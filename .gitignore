@@ -1,0 +1,45 @@
+# Local task context
+activeTask.md
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# Node / frontend
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+*.tsbuildinfo
+.vite/
+coverage/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Logs / temp
+*.log
+*.tmp
+.tmp/
+tmp/
