@@ -13,7 +13,7 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Repository migration files and applied DDL must remain aligned. If emergency/manual production repair is ever explicitly authorized, reconcile it back into the migration history immediately and document the exceptional path.
 - Public-schema changes explicitly define least-privilege grants; do not rely on broad defaults.
 - Never hardcode generated environment/project identifiers in product migrations.
-- Project identity comes from actual environment/repository configuration, never from Babelbeez values.
+- Project identity comes from actual environment/repository configuration, never from values inherited from any prior project.
 - Schema changes require corresponding persistence/domain tests and affected generated types/contracts if such generation is adopted.
 
 ## Security / isolation
