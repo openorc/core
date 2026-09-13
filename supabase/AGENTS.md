@@ -6,7 +6,11 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 
 ## Migration rules
 
-- Repository migration files and applied DDL must remain aligned.
+- Repository migrations are the authoritative source for schema evolution. Schema changes are authored in `supabase/migrations/` first, reviewed with the code change, and then applied to deployed Supabase projects through the supported deployment path.
+- Do not mutate the live production Supabase schema first and backfill a migration afterward. Production is a deployment target, not an agent development workbench.
+- Agents must not use Supabase MCP, SQL consoles, or equivalent privileged tooling to make ad hoc production DDL changes as the normal development workflow.
+- Develop and validate schema changes against local Supabase or another explicitly designated non-production environment when available. The production project must be reproducible from committed migrations rather than from undocumented live edits.
+- Repository migration files and applied DDL must remain aligned. If emergency/manual production repair is ever explicitly authorized, reconcile it back into the migration history immediately and document the exceptional path.
 - Public-schema changes explicitly define least-privilege grants; do not rely on broad defaults.
 - Never hardcode generated environment/project identifiers in product migrations.
 - Project identity comes from actual environment/repository configuration, never from Babelbeez values.
