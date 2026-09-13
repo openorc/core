@@ -50,8 +50,6 @@ API routers and worker jobs remain thin transports over shared services. Workflo
 
 Repository implementation guidance is carried by the root `AGENTS.md` plus nested `AGENTS.md` files at architectural boundaries. Agents working across boundaries must read every applicable local guide before editing.
 
-The file `docs/openorc-agents-bootstrap-analysis.md` is transitional bootstrap source material. It is not a second product specification and should eventually disappear once its useful guidance has been compiled into repository-native code, tests, documentation, and `AGENTS.md` files.
-
 ## License
 
 Apache License 2.0. See `LICENSE`.
