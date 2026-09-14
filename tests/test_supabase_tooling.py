@@ -52,6 +52,9 @@ with open(os.environ["SUPABASE_STUB_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(argv) + "\\n")
 
 if argv[:1] == ["--version"]:
+    if os.environ.get("SUPABASE_STUB_VERSION_FAIL"):
+        print("stub: version probe failed", file=sys.stderr)
+        raise SystemExit(7)
     print(os.environ.get("SUPABASE_STUB_VERSION", "__PIN__"))
     raise SystemExit(0)
 
@@ -243,6 +246,53 @@ def test_pin_older_installed_version_also_refused(
     assert result.returncode != 0
     assert "version mismatch" in result.stderr
     assert read_calls(tmp_path) == [["--version"]]
+
+
+def test_prerelease_version_identity_rejected(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    # Regression: a prerelease suffix is part of the reported version
+    # identity. The check must not truncate it (e.g. 2.117.0-beta.1 ->
+    # 2.117.0) into a false match against the pinned release.
+    result = run_tool(
+        *BRANCH_ARGS,
+        env={**branch_env(), "SUPABASE_STUB_VERSION": "2.117.0-beta.1"},
+        with_migration=True,
+    )
+
+    assert result.returncode != 0
+    assert "version mismatch" in result.stderr
+    assert "2.117.0-beta.1" in result.stderr
+    assert read_calls(tmp_path) == [["--version"]]
+
+
+def test_version_probe_failure_fails_closed(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    result = run_tool(
+        *BRANCH_ARGS,
+        env={**branch_env(), "SUPABASE_STUB_VERSION_FAIL": "1"},
+        with_migration=True,
+    )
+
+    assert result.returncode != 0
+    assert "exited with a non-zero status" in result.stderr
+    assert read_calls(tmp_path) == [["--version"]]
+
+
+def test_whitespace_around_reported_version_is_normalized(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    # Only harmless whitespace/prefix normalization is allowed; the pinned
+    # identity itself must still match exactly.
+    result = run_tool(
+        *BRANCH_ARGS,
+        env={**branch_env(), "SUPABASE_STUB_VERSION": "  2.117.0  "},
+        with_migration=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Migrations applied successfully." in result.stdout
 
 
 # ---------------------------------------------------------------------------

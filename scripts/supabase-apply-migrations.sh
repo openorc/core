@@ -139,6 +139,16 @@ load_env_file
 # verified against the upstream stable release at pin time. Per repository
 # dependency policy this is an exact pin, not a minimum-version floor: any
 # other installed version is refused.
+#
+# The installed CLI must self-report the pinned version exactly. Only
+# harmless normalization is applied to the reported identity:
+#   - surrounding whitespace is trimmed;
+#   - one fixed optional prefix is stripped (the binary's self-name
+#     "supabase"/"Supabase", or a leading "v").
+# The full semantic version identity — including prerelease/build suffixes
+# such as 2.117.0-beta.1 — must otherwise match the pin exactly, so a
+# prerelease is never truncated into a matching release. A failing
+# `supabase --version` is a hard failure.
 # ---------------------------------------------------------------------------
 
 require_command() {
@@ -149,8 +159,17 @@ require_command() {
     fi
 }
 
+# Trim leading and trailing whitespace.
+trim() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    printf '%s' "${value%"${value##*[![:space:]]}"}"
+}
+
 require_pinned_cli_version() {
-    local pinned installed_raw installed_version
+    local pinned installed_raw normalized
+    local semver_re='^[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
 
     if [ ! -f "$CLI_VERSION_FILE" ]; then
         die "CLI version pin file missing: supabase/cli-version"
@@ -162,19 +181,30 @@ require_pinned_cli_version() {
         die "CLI version pin file is empty: supabase/cli-version"
     fi
 
-    installed_raw="$(supabase --version 2>/dev/null || true)"
-
-    if ! installed_version="$(printf '%s\n' "$installed_raw" \
-        | grep -Eom1 '[0-9]+(\.[0-9]+)+')"; then
-        die "Could not determine the installed Supabase CLI version (output: ${installed_raw:-<empty>})."
+    if ! installed_raw="$(supabase --version)"; then
+        die "supabase --version exited with a non-zero status; cannot verify the installed CLI version."
     fi
 
-    if [ "$installed_version" != "$pinned" ]; then
-        die "Supabase CLI version mismatch: installed $installed_version, repository pin $pinned.
+    normalized="$(trim "$installed_raw")"
+
+    case "$normalized" in
+        [Ss]upabase\ *)
+            normalized="$(trim "${normalized#[Ss]upabase }")"
+            ;;
+    esac
+
+    normalized="${normalized#v}"
+
+    if [ -z "$normalized" ] || [[ ! "$normalized" =~ $semver_re ]]; then
+        die "Could not determine the installed Supabase CLI version from unexpected --version output: ${installed_raw:-<empty>}."
+    fi
+
+    if [ "$normalized" != "$pinned" ]; then
+        die "Supabase CLI version mismatch: installed $normalized, repository pin $pinned.
 Align your Supabase CLI with the repository pin (see docs/supabase-migrations.md)."
     fi
 
-    log "Supabase CLI version OK: $installed_version"
+    log "Supabase CLI version OK: $normalized"
 }
 
 
