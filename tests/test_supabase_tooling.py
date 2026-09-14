@@ -63,6 +63,11 @@ if argv[:2] == ["branches", "get"]:
     if mode == "fail":
         print("stub: branches get failed", file=sys.stderr)
         raise SystemExit(1)
+    if mode == "authfail":
+        # Simulated CLI-unauthenticated/unauthorized state for the branch
+        # operation itself.
+        print("ERROR: Invalid API key (HTTP 401)", file=sys.stderr)
+        raise SystemExit(1)
     if mode == "nourl":
         # Emulate a branch without published database credentials
         # (not ready yet, or the production/main branch).
@@ -312,12 +317,12 @@ def test_whitespace_around_reported_version_is_normalized(
 # ---------------------------------------------------------------------------
 
 
-def test_branch_mode_without_token_uses_cli_stored_login(
+def test_branch_mode_with_cli_authenticated_state_proceeds_without_exported_token(
     run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
 ) -> None:
-    # Authentication is delegated to the CLI: an exported token OR stored
-    # `supabase login` credentials both work. Absence of the env var must
-    # not fail the tooling when the CLI itself is authenticated.
+    # Simulated CLI-authenticated state: the stub CLI accepts the branch
+    # operation, and no SUPABASE_ACCESS_TOKEN is exported. Authentication is
+    # delegated to the CLI, so the tooling must proceed and delegate.
     env = branch_env()
     del env["SUPABASE_ACCESS_TOKEN"]
 
@@ -329,19 +334,25 @@ def test_branch_mode_without_token_uses_cli_stored_login(
     assert ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"] in calls
 
 
-def test_branch_mode_without_cli_auth_fails_fast(
+def test_branch_mode_with_cli_unauthenticated_state_fails_immediately(
     run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
 ) -> None:
-    env = branch_env(SUPABASE_STUB_AUTH_FAIL="1")
+    # Simulated CLI-unauthenticated/unauthorized state: the branch operation
+    # itself is rejected. The tooling must fail immediately with a useful
+    # diagnostic instead of retrying through the whole wait budget.
+    env = branch_env(SUPABASE_STUB_BRANCH_GET="authfail")
     del env["SUPABASE_ACCESS_TOKEN"]
 
     result = run_tool(*BRANCH_ARGS, env=env)
 
     assert result.returncode != 0
-    assert "Supabase authentication unavailable" in result.stderr
-    assert "supabase login" in result.stderr
-    # Fail fast: no credential wait, no branch resolution, no write.
-    assert read_calls(tmp_path) == [["--version"], ["projects", "list"]]
+    assert "authentication/authorization" in result.stderr
+    assert "Invalid API key" in result.stderr
+    # Fail immediately: exactly one branch lookup, no retries, no writes.
+    assert read_calls(tmp_path) == [
+        ["--version"],
+        ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"],
+    ]
 
 
 def test_branch_mode_without_parent_ref_fails_closed(
@@ -383,7 +394,6 @@ def test_branch_resolved_production_identity_refused(
     assert "configured production project" in result.stderr
     assert [call[:2] for call in read_calls(tmp_path)] == [
         ["--version"],
-        ["projects", "list"],
         ["branches", "get"],
         ["migration", "list"],
     ]
@@ -457,7 +467,6 @@ def test_branch_mode_happy_path_applies_migrations(
     calls = read_calls(tmp_path)
     assert calls == [
         ["--version"],
-        ["projects", "list"],
         ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"],
         ["migration", "list", "--db-url", BRANCH_DB_URL],
         ["db", "push", "--db-url", BRANCH_DB_URL],
@@ -614,7 +623,7 @@ def test_env_file_supplies_branch_configuration(
 
     assert result.returncode == 0, result.stderr
     calls = read_calls(tmp_path)
-    assert calls[2] == ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"]
+    assert calls[1] == ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"]
 
 
 def test_exported_environment_wins_over_env_file(

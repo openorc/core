@@ -352,14 +352,12 @@ require_branch_configuration() {
         die "OPENORC_SUPABASE_PROJECT_REF is required for --branch mode."
     fi
 
-    # Authentication is delegated to the Supabase CLI: an exported
-    # SUPABASE_ACCESS_TOKEN or stored `supabase login` credentials both work,
-    # and the CLI fails closed when neither is available. Probe once so that
-    # missing authentication fails fast instead of silently burning the whole
-    # bounded branch-credentials wait.
-    if ! supabase projects list >/dev/null 2>&1 </dev/null; then
-        die "Supabase authentication unavailable: run 'supabase login' or export SUPABASE_ACCESS_TOKEN."
-    fi
+    # Authentication is delegated entirely to the Supabase CLI. An exported
+    # SUPABASE_ACCESS_TOKEN is the intended non-interactive path (Cline Hub /
+    # self-hosted); a stored `supabase login` also works for interactive use.
+    # No account-wide probe is performed here: authentication and
+    # authorization failures surface through the actual branch operation
+    # (see wait_for_branch_database), so scoped tokens work.
 
     if [ -n "${OPENORC_SUPABASE_PRODUCTION_PROJECT_REF:-}" ] \
         && [ "${OPENORC_SUPABASE_PROJECT_REF:-}" = "${OPENORC_SUPABASE_PRODUCTION_PROJECT_REF:-}" ]; then
@@ -424,13 +422,24 @@ require_non_production_db_url() {
 #   BRANCH_POSTGRES_URL  direct (non-pooling) Postgres URL of the branch
 #   BRANCH_API_URL       https API URL of the branch
 #   BRANCH_PROJECT_REF   the branch's own project ref
+#   BRANCH_GET_STDERR    sanitized stderr from the last CLI invocation
+# Returns:
+#   0  credentials and identity resolved
+#   1  CLI invocation failed (BRANCH_GET_STDERR holds the sanitized stderr)
+#   2  branch exists but database credentials are not published yet
+#   3  credentials published but the branch identity could not be determined
 fetch_branch_environment() {
     local branch_name="$1"
-    local raw line key value
+    local err_file raw line key value status=0
 
-    if ! raw="$(supabase branches get "$branch_name" \
+    err_file="$(mktemp "${TMPDIR:-/tmp}/openorc-branch-get.XXXXXX")"
+    raw="$(supabase branches get "$branch_name" \
         --project-ref "${OPENORC_SUPABASE_PROJECT_REF:-}" \
-        -o env 2>/dev/null)"; then
+        -o env 2>"$err_file")" || status=$?
+    BRANCH_GET_STDERR="$(sanitize_cli_error "$(cat "$err_file")")"
+    rm -f "$err_file"
+
+    if [ "$status" != 0 ]; then
         return 1
     fi
 
@@ -455,29 +464,71 @@ fetch_branch_environment() {
     done <<< "$raw"
 
     if [ -z "$BRANCH_POSTGRES_URL" ]; then
-        return 1
+        return 2
     fi
 
     BRANCH_PROJECT_REF="$(extract_supabase_ref "${BRANCH_API_URL:-$BRANCH_POSTGRES_URL}")"
 
     if [ -z "$BRANCH_PROJECT_REF" ]; then
-        return 1
+        return 3
     fi
 }
 
+# Redact credentials from CLI diagnostics before surfacing them.
+sanitize_cli_error() {
+    local text="$1"
+
+    if [ -n "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+        text="${text//$SUPABASE_ACCESS_TOKEN/<redacted-token>}"
+    fi
+    text="$(printf '%s\n' "$text" | sed -E 's#((postgres(ql)?|https?)://[^:/@ ]+):[^@ ]+@#\1:<redacted>@#g')"
+    printf '%s' "$text"
+}
+
+# Returns 0 when the CLI error output looks like an authentication or
+# authorization failure for the branch operation itself.
+branch_get_error_is_auth() {
+    local text
+
+    text="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+
+    printf '%s' "$text" | grep -Eq '401|403|unauthorized|forbidden|invalid access token|invalid api key|not logged in|access token|api key|permission'
+}
+
+# Bounded wait around the branch operation. Distinguishes:
+#   - authentication/authorization failure  -> fail immediately;
+#   - credentials not published yet         -> retry;
+#   - credentials published, DB not ready   -> retry;
+#   - database answers                      -> proceed.
 wait_for_branch_database() {
     local branch_name="$1"
-    local attempt=1 reason=""
+    local attempt=1 reason="" status=0
 
     while [ "$attempt" -le "$BRANCH_WAIT_MAX_ATTEMPTS" ]; do
-        if fetch_branch_environment "$branch_name"; then
-            if supabase migration list --db-url "$BRANCH_POSTGRES_URL" >/dev/null 2>&1 </dev/null; then
-                return 0
-            fi
-            reason="database not answering yet"
-        else
-            reason="credentials not published yet"
-        fi
+        status=0
+        fetch_branch_environment "$branch_name" || status=$?
+
+        case "$status" in
+            0)
+                if supabase migration list --db-url "$BRANCH_POSTGRES_URL" >/dev/null 2>&1 </dev/null; then
+                    return 0
+                fi
+                reason="database not answering yet"
+                ;;
+            2)
+                reason="database credentials not published yet"
+                ;;
+            3)
+                reason="branch identity not determinable from CLI output"
+                ;;
+            *)
+                if branch_get_error_is_auth "$BRANCH_GET_STDERR"; then
+                    die "Supabase rejected the branch operation for '$branch_name' (authentication/authorization): ${BRANCH_GET_STDERR:-<no diagnostic>}
+Check that SUPABASE_ACCESS_TOKEN (or your stored CLI login) is valid and authorized for the parent project."
+                fi
+                reason="branch lookup failed transiently"
+                ;;
+        esac
 
         if [ "$attempt" -lt "$BRANCH_WAIT_MAX_ATTEMPTS" ]; then
             log "Branch '$branch_name' not ready ($reason; attempt $attempt/$BRANCH_WAIT_MAX_ATTEMPTS); waiting ${BRANCH_WAIT_SLEEP_SECONDS}s..."
@@ -580,8 +631,9 @@ Options:
   -h, --help      Show this help.
 
 Environment:
-  SUPABASE_ACCESS_TOKEN                    optional; a stored `supabase login`
-                                           also authenticates the CLI
+  SUPABASE_ACCESS_TOKEN                    intended non-interactive auth path
+                                           (Cline Hub / self-hosted); a stored
+                                           `supabase login` also works
   OPENORC_SUPABASE_PROJECT_REF             parent project for --branch mode
   OPENORC_SUPABASE_PRODUCTION_PROJECT_REF  production identity guard;
                                            required for non-loopback
