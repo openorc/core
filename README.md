@@ -109,6 +109,20 @@ npm test           # Vitest
 
 The SPA never assumes it is served by the API process or that API calls are same-origin. The API base URL is externalized through `VITE_API_BASE_URL` (see `apps/app/.env.example`); an unset or invalid value fails closed when the application needs the API base URL rather than silently falling back to same-origin behavior.
 
+## Local development (Supabase migrations)
+
+`supabase/` owns the product Postgres schema. Repository migrations are the authoritative schema-evolution source (see `supabase/AGENTS.md`); the supported developer workflow is documented in [`docs/supabase-migrations.md`](docs/supabase-migrations.md).
+
+The Supabase CLI version is pinned exactly in `supabase/cli-version` and is enforced (strict equality, no version floor) by the tooling:
+
+```bash
+supabase migration new <name>                                       # author a migration
+scripts/supabase-apply-migrations.sh --dry-run --branch my-branch   # validate (no writes)
+scripts/supabase-apply-migrations.sh --branch my-branch             # apply to a non-production branch
+```
+
+The tooling refuses any target that cannot be reliably proven non-production; production application belongs to `openorc/cloud`, not this repository. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
+
 ## Agent context
 
 Repository implementation guidance is carried by the root `AGENTS.md` plus nested `AGENTS.md` files at architectural boundaries. Agents working across boundaries must read every applicable local guide before editing.

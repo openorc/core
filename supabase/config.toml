@@ -1,0 +1,30 @@
+# OpenOrc Supabase CLI project configuration.
+#
+# Full configuration reference:
+#   https://supabase.com/docs/guides/local-development/cli/config
+#
+# This file is committed and contains no secrets. Project identity (project
+# refs, access tokens, database credentials) comes from the environment and
+# is never committed; see .env.example for the local development contract.
+#
+# supabase/migrations/ is the authoritative schema-evolution source
+# (see supabase/AGENTS.md). The Supabase CLI version used with this
+# directory is pinned exactly in supabase/cli-version; the supported
+# repository-native developer workflow is documented in
+# docs/supabase-migrations.md.
+#
+# Only configuration that departs from CLI defaults is listed here. The
+# CLI fills in documented defaults for everything else.
+
+project_id = "openorc"
+
+[db.migrations]
+enabled = true
+schema_paths = []
+
+[db.seed]
+# Reserved for a future supabase/seed.sql (representative non-production
+# data only). No seed data exists yet; dev tooling skips seeding while the
+# file is absent. Do not invent product seed data to prove tooling works.
+enabled = true
+sql_paths = ["./seed.sql"]

@@ -43,3 +43,7 @@ coverage/
 *.tmp
 .tmp/
 tmp/
+
+# Supabase CLI internal state (never commit link/branch state)
+supabase/.temp/
+supabase/.branches/
