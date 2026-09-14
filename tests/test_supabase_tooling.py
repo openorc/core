@@ -35,7 +35,9 @@ REF_BRANCH = "b" * 20
 REF_PRODUCTION = "c" * 20
 
 BRANCH_DB_URL = f"postgresql://postgres.{REF_BRANCH}:branchsecret@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
-BRANCH_DIRECT_DB_URL = f"postgresql://postgres:branchsecret@db.{REF_BRANCH}.supabase.co:5432/postgres"
+BRANCH_DIRECT_DB_URL = (
+    f"postgresql://postgres:branchsecret@db.{REF_BRANCH}.supabase.co:5432/postgres"
+)
 BRANCH_API_URL = f"https://{REF_BRANCH}.supabase.co"
 BRANCH_SECRET_TOKEN = "supatest-access-token"
 
@@ -522,6 +524,35 @@ def test_dry_run_forwarded_to_db_push(
         "--dry-run",
     ]
     assert result.stdout.count("u:p") == 0
+
+
+def test_bootstrap_baseline_is_noop_and_matches_lineage() -> None:
+    # The parent project's migration history carries the platform-recorded
+    # baseline version 20260914035628 (name: remote_schema); preview branches
+    # inherit it. The repository counterpart must exist, be a no-op, and
+    # contain no schema definition.
+    baseline = REPO_ROOT / "supabase" / "migrations" / "20260914035628_bootstrap_baseline.sql"
+
+    assert baseline.exists(), "the repository baseline for the platform lineage is missing"
+    statements = [
+        line.strip().lower()
+        for line in baseline.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("--")
+    ]
+    assert "select 1;" in statements
+    ddl_prefixes = (
+        "create",
+        "alter",
+        "drop",
+        "grant",
+        "revoke",
+        "insert",
+        "update",
+        "delete",
+        "truncate",
+    )
+    for line in statements:
+        assert not line.startswith(ddl_prefixes), f"baseline must remain a no-op, found: {line}"
 
 
 def test_empty_migrations_is_clean_noop(

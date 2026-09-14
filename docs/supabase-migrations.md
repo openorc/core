@@ -132,6 +132,22 @@ committed; exported variables win over `.env`):
 Generated branch credentials (database URLs, API keys) are consumed in-process
 by the tooling and are never printed, written to tracked files, or committed.
 
+## Migration-history baseline
+
+The parent OpenOrc Cloud project's `supabase_migrations.schema_migrations`
+contains version `20260914035628` (name: `remote_schema`) — the platform
+recorded the base project's initialization state (Supabase default
+extensions and grants) when preview branches were first provisioned. No
+OpenOrc-owned schema existed at that point (the `public` schema was empty;
+all other schemas are platform-managed).
+
+`supabase/migrations/20260914035628_bootstrap_baseline.sql` is the
+repository-side counterpart of that lineage entry: a deliberate no-op
+baseline. Preview branches inherit the parent's history, so `db push` sees
+local and remote histories as aligned. All future schema changes must be
+represented by later committed migrations; never delete or repair this
+baseline entry to make a mismatch disappear.
+
 ## Behavior notes
 
 - The script enforces the exact CLI pin before anything else, refuses

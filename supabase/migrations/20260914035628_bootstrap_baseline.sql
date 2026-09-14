@@ -1,0 +1,17 @@
+-- Repository baseline matching the existing Supabase migration-history lineage.
+--
+-- When preview branches were first provisioned from the parent OpenOrc Cloud
+-- project, the Supabase platform recorded the base project's initialization
+-- state as migration version 20260914035628 (name: remote_schema) in
+-- supabase_migrations.schema_migrations. Preview branches inherit that
+-- lineage, and db push compares local migrations against it.
+--
+-- No OpenOrc-owned schema existed at this baseline: the parent's `public`
+-- schema was empty and every other schema is Supabase-managed. The recorded
+-- statements describe platform defaults (default extensions and grants), not
+-- OpenOrc product schema.
+--
+-- This file is the repository counterpart of that lineage entry so local and
+-- remote histories align. Future schema changes MUST be represented by later
+-- committed migrations; this file must remain a harmless no-op.
+select 1;
