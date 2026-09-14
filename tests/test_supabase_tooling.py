@@ -34,7 +34,8 @@ REF_PARENT = "a" * 20
 REF_BRANCH = "b" * 20
 REF_PRODUCTION = "c" * 20
 
-BRANCH_DB_URL = f"postgresql://postgres:branchsecret@db.{REF_BRANCH}.supabase.co:5432/postgres"
+BRANCH_DB_URL = f"postgresql://postgres.{REF_BRANCH}:branchsecret@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+BRANCH_DIRECT_DB_URL = f"postgresql://postgres:branchsecret@db.{REF_BRANCH}.supabase.co:5432/postgres"
 BRANCH_API_URL = f"https://{REF_BRANCH}.supabase.co"
 BRANCH_SECRET_TOKEN = "supatest-access-token"
 
@@ -74,8 +75,11 @@ if argv[:2] == ["branches", "get"]:
         raise SystemExit(0)
     api_url = os.environ.get("SUPABASE_STUB_BRANCH_API_URL", "")
     db_url = os.environ.get("SUPABASE_STUB_BRANCH_POSTGRES_URL", "")
+    pooler_url = os.environ.get("SUPABASE_STUB_BRANCH_POOLER_URL", "")
     if api_url:
         print(f'SUPABASE_URL="{api_url}"')
+    if pooler_url:
+        print(f'POSTGRES_URL="{pooler_url}"')
     if db_url:
         print(f'POSTGRES_URL_NON_POOLING="{db_url}"')
     raise SystemExit(0)
@@ -181,7 +185,8 @@ def branch_env(**overrides: str) -> dict[str, str]:
         "OPENORC_SUPABASE_PROJECT_REF": REF_PARENT,
         "OPENORC_SUPABASE_PRODUCTION_PROJECT_REF": REF_PRODUCTION,
         "SUPABASE_ACCESS_TOKEN": BRANCH_SECRET_TOKEN,
-        "SUPABASE_STUB_BRANCH_POSTGRES_URL": BRANCH_DB_URL,
+        "SUPABASE_STUB_BRANCH_POSTGRES_URL": BRANCH_DIRECT_DB_URL,
+        "SUPABASE_STUB_BRANCH_POOLER_URL": BRANCH_DB_URL,
         "SUPABASE_STUB_BRANCH_API_URL": BRANCH_API_URL,
     }
     base.update(overrides)
@@ -473,10 +478,26 @@ def test_branch_mode_happy_path_applies_migrations(
     ]
     # Strict push: no history-drift masking flag.
     assert not any("--include-all" in call for call in calls)
+    # Pooler preference (live-verified): when both URLs are published, the
+    # pooler URL is the apply target even though the direct URL was offered.
+    assert calls[-1] == ["db", "push", "--db-url", BRANCH_DB_URL]
     # Generated credentials never reach stdout/stderr.
     assert "branchsecret" not in result.stdout
     assert "branchsecret" not in result.stderr
     assert BRANCH_SECRET_TOKEN not in result.stdout
+
+
+def test_branch_mode_falls_back_to_direct_url_when_pooler_absent(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    env = branch_env(SUPABASE_STUB_BRANCH_POOLER_URL="")
+
+    result = run_tool(*BRANCH_ARGS, env=env, with_migration=True)
+
+    assert result.returncode == 0, result.stderr
+    calls = read_calls(tmp_path)
+    assert ["migration", "list", "--db-url", BRANCH_DIRECT_DB_URL] in calls
+    assert calls[-1] == ["db", "push", "--db-url", BRANCH_DIRECT_DB_URL]
 
 
 def test_dry_run_forwarded_to_db_push(

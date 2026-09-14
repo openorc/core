@@ -419,7 +419,8 @@ require_non_production_db_url() {
 # ---------------------------------------------------------------------------
 
 # Populates from `supabase branches get ... -o env`:
-#   BRANCH_POSTGRES_URL  direct (non-pooling) Postgres URL of the branch
+#   BRANCH_POSTGRES_URL  the branch database URL the tooling applies through
+#                        (the published pooler URL; see below)
 #   BRANCH_API_URL       https API URL of the branch
 #   BRANCH_PROJECT_REF   the branch's own project ref
 #   BRANCH_GET_STDERR    sanitized stderr from the last CLI invocation
@@ -428,6 +429,13 @@ require_non_production_db_url() {
 #   1  CLI invocation failed (BRANCH_GET_STDERR holds the sanitized stderr)
 #   2  branch exists but database credentials are not published yet
 #   3  credentials published but the branch identity could not be determined
+#
+# Live verification (issue #7 E2E): CLI-created preview branches publish
+# both POSTGRES_URL (pooler) and POSTGRES_URL_NON_POOLING (direct), but the
+# direct host (db.<ref>.supabase.co) does not resolve (getaddrinfo
+# ENOTFOUND) while the pooler URL is reachable immediately. The pooler URL
+# is therefore the supported apply target; the direct URL is only a
+# fallback when no pooler URL is published.
 fetch_branch_environment() {
     local branch_name="$1"
     local err_file raw line key value status=0
@@ -443,7 +451,8 @@ fetch_branch_environment() {
         return 1
     fi
 
-    BRANCH_POSTGRES_URL=""
+    BRANCH_POOLER_URL=""
+    BRANCH_DIRECT_URL=""
     BRANCH_API_URL=""
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -458,20 +467,23 @@ fetch_branch_environment() {
         fi
 
         case "$key" in
-            POSTGRES_URL_NON_POOLING) BRANCH_POSTGRES_URL="$value" ;;
+            POSTGRES_URL)             BRANCH_POOLER_URL="$value" ;;
+            POSTGRES_URL_NON_POOLING) BRANCH_DIRECT_URL="$value" ;;
             SUPABASE_URL)             BRANCH_API_URL="$value" ;;
         esac
     done <<< "$raw"
 
-    if [ -z "$BRANCH_POSTGRES_URL" ]; then
+    if [ -z "$BRANCH_POOLER_URL" ] && [ -z "$BRANCH_DIRECT_URL" ]; then
         return 2
     fi
 
-    BRANCH_PROJECT_REF="$(extract_supabase_ref "${BRANCH_API_URL:-$BRANCH_POSTGRES_URL}")"
+    BRANCH_PROJECT_REF="$(extract_supabase_ref "${BRANCH_API_URL:-${BRANCH_POOLER_URL:-$BRANCH_DIRECT_URL}}")"
 
     if [ -z "$BRANCH_PROJECT_REF" ]; then
         return 3
     fi
+
+    BRANCH_POSTGRES_URL="${BRANCH_POOLER_URL:-$BRANCH_DIRECT_URL}"
 }
 
 # Redact credentials from CLI diagnostics before surfacing them.
