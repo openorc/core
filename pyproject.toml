@@ -1,0 +1,60 @@
+[project]
+name = "openorc"
+description = "OpenOrc control plane: open, provider-neutral orchestration for governed agentic software development."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.13,<3.14"
+dynamic = ["version"]
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.52.4",
+    "rq==2.12.0",
+    "redis==8.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/openorc/core"
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.1.1",
+    "ruff==0.16.7",
+    "pyright==1.1.414",
+]
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/openorc/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openorc"]
+
+[tool.uv]
+required-version = "==0.10.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "integration: requires live external infrastructure; excluded from the ordinary deterministic baseline",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "apps", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["src", "apps", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
