@@ -31,6 +31,6 @@ Planned coverage layers include:
 - Task session lifecycle/isolation;
 - GitHub reconciliation;
 - frontend component/state/API contracts;
-- developer/infra tooling contracts (for example, the Supabase migration tooling exercised through a stub CLI);
+- developer/infra tooling contracts (for example, the Supabase migration tooling exercised through a stub CLI, and the devserver orchestrator exercised through Python-level process-runner fakes);
 - explicit real headless integration/E2E validation later in the implementation sequence.
 

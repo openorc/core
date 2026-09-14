@@ -133,6 +133,35 @@ scripts/supabase-apply-migrations.sh --branch my-branch             # apply to a
 
 The tooling refuses any target that cannot be reliably proven non-production; production application belongs to `openorc/cloud`, not this repository. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
 
+## Manual local E2E (devserver)
+
+`scripts/devserver.sh` starts the full local stack against a fresh ephemeral hosted Supabase branch. It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
+
+The orchestration is implemented in Python (`src/openorc/devtools/devserver.py`); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
+
+```bash
+bash scripts/devserver.sh                 # full stack: Supabase branch + queue + API + worker + app (foreground)
+bash scripts/devserver.sh --help          # component-only modes, --no-* controls, --keep-supabase
+```
+
+What a default run does:
+
+1. creates a unique ephemeral Supabase branch from `OPENORC_SUPABASE_PROJECT_REF`;
+2. waits for genuine branch readiness (published credentials plus a live database, bounded timeout);
+3. exports branch credentials (`SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `DATABASE_URL`) to the stack process tree only — never to tracked files;
+4. applies current-checkout migrations through `scripts/supabase-apply-migrations.sh` (fails hard on error) and `supabase/seed.sql` when present;
+5. ensures the local Redis-compatible queue backend (`VALKEY_URL`, default `redis://127.0.0.1:6379/2`) and flushes the selected local DB before the worker starts;
+6. starts the API and RQ worker from the repository `.venv` (`uv sync`), and runs the Vue dev server in the foreground;
+7. on any exit (including Ctrl-C or failure) runs a single dependency-aware cleanup: the app/worker/API stop first, the worker is allowed to finish its RQ shutdown while the queue backend is still alive, a devserver-started queue server stops only after that, and only the branch created by that run is deleted.
+
+Lifecycle and safety properties:
+
+- A queue server already responding at `VALKEY_URL` is reused and left running; the selected local DB is still flushed. A devserver-started queue server runs `redis-server` directly (never `brew services`) with persistence disabled and is stopped on exit. Non-local URLs are never flushed or managed.
+- The production Supabase project is never a development target: the stack only consumes credentials of the branch created by the run, and the migration tooling re-verifies non-production identity.
+- `--keep-supabase` preserves the branch for debugging and says so loudly (branches cost compute; delete them manually).
+
+Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, local `redis-server`, npm dependencies, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
+
 ## Agent context
 
 Repository implementation guidance is carried by the root `AGENTS.md` plus nested `AGENTS.md` files at architectural boundaries. Agents working across boundaries must read every applicable local guide before editing.
