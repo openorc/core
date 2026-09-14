@@ -81,6 +81,12 @@ if argv[:2] == ["projects", "list"]:
         raise SystemExit(1)
     raise SystemExit(0)
 
+if argv[:2] == ["migration", "list"]:
+    if os.environ.get("SUPABASE_STUB_DB_NOTREADY"):
+        print("stub: database not ready", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0)
+
 if argv[:2] == ["db", "push"]:
     raise SystemExit(0)
 
@@ -379,6 +385,7 @@ def test_branch_resolved_production_identity_refused(
         ["--version"],
         ["projects", "list"],
         ["branches", "get"],
+        ["migration", "list"],
     ]
     assert "db push" not in result.stdout
 
@@ -409,9 +416,28 @@ def test_branch_wait_timeout_fails_closed(
     result = run_tool(*BRANCH_ARGS, env=env)
 
     assert result.returncode != 0
-    assert "did not publish database credentials" in result.stderr
+    assert "did not become ready" in result.stderr
+    assert "credentials not published yet" in result.stderr
+    assert not any(call[:2] == ["db", "push"] for call in read_calls(tmp_path))
+
+
+def test_branch_database_not_ready_times_out(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    # Regression from live E2E: hosted branches publish credentials BEFORE
+    # their database host resolves. Credential presence alone must not be
+    # treated as readiness; the wait must poll until the database answers.
+    env = branch_env(
+        SUPABASE_STUB_DB_NOTREADY="1",
+        OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS="2",
+        OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS="0",
+    )
+
+    result = run_tool(*BRANCH_ARGS, env=env, with_migration=True)
+
     assert result.returncode != 0
-    assert "did not publish database credentials" in result.stderr
+    assert "did not become ready" in result.stderr
+    assert "database not answering yet" in result.stderr
     assert not any(call[:2] == ["db", "push"] for call in read_calls(tmp_path))
 
 
@@ -433,6 +459,7 @@ def test_branch_mode_happy_path_applies_migrations(
         ["--version"],
         ["projects", "list"],
         ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"],
+        ["migration", "list", "--db-url", BRANCH_DB_URL],
         ["db", "push", "--db-url", BRANCH_DB_URL],
     ]
     # Strict push: no history-drift masking flag.

@@ -414,6 +414,10 @@ require_non_production_db_url() {
 # the write target; the branch's own project identity is checked against the
 # production guard. Generated branch credentials are consumed in-process and
 # are never printed or written anywhere.
+#
+# Readiness is verified with an actual database connection (`supabase
+# migration list`): publishing credentials alone is NOT sufficient - hosted
+# branches expose credentials before their database host resolves.
 # ---------------------------------------------------------------------------
 
 # Populates from `supabase branches get ... -o env`:
@@ -461,24 +465,29 @@ fetch_branch_environment() {
     fi
 }
 
-wait_for_branch_credentials() {
+wait_for_branch_database() {
     local branch_name="$1"
-    local attempt=1
+    local attempt=1 reason=""
 
     while [ "$attempt" -le "$BRANCH_WAIT_MAX_ATTEMPTS" ]; do
         if fetch_branch_environment "$branch_name"; then
-            return 0
+            if supabase migration list --db-url "$BRANCH_POSTGRES_URL" >/dev/null 2>&1 </dev/null; then
+                return 0
+            fi
+            reason="database not answering yet"
+        else
+            reason="credentials not published yet"
         fi
 
         if [ "$attempt" -lt "$BRANCH_WAIT_MAX_ATTEMPTS" ]; then
-            log "Branch '$branch_name' not ready yet (attempt $attempt/$BRANCH_WAIT_MAX_ATTEMPTS); waiting ${BRANCH_WAIT_SLEEP_SECONDS}s..."
+            log "Branch '$branch_name' not ready ($reason; attempt $attempt/$BRANCH_WAIT_MAX_ATTEMPTS); waiting ${BRANCH_WAIT_SLEEP_SECONDS}s..."
             sleep "$BRANCH_WAIT_SLEEP_SECONDS"
         fi
 
         attempt=$((attempt + 1))
     done
 
-    die "Branch '$branch_name' did not publish database credentials within $((BRANCH_WAIT_MAX_ATTEMPTS * BRANCH_WAIT_SLEEP_SECONDS))s. It may still be provisioning, or it may be the production/main branch (whose database credentials are never retrievable)."
+    die "Branch '$branch_name' did not become ready within $((BRANCH_WAIT_MAX_ATTEMPTS * BRANCH_WAIT_SLEEP_SECONDS))s (last status: $reason). It may still be provisioning, or it may be the production/main branch (whose database credentials are never retrievable)."
 }
 
 resolve_branch_target() {
@@ -493,7 +502,7 @@ resolve_branch_target() {
 
     log "Resolving branch '$branch_name' under parent project ${OPENORC_SUPABASE_PROJECT_REF}..."
 
-    wait_for_branch_credentials "$branch_name"
+    wait_for_branch_database "$branch_name"
 
     require_non_production_branch "$branch_name" "$BRANCH_PROJECT_REF"
 
