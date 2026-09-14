@@ -372,6 +372,13 @@ require_base_tools() {
 # the devserver-owned queue backend. Cleanup stops them in REVERSE start
 # order: the foreground process (registered last) stops first; the queue
 # backend (registered first) stops after the worker/API that depend on it.
+#
+# Background children IGNORE SIGINT (trap '' INT before exec): a terminal
+# Ctrl-C delivers SIGINT to the whole foreground process group, which would
+# otherwise stop the queue backend before the worker finishes its warm
+# shutdown. With SIGINT ignored, cleanup's TERM is the single controlled
+# stop signal for every background child, so the documented stop order is
+# actually enforced.
 # ---------------------------------------------------------------------------
 
 register_background_pid() {
@@ -404,6 +411,10 @@ stop_background_processes() {
                 kill -9 "$pid" >/dev/null 2>&1 || true
             fi
         fi
+
+        # Reap the child so bash does not print job-status notices for
+        # signal-terminated background jobs (e.g. "... Terminated: 15 ...").
+        wait "$pid" 2>/dev/null || true
     done
 
     BACKGROUND_PIDS=()
@@ -424,11 +435,15 @@ require_supabase_configuration() {
         die "OPENORC_SUPABASE_PROJECT_REF is required for ephemeral Supabase."
     fi
 
-    # Defense against future configuration accidents.
+    # The branch PARENT project may legitimately be the hosted production
+    # project (that is how Supabase preview branching works); only branch
+    # resolution touches the parent, and that case is warned about (same
+    # semantics as scripts/supabase-apply-migrations.sh). Migrations are
+    # always written to the branch database itself, never to the parent.
     if [ -n "$SUPABASE_PRODUCTION_PROJECT_REF" ] \
-        && [ "$SUPABASE_PARENT_PROJECT_REF" != "$SUPABASE_PRODUCTION_PROJECT_REF" ]; then
-        warn "Configured parent project differs from production project ref."
-        warn "Verify that this is intentional."
+        && [ "$SUPABASE_PARENT_PROJECT_REF" = "$SUPABASE_PRODUCTION_PROJECT_REF" ]; then
+        warn "Branch parent project equals the configured production project ref."
+        warn "Expected when preview branches are hosted on the production project; writes still target only the branch database."
     fi
 }
 
@@ -1032,6 +1047,7 @@ ensure_local_valkey() {
     log "Queue backend logs: $VALKEY_LOG_PATH"
 
     (
+        trap '' INT
         exec redis-server \
             --port "$valkey_port" \
             --bind 127.0.0.1 \
@@ -1146,6 +1162,7 @@ start_ngrok_background() {
     log "ngrok logs: $NGROK_LOG_PATH"
 
     (
+        trap '' INT
         exec ngrok http \
             --url="$ngrok_url" \
             "$api_port" \
@@ -1172,6 +1189,7 @@ start_api_background() {
     log "Starting OpenOrc API in background (127.0.0.1:$api_port)..."
 
     (
+        trap '' INT
         export OPENORC_ENV="${OPENORC_ENV:-development}"
         export OPENORC_API_PORT="$api_port"
         exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/apps/api/main.py"
@@ -1193,6 +1211,7 @@ start_worker_background() {
     log "Starting OpenOrc worker in background..."
 
     (
+        trap '' INT
         export OPENORC_ENV="${OPENORC_ENV:-development}"
         exec "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/apps/worker/main.py"
     ) &

@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -143,10 +145,30 @@ raise SystemExit(0)
 '''
 
 _NPM_STUB = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, signal, sys, time
 
-with open(os.environ["DEVSERVER_STUB_LOG"], "a", encoding="utf-8") as log:
-    log.write(json.dumps({"tool": "npm", "argv": sys.argv[1:]}) + "\\n")
+def record(argv):
+    with open(os.environ["DEVSERVER_STUB_LOG"], "a", encoding="utf-8") as log:
+        log.write(json.dumps({"tool": "npm", "argv": argv}) + "\\n")
+
+record(sys.argv[1:])
+
+if os.environ.get("NPM_STUB_STAY") != "1":
+    raise SystemExit(0)
+
+# The app is the FOREGROUND service: it intentionally keeps SIGINT enabled so
+# a terminal Ctrl-C stops it directly; devserver cleanup stops everything else.
+def int_handler(signum, frame):
+    record(["--signal", "INT"])
+    raise SystemExit(0)
+
+def term_handler(signum, frame):
+    record(["--signal", "TERM"])
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, int_handler)
+signal.signal(signal.SIGTERM, term_handler)
+time.sleep(120)
 """
 
 _BREW_STUB = """#!/usr/bin/env python3
@@ -348,13 +370,10 @@ def devserver_harness(tmp_path: Path) -> Any:
 
     log_path = tmp_path / "stub-log.jsonl"
 
-    def run(
-        *args: str,
+    def make_env(
         env: dict[str, str] | None = None,
         env_file: dict[str, str] | None = None,
-        timeout: float = 60.0,
-        cwd: Path | None = None,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> dict[str, str]:
         full_env = {
             key: value
             for key, value in os.environ.items()
@@ -373,17 +392,28 @@ def devserver_harness(tmp_path: Path) -> Any:
                 encoding="utf-8",
             )
 
+        return full_env
+
+    def run(
+        *args: str,
+        env: dict[str, str] | None = None,
+        env_file: dict[str, str] | None = None,
+        timeout: float = 60.0,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(repo / "scripts" / "devserver.sh"), *args],
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=full_env,
+            env=make_env(env, env_file),
             check=False,
             cwd=str(cwd) if cwd is not None else None,
         )
 
-    return SimpleNamespace(run=run, repo=repo, log_path=log_path, tmp_path=tmp_path)
+    return SimpleNamespace(
+        run=run, make_env=make_env, repo=repo, log_path=log_path, tmp_path=tmp_path
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -902,3 +932,119 @@ def test_runs_from_scripts_working_directory_with_env_file(
     create_call = calls_of(read_calls(devserver_harness.log_path), "supabase")[1]
     assert create_call[:2] == ["branches", "create"]
     assert create_call[-1] == REF_PARENT
+
+
+# ---------------------------------------------------------------------------
+# Terminal interrupt (Ctrl-C) signal hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_group_interrupt_stops_children_via_cleanup_only(
+    devserver_harness: Any,
+) -> None:
+    """A terminal-style Ctrl-C (SIGINT to the whole foreground process group)
+    must stop background children only through the devserver's ordered
+    cleanup: background children ignore SIGINT, survive the group interrupt,
+    and are reaped via cleanup's TERM in dependency order (worker/API before
+    the owned queue backend, branch deleted last)."""
+    valkey_dir_baseline = owned_valkey_temp_dirs()
+
+    full_env = devserver_harness.make_env(
+        env=supabase_env(
+            PY_STUB_STAY="1",
+            NPM_STUB_STAY="1",
+            REDIS_STUB_PING_FAIL_FIRST_N="1",
+        ),
+    )
+
+    process = subprocess.Popen(
+        ["bash", str(devserver_harness.repo / "scripts" / "devserver.sh")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=full_env,
+        start_new_session=True,
+    )
+
+    try:
+        # Wait until every surface is up: the app foreground (npm) spawns
+        # after the queue backend, API, and worker.
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if any(call["tool"] == "npm" for call in read_calls(devserver_harness.log_path)):
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail("devserver stack did not reach the app foreground")
+        time.sleep(0.5)
+
+        # Simulate a terminal Ctrl-C: SIGINT to the whole process group.
+        os.killpg(process.pid, signal.SIGINT)
+    finally:
+        stdout, stderr = process.communicate(timeout=60)
+
+    # The interrupted foreground wait yields 130.
+    assert process.returncode == 130, stderr
+
+    calls = read_calls(devserver_harness.log_path)
+
+    # The foreground service received the interrupt directly.
+    assert ["--signal", "INT"] in calls_of(calls, "npm")
+
+    # Background children survived the group interrupt and were stopped by
+    # cleanup's TERM (a child killed directly by INT could not record TERM).
+    python_term_indices = [
+        index
+        for index, call in enumerate(calls)
+        if call["tool"] == "python" and call["argv"] == ["--signal", "TERM"]
+    ]
+    assert len(python_term_indices) == 2
+
+    redis_term_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call["tool"] == "redis-server" and call["argv"] == ["--signal", "TERM"]
+    )
+    assert max(python_term_indices) < redis_term_index
+
+    delete_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call["tool"] == "supabase" and call["argv"][:2] == ["branches", "delete"]
+    )
+    assert delete_index == len(calls) - 1
+    assert delete_index > redis_term_index
+
+    assert owned_valkey_temp_dirs() == valkey_dir_baseline
+    assert calls_of(calls, "brew") == []
+
+
+# ---------------------------------------------------------------------------
+# Parent/production warning alignment (mirrors the migration tooling)
+# ---------------------------------------------------------------------------
+
+
+def test_devserver_warns_when_parent_equals_production(
+    devserver_harness: Any,
+) -> None:
+    # Same semantics as scripts/supabase-apply-migrations.sh: preview branches
+    # hosted on the production project are the expected setup, surfaced as a
+    # warning (not an error) because writes always target the branch database.
+    result = devserver_harness.run(
+        "--api-only",
+        env=supabase_env(OPENORC_SUPABASE_PRODUCTION_PROJECT_REF=REF_PARENT),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Branch parent project equals the configured production project ref." in result.stderr
+    assert "writes still target only the branch database" in result.stderr
+
+
+def test_no_parent_warning_when_parent_differs_from_production(
+    devserver_harness: Any,
+) -> None:
+    result = devserver_harness.run("--api-only", env=supabase_env())
+
+    assert result.returncode == 0, result.stderr
+    assert "equals the configured production project ref" not in result.stderr
+    assert "differs from production project ref" not in result.stderr
