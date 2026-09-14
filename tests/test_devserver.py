@@ -353,6 +353,7 @@ def devserver_harness(tmp_path: Path) -> Any:
         env: dict[str, str] | None = None,
         env_file: dict[str, str] | None = None,
         timeout: float = 60.0,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         full_env = {
             key: value
@@ -379,6 +380,7 @@ def devserver_harness(tmp_path: Path) -> Any:
             timeout=timeout,
             env=full_env,
             check=False,
+            cwd=str(cwd) if cwd is not None else None,
         )
 
     return SimpleNamespace(run=run, repo=repo, log_path=log_path, tmp_path=tmp_path)
@@ -806,3 +808,97 @@ def test_api_only_foreground_mode(devserver_harness: Any) -> None:
     assert len(python_calls) == 1
     assert python_calls[0][0].endswith(".venv/bin/python")
     assert python_calls[0][1].endswith("apps/api/main.py")
+
+
+# ---------------------------------------------------------------------------
+# Environment file resolution
+#
+# Supabase project identity is resolved AFTER `.env` loading, so refs may be
+# supplied via `.env` alone; exported variables always win.
+# ---------------------------------------------------------------------------
+
+
+def test_env_file_supplies_parent_ref_and_production_guard(
+    devserver_harness: Any,
+) -> None:
+    # No exported OPENORC_/SUPABASE_ configuration: everything comes from .env.
+    # (An exported EMPTY value would legitimately suppress the .env value, so
+    # the keys are omitted entirely; ambient configuration is stripped by the
+    # harness.)
+    result = devserver_harness.run(
+        "--api-only",
+        env={
+            "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS": "2",
+            "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS": "0",
+            "SUPABASE_STUB_BRANCH_API_URL": BRANCH_API_URL,
+            "SUPABASE_STUB_BRANCH_POOLER_URL": BRANCH_DB_URL,
+            "SUPABASE_STUB_PUBLISHABLE_KEY": PUBLISHABLE_KEY,
+            "SUPABASE_STUB_DEFAULT_KEY": DEFAULT_SECRET_KEY,
+        },
+        env_file={
+            "OPENORC_SUPABASE_PROJECT_REF": REF_PARENT,
+            "OPENORC_SUPABASE_PRODUCTION_PROJECT_REF": REF_PRODUCTION,
+            "SUPABASE_ACCESS_TOKEN": "token-from-env-file",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = read_calls(devserver_harness.log_path)
+
+    create_call = calls_of(calls, "supabase")[1]
+    assert create_call[:2] == ["branches", "create"]
+    assert create_call[-1] == REF_PARENT
+
+    apply_calls = [call for call in calls if call["tool"] == "apply-migrations"]
+    assert apply_calls[0]["env"]["OPENORC_SUPABASE_PROJECT_REF"] == REF_PARENT
+
+
+def test_exported_parent_ref_wins_over_env_file(devserver_harness: Any) -> None:
+    result = devserver_harness.run(
+        "--api-only",
+        env={
+            "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS": "2",
+            "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS": "0",
+            "SUPABASE_STUB_BRANCH_API_URL": BRANCH_API_URL,
+            "SUPABASE_STUB_BRANCH_POOLER_URL": BRANCH_DB_URL,
+            "SUPABASE_STUB_PUBLISHABLE_KEY": PUBLISHABLE_KEY,
+            "SUPABASE_STUB_DEFAULT_KEY": DEFAULT_SECRET_KEY,
+            "OPENORC_SUPABASE_PROJECT_REF": REF_PARENT,
+        },
+        env_file={
+            # A deliberately different (would-be-refused) ref in .env must
+            # never override the exported value.
+            "OPENORC_SUPABASE_PROJECT_REF": REF_PRODUCTION,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    create_call = calls_of(read_calls(devserver_harness.log_path), "supabase")[1]
+    assert create_call[:2] == ["branches", "create"]
+    assert create_call[-1] == REF_PARENT
+
+
+def test_runs_from_scripts_working_directory_with_env_file(
+    devserver_harness: Any,
+) -> None:
+    # Regression: invoking the script from inside scripts/ (cwd != repo root)
+    # must still resolve ROOT_DIR and load the repo-root .env.
+    result = devserver_harness.run(
+        "--api-only",
+        env={
+            "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS": "2",
+            "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS": "0",
+            "SUPABASE_STUB_BRANCH_API_URL": BRANCH_API_URL,
+            "SUPABASE_STUB_BRANCH_POOLER_URL": BRANCH_DB_URL,
+            "SUPABASE_STUB_PUBLISHABLE_KEY": PUBLISHABLE_KEY,
+            "SUPABASE_STUB_DEFAULT_KEY": DEFAULT_SECRET_KEY,
+        },
+        env_file={"OPENORC_SUPABASE_PROJECT_REF": REF_PARENT},
+        cwd=devserver_harness.repo / "scripts",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Loading environment file" in result.stdout
+    create_call = calls_of(read_calls(devserver_harness.log_path), "supabase")[1]
+    assert create_call[:2] == ["branches", "create"]
+    assert create_call[-1] == REF_PARENT

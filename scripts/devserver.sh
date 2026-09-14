@@ -126,13 +126,6 @@ VALKEY_LOG_PATH="/tmp/openorc-redis-$$.log"
 
 NGROK_LOG_PATH="/tmp/openorc-ngrok.log"
 
-# Bounded wait for a freshly created branch to become genuinely usable
-# (credentials published AND a database that answers). The timing constants
-# are overridable for deterministic tests; the defaults are the supported
-# developer values and are not part of the .env contract.
-SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS="${OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS:-60}"
-SUPABASE_BRANCH_WAIT_SLEEP_SECONDS="${OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS:-5}"
-
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -147,20 +140,8 @@ VALKEY_TMP_DIR_CREATED=false
 SUPABASE_BRANCH_CREATED=false
 SUPABASE_BRANCH_NAME=""
 
-# Parent hosted project ("OpenOrc Cloud").
-#
-# Supplied by local environment/configuration. Do NOT hardcode the real
-# production project ref into this script.
-SUPABASE_PARENT_PROJECT_REF="${OPENORC_SUPABASE_PROJECT_REF:-}"
-
-# Safety guard.
-#
-# The branch PARENT project may legitimately be the hosted production project
-# (that is how Supabase preview branching works); only branch resolution
-# touches the parent. The production project itself is never a development
-# target: the stack only ever consumes credentials of the branch created by
-# this invocation, and the migration tooling re-verifies that identity.
-SUPABASE_PRODUCTION_PROJECT_REF="${OPENORC_SUPABASE_PRODUCTION_PROJECT_REF:-}"
+# Parent hosted project ("OpenOrc Cloud") and the production safety guard
+# are resolved after `.env` loading (see Configuration resolution below).
 
 # Branch credentials fetched from `supabase branches get -o env`.
 BRANCH_ENV_API_URL=""
@@ -250,6 +231,39 @@ load_env_file() {
 }
 
 load_env_file
+
+
+# ---------------------------------------------------------------------------
+# Configuration resolution
+#
+# Resolved AFTER `.env` loading so values supplied via `.env` apply no matter
+# where the script is invoked from (the repo root is derived from
+# BASH_SOURCE, so the working directory never matters here). Variables
+# already exported in the calling shell always win: load_env_file never
+# overwrites an exported variable.
+# ---------------------------------------------------------------------------
+
+# Parent hosted project ("OpenOrc Cloud").
+#
+# Supplied by local environment/configuration. Do NOT hardcode the real
+# production project ref into this script.
+SUPABASE_PARENT_PROJECT_REF="${OPENORC_SUPABASE_PROJECT_REF:-}"
+
+# Safety guard.
+#
+# The branch PARENT project may legitimately be the hosted production project
+# (that is how Supabase preview branching works); only branch resolution
+# touches the parent. The production project itself is never a development
+# target: the stack only ever consumes credentials of the branch created by
+# this invocation, and the migration tooling re-verifies that identity.
+SUPABASE_PRODUCTION_PROJECT_REF="${OPENORC_SUPABASE_PRODUCTION_PROJECT_REF:-}"
+
+# Bounded wait for a freshly created branch to become genuinely usable
+# (credentials published AND a database that answers). The timing constants
+# are overridable for deterministic tests; the defaults are the supported
+# developer values and are not part of the .env contract.
+SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS="${OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS:-60}"
+SUPABASE_BRANCH_WAIT_SLEEP_SECONDS="${OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS:-5}"
 
 
 # ---------------------------------------------------------------------------
