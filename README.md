@@ -46,6 +46,36 @@ docs/                      design/bootstrap/reference documentation
 
 API routers and worker jobs remain thin transports over shared services. Workflow meaning belongs in domain/services code. Adapters own external mechanics, not product authority. Durable workflow state belongs in Postgres, not queues or agent transcripts.
 
+## Local development (Python)
+
+The Python control plane targets Python 3.13. The repository commits a portable toolchain contract that developer workstations, agent runtimes, CI, and hosted deployment environments consume identically; only environment bootstrap differs:
+
+- `pyproject.toml` — direct dependencies (exact-pinned) and tool configuration
+- `uv.lock` — the committed, solver-resolved transitive dependency graph
+- `.python-version` — the exact default interpreter version
+- uv itself is version-pinned through `[tool.uv] required-version`; environments running lock or build operations must use that uv version
+
+### One-time setup
+
+```bash
+# Install the uv version pinned by the repository (see [tool.uv] required-version).
+uv --version   # must satisfy the repository requirement
+uv sync        # creates or updates the local .venv from uv.lock (dev group included)
+```
+
+### Canonical commands
+
+```bash
+.venv/bin/python -m pytest                 # tests
+.venv/bin/python -m ruff check .           # lint
+.venv/bin/python -m ruff format --check .  # format check
+.venv/bin/pyright                          # static type checks
+.venv/bin/python apps/api/main.py          # API process (GET /healthz)
+.venv/bin/python apps/worker/main.py       # RQ worker process
+```
+
+uv is the dependency/build tool, not a runtime dependency: environments that receive a prepared environment run the same entrypoints with their own interpreter (`python apps/api/main.py`). API and worker configuration comes from environment variables (see `.env.example`); neither process requires persistent local filesystem state.
+
 ## Agent context
 
 Repository implementation guidance is carried by the root `AGENTS.md` plus nested `AGENTS.md` files at architectural boundaries. Agents working across boundaries must read every applicable local guide before editing.
