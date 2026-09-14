@@ -76,6 +76,39 @@ uv sync        # creates or updates the local .venv from uv.lock (dev group incl
 
 uv is the dependency/build tool, not a runtime dependency: environments that receive a prepared environment run the same entrypoints with their own interpreter (`python apps/api/main.py`). API and worker configuration comes from environment variables (see `.env.example`); neither process requires persistent local filesystem state.
 
+## Local development (frontend)
+
+`apps/app` is the product SPA (Vue 3 + Vite + TypeScript) and targets Node 24. Its toolchain contract mirrors the Python one:
+
+- `apps/app/package.json` — direct dependencies (exact-pinned), scripts, and toolchain declarations
+- `apps/app/package-lock.json` — the committed, resolved transitive dependency graph
+- `apps/app/.node-version` — the exact Node 24 development/default patch
+- npm-native `devEngines` enforces the supported Node 24 line and the exact npm version before `install`, `ci`, and `run` commands; `"packageManager"` is ecosystem metadata only
+- `apps/app/.npmrc` pins `save-exact=true` so dependencies stay exact-pinned
+
+### One-time setup
+
+```bash
+# Use the Node 24 patch from apps/app/.node-version (for example via nvm).
+node --version   # must satisfy apps/app/package.json engines/devEngines
+cd apps/app
+npm ci           # installs exactly from package-lock.json
+```
+
+### Canonical commands
+
+```bash
+cd apps/app
+npm run dev        # development server
+npm run build      # type-check + production build (dist/)
+npm run typecheck  # vue-tsc strict type checks
+npm test           # Vitest
+```
+
+### API base configuration
+
+The SPA never assumes it is served by the API process or that API calls are same-origin. The API base URL is externalized through `VITE_API_BASE_URL` (see `apps/app/.env.example`); an unset or invalid value fails closed when the application needs the API base URL rather than silently falling back to same-origin behavior.
+
 ## Agent context
 
 Repository implementation guidance is carried by the root `AGENTS.md` plus nested `AGENTS.md` files at architectural boundaries. Agents working across boundaries must read every applicable local guide before editing.
