@@ -169,10 +169,11 @@ baseline entry to make a mismatch disappear.
 5. Deployment to production happens through `openorc/cloud`'s supported
    deployment path after merge — never first, never from this repository.
 
-`scripts/devserver.sh` (issue #10) will create ephemeral preview branches,
-invoke this tooling, export branch credentials for the local stack, and
-delete the branch on exit. Branch creation/deletion is not this script's
-job.
+`scripts/devserver.sh` creates ephemeral preview branches for the manual
+local E2E stack, waits for genuine branch readiness, exports branch
+credentials to the local stack process tree, invokes this tooling to apply
+current-checkout migrations, and deletes the branch on exit. Branch
+creation/deletion is not this script's job.
 
 `supabase/seed.sql` is reserved for future representative non-production
 seed data. The tooling skips seeding while the file is absent; do not invent
@@ -183,7 +184,7 @@ product seed data to prove tooling works.
 The automated tests exercise the tooling against a stub CLI and never touch
 live infrastructure. The full lifecycle below requires a real parent project
 and access token; it is the Owner's manual verification step and is fully
-exercised by `scripts/devserver.sh` E2E once issue #10 lands:
+exercised by `scripts/devserver.sh` E2E:
 
 1. `supabase login` (or export `SUPABASE_ACCESS_TOKEN`).
 2. Export `OPENORC_SUPABASE_PROJECT_REF` and
