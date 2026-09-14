@@ -28,6 +28,15 @@ Supabase persistence/auth integration and the official v1 Cline adapter belong i
 - Use supported official external abstractions when they satisfy the contract; do not casually reimplement provider/runtime internals.
 - Authentication ownership follows direct consumption. OpenOrc is not a universal vault for runtime-owned provider, MCP, Git, tool, or account credentials.
 
+## Dependency policy
+
+- Do not choose dependency or tool versions from model memory.
+- When adding or upgrading a dependency or development tool, determine the latest stable release from its authoritative package registry or upstream release source at implementation time.
+- Verify compatibility with OpenOrc's pinned runtime/toolchain versions and all supported target environments.
+- Pin the selected direct dependency/tool version using the repository's established dependency and lockfile conventions.
+- Transitive dependencies must be captured by the repository lock convention; do not rely on floating environment resolution.
+- Avoid prerelease, nightly, RC, beta, or development versions unless the task explicitly requires one.
+
 ## Cross-cutting workflow invariants
 
 - One GitHub issue has at most one current/non-archived OpenOrc Task.
