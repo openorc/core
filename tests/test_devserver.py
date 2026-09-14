@@ -22,13 +22,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from openorc.devtools import devserver as devserver_module
 from openorc.devtools.devserver import (
     DEFAULT_VALKEY_URL,
     NGROK_LOG_PATH,
@@ -103,6 +103,7 @@ class FakeChild:
     exit_code: int = 0
     die_on_signals: int = 1
     dead: bool = False
+    fail_wait: bool = False
     signals: list[int] = field(default_factory=list)
     waited: bool = False
     wait_timeout: float | None = None
@@ -119,6 +120,8 @@ class FakeChild:
         return None
 
     def wait(self, timeout: float | None = None) -> int:
+        if self.fail_wait:
+            raise RuntimeError(f"simulated reap failure for {self.label}")
         self.waited = True
         self.wait_timeout = timeout
         self.events.append(("wait", self.label, "wait"))
@@ -319,6 +322,7 @@ def make_harness(
     queue_respond_after_pings: int | None = 2,
     foreground_exit_after_polls: int | None = 3,
     foreground_exit_code: int = 0,
+    command_resolver: Callable[[str], str | None] | None = None,
 ) -> Harness:
     repo_root = root if root is not None else tmp_path / "repo"
     (repo_root / "supabase").mkdir(parents=True)
@@ -381,6 +385,9 @@ def make_harness(
         queue_factory_urls.append(url)
         return queue
 
+    def default_command_resolver(name: str) -> str | None:
+        return f"/fake/bin/{name}"
+
     devserver = Devserver(
         config=run_config,
         root=repo_root,
@@ -391,6 +398,9 @@ def make_harness(
         sleep=lambda seconds: None,
         tmp_root=tmp_path / "tmp",
         stop_term_timeout_seconds=0.3,
+        command_resolver=(
+            command_resolver if command_resolver is not None else default_command_resolver
+        ),
     )
     return Harness(
         devserver=devserver,
@@ -1079,8 +1089,7 @@ def test_app_only_runs_npm_in_app_directory_only(tmp_path: Path) -> None:
     assert harness.queue.flushes == 0
 
 
-def test_ngrok_started_when_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(devserver_module.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+def test_ngrok_started_when_configured(tmp_path: Path) -> None:
     harness = make_harness(
         tmp_path,
         config=parse_args(["--api-only"]),
@@ -1296,3 +1305,130 @@ def test_real_child_ignoring_sigterm_is_killed(tmp_path: Path) -> None:
     # The child ignored TERM, so only the KILL escalation could end it.
     assert child.poll() is not None
     assert any("forcing" in message for message in log.messages_of("warn"))
+
+
+# ---------------------------------------------------------------------------
+# Regression: owned queue backend is recorded immediately after spawn
+#
+# Startup failure after branch creation must still invoke cleanup: if the
+# ownership guard or readiness wait fails while the spawned child is alive,
+# the canonical cleanup path must stop/reap it, remove its temp dir, and
+# still delete the invocation-created Supabase branch.
+# ---------------------------------------------------------------------------
+
+
+def test_readiness_failure_stops_owned_redis_removes_temp_dir_and_deletes_branch(
+    tmp_path: Path,
+) -> None:
+    # The queue backend never becomes ready; the spawned child stays alive.
+    harness = make_harness(tmp_path, queue_responding=False, queue_respond_after_pings=None)
+    tmp_dir = tmp_path / "tmp" / f"openorc-redis-{os.getpid()}"
+
+    assert harness.devserver.run() == 1
+
+    errors = harness.log.messages_of("error")
+    assert any("did not become ready" in message for message in errors)
+    assert any(call.label == "queue-backend" for call in harness.runner.spawn_calls)
+
+    # The owned child was recorded before readiness failed, so cleanup
+    # stopped and reaped it (safe even though it never became ready).
+    assert ("signal", "queue-backend", signal.SIGTERM) in harness.events
+    assert ("wait", "queue-backend", "wait") in harness.events
+    assert not tmp_dir.exists()
+
+    # The branch created before the failure is still deleted.
+    assert len(harness.runner.delete_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: cleanup stages are best-effort and deletion is always last
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_stage_failure_does_not_block_branch_deletion(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path)
+    # Poison one application child (per-child resilience inside stage 1) and
+    # the owned queue-backend child (stage-level guard around stage 2).
+    harness.runner.spawn_children["worker"] = FakeChild(
+        label="worker", pid=4242, events=harness.events, fail_wait=True
+    )
+    harness.runner.spawn_children["queue-backend"] = FakeChild(
+        label="queue-backend", pid=4243, events=harness.events, fail_wait=True
+    )
+    tmp_dir = tmp_path / "tmp" / f"openorc-redis-{os.getpid()}"
+
+    assert harness.devserver.run() == 0
+
+    warnings = harness.log.messages_of("warn")
+    assert any("Failed to stop worker" in message for message in warnings)
+    assert any(
+        "Cleanup stage 'owned queue-backend shutdown' failed" in message for message in warnings
+    )
+
+    # Later cleanup stages still ran where safe.
+    assert ("signal", "api", signal.SIGTERM) in harness.events
+    assert ("signal", "queue-backend", signal.SIGTERM) in harness.events
+    assert not tmp_dir.exists()
+
+    # Supabase deletion was attempted exactly once and remains the last
+    # action; the cleanup failure did not mask the run result.
+    assert len(harness.runner.delete_calls) == 1
+    delete_events = [event for event in harness.events if "branches delete" in event[1]]
+    assert harness.events.index(delete_events[0]) == len(harness.events) - 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: command resolution is injected (no host-tool dependencies)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_supabase_cli_fails_closed(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        command_resolver=lambda name: None if name == "supabase" else f"/fake/bin/{name}",
+    )
+    assert harness.devserver.run() == 1
+    assert any(
+        "Required command not found on PATH: supabase" in message
+        for message in harness.log.messages_of("error")
+    )
+    assert harness.runner.create_calls == []
+
+
+def test_missing_npm_fails_closed_when_app_included(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        command_resolver=lambda name: None if name == "npm" else f"/fake/bin/{name}",
+    )
+    assert harness.devserver.run() == 1
+    assert any(
+        "Required command not found on PATH: npm" in message
+        for message in harness.log.messages_of("error")
+    )
+    assert harness.runner.create_calls == []
+
+
+def test_missing_redis_server_fails_closed(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        command_resolver=(lambda name: None if name == "redis-server" else f"/fake/bin/{name}"),
+    )
+    assert harness.devserver.run() == 1
+    errors = harness.log.messages_of("error")
+    assert any("redis-server is not on PATH" in message for message in errors)
+    # The binary check precedes any spawn attempt.
+    assert not [call for call in harness.runner.spawn_calls if call.label == "queue-backend"]
+    # The branch created before the failure is still deleted.
+    assert len(harness.runner.delete_calls) == 1
+
+
+def test_ngrok_binary_missing_warns_and_skips(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(["--api-only"]),
+        env={"NGROK_RESERVED_URL": "https://openorc-test.ngrok.app"},
+        command_resolver=lambda name: None if name == "ngrok" else f"/fake/bin/{name}",
+    )
+    assert harness.devserver.run() == 0
+    assert not [call for call in harness.runner.spawn_calls if call.label == "ngrok"]
+    assert any("ngrok not found on PATH" in message for message in harness.log.messages_of("warn"))

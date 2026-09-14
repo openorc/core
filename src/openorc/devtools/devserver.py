@@ -190,6 +190,13 @@ class ProcessRunner(Protocol):
     ) -> ChildProcess: ...
 
 
+# Resolves a command name to an executable path (or None). Real execution
+# uses shutil.which; deterministic tests inject a fake so the suite never
+# depends on host-installed developer tools (supabase, npm, redis-server,
+# ngrok).
+CommandResolver = Callable[[str], str | None]
+
+
 # ---------------------------------------------------------------------------
 # Redaction and URL helpers
 #
@@ -977,13 +984,17 @@ class ProcessSupervisor:
         before the queue backend is ever touched.
         """
         for managed in reversed(self._managed):
-            stop_child(
-                self._log,
-                managed.label,
-                managed.child,
-                sleep=self._sleep,
-                term_timeout_seconds=self._stop_term_timeout_seconds,
-            )
+            try:
+                stop_child(
+                    self._log,
+                    managed.label,
+                    managed.child,
+                    sleep=self._sleep,
+                    term_timeout_seconds=self._stop_term_timeout_seconds,
+                )
+            except Exception as error:
+                # One stuck child must not block stopping the remaining ones.
+                self._log.warn(f"Failed to stop {managed.label} (PID {managed.child.pid}): {error}")
         self._managed.clear()
 
 
@@ -1022,6 +1033,7 @@ class ValkeyManager:
         sleep: Callable[[float], None],
         queue_client_factory: Callable[[str], QueueClient],
         tmp_root: Path,
+        command_resolver: CommandResolver = shutil.which,
     ) -> None:
         self._url = url
         self._runner = runner
@@ -1029,6 +1041,7 @@ class ValkeyManager:
         self._sleep = sleep
         self._queue_client_factory = queue_client_factory
         self._tmp_root = tmp_root
+        self._command_resolver = command_resolver
         self._owned_child: ChildProcess | None = None
         self._owned_tmp_dir: Path | None = None
 
@@ -1062,7 +1075,7 @@ class ValkeyManager:
         self._start_owned()
 
     def _start_owned(self) -> None:
-        if shutil.which("redis-server") is None:
+        if self._command_resolver("redis-server") is None:
             raise DevserverError(
                 f"No queue backend is responding at {self._url} and redis-server is not on "
                 "PATH. Start a local Redis-compatible server or point VALKEY_URL at a "
@@ -1102,6 +1115,12 @@ class ValkeyManager:
             ],
             log_path=log_path,
         )
+        # Record ownership immediately: if the ownership guard or the
+        # readiness wait fails while the child is still alive, the canonical
+        # cleanup path must still stop/reap this child and remove this temp
+        # dir (startup failure after branch creation still invokes cleanup).
+        self._owned_child = child
+        self._owned_tmp_dir = tmp_dir
 
         # Ownership sanity guard: if a foreign server grabbed the port during
         # startup, our instance exits (bind conflict) within milliseconds
@@ -1118,8 +1137,6 @@ class ValkeyManager:
 
         for _ in range(VALKEY_READY_ATTEMPTS):
             if self._responding():
-                self._owned_child = child
-                self._owned_tmp_dir = tmp_dir
                 self._log.log(
                     f"Queue backend started (devserver-owned PID {child.pid}; "
                     "stopped automatically on exit)"
@@ -1201,6 +1218,7 @@ class Devserver:
         sleep: Callable[[float], None] = time.sleep,
         tmp_root: Path | None = None,
         stop_term_timeout_seconds: float = STOP_TERM_TIMEOUT_SECONDS,
+        command_resolver: CommandResolver | None = None,
     ) -> None:
         self._config = config
         self._root = root
@@ -1214,6 +1232,9 @@ class Devserver:
         )
         self._sleep = sleep
         self._tmp_root = tmp_root if tmp_root is not None else Path(tempfile.gettempdir())
+        self._command_resolver: CommandResolver = (
+            command_resolver if command_resolver is not None else shutil.which
+        )
         self._supervisor = ProcessSupervisor(
             self._log, sleep=self._sleep, stop_term_timeout_seconds=stop_term_timeout_seconds
         )
@@ -1291,22 +1312,44 @@ class Devserver:
         self._check_shutdown()
 
     def _cleanup_once(self) -> None:
-        """The single, idempotent cleanup path (see module ordering notes)."""
+        """The single, idempotent cleanup path (see module ordering notes).
+
+        Stages are best-effort: a failure in one stage is logged and must
+        never short-circuit later stages, so the invocation-owned Supabase
+        branch deletion is always attempted last and no cleanup error masks
+        the original run result.
+        """
         if self._cleanup_done:
             return
         self._cleanup_done = True
         self._ignore_signals_for_cleanup()
         try:
-            self._supervisor.stop_all_reverse()
-            if self._valkey is not None:
-                self._valkey.stop_owned()
-                self._valkey.remove_temp_dir()
-            if self._supabase is not None:
-                self._supabase.delete_branch_if_created(keep=self._config.keep_supabase)
-        except Exception as cleanup_error:  # cleanup must never mask the run result
-            self._log.warn(f"Cleanup encountered an error: {cleanup_error}")
+            self._attempt_cleanup_stage(
+                "application-child shutdown", self._supervisor.stop_all_reverse
+            )
+            valkey = self._valkey
+            if valkey is not None:
+                self._attempt_cleanup_stage("owned queue-backend shutdown", valkey.stop_owned)
+                self._attempt_cleanup_stage("queue temp cleanup", valkey.remove_temp_dir)
+            supabase = self._supabase
+            if supabase is not None:
+                keep = self._config.keep_supabase
+
+                def delete_branch() -> None:
+                    supabase.delete_branch_if_created(keep=keep)
+
+                # Always attempted last; deletion failure is reported by the
+                # manager as a loud warning identifying the branch.
+                self._attempt_cleanup_stage("supabase branch deletion", delete_branch)
         finally:
             self._restore_signal_handlers()
+
+    def _attempt_cleanup_stage(self, stage: str, action: Callable[[], None]) -> None:
+        """Run one cleanup stage; log its failure without blocking later stages."""
+        try:
+            action()
+        except Exception as error:  # best-effort: keep reaching later stages
+            self._log.warn(f"Cleanup stage '{stage}' failed: {error}")
 
     # -- execution ---------------------------------------------------------
 
@@ -1328,9 +1371,9 @@ class Devserver:
 
     def _require_base_tools(self) -> None:
         config = self._config
-        if config.auto_supabase and shutil.which("supabase") is None:
+        if config.auto_supabase and self._command_resolver("supabase") is None:
             raise DevserverError("Required command not found on PATH: supabase")
-        if config.include_app and shutil.which("npm") is None:
+        if config.include_app and self._command_resolver("npm") is None:
             raise DevserverError("Required command not found on PATH: npm")
         if config.include_api or config.include_worker:
             python_path = self._root / ".venv" / "bin" / "python"
@@ -1386,6 +1429,7 @@ class Devserver:
             sleep=self._sleep,
             queue_client_factory=self._queue_client_factory,
             tmp_root=self._tmp_root,
+            command_resolver=self._command_resolver,
         )
         self._valkey = manager
         if not self._config.auto_valkey:
@@ -1442,7 +1486,7 @@ class Devserver:
         if not reserved_url:
             self._log.log("NGROK_RESERVED_URL not set; skipping ngrok startup.")
             return
-        if shutil.which("ngrok") is None:
+        if self._command_resolver("ngrok") is None:
             self._log.warn("ngrok not found on PATH; skipping tunnel startup.")
             return
         self._log.log(f"Starting ngrok tunnel for API: {reserved_url}")
