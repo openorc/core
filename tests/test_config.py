@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from openorc.config import ConfigurationError, Settings
+from openorc.config import (
+    API_HOST_VAR,
+    API_PORT_VAR,
+    API_RELOAD_VAR,
+    DEFAULT_API_HOST,
+    DEFAULT_API_PORT,
+    DEFAULT_ENVIRONMENT,
+    DEFAULT_VALKEY_URL,
+    ENVIRONMENT_VAR,
+    VALKEY_URL_VAR,
+    ConfigurationError,
+    Settings,
+)
 
 
 def test_defaults_when_environment_is_empty() -> None:
@@ -55,8 +67,30 @@ def test_invalid_reload_values_are_rejected(raw: str) -> None:
         Settings.from_env({"OPENORC_API_RELOAD": raw})
 
 
-def test_from_env_defaults_to_process_environment() -> None:
+def test_from_env_defaults_to_process_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Hermetic by construction: ambient OPENORC_*/VALKEY_URL values must not
+    # affect this test even though from_env() reads the real environment.
+    for name in (
+        ENVIRONMENT_VAR,
+        API_HOST_VAR,
+        API_PORT_VAR,
+        API_RELOAD_VAR,
+        VALKEY_URL_VAR,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     settings = Settings.from_env()
 
-    assert isinstance(settings.api_port, int)
-    assert isinstance(settings.valkey_url, str)
+    assert settings.environment == DEFAULT_ENVIRONMENT
+    assert settings.api_host == DEFAULT_API_HOST
+    assert settings.api_port == DEFAULT_API_PORT
+    assert settings.api_reload is False
+    assert settings.valkey_url == DEFAULT_VALKEY_URL
+
+
+@pytest.mark.parametrize("raw", ["http://127.0.0.1:1/0", "not-a-url"])
+def test_malformed_valkey_url_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="VALKEY_URL"):
+        Settings.from_env({"VALKEY_URL": raw})

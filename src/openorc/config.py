@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 ENVIRONMENT_VAR = "OPENORC_ENV"
 API_HOST_VAR = "OPENORC_API_HOST"
@@ -24,6 +25,11 @@ DEFAULT_VALKEY_URL = "redis://127.0.0.1:6379/0"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
+
+# Schemes accepted for the Redis-compatible queue backend, matching redis-py's
+# URL parser. Validating here keeps malformed backend configuration inside the
+# configuration error boundary instead of surfacing from deep client code.
+_VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
 
 
 class ConfigurationError(Exception):
@@ -82,10 +88,18 @@ class Settings:
                     f"{API_RELOAD_VAR} must be a boolean-like value, got {api_reload_raw!r}"
                 )
 
+        valkey_url = _read(source, VALKEY_URL_VAR) or DEFAULT_VALKEY_URL
+        scheme = urlparse(valkey_url).scheme.lower()
+        if scheme not in _VALKEY_URL_SCHEMES:
+            raise ConfigurationError(
+                f"{VALKEY_URL_VAR} must use one of the schemes "
+                f"{', '.join(sorted(_VALKEY_URL_SCHEMES))}; got scheme {scheme!r}"
+            )
+
         return cls(
             environment=_read(source, ENVIRONMENT_VAR) or DEFAULT_ENVIRONMENT,
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
             api_port=api_port,
             api_reload=api_reload,
-            valkey_url=_read(source, VALKEY_URL_VAR) or DEFAULT_VALKEY_URL,
+            valkey_url=valkey_url,
         )

@@ -53,16 +53,21 @@ def run_worker(
 ) -> None:
     """Connect to the configured backend and run the worker loop until stopped.
 
-    Connection failure fails fast with :class:`WorkerBootstrapError` so the
-    process never idles against an unreachable backend.
+    Connection failure or client-construction failure (including malformed
+    backend URLs that redis-py's parser rejects) fails fast with
+    :class:`WorkerBootstrapError` so the process never idles against an
+    unreachable or misconfigured backend.
     """
     make_client = client_factory if client_factory is not None else create_redis_client
     make_worker = worker_builder if worker_builder is not None else build_worker
 
-    redis_client = make_client(settings)
     try:
+        redis_client = make_client(settings)
         redis_client.ping()
-    except RedisError as exc:
+    except (RedisError, ValueError) as exc:
+        # ValueError covers redis-py's URL parser (unsupported schemes and
+        # invalid URL options) so malformed backend configuration fails with
+        # the same concise bootstrap error instead of a raw traceback.
         raise WorkerBootstrapError(
             "Cannot connect to the configured Redis-compatible queue backend."
         ) from exc
