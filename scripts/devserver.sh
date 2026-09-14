@@ -59,7 +59,10 @@
 # Things intentionally NOT finalized yet:
 # - final env-file layout
 # - final API/app ports
-# - RQ queue names / worker count
+# - devserver wiring for the defined queue names (openorc: prefix,
+#   canonical openorc:default) and the ownership-aware Redis lifecycle
+#   (start/stop only devserver-owned instances; recommended local
+#   namespace is Redis DB index 2)
 # - exact Valkey launch command
 # - exact Supabase CLI JSON parsing
 # - exact Supabase branch migration command
@@ -100,7 +103,11 @@ DELETE_SUPABASE_BRANCH_ON_EXIT=true
 DEFAULT_APP_PORT=8081
 DEFAULT_API_PORT=3000
 
-# Adjust when the actual OpenOrc queue backend is finalized.
+# OpenOrc queue naming is defined in src/openorc/workers/queues.py
+# (openorc: prefix; canonical default queue openorc:default). The effective
+# default here is unchanged until the devserver work switches the local
+# default to Redis DB index 2 together with ownership-aware Redis
+# startup/teardown (see .env.example for the recommended local value).
 DEFAULT_VALKEY_URL="redis://127.0.0.1:6379/0"
 
 NGROK_LOG_PATH="/tmp/openorc-ngrok.log"

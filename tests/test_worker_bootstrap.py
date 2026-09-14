@@ -20,14 +20,23 @@ from openorc.config import (
 from openorc.workers import bootstrap
 
 
-def test_build_worker_uses_stock_default_queue() -> None:
-    redis_client = redis.Redis()
+def test_build_worker_uses_the_canonical_default_queue() -> None:
+    redis_client = cast("redis.Redis", _FakeRedisClient())
 
     worker = bootstrap.build_worker(redis_client)
 
     assert isinstance(worker, rq.Worker)
-    assert [queue.name for queue in worker.queues] == ["default"]
+    assert [queue.name for queue in worker.queues] == ["openorc:default"]
     assert worker.connection is redis_client
+
+
+def test_build_worker_accepts_explicit_queue_names() -> None:
+    redis_client = cast("redis.Redis", _FakeRedisClient())
+
+    worker = bootstrap.build_worker(redis_client, queue_names=["openorc:dispatch"])
+
+    assert isinstance(worker, rq.Worker)
+    assert [queue.name for queue in worker.queues] == ["openorc:dispatch"]
 
 
 def test_run_worker_fails_fast_when_backend_ping_fails(
@@ -90,14 +99,36 @@ def test_run_worker_starts_worker_loop_once_connected(
 
 
 class _FakeRedisClient:
-    """Minimal Redis-compatible double for worker bootstrap tests."""
+    """Minimal Redis-compatible double for worker bootstrap tests.
+
+    Satisfies the redis-py calls RQ makes at Worker construction time (the
+    connection-pool socket-timeout handling and the CLIENT SETNAME/LIST
+    ip-address discovery) without any live server, so construction-level
+    wiring tests stay hermetic.
+    """
 
     def __init__(self, ping_error: Exception | None = None) -> None:
         self.ping_calls = 0
+        self.client_setname_calls: list[str] = []
         self._ping_error = ping_error
+        self.connection_pool = _FakeConnectionPool()
 
     def ping(self) -> bool:
         self.ping_calls += 1
         if self._ping_error is not None:
             raise self._ping_error
         return True
+
+    def client_setname(self, name: str) -> bool:
+        self.client_setname_calls.append(name)
+        return True
+
+    def client_list(self) -> list[dict[str, str]]:
+        return []
+
+
+class _FakeConnectionPool:
+    """Connection-pool double exposing the kwargs RQ's Worker init adjusts."""
+
+    def __init__(self) -> None:
+        self.connection_kwargs: dict[str, Any] = {}
