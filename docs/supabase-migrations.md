@@ -127,7 +127,7 @@ committed; exported variables win over `.env`):
 | --- | --- |
 | `OPENORC_SUPABASE_PROJECT_REF` | Parent project ref for `--branch` mode |
 | `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF` | Production identity guard (required for non-loopback `--db-url` targets) |
-| `SUPABASE_ACCESS_TOKEN` | CLI authentication for `--branch` mode |
+| `SUPABASE_ACCESS_TOKEN` | Optional; CLI authentication for `--branch` mode (stored `supabase login` credentials also work) |
 
 Generated branch credentials (database URLs, API keys) are consumed in-process
 by the tooling and are never printed, written to tracked files, or committed.

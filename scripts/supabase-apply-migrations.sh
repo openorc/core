@@ -27,7 +27,9 @@
 # Environment (contract documented in .env.example; .env at the repo root is
 # loaded first, exported variables win):
 #
-#   SUPABASE_ACCESS_TOKEN                    required for --branch mode
+#   SUPABASE_ACCESS_TOKEN                    optional; a stored `supabase
+#                                            login` also authenticates the
+#                                            CLI for --branch mode
 #   OPENORC_SUPABASE_PROJECT_REF             parent project for --branch mode
 #   OPENORC_SUPABASE_PRODUCTION_PROJECT_REF  production identity guard;
 #                                            required for non-loopback
@@ -350,8 +352,13 @@ require_branch_configuration() {
         die "OPENORC_SUPABASE_PROJECT_REF is required for --branch mode."
     fi
 
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        die "SUPABASE_ACCESS_TOKEN is required for --branch mode."
+    # Authentication is delegated to the Supabase CLI: an exported
+    # SUPABASE_ACCESS_TOKEN or stored `supabase login` credentials both work,
+    # and the CLI fails closed when neither is available. Probe once so that
+    # missing authentication fails fast instead of silently burning the whole
+    # bounded branch-credentials wait.
+    if ! supabase projects list >/dev/null 2>&1 </dev/null; then
+        die "Supabase authentication unavailable: run 'supabase login' or export SUPABASE_ACCESS_TOKEN."
     fi
 
     if [ -n "${OPENORC_SUPABASE_PRODUCTION_PROJECT_REF:-}" ] \
@@ -477,13 +484,14 @@ wait_for_branch_credentials() {
 resolve_branch_target() {
     local branch_name="$1"
 
-    require_branch_configuration
-
-    log "Resolving branch '$branch_name' under parent project ${OPENORC_SUPABASE_PROJECT_REF}..."
-
+    # Refuse the production branch identity before any CLI call.
     if [ "$branch_name" = "main" ]; then
         die "Refusing to apply migrations to branch 'main': that is the production branch identity."
     fi
+
+    require_branch_configuration
+
+    log "Resolving branch '$branch_name' under parent project ${OPENORC_SUPABASE_PROJECT_REF}..."
 
     wait_for_branch_credentials "$branch_name"
 
@@ -563,7 +571,8 @@ Options:
   -h, --help      Show this help.
 
 Environment:
-  SUPABASE_ACCESS_TOKEN                    required for --branch mode
+  SUPABASE_ACCESS_TOKEN                    optional; a stored `supabase login`
+                                           also authenticates the CLI
   OPENORC_SUPABASE_PROJECT_REF             parent project for --branch mode
   OPENORC_SUPABASE_PRODUCTION_PROJECT_REF  production identity guard;
                                            required for non-loopback
