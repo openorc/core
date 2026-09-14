@@ -1,10 +1,9 @@
 """Bootstrap for the OpenOrc RQ worker process surface.
 
 The worker is a thin queue-transport process: it connects to the configured
-Redis-compatible backend and runs a minimal RQ worker loop. Queue naming and
-prefix conventions and fuller Valkey/RQ wiring are owned by dedicated queue
-foundation work; this bootstrap deliberately uses RQ's stock default queue
-and defines no OpenOrc workflow jobs.
+Redis-compatible backend and runs an RQ worker loop over the canonical OpenOrc
+queues defined in :mod:`openorc.workers.queues`. No OpenOrc workflow jobs
+exist yet; this module owns queue transport mechanics only.
 """
 
 from __future__ import annotations
@@ -17,13 +16,9 @@ import rq
 from redis.exceptions import RedisError
 
 from openorc.config import Settings
+from openorc.workers.queues import DEFAULT_QUEUE_NAMES
 
 logger = logging.getLogger(__name__)
-
-# RQ's stock queue name. This is deliberately not an OpenOrc naming
-# convention: queue naming/prefix conventions are established by the queue
-# foundation work.
-DEFAULT_QUEUE_NAMES: tuple[str, ...] = ("default",)
 
 
 class WorkerBootstrapError(Exception):

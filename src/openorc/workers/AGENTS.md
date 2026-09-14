@@ -15,3 +15,9 @@ A replayed job must never create replacement Task sessions, resend a known-deliv
 RQ status is not workflow truth. Postgres is. Workers must be restartable without reconstructing domain state from process memory.
 
 Read services plus the relevant adapter and persistence guides for queue behavior changes.
+
+## Queue naming and backend contract
+
+- `openorc:` is the stable application-level RQ queue prefix. Deployment isolation is provided by the Redis/Valkey namespace selected by `VALKEY_URL`. In the current reference/local setup this may be a Redis DB index; another deployment may use a dedicated instance/service.
+- Canonical queue names are defined in `src/openorc/workers/queues.py`; the canonical default queue is `openorc:default`.
+- The queue backend contract is Redis-compatibility through `VALKEY_URL`; no server binary or server version is pinned. The pinned `rq`/`redis` packages are application dependencies under the repository dependency policy, not server-version indicators.

@@ -76,6 +76,16 @@ uv sync        # creates or updates the local .venv from uv.lock (dev group incl
 
 uv is the dependency/build tool, not a runtime dependency: environments that receive a prepared environment run the same entrypoints with their own interpreter (`python apps/api/main.py`). API and worker configuration comes from environment variables (see `.env.example`); neither process requires persistent local filesystem state.
 
+### Queue backend
+
+The worker connects to any Redis-compatible backend selected through `VALKEY_URL`; when unset, the application falls back to its built-in default (`redis://127.0.0.1:6379/0`).
+
+- `openorc:` is the stable application-level RQ queue prefix. Deployment isolation is provided by the Redis/Valkey namespace selected by `VALKEY_URL`. In the current reference/local setup this may be a Redis DB index; another deployment may use a dedicated instance/service.
+- The canonical default queue is `openorc:default` (defined in `src/openorc/workers/queues.py`); future OpenOrc queues derive from the same prefix.
+- For local OpenOrc development, `VALKEY_URL=redis://127.0.0.1:6379/2` is the recommended namespace (see `.env.example`), keeping the local stack out of a Redis namespace shared with other local development tooling.
+- No server binary or server version is pinned: the queue backend contract is Redis-compatibility through `VALKEY_URL`. The exact-pinned `rq` and `redis` Python packages are application dependencies under the repository dependency policy, not server-version indicators.
+- RQ is asynchronous execution machinery, not workflow truth; durable workflow state belongs in Postgres, not queue payloads.
+
 ## Local development (frontend)
 
 `apps/app` is the product SPA (Vue 3 + Vite + TypeScript) and targets Node 24. Its toolchain contract mirrors the Python one:
