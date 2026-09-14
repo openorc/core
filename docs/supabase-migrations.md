@@ -27,16 +27,40 @@ pin time; see the dependency policy in the root `AGENTS.md`). The CLI is not
 version-floored: `scripts/supabase-apply-migrations.sh` refuses to run unless
 `supabase --version` matches the pin exactly.
 
-Install or align the pinned version:
+The Supabase CLI is a machine-wide installation shared by every repository
+and project on this machine. The pin is the repository contract: the tooling
+fails closed if the shared binary drifts away from the pinned identity.
 
-```bash
-npm install --global supabase@2.117.0   # exact version via npm
-# or, when the Homebrew tap carries the pinned version:
-brew install supabase/tap/supabase      # verify with supabase --version
-```
+Supported ways to align the machine-wide CLI with the pin:
+
+1. **Homebrew** — preferred when the `supabase/tap/supabase` formula provides
+   the exact version pinned in `supabase/cli-version`:
+
+   ```bash
+   brew upgrade supabase/tap/supabase   # or: brew install supabase/tap/supabase
+   supabase --version                   # must print exactly the pinned version
+   ```
+
+2. **Official standalone pinned release binary** — the fallback when Homebrew
+   does not carry the exact pin. Download the official release archive for
+   the pinned version from `github.com/supabase/cli/releases`, install the
+   extracted binary on PATH, then verify it:
+
+   ```bash
+   supabase --version                   # must print exactly the pinned version
+   ```
+
+Supabase does not support global npm installation; do not install the CLI
+through npm.
+
+Always finish alignment with an explicit `supabase --version` check. The
+reported identity must match the pin exactly, including any prerelease or
+build suffix (a prerelease is refused even when its base numbers match the
+pin).
 
 Upgrade procedure: when a new stable release is adopted, update
-`supabase/cli-version` in the same change, verify the tooling against it, and
+`supabase/cli-version` in the same change, align the machine-wide CLI using
+one of the supported paths above, verify with `supabase --version`, and
 commit the bump — never run the tooling with an unverified CLI version.
 
 ## Creating a migration
