@@ -16,6 +16,13 @@ Do not implement independent workflow authority, direct Agent Runtime calls, dir
 - TanStack Vue Query owns server-derived state.
 - Pinia is for genuine client/application state, not a duplicate server truth store.
 
+## Toolchain contract
+
+- Node 24 is the runtime line. `.node-version` pins the exact development/default patch; `engines.node` and `devEngines.runtime` express the supported Node 24 line.
+- npm is the package manager. The exact npm version is enforced through npm-native `devEngines.packageManager` with `onFail: "error"`, which npm evaluates before `install`, `ci`, and `run` commands. `"packageManager"` remains ecosystem metadata only unless the repository explicitly routes npm through Corepack.
+- Direct dependencies are exact-pinned (no ranges); the committed `package-lock.json` is the authoritative transitive graph; `.npmrc` sets `save-exact=true`.
+- Pinia is installed and registered in the composition root, but stores exist only when genuine client/application state requires them.
+
 ## Product invariants
 
 - The dashboard is the primary happy path.
