@@ -6,9 +6,50 @@ It keeps the engineering workflow stable while coding runtimes, models, inferenc
 
 ## Repository status
 
-This repository is in the initial bootstrap phase. The architecture and repository context are being established before substantive implementation begins.
+Phase 0 repository bootstrap is complete. The development environment, app/API/worker shells, CI baseline, Supabase migration workflow, Redis-compatible queue integration, and ephemeral local dev stack are established and operational.
 
-`openorc/core` is the complete open-source product. Self-hosting must remain complete. The private `openorc/cloud` repository may compose and operate core, but core must never depend on Cloud-only code or infrastructure.
+Phase 1 is the current implementation focus: building OpenOrc's durable domain and persistence foundation. OpenOrc remains under active development and is not yet a complete end-to-end product.
+
+`openorc/core` is the complete open-source product. Self-hosting must remain complete.
+
+```text
+Phase 0  Repository foundation           ✓ complete
+Phase 1  Domain + persistence            ← current
+Phase 2  Backend control plane
+Phase 3  Real headless E2E
+Phase 4  Frontend control surface
+Phase 5  Product E2E + hardening
+```
+
+## How OpenOrc works
+
+OpenOrc governs an issue-to-merge engineering workflow while leaving coding execution to connected agent runtimes and repository policy to GitHub.
+
+```text
+GitHub issue
+↓
+Producer prepares an implementation strategy
+↓
+Producer ↔ Reviewer bounded review loop
+↓
+Owner authorizes implementation
+↓
+Producer implements
+↓
+Owner authorizes PR creation
+↓
+OpenOrc creates the pull request
+↓
+Producer ↔ Reviewer review/remediate committed state
+↓
+Owner requests merge
+↓
+GitHub confirms merge
+```
+
+Automation handles coordination between those boundaries; consequential progression remains explicit Owner authority. Producer and Reviewer are independent logical roles with separate Task-scoped sessions. v1 uses Cline Hub for both roles through `ClineAdapter`, while the workflow architecture keeps the connected runtime replaceable behind the Connection/adapter boundary.
+
+The ownership split is deliberate: GitHub remains the durable engineering record for issues, committed code, pull requests, CI, and merge outcomes. OpenOrc owns deterministic workflow/control truth such as Task state, reviews, Owner gates, runtime-session bindings, and audit history. Connected agent runtimes own their conversational and execution context, tools, filesystem state, and runtime-owned credentials. In v1 those runtimes are bring-your-own, Owner-controlled execution infrastructure rather than part of the OpenOrc control plane.
 
 ## Architectural shape
 
@@ -23,10 +64,11 @@ OpenOrc control plane
         │
 Connection + adapter layer
         │
-Agent runtimes such as Cline Hub
+Agent runtimes
+  v1: Cline Hub via ClineAdapter
 ```
 
-The starting repository structure is intentionally explicit:
+The repository structure is intentionally explicit:
 
 ```text
 apps/app/                  Vue product SPA
@@ -131,7 +173,7 @@ scripts/supabase-apply-migrations.sh --dry-run --branch my-branch   # validate (
 scripts/supabase-apply-migrations.sh --branch my-branch             # apply to a non-production branch
 ```
 
-The tooling refuses any target that cannot be reliably proven non-production; production application belongs to `openorc/cloud`, not this repository. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
+The tooling refuses any target that cannot be reliably proven non-production; applying migrations to production is intentionally outside this developer workflow. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
 
 ## Continuous integration
 
