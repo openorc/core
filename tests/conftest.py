@@ -15,6 +15,10 @@ _TEST_SETTINGS: dict[str, Any] = {
     "api_port": 3999,
     "api_reload": False,
     "valkey_url": "redis://127.0.0.1:6379/0",
+    "database_url": "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+    "db_pool_min": 1,
+    "db_pool_max": 5,
+    "db_pool_timeout": 5.0,
 }
 
 

@@ -17,11 +17,23 @@ API_HOST_VAR = "OPENORC_API_HOST"
 API_PORT_VAR = "OPENORC_API_PORT"
 API_RELOAD_VAR = "OPENORC_API_RELOAD"
 VALKEY_URL_VAR = "VALKEY_URL"
+DATABASE_URL_VAR = "DATABASE_URL"
+DB_POOL_MIN_VAR = "OPENORC_DB_POOL_MIN"
+DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
+DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
 
 DEFAULT_ENVIRONMENT = "development"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 3000
 DEFAULT_VALKEY_URL = "redis://127.0.0.1:6379/0"
+# Documented Supabase local-stack endpoint (`supabase start`); the only
+# non-environment Postgres default, mirroring DEFAULT_VALKEY_URL.
+DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+# Pool bounds are per process, not deployment-wide: sizing deployments must
+# account for process count x pool size.
+DEFAULT_DB_POOL_MIN = 1
+DEFAULT_DB_POOL_MAX = 10
+DEFAULT_DB_POOL_TIMEOUT = 30.0
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -30,6 +42,11 @@ _FALSY = frozenset({"0", "false", "no", "off"})
 # URL parser. Validating here keeps malformed backend configuration inside the
 # configuration error boundary instead of surfacing from deep client code.
 _VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
+
+# Schemes accepted for the direct Postgres connection URL (standard libpq
+# conninfo URLs). Driver-qualified schemes (e.g. SQLAlchemy-style suffixes)
+# are not part of this configuration boundary.
+_DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
 
 
 class ConfigurationError(Exception):
@@ -44,6 +61,34 @@ def _read(env: Mapping[str, str], name: str) -> str | None:
     return value
 
 
+def _read_int(env: Mapping[str, str], name: str, *, minimum: int, default: int) -> int:
+    """Read an integer setting enforcing a minimum; blank/unset uses default."""
+    raw = _read(env, name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < minimum:
+        raise ConfigurationError(f"{name} must be at least {minimum}, got {value}")
+    return value
+
+
+def _read_positive_float(env: Mapping[str, str], name: str, *, default: float) -> float:
+    """Read a strictly positive numeric setting; blank/unset uses default."""
+    raw = _read(env, name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ConfigurationError(f"{name} must be greater than 0, got {value}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Process configuration resolved from the environment boundary."""
@@ -53,6 +98,10 @@ class Settings:
     api_port: int
     api_reload: bool
     valkey_url: str
+    database_url: str = DEFAULT_DATABASE_URL
+    db_pool_min: int = DEFAULT_DB_POOL_MIN
+    db_pool_max: int = DEFAULT_DB_POOL_MAX
+    db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -96,10 +145,34 @@ class Settings:
                 f"{', '.join(sorted(_VALKEY_URL_SCHEMES))}; got scheme {scheme!r}"
             )
 
+        database_url = _read(source, DATABASE_URL_VAR) or DEFAULT_DATABASE_URL
+        db_scheme = urlparse(database_url).scheme.lower()
+        if db_scheme not in _DATABASE_URL_SCHEMES:
+            raise ConfigurationError(
+                f"{DATABASE_URL_VAR} must use one of the schemes "
+                f"{', '.join(sorted(_DATABASE_URL_SCHEMES))}; got scheme {db_scheme!r}"
+            )
+
+        # Pool bounds describe one process's pool, never a deployment-wide cap.
+        db_pool_min = _read_int(source, DB_POOL_MIN_VAR, minimum=1, default=DEFAULT_DB_POOL_MIN)
+        db_pool_max = _read_int(source, DB_POOL_MAX_VAR, minimum=1, default=DEFAULT_DB_POOL_MAX)
+        if db_pool_max < db_pool_min:
+            raise ConfigurationError(
+                f"{DB_POOL_MAX_VAR} ({db_pool_max}) must be greater than or equal to "
+                f"{DB_POOL_MIN_VAR} ({db_pool_min})"
+            )
+        db_pool_timeout = _read_positive_float(
+            source, DB_POOL_TIMEOUT_VAR, default=DEFAULT_DB_POOL_TIMEOUT
+        )
+
         return cls(
             environment=_read(source, ENVIRONMENT_VAR) or DEFAULT_ENVIRONMENT,
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
             api_port=api_port,
             api_reload=api_reload,
             valkey_url=valkey_url,
+            database_url=database_url,
+            db_pool_min=db_pool_min,
+            db_pool_max=db_pool_max,
+            db_pool_timeout=db_pool_timeout,
         )

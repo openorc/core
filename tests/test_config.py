@@ -8,8 +8,16 @@ from openorc.config import (
     API_HOST_VAR,
     API_PORT_VAR,
     API_RELOAD_VAR,
+    DATABASE_URL_VAR,
+    DB_POOL_MAX_VAR,
+    DB_POOL_MIN_VAR,
+    DB_POOL_TIMEOUT_VAR,
     DEFAULT_API_HOST,
     DEFAULT_API_PORT,
+    DEFAULT_DATABASE_URL,
+    DEFAULT_DB_POOL_MAX,
+    DEFAULT_DB_POOL_MIN,
+    DEFAULT_DB_POOL_TIMEOUT,
     DEFAULT_ENVIRONMENT,
     DEFAULT_VALKEY_URL,
     ENVIRONMENT_VAR,
@@ -78,6 +86,10 @@ def test_from_env_defaults_to_process_environment(
         API_PORT_VAR,
         API_RELOAD_VAR,
         VALKEY_URL_VAR,
+        DATABASE_URL_VAR,
+        DB_POOL_MIN_VAR,
+        DB_POOL_MAX_VAR,
+        DB_POOL_TIMEOUT_VAR,
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -88,9 +100,77 @@ def test_from_env_defaults_to_process_environment(
     assert settings.api_port == DEFAULT_API_PORT
     assert settings.api_reload is False
     assert settings.valkey_url == DEFAULT_VALKEY_URL
+    assert settings.database_url == DEFAULT_DATABASE_URL
+    assert settings.db_pool_min == DEFAULT_DB_POOL_MIN
+    assert settings.db_pool_max == DEFAULT_DB_POOL_MAX
+    assert settings.db_pool_timeout == DEFAULT_DB_POOL_TIMEOUT
 
 
 @pytest.mark.parametrize("raw", ["http://127.0.0.1:1/0", "not-a-url"])
 def test_malformed_valkey_url_is_rejected(raw: str) -> None:
     with pytest.raises(ConfigurationError, match="VALKEY_URL"):
         Settings.from_env({"VALKEY_URL": raw})
+
+
+def test_database_defaults_when_environment_is_empty() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.database_url == DEFAULT_DATABASE_URL
+    assert settings.db_pool_min == DEFAULT_DB_POOL_MIN
+    assert settings.db_pool_max == DEFAULT_DB_POOL_MAX
+    assert settings.db_pool_timeout == DEFAULT_DB_POOL_TIMEOUT
+
+
+def test_database_values_override_defaults() -> None:
+    url = "postgresql://postgres:pw@db.example.supabase.co:5432/postgres"
+    settings = Settings.from_env(
+        {
+            "DATABASE_URL": url,
+            "OPENORC_DB_POOL_MIN": "2",
+            "OPENORC_DB_POOL_MAX": "8",
+            "OPENORC_DB_POOL_TIMEOUT": "12.5",
+        }
+    )
+
+    assert settings.database_url == url
+    assert settings.db_pool_min == 2
+    assert settings.db_pool_max == 8
+    assert settings.db_pool_timeout == 12.5
+
+
+def test_postgres_scheme_is_accepted() -> None:
+    settings = Settings.from_env({"DATABASE_URL": "postgres://u:p@h.example:5432/db"})
+
+    assert settings.database_url == "postgres://u:p@h.example:5432/db"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["mysql://u:p@h.example/db", "postgresql+psycopg://u:p@h.example/db", "not-a-url"],
+)
+def test_malformed_database_url_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="DATABASE_URL"):
+        Settings.from_env({"DATABASE_URL": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "two"])
+def test_pool_min_below_one_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_DB_POOL_MIN"):
+        Settings.from_env({"OPENORC_DB_POOL_MIN": raw})
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "two"])
+def test_pool_max_below_one_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_DB_POOL_MAX"):
+        Settings.from_env({"OPENORC_DB_POOL_MAX": raw})
+
+
+def test_pool_max_below_pool_min_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_DB_POOL_MAX"):
+        Settings.from_env({"OPENORC_DB_POOL_MIN": "4", "OPENORC_DB_POOL_MAX": "2"})
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "later"])
+def test_invalid_pool_timeout_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_DB_POOL_TIMEOUT"):
+        Settings.from_env({"OPENORC_DB_POOL_TIMEOUT": raw})
