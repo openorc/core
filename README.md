@@ -21,6 +21,36 @@ Phase 4  Frontend control surface
 Phase 5  Product E2E + hardening
 ```
 
+## How OpenOrc works
+
+OpenOrc governs an issue-to-merge engineering workflow while leaving coding execution to connected agent runtimes and repository policy to GitHub.
+
+```text
+GitHub issue
+↓
+Producer prepares an implementation strategy
+↓
+Producer ↔ Reviewer bounded review loop
+↓
+Owner authorizes implementation
+↓
+Producer implements
+↓
+Owner authorizes PR creation
+↓
+OpenOrc creates the pull request
+↓
+Producer ↔ Reviewer review/remediate committed state
+↓
+Owner requests merge
+↓
+GitHub confirms merge
+```
+
+Automation handles coordination between those boundaries; consequential progression remains explicit Owner authority. Producer and Reviewer are independent logical roles with separate Task-scoped sessions. v1 uses Cline Hub for both roles through `ClineAdapter`, while the workflow architecture keeps the connected runtime replaceable behind the Connection/adapter boundary.
+
+The ownership split is deliberate: GitHub remains the durable engineering record for issues, committed code, pull requests, CI, and merge outcomes. OpenOrc owns deterministic workflow/control truth such as Task state, reviews, Owner gates, runtime-session bindings, and audit history. Connected agent runtimes own their conversational and execution context, tools, filesystem state, and runtime-owned credentials. In v1 those runtimes are bring-your-own, Owner-controlled execution infrastructure rather than part of the OpenOrc control plane.
+
 ## Architectural shape
 
 ```text
@@ -34,7 +64,8 @@ OpenOrc control plane
         │
 Connection + adapter layer
         │
-Agent runtimes such as Cline Hub
+Agent runtimes
+  v1: Cline Hub via ClineAdapter
 ```
 
 The repository structure is intentionally explicit:
