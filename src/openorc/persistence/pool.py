@@ -1,15 +1,17 @@
 """Process-local Postgres connection pooling for OpenOrc persistence.
 
 A connection pool belongs to exactly one OS process. The ``ConnectionPool``
-object is created by the process that first uses it: never at import time, in
-an application factory, on ``app.state``, or anywhere a pool could be
-inherited across an RQ fork boundary (the default RQ worker forks a child
-process per job).
+object is created in the OS process that uses it, after any fork that process
+has gone through: it must never exist somewhere it could be inherited across
+an RQ fork boundary (the default RQ worker forks a child process per job), so
+an RQ parent must not establish database pool/connection state before forking
+its work horse.
 
 Access is process-aware: the accessor tracks the owning PID and fails closed
-on PID change. A changed process identity can never reuse the previous pool,
-and a stale fork-inherited pool is abandoned — never closed — from the new
-process. A new process obtains a pool only through :func:`open_database_pool`.
+on PID change. A changed process identity can never reuse, replace, or close
+the previous pool; a stale fork-inherited pool is abandoned untouched. A
+process creates a pool through :func:`open_database_pool` only when its
+parent established no pool before the fork.
 """
 
 from __future__ import annotations
@@ -165,18 +167,33 @@ def open_database_pool(
     """Construct a pool owned by the current process and register it.
 
     Process-entry code in a fresh process (for example, later RQ job-child
-    wiring after a fork) obtains its pool here. A pool registered by another
-    process is abandoned untouched — never closed from this process. A process
-    that already owns a registered pool must use :func:`get_database_pool`.
+    wiring) may create its pool here only when the parent process established
+    no pool before the fork. A pool registered by another process is never
+    replaced, closed, or otherwise touched: access fails closed with
+    :class:`PoolOwnershipError`. A process that already owns a registered pool
+    must use :func:`get_database_pool`.
     """
     global _pool, _pool_owner_pid
 
     pid = _pid(pid_provider)
 
+    # Fail closed before taking the lock, mirroring get_database_pool: a
+    # forked child must never block on pool state owned by its parent process.
+    if _pool is not None and _pool_owner_pid != pid:
+        raise PoolOwnershipError(
+            f"database pool is owned by PID {_pool_owner_pid}; PID {pid} cannot "
+            "replace it across a process boundary"
+        )
+
     with _state_lock:
-        if _pool is not None and _pool_owner_pid == pid:
+        if _pool is not None:
+            if _pool_owner_pid == pid:
+                raise PoolOwnershipError(
+                    f"PID {pid} already owns a database pool; use get_database_pool()"
+                )
             raise PoolOwnershipError(
-                f"PID {pid} already owns a database pool; use get_database_pool()"
+                f"database pool is owned by PID {_pool_owner_pid}; PID {pid} cannot "
+                "replace it across a process boundary"
             )
 
         factory = default_pool_factory if pool_factory is None else pool_factory

@@ -14,6 +14,8 @@ It does not own workflow transitions, review/session lifecycle decisions, GitHub
 - Browser clients never call Agent Runtimes directly through hidden API shortcuts.
 - Runtime/provider URLs exposed to the UI are navigation affordances only.
 - SSE is live delivery, not durable workflow truth.
+- FastAPI `BackgroundTasks` is not used for deferred or workflow execution; that work goes through RQ/Valkey queues and shared application services.
+- v1 persistence is synchronous: async/event-loop handlers must not perform blocking database I/O directly.
 - API contracts consumed by the SPA require coordinated changes with `apps/app/AGENTS.md`.
 
 Read services/domain guidance and persistence guidance where relevant.

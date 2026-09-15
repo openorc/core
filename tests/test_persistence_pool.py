@@ -116,13 +116,32 @@ def test_changed_process_identity_cannot_reuse_prior_pool(
     assert stale.events == []
 
 
-def test_fresh_pool_path_gives_new_process_its_own_pool(
+def test_open_database_pool_refuses_foreign_inherited_pool(
     settings_factory: Callable[..., Settings],
 ) -> None:
     specs: list[PoolSpec] = []
     settings = settings_factory()
 
     stale = get_database_pool(settings, pool_factory=make_factory(specs), pid_provider=lambda: 4242)
+
+    with pytest.raises(PoolOwnershipError, match="4242"):
+        open_database_pool(settings, pool_factory=make_factory(specs), pid_provider=lambda: 9999)
+
+    # Fail closed: the inherited pool was not replaced, closed, or touched in
+    # any way, and the new process's pool factory was never invoked.
+    assert len(specs) == 1
+    assert isinstance(stale, FakePool)
+    assert stale.events == []
+
+
+def test_open_database_pool_constructs_when_no_pool_was_inherited(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    specs: list[PoolSpec] = []
+    settings = settings_factory()
+
+    # A parent that established no pool before forking leaves its child free
+    # to create and register its own process-local pool.
     fresh = open_database_pool(
         settings, pool_factory=make_factory(specs), pid_provider=lambda: 9999
     )
@@ -130,11 +149,9 @@ def test_fresh_pool_path_gives_new_process_its_own_pool(
         settings, pool_factory=make_factory(specs), pid_provider=lambda: 9999
     )
 
-    assert fresh is not stale
+    assert len(specs) == 1
+    assert isinstance(fresh, FakePool)
     assert reused is fresh
-    assert len(specs) == 2
-    assert isinstance(stale, FakePool)
-    assert stale.events == []  # abandoned, never closed from the new process
 
 
 def test_open_database_pool_rejects_second_pool_in_same_process(
