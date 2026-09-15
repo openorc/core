@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        # No `version:` input: the action reads [tool.uv] required-version from
+        # pyproject.toml and installs exactly the uv version the repository pins.
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Sync locked Python environment
+        # --locked verifies the committed pyproject.toml/uv.lock pair is
+        # consistent instead of re-resolving the lockfile.
+        run: uv sync --locked
+
+      - name: Run tests (pytest)
+        run: .venv/bin/python -m pytest
+
+      - name: Lint (ruff check)
+        run: .venv/bin/python -m ruff check .
+
+      - name: Format check (ruff format --check)
+        run: .venv/bin/python -m ruff format --check .
+
+      - name: Static type checks (pyright)
+        run: .venv/bin/pyright
+
+  frontend-checks:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/app
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: apps/app/.node-version
+          cache: npm
+          cache-dependency-path: apps/app/package-lock.json
+
+      - name: Bootstrap pinned npm
+        # devEngines in apps/app/package.json requires the exact npm version
+        # declared there before install/ci/run commands; read it from the file
+        # rather than duplicating the pin in this workflow.
+        run: |
+          npm install -g npm@"$(node -p "require('./package.json').devEngines.packageManager.version")"
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Type check (vue-tsc)
+        run: npm run typecheck
+
+      - name: Test (Vitest)
+        run: npm test
+
+      - name: Production build (vue-tsc + vite)
+        run: npm run build

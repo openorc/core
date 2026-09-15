@@ -133,6 +133,19 @@ scripts/supabase-apply-migrations.sh --branch my-branch             # apply to a
 
 The tooling refuses any target that cannot be reliably proven non-production; production application belongs to `openorc/cloud`, not this repository. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
 
+## Continuous integration
+
+The `CI` GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same canonical commands developers run locally. It triggers on pull requests to `main`, pushes to `main`, and manual dispatch. Baseline runs are deterministic: they require no secrets and no live Supabase, Valkey, Cline Hub, GitHub-integration, or other external infrastructure.
+
+The workflow has two jobs. Their display names are the stable names to configure as required status checks when branch protection is enabled:
+
+- **Python checks** (`python-checks`) — `uv sync --locked` (verifies the committed `pyproject.toml`/`uv.lock` pair is consistent rather than re-resolving it), then pytest, `ruff check`, `ruff format --check`, and pyright. The uv and Python versions come from the repository toolchain contract: the setup-uv action reads `[tool.uv] required-version` from `pyproject.toml`, and uv provisions the interpreter from `.python-version`.
+- **Frontend checks** (`frontend-checks`) — bootstraps the exact npm version declared in `apps/app/package.json` (`devEngines`) before any app-local npm command, runs `npm ci` from the committed lockfile, then `typecheck`, Vitest, and the production build. Node resolves from `apps/app/.node-version`.
+
+Third-party actions are pinned to the immutable commit SHA of their current stable release, with the release version noted in a comment. Dependency caches (uv/npm) accelerate runs but are never required for correctness: installation always verifies against the committed lockfiles.
+
+The ordinary pytest baseline excludes tests marked `integration` by default; `pytest -m integration` overrides that explicitly (see [`tests/README.md`](tests/README.md)).
+
 ## Manual local E2E (devserver)
 
 `scripts/devserver.sh` starts the full local stack against a fresh ephemeral hosted Supabase branch. It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
