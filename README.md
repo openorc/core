@@ -128,6 +128,14 @@ The worker connects to any Redis-compatible backend selected through `VALKEY_URL
 - No server binary or server version is pinned: the queue backend contract is Redis-compatibility through `VALKEY_URL`. The exact-pinned `rq` and `redis` Python packages are application dependencies under the repository dependency policy, not server-version indicators.
 - RQ is asynchronous execution machinery, not workflow truth; durable workflow state belongs in Postgres, not queue payloads.
 
+### Postgres (persistence)
+
+API and worker processes access OpenOrc's dedicated `openorc` Postgres schema through shared persistence code (`src/openorc/persistence/`), using synchronous psycopg 3 with a bounded `psycopg_pool.ConnectionPool`. In devserver runs, `DATABASE_URL` is exported per-run from the ephemeral Supabase branch; when unset, the application falls back to the documented Supabase local-stack default (`postgresql://postgres:postgres@127.0.0.1:54322/postgres`).
+
+- Pool bounds are **per process**, not deployment-wide: `OPENORC_DB_POOL_MIN` / `OPENORC_DB_POOL_MAX` (defaults 1 / 10) and `OPENORC_DB_POOL_TIMEOUT` seconds (default 30). Size deployments for process count × pool size.
+- Connections are pooler-neutral by default (`prepare_threshold=None`; no session-local state), so direct, session-pooler, and transaction-pooler endpoints work identically.
+- A pool belongs to exactly one OS process and is created by the process that uses it — never inherited or reused across an RQ fork boundary. The durable invariants live in `src/openorc/persistence/AGENTS.md`.
+
 ## Local development (frontend)
 
 `apps/app` is the product SPA (Vue 3 + Vite + TypeScript) and targets Node 24. Its toolchain contract mirrors the Python one:
