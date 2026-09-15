@@ -39,7 +39,7 @@ required-version = "==0.10.9"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers"
+addopts = "--strict-markers -m 'not integration'"
 markers = [
     "integration: requires live external infrastructure; excluded from the ordinary deterministic baseline",
 ]
