@@ -6,9 +6,20 @@ It keeps the engineering workflow stable while coding runtimes, models, inferenc
 
 ## Repository status
 
-This repository is in the initial bootstrap phase. The architecture and repository context are being established before substantive implementation begins.
+Phase 0 repository bootstrap is complete. The development environment, app/API/worker shells, CI baseline, Supabase migration workflow, Redis-compatible queue integration, and ephemeral local dev stack are established and operational.
 
-`openorc/core` is the complete open-source product. Self-hosting must remain complete. The private `openorc/cloud` repository may compose and operate core, but core must never depend on Cloud-only code or infrastructure.
+Phase 1 is the current implementation focus: building OpenOrc's durable domain and persistence foundation. OpenOrc remains under active development and is not yet a complete end-to-end product.
+
+`openorc/core` is the complete open-source product. Self-hosting must remain complete.
+
+```text
+Phase 0  Repository foundation           ✓ complete
+Phase 1  Domain + persistence            ← current
+Phase 2  Backend control plane
+Phase 3  Real headless E2E
+Phase 4  Frontend control surface
+Phase 5  Product E2E + hardening
+```
 
 ## Architectural shape
 
@@ -26,7 +37,7 @@ Connection + adapter layer
 Agent runtimes such as Cline Hub
 ```
 
-The starting repository structure is intentionally explicit:
+The repository structure is intentionally explicit:
 
 ```text
 apps/app/                  Vue product SPA
@@ -131,7 +142,7 @@ scripts/supabase-apply-migrations.sh --dry-run --branch my-branch   # validate (
 scripts/supabase-apply-migrations.sh --branch my-branch             # apply to a non-production branch
 ```
 
-The tooling refuses any target that cannot be reliably proven non-production; production application belongs to `openorc/cloud`, not this repository. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
+The tooling refuses any target that cannot be reliably proven non-production; applying migrations to production is intentionally outside this developer workflow. Configuration (project refs, access token) comes from the environment (see `.env.example`); credentials are never committed.
 
 ## Continuous integration
 
