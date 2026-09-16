@@ -48,7 +48,8 @@ The equivalent explicit form runs an arbitrary command against the same branch:
 
 ```bash
 ./scripts/devserver.sh --testdb -- \
-  .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
+  .venv/bin/python -m pytest -o addopts=--strict-markers \
+  -m integration tests/integration/test_ownership_persistence.py
 ```
 
 Equivalently, the suite can be pointed at any explicitly supplied non-production branch database:

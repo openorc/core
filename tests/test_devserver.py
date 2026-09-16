@@ -1569,6 +1569,58 @@ def test_testdb_bare_form_runs_canonical_suite(tmp_path: Path) -> None:
     assert len(harness.runner.delete_calls) == 1
 
 
+def test_testdb_default_command_overrides_marker_exclusion() -> None:
+    argv = list(DEFAULT_TESTDB_COMMAND)
+    # The repository pytest default (pyproject addopts "-m 'not integration'")
+    # excludes integration-marked tests from ordinary runs. The built-in
+    # command must replace that default while keeping strict marker checking,
+    # then select integration explicitly.
+    override_index = argv.index("-o")
+    assert argv[override_index + 1] == "addopts=--strict-markers"
+    selection_index = argv.index("-m", override_index + 1)
+    assert argv[selection_index + 1] == "integration"
+
+
+def _collect_integration_tests(pytest_args: list[str]) -> tuple[int, list[str]]:
+    """Collect the canonical integration file; return (exit code, node lines).
+
+    Collection only imports the test module: no fixture runs, no database is
+    contacted, and the suite still skips itself when OPENORC_TEST_DATABASE_URL
+    is absent.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *pytest_args, "--collect-only", "-q"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    node_lines = [line for line in result.stdout.splitlines() if "tests/integration/" in line]
+    return result.returncode, node_lines
+
+
+def test_testdb_default_command_selects_integration_tests() -> None:
+    # Regression guard for the first Owner run, where the built-in suite
+    # reported "collected 8 items / 8 deselected / 0 selected": the
+    # integration tests carried no integration marker and the repository
+    # addopts filter remained in force. The built-in command must actually
+    # select the integration tests against the real repository pytest
+    # configuration.
+    returncode, node_lines = _collect_integration_tests(list(DEFAULT_TESTDB_COMMAND)[3:])
+    assert returncode == 0
+    assert len(node_lines) >= 1
+
+
+def test_ordinary_pytest_defaults_still_exclude_integration_tests() -> None:
+    # Pins the DB-free property of ordinary runs: without the --testdb addopts
+    # override, the repository default deselects the whole integration module.
+    returncode, node_lines = _collect_integration_tests(
+        ["tests/integration/test_ownership_persistence.py"]
+    )
+    assert node_lines == []
+    assert returncode != 0  # nothing selected under the repository default
+
+
 def test_testdb_branch_url_overrides_existing_export(tmp_path: Path) -> None:
     harness = make_harness(
         tmp_path,

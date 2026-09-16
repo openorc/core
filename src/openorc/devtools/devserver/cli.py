@@ -95,8 +95,8 @@ Options:
       Supply a command after '--' to run something else instead:
 
         ./devserver.sh --testdb -- \
-          .venv/bin/python -m pytest -m integration \
-          tests/integration/test_ownership_persistence.py
+          .venv/bin/python -m pytest -o addopts=--strict-markers \
+          -m integration tests/integration/test_ownership_persistence.py
 
       Nothing else starts in this mode: no app, API, worker, queue
       backend, or ngrok. Surface-selection flags (--app-only,
@@ -122,17 +122,27 @@ Notes:
     PATH python3 fallback.
   - --testdb provisions only the branch database: committed migrations are
     applied, seed data is not, and the integration suite (or the command
-    supplied after '--') is the only process started.
+    supplied after '--') is the only process started; the built-in suite
+    replaces the ordinary pytest marker defaults so integration tests are
+    actually selected.
   - Cline is not expected to run this script during normal implementation.
 """
 
 
 # The canonical persistence integration suite run when --testdb is given
 # without an explicit command override (Owner workflow default).
+#
+# The repository pytest default (pyproject addopts) excludes
+# integration-marked tests so ordinary runs stay DB-free. This command
+# replaces that default with strict-markers-only addopts and selects the
+# integration marker explicitly, so the built-in suite can never silently
+# report "0 selected" due to repository marker defaults.
 DEFAULT_TESTDB_COMMAND: tuple[str, ...] = (
     ".venv/bin/python",
     "-m",
     "pytest",
+    "-o",
+    "addopts=--strict-markers",
     "-m",
     "integration",
     "tests/integration/test_ownership_persistence.py",
