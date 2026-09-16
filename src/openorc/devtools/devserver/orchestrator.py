@@ -28,7 +28,7 @@ from openorc.devtools.devserver.errors import (
     ShutdownRequested,
     UsageError,
 )
-from openorc.devtools.devserver.logging import LOG_PREFIX, Logger, StreamLogger
+from openorc.devtools.devserver.logging import LOG_PREFIX, Logger, StreamLogger, redact_url
 from openorc.devtools.devserver.processes import (
     STOP_TERM_TIMEOUT_SECONDS,
     CommandResolver,
@@ -41,6 +41,7 @@ from openorc.devtools.devserver.supabase import (
     BRANCH_WAIT_MAX_ATTEMPTS_ENV,
     BRANCH_WAIT_SLEEP_SECONDS_DEFAULT,
     BRANCH_WAIT_SLEEP_SECONDS_ENV,
+    BranchEnvironment,
     SupabaseManager,
 )
 from openorc.devtools.devserver.valkey import (
@@ -226,6 +227,8 @@ class Devserver:
     # -- execution ---------------------------------------------------------
 
     def _execute(self) -> int:
+        if self._config.testdb_command is not None:
+            return self._execute_testdb()
         self._require_base_tools()
         load_env_file(self._root / ".env", self._env, self._log)
         api_port = self._env_value("LOCAL_API_PORT", str(DEFAULT_API_PORT))
@@ -262,6 +265,14 @@ class Devserver:
         if not self._config.auto_supabase:
             self._log.log("Supabase automation disabled.")
             return
+        manager = self._build_supabase_manager()
+        self._provision_supabase_branch(manager)
+        manager.export_runtime_credentials(self._env)
+        manager.apply_migrations()
+        manager.apply_seed_if_present()
+
+    def _build_supabase_manager(self) -> SupabaseManager:
+        """Construct the branch manager; recorded for the single cleanup path."""
         manager = SupabaseManager(
             runner=self._runner,
             root=self._root,
@@ -282,13 +293,18 @@ class Devserver:
             ),
         )
         self._supabase = manager
+        return manager
+
+    def _provision_supabase_branch(self, manager: SupabaseManager) -> BranchEnvironment:
+        """Run the canonical branch lifecycle through bounded readiness.
+
+        Shared by ordinary stack startup and --testdb. Credentials are
+        resolved into the manager and returned; they are never logged.
+        """
         manager.verify_configuration()
         manager.verify_cli_pin()
         manager.create_branch()
-        manager.wait_until_ready()
-        manager.export_runtime_credentials(self._env)
-        manager.apply_migrations()
-        manager.apply_seed_if_present()
+        return manager.wait_until_ready()
 
     def _prepare_valkey(self) -> None:
         if not self._config.include_worker:
@@ -404,6 +420,55 @@ class Devserver:
                 inherit_stdin=True,
             )
 
+        while child.poll() is None:
+            self._check_shutdown()
+            self._sleep(FOREGROUND_POLL_SECONDS)
+        return child.wait()
+
+    # -- testdb mode -------------------------------------------------------
+
+    def _require_testdb_tools(self) -> None:
+        """--testdb needs only the Supabase CLI; stack tooling is irrelevant."""
+        if self._command_resolver("supabase") is None:
+            raise DevserverError("Required command not found on PATH: supabase")
+
+    def _execute_testdb(self) -> int:
+        """Run one Owner command against a freshly provisioned branch.
+
+        --testdb provisions the canonical ephemeral Supabase branch, applies
+        the current checkout's committed migrations (seed data is not
+        applied), runs the command supplied after '--' with
+        OPENORC_TEST_DATABASE_URL pointed at the branch database, and
+        deletes the branch on exit via the single cleanup path. Nothing
+        else is started: no app, API, worker, queue backend, or ngrok.
+        """
+        command = list(self._config.testdb_command or ())
+        if not command:  # unreachable: parse_args enforces a non-empty command
+            raise DevserverError("--testdb requires a command to run.")
+        self._require_testdb_tools()
+        load_env_file(self._root / ".env", self._env, self._log)
+        manager = self._build_supabase_manager()
+        branch_environment = self._provision_supabase_branch(manager)
+        manager.apply_migrations()
+
+        database_url = branch_environment.database_url
+        if not database_url:  # fail closed even though readiness implies it
+            raise DevserverError("Supabase branch did not publish database credentials.")
+        child_env = dict(self._env)
+        # The integration contract is specifically OPENORC_TEST_DATABASE_URL;
+        # the branch URL is never mapped onto application DATABASE_URL here.
+        child_env["OPENORC_TEST_DATABASE_URL"] = database_url
+        self._log.log(
+            f"Running testdb command against branch '{manager.branch_name}' "
+            f"(database: {redact_url(database_url)})."
+        )
+        child = self._supervisor.start(
+            "testdb-command",
+            command,
+            runner=self._runner,
+            env=child_env,
+            inherit_stdin=True,
+        )
         while child.poll() is None:
             self._check_shutdown()
             self._sleep(FOREGROUND_POLL_SECONDS)

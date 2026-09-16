@@ -1432,3 +1432,244 @@ def test_ngrok_binary_missing_warns_and_skips(tmp_path: Path) -> None:
     assert harness.devserver.run() == 0
     assert not [call for call in harness.runner.spawn_calls if call.label == "ngrok"]
     assert any("ngrok not found on PATH" in message for message in harness.log.messages_of("warn"))
+
+
+# ---------------------------------------------------------------------------
+# --testdb: Owner-only command-against-ephemeral-branch mode
+# ---------------------------------------------------------------------------
+
+
+def test_testdb_parses_command_after_separator() -> None:
+    config = parse_args(["--testdb", "--", ".venv/bin/python", "-m", "pytest"])
+    assert config.testdb_command == (".venv/bin/python", "-m", "pytest")
+    assert config.keep_supabase is False
+
+
+def test_testdb_composes_with_keep_supabase_before_separator() -> None:
+    config = parse_args(["--testdb", "--keep-supabase", "--", "echo", "hi"])
+    assert config.testdb_command == ("echo", "hi")
+    assert config.keep_supabase is True
+
+
+def test_testdb_flags_after_separator_belong_to_the_command() -> None:
+    config = parse_args(["--testdb", "--", "pytest", "--keep-supabase", "-x"])
+    assert config.testdb_command == ("pytest", "--keep-supabase", "-x")
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--app-only",
+        "--api-only",
+        "--worker-only",
+        "--no-worker",
+        "--no-valkey",
+        "--no-ngrok",
+        "--no-supabase",
+    ],
+)
+def test_testdb_rejects_surface_selection_flags(flag: str) -> None:
+    with pytest.raises(UsageError, match="cannot be combined with --testdb"):
+        parse_args(["--testdb", flag, "--", "true"])
+
+
+@pytest.mark.parametrize("argv", [["--testdb"], ["--testdb", "--"]])
+def test_testdb_without_command_is_a_usage_error(argv: list[str]) -> None:
+    with pytest.raises(UsageError, match="command"):
+        parse_args(argv)
+
+
+def test_testdb_command_without_separator_is_a_usage_error() -> None:
+    with pytest.raises(UsageError, match="Expected '--'"):
+        parse_args(["--testdb", "pytest", "-m", "integration"])
+
+
+def test_testdb_unknown_option_is_a_usage_error() -> None:
+    with pytest.raises(UsageError, match="Unknown parameter"):
+        parse_args(["--testdb", "--bogus", "--", "true"])
+
+
+def test_testdb_provisions_branch_runs_command_and_deletes_branch(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(
+            ["--testdb", "--", ".venv/bin/python", "-m", "pytest", "-m", "integration"]
+        ),
+    )
+    assert harness.devserver.run() == 0
+
+    # Only the testdb command runs: no app, API, worker, queue backend, or
+    # ngrok; the queue client is never consulted.
+    assert harness.spawn_labels() == ["testdb-command"]
+    assert harness.queue.ping_count == 0
+    assert harness.queue.flushes == 0
+    assert harness.queue_factory_urls == []
+
+    create = harness.runner.create_calls[0]
+    branch_name = create.argv[3]
+    migrations = [
+        call
+        for call in harness.runner.run_calls
+        if call.argv[0].endswith("supabase-apply-migrations.sh")
+    ]
+    assert migrations[0].argv[1:] == ("--branch", branch_name)
+
+    child = harness.runner.spawn_calls[0]
+    assert child.argv == (".venv/bin/python", "-m", "pytest", "-m", "integration")
+    assert child.inherit_stdin is True
+    assert child.env is not None
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+    # Only the testdb contract variable is injected: the branch URL is never
+    # mapped onto application DATABASE_URL or the stack service environment.
+    assert "DATABASE_URL" not in child.env
+    assert "SUPABASE_URL" not in child.env
+    assert "OPENORC_ENV" not in child.env
+    assert "VITE_API_BASE_URL" not in child.env
+
+    # Ordering: provisioning+migrations -> child command -> branch deletion,
+    # exactly once, last of all.
+    kinds = [(event[0], event[1]) for event in harness.events]
+    migration_index = next(
+        index
+        for index, (kind, name) in enumerate(kinds)
+        if kind == "run" and "supabase-apply-migrations" in name
+    )
+    spawn_index = next(
+        index
+        for index, (kind, name) in enumerate(kinds)
+        if kind == "spawn" and name == "testdb-command"
+    )
+    delete_index = next(
+        index
+        for index, (kind, name) in enumerate(kinds)
+        if kind == "run" and "branches delete" in name
+    )
+    assert migration_index < spawn_index < delete_index
+    assert len(harness.runner.delete_calls) == 1
+    assert harness.runner.delete_calls[0].argv[3] == branch_name
+
+
+def test_testdb_branch_url_overrides_existing_export(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(["--testdb", "--", "env"]),
+        env={"OPENORC_TEST_DATABASE_URL": "postgresql://stale:stale@old-host:5432/stale"},
+    )
+    assert harness.devserver.run() == 0
+    child = harness.runner.spawn_calls[0]
+    assert child.env is not None
+    # The generated branch URL always wins for the child process.
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+
+
+def test_testdb_logs_never_contain_credentials_or_full_database_url(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, config=parse_args(["--testdb", "--", "true"]))
+    assert harness.devserver.run() == 0
+    text = harness.log.text()
+    assert "branchsecret" not in text
+    assert BRANCH_DB_URL not in text
+    assert PUBLISHABLE_KEY not in text
+    assert DEFAULT_SECRET_KEY not in text
+    # Host-oriented redaction is the only database reference logged.
+    assert "postgresql://aws-0-us-east-1.pooler.supabase.com" in text
+
+
+def test_testdb_child_exit_status_propagates(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path, config=parse_args(["--testdb", "--", "false"]), foreground_exit_code=7
+    )
+    assert harness.devserver.run() == 7
+    # Child failure still deletes the created branch exactly once.
+    assert len(harness.runner.delete_calls) == 1
+
+
+def test_testdb_migration_failure_fails_closed_and_cleans_up(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, config=parse_args(["--testdb", "--", "true"]))
+    harness.runner.run_prefix_results.append(
+        ((str(harness.root / "scripts" / "supabase-apply-migrations.sh"),), RunResult(1, "", ""))
+    )
+    assert harness.devserver.run() == 1
+    # Ownership was acquired (branch created) before the failure, so the
+    # single cleanup path still deletes exactly that branch; the child
+    # command never runs.
+    assert len(harness.runner.create_calls) == 1
+    assert len(harness.runner.delete_calls) == 1
+    assert harness.spawn_labels() == []
+    assert any(
+        "migration application failed" in message for message in harness.log.messages_of("error")
+    )
+
+
+def test_testdb_branch_create_failure_never_deletes_any_branch(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path, config=parse_args(["--testdb", "--", "true"]), create_returncode=1
+    )
+    assert harness.devserver.run() == 1
+    # No branch was created by this invocation, so cleanup deletes nothing.
+    assert harness.runner.delete_calls == []
+    assert harness.spawn_labels() == []
+
+
+def test_testdb_seed_is_never_applied(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, config=parse_args(["--testdb", "--", "true"]), seed_sql=True)
+    assert harness.devserver.run() == 0
+    # --testdb applies migrations only; seeding stays an ordinary-mode step.
+    assert harness.runner.calls_with_prefix(("supabase", "db", "push")) == []
+
+
+def test_testdb_keep_supabase_preserves_created_branch(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path, config=parse_args(["--testdb", "--keep-supabase", "--", "true"])
+    )
+    assert harness.devserver.run() == 0
+    assert harness.runner.delete_calls == []
+    assert any("--keep-supabase" in message for message in harness.log.messages_of("warn"))
+
+
+def test_testdb_requires_supabase_binary_but_not_stack_tools(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(["--testdb", "--", "true"]),
+        command_resolver=(lambda name: None if name == "supabase" else f"/fake/bin/{name}"),
+    )
+    assert harness.devserver.run() == 1
+    assert any(
+        "Required command not found on PATH: supabase" in message
+        for message in harness.log.messages_of("error")
+    )
+    # The binary check precedes any Supabase operation.
+    assert harness.runner.create_calls == []
+
+
+def wait_for_testdb_spawn(harness: Harness) -> None:
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if any(call.label == "testdb-command" for call in harness.runner.spawn_calls):
+            return
+        time.sleep(0.01)
+    pytest.fail("devserver did not reach the testdb command")
+
+
+def test_testdb_child_stopped_and_branch_deleted_on_sigint(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(["--testdb", "--", ".venv/bin/python", "-m", "pytest"]),
+        foreground_exit_after_polls=None,
+    )
+    results: list[int] = []
+    thread = threading.Thread(target=lambda: results.append(harness.devserver.run()))
+    thread.start()
+    try:
+        wait_for_testdb_spawn(harness)
+        harness.devserver.request_shutdown(signal.SIGINT)
+    finally:
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    assert results == [130]
+    # The single cleanup path stops the child first, then deletes the branch
+    # created by this invocation exactly once, last of all.
+    assert harness.signal_labels() == ["testdb-command"]
+    assert len(harness.runner.delete_calls) == 1
+    delete_events = [event for event in harness.events if "branches delete" in event[1]]
+    assert harness.events.index(delete_events[0]) == len(harness.events) - 1

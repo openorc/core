@@ -23,6 +23,9 @@ class RunConfig:
     auto_ngrok: bool = True
     auto_supabase: bool = True
     keep_supabase: bool = False
+    # When set, --testdb mode: run this command against a freshly provisioned
+    # ephemeral Supabase branch instead of starting the application stack.
+    testdb_command: tuple[str, ...] | None = None
 
     @property
     def foreground_kind(self) -> str | None:
@@ -78,6 +81,26 @@ Options:
       This should NOT be the normal workflow.
       Leaving branches running incurs compute cost.
 
+  --testdb [--keep-supabase] -- <command> [args...]
+      Provision an ephemeral hosted Supabase branch, apply the current
+      checkout's committed migrations (never seed data), run <command>
+      with OPENORC_TEST_DATABASE_URL pointing at the branch database,
+      and delete the branch on exit (including failure or Ctrl-C).
+
+      Owner workflow for integration-marked tests:
+
+        ./devserver.sh --testdb -- \
+          .venv/bin/python -m pytest -m integration \
+          tests/integration/test_ownership_persistence.py
+
+      Nothing else starts in this mode: no app, API, worker, queue
+      backend, or ngrok. Surface-selection flags (--app-only,
+      --api-only, --worker-only, --no-worker, --no-valkey, --no-ngrok,
+      --no-supabase) cannot be combined with --testdb. --keep-supabase
+      keeps the branch after the run (debug escape hatch; incurs
+      compute cost). The branch database URL is injected into the child
+      environment only; it is never logged or written to files.
+
   -h, --help
       Show this help.
 
@@ -92,8 +115,24 @@ Notes:
     persistence disabled and is stopped on exit (never via brew services).
   - API/worker processes run from the repository .venv (uv sync); there is no
     PATH python3 fallback.
+  - --testdb provisions only the branch database: committed migrations are
+    applied, seed data is not, and the given command is the only process
+    started.
   - Cline is not expected to run this script during normal implementation.
 """
+
+
+_TESTDB_INCOMPATIBLE_FLAGS = frozenset(
+    {
+        "--app-only",
+        "--api-only",
+        "--worker-only",
+        "--no-worker",
+        "--no-valkey",
+        "--no-ngrok",
+        "--no-supabase",
+    }
+)
 
 
 def parse_args(argv: Sequence[str]) -> RunConfig:
@@ -102,8 +141,15 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
     Raises HelpRequested for -h/--help and UsageError for unknown options.
     """
     config = RunConfig()
-    for arg in argv:
-        if arg == "--app-only":
+    arguments = list(argv)
+    index = 0
+    while index < len(arguments):
+        arg = arguments[index]
+        index += 1
+        if arg == "--testdb":
+            config.testdb_command = _parse_testdb_command(config, arguments[index:])
+            return config
+        elif arg == "--app-only":
             config.include_app = True
             config.include_api = False
             config.include_worker = False
@@ -135,3 +181,32 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         else:
             raise UsageError(f"Unknown parameter: {arg}")
     return config
+
+
+def _parse_testdb_command(config: RunConfig, rest: Sequence[str]) -> tuple[str, ...]:
+    """Parse everything after --testdb: options up to '--', then the command.
+
+    '--' terminates option parsing; every argument after it belongs to the
+    child command and is never interpreted by the devserver.
+    """
+    remaining = list(rest)
+    while remaining:
+        arg = remaining.pop(0)
+        if arg == "--":
+            if not remaining:
+                raise UsageError("--testdb requires a command after '--'.")
+            return tuple(remaining)
+        if arg in {"-h", "--help"}:
+            raise HelpRequested
+        if arg == "--keep-supabase":
+            config.keep_supabase = True
+        elif arg in _TESTDB_INCOMPATIBLE_FLAGS:
+            raise UsageError(f"{arg} cannot be combined with --testdb.")
+        elif arg.startswith("-"):
+            raise UsageError(f"Unknown parameter: {arg}")
+        else:
+            raise UsageError(
+                f"Expected '--' before the testdb command; got {arg!r}. "
+                "Use: --testdb [--keep-supabase] -- <command> [args...]"
+            )
+    raise UsageError("--testdb requires '--' followed by the command to run.")

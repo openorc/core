@@ -204,7 +204,7 @@ The orchestration is implemented in Python (`src/openorc/devtools/devserver/`, a
 
 ```bash
 bash scripts/devserver.sh                 # full stack: Supabase branch + queue + API + worker + app (foreground)
-bash scripts/devserver.sh --help          # component-only modes, --no-* controls, --keep-supabase
+bash scripts/devserver.sh --help          # component modes, --testdb, --no-* controls, --keep-supabase
 ```
 
 What a default run does:
@@ -224,6 +224,17 @@ Lifecycle and safety properties:
 - `--keep-supabase` preserves the branch for debugging and says so loudly (branches cost compute; delete them manually).
 
 Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, local `redis-server`, npm dependencies, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
+
+### Running a command against an ephemeral branch (`--testdb`)
+
+`--testdb` reuses the same ephemeral branch lifecycle for an explicit Owner-controlled persistence workflow: it provisions a non-production branch, applies committed migrations (never seed data), runs one command, and deletes the branch on exit:
+
+```bash
+./scripts/devserver.sh --testdb -- \
+  .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
+```
+
+The command receives `OPENORC_TEST_DATABASE_URL` (the branch database URL, injected into its environment only and never logged). Nothing else starts in this mode: no app, API, worker, queue backend, or ngrok. Surface-selection flags cannot be combined with `--testdb`; `--keep-supabase` keeps the branch after the run as the existing debug escape hatch. See `tests/README.md` for the integration-suite contract.
 
 ## Agent context
 
