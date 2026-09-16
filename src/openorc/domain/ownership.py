@@ -12,9 +12,10 @@ scopes all later Workspace-owned OpenOrc state (Phase 1).
 - A Project belongs to one Workspace. A Repository belongs to one Project and
   carries its Workspace directly; the direct scope must agree with the parent
   Project's Workspace.
-- Repository identity is the stable GitHub repository ID. Owner login, name,
-  URL, visibility, and similar fields are mutable observed metadata and never
-  identity.
+- A Repository record's identity is its OpenOrc UUID; the GitHub repository ID
+  is the stable external identity used for reconciliation and per-Workspace
+  canonicalization. Owner login, name, URL, visibility, and similar fields are
+  mutable observed metadata and never identity.
 """
 
 from __future__ import annotations
@@ -79,7 +80,8 @@ class GitHubRepositoryIdentity:
 
     GitHub repository IDs survive renames and ownership transfers; deleted and
     recreated repositories receive new IDs. This value — not owner/name
-    presentation — is what OpenOrc Repository identity is bound to.
+    presentation — is the stable external identity OpenOrc uses for
+    reconciliation and per-Workspace canonicalization.
     """
 
     github_repository_id: int
@@ -121,9 +123,10 @@ class RepositoryMetadata:
 class Repository:
     """One canonical OpenOrc Repository record within one Workspace.
 
-    Identity is ``(id, identity)``: the OpenOrc record and the stable GitHub
-    repository ID it refers to. ``workspace_id`` carries the direct Workspace
-    scope and must agree with the owning Project's Workspace.
+    The OpenOrc ``id`` is the domain-record identity. ``identity`` is the
+    stable external GitHub repository identity used for reconciliation and
+    per-Workspace canonicalization. ``workspace_id`` carries the direct
+    Workspace scope and must agree with the owning Project's Workspace.
     """
 
     id: UUID

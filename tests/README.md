@@ -39,11 +39,11 @@ Planned coverage layers include:
 `tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly:
 
 ```bash
-OPENORC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres \
+OPENORC_TEST_DATABASE_URL=<supplied non-production Supabase branch database URL> \
   .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
 ```
 
-- Integration tests **consume** a database; they never provision one. Nothing in the suite starts a server, creates a database, or creates a Supabase branch — provisioning a disposable target is the caller's out-of-band step.
-- `OPENORC_TEST_DATABASE_URL` must point at that already-running **disposable** Postgres database (for example a throwaway container or a local development stack database). The session fixture resets the `openorc` schema and applies the committed migrations from scratch before the tests run.
-- Ordinary deterministic tests never require this variable and never touch a database.
+- Integration tests **consume** the explicitly supplied non-production Supabase branch database; they **never provision** one. Provisioning, starting, and tearing down the target sits outside the test suite and outside agent responsibility: nothing in the suite creates a database, starts a server, or creates or deletes a Supabase branch. The suite only resets the `openorc` schema and applies the committed migrations from scratch within the supplied database.
+- The suite skips cleanly when `OPENORC_TEST_DATABASE_URL` is absent. Ordinary deterministic tests never require the variable and never touch a database.
+- Context: in the normal Owner local-development flow, such a target is the ephemeral non-production Supabase branch that `devserver.sh` creates and later deletes. `devserver.sh` is an Owner-only manual command for local end-to-end development; agents never invoke it (to run these tests or for any other purpose) and never provision infrastructure for them. Live integration execution is an explicit Owner-controlled validation step performed when an ephemeral branch database URL has been made available.
 

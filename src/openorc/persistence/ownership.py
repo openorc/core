@@ -195,8 +195,8 @@ def update_repository_metadata(
 ) -> Repository | None:
     """Replace the mutable observed metadata of one Repository record.
 
-    Identity columns are never touched: the record keeps its OpenOrc id and
-    its stable GitHub repository identity, and ``updated_at`` advances to the
+    Identity is never touched: the record keeps its OpenOrc UUID and its stable
+    external GitHub repository identity, and ``updated_at`` advances to the
     database clock. Returns ``None`` when the repository does not exist.
     """
     with transaction(pool) as conn:

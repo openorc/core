@@ -3,7 +3,7 @@
 -- Establishes the ownership hierarchy that scopes later Workspace-owned
 -- OpenOrc state:
 --
---   Profile -> Workspace -> Project / Repository
+--   Profile -> Workspace -> Project -> Repository
 --
 -- Durable properties carried by this migration:
 --
@@ -16,9 +16,11 @@
 -- - A Project belongs to one Workspace. A Repository belongs to one Project
 --   and carries its Workspace directly; the composite foreign key below makes
 --   direct-scope disagreement with the parent Project impossible.
--- - Repository identity is the stable GitHub repository ID, not mutable
---   owner/name presentation fields. The same external GitHub repository may
---   exist independently in multiple Workspaces; within one Workspace there is
+-- - A Repository record's identity is its OpenOrc UUID. The GitHub repository
+--   ID is the stable external identity used for reconciliation and
+--   canonicalization within a Workspace — never the mutable owner/name
+--   presentation fields. The same external GitHub repository may exist
+--   independently in multiple Workspaces; within one Workspace there is
 --   exactly one canonical Repository record per GitHub repository identity.
 --   Observed presentation metadata (owner login, name, URL, visibility,
 --   default branch) is mutable and never identity.

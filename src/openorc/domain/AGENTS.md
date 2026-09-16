@@ -15,9 +15,9 @@ Do not add speculative generic entities without a demonstrated v1 requirement.
 ## Ownership and repository identity (Phase 1)
 
 - Profile is the canonical OpenOrc application identity. Its identifier is the corresponding Supabase Auth user UUID by value — a deliberate 1:1 infrastructure identity, not a foreign key into Supabase-managed schemas. Ordinary OpenOrc domain references point at Profile, never at `auth.users`.
-- The ownership hierarchy is Profile → Workspace → Project/Repository. A Workspace is owned by exactly one Profile in v1; membership, invitation, and RBAC concepts do not exist.
+- The ownership hierarchy is Profile → Workspace → Project → Repository. A Workspace is owned by exactly one Profile in v1; membership, invitation, and RBAC concepts do not exist.
 - A Project belongs to one Workspace. A Repository belongs to one Project and carries its Workspace directly; the direct scope must agree with the owning Project's Workspace.
-- Repository identity is the stable GitHub repository ID. Owner login, name, URL, visibility, and default branch are mutable observed metadata and never identity; changing them does not change which external repository a Repository record refers to. The same external GitHub repository may exist independently in multiple Workspaces; within one Workspace there is one canonical Repository record per GitHub repository identity.
+- A Repository record's identity is its OpenOrc UUID. The GitHub repository ID is the stable external identity used for reconciliation and per-Workspace canonicalization; it survives renames and ownership transfers. Owner login, name, URL, visibility, and default branch are mutable observed metadata and never identity. The same external GitHub repository may exist independently in multiple Workspaces; within one Workspace there is one canonical Repository record per GitHub repository identity.
 
 ## Core invariants
 

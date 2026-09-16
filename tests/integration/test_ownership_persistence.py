@@ -1,21 +1,25 @@
 """Integration-marked persistence tests for the ownership foundation (issue #19).
 
-These tests apply the committed Supabase migrations to a real, disposable
-Postgres database and prove the durable ownership invariants directly:
-caller-supplied unique Profile identity, Workspace/Project ownership foreign
-keys, direct Workspace-scope consistency, and per-Workspace repository
-uniqueness. They are excluded from the ordinary deterministic baseline by the
-repository pytest configuration.
+These tests apply the committed Supabase migrations within the explicitly
+supplied non-production Supabase branch database and prove the durable
+ownership invariants directly: caller-supplied unique Profile identity,
+Workspace/Project ownership foreign keys, direct Workspace-scope consistency,
+and per-Workspace repository uniqueness. They are excluded from the ordinary
+deterministic baseline by the repository pytest configuration.
 
-Run explicitly against a disposable database:
+Run explicitly when a target has been made available:
 
-    OPENORC_TEST_DATABASE_URL=postgresql://... \
+    OPENORC_TEST_DATABASE_URL=<supplied non-production branch database URL> \
       .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
 
-The suite consumes the database it is given and never provisions one: the
-target must already be running, and the session fixture merely resets the
-``openorc`` schema and applies the committed migrations from scratch within
-it.
+The suite consumes the database it is given and never provisions one.
+Provisioning and teardown of the target sit outside the test suite and outside
+agent responsibility: in the normal Owner local-development flow the target is
+the ephemeral non-production Supabase branch that the Owner-only
+``devserver.sh`` command creates and later deletes (agents never invoke it).
+The session fixture merely resets the ``openorc`` schema and applies the
+committed migrations from scratch within the supplied database, and the suite
+skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 """
 
 from __future__ import annotations
