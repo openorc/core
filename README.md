@@ -200,7 +200,7 @@ The ordinary pytest baseline excludes tests marked `integration` by default; `py
 
 `scripts/devserver.sh` starts the full local stack against a fresh ephemeral hosted Supabase branch. It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
 
-The orchestration is implemented in Python (`src/openorc/devtools/devserver.py`); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
+The orchestration is implemented in Python (`src/openorc/devtools/devserver/`, a package of focused modules: CLI, environment, logging, subprocess mechanics, Supabase branch lifecycle, queue-backend ownership, and the orchestrator); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
 
 ```bash
 bash scripts/devserver.sh                 # full stack: Supabase branch + queue + API + worker + app (foreground)
