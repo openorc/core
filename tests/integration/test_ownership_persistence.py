@@ -12,8 +12,10 @@ Run explicitly against a disposable database:
     OPENORC_TEST_DATABASE_URL=postgresql://... \
       .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
 
-The target database must be disposable: the session fixture resets the
-``openorc`` schema and applies the committed migrations from scratch.
+The suite consumes the database it is given and never provisions one: the
+target must already be running, and the session fixture merely resets the
+``openorc`` schema and applies the committed migrations from scratch within
+it.
 """
 
 from __future__ import annotations

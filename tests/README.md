@@ -43,6 +43,7 @@ OPENORC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgre
   .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
 ```
 
-- `OPENORC_TEST_DATABASE_URL` must point at a **disposable** Postgres database (for example a throwaway container or a local development stack database). The session fixture resets the `openorc` schema and applies the committed migrations from scratch before the tests run.
+- Integration tests **consume** a database; they never provision one. Nothing in the suite starts a server, creates a database, or creates a Supabase branch — provisioning a disposable target is the caller's out-of-band step.
+- `OPENORC_TEST_DATABASE_URL` must point at that already-running **disposable** Postgres database (for example a throwaway container or a local development stack database). The session fixture resets the `openorc` schema and applies the committed migrations from scratch before the tests run.
 - Ordinary deterministic tests never require this variable and never touch a database.
 
