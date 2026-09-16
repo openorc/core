@@ -10,7 +10,7 @@ Phase 0 repository bootstrap is complete. The development environment, app/API/w
 
 Phase 1 is the current implementation focus: building OpenOrc's durable domain and persistence foundation. OpenOrc remains under active development and is not yet a complete end-to-end product.
 
-`openorc/core` is the complete open-source product. Self-hosting must remain complete.
+`openorc/core` is the complete source-available product. Self-hosting must remain complete.
 
 ```text
 Phase 0  Repository foundation           ✓ complete
@@ -231,4 +231,4 @@ Repository implementation guidance is carried by the root `AGENTS.md` plus neste
 
 ## License
 
-Apache License 2.0. See `LICENSE`.
+Copyright © 2026 Oliver Cheung. OpenOrc is licensed under the Elastic License 2.0 (ELv2). You may use, modify, redistribute, and self-host OpenOrc, including for commercial internal use and to build commercial products. Providing OpenOrc itself as a hosted or managed service requires a separate commercial license. See `LICENSE`.
