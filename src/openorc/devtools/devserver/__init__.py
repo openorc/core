@@ -40,7 +40,7 @@ Secrets are never logged; URLs are logged host-oriented (scheme + host).
 
 from __future__ import annotations
 
-from openorc.devtools.devserver.cli import USAGE, RunConfig, parse_args
+from openorc.devtools.devserver.cli import DEFAULT_TESTDB_COMMAND, USAGE, RunConfig, parse_args
 from openorc.devtools.devserver.environment import load_env_file
 from openorc.devtools.devserver.errors import (
     DevserverError,
@@ -79,6 +79,7 @@ from openorc.devtools.devserver.valkey import (
 )
 
 __all__ = [
+    "DEFAULT_TESTDB_COMMAND",
     "DEFAULT_VALKEY_URL",
     "LOG_PREFIX",
     "NGROK_LOG_PATH",

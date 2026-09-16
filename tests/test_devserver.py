@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from openorc.devtools.devserver import (
+    DEFAULT_TESTDB_COMMAND,
     DEFAULT_VALKEY_URL,
     NGROK_LOG_PATH,
     Devserver,
@@ -1474,9 +1475,15 @@ def test_testdb_rejects_surface_selection_flags(flag: str) -> None:
 
 
 @pytest.mark.parametrize("argv", [["--testdb"], ["--testdb", "--"]])
-def test_testdb_without_command_is_a_usage_error(argv: list[str]) -> None:
-    with pytest.raises(UsageError, match="command"):
-        parse_args(argv)
+def test_testdb_without_command_runs_canonical_suite(argv: list[str]) -> None:
+    config = parse_args(argv)
+    assert config.testdb_command == DEFAULT_TESTDB_COMMAND
+
+
+def test_testdb_keep_supabase_without_command_uses_default_suite() -> None:
+    config = parse_args(["--testdb", "--keep-supabase"])
+    assert config.testdb_command == DEFAULT_TESTDB_COMMAND
+    assert config.keep_supabase is True
 
 
 def test_testdb_command_without_separator_is_a_usage_error() -> None:
@@ -1547,6 +1554,19 @@ def test_testdb_provisions_branch_runs_command_and_deletes_branch(tmp_path: Path
     assert migration_index < spawn_index < delete_index
     assert len(harness.runner.delete_calls) == 1
     assert harness.runner.delete_calls[0].argv[3] == branch_name
+
+
+def test_testdb_bare_form_runs_canonical_suite(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, config=parse_args(["--testdb"]))
+    assert harness.devserver.run() == 0
+    # The default child command is the canonical persistence suite, run
+    # against the branch database; the branch is deleted exactly once.
+    assert harness.spawn_labels() == ["testdb-command"]
+    child = harness.runner.spawn_calls[0]
+    assert child.argv == DEFAULT_TESTDB_COMMAND
+    assert child.env is not None
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+    assert len(harness.runner.delete_calls) == 1
 
 
 def test_testdb_branch_url_overrides_existing_export(tmp_path: Path) -> None:

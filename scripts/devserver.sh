@@ -25,8 +25,9 @@
 #                                                      queue backend
 #                          API/worker -> Supabase preview branch (ephemeral)
 #
-# ./scripts/devserver.sh --testdb -- <command> [args...] provisions an
-# ephemeral branch, applies committed migrations, runs <command> with
+# ./scripts/devserver.sh --testdb [-- <command> [args...]] provisions an
+# ephemeral branch, applies committed migrations, runs the persistence
+# integration suite (or the supplied <command>) with
 # OPENORC_TEST_DATABASE_URL, and deletes the branch on exit.
 #
 # The Supabase branch created by a run is deleted on exit (including Ctrl-C

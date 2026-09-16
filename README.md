@@ -225,9 +225,15 @@ Lifecycle and safety properties:
 
 Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, local `redis-server`, npm dependencies, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
 
-### Running a command against an ephemeral branch (`--testdb`)
+### Running the integration suite against an ephemeral branch (`--testdb`)
 
-`--testdb` reuses the same ephemeral branch lifecycle for an explicit Owner-controlled persistence workflow: it provisions a non-production branch, applies committed migrations (never seed data), runs one command, and deletes the branch on exit:
+`--testdb` reuses the same ephemeral branch lifecycle for an explicit Owner-controlled persistence workflow: it provisions a non-production branch, applies committed migrations (never seed data), runs the canonical persistence integration suite, and deletes the branch on exit:
+
+```bash
+./scripts/devserver.sh --testdb
+```
+
+Supply a command after `--` to run something else against the same branch instead:
 
 ```bash
 ./scripts/devserver.sh --testdb -- \

@@ -81,13 +81,18 @@ Options:
       This should NOT be the normal workflow.
       Leaving branches running incurs compute cost.
 
-  --testdb [--keep-supabase] -- <command> [args...]
+  --testdb [--keep-supabase] [-- <command> [args...]]
       Provision an ephemeral hosted Supabase branch, apply the current
-      checkout's committed migrations (never seed data), run <command>
-      with OPENORC_TEST_DATABASE_URL pointing at the branch database,
-      and delete the branch on exit (including failure or Ctrl-C).
+      checkout's committed migrations (never seed data), run the
+      persistence integration suite with OPENORC_TEST_DATABASE_URL
+      pointing at the branch database, and delete the branch on exit
+      (including failure or Ctrl-C).
 
-      Owner workflow for integration-marked tests:
+      Bare --testdb runs the canonical suite:
+
+        ./devserver.sh --testdb
+
+      Supply a command after '--' to run something else instead:
 
         ./devserver.sh --testdb -- \
           .venv/bin/python -m pytest -m integration \
@@ -116,11 +121,22 @@ Notes:
   - API/worker processes run from the repository .venv (uv sync); there is no
     PATH python3 fallback.
   - --testdb provisions only the branch database: committed migrations are
-    applied, seed data is not, and the given command is the only process
-    started.
+    applied, seed data is not, and the integration suite (or the command
+    supplied after '--') is the only process started.
   - Cline is not expected to run this script during normal implementation.
 """
 
+
+# The canonical persistence integration suite run when --testdb is given
+# without an explicit command override (Owner workflow default).
+DEFAULT_TESTDB_COMMAND: tuple[str, ...] = (
+    ".venv/bin/python",
+    "-m",
+    "pytest",
+    "-m",
+    "integration",
+    "tests/integration/test_ownership_persistence.py",
+)
 
 _TESTDB_INCOMPATIBLE_FLAGS = frozenset(
     {
@@ -187,14 +203,15 @@ def _parse_testdb_command(config: RunConfig, rest: Sequence[str]) -> tuple[str, 
     """Parse everything after --testdb: options up to '--', then the command.
 
     '--' terminates option parsing; every argument after it belongs to the
-    child command and is never interpreted by the devserver.
+    child command and is never interpreted by the devserver. A missing or
+    empty override means the canonical integration suite runs.
     """
     remaining = list(rest)
     while remaining:
         arg = remaining.pop(0)
         if arg == "--":
             if not remaining:
-                raise UsageError("--testdb requires a command after '--'.")
+                return DEFAULT_TESTDB_COMMAND
             return tuple(remaining)
         if arg in {"-h", "--help"}:
             raise HelpRequested
@@ -209,4 +226,4 @@ def _parse_testdb_command(config: RunConfig, rest: Sequence[str]) -> tuple[str, 
                 f"Expected '--' before the testdb command; got {arg!r}. "
                 "Use: --testdb [--keep-supabase] -- <command> [args...]"
             )
-    raise UsageError("--testdb requires '--' followed by the command to run.")
+    return DEFAULT_TESTDB_COMMAND
