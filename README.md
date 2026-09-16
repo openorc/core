@@ -200,11 +200,11 @@ The ordinary pytest baseline excludes tests marked `integration` by default; `py
 
 `scripts/devserver.sh` starts the full local stack against a fresh ephemeral hosted Supabase branch. It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
 
-The orchestration is implemented in Python (`src/openorc/devtools/devserver.py`); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
+The orchestration is implemented in Python (`src/openorc/devtools/devserver/`, a package of focused modules: CLI, environment, logging, subprocess mechanics, Supabase branch lifecycle, queue-backend ownership, and the orchestrator); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
 
 ```bash
 bash scripts/devserver.sh                 # full stack: Supabase branch + queue + API + worker + app (foreground)
-bash scripts/devserver.sh --help          # component-only modes, --no-* controls, --keep-supabase
+bash scripts/devserver.sh --help          # component modes, --testdb, --no-* controls, --keep-supabase
 ```
 
 What a default run does:
@@ -224,6 +224,26 @@ Lifecycle and safety properties:
 - `--keep-supabase` preserves the branch for debugging and says so loudly (branches cost compute; delete them manually).
 
 Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, local `redis-server`, npm dependencies, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
+
+### Running the integration suite against an ephemeral branch (`--testdb`)
+
+`--testdb` reuses the same ephemeral branch lifecycle for an explicit Owner-controlled persistence workflow: it provisions a non-production branch, applies committed migrations (never seed data), runs the canonical persistence integration suite, and deletes the branch on exit:
+
+```bash
+./scripts/devserver.sh --testdb
+```
+
+Supply a command after `--` to run something else against the same branch instead:
+
+```bash
+./scripts/devserver.sh --testdb -- \
+  .venv/bin/python -m pytest -o addopts=--strict-markers \
+  -m integration tests/integration/test_ownership_persistence.py
+```
+
+The built-in suite command replaces the repository pytest marker defaults (`-o addopts=--strict-markers`) so the integration tests are actually selected while strict marker checking is preserved; ordinary runs keep excluding them and remain DB-free.
+
+The command receives `OPENORC_TEST_DATABASE_URL` (the branch database URL, injected into its environment only and never logged). Nothing else starts in this mode: no app, API, worker, queue backend, or ngrok. Surface-selection flags cannot be combined with `--testdb`; `--keep-supabase` keeps the branch after the run as the existing debug escape hatch. See `tests/README.md` for the integration-suite contract.
 
 ## Agent context
 

@@ -36,14 +36,31 @@ Planned coverage layers include:
 
 ## Integration-marked suites
 
-`tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly:
+`tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly.
+
+The Owner-run command for these suites is the devserver's `--testdb` mode. It reuses the canonical ephemeral Supabase branch lifecycle: provision a non-production branch, apply the committed migrations, run the persistence integration suite (or an explicitly supplied command) with `OPENORC_TEST_DATABASE_URL` pointing at the branch database, and delete the branch on exit:
+
+```bash
+./scripts/devserver.sh --testdb
+```
+
+The equivalent explicit form runs an arbitrary command against the same branch:
+
+```bash
+./scripts/devserver.sh --testdb -- \
+  .venv/bin/python -m pytest -o addopts=--strict-markers \
+  -m integration tests/integration/test_ownership_persistence.py
+```
+
+Equivalently, the suite can be pointed at any explicitly supplied non-production branch database:
 
 ```bash
 OPENORC_TEST_DATABASE_URL=<supplied non-production Supabase branch database URL> \
   .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
 ```
 
-- Integration tests **consume** the explicitly supplied non-production Supabase branch database; they **never provision** one. Provisioning, starting, and tearing down the target sits outside the test suite and outside agent responsibility: nothing in the suite creates a database, starts a server, or creates or deletes a Supabase branch. The suite only resets the `openorc` schema and applies the committed migrations from scratch within the supplied database.
+- Integration tests **consume** the explicitly supplied non-production Supabase branch database; they **never provision** one. Provisioning, starting, and tearing down the target sits outside the test suite and outside agent responsibility: `--testdb` owns branch provisioning and cleanup, and nothing in the suite creates a database, starts a server, or creates or deletes a Supabase branch. The suite only resets the `openorc` schema and applies the committed migrations from scratch within the supplied database.
+- The test process's only contract with provisioning is the `OPENORC_TEST_DATABASE_URL` environment variable; it never learns how the database was provisioned.
 - The suite skips cleanly when `OPENORC_TEST_DATABASE_URL` is absent. Ordinary deterministic tests never require the variable and never touch a database.
-- Context: in the normal Owner local-development flow, such a target is the ephemeral non-production Supabase branch that `devserver.sh` creates and later deletes. `devserver.sh` is an Owner-only manual command for local end-to-end development; agents never invoke it (to run these tests or for any other purpose) and never provision infrastructure for them. Live integration execution is an explicit Owner-controlled validation step performed when an ephemeral branch database URL has been made available.
+- `scripts/devserver.sh` (including `--testdb`) is Owner-only manual tooling; agents never invoke it — to run these tests or for any other purpose — and never provision infrastructure for them. Live integration execution is an explicit Owner-controlled validation step.
 
