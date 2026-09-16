@@ -37,4 +37,12 @@ These are durable Phase 1 conventions. Later issues inherit them; do not re-liti
 - Workflow/type vocabularies are Python enums/value objects enforced in the database as text columns plus CHECK constraints, never native Postgres ENUMs.
 - Instants are stored as `TIMESTAMPTZ`. Python datetimes crossing the persistence boundary are timezone-aware and normalized to UTC; naive datetimes are rejected. `utc_now()`-style helpers are low-level utilities, not workflow-clock semantics.
 
+## Ownership and repository identity conventions (Phase 1)
+
+- The ownership tables (`profiles`, `workspaces`, `projects`, `repositories`) live in the `openorc` schema and map to `openorc.domain.ownership` objects. Instants read from Postgres are normalized to UTC at the mapping boundary.
+- `profiles.id` is the caller-supplied Supabase Auth user UUID (1:1 by value). OpenOrc migrations never create foreign keys into Supabase-managed schemas (`auth`, `storage`, ...); domain references point at `openorc.profiles`.
+- Workspace-owned child rows carry a direct `workspace_id`. Where the parent also carries `workspace_id`, a composite foreign key `(parent_id, workspace_id) → parent (id, workspace_id)` enforces that the direct scope agrees with parent ownership. This is the durable pattern for later Workspace-owned tables.
+- External identities that must be canonical per Workspace use `UNIQUE (workspace_id, <stable external identity>)` (for example the GitHub repository ID). Mutable observed metadata changes through explicit repository UPDATE statements that also advance `updated_at`; identity columns are never part of such updates.
+- Violated durable invariants surface as driver exceptions (`UniqueViolation`, `ForeignKeyViolation`, ...). Translating them into typed application errors is a service-layer concern, not a persistence one.
+
 Read `supabase/AGENTS.md` for migration/auth/RLS concerns and domain/services guidance for semantic changes.

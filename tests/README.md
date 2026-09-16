@@ -34,3 +34,15 @@ Planned coverage layers include:
 - developer/infra tooling contracts (for example, the Supabase migration tooling exercised through a stub CLI, and the devserver orchestrator exercised through Python-level process-runner fakes);
 - explicit real headless integration/E2E validation later in the implementation sequence.
 
+## Integration-marked suites
+
+`tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly:
+
+```bash
+OPENORC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres \
+  .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
+```
+
+- `OPENORC_TEST_DATABASE_URL` must point at a **disposable** Postgres database (for example a throwaway container or a local development stack database). The session fixture resets the `openorc` schema and applies the committed migrations from scratch before the tests run.
+- Ordinary deterministic tests never require this variable and never touch a database.
+
