@@ -4,7 +4,7 @@
 
 OpenOrc is an open, provider-neutral control plane for governed agentic software development. It orchestrates engineering workflow; it does not replace coding runtimes, models, GitHub, CI, or observability systems.
 
-`openorc/core` is the complete Apache-2.0 open-source product. Self-hosting must remain complete. `openorc/cloud` may depend on core; core must never import, require, or encode Cloud-only billing or infrastructure assumptions.
+`openorc/core` is the complete Elastic License 2.0 (ELv2) source-available product. Self-hosting must remain complete. `openorc/cloud` may depend on core; core must never import, require, or encode Cloud-only billing or infrastructure assumptions.
 
 Supabase persistence/auth integration and the official v1 Cline adapter belong in core. Concrete OpenOrc Cloud deployment and Polar billing do not.
 
