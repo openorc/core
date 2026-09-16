@@ -2,7 +2,7 @@
 name = "openorc"
 description = "OpenOrc control plane: open, provider-neutral orchestration for governed agentic software development."
 readme = "README.md"
-license = "Apache-2.0"
+license = "Elastic-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13,<3.14"
 dynamic = ["version"]
