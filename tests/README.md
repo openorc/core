@@ -34,3 +34,16 @@ Planned coverage layers include:
 - developer/infra tooling contracts (for example, the Supabase migration tooling exercised through a stub CLI, and the devserver orchestrator exercised through Python-level process-runner fakes);
 - explicit real headless integration/E2E validation later in the implementation sequence.
 
+## Integration-marked suites
+
+`tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly:
+
+```bash
+OPENORC_TEST_DATABASE_URL=<supplied non-production Supabase branch database URL> \
+  .venv/bin/python -m pytest -m integration tests/integration/test_ownership_persistence.py
+```
+
+- Integration tests **consume** the explicitly supplied non-production Supabase branch database; they **never provision** one. Provisioning, starting, and tearing down the target sits outside the test suite and outside agent responsibility: nothing in the suite creates a database, starts a server, or creates or deletes a Supabase branch. The suite only resets the `openorc` schema and applies the committed migrations from scratch within the supplied database.
+- The suite skips cleanly when `OPENORC_TEST_DATABASE_URL` is absent. Ordinary deterministic tests never require the variable and never touch a database.
+- Context: in the normal Owner local-development flow, such a target is the ephemeral non-production Supabase branch that `devserver.sh` creates and later deletes. `devserver.sh` is an Owner-only manual command for local end-to-end development; agents never invoke it (to run these tests or for any other purpose) and never provision infrastructure for them. Live integration execution is an explicit Owner-controlled validation step performed when an ephemeral branch database URL has been made available.
+
