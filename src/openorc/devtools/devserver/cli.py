@@ -83,20 +83,21 @@ Options:
 
   --testdb [--keep-supabase] [-- <command> [args...]]
       Provision an ephemeral hosted Supabase branch, apply the current
-      checkout's committed migrations (never seed data), run the
-      persistence integration suite with OPENORC_TEST_DATABASE_URL
-      pointing at the branch database, and delete the branch on exit
-      (including failure or Ctrl-C).
+      checkout's committed migrations (never seed data), run every
+      persistence integration suite under tests/integration with
+      OPENORC_TEST_DATABASE_URL pointing at the branch database, and delete
+      the branch on exit (including failure or Ctrl-C).
 
       Bare --testdb runs the canonical suite:
 
         ./devserver.sh --testdb
 
-      Supply a command after '--' to run something else instead:
+      Supply a command after '--' to run something else instead (any pytest
+      selection may be substituted, for example one integration module):
 
         ./devserver.sh --testdb -- \
           .venv/bin/python -m pytest -o addopts=--strict-markers \
-          -m integration tests/integration/test_ownership_persistence.py
+          -m integration tests/integration/test_task_agent_session_persistence.py
 
       Nothing else starts in this mode: no app, API, worker, queue
       backend, or ngrok. Surface-selection flags (--app-only,
@@ -132,6 +133,11 @@ Notes:
 # The canonical persistence integration suite run when --testdb is given
 # without an explicit command override (Owner workflow default).
 #
+# The target is the tests/integration DIRECTORY, not a hard-coded module
+# list: the directory is the canonical persistence integration surface, so
+# every integration module runs today and future integration modules are
+# included automatically.
+#
 # The repository pytest default (pyproject addopts) excludes
 # integration-marked tests so ordinary runs stay DB-free. This command
 # replaces that default with strict-markers-only addopts and selects the
@@ -145,7 +151,7 @@ DEFAULT_TESTDB_COMMAND: tuple[str, ...] = (
     "addopts=--strict-markers",
     "-m",
     "integration",
-    "tests/integration/test_ownership_persistence.py",
+    "tests/integration",
 )
 
 _TESTDB_INCOMPATIBLE_FLAGS = frozenset(

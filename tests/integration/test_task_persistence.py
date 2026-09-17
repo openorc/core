@@ -218,8 +218,8 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
     with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             "insert into openorc.tasks "
-            "(workspace_id, repository_id, github_issue_id, github_issue_number) "
-            "values (%s, %s, %s, %s)",
+            "(workspace_id, repository_id, github_issue_id, github_issue_number, status) "
+            "values (%s, %s, %s, %s, 'ready_to_plan')",
             (workspace_id, repository_id, 9001, 42),
         )
 
@@ -529,18 +529,33 @@ def test_cancelled_and_completed_attempts_remain_distinguishable_history(
     attempts = task_repositories.list_issue_attempts(
         pool, repository_id=repository_id, github_issue_id=9001
     )
-    assert [attempt.id for attempt in attempts] == [
+    # All three attempts remain distinct, distinguishable history. The
+    # acceptance requirement is the distinct archived/current states per
+    # attempt — not that same-transaction inserts form a strict
+    # chronological sequence: PostgreSQL now() is transaction-stable, so
+    # rows inserted beneath one outer transaction can share a created_at
+    # value and the (created_at, id) ordering falls back to arbitrary UUID
+    # order. Verify each expected attempt by ID instead of position.
+    assert len(attempts) == 3
+    attempts_by_id = {attempt.id: attempt for attempt in attempts}
+    assert set(attempts_by_id) == {
         cancelled_attempt.id,
         completed_attempt.id,
         current.id,
-    ]
+    }
+
+    cancelled_row = attempts_by_id[cancelled_attempt.id]
     # Both terminal attempts are archived history and remain distinguishable.
-    assert attempts[0].status is TaskStatus.CANCELLED
-    assert attempts[0].archived_at is not None
-    assert attempts[1].status is TaskStatus.COMPLETED
-    assert attempts[1].archived_at is not None
-    assert attempts[2].status is TaskStatus.READY_TO_PLAN
-    assert attempts[2].archived_at is None
+    assert cancelled_row.status is TaskStatus.CANCELLED
+    assert cancelled_row.archived_at is not None
+
+    completed_row = attempts_by_id[completed_attempt.id]
+    assert completed_row.status is TaskStatus.COMPLETED
+    assert completed_row.archived_at is not None
+
+    current_row = attempts_by_id[current.id]
+    assert current_row.status is TaskStatus.READY_TO_PLAN
+    assert current_row.archived_at is None
 
     resolved = task_repositories.find_current_task_for_issue(
         pool, repository_id=repository_id, github_issue_id=9001
@@ -737,10 +752,13 @@ def test_archival_check_constraint_mirrors_the_domain_invariant(
 ) -> None:
     workspace_id, repository_id = _ownership_chain(conn)
     task_id = uuid.uuid4()
+    # Direct setup supplies the explicit nonterminal status: the schema
+    # intentionally carries no status default, and create_task() supplies
+    # READY_TO_PLAN at the write boundary.
     conn.execute(
         "insert into openorc.tasks "
-        "(id, workspace_id, repository_id, github_issue_id, github_issue_number) "
-        "values (%s, %s, %s, %s, %s)",
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status) "
+        "values (%s, %s, %s, %s, %s, 'ready_to_plan')",
         (task_id, workspace_id, repository_id, 9001, 42),
     )
 
