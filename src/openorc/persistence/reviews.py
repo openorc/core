@@ -18,6 +18,13 @@ outcome, summary, findings, and ``decided_at`` in one statement. There is
 no rewrite path: a finalized iteration can never change, and revisions and
 results are not rewritten to manufacture a different past.
 
+Iteration creation is guarded by the loop's current lifecycle,
+concurrency-safely: ``create_review_iteration`` locks the referenced loop
+row ``FOR UPDATE`` inside the creation transaction and inserts only while
+the loop is OPEN, so an iteration can never commit after the loop has
+closed (a concurrent close needs the same row lock). This is lifecycle
+integrity, not ReviewLoop orchestration.
+
 The durable backstops are database constraints: iteration numbering is
 unique per ReviewLoop (``UniqueViolation``), the reviewed PlanRevision must
 belong to the same Task and Workspace as the loop (``ForeignKeyViolation``),
@@ -211,18 +218,28 @@ def create_review_iteration(
     review_loop_id: UUID,
     iteration_number: int,
     plan_revision_id: UUID,
-) -> ReviewIteration:
+) -> ReviewIteration | None:
     """Create one unfinalized review iteration bound to its exact subject.
 
     The iteration starts unfinalized: all four result facts (outcome,
     summary, findings, decided_at) are NULL until
-    :func:`record_review_iteration_result` finalizes them atomically. The
-    subject is the exact PlanRevision under review; the composite foreign
-    keys durably enforce that the subject belongs to the same Task and
-    Workspace as the loop (a cross-Task subject raises
-    ``ForeignKeyViolation``), and the ``unique (review_loop_id,
-    iteration_number)`` constraint makes a duplicate iteration number
-    impossible (``UniqueViolation``).
+    :func:`record_review_iteration_result` finalizes them atomically.
+
+    The write is guarded by the loop's current lifecycle, concurrency-safely:
+    the referenced loop row is locked ``FOR UPDATE`` inside the creation
+    transaction and the insert applies only while the loop is OPEN. A CLOSED
+    or missing loop rejects the creation with ``None`` — CLOSED accepts no
+    further iterations, and a loop cannot close concurrently between the
+    check and the commit because ``close_review_loop`` needs the same row
+    lock (either the iteration commits while the loop is OPEN, or the close
+    wins and the creation is rejected). This is lifecycle integrity, not
+    ReviewLoop orchestration.
+
+    The same-Task/Workspace and exact-subject foreign keys are unchanged:
+    against an OPEN loop, an iteration whose Task/Workspace disagrees with
+    the loop, or whose subject belongs to another Task, still raises
+    ``ForeignKeyViolation``; a duplicate iteration number still raises
+    ``UniqueViolation``.
     """
     _require_positive_int(iteration_number, "iteration_number")
     if not isinstance(plan_revision_id, UUID):
@@ -230,6 +247,17 @@ def create_review_iteration(
             "ReviewIteration.plan_revision_id must be a UUID (the exact subject reviewed)"
         )
     with transaction(pool) as conn:
+        # Lifecycle guard, held to commit: locking the loop row FOR UPDATE
+        # makes the OPEN check and the insert atomic against a concurrent
+        # close_review_loop (which needs the same row lock), so an iteration
+        # can never commit after the loop has closed. A missing loop is
+        # equally "no OPEN loop to accept the iteration".
+        loop_state = conn.execute(
+            "select status from openorc.review_loops where id = %s for update",
+            (review_loop_id,),
+        ).fetchone()
+        if loop_state is None or loop_state[0] != "open":
+            return None
         row = conn.execute(
             "insert into openorc.review_iterations "
             "(workspace_id, task_id, review_loop_id, iteration_number, plan_revision_id) "

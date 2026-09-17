@@ -9,8 +9,10 @@ results (outcome, summary, findings, decided_at finalizing atomically and
 never rewriting), per-Loop iteration-number uniqueness, the exact v1
 purpose vocabulary, effective-iteration-limit retention with the
 configured default, current-plan pointer movement with same-Task/Workspace
-consistency, cross-Task corruption rejection, and the settled
-outcome/findings coherence. They are excluded from the ordinary
+consistency, cross-Task corruption rejection, the settled
+outcome/findings coherence, and iteration creation guarded
+concurrency-safely by the OPEN-loop lifecycle (a CLOSED loop accepts no
+further iterations). They are excluded from the ordinary
 deterministic baseline by the repository pytest configuration.
 
 Run explicitly when a target has been made available:
@@ -301,6 +303,7 @@ def test_repository_base_movement_neither_invalidates_nor_rewrites_an_accepted_r
         iteration_number=1,
         plan_revision_id=revision_v1.id,
     )
+    assert iteration is not None
     accepted = review_repositories.record_review_iteration_result(
         pool,
         review_iteration_id=iteration.id,
@@ -369,6 +372,7 @@ def test_finalized_iteration_results_cannot_be_rewritten(conn: Connection[Any]) 
         iteration_number=1,
         plan_revision_id=revision.id,
     )
+    assert iteration is not None
 
     first_result = review_repositories.record_review_iteration_result(
         pool,
@@ -476,6 +480,111 @@ def test_one_review_loop_cannot_contain_duplicate_iteration_numbers(
         )
         == 1
     )
+
+
+def test_iteration_creation_is_rejected_after_the_loop_has_closed(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, _, task_id, pool = _fresh_task(conn)
+    revision = planning_repositories.create_plan_revision(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        revision_number=1,
+        content="# Plan",
+        repository_base_sha="base-a",
+    )
+    loop = review_repositories.create_review_loop(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        purpose=ReviewLoopPurpose.PLANNING,
+        iteration_limit=DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
+    )
+    review_repositories.create_review_iteration(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        review_loop_id=loop.id,
+        iteration_number=1,
+        plan_revision_id=revision.id,
+    )
+    closed = review_repositories.close_review_loop(pool, review_loop_id=loop.id)
+    assert closed is not None and closed.status is ReviewLoopStatus.CLOSED
+
+    # A CLOSED loop accepts no further iterations: creation is a rejected
+    # no-op (lifecycle integrity at the persistence boundary, guarded
+    # concurrency-safely by the OPEN-loop state), no new row appears, and
+    # the earlier iteration remains intact.
+    assert (
+        review_repositories.create_review_iteration(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            review_loop_id=loop.id,
+            iteration_number=2,
+            plan_revision_id=revision.id,
+        )
+        is None
+    )
+    assert (
+        _row_count(
+            conn,
+            "select count(*) from openorc.review_iterations where review_loop_id = %s",
+            (loop.id,),
+        )
+        == 1
+    )
+    reread = review_repositories.get_review_iteration(
+        pool,
+        review_iteration_id=(
+            review_repositories.list_review_loop_iterations(pool, review_loop_id=loop.id)[0].id
+        ),
+    )
+    assert reread is not None and reread.iteration_number == 1
+
+    # A missing loop is equally "no OPEN loop to accept the iteration".
+    assert (
+        review_repositories.create_review_iteration(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            review_loop_id=uuid.uuid4(),
+            iteration_number=2,
+            plan_revision_id=revision.id,
+        )
+        is None
+    )
+
+    # The same-Task/Workspace and exact-subject FK behavior is unchanged:
+    # against an OPEN loop, a Task mismatch still raises ForeignKeyViolation.
+    other_task_id = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=_insert_repository(
+            conn,
+            project_id=_insert_project(conn, workspace_id),
+            workspace_id=workspace_id,
+            github_repository_id=70_000_005,
+        ),
+        github_issue_id=7304,
+    )
+    open_loop = review_repositories.create_review_loop(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        purpose=ReviewLoopPurpose.PLANNING,
+        iteration_limit=DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
+    )
+    with pytest.raises(ForeignKeyViolation):
+        review_repositories.create_review_iteration(
+            pool,
+            workspace_id=workspace_id,
+            task_id=other_task_id,
+            review_loop_id=open_loop.id,
+            iteration_number=1,
+            plan_revision_id=revision.id,
+        )
 
 
 def test_review_loop_purpose_accepts_only_planning_and_pr_review(
@@ -718,6 +827,7 @@ def test_settled_result_coherence_is_durable_in_both_directions(
             iteration_number=number,
             plan_revision_id=revision.id,
         )
+        assert created is not None
         return created.id
 
     # ACCEPTED clears with zero findings.
@@ -783,6 +893,7 @@ def test_findings_are_persisted_verbatim_as_a_json_array(conn: Connection[Any]) 
         iteration_number=1,
         plan_revision_id=revision.id,
     )
+    assert iteration is not None
     recorded_findings = [
         {"summary": "vague step 2", "details": "no measurable outcome", "lines": [40, 55]},
         {"summary": "missing rollback", "details": "add a rollback step", "lines": []},
@@ -866,6 +977,7 @@ def test_the_same_review_primitives_serve_both_v1_purposes(conn: Connection[Any]
         iteration_number=1,
         plan_revision_id=revision.id,
     )
+    assert iteration is not None
     assert iteration.review_loop_id == pr_loop.id
     loops = review_repositories.list_task_review_loops(
         pool, task_id=task_id, status=ReviewLoopStatus.OPEN

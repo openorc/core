@@ -4,11 +4,12 @@ The ordinary suite cannot execute Postgres; these tests use canned rows and
 a fake pool/connection seam (mirroring the session/ownership mapping fakes)
 to prove row-to-domain-object mapping, UTC normalization at the persistence
 boundary, parameterization, the explicit-OPEN establishment SQL, the
-absorbing close transition, the unfinalized-iteration insert, the atomic
-one-shot finalize SQL (with the ``Jsonb`` findings adapter and the
-``WHERE outcome IS NULL`` no-rewrite condition), and empty-result handling.
-Database constraint behavior is proven against a real database by the
-integration-marked suite in ``tests/integration/``.
+absorbing close transition, the lifecycle-guarded unfinalized-iteration
+insert (the loop row locked FOR UPDATE, the insert applying only while the
+loop is OPEN), the atomic one-shot finalize SQL (with the ``Jsonb``
+findings adapter and the ``WHERE outcome IS NULL`` no-rewrite condition),
+and empty-result handling. Database constraint behavior is proven against a
+real database by the integration-marked suite in ``tests/integration/``.
 """
 
 from __future__ import annotations
@@ -56,19 +57,28 @@ class FakeCursor:
 
 
 class FakeConnection:
-    """Records executed SQL and returns canned rows."""
+    """Records executed SQL and returns canned rows, optionally per statement."""
 
     def __init__(
         self,
         row: tuple[Any, ...] | None = None,
         rows: list[tuple[Any, ...]] | None = None,
+        responses: list[tuple[Any, ...] | None] | None = None,
     ) -> None:
         self.row = row
         self.rows = rows
+        # When supplied, each execute() consumes the next canned response —
+        # this models multi-statement repositories such as the
+        # lifecycle-guarded iteration creation (loop FOR UPDATE lock read,
+        # then the guarded insert).
+        self.responses = list(responses) if responses is not None else None
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
+        if self.responses is not None:
+            response = self.responses.pop(0)
+            return FakeCursor(response, None if response is None else [response])
         return FakeCursor(self.row, self.rows)
 
 
@@ -259,7 +269,7 @@ def test_close_review_loop_is_an_absorbing_conditional_transition() -> None:
 
 def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() -> None:
     row = _iteration_row()
-    fake_conn = FakeConnection(row)
+    fake_conn = FakeConnection(responses=[("open",), row])
     pool = cast(DatabasePool, FakePool(fake_conn))
 
     iteration = create_review_iteration(
@@ -271,6 +281,7 @@ def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() ->
         plan_revision_id=row[5],
     )
 
+    assert iteration is not None
     assert iteration.id == row[0]
     assert iteration.iteration_number == 1
     assert iteration.plan_revision_id == row[5]
@@ -280,14 +291,19 @@ def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() ->
     assert iteration.decided_at is None
     assert iteration.created_at == _utc_observed_at()
 
-    sql, params = fake_conn.executed[0]
+    # Two statements: the lifecycle guard first, then the guarded insert.
+    guard_sql, guard_params = fake_conn.executed[0]
+    assert "select status from openorc.review_loops" in guard_sql
+    assert "where id = %s for update" in guard_sql
+    assert guard_params == (row[3],)
+    sql, params = fake_conn.executed[1]
     assert "insert into openorc.review_iterations" in sql
     # An unfinalized iteration carries no result facts: the insert names
     # none of the four result columns.
     for excluded in ("outcome", "summary", "findings", "decided_at"):
         assert excluded not in sql.split("values")[0]
     assert params == (row[1], row[2], row[3], row[4], row[5])
-    assert len(fake_conn.executed) == 1
+    assert len(fake_conn.executed) == 2
 
 
 def test_create_review_iteration_validates_subject_and_number_before_sql() -> None:
@@ -312,6 +328,47 @@ def test_create_review_iteration_validates_subject_and_number_before_sql() -> No
             plan_revision_id=None,  # type: ignore[arg-type]
         )
     assert fake_conn.executed == []
+
+
+def test_create_review_iteration_is_guarded_by_the_open_loop_state() -> None:
+    # A CLOSED loop accepts no further iterations: the FOR UPDATE lifecycle
+    # guard runs first, the insert is never attempted, and the rejected
+    # no-op returns None (never retried blindly).
+    row = _iteration_row()
+    closed_conn = FakeConnection(responses=[("closed",)])
+    closed_pool = cast(DatabasePool, FakePool(closed_conn))
+    assert (
+        create_review_iteration(
+            closed_pool,
+            workspace_id=row[1],
+            task_id=row[2],
+            review_loop_id=row[3],
+            iteration_number=2,
+            plan_revision_id=row[5],
+        )
+        is None
+    )
+    assert len(closed_conn.executed) == 1
+    guard_sql, guard_params = closed_conn.executed[0]
+    assert "select status from openorc.review_loops" in guard_sql
+    assert "where id = %s for update" in guard_sql
+    assert guard_params == (row[3],)
+
+    # A missing loop is equally "no OPEN loop to accept the iteration".
+    missing_conn = FakeConnection(responses=[None])
+    missing_pool = cast(DatabasePool, FakePool(missing_conn))
+    assert (
+        create_review_iteration(
+            missing_pool,
+            workspace_id=row[1],
+            task_id=row[2],
+            review_loop_id=uuid.uuid4(),
+            iteration_number=2,
+            plan_revision_id=row[5],
+        )
+        is None
+    )
+    assert len(missing_conn.executed) == 1
 
 
 def test_list_review_loop_iterations_orders_by_number() -> None:
