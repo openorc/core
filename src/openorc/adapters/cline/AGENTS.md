@@ -19,7 +19,9 @@ Use the official Cline SDK path; do not reimplement the Cline Hub wire protocol 
 
 Cline owns provider authentication/catalogs, MCP/tool credentials, Git/runtime credentials, filesystem/tool execution, runtime persistence, and private conversational state. OpenOrc owns only the Connection/session routing and workflow semantics.
 
-At the validated v1 baseline OpenOrc does not pretend to select provider/model remotely; new sessions use the Hub's configured/default choice until a supported credential-safe discovery/configuration surface exists.
+OpenOrc Connection rows never model Cline-owned credentials: runtime-owned provider/MCP/tool credentials remain runtime-owned and are not stored as generic OpenOrc credential records. OpenOrc-owned authentication reaches the runtime only through an opaque reference boundary (`connections.auth_reference`), never as a persisted secret.
+
+At the validated v1 baseline OpenOrc does not pretend to select provider/model remotely; new sessions use the Hub's configured/default choice until a supported credential-safe discovery/configuration surface exists. `connections.reported_provider`/`reported_model` are nullable runtime-reported observations only — never configuration authority, never enums. Connection `enabled` and `session_capacity` are OpenOrc admission/eligibility semantics: they say nothing about runtime reachability, health, or lifecycle, and capacity is Owner-configured, never discovered from Cline.
 
 ## Delivery / telemetry
 
