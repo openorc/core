@@ -22,6 +22,10 @@
 --   scoped to the Connection and never discovered from the runtime. The
 --   default of 1 is deliberate: concurrency must be explicitly enabled by
 --   the Owner rather than assumed.
+-- - Durable checks mirror the domain's validation so a transaction cannot
+--   commit state the domain would reject afterwards: Connection names are
+--   nonblank, ``auth_reference`` is NULL or nonblank, and ``safe_config`` is
+--   a JSON object.
 -- - ``reported_provider``/``reported_model`` are nullable opaque
 --   runtime-reported observation strings, never OpenOrc configuration
 --   authority and never an enum; Cline provider/model selection remains
@@ -45,11 +49,17 @@ create table openorc.connections (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references openorc.workspaces (id),
     adapter_type text not null check (adapter_type = 'cline'),
-    name text not null,
-    safe_config jsonb not null default '{}'::jsonb,
+    -- Nonblank name: mirrors the domain's "strip() must be non-empty" rule
+    -- ('\S' matches at least one non-whitespace character).
+    name text not null check (name ~ '\S'),
+    -- Non-secret Owner configuration container: canonical JSON object only.
+    safe_config jsonb not null default '{}'::jsonb
+        check (jsonb_typeof(safe_config) = 'object'),
     session_capacity integer not null default 1 check (session_capacity > 0),
     enabled boolean not null default true,
-    auth_reference text,
+    -- Opaque OpenOrc-owned authentication boundary. NULL means no reference
+    -- is configured; a non-NULL value must be nonblank.
+    auth_reference text check (auth_reference is null or auth_reference ~ '\S'),
     reported_provider text,
     reported_model text,
     created_at timestamptz not null default now(),

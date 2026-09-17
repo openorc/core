@@ -22,11 +22,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
+from psycopg.types.json import Jsonb
+
 from openorc.domain.connections import (
     AdapterType,
     Connection,
     WorkflowRole,
     WorkflowRoleBinding,
+    canonical_safe_config,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
@@ -86,7 +89,12 @@ def create_connection(
     concurrency is explicitly enabled by the Owner). ``auth_reference`` is the
     opaque OpenOrc-owned auth boundary; ``reported_provider``/``reported_model``
     are nullable runtime-reported observations, never configuration.
+
+    ``safe_config`` is canonicalized through the domain (canonical JSON-object
+    semantics) and supplied to the driver as an explicit ``Jsonb`` adapter —
+    psycopg 3 does not adapt plain mappings to jsonb without one.
     """
+    config = canonical_safe_config({} if safe_config is None else safe_config)
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.connections "
@@ -98,7 +106,7 @@ def create_connection(
                 workspace_id,
                 adapter.value,
                 name,
-                {} if safe_config is None else dict(safe_config),
+                Jsonb(dict(config)),
                 session_capacity,
                 enabled,
                 auth_reference,
@@ -145,7 +153,11 @@ def update_connection(
     Identity, Workspace scope, adapter type, and the runtime-reported
     observation fields are never touched here. ``updated_at`` advances to the
     database clock. Returns ``None`` when the Connection does not exist.
+
+    ``safe_config`` is canonicalized through the domain and supplied as an
+    explicit ``Jsonb`` adapter, like every jsonb write at this boundary.
     """
+    config = canonical_safe_config(safe_config)
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.connections "
@@ -155,7 +167,7 @@ def update_connection(
             f"returning {_CONNECTION_COLUMNS}",
             (
                 name,
-                dict(safe_config),
+                Jsonb(dict(config)),
                 session_capacity,
                 enabled,
                 auth_reference,

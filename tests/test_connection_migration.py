@@ -22,13 +22,17 @@ BINDINGS_TABLE = "openorc.workflow_role_bindings"
 
 
 def _migration_text() -> str:
+    return _migration_text_raw().lower()
+
+
+def _migration_text_raw() -> str:
     matches = sorted(
         p.name for p in MIGRATIONS_DIR.glob("*_create_connection_and_role_bindings.sql")
     )
     assert len(matches) == 1, (
         f"expected exactly one create_connection_and_role_bindings migration, found {matches}"
     )
-    return (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8").lower()
+    return (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8")
 
 
 def _table_block(text: str, table: str) -> str:
@@ -64,8 +68,19 @@ def test_enablement_is_a_boolean_eligibility_switch() -> None:
 
 def test_authentication_is_only_the_opaque_nullable_reference() -> None:
     block = _table_block(_migration_text(), CONNECTIONS_TABLE)
-    assert "auth_reference text," in block
+    assert "auth_reference text" in block
     assert "auth_reference text not null" not in block
+
+
+def test_durable_checks_mirror_domain_validation() -> None:
+    # Raw text: lowercasing would corrupt the '\S' regex literals. The checks
+    # make it impossible to commit Connection state the domain rejects
+    # afterwards: nonblank names, NULL-or-nonblank auth reference, and
+    # canonical JSON-object safe_config.
+    block = _table_block(_migration_text_raw(), CONNECTIONS_TABLE)
+    assert "check (name ~ '\\S')" in block
+    assert "check (auth_reference is null or auth_reference ~ '\\S')" in block
+    assert "check (jsonb_typeof(safe_config) = 'object')" in block
 
 
 def test_reported_provider_model_are_nullable_opaque_strings() -> None:

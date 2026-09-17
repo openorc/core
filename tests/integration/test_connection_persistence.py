@@ -26,7 +26,6 @@ skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from collections.abc import Iterator
@@ -38,6 +37,7 @@ from typing import Any, LiteralString, cast
 import pytest
 from psycopg import Connection, connect
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
+from psycopg.types.json import Jsonb
 
 from openorc.domain.connections import AdapterType, WorkflowRole
 from openorc.persistence import connections as connection_repositories
@@ -122,7 +122,7 @@ def _insert_connection(
             workspace_id,
             "cline",
             name,
-            "{}" if safe_config is None else json.dumps(safe_config),
+            Jsonb({} if safe_config is None else safe_config),
             session_capacity,
             enabled,
             auth_reference,
@@ -223,6 +223,39 @@ def test_role_check_rejects_unknown_role(conn: Connection[Any]) -> None:
     with pytest.raises(CheckViolation):
         _insert_binding(
             conn, workspace_id=workspace_id, role="navigator", connection_id=connection_id
+        )
+
+
+def test_blank_connection_name_is_rejected(conn: Connection[Any]) -> None:
+    # The durable check mirrors the domain's nonblank-name rule: a blank
+    # (empty or whitespace-only) name can never be committed.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+
+    with pytest.raises(CheckViolation):
+        _insert_connection(conn, workspace_id=workspace_id, name="   ")
+
+
+def test_blank_auth_reference_is_rejected(conn: Connection[Any]) -> None:
+    # auth_reference is NULL (none configured) or nonblank; a blank string
+    # would blur the NULL sentinel and can never be committed.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+
+    with pytest.raises(CheckViolation):
+        _insert_connection(conn, workspace_id=workspace_id, auth_reference="   ")
+
+
+def test_safe_config_must_be_a_json_object(conn: Connection[Any]) -> None:
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+
+    with pytest.raises(CheckViolation):
+        conn.execute(
+            "insert into openorc.connections "
+            "(id, workspace_id, adapter_type, name, safe_config) "
+            "values (%s, %s, %s, %s, '[]'::jsonb)",
+            (uuid.uuid4(), workspace_id, "cline", "non-object config"),
         )
 
 

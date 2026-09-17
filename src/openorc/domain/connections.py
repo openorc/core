@@ -21,10 +21,11 @@ a workflow role (Producer or Reviewer) at a Connection.
   observation strings — never configuration authority, never enums. A future
   OpenOrc-side selection capability would add separate ``configured_*``
   concepts rather than repurposing these fields.
-- ``safe_config`` is the non-secret Owner configuration container. It is
-  validated only for structural JSON-serializability; concrete adapter
-  configuration schemas enforce allowed fields once those configurations
-  exist. Secret material never belongs here.
+- ``safe_config`` is the non-secret Owner configuration container with
+  canonical JSON-object semantics: string keys at every level, JSON-representable
+  values only, sequences normalized to lists, and nothing relying on silent
+  key coercion. Concrete adapter configuration schemas enforce allowed fields
+  once those configurations exist. Secret material never belongs here.
 - Exactly one binding exists per ``(Workspace, role)`` in v1 (no runtime
   pools, no failover). Producer and Reviewer bindings are independent and may
   reference the same Connection or separate Connections. The binding carries
@@ -34,11 +35,11 @@ a workflow role (Producer or Reviewer) at a Connection.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
+from math import isinf, isnan
 from types import MappingProxyType
 from uuid import UUID
 
@@ -48,6 +49,7 @@ __all__ = [
     "ConnectionDomainError",
     "WorkflowRole",
     "WorkflowRoleBinding",
+    "canonical_safe_config",
 ]
 
 
@@ -118,27 +120,7 @@ class Connection:
             # configuration authority.
             if value is not None and not isinstance(value, str):
                 raise ConnectionDomainError(f"Connection.{field_name} must be None or a string")
-        object.__setattr__(self, "safe_config", self._validated_safe_config(self.safe_config))
-
-    @staticmethod
-    def _validated_safe_config(value: object) -> Mapping[str, object]:
-        """Validate the non-secret configuration container and freeze its view.
-
-        Only structural rules apply: it must be a string-keyed mapping whose
-        content survives strict JSON round-tripping (jsonb storage). No
-        credential-shaped key rejection happens here — the contract is that
-        secret material does not belong in this container at all, and concrete
-        adapter configuration schemas enforce allowed fields when they exist.
-        """
-        if not isinstance(value, Mapping):
-            raise ConnectionDomainError("Connection.safe_config must be a mapping")
-        try:
-            json.dumps(dict(value), allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise ConnectionDomainError(
-                f"Connection.safe_config must be JSON-serializable for jsonb storage: {exc}"
-            ) from exc
-        return MappingProxyType(dict(value))
+        object.__setattr__(self, "safe_config", canonical_safe_config(self.safe_config))
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +144,58 @@ class WorkflowRoleBinding:
             raise ConnectionDomainError(
                 "WorkflowRoleBinding.role must be a WorkflowRole (producer or reviewer)"
             )
+
+
+def canonical_safe_config(value: object) -> Mapping[str, object]:
+    """Canonicalize a Connection's non-secret configuration container.
+
+    Canonical JSON-object semantics: the value must be a mapping with string
+    keys at every level, and every value must be JSON-representable — nested
+    mappings, sequences, and scalars only. Sequences normalize to lists
+    (tuples do not silently survive), NaN/Infinity are rejected, and nothing
+    relies on silent key coercion. The returned frozen view is exactly what
+    jsonb stores and what a reload reads back. This validates canonical form,
+    not credential safety: the contract is that secret material does not
+    belong in this container at all, and concrete adapter configuration
+    schemas enforce allowed fields when they exist.
+    """
+    if not isinstance(value, Mapping):
+        raise ConnectionDomainError("Connection.safe_config must be a mapping")
+    canonical: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ConnectionDomainError(
+                "Connection.safe_config keys must be strings at every level "
+                "(canonical JSON object keys)"
+            )
+        canonical[key] = _canonical_json_value(item)
+    return MappingProxyType(canonical)
+
+
+def _canonical_json_value(value: object) -> object:
+    """Return the canonical JSON representation of one safe-config value."""
+    if isinstance(value, Mapping):
+        nested: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ConnectionDomainError(
+                    "Connection.safe_config keys must be strings at every level "
+                    "(canonical JSON object keys)"
+                )
+            nested[key] = _canonical_json_value(item)
+        return nested
+    if isinstance(value, (list, tuple)):
+        return [_canonical_json_value(item) for item in value]
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        if isinstance(value, float) and (isnan(value) or isinf(value)):
+            raise ConnectionDomainError(
+                "Connection.safe_config must be canonical JSON; NaN and Infinity are not JSON"
+            )
+        return value
+    raise ConnectionDomainError(
+        "Connection.safe_config values must be JSON-representable "
+        f"(mapping, sequence, string, number, boolean, or null); got {type(value).__name__}"
+    )
 
 
 def connection_field_names() -> frozenset[str]:

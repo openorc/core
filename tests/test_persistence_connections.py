@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
+from psycopg.types.json import Jsonb
+
 from openorc.domain.connections import AdapterType, WorkflowRole
 from openorc.persistence.connections import (
     create_connection,
@@ -169,17 +171,13 @@ def test_create_connection_maps_row_and_normalizes_utc() -> None:
 
     sql, params = fake_conn.executed[0]
     assert "openorc.connections" in sql
-    assert params == (
-        row[1],
-        "cline",
-        "primary cline hub",
-        {"base_url": "https://hub.example.com"},
-        2,
-        True,
-        "vault://openorc/connection-auth/abc",
-        None,
-        None,
-    )
+    assert params is not None
+    # psycopg 3 does not adapt plain mappings to jsonb without an explicit
+    # wrapper: the repository must supply the Jsonb adapter itself.
+    assert isinstance(params[3], Jsonb)
+    assert params[3].obj == {"base_url": "https://hub.example.com"}
+    assert params[0:3] == (row[1], "cline", "primary cline hub")
+    assert params[4:] == (2, True, "vault://openorc/connection-auth/abc", None, None)
 
 
 def test_get_connection_maps_row_or_none() -> None:
@@ -237,7 +235,10 @@ def test_update_connection_maps_updated_row_and_params() -> None:
     assert "openorc.connections" in sql
     assert params is not None
     assert "updated_at = now()" in sql
-    assert params[:5] == ("renamed hub", {}, 3, False, "vault://openorc/connection-auth/def")
+    assert params[0] == "renamed hub"
+    assert isinstance(params[1], Jsonb)
+    assert params[1].obj == {}
+    assert params[2:5] == (3, False, "vault://openorc/connection-auth/def")
     assert params[5] == row[0]
     assert (
         update_connection(

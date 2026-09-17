@@ -154,10 +154,31 @@ def test_safe_config_rejects_non_json_serializable_content() -> None:
 
 
 def test_safe_config_rejects_non_json_numbers() -> None:
-    # jsonb storage does not accept NaN/Infinity; strict serialization rejects
+    # jsonb storage does not accept NaN/Infinity; canonical JSON rejects
     # them here rather than at the database boundary.
     with pytest.raises(ConnectionDomainError):
         _connection(safe_config={"ratio": float("nan")})
+
+
+@pytest.mark.parametrize("bad_config", [{1: "a"}, {None: "a"}, {"nested": {2: "b"}}])
+def test_safe_config_requires_string_keys_at_every_level(bad_config: dict[Any, Any]) -> None:
+    # Canonical JSON-object semantics: keys are strings everywhere. Nothing
+    # relies on json's silent key coercion ({"1": ...} would change what the
+    # caller sent).
+    with pytest.raises(ConnectionDomainError):
+        _connection(safe_config=bad_config)
+
+
+def test_safe_config_normalizes_sequences_to_lists() -> None:
+    # Canonical representation: tuples do not silently survive as tuples;
+    # what is stored is exactly what a reload reads back.
+    connection = _connection(safe_config={"flags": (1, 2), "nested": {"more": (3,)}})
+    assert dict(connection.safe_config) == {"flags": [1, 2], "nested": {"more": [3]}}
+
+
+def test_safe_config_rejects_non_json_value_types() -> None:
+    with pytest.raises(ConnectionDomainError):
+        _connection(safe_config={"raw": b"bytes"})
 
 
 def test_safe_config_must_be_a_mapping() -> None:
