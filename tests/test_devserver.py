@@ -1582,11 +1582,11 @@ def test_testdb_default_command_overrides_marker_exclusion() -> None:
 
 
 def _collect_integration_tests(pytest_args: list[str]) -> tuple[int, list[str]]:
-    """Collect the canonical integration file; return (exit code, node lines).
+    """Collect the integration tests pytest selects for these args.
 
-    Collection only imports the test module: no fixture runs, no database is
-    contacted, and the suite still skips itself when OPENORC_TEST_DATABASE_URL
-    is absent.
+    Collection only imports the test modules: no fixture runs, no database is
+    contacted, and the suites still skip themselves when
+    OPENORC_TEST_DATABASE_URL is absent.
     """
     result = subprocess.run(
         [sys.executable, "-m", "pytest", *pytest_args, "--collect-only", "-q"],
@@ -1600,23 +1600,29 @@ def _collect_integration_tests(pytest_args: list[str]) -> tuple[int, list[str]]:
 
 
 def test_testdb_default_command_selects_integration_tests() -> None:
-    # Regression guard for the first Owner run, where the built-in suite
-    # reported "collected 8 items / 8 deselected / 0 selected": the
-    # integration tests carried no integration marker and the repository
-    # addopts filter remained in force. The built-in command must actually
+    # Regression guards for Owner runs: the built-in suite must actually
     # select the integration tests against the real repository pytest
-    # configuration.
+    # configuration (the first Owner run saw "0 selected" under the marker
+    # default), and the directory target must cover every integration module
+    # so future modules run without amending this command.
     returncode, node_lines = _collect_integration_tests(list(DEFAULT_TESTDB_COMMAND)[3:])
     assert returncode == 0
     assert len(node_lines) >= 1
+    integration_modules = sorted(
+        path.name for path in (REPO_ROOT / "tests" / "integration").glob("test_*.py")
+    )
+    assert integration_modules, "expected at least one integration module"
+    for module in integration_modules:
+        assert any(f"tests/integration/{module}" in line for line in node_lines), (
+            f"the canonical --testdb suite must select {module}"
+        )
 
 
 def test_ordinary_pytest_defaults_still_exclude_integration_tests() -> None:
     # Pins the DB-free property of ordinary runs: without the --testdb addopts
-    # override, the repository default deselects the whole integration module.
-    returncode, node_lines = _collect_integration_tests(
-        ["tests/integration/test_ownership_persistence.py"]
-    )
+    # override, the repository default deselects the whole integration
+    # directory.
+    returncode, node_lines = _collect_integration_tests(["tests/integration"])
     assert node_lines == []
     assert returncode != 0  # nothing selected under the repository default
 
