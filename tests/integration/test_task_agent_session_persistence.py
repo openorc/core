@@ -42,6 +42,7 @@ from typing import Any, LiteralString, cast
 import pytest
 from psycopg import Connection, connect
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
+from psycopg.types.json import Jsonb
 
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskAgentSessionDomainError, TaskSessionLifecycleStatus
@@ -940,7 +941,7 @@ def test_initialization_coherence_rejects_mixed_state_rows(conn: Connection[Any]
                 "ext-session-partial",
                 "ready",
                 None,
-                {"stage": "plan"},
+                Jsonb({"stage": "plan"}),
                 stamp,
                 None,
             ),
@@ -966,7 +967,7 @@ def test_initialization_coherence_rejects_mixed_state_rows(conn: Connection[Any]
             "ext-session-full",
             "ready",
             "1",
-            {},
+            Jsonb({}),
             stamp,
             None,
         ),
