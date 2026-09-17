@@ -45,6 +45,7 @@ __all__ = [
     "get_task",
     "list_issue_attempts",
     "list_workspace_tasks",
+    "set_current_plan_revision",
     "update_task_status",
 ]
 
@@ -301,5 +302,47 @@ def bind_canonical_branch(
             "and canonical_feature_branch is null "
             f"returning {_TASK_COLUMNS}",
             (canonical_feature_branch, task_id, expected_state_token),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def set_current_plan_revision(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    plan_revision_id: UUID,
+) -> Task | None:
+    """Point the Task's current-plan pointer at one exact PlanRevision.
+
+    The current-plan pointer is a nullable Task-level fact: it identifies
+    the authoritative current PlanRevision without duplicating the
+    revision's content or review outcomes on the Task row (one fact, one
+    home). The composite foreign key ``tasks_current_plan_revision_fk``
+    durably enforces same-Task/Workspace consistency: the pointer may only
+    reference a PlanRevision whose ``(id, task_id, workspace_id)`` matches
+    the Task, so cross-Task or cross-Workspace corruption attempts raise
+    ``ForeignKeyViolation`` (translating driver exceptions into typed
+    application errors is a service-layer concern). Moving the pointer to a
+    newer same-Task revision leaves every older revision intact; the
+    pointer is never cleared implicitly (archival is what ends a Task's
+    attempt).
+
+    The update is conditional on ``expected_state_token`` and rotates the
+    token like every other authoritative Task-state mutation. Returns the
+    updated Task, or ``None`` when the token no longer matches or the Task
+    is missing/already archived (a stale operation that must not be retried
+    blindly).
+    """
+    if not isinstance(plan_revision_id, UUID):
+        raise TaskDomainError("plan_revision_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set current_plan_revision_id = %s, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            f"returning {_TASK_COLUMNS}",
+            (plan_revision_id, task_id, expected_state_token),
         ).fetchone()
     return None if row is None else _task_from_row(row)
