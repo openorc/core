@@ -168,6 +168,12 @@ def test_ensure_task_agent_session_inserts_and_maps_connecting_row() -> None:
     sql, params = fake_conn.executed[0]
     assert "openorc.task_agent_sessions" in sql
     assert "on conflict (task_id, role) do nothing" in sql
+    # Establishment semantics are explicit at the write boundary: the schema
+    # intentionally carries no lifecycle default, so the INSERT itself must
+    # supply CONNECTING. (A canned-row fake returns whatever row it is given,
+    # so only the SQL shape proves this — the gap this assertion closes.)
+    assert "lifecycle_status" in sql
+    assert "values (%s, %s, %s, %s, 'connecting')" in sql
     assert params is not None
     assert params == (row[1], row[2], "producer", row[4])
     # One statement: the fresh insert returned the new row directly.

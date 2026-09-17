@@ -116,7 +116,9 @@ def ensure_task_agent_session(
     """Establish the one Task/role session binding, idempotently.
 
     Exactly one binding exists per ``(task_id, role)``. When the binding does
-    not exist it is created as CONNECTING (no external session identity yet).
+    not exist it is created as CONNECTING (no external session identity yet):
+    establishment semantics are explicit at the write boundary because the
+    schema intentionally carries no lifecycle default.
     When it already exists, the existing row is returned unchanged — repeated
     establishment is idempotent and never creates a second row — but only
     when it agrees on the Workspace and the Connection: establishing the
@@ -127,10 +129,13 @@ def ensure_task_agent_session(
     """
     _require_role(role)
     with transaction(pool) as conn:
+        # Establishment explicitly writes the CONNECTING lifecycle: the
+        # schema deliberately declares lifecycle_status NOT NULL with no
+        # default, so a fresh binding's semantics are set here, not implied.
         row = conn.execute(
             "insert into openorc.task_agent_sessions "
-            "(workspace_id, task_id, role, connection_id) "
-            "values (%s, %s, %s, %s) "
+            "(workspace_id, task_id, role, connection_id, lifecycle_status) "
+            "values (%s, %s, %s, %s, 'connecting') "
             "on conflict (task_id, role) do nothing "
             f"returning {_SESSION_COLUMNS}",
             (workspace_id, task_id, role.value, connection_id),

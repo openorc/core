@@ -359,17 +359,21 @@ def test_direct_duplicate_insert_cannot_create_a_second_row(conn: Connection[Any
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
 
     # The database UNIQUE constraint is the durable backstop behind the
-    # idempotent repository path. (The direct statement needs its own
-    # savepoint so the failed insert cannot abort the per-test transaction.)
+    # idempotent repository path; establishment explicitly supplies the
+    # CONNECTING lifecycle (the schema carries no default). (The direct
+    # statement needs its own savepoint so the failed insert cannot abort
+    # the per-test transaction.)
     with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             "insert into openorc.task_agent_sessions "
-            "(workspace_id, task_id, role, connection_id) values (%s, %s, 'producer', %s)",
+            "(workspace_id, task_id, role, connection_id, lifecycle_status) "
+            "values (%s, %s, 'producer', %s, 'connecting')",
             (workspace_id, task_id, connection_id),
         )
         conn.execute(
             "insert into openorc.task_agent_sessions "
-            "(workspace_id, task_id, role, connection_id) values (%s, %s, 'producer', %s)",
+            "(workspace_id, task_id, role, connection_id, lifecycle_status) "
+            "values (%s, %s, 'producer', %s, 'connecting')",
             (workspace_id, task_id, connection_id),
         )
 
