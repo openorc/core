@@ -29,6 +29,8 @@ Before any delayed/replayed workflow-changing action:
 
 Distinguish known success, known non-delivery/failure, and uncertain outcome. Timeout or connection loss is not automatically safe to retry. Reconcile authoritatively where possible; use bounded retry only for known-safe cases; otherwise block. The LLM is never the idempotency mechanism.
 
+Task state carries the same discipline through the opaque `state_token`: reload the current durable Task and its token before any delayed/replayed workflow-changing action, apply mutations only through the conditional persistence primitives that rotate the token, and treat a stale token as a stale operation — never applied, surfaced as recovery context instead.
+
 ## Workflow ownership
 
 Services decide when workflow policy permits plan publication, PR composition/publication, Reviewer dispatch, runtime continuation, and merge invocation. Adapters provide mechanics only.
