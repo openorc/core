@@ -82,14 +82,16 @@ def create_task(
     github_issue_id: int,
     github_issue_number: int,
     status: TaskStatus = TaskStatus.READY_TO_PLAN,
-    canonical_feature_branch: str | None = None,
 ) -> Task:
     """Insert one Task attempt for a stable GitHub issue within a Repository.
 
-    A fresh Task starts nonterminal (default ``ready_to_plan``): terminal
-    attempts only arise through :func:`archive_task`, and at most one
-    non-archived Task may exist per ``(repository_id, github_issue_id)``
-    (the database partial unique index enforces it).
+    A fresh Task starts nonterminal (default ``ready_to_plan``) with a NULL
+    canonical branch: terminal attempts only arise through
+    :func:`archive_task`, the canonical branch is only bound once later
+    workflow/runtime logic has verified it (:func:`bind_canonical_branch`),
+    and at most one non-archived Task may exist per
+    ``(repository_id, github_issue_id)`` (the database partial unique index
+    enforces it).
     """
     if status.is_terminal:
         raise TaskDomainError(
@@ -98,9 +100,8 @@ def create_task(
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.tasks "
-            "(workspace_id, repository_id, github_issue_id, github_issue_number, "
-            "status, canonical_feature_branch) "
-            "values (%s, %s, %s, %s, %s, %s) "
+            "(workspace_id, repository_id, github_issue_id, github_issue_number, status) "
+            "values (%s, %s, %s, %s, %s) "
             f"returning {_TASK_COLUMNS}",
             (
                 workspace_id,
@@ -108,7 +109,6 @@ def create_task(
                 github_issue_id,
                 github_issue_number,
                 status.value,
-                canonical_feature_branch,
             ),
         ).fetchone()
     assert row is not None
@@ -133,11 +133,11 @@ def list_workspace_tasks(
     ``include_archived=True`` for full history. Serves the active-Workspace
     and status query shapes behind the ``tasks_workspace_*`` indexes.
     """
-    predicate = "" if include_archived else " where archived_at is null"
+    predicate = "" if include_archived else " and archived_at is null"
     with transaction(pool) as conn:
         rows = conn.execute(
-            f"select {_TASK_COLUMNS} from openorc.tasks{predicate} "
-            "where workspace_id = %s order by created_at, id",
+            f"select {_TASK_COLUMNS} from openorc.tasks "
+            f"where workspace_id = %s{predicate} order by created_at, id",
             (workspace_id,),
         ).fetchall()
     return [_task_from_row(row) for row in rows]
@@ -270,31 +270,35 @@ def bind_canonical_branch(
     task_id: UUID,
     *,
     expected_state_token: UUID,
-    canonical_feature_branch: str | None,
+    canonical_feature_branch: str,
 ) -> Task | None:
-    """Bind (or release) a Task's canonical feature branch, rotating the token.
+    """Bind a Task's canonical feature branch once, rotating the token.
 
-    Canonical branch ownership is a Task-level fact, established once later
-    workflow/runtime logic has verified the Producer-created branch. A
-    current Task's branch is exclusive within its Repository (enforced by
-    the partial unique index); retries, later Executions, and PR remediation
-    for the Task continue on the same branch.
+    Canonical branch ownership is a one-time, Task-level fact: the branch is
+    created NULL and bound exactly once, after later workflow/runtime logic
+    has verified the Producer-created branch. The conditional UPDATE applies
+    only while ``canonical_feature_branch IS NULL``, so a rebinding attempt
+    is a rejected no-op — a current Task never releases or switches its
+    canonical branch. A Task's branch is exclusive within its Repository
+    (enforced by the partial unique index); retries, later Executions, and
+    PR remediation for the Task continue on the same branch. Archival is
+    what releases branch ownership for future Tasks.
 
     The update is conditional on ``expected_state_token``. Returns the
-    updated Task, or ``None`` when the token no longer matches or the Task
-    is missing/already archived (a stale operation that must not be retried
-    blindly).
+    updated Task, or ``None`` when the token no longer matches, the Task is
+    missing/already archived, or the branch is already bound (none of these
+    outcomes may be retried blindly; stale-branch translation is a
+    service-layer concern).
     """
-    if canonical_feature_branch is not None and (
-        not isinstance(canonical_feature_branch, str) or not canonical_feature_branch.strip()
-    ):
-        raise TaskDomainError("canonical_feature_branch must be None or a non-empty string")
+    if not isinstance(canonical_feature_branch, str) or not canonical_feature_branch.strip():
+        raise TaskDomainError("canonical_feature_branch must be a non-empty string")
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.tasks "
             "set canonical_feature_branch = %s, "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
+            "and canonical_feature_branch is null "
             f"returning {_TASK_COLUMNS}",
             (canonical_feature_branch, task_id, expected_state_token),
         ).fetchone()

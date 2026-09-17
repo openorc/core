@@ -163,7 +163,15 @@ def _ownership_chain(
 
 
 class _SingleConnectionPool:
-    """Minimal DatabasePool adapter sharing the test connection and transaction."""
+    """Minimal DatabasePool adapter sharing the test connection and transaction.
+
+    Repository calls run inside a nested psycopg transaction (a SAVEPOINT on
+    the already-active per-test transaction), mirroring psycopg_pool's
+    per-checkout transaction semantics: a successful call releases the
+    savepoint, and an expected constraint violation rolls back only to it —
+    the per-test transaction stays valid so the remaining assertions run
+    instead of failing with ``InFailedSqlTransaction``.
+    """
 
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
@@ -171,7 +179,8 @@ class _SingleConnectionPool:
     def connection(self) -> Any:
         @contextmanager
         def managed() -> Any:
-            yield self._connection
+            with self._connection.transaction():
+                yield self._connection
 
         return managed()
 
@@ -195,6 +204,9 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
 
     # A second current Task for the same stable issue violates the partial
     # unique index, through the repository and through a direct insert alike.
+    # (Repository calls are savepoint-isolated by the pool adapter; the direct
+    # statement needs its own savepoint so the failed insert cannot abort the
+    # per-test transaction.)
     with pytest.raises(UniqueViolation):
         task_repositories.create_task(
             pool,
@@ -203,7 +215,7 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
             github_issue_id=9001,
             github_issue_number=42,
         )
-    with pytest.raises(UniqueViolation):
+    with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             "insert into openorc.tasks "
             "(workspace_id, repository_id, github_issue_id, github_issue_number) "
@@ -339,6 +351,74 @@ def test_canonical_branch_ownership_is_exclusive_among_current_tasks(
     assert owner is not None and owner.id == task_a.id
 
 
+def test_canonical_branch_binding_is_one_time(conn: Connection[Any]) -> None:
+    workspace_id, repository_id = _ownership_chain(conn)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    task = task_repositories.create_task(
+        pool,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=9001,
+        github_issue_number=42,
+    )
+    # The branch is created NULL; it is bound only after verification.
+    assert task.canonical_feature_branch is None
+
+    bound = task_repositories.bind_canonical_branch(
+        pool,
+        task.id,
+        expected_state_token=task.state_token,
+        canonical_feature_branch="openorc/task-42/producer",
+    )
+    assert bound is not None
+    assert bound.canonical_feature_branch == "openorc/task-42/producer"
+    rotated = bound.state_token
+
+    # A current Task cannot rebind (switch) or release (unbind) its canonical
+    # branch: the conditional bind applies only while the branch is NULL, so
+    # both attempts are rejected no-ops that leave the row untouched.
+    assert (
+        task_repositories.bind_canonical_branch(
+            pool,
+            task.id,
+            expected_state_token=rotated,
+            canonical_feature_branch="openorc/task-42/switched",
+        )
+        is None
+    )
+    unchanged = task_repositories.get_task(pool, task.id)
+    assert unchanged is not None
+    assert unchanged.canonical_feature_branch == "openorc/task-42/producer"
+    assert unchanged.state_token == rotated
+
+    # Archival is what releases branch ownership for future Tasks.
+    archived = task_repositories.archive_task(
+        pool,
+        task.id,
+        expected_state_token=rotated,
+        terminal_status=TaskStatus.COMPLETED,
+    )
+    assert archived is not None
+
+    # A fresh Task for the same (now terminal) issue may bind that branch.
+    fresh = task_repositories.create_task(
+        pool,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=9001,
+        github_issue_number=42,
+    )
+    fresh_bound = task_repositories.bind_canonical_branch(
+        pool,
+        fresh.id,
+        expected_state_token=fresh.state_token,
+        canonical_feature_branch="openorc/task-42/producer",
+    )
+    assert fresh_bound is not None
+    assert fresh_bound.canonical_feature_branch == "openorc/task-42/producer"
+
+
 def test_archived_attempt_releases_the_issue_and_the_branch(
     conn: Connection[Any],
 ) -> None:
@@ -366,10 +446,16 @@ def test_archived_attempt_releases_the_issue_and_the_branch(
         canonical_feature_branch="openorc/task-42/producer",
     )
 
+    # Binding rotated task_a's token: archival must use the rotated token,
+    # never the pre-bind one.
+    bound = task_repositories.get_task(pool, task_a.id)
+    assert bound is not None
+    assert bound.state_token != task_a.state_token
+
     archived = task_repositories.archive_task(
         pool,
         task_a.id,
-        expected_state_token=task_a.state_token,
+        expected_state_token=bound.state_token,
         terminal_status=TaskStatus.CANCELLED,
     )
     assert archived is not None
@@ -659,18 +745,27 @@ def test_archival_check_constraint_mirrors_the_domain_invariant(
     )
 
     # A terminal status without archival violates the lifecycle CHECK...
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute("update openorc.tasks set status = 'cancelled' where id = %s", (task_id,))
     # ...and archival without a terminal outcome violates it too.
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute("update openorc.tasks set archived_at = now() where id = %s", (task_id,))
 
     # A status outside the settled vocabulary is rejected outright.
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "update openorc.tasks set status = 'awaiting_review' where id = %s",
             (task_id,),
         )
+
+    # Every expected violation was savepoint-isolated, so the transaction is
+    # still healthy and the untouched row remains readable.
+    row = conn.execute(
+        "select status, archived_at from openorc.tasks where id = %s", (task_id,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "ready_to_plan"
+    assert row[1] is None
 
 
 def test_task_round_trip_and_instants_are_utc_normalized(conn: Connection[Any]) -> None:

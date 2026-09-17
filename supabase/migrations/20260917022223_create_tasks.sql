@@ -48,8 +48,10 @@
 --   partial unique index makes two current Tasks in one Repository owning
 --   the same non-null canonical branch impossible. Retries, later
 --   Executions, and PR remediation for a Task continue on that Task's
---   branch. An archived attempt releases the branch, so a fresh Task after
---   reopen may bind it again.
+--   branch. Binding is a one-time operation: the branch is created NULL and
+--   bound exactly once, and a current Task never releases or switches its
+--   canonical branch — archival releases the ownership, so a fresh Task
+--   after reopen may bind it again.
 -- - ``state_token`` is the opaque optimistic-concurrency state token. Every
 --   authoritative Task-state mutation must replace it, and mutations are
 --   conditional on the caller's expected token: stale operations fail
@@ -100,7 +102,9 @@ create table openorc.tasks (
     -- status, never through archival alone.
     archived_at timestamptz,
     -- Task-level canonical feature-branch ownership. NULL until later
-    -- workflow logic verifies and binds the Producer-created branch.
+    -- workflow logic verifies and binds the Producer-created branch; binding
+    -- is one-time (a current Task never releases or switches its branch) and
+    -- archival releases the ownership for future Tasks.
     canonical_feature_branch text check (
         canonical_feature_branch is null or canonical_feature_branch ~ '\S'
     ),

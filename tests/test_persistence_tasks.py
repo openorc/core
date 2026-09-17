@@ -128,7 +128,9 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
 
 
 def test_create_task_maps_row_and_normalizes_utc() -> None:
-    row = _task_row(status="planning", canonical_feature_branch="openorc/task-42/prod")
+    # A fresh Task is created with a NULL canonical branch; binding happens
+    # once later workflow logic has verified the Producer-created branch.
+    row = _task_row(status="planning")
     fake_conn = FakeConnection(row)
     pool = cast(DatabasePool, FakePool(fake_conn))
 
@@ -139,7 +141,6 @@ def test_create_task_maps_row_and_normalizes_utc() -> None:
         github_issue_id=9001,
         github_issue_number=42,
         status=TaskStatus.PLANNING,
-        canonical_feature_branch="openorc/task-42/prod",
     )
 
     assert created.id == row[0]
@@ -149,14 +150,18 @@ def test_create_task_maps_row_and_normalizes_utc() -> None:
     assert created.github_issue_number == 42
     assert created.status is TaskStatus.PLANNING
     assert created.archived_at is None
-    assert created.canonical_feature_branch == "openorc/task-42/prod"
+    assert created.canonical_feature_branch is None
     assert created.created_at == _utc_observed_at()
     assert created.created_at.utcoffset() == timedelta(0)
 
     sql, params = fake_conn.executed[0]
     assert "insert into openorc.tasks" in sql
+    # The insert's column list never sets a canonical branch: create-NULL is
+    # the contract (the RETURNING projection legitimately reads it back).
+    columns = sql.split("(", 1)[1].split(")", 1)[0]
+    assert columns == "workspace_id, repository_id, github_issue_id, github_issue_number, status"
     assert params is not None
-    assert params == (row[1], row[2], 9001, 42, "planning", "openorc/task-42/prod")
+    assert params == (row[1], row[2], 9001, 42, "planning")
     # Values are parameterized, never interpolated into the SQL text.
     assert "9001" not in sql
 
@@ -197,7 +202,11 @@ def test_get_task_maps_row_or_none() -> None:
     assert get_task(cast(DatabasePool, FakePool(FakeConnection(None))), row[0]) is None
 
 
-def test_list_workspace_tasks_defaults_to_current_only() -> None:
+def test_list_workspace_tasks_builds_one_valid_where_clause() -> None:
+    # Construction guard: both paths must produce exactly one WHERE clause
+    # (a predicate appended after the workspace condition would emit
+    # "... where archived_at is null where workspace_id = %s", which is
+    # invalid SQL the fake cannot catch by substring assertions alone).
     rows = [_task_row(), _task_row()]
     fake_conn = FakeConnection(None, rows)
     pool = cast(DatabasePool, FakePool(fake_conn))
@@ -205,13 +214,20 @@ def test_list_workspace_tasks_defaults_to_current_only() -> None:
     listed = list_workspace_tasks(pool, workspace_id=rows[0][1])
     assert [task.id for task in listed] == [rows[0][0], rows[1][0]]
     sql, params = fake_conn.executed[0]
-    assert "where archived_at is null" in sql
+    assert sql.count(" where ") == 1
+    assert "where workspace_id = %s" in sql
+    # The active-only filter narrows the workspace condition, never opens a
+    # second WHERE clause.
+    assert "and archived_at is null" in sql
+    assert sql.index("where workspace_id") < sql.index("and archived_at is null")
     assert params == (rows[0][1],)
 
     all_tasks = list_workspace_tasks(pool, workspace_id=rows[0][1], include_archived=True)
     assert [task.id for task in all_tasks] == [rows[0][0], rows[1][0]]
     sql, _ = fake_conn.executed[1]
-    assert "where archived_at is null" not in sql
+    assert sql.count(" where ") == 1
+    assert "where workspace_id = %s" in sql
+    assert "archived_at is null" not in sql
 
 
 def test_list_issue_attempts_and_current_resolution_queries() -> None:
@@ -397,7 +413,7 @@ def test_archive_task_returns_none_when_token_is_stale() -> None:
     )
 
 
-def test_bind_canonical_branch_is_conditional_and_validates() -> None:
+def test_bind_canonical_branch_is_conditional_and_one_time() -> None:
     # The canned row mirrors the post-mutation row: bound branch, rotated token.
     original_token = uuid.uuid4()
     row = _task_row(canonical_feature_branch="openorc/task-42/prod", state_token=uuid.uuid4())
@@ -419,23 +435,17 @@ def test_bind_canonical_branch_is_conditional_and_validates() -> None:
         "set canonical_feature_branch = %s, "
         "state_token = gen_random_uuid(), updated_at = now()" in sql
     )
+    # One-time binding: the update only applies while the branch is NULL, so a
+    # rebinding attempt is a rejected no-op rather than a competing claim.
+    assert "and canonical_feature_branch is null" in sql
     assert "where id = %s and state_token = %s and archived_at is null" in sql
     assert params == ("openorc/task-42/prod", row[0], original_token)
 
-    # Release is just the None case of the same conditional primitive.
-    row = _task_row(canonical_feature_branch=None, state_token=uuid.uuid4())
-    fake_conn = FakeConnection(row)
-    pool = cast(DatabasePool, FakePool(fake_conn))
-    released = bind_canonical_branch(
-        pool, row[0], expected_state_token=original_token, canonical_feature_branch=None
-    )
-    assert released is not None and released.canonical_feature_branch is None
-    sql, _ = fake_conn.executed[0]
-    assert "state_token = gen_random_uuid()" in sql
 
-
-@pytest.mark.parametrize("branch", ["", "   ", "\t\n"])
-def test_bind_canonical_branch_rejects_blank_branches_before_any_sql(branch: str) -> None:
+@pytest.mark.parametrize("branch", [None, "", "   ", "\t\n"])
+def test_bind_canonical_branch_requires_a_nonblank_branch(branch: object) -> None:
+    # One-time binding only: there is no release-by-NULL path — archival is
+    # what releases branch ownership for future Tasks.
     fake_conn = FakeConnection()
     pool = cast(DatabasePool, FakePool(fake_conn))
 
@@ -444,7 +454,7 @@ def test_bind_canonical_branch_rejects_blank_branches_before_any_sql(branch: str
             pool,
             uuid.uuid4(),
             expected_state_token=uuid.uuid4(),
-            canonical_feature_branch=branch,
+            canonical_feature_branch=branch,  # type: ignore[arg-type]
         )
     assert fake_conn.executed == []
 

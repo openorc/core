@@ -117,6 +117,9 @@ def test_canonical_branch_ownership_is_a_task_level_column() -> None:
     assert "canonical_feature_branch text check (" in block
     # Nonblank when set ('\S' matches at least one non-whitespace character).
     assert "canonical_feature_branch ~ '\\S'" in _migration_text_raw()
+    # One-time binding is documented intent: created NULL, bound once, never
+    # released or switched by a current Task — archival releases ownership.
+    assert "binding is a one-time operation" in _migration_text()
 
 
 def test_exclusivity_partial_unique_indexes() -> None:
