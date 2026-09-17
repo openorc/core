@@ -39,6 +39,16 @@ Do not add speculative generic entities without a demonstrated v1 requirement.
 - `current_plan_revision_id`/`current_owner_gate_id` are nullable current-object pointers only. They identify related records and never duplicate those records' content or outcomes (one fact, one home). There is deliberately no singular current-Execution pointer: Executions are attempt/history records and multiple may exist.
 - Ordinary lifecycle archives Tasks. Explicit Owner purge of archived internal Task data is a distinct, separately authorized operation and never implies GitHub mutation; nothing in the Task row is GitHub-authoritative.
 
+## Task agent sessions (Phase 1)
+
+- A TaskAgentSession is the durable Task/role ↔ external-session binding. Exactly one binding exists per `(Task, role)` in v1 for PRODUCER and REVIEWER. Establishment is idempotent for the same Connection and a deterministic conflict against a different one; a binding is never silently repointed, replaced, or duplicated.
+- `external_session_id` is the opaque external-session identity. It is NULL while CONNECTING and, once successfully initialized, immutable for the binding's lifetime: no successor session ever replaces it. A non-null external session identity belongs to exactly one Task/role binding within its Connection; the same opaque identity may be bound independently under different Connections.
+- Lifecycle vocabulary is CONNECTING, READY, LOST, ENDED. CONNECTING is establishment in progress and by definition not yet a bound session. Legal transitions are CONNECTING → READY | ENDED and READY → LOST | ENDED; LOST and ENDED are absorbing. `ended_at` is the semantic ENDED timestamp, set exactly when the status is ENDED and never substituted by `updated_at`.
+- Runtime/Hub unavailability is not session loss and is not persisted lifecycle state: a recoverable Hub restart does not create a replacement binding. Genuine loss of the exact external session/context is LOST on the same binding; later workflow services translate that into `AGENT_SESSION_LOST` blocking behavior.
+- `initialization_protocol_version` records the protocol version used to initialize the session (opaque string; absence is valid). `effective_config_snapshot` is the NON-SECRET effective runtime/session configuration snapshot captured at initialization: it is caller-assembled, never populated by blindly serializing Connection configuration or authentication material, and raw credentials/tokens must never enter it. Once a session has initialized, its snapshot is historical for that Task session; later Workspace role-binding/Connection configuration changes affect future sessions and never rewrite an initialized session's snapshot.
+- `reported_provider`/`reported_model`/`reported_runtime_version` are nullable opaque runtime-reported provenance observations — arbitrary strings or NULL, never enums, never configuration authority.
+- Capacity is Connection-scoped: Producer and Reviewer sessions sharing one Connection each consume occupancy against that Connection's Owner-configured `session_capacity`. Persistence exposes active-session accounting; admission decisions belong to later services.
+
 ## Core invariants
 
 - One GitHub issue has at most one current non-archived Task; cancellation archives/releases that mapping for a fresh Task.
