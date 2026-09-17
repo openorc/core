@@ -18,11 +18,11 @@ services
 API / workers
 
 services → persistence + adapters
-adapters → protocol
+Agent Runtime adapters → protocol
 adapters/persistence → external systems
 ```
 
-`src/openorc/protocol/` is the low-level runtime-independent formal-contract boundary between OpenOrc and connected agent runtimes: versioned formal response families, envelopes, protocol parsing/validation helpers, and shared typed protocol models. It imports no concrete adapters, services, domain, persistence, API, workers, or runtime-specific packages. Services may consume protocol result types returned by adapters.
+`src/openorc/protocol/` is the low-level runtime-independent formal-contract boundary between OpenOrc and connected agent runtimes: versioned formal response families, envelopes, protocol parsing/validation helpers, and shared typed protocol models. It imports no concrete adapters, services, domain, persistence, API, workers, or runtime-specific packages. Services may consume protocol result types returned by Agent Runtime adapters.
 
 Forbidden dependency directions include:
 

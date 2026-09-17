@@ -36,7 +36,7 @@ This package is not a network service, runtime adapter, workflow engine, or gene
 - Protocol code defines and validates the language OpenOrc speaks with agents; it does not decide workflow consequences. Task state transitions, Owner authority, ReviewLoop behavior, retry/recovery policy, durable persistence effects, and other workflow semantics remain in services/domain code.
 - A validated `review_result`, for example, is a typed protocol result. Deciding whether it advances a Task, creates another review iteration, or opens an OwnerGate is outside this package.
 - Domain validation remains responsible for domain entities/value objects and workflow invariants. Formal agent-response schema validation belongs here; do not duplicate it in `domain/`.
-- Adapters own transport/session mechanics, response extraction, provider/runtime-specific normalization, and provider/runtime error classification. They invoke protocol parsing/validation when translating provider-native responses into typed OpenOrc results and do not duplicate formal OpenOrc schemas locally.
+- Agent Runtime adapters own transport/session mechanics, response extraction, provider/runtime-specific normalization, and provider/runtime error classification. They invoke protocol parsing/validation when translating provider-native responses into typed OpenOrc results and do not duplicate formal OpenOrc schemas locally. Other external-system adapters (e.g. GitHub) do not depend on this package.
 
 ## Dependency direction
 
@@ -47,8 +47,8 @@ Code dependency rules:
 ```text
 services → domain
 services → adapters + persistence
-adapters → protocol
-services may consume protocol result types returned by adapters
+Agent Runtime adapters → protocol
+services may consume protocol result types returned by Agent Runtime adapters
 protocol → no concrete adapters, services, domain, persistence, API, workers, or runtime-specific packages
 API / workers → services
 ```
