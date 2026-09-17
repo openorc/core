@@ -2,7 +2,7 @@
 
 ## Boundary
 
-The domain is the semantic heart of OpenOrc. It owns entities/value objects, state enums, transition rules, exact-subject invariants, authority semantics, and provider/transport-independent validation.
+The domain is the semantic heart of OpenOrc. It owns entities/value objects, state enums, transition rules, exact-subject invariants, authority semantics, and provider/transport-independent validation of domain entities, value objects, and workflow invariants. Formal agent-response protocol-schema validation belongs to `src/openorc/protocol/`, not here; do not duplicate it in the domain.
 
 Do not import FastAPI, RQ, Supabase SDK, GitHub SDK, Cline SDK, bridge mechanics, or Cloud billing/deployment code.
 

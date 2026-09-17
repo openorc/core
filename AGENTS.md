@@ -72,6 +72,7 @@ Read the nearest relevant guide before editing, and read all relevant guides for
 - `.github/AGENTS.md`
 - `apps/app/AGENTS.md`
 - `src/openorc/AGENTS.md`
+- `src/openorc/protocol/AGENTS.md`
 - `src/openorc/domain/AGENTS.md`
 - `src/openorc/services/AGENTS.md`
 - `src/openorc/api/AGENTS.md`
