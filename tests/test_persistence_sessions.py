@@ -288,11 +288,15 @@ def test_initialize_maps_the_ready_row_and_wraps_the_snapshot_in_jsonb() -> None
     assert params[6:8] == (row[2], "producer")
 
 
-def test_initialize_without_a_snapshot_passes_null_not_jsonb_null() -> None:
+def test_initialize_with_an_empty_snapshot_wraps_jsonb_empty_object() -> None:
+    # An empty JSON object is a valid effective configuration snapshot when
+    # no concrete configurable values exist; NULL is not — initialization
+    # facts move atomically with the bound identity.
     row = _session_row(
         external_session_id="ext-session-2",
         lifecycle_status="ready",
         initialization_protocol_version="1",
+        effective_config_snapshot={},
         initialized_at=_observed_at(),
         updated_at=_observed_at(),
     )
@@ -305,13 +309,40 @@ def test_initialize_without_a_snapshot_passes_null_not_jsonb_null() -> None:
         role=WorkflowRole.REVIEWER,
         external_session_id="ext-session-2",
         initialization_protocol_version="1",
+        effective_config_snapshot={},
     )
 
     assert session is not None
-    assert session.effective_config_snapshot is None
+    assert dict(session.effective_config_snapshot) == {}  # type: ignore[arg-type]
     _, params = fake_conn.executed[0]
     assert params is not None
-    assert params[2] is None
+    assert isinstance(params[2], Jsonb)
+    assert params[2].obj == {}
+
+
+def test_initialize_requires_the_initialization_facts() -> None:
+    # The initialization facts move atomically: a missing protocol version or
+    # snapshot is rejected at the boundary, never stored as a partially
+    # initialized READY row. The reported provenance fields stay optional.
+    pool = cast(DatabasePool, FakePool(FakeConnection()))
+    with pytest.raises(TaskAgentSessionDomainError):
+        initialize_task_agent_session(
+            pool,
+            task_id=uuid.uuid4(),
+            role=WorkflowRole.PRODUCER,
+            external_session_id="ext-session-1",
+            initialization_protocol_version=None,  # type: ignore[arg-type]
+            effective_config_snapshot={},
+        )
+    with pytest.raises(TaskAgentSessionDomainError):
+        initialize_task_agent_session(
+            pool,
+            task_id=uuid.uuid4(),
+            role=WorkflowRole.PRODUCER,
+            external_session_id="ext-session-1",
+            initialization_protocol_version="1",
+            effective_config_snapshot=None,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("bad_identity", ["", "   "])
@@ -322,6 +353,8 @@ def test_initialize_rejects_blank_external_session_ids(bad_identity: str) -> Non
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
             external_session_id=bad_identity,
+            initialization_protocol_version="1",
+            effective_config_snapshot={},
         )
 
 
@@ -333,6 +366,7 @@ def test_initialize_rejects_blank_protocol_versions() -> None:
             role=WorkflowRole.PRODUCER,
             external_session_id="ext-session-1",
             initialization_protocol_version="   ",
+            effective_config_snapshot={},
         )
 
 
@@ -341,6 +375,7 @@ def test_mark_lost_applies_only_from_ready_and_preserves_the_identity() -> None:
         external_session_id="ext-session-1",
         lifecycle_status="lost",
         initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
         initialized_at=_observed_at(),
         updated_at=_observed_at(),
     )
@@ -376,6 +411,7 @@ def test_mark_ended_stamps_the_semantic_timestamp() -> None:
         external_session_id="ext-session-1",
         lifecycle_status="ended",
         initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
         initialized_at=_observed_at(),
         ended_at=_observed_at(),
         updated_at=_observed_at(),
@@ -433,6 +469,7 @@ def test_list_active_task_agent_sessions_maps_rows_and_filters_active() -> None:
             external_session_id="ext-session-2",
             lifecycle_status="ready",
             initialization_protocol_version="1",
+            effective_config_snapshot={"stage": "plan"},
             initialized_at=_observed_at(),
             updated_at=_observed_at(),
         ),

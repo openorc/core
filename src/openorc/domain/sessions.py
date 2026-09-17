@@ -29,18 +29,24 @@ recovery/replacement workflow.
 - ``ended_at`` is the semantic ENDED timestamp: set exactly when the
   lifecycle status is ENDED, never substituted by ``updated_at``.
 - ``effective_config_snapshot`` is the NON-SECRET effective runtime/session
-  configuration snapshot captured at initialization. It is assembled by the
-  establishing caller; it is never populated by blindly serializing
+  configuration snapshot captured at initialization: NULL means
+  initialization never completed, and an empty JSON object is a valid
+  snapshot when no concrete configurable values exist. It is assembled by
+  the establishing caller; it is never populated by blindly serializing
   Connection configuration or authentication material, and raw
   credentials/tokens must never enter it. Once a session has initialized,
   its snapshot is historical for that Task session: later Workspace
   role-binding/Connection configuration changes affect future sessions and
   never rewrite an initialized session's snapshot.
-- ``initialization_protocol_version`` records the protocol version used to
-  initialize the session (opaque string; absence is valid).
+- The initialization facts (``external_session_id``, ``initialized_at``,
+  ``initialization_protocol_version``, and ``effective_config_snapshot``)
+  move atomically with the external-session binding: all NULL before
+  initialization succeeds, all non-NULL once it does.
+  ``initialization_protocol_version`` records the opaque protocol version
+  used to initialize the session.
   ``reported_provider``/``reported_model``/``reported_runtime_version`` are
   nullable opaque runtime-reported provenance observations — never
-  configuration authority.
+  configuration authority, and independent of the initialization facts.
 - Capacity is Connection-scoped: Producer and Reviewer sessions sharing one
   Connection each consume occupancy against that Connection's
   Owner-configured session capacity. This module carries the facts;
@@ -242,31 +248,42 @@ class TaskAgentSession:
                 )
         _require_uuid(self.task_id, "task_id")
         _require_uuid(self.connection_id, "connection_id")
-        # Initialization coherence, mirrored by the database CHECK: CONNECTING
-        # requires both NULL; READY and LOST require both non-NULL; ENDED
-        # permits either coherent form. Mixed forms (one NULL, one non-NULL)
+        # Initialization coherence, mirrored by the database CHECK: the four
+        # initialization facts move atomically with the external-session
+        # binding. CONNECTING requires all four NULL; READY and LOST require
+        # all four non-NULL; ENDED permits either coherent form. Mixed forms
         # are rejected for every lifecycle status.
-        if self.lifecycle_status is TaskSessionLifecycleStatus.CONNECTING:
-            if self.external_session_id is not None or self.initialized_at is not None:
-                raise TaskAgentSessionDomainError(
-                    "a connecting TaskAgentSession has not initialized an external session "
-                    "yet: external_session_id and initialized_at must both be None"
-                )
-        elif self.lifecycle_status is TaskSessionLifecycleStatus.ENDED:
-            if (self.external_session_id is None) != (self.initialized_at is None):
-                raise TaskAgentSessionDomainError(
-                    "an ended TaskAgentSession must carry a coherent initialization "
-                    "state: external_session_id and initialized_at are both None "
-                    "(ended before initialization) or both set (ended after a "
-                    "successful initialization)"
-                )
-        else:  # READY or LOST
-            if self.external_session_id is None or self.initialized_at is None:
-                raise TaskAgentSessionDomainError(
-                    f"a {self.lifecycle_status.value} TaskAgentSession has an initialized "
-                    "external session: external_session_id and initialized_at must "
-                    "both be set"
-                )
+        initialization_facts = (
+            self.external_session_id,
+            self.initialized_at,
+            self.initialization_protocol_version,
+            self.effective_config_snapshot,
+        )
+        any_fact_set = any(fact is not None for fact in initialization_facts)
+        all_facts_set = all(fact is not None for fact in initialization_facts)
+        status = self.lifecycle_status
+        if status is TaskSessionLifecycleStatus.CONNECTING and any_fact_set:
+            raise TaskAgentSessionDomainError(
+                "a connecting TaskAgentSession has not initialized an external session "
+                "yet: external_session_id, initialized_at, initialization_protocol_version, "
+                "and effective_config_snapshot must all be None"
+            )
+        if (
+            status in (TaskSessionLifecycleStatus.READY, TaskSessionLifecycleStatus.LOST)
+            and not all_facts_set
+        ):
+            raise TaskAgentSessionDomainError(
+                f"a {status.value} TaskAgentSession has an initialized external session: "
+                "external_session_id, initialized_at, initialization_protocol_version, "
+                "and effective_config_snapshot must all be set"
+            )
+        if status is TaskSessionLifecycleStatus.ENDED and any_fact_set != all_facts_set:
+            raise TaskAgentSessionDomainError(
+                "an ended TaskAgentSession must carry a coherent initialization state: "
+                "external_session_id, initialized_at, initialization_protocol_version, "
+                "and effective_config_snapshot are all NULL (ended before initialization) "
+                "or all set (ended after a successful initialization)"
+            )
         # ``ended_at`` is the semantic ENDED timestamp: set exactly when the
         # lifecycle status is ENDED, never substituted by ``updated_at``.
         if (self.ended_at is not None) != (

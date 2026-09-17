@@ -107,14 +107,14 @@ def test_initialization_protocol_version_rejects_blank_strings(bad_version: str)
         _session(initialization_protocol_version=bad_version)
 
 
-def test_absence_is_valid_for_protocol_version_and_provenance() -> None:
+def test_absence_is_valid_for_reported_provenance() -> None:
+    # The runtime-reported provenance fields are independent nullable
+    # observations, not part of the initialization-facts coherence.
     session = _session(
-        initialization_protocol_version=None,
         reported_provider=None,
         reported_model=None,
         reported_runtime_version=None,
     )
-    assert session.initialization_protocol_version is None
     assert session.reported_provider is None
     assert session.reported_model is None
     assert session.reported_runtime_version is None
@@ -139,7 +139,7 @@ def test_reported_provenance_accepts_arbitrary_opaque_strings() -> None:
     assert session.reported_runtime_version == "2026.09.12+build"
 
 
-def test_connecting_requires_no_external_session_identity() -> None:
+def test_connecting_requires_no_initialization_facts() -> None:
     connecting = _session(
         lifecycle_status=TaskSessionLifecycleStatus.CONNECTING,
         external_session_id=None,
@@ -149,8 +149,8 @@ def test_connecting_requires_no_external_session_identity() -> None:
     )
     assert connecting.external_session_id is None
     assert connecting.initialized_at is None
-    # CONNECTING is by definition not a bound session: an identity or an
-    # initialization instant cannot exist yet.
+    # CONNECTING is by definition not a bound session: no initialization fact
+    # can exist yet — the facts move atomically.
     with pytest.raises(TaskAgentSessionDomainError):
         _session(
             lifecycle_status=TaskSessionLifecycleStatus.CONNECTING,
@@ -163,23 +163,36 @@ def test_connecting_requires_no_external_session_identity() -> None:
             external_session_id="ext-session-1",
             initialized_at=None,
         )
+    with pytest.raises(TaskAgentSessionDomainError):
+        _session(
+            lifecycle_status=TaskSessionLifecycleStatus.CONNECTING,
+            initialization_protocol_version="1",
+        )
+    with pytest.raises(TaskAgentSessionDomainError):
+        _session(
+            lifecycle_status=TaskSessionLifecycleStatus.CONNECTING, effective_config_snapshot={}
+        )
 
 
-def test_ready_and_lost_require_a_coherent_initialized_identity() -> None:
+def test_ready_and_lost_require_coherent_initialization_facts() -> None:
     for status in (TaskSessionLifecycleStatus.READY, TaskSessionLifecycleStatus.LOST):
         session = _session(lifecycle_status=status)
         assert session.external_session_id is not None
         assert session.initialized_at is not None
-        with pytest.raises(TaskAgentSessionDomainError):
-            _session(lifecycle_status=status, external_session_id=None)
-        with pytest.raises(TaskAgentSessionDomainError):
-            _session(lifecycle_status=status, initialized_at=None)
+        # Every initialization fact is required once initialization succeeded:
+        # any one of them NULL means the row is incoherent.
+        for missing_fact in (
+            {"external_session_id": None},
+            {"initialized_at": None},
+            {"initialization_protocol_version": None},
+            {"effective_config_snapshot": None},
+        ):
+            with pytest.raises(TaskAgentSessionDomainError):
+                _session(lifecycle_status=status, **missing_fact)
 
 
 def test_ended_permits_both_coherent_initialization_forms() -> None:
-    # Ended before initialization: the establishment attempt ended without
-    # ever binding an external session — the binding stays valid with a NULL
-    # identity.
+    # Ended before initialization: all four initialization facts are NULL.
     before = _session(
         lifecycle_status=TaskSessionLifecycleStatus.ENDED,
         external_session_id=None,
@@ -190,40 +203,79 @@ def test_ended_permits_both_coherent_initialization_forms() -> None:
     )
     assert before.external_session_id is None
     assert before.initialized_at is None
+    assert before.initialization_protocol_version is None
+    assert before.effective_config_snapshot is None
     assert before.ended_at is not None
-    # Ended after a successful initialization: the bound identity is
-    # preserved on the same binding.
-    after = _session(
-        lifecycle_status=TaskSessionLifecycleStatus.ENDED,
-        ended_at=_INITIALIZED_AT,
-    )
+    # Ended after a successful initialization: all four facts are set and the
+    # bound identity is preserved on the same binding.
+    after = _session(lifecycle_status=TaskSessionLifecycleStatus.ENDED, ended_at=_INITIALIZED_AT)
     assert after.external_session_id == "ext-session-1"
     assert after.initialized_at == _INITIALIZED_AT
+    assert after.initialization_protocol_version == "1"
+    assert dict(after.effective_config_snapshot) == {"stage": "plan"}  # type: ignore[arg-type]
     assert after.ended_at is not None
 
 
 @pytest.mark.parametrize("status", list(TaskSessionLifecycleStatus))
-def test_mixed_initialization_state_is_rejected_for_every_status(
+def test_partially_set_initialization_facts_are_rejected_for_every_status(
     status: TaskSessionLifecycleStatus,
 ) -> None:
-    # One NULL and one non-NULL is incoherent no matter the lifecycle status.
-    # ended_at is kept consistent with the status so the mixed-state rule is
-    # the violation that surfaces.
+    # Starting from the all-NULL coherent form (valid for CONNECTING and for
+    # ended-before-initialization), setting any one initialization fact while
+    # the others stay NULL is incoherent — for every lifecycle status.
     ended_at = _INITIALIZED_AT if status is TaskSessionLifecycleStatus.ENDED else None
-    with pytest.raises(TaskAgentSessionDomainError):
-        _session(
-            lifecycle_status=status,
-            external_session_id=None,
-            initialized_at=_INITIALIZED_AT,
-            ended_at=ended_at,
-        )
-    with pytest.raises(TaskAgentSessionDomainError):
-        _session(
-            lifecycle_status=status,
-            external_session_id="ext-session-1",
-            initialized_at=None,
-            ended_at=ended_at,
-        )
+    base: dict[str, Any] = {
+        "lifecycle_status": status,
+        "external_session_id": None,
+        "initialized_at": None,
+        "initialization_protocol_version": None,
+        "effective_config_snapshot": None,
+        "ended_at": ended_at,
+    }
+    partially_set: list[dict[str, Any]] = [
+        {"external_session_id": "ext-session-1"},
+        {"initialized_at": _INITIALIZED_AT},
+        {"initialization_protocol_version": "1"},
+        {"effective_config_snapshot": {}},
+    ]
+    for fact in partially_set:
+        with pytest.raises(TaskAgentSessionDomainError):
+            _session(**{**base, **fact})
+
+
+@pytest.mark.parametrize("status", list(TaskSessionLifecycleStatus))
+def test_partially_null_initialization_facts_are_rejected_for_every_status(
+    status: TaskSessionLifecycleStatus,
+) -> None:
+    # Starting from the all-set coherent form (valid for READY/LOST and for
+    # ended-after-initialization), nulling any one initialization fact while
+    # the others stay set is incoherent — for every lifecycle status.
+    ended_at = _INITIALIZED_AT if status is TaskSessionLifecycleStatus.ENDED else None
+    base: dict[str, Any] = {
+        "lifecycle_status": status,
+        "external_session_id": "ext-session-1",
+        "initialized_at": _INITIALIZED_AT,
+        "initialization_protocol_version": "1",
+        "effective_config_snapshot": {"stage": "plan"},
+        "ended_at": ended_at,
+    }
+    partially_null: list[dict[str, Any]] = [
+        {"external_session_id": None},
+        {"initialized_at": None},
+        {"initialization_protocol_version": None},
+        {"effective_config_snapshot": None},
+    ]
+    for fact in partially_null:
+        with pytest.raises(TaskAgentSessionDomainError):
+            _session(**{**base, **fact})
+
+
+def test_empty_snapshot_is_a_valid_initialization_fact() -> None:
+    # An empty JSON object is a valid effective configuration snapshot when
+    # there are no concrete configurable values; NULL is not — NULL means
+    # initialization never completed.
+    session = _session(effective_config_snapshot={})
+    assert dict(session.effective_config_snapshot) == {}  # type: ignore[arg-type]
 
 
 def test_ended_at_is_set_exactly_when_status_is_ended() -> None:

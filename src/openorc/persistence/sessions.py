@@ -15,7 +15,10 @@ Continuity invariants enforced here:
   silently adopts different routing.
 - ``initialize_task_agent_session`` is the only writer of
   ``external_session_id`` and applies only while the binding is CONNECTING
-  with a NULL identity. Once initialized, no code path in this module can
+  with a NULL identity. The four initialization facts (``external_session_id``,
+  ``initialized_at``, ``initialization_protocol_version``, and
+  ``effective_config_snapshot``) move atomically with the binding. Once
+  initialized, no code path in this module can
   replace the external session: LOST and ENDED are lifecycle states on the
   same row, never replacement triggers. ``effective_config_snapshot`` is
   written only from the caller-assembled explicit parameter through the
@@ -177,8 +180,8 @@ def initialize_task_agent_session(
     task_id: UUID,
     role: WorkflowRole,
     external_session_id: str,
-    initialization_protocol_version: str | None = None,
-    effective_config_snapshot: Mapping[str, object] | None = None,
+    initialization_protocol_version: str,
+    effective_config_snapshot: Mapping[str, object],
     reported_provider: str | None = None,
     reported_model: str | None = None,
     reported_runtime_version: str | None = None,
@@ -190,19 +193,23 @@ def initialize_task_agent_session(
     initialized binding (READY, LOST, or ENDED) is a rejected no-op — a
     replacement session can never overwrite the bound identity, and a lost or
     ended binding can never be re-initialized. Sets READY, stamps
-    ``initialized_at``, and captures the initialization facts.
+    ``initialized_at``, and captures the initialization facts, which move
+    atomically with the bound identity.
 
-    ``effective_config_snapshot`` is the caller-assembled NON-SECRET effective
-    runtime/session configuration snapshot, canonicalized through the domain
-    and supplied as an explicit ``Jsonb`` adapter (like every jsonb write at
-    this boundary). Repositories never derive it from Connection rows, and
-    authentication material must never enter it. Once set, no update path in
-    this module rewrites the snapshot: it is historical for the initialized
-    session, and later Connection/role-binding configuration changes affect
-    only future sessions.
+    ``effective_config_snapshot`` is the required caller-assembled NON-SECRET
+    effective runtime/session configuration snapshot, canonicalized through
+    the domain and supplied as an explicit ``Jsonb`` adapter (like every
+    jsonb write at this boundary). An empty mapping is valid when there are
+    no concrete configurable values; NULL is not — initialization facts are
+    never partially set. Repositories never derive the snapshot from
+    Connection rows, and authentication material must never enter it. Once
+    set, no update path in this module rewrites the snapshot: it is
+    historical for the initialized session, and later Connection/role-binding
+    configuration changes affect only future sessions.
 
-    ``initialization_protocol_version`` and the reported provenance fields
-    are nullable opaque observations; absence is valid.
+    ``initialization_protocol_version`` is the required opaque protocol
+    version used to initialize the session. The reported provenance fields
+    remain nullable opaque observations; absence is valid for them.
 
     Returns the updated binding, or ``None`` when the binding is missing or
     not in the CONNECTING state (a rejected no-op that must not be retried
@@ -212,18 +219,18 @@ def initialize_task_agent_session(
     _require_role(role)
     if not isinstance(external_session_id, str) or not external_session_id.strip():
         raise TaskAgentSessionDomainError("external_session_id must be a non-empty opaque string")
-    if initialization_protocol_version is not None and (
-        not isinstance(initialization_protocol_version, str)
-        or not initialization_protocol_version.strip()
+    if not isinstance(initialization_protocol_version, str) or (
+        not initialization_protocol_version.strip()
     ):
         raise TaskAgentSessionDomainError(
-            "initialization_protocol_version must be None or a non-empty string"
+            "initialization_protocol_version must be a non-empty opaque string"
         )
-    snapshot = (
-        None
-        if effective_config_snapshot is None
-        else canonical_effective_config_snapshot(effective_config_snapshot)
-    )
+    if effective_config_snapshot is None:
+        raise TaskAgentSessionDomainError(
+            "effective_config_snapshot must be supplied at initialization; use an "
+            "empty mapping when there are no concrete configurable values"
+        )
+    snapshot = canonical_effective_config_snapshot(effective_config_snapshot)
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.task_agent_sessions "
@@ -237,7 +244,7 @@ def initialize_task_agent_session(
             (
                 external_session_id,
                 initialization_protocol_version,
-                None if snapshot is None else Jsonb(dict(snapshot)),
+                Jsonb(dict(snapshot)),
                 reported_provider,
                 reported_model,
                 reported_runtime_version,

@@ -36,18 +36,23 @@
 --   state here: a recoverable Hub restart does not create a replacement
 --   binding, and reachability/health is separate telemetry, never durable
 --   workflow state.
--- - Initialization coherence is CHECK-enforced in both directions:
---   CONNECTING requires NULL ``external_session_id`` AND NULL
---   ``initialized_at``; READY and LOST require both non-NULL; ENDED permits
---   either coherent form. Mixed forms (one NULL, one non-NULL) match no
---   branch and are rejected for every lifecycle status.
+-- - Initialization coherence is CHECK-enforced in both directions: the four
+--   initialization facts (``external_session_id``, ``initialized_at``,
+--   ``initialization_protocol_version``, and ``effective_config_snapshot``)
+--   move atomically with the external-session binding. CONNECTING requires
+--   all four NULL; READY and LOST require all four non-NULL; ENDED permits
+--   either coherent form (ended before initialization keeps all four NULL).
+--   Mixed forms match no branch and are rejected for every lifecycle status.
 -- - ``ended_at`` is the semantic ENDED timestamp: non-NULL exactly when the
 --   lifecycle status is ENDED. It is never substituted by ``updated_at``.
--- - ``initialization_protocol_version`` records the protocol version used to
---   initialize the external session (opaque version string; absence is
---   valid).
+-- - ``initialization_protocol_version`` records the opaque protocol version
+--   used to initialize the external session: NULL until initialization and
+--   non-NULL once initialization succeeds (it moves atomically with the
+--   bound identity).
 -- - ``effective_config_snapshot`` is the NON-SECRET effective runtime/session
---   configuration snapshot captured at initialization. It is assembled by
+--   configuration snapshot captured at initialization: NULL means
+--   initialization never completed, and an empty JSON object is a valid
+--   snapshot when no concrete configurable values exist. It is assembled by
 --   the caller that establishes the session; it must never be populated by
 --   blindly serializing Connection configuration or authentication material,
 --   and raw credentials/tokens must never enter this column. It is validated
@@ -96,13 +101,16 @@ create table openorc.task_agent_sessions (
     lifecycle_status text not null check (lifecycle_status in (
         'connecting', 'ready', 'lost', 'ended'
     )),
-    -- Opaque initialization protocol version; NULL until initialization and
-    -- NULL-or-nonblank. Absence is valid.
+    -- Opaque initialization protocol version: NULL until initialization,
+    -- non-NULL once initialization succeeds — it moves atomically with the
+    -- bound identity and must be NULL or nonblank.
     initialization_protocol_version text check (
         initialization_protocol_version is null or initialization_protocol_version ~ '\S'
     ),
-    -- Non-secret effective runtime/session configuration snapshot captured at
-    -- initialization (canonical JSON object). Never populated by blindly
+    -- Non-secret effective runtime/session configuration snapshot captured
+    -- at initialization (canonical JSON object): NULL means initialization
+    -- never completed, and an empty JSON object is a valid snapshot when no
+    -- concrete configurable values exist. Never populated by blindly
     -- serializing Connection configuration or authentication material; raw
     -- credentials/tokens must never enter this column. Historical for the
     -- initialized binding: later Connection/role-binding configuration
@@ -133,25 +141,40 @@ create table openorc.task_agent_sessions (
     -- conflict otherwise). Also serves Task-role lookup.
     unique (task_id, role),
 
-    -- Initialization coherence (see header): CONNECTING requires both NULL;
-    -- READY/LOST require both non-NULL; ENDED permits either coherent form;
-    -- mixed forms are rejected for every lifecycle status.
+    -- Initialization coherence (see header): the four initialization facts
+    -- move atomically. CONNECTING requires all four NULL; READY/LOST require
+    -- all four non-NULL; ENDED permits either coherent form; mixed forms are
+    -- rejected for every lifecycle status.
     check (
         (
             lifecycle_status = 'connecting'
             and external_session_id is null
             and initialized_at is null
+            and initialization_protocol_version is null
+            and effective_config_snapshot is null
         )
         or (
             lifecycle_status in ('ready', 'lost')
             and external_session_id is not null
             and initialized_at is not null
+            and initialization_protocol_version is not null
+            and effective_config_snapshot is not null
         )
         or (
             lifecycle_status = 'ended'
             and (
-                (external_session_id is null and initialized_at is null)
-                or (external_session_id is not null and initialized_at is not null)
+                (
+                    external_session_id is null
+                    and initialized_at is null
+                    and initialization_protocol_version is null
+                    and effective_config_snapshot is null
+                )
+                or (
+                    external_session_id is not null
+                    and initialized_at is not null
+                    and initialization_protocol_version is not null
+                    and effective_config_snapshot is not null
+                )
             )
         )
     ),

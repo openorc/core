@@ -410,6 +410,8 @@ def test_initialize_is_irreplaceable_and_sets_the_ready_facts(conn: Connection[A
         task_id=task_id,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-beta",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     assert replacement is None
 
@@ -454,6 +456,8 @@ def test_external_session_identity_is_non_reusable_within_a_connection(
         task_id=first_task,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-shared",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
 
     # The same non-null external session identity cannot be bound to two
@@ -464,6 +468,8 @@ def test_external_session_identity_is_non_reusable_within_a_connection(
             task_id=second_task,
             role=WorkflowRole.PRODUCER,
             external_session_id="ext-session-shared",
+            initialization_protocol_version="1",
+            effective_config_snapshot={"stage": "plan"},
         )
     # A distinct identity initializes normally.
     distinct = session_repositories.initialize_task_agent_session(
@@ -471,6 +477,8 @@ def test_external_session_identity_is_non_reusable_within_a_connection(
         task_id=second_task,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-other",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     assert distinct is not None
 
@@ -507,12 +515,16 @@ def test_external_session_identity_is_scoped_per_connection(conn: Connection[Any
         task_id=first_task,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-same-opaque-string",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     second = session_repositories.initialize_task_agent_session(
         pool,
         task_id=second_task,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-same-opaque-string",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     # Identity uniqueness is scoped to the Connection: different Connections
     # may independently bind the same opaque string.
@@ -543,6 +555,8 @@ def test_lost_is_lifecycle_state_on_the_same_binding(conn: Connection[Any]) -> N
         task_id=ready_task,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-lost-later",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     session_repositories.ensure_task_agent_session(
         pool,
@@ -635,6 +649,8 @@ def test_ended_after_initialization_preserves_the_bound_identity(
         task_id=task_id,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-ends-later",
+        initialization_protocol_version="1",
+        effective_config_snapshot={"stage": "plan"},
     )
     ended = session_repositories.mark_task_agent_session_ended(
         pool, task_id=task_id, role=WorkflowRole.PRODUCER
@@ -672,6 +688,8 @@ def test_absorbing_terminal_states_reject_further_transitions(conn: Connection[A
             task_id=task,
             role=WorkflowRole.PRODUCER,
             external_session_id=identity,
+            initialization_protocol_version="1",
+            effective_config_snapshot={"stage": "plan"},
         )
     session_repositories.mark_task_agent_session_lost(
         pool, task_id=lost_task, role=WorkflowRole.PRODUCER
@@ -693,6 +711,8 @@ def test_absorbing_terminal_states_reject_further_transitions(conn: Connection[A
             task_id=lost_task,
             role=WorkflowRole.PRODUCER,
             external_session_id="ext-session-replacement",
+            initialization_protocol_version="1",
+            effective_config_snapshot={"stage": "plan"},
         )
         is None
     )
@@ -741,6 +761,8 @@ def test_shared_connection_occupancy_counts_against_capacity(conn: Connection[An
             task_id=task,
             role=role,
             external_session_id=identity,
+            initialization_protocol_version="1",
+            effective_config_snapshot={"stage": "plan"},
         )
 
     # Capacity accounting is Connection-scoped: Producer and Reviewer
@@ -784,6 +806,7 @@ def test_later_configuration_changes_do_not_rewrite_historical_configuration(
         task_id=task_id,
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-historical",
+        initialization_protocol_version="1",
         effective_config_snapshot={"stage": "plan", "runtime": "cline"},
     )
 
@@ -859,11 +882,14 @@ def test_initialization_coherence_rejects_mixed_state_rows(conn: Connection[Any]
         "values (%s, %s, 'producer', %s, %s, %s, %s, %s)"
     )
 
-    # READY/LOST require both non-NULL; CONNECTING requires both NULL; ENDED
-    # permits either coherent form; mixed forms match no branch and are
-    # rejected for every lifecycle status.
+    # READY/LOST require all four initialization facts non-NULL; CONNECTING
+    # requires all four NULL; ENDED permits either coherent form; mixed forms
+    # match no branch and are rejected for every lifecycle status. These rows
+    # omit the protocol version and snapshot columns (NULL by default), so
+    # any initialized status below also violates the extended coherence.
     incoherent_rows = [
-        # READY with the identity set but no initialization instant.
+        # READY with the identity set but no initialization instant, and with
+        # the protocol version/snapshot NULL: partial initialization facts.
         ("ext-session-1", "ready", None, None),
         # READY without an initialized identity.
         (None, "ready", stamp, None),
@@ -891,12 +917,57 @@ def test_initialization_coherence_rejects_mixed_state_rows(conn: Connection[Any]
                 ),
             )
 
-    # The valid coherent forms commit: CONNECTING (both NULL) and ENDED
-    # before initialization (both NULL plus the semantic ended_at).
+    second_task = _insert_task(
+        conn, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=9119
+    )
+    full_insert = (
+        "insert into openorc.task_agent_sessions "
+        "(workspace_id, task_id, role, connection_id, external_session_id, "
+        "lifecycle_status, initialization_protocol_version, "
+        "effective_config_snapshot, initialized_at, ended_at) "
+        "values (%s, %s, 'producer', %s, %s, %s, %s, %s, %s, %s)"
+    )
+    # The four initialization facts move atomically: an initialized status
+    # with a NULL protocol version (or snapshot) is rejected even when the
+    # identity and initialization instant are both set.
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            full_insert,
+            (
+                workspace_id,
+                second_task,
+                connection_id,
+                "ext-session-partial",
+                "ready",
+                None,
+                {"stage": "plan"},
+                stamp,
+                None,
+            ),
+        )
+
+    # The valid coherent forms commit: CONNECTING (all four NULL), ENDED
+    # before initialization (all four NULL plus the semantic ended_at), and a
+    # fully initialized READY row (all four set; an empty snapshot object is
+    # valid when no concrete configurable values exist).
     conn.execute(insert, (workspace_id, task_id, connection_id, None, "connecting", None, None))
     conn.execute(
         "insert into openorc.task_agent_sessions "
         "(workspace_id, task_id, role, connection_id, lifecycle_status, ended_at) "
         "values (%s, %s, 'reviewer', %s, 'ended', %s)",
         (workspace_id, task_id, connection_id, stamp),
+    )
+    conn.execute(
+        full_insert,
+        (
+            workspace_id,
+            second_task,
+            connection_id,
+            "ext-session-full",
+            "ready",
+            "1",
+            {},
+            stamp,
+            None,
+        ),
     )

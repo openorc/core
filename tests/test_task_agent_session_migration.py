@@ -110,20 +110,32 @@ def test_external_session_identity_is_non_reusable_within_a_connection() -> None
 
 
 def test_initialization_coherence_is_enforced_in_both_directions() -> None:
-    # CONNECTING requires both NULL; READY/LOST require both non-NULL; ENDED
-    # permits either coherent form. Mixed forms (one NULL, one non-NULL) match
-    # no branch and are rejected for every lifecycle status.
+    # The four initialization facts (external_session_id, initialized_at,
+    # initialization_protocol_version, effective_config_snapshot) move
+    # atomically: CONNECTING requires all four NULL; READY/LOST require all
+    # four non-NULL; ENDED permits either coherent form. Mixed forms match no
+    # branch and are rejected for every lifecycle status. (The coherence
+    # CHECK is sliced out of the table block so column-level NULL-or-nonblank
+    # checks do not skew the counts.)
     block = _table_block(_migration_text_raw(), SESSIONS_TABLE)
-    assert "lifecycle_status = 'connecting'" in block
-    assert "and external_session_id is null" in block
-    assert "and initialized_at is null" in block
-    assert "lifecycle_status in ('ready', 'lost')" in block
-    assert "and external_session_id is not null" in block
-    assert "and initialized_at is not null" in block
-    assert "lifecycle_status = 'ended'" in block
-    # Both ENDED forms are explicitly represented.
-    assert "(external_session_id is null and initialized_at is null)" in block
-    assert "(external_session_id is not null and initialized_at is not null)" in block
+    coherence_start = block.index("Initialization coherence (see header)")
+    coherence_end = block.index("is non-NULL exactly when", coherence_start)
+    coherence = block[coherence_start:coherence_end]
+    assert "lifecycle_status = 'connecting'" in coherence
+    assert "lifecycle_status in ('ready', 'lost')" in coherence
+    assert "lifecycle_status = 'ended'" in coherence
+    # Each initialization fact appears exactly in the CONNECTING branch and
+    # the ended-before-initialization form (is null), and exactly in the
+    # READY/LOST branch and the ended-after-initialization form (is not null):
+    # partial initialization states match no branch.
+    for fact in (
+        "external_session_id",
+        "initialized_at",
+        "initialization_protocol_version",
+        "effective_config_snapshot",
+    ):
+        assert coherence.count(f"{fact} is null") == 2
+        assert coherence.count(f"{fact} is not null") == 2
 
 
 def test_ended_at_is_the_semantic_ended_timestamp() -> None:
