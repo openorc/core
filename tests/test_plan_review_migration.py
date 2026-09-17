@@ -137,6 +137,18 @@ def test_iteration_result_coherence_is_settled_in_both_directions() -> None:
     assert "outcome = 'changes_requested' and jsonb_array_length(findings) >= 1" in collapsed
 
 
+def test_iteration_result_coherence_is_case_guarded_for_arbitrary_json() -> None:
+    # The coherence CHECK never evaluates jsonb_array_length on a non-array:
+    # the CASE expression yields false for any other JSON type, so a
+    # non-array findings document fails cleanly as a plain CheckViolation
+    # (together with the jsonb_typeof column CHECK) instead of raising an
+    # evaluation error. Boolean-expression evaluation order is not relied
+    # upon.
+    collapsed = _collapsed_raw_block(REVIEW_ITERATIONS_TABLE)
+    assert "outcome is null or case when jsonb_typeof(findings) = 'array' then" in collapsed
+    assert "else false end" in collapsed
+
+
 def test_iteration_numbering_is_unique_per_review_loop() -> None:
     block = _table_block(_migration_text(), REVIEW_ITERATIONS_TABLE)
     assert "unique (review_loop_id, iteration_number)" in block

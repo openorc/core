@@ -402,10 +402,13 @@ def test_finalized_iteration_results_cannot_be_rewritten(conn: Connection[Any]) 
     assert reread.findings == [{"summary": "vague step 2", "details": "no measurable outcome"}]
 
     # No partially recorded result can exist at the database level either:
-    # setting one result fact alone violates the finalize-coherence CHECK.
+    # nulling one result fact on the finalized row leaves the four facts
+    # incoherent, so the finalize-coherence CHECK rejects the update (the
+    # persisted no-rewrite invariant is already proven above through the
+    # second record attempt returning None).
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
-            "update openorc.review_iterations set summary = 'orphan fact' where id = %s",
+            "update openorc.review_iterations set summary = null where id = %s",
             (iteration.id,),
         )
 
@@ -918,7 +921,10 @@ def test_findings_are_persisted_verbatim_as_a_json_array(conn: Connection[Any]) 
     ).fetchone()
     assert array_type is not None and array_type[0] == "array"
 
-    # A non-array findings document is rejected by the durable shape CHECK.
+    # A non-array findings document is rejected cleanly with CheckViolation:
+    # the jsonb_typeof column CHECK fails, and the CASE-guarded coherence
+    # CHECK yields false for the non-array instead of raising an evaluation
+    # error from jsonb_array_length.
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "update openorc.review_iterations "

@@ -45,8 +45,10 @@
 --   structurally excluded from the outcome vocabulary.
 -- - The settled Reviewer-result coherence is durable: ACCEPTED clears with
 --   zero findings (nothing unresolved); CHANGES_REQUESTED retains at least
---   one finding of unresolved work. A later REVIEW_RESOLUTION consumes the
---   retained findings and iteration history.
+--   one finding of unresolved work. The coherence CHECK is CASE-guarded on
+--   jsonb_typeof so a non-array findings document is rejected cleanly as a
+--   plain CheckViolation, never by an evaluation error. A later
+--   REVIEW_RESOLUTION consumes the retained findings and iteration history.
 -- - ``findings`` is the protocol-settled Reviewer-result findings document:
 --   a JSON array persisted verbatim as historical evidence. Per-item
 --   protocol schema validation (finding objects with non-empty summary and
@@ -226,11 +228,22 @@ create table openorc.review_iterations (
 
     -- Settled Reviewer-result coherence: ACCEPTED clears with zero
     -- findings; CHANGES_REQUESTED retains at least one finding of
-    -- unresolved work.
+    -- unresolved work. The CASE guard keeps this CHECK well-formed for
+    -- arbitrary JSON: a non-array findings document fails this CHECK
+    -- cleanly (together with the jsonb_typeof column CHECK above) as a
+    -- plain CheckViolation, never as an evaluation error from
+    -- jsonb_array_length.
     check (
         outcome is null
-        or (outcome = 'accepted' and jsonb_array_length(findings) = 0)
-        or (outcome = 'changes_requested' and jsonb_array_length(findings) >= 1)
+        or case
+            when jsonb_typeof(findings) = 'array' then
+                (
+                    (outcome = 'accepted' and jsonb_array_length(findings) = 0)
+                    or
+                    (outcome = 'changes_requested' and jsonb_array_length(findings) >= 1)
+                )
+            else false
+        end
     )
 );
 
