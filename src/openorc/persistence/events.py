@@ -22,9 +22,13 @@ normalized to timezone-aware UTC at this boundary.
   database. ``actor_id`` is optional opaque logical actor identity.
 - Reads match the demonstrated v1 query paths and their indexes: recent
   Workspace activity, Task history, event type/time, actor, and generic
-  subject lookup. All reads are Workspace-scoped (Workspace isolation is
-  a security boundary) and deterministically ordered newest-first with
-  the event id as tiebreaker.
+  subject lookup. The list/find reads that take ``workspace_id`` are
+  Workspace-scoped (Workspace isolation is a security boundary);
+  ``get_workflow_event`` is a direct event-id lookup and
+  ``list_task_events`` is a Task-id-scoped read — Workspace filtering
+  and authorization for those lookups are service-layer concerns, not
+  repository predicates. Reads are deterministically ordered newest-first
+  with the event id as tiebreaker.
 
 This module knows nothing about prompt mutation: prompt override
 repositories do not write events, and this module does not reference
