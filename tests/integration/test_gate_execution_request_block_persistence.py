@@ -53,6 +53,7 @@ from psycopg.errors import (
 )
 
 from openorc.domain.blocks import TaskBlockReason
+from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import ExecutionDomainError, ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewOutcome
@@ -66,6 +67,7 @@ from openorc.persistence import gates as gate_repositories
 from openorc.persistence import planning as planning_repositories
 from openorc.persistence import reviews as review_repositories
 from openorc.persistence import runtime_requests as request_repositories
+from openorc.persistence import sessions as session_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.gates import OwnerGateResolutionOutcome
 from openorc.persistence.pool import DatabasePool
@@ -249,14 +251,35 @@ def _insert_session(
     connection_id: uuid.UUID,
     role: str,
 ) -> uuid.UUID:
-    session_id = uuid.uuid4()
-    conn.execute(
-        "insert into openorc.task_agent_sessions "
-        "(id, workspace_id, task_id, role, connection_id, lifecycle_status) "
-        "values (%s, %s, %s, %s, %s, 'ready')",
-        (session_id, workspace_id, task_id, role, connection_id),
+    """Establish and initialize one coherent READY Task/role binding.
+
+    Goes through the canonical session persistence primitives instead of raw
+    fixture SQL: a READY binding is only coherent together with its four
+    initialization facts (external_session_id, initialized_at,
+    initialization_protocol_version, effective_config_snapshot), so the
+    fixture takes the same CONNECTING -> READY path production code uses,
+    with test-only values.
+    """
+    workflow_role = WorkflowRole(role)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    binding = session_repositories.ensure_task_agent_session(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=workflow_role,
+        connection_id=connection_id,
     )
-    return session_id
+    initialized = session_repositories.initialize_task_agent_session(
+        pool,
+        task_id=task_id,
+        role=workflow_role,
+        external_session_id=f"integration-{binding.id}",
+        initialization_protocol_version="test-1",
+        effective_config_snapshot={},
+    )
+    assert initialized is not None
+    return initialized.id
 
 
 def _row_count(conn: Connection[Any], sql: str, params: tuple[Any, ...]) -> int:
