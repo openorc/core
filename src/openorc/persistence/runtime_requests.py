@@ -55,12 +55,12 @@ __all__ = [
 
 _RUNTIME_REQUEST_COLUMNS = (
     "id, workspace_id, task_id, producer_session_id, kind, external_approval_id, "
-    "status, resolution, decided_at, created_at"
+    "status, resolution, closed_at, created_at"
 )
 
 
 def _runtime_request_from_row(row: Sequence[Any]) -> RuntimeRequest:
-    decided_at = row[8]
+    closed_at = row[8]
     return RuntimeRequest(
         id=row[0],
         workspace_id=row[1],
@@ -70,7 +70,7 @@ def _runtime_request_from_row(row: Sequence[Any]) -> RuntimeRequest:
         external_approval_id=row[5],
         status=RuntimeRequestStatus(row[6]),
         resolution=None if row[7] is None else RuntimeRequestResolution(row[7]),
-        decided_at=None if decided_at is None else normalize_utc(decided_at),
+        closed_at=None if closed_at is None else normalize_utc(closed_at),
         created_at=normalize_utc(row[9]),
     )
 
@@ -90,7 +90,9 @@ def create_runtime_request(
     reads the referenced binding and requires its role to be exactly
     ``producer`` (a Reviewer session is rejected with
     ``RuntimeRequestDomainError``; Task/Workspace scope agreement is
-    durably enforced by the composite foreign key). The correlation
+    durably enforced by the composite foreign key). The request is inserted
+    ``pending`` explicitly — the migration declares no lifecycle default.
+    The correlation
     identity ``(producer_session_id, external_approval_id)`` is unique
     across all history — one exact external request is one row forever, so
     re-submitting the same external identifier in the same Producer session
@@ -113,14 +115,15 @@ def create_runtime_request(
             )
         row = conn.execute(
             "insert into openorc.runtime_requests "
-            "(workspace_id, task_id, producer_session_id, kind, external_approval_id) "
-            "values (%s, %s, %s, %s, %s) "
+            "(workspace_id, task_id, producer_session_id, kind, status, external_approval_id) "
+            "values (%s, %s, %s, %s, %s, %s) "
             f"returning {_RUNTIME_REQUEST_COLUMNS}",
             (
                 workspace_id,
                 task_id,
                 producer_session_id,
                 RuntimeRequestKind.ACTION_APPROVAL.value,
+                RuntimeRequestStatus.PENDING.value,
                 external_approval_id,
             ),
         ).fetchone()
@@ -164,7 +167,7 @@ def _finish_pending_request(
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.runtime_requests "
-            "set status = %s, resolution = %s, decided_at = now() "
+            "set status = %s, resolution = %s, closed_at = now() "
             "where id = %s and status = 'pending' "
             f"returning {_RUNTIME_REQUEST_COLUMNS}",
             (

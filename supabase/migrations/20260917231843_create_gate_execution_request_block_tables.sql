@@ -221,7 +221,7 @@ create index executions_task_active_idx
 
 -- RuntimeRequests: one exact external approval request from the Producer
 -- runtime. Deliberately no ``updated_at``: terminal transitions are stamped
--- by the semantic ``decided_at``.
+-- by the semantic ``closed_at``.
 create table openorc.runtime_requests (
     id uuid primary key default gen_random_uuid(),
     workspace_id uuid not null references openorc.workspaces (id),
@@ -246,8 +246,9 @@ create table openorc.runtime_requests (
     -- The typed correlated Owner control, set exactly when resolved.
     resolution text check (resolution in ('approved', 'rejected')),
     -- Semantic terminal stamp, non-NULL exactly when the status is
-    -- terminal.
-    decided_at timestamptz,
+    -- terminal (resolved, expired, or cancelled). Generic on purpose: an
+    -- expiry or cancellation closes the request without an Owner decision.
+    closed_at timestamptz,
     created_at timestamptz not null default now(),
 
     -- Direct Workspace scope must agree with the Task's Workspace.
@@ -273,17 +274,17 @@ create table openorc.runtime_requests (
         (
             status = 'pending'
             and resolution is null
-            and decided_at is null
+            and closed_at is null
         )
         or (
             status = 'resolved'
             and resolution is not null
-            and decided_at is not null
+            and closed_at is not null
         )
         or (
             status in ('expired', 'cancelled')
             and resolution is null
-            and decided_at is not null
+            and closed_at is not null
         )
     )
 );
@@ -314,9 +315,9 @@ create table openorc.task_blocks (
     -- Reason/recovery context (canonical JSON object): the
     -- recovery/continuation facts specific to this block, persisted for
     -- the block's lifetime — historical evidence that survives resolution.
-    -- Never a universal blocked-to-next-state transition; recovery is
-    -- reason/context-specific and belongs to later orchestration.
-    context jsonb check (jsonb_typeof(context) = 'object'),
+    -- NOT NULL by design: a block always carries its recovery context, and
+    -- an empty JSON object is the valid empty context.
+    context jsonb not null check (jsonb_typeof(context) = 'object'),
     -- Semantic resolution stamp: NULL while the block is current; stamped
     -- exactly once when resolved. A resolved block remains historical and
     -- retains its reason and context.

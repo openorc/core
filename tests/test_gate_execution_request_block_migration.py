@@ -137,7 +137,7 @@ def test_owner_gate_hook_supports_the_task_pointer() -> None:
 def test_single_mutation_rows_carry_no_updated_at() -> None:
     # The gate's only mutation is the resolution (stamped decided_at), the
     # runtime request's only mutations are terminal transitions (stamped
-    # decided_at), and the block's only mutation is resolution (stamped
+    # closed_at), and the block's only mutation is resolution (stamped
     # resolved_at). Immutable single-mutation rows have no updated_at.
     for table in (OWNER_GATES_TABLE, RUNTIME_REQUESTS_TABLE, TASK_BLOCKS_TABLE):
         assert "updated_at" not in _table_block(_migration_text_raw(), table)
@@ -226,9 +226,14 @@ def test_runtime_request_correlation_is_unique_across_history() -> None:
 
 def test_runtime_request_terminal_coherence_is_durable() -> None:
     raw = _collapsed_raw_block(RUNTIME_REQUESTS_TABLE)
-    assert "status = 'pending' and resolution is null and decided_at is null" in raw
+    assert "status = 'pending' and resolution is null and closed_at is null" in raw
     assert "status = 'resolved' and resolution is not null" in raw
     assert "status in ('expired', 'cancelled') and resolution is null" in raw
+    # The terminal stamp is generic `closed_at`: an expiry or cancellation
+    # closes the request without an Owner decision. The Owner-decision stamp
+    # (`decided_at`) belongs to gates only.
+    assert "closed_at timestamptz" in raw
+    assert "decided_at" not in raw
 
 
 def test_runtime_request_resolution_vocabulary_is_the_typed_control() -> None:
@@ -265,7 +270,10 @@ def test_review_loop_exhaustion_is_not_a_block_reason() -> None:
 
 def test_task_blocks_persist_canonical_json_context() -> None:
     raw = _collapsed_raw_block(TASK_BLOCKS_TABLE)
-    assert "context jsonb check (jsonb_typeof(context) = 'object')" in raw
+    # NOT NULL by design: a block always carries its recovery context, and
+    # an empty JSON object is the valid empty context. A plain
+    # jsonb_typeof CHECK would pass SQL NULL.
+    assert "context jsonb not null check (jsonb_typeof(context) = 'object')" in raw
     assert "resolved_at timestamptz" in raw
 
 

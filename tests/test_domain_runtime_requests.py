@@ -38,7 +38,7 @@ def _request(**overrides: Any) -> RuntimeRequest:
         "external_approval_id": "approval-1",
         "status": RuntimeRequestStatus.PENDING,
         "resolution": None,
-        "decided_at": None,
+        "closed_at": None,
         "created_at": _NOW,
     }
     values.update(overrides)
@@ -88,38 +88,38 @@ def test_pending_request_carries_neither_resolution_nor_stamp() -> None:
     with pytest.raises(RuntimeRequestDomainError):
         _request(resolution=RuntimeRequestResolution.APPROVED)
     with pytest.raises(RuntimeRequestDomainError):
-        _request(decided_at=_DECIDED_AT)
+        _request(closed_at=_DECIDED_AT)
 
 
 def test_resolved_request_carries_its_typed_control_and_stamp() -> None:
     request = _request(
         status=RuntimeRequestStatus.RESOLVED,
         resolution=RuntimeRequestResolution.APPROVED,
-        decided_at=_DECIDED_AT,
+        closed_at=_DECIDED_AT,
     )
     assert request.is_pending is False
     assert request.resolution is RuntimeRequestResolution.APPROVED
-    assert request.decided_at == _DECIDED_AT
+    assert request.closed_at == _DECIDED_AT
     # A resolved request without its control or stamp is incoherent.
     with pytest.raises(RuntimeRequestDomainError):
         _request(status=RuntimeRequestStatus.RESOLVED, resolution=None)
     with pytest.raises(RuntimeRequestDomainError):
-        _request(status=RuntimeRequestStatus.RESOLVED, decided_at=None)
+        _request(status=RuntimeRequestStatus.RESOLVED, closed_at=None)
 
 
 def test_expired_and_cancelled_requests_carry_the_stamp_not_a_control() -> None:
     # Expiry and cancellation are terminal historical facts carrying their
     # semantic stamp, never a typed resolution control.
     for status in (RuntimeRequestStatus.EXPIRED, RuntimeRequestStatus.CANCELLED):
-        stamped = _request(status=status, decided_at=_DECIDED_AT)
+        stamped = _request(status=status, closed_at=_DECIDED_AT)
         assert stamped.is_pending is False
         assert stamped.resolution is None
-        assert stamped.decided_at == _DECIDED_AT
+        assert stamped.closed_at == _DECIDED_AT
         with pytest.raises(RuntimeRequestDomainError):
             _request(
                 status=status,
                 resolution=RuntimeRequestResolution.REJECTED,
-                decided_at=_DECIDED_AT,
+                closed_at=_DECIDED_AT,
             )
         with pytest.raises(RuntimeRequestDomainError):
             _request(status=status)  # unstamped terminal form is incoherent
@@ -146,7 +146,7 @@ def test_field_set_carries_only_correlation_and_control_facts() -> None:
             "external_approval_id",
             "status",
             "resolution",
-            "decided_at",
+            "closed_at",
             "created_at",
         }
     )

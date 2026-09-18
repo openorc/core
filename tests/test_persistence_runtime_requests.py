@@ -109,7 +109,7 @@ def _request_row(**overrides: Any) -> tuple[Any, ...]:
         "external_approval_id": "approval-1",
         "status": "pending",
         "resolution": None,
-        "decided_at": None,
+        "closed_at": None,
         "created_at": _observed_at(),
     }
     values.update(overrides)
@@ -122,7 +122,7 @@ def _request_row(**overrides: Any) -> tuple[Any, ...]:
         values["external_approval_id"],
         values["status"],
         values["resolution"],
-        values["decided_at"],
+        values["closed_at"],
         values["created_at"],
     )
 
@@ -143,7 +143,7 @@ def test_create_runtime_request_inserts_pending_action_approval() -> None:
     assert request.id == row[0]
     assert request.kind.value == "action_approval"
     assert request.status is RuntimeRequestStatus.PENDING
-    assert request.resolution is None and request.decided_at is None
+    assert request.resolution is None and request.closed_at is None
     assert request.created_at == _utc_observed_at()
     assert request.created_at.utcoffset() == timedelta(0)
 
@@ -153,7 +153,18 @@ def test_create_runtime_request_inserts_pending_action_approval() -> None:
     assert role_params == (row[3],)
     insert_sql, insert_params = fake_conn.executed[1]
     assert "insert into openorc.runtime_requests" in insert_sql
-    assert insert_params == (row[1], row[2], row[3], "action_approval", row[5])
+    # The lifecycle column carries no database default: the initial pending
+    # status is explicit in the creation statement.
+    assert "producer_session_id, kind, status, external_approval_id" in insert_sql
+    assert insert_params == (
+        row[1],
+        row[2],
+        row[3],
+        "action_approval",
+        "pending",
+        row[5],
+    )
+    assert len(fake_conn.executed) == 2
 
 
 def test_create_runtime_request_rejects_reviewer_or_missing_session() -> None:
@@ -200,7 +211,7 @@ def test_get_runtime_request_maps_or_returns_none() -> None:
 
 
 def test_list_task_runtime_requests_orders_by_creation() -> None:
-    first = _request_row(status="resolved", resolution="approved", decided_at=_observed_at())
+    first = _request_row(status="resolved", resolution="approved", closed_at=_observed_at())
     second = _request_row(task_id=first[2], external_approval_id="approval-2")
     fake_conn = FakeConnection(rows=[first, second])
     pool = cast(DatabasePool, FakePool(fake_conn))
@@ -217,7 +228,7 @@ def test_list_task_runtime_requests_orders_by_creation() -> None:
 def test_resolve_runtime_request_applies_the_typed_one_shot_control() -> None:
     row = _request_row()
     resolved = _request_row(
-        id=row[0], status="resolved", resolution="approved", decided_at=_observed_at()
+        id=row[0], status="resolved", resolution="approved", closed_at=_observed_at()
     )
     fake_conn = FakeConnection(row=resolved)
     pool = cast(DatabasePool, FakePool(fake_conn))
@@ -229,10 +240,10 @@ def test_resolve_runtime_request_applies_the_typed_one_shot_control() -> None:
     assert request is not None
     assert request.status is RuntimeRequestStatus.RESOLVED
     assert request.resolution is RuntimeRequestResolution.APPROVED
-    assert request.decided_at == _utc_observed_at()
+    assert request.closed_at == _utc_observed_at()
     sql, params = fake_conn.executed[0]
     assert "update openorc.runtime_requests" in sql
-    assert "set status = %s, resolution = %s, decided_at = now()" in sql
+    assert "set status = %s, resolution = %s, closed_at = now()" in sql
     assert "where id = %s and status = 'pending'" in sql
     assert params == ("resolved", "approved", row[0])
 
@@ -250,20 +261,20 @@ def test_resolve_runtime_request_rejects_non_typed_controls() -> None:
 
 
 def test_expire_and_cancel_are_one_shot_terminal_transitions() -> None:
-    expired = _request_row(status="expired", decided_at=_observed_at())
+    expired = _request_row(status="expired", closed_at=_observed_at())
     expire_conn = FakeConnection(row=expired)
     request = expire_runtime_request(
         cast(DatabasePool, FakePool(expire_conn)), runtime_request_id=expired[0]
     )
     assert request is not None
     assert request.status is RuntimeRequestStatus.EXPIRED
-    assert request.resolution is None and request.decided_at == _utc_observed_at()
+    assert request.resolution is None and request.closed_at == _utc_observed_at()
     sql, params = expire_conn.executed[0]
-    assert "set status = %s, resolution = %s, decided_at = now()" in sql
+    assert "set status = %s, resolution = %s, closed_at = now()" in sql
     assert "where id = %s and status = 'pending'" in sql
     assert params == ("expired", None, expired[0])
 
-    cancelled = _request_row(status="cancelled", decided_at=_observed_at())
+    cancelled = _request_row(status="cancelled", closed_at=_observed_at())
     cancel_conn = FakeConnection(row=cancelled)
     request = cancel_runtime_request(
         cast(DatabasePool, FakePool(cancel_conn)), runtime_request_id=cancelled[0]

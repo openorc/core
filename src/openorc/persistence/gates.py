@@ -156,8 +156,9 @@ def create_owner_gate(
 ) -> OwnerGate:
     """Insert one pending OwnerGate decision record for a Task.
 
-    The gate is created ``pending`` with no decided_at stamp; the
-    authoritative resolution is a separate, later operation. Same-type
+    The gate is created ``pending`` (inserted explicitly — the migration
+    declares no lifecycle default) with no closed stamp; the authoritative
+    resolution is a separate, later operation. Same-type
     re-decisions are new rows, never rewrites of resolved gates: resolved
     gates are immutable history and are never recycled. The per-type
     exact-subject coherence is validated here (mirroring the domain and the
@@ -178,13 +179,14 @@ def create_owner_gate(
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.owner_gates "
-            "(workspace_id, task_id, gate_type, plan_revision_id, subject_head_sha) "
-            "values (%s, %s, %s, %s, %s) "
+            "(workspace_id, task_id, gate_type, status, plan_revision_id, subject_head_sha) "
+            "values (%s, %s, %s, %s, %s, %s) "
             f"returning {_OWNER_GATE_COLUMNS}",
             (
                 workspace_id,
                 task_id,
                 gate_type.value,
+                OwnerGateStatus.PENDING.value,
                 plan_revision_id,
                 subject_head_sha,
             ),

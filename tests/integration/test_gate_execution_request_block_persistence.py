@@ -45,7 +45,12 @@ from typing import Any, LiteralString, cast
 
 import pytest
 from psycopg import Connection, connect
-from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
+from psycopg.errors import (
+    CheckViolation,
+    ForeignKeyViolation,
+    NotNullViolation,
+    UniqueViolation,
+)
 
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.executions import ExecutionDomainError, ExecutionStatus
@@ -823,7 +828,7 @@ def test_runtime_request_correlation_identity_is_unique_across_history(
     assert resolved is not None
     assert resolved.status.value == "resolved"
     assert resolved.resolution is RuntimeRequestResolution.APPROVED
-    assert resolved.decided_at is not None
+    assert resolved.closed_at is not None
 
     # The correlation identity is unique across all history: one exact
     # external request is one row forever, and resolving it never frees the
@@ -924,7 +929,7 @@ def test_terminal_requests_are_immutable_historical_records(conn: Connection[Any
     assert reread is not None
     assert reread.status.value == "resolved"
     assert reread.resolution is RuntimeRequestResolution.APPROVED
-    assert reread.decided_at is not None
+    assert reread.closed_at is not None
 
     # The terminal coherence is CHECK-enforced: a terminal form without its
     # matching facts is rejected durably.
@@ -946,7 +951,7 @@ def test_terminal_requests_are_immutable_historical_records(conn: Connection[Any
     assert expired_request is not None
     assert expired_request.status.value == "expired"
     assert expired_request.resolution is None
-    assert expired_request.decided_at is not None
+    assert expired_request.closed_at is not None
 
 
 def test_task_block_reasons_use_the_settled_vocabulary(conn: Connection[Any]) -> None:
@@ -980,6 +985,23 @@ def test_task_block_reasons_use_the_settled_vocabulary(conn: Connection[Any]) ->
             "values (%s, %s, 'unknown', '[]')",
             (workspace_id, task_id),
         )
+    # The context is NOT NULL by design: a block always carries its
+    # recovery context, and the plain jsonb_typeof CHECK alone would pass
+    # SQL NULL. An empty JSON object is the valid empty context.
+    with pytest.raises(NotNullViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.task_blocks (workspace_id, task_id, reason, context) "
+            "values (%s, %s, 'unknown', null)",
+            (workspace_id, task_id),
+        )
+    empty_context = block_repositories.create_task_block(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        reason=TaskBlockReason.UNKNOWN,
+        context={},
+    )
+    assert empty_context.context == {}
 
 
 def test_resolved_blocks_remain_historical_with_context(conn: Connection[Any]) -> None:

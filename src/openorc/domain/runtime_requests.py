@@ -22,7 +22,7 @@ Producer/runtime-originated consequential-action approval (Phase 1, issue
   records with no rewrite path.
 - The Owner response is a typed correlated control: ``approved`` or
   ``rejected``, set exactly when the status is RESOLVED and stamped with
-  ``decided_at``. It is a control to that exact pending request — never a
+  ``closed_at``. It is a control to that exact pending request — never a
   general communication channel or an arbitrary response document.
 
 This module carries transport-independent validation only. It performs no
@@ -60,7 +60,7 @@ class RuntimeRequestStatus(StrEnum):
     """The settled v1 RuntimeRequest lifecycle vocabulary.
 
     ``PENDING`` is the only nonterminal status; resolved, expired, and
-    cancelled are terminal and immutable once stamped with ``decided_at``.
+    cancelled are terminal and immutable once stamped with ``closed_at``.
     """
 
     PENDING = "pending"
@@ -88,7 +88,7 @@ class RuntimeRequest:
     ``kind`` is exactly ``action_approval`` in v1; ``external_approval_id``
     is the exact external identifier that created the request and is
     correlation-unique per Producer session across all history. The typed
-    ``resolution`` and the ``decided_at`` stamp finalize the request
+    ``resolution`` and the ``closed_at`` stamp finalize the request
     exactly once.
     """
 
@@ -100,7 +100,7 @@ class RuntimeRequest:
     external_approval_id: str
     status: RuntimeRequestStatus
     resolution: RuntimeRequestResolution | None
-    decided_at: datetime | None
+    closed_at: datetime | None
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -133,21 +133,21 @@ class RuntimeRequest:
         # is resolved; expired/cancelled carry the terminal stamp without a
         # typed control; pending carries neither.
         if self.status is RuntimeRequestStatus.PENDING:
-            if self.resolution is not None or self.decided_at is not None:
+            if self.resolution is not None or self.closed_at is not None:
                 raise RuntimeRequestDomainError(
                     "a pending RuntimeRequest carries neither a typed "
-                    "resolution nor a decided_at stamp"
+                    "resolution nor a closed_at stamp"
                 )
         elif self.status is RuntimeRequestStatus.RESOLVED:
-            if self.resolution is None or self.decided_at is None:
+            if self.resolution is None or self.closed_at is None:
                 raise RuntimeRequestDomainError(
-                    "a resolved RuntimeRequest carries its typed resolution and decided_at stamp"
+                    "a resolved RuntimeRequest carries its typed resolution and closed_at stamp"
                 )
         else:  # expired / cancelled: stamped terminal facts, no typed control.
-            if self.resolution is not None or self.decided_at is None:
+            if self.resolution is not None or self.closed_at is None:
                 raise RuntimeRequestDomainError(
                     f"a {self.status.value} RuntimeRequest carries its terminal "
-                    "decided_at stamp and no typed resolution"
+                    "closed_at stamp and no typed resolution"
                 )
 
     @property

@@ -186,8 +186,11 @@ def test_create_owner_gate_inserts_and_maps_the_pending_row() -> None:
 
     sql, params = fake_conn.executed[0]
     assert "insert into openorc.owner_gates" in sql
+    # The lifecycle columns carry no database default: the initial pending
+    # status is explicit in the creation statement.
+    assert "workspace_id, task_id, gate_type, status," in sql
     assert "implementation_authorization" not in sql  # enum values are parameters
-    assert params == (row[1], row[2], "implementation_authorization", row[5], None)
+    assert params == (row[1], row[2], "implementation_authorization", "pending", row[5], None)
     assert len(fake_conn.executed) == 1
 
 
