@@ -61,6 +61,8 @@ def _iteration(**overrides: Any) -> ReviewIteration:
         "review_loop_id": uuid4(),
         "iteration_number": 1,
         "plan_revision_id": uuid4(),
+        "task_pull_request_id": None,
+        "reviewed_head_sha": None,
         "outcome": None,
         "summary": None,
         "findings": None,
@@ -136,12 +138,78 @@ def test_iteration_requires_a_positive_iteration_number() -> None:
             _iteration(iteration_number=bad)
 
 
-def test_iteration_requires_the_exact_subject() -> None:
-    # v1 subjects are planning revisions: the exact PlanRevision under
-    # review is required, never None or a loose value.
+def test_planning_iteration_binds_exactly_the_plan_revision() -> None:
+    # The planning subject is the exact PlanRevision under review with no
+    # PR binding (issue #25): never None or a loose value, and never both
+    # subject forms at once.
+    revision_id = uuid4()
+    iteration = _iteration(plan_revision_id=revision_id)
+    assert iteration.plan_revision_id == revision_id
+    assert iteration.task_pull_request_id is None
+    assert iteration.reviewed_head_sha is None
     for bad in (None, "not-a-uuid", 42):
         with pytest.raises(ReviewLoopDomainError):
             _iteration(plan_revision_id=bad)
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(task_pull_request_id=uuid4())
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(reviewed_head_sha="0123456789abcdef")
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(plan_revision_id=None, task_pull_request_id=uuid4())
+
+
+def test_pr_review_iteration_binds_the_task_pull_request_plus_exact_head() -> None:
+    # The PR-review subject is exactly one TaskPullRequest plus the exact
+    # (non-empty) reviewed head SHA — the immutable per-iteration review
+    # identity (issue #25). Partial PR forms are not subjects.
+    pr_id = uuid4()
+    head = "0123456789abcdef0123456789abcdef01234567"
+    iteration = _iteration(
+        plan_revision_id=None,
+        task_pull_request_id=pr_id,
+        reviewed_head_sha=head,
+    )
+    assert iteration.task_pull_request_id == pr_id
+    assert iteration.plan_revision_id is None
+    assert iteration.reviewed_head_sha == head
+    # Partial PR forms are not subjects: PR identity without the exact
+    # head, and the exact head without the PR identity.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(plan_revision_id=None, task_pull_request_id=pr_id)
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(plan_revision_id=None, reviewed_head_sha=head)
+    for bad in ("", "   ", 42, None):
+        with pytest.raises(ReviewLoopDomainError):
+            _iteration(
+                plan_revision_id=None,
+                task_pull_request_id=pr_id,
+                reviewed_head_sha=bad,
+            )
+
+
+def test_poisoned_mixed_subject_forms_are_rejected() -> None:
+    # A wrong-type non-NULL subject id is a caller error in its own right
+    # (issue #25 review amendment): it can never masquerade as an absent
+    # subject and silently select the other subject form. Validated before
+    # subject-form selection, independently.
+    # A valid PlanRevision with a poisoned PR id.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(task_pull_request_id="not-a-uuid")  # type: ignore[arg-type]
+    # A poisoned PlanRevision cannot masquerade as absent and select the
+    # otherwise-valid PR/head subject form.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(
+            plan_revision_id="not-a-uuid",  # type: ignore[arg-type]
+            task_pull_request_id=uuid4(),
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        )
+    # A valid PlanRevision with a poisoned PR id and a head SHA.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(
+            plan_revision_id=uuid4(),
+            task_pull_request_id="not-a-uuid",  # type: ignore[arg-type]
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        )
 
 
 def test_iteration_outcome_must_be_a_reviewer_judgment_or_none() -> None:
@@ -323,6 +391,8 @@ def test_iteration_field_set_carries_the_complete_result_without_the_wire_envelo
             "review_loop_id",
             "iteration_number",
             "plan_revision_id",
+            "task_pull_request_id",
+            "reviewed_head_sha",
             "outcome",
             "summary",
             "findings",

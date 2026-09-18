@@ -51,6 +51,7 @@ from openorc.domain.reviews import (
     ReviewOutcome,
 )
 from openorc.persistence import planning as planning_repositories
+from openorc.persistence import pull_requests as pull_request_repositories
 from openorc.persistence import reviews as review_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
@@ -63,6 +64,9 @@ pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
+
+# One exact reviewed head SHA for the PR-review subject fixtures.
+_EXACT_REVIEWED_HEAD = "0123456789abcdef0123456789abcdef01234567"
 
 
 @pytest.fixture(scope="session")
@@ -459,12 +463,13 @@ def test_one_review_loop_cannot_contain_duplicate_iteration_numbers(
             "values (%s, %s, %s, 1, %s)",
             (workspace_id, task_id, loop.id, revision.id),
         )
-    # A different loop numbers its iterations independently.
+    # A different loop numbers its iterations independently (the loop's
+    # purpose is irrelevant to numbering independence).
     other_loop = review_repositories.create_review_loop(
         pool,
         workspace_id=workspace_id,
         task_id=task_id,
-        purpose=ReviewLoopPurpose.PR_REVIEW,
+        purpose=ReviewLoopPurpose.PLANNING,
         iteration_limit=3,
     )
     review_repositories.create_review_iteration(
@@ -956,17 +961,21 @@ def test_review_loop_close_is_absorbing(conn: Connection[Any]) -> None:
 
 
 def test_the_same_review_primitives_serve_both_v1_purposes(conn: Connection[Any]) -> None:
-    # PR review support later binds one TaskPullRequest plus exact head SHA
-    # on this same review-history model (#25): no second model exists, and
-    # the PR_REVIEW purpose is already a first-class loop vocabulary.
-    workspace_id, _, task_id, pool = _fresh_task(conn)
-    revision = planning_repositories.create_plan_revision(
+    # The PR-review purpose exercises the same review-history model as the
+    # planning purpose (issue #25): its iteration binds the Task's canonical
+    # TaskPullRequest plus the exact reviewed head SHA — no second model
+    # exists, and PR_REVIEW is a first-class loop vocabulary.
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    pull_request = pull_request_repositories.create_task_pull_request(
         pool,
         workspace_id=workspace_id,
         task_id=task_id,
-        revision_number=1,
-        content="# Plan",
-        repository_base_sha="base-a",
+        repository_id=repository_id,
+        github_pr_id=555_000,
+        github_pr_number=42,
+        head_ref="openorc/task-42",
+        base_ref="main",
+        head_sha=_EXACT_REVIEWED_HEAD,
     )
     pr_loop = review_repositories.create_review_loop(
         pool,
@@ -981,10 +990,17 @@ def test_the_same_review_primitives_serve_both_v1_purposes(conn: Connection[Any]
         task_id=task_id,
         review_loop_id=pr_loop.id,
         iteration_number=1,
-        plan_revision_id=revision.id,
+        plan_revision_id=None,
+        task_pull_request_id=pull_request.id,
+        reviewed_head_sha=_EXACT_REVIEWED_HEAD,
     )
     assert iteration is not None
     assert iteration.review_loop_id == pr_loop.id
+    # The iteration carries the exact PR-review subject: the canonical PR
+    # plus the exact reviewed head SHA (never a PlanRevision).
+    assert iteration.task_pull_request_id == pull_request.id
+    assert iteration.reviewed_head_sha == _EXACT_REVIEWED_HEAD
+    assert iteration.plan_revision_id is None
     loops = review_repositories.list_task_review_loops(
         pool, task_id=task_id, status=ReviewLoopStatus.OPEN
     )
