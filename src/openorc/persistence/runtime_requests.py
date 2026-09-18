@@ -142,7 +142,7 @@ def get_runtime_request(pool: DatabasePool, *, runtime_request_id: UUID) -> Runt
 
 
 def list_task_runtime_requests(pool: DatabasePool, *, task_id: UUID) -> list[RuntimeRequest]:
-    """List a Task's complete runtime-request history, in creation order.
+    """List a Task's complete runtime-request history, in deterministic (created_at, id) order.
 
     Every request of the Task — pending and terminal alike — is retained:
     terminal requests are immutable historical records.

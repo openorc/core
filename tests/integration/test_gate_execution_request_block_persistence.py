@@ -252,8 +252,8 @@ def _insert_session(
     session_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.task_agent_sessions "
-        "(workspace_id, task_id, role, connection_id, lifecycle_status) "
-        "values (%s, %s, %s, %s, 'ready')",
+        "(id, workspace_id, task_id, role, connection_id, lifecycle_status) "
+        "values (%s, %s, %s, %s, %s, 'ready')",
         (session_id, workspace_id, task_id, role, connection_id),
     )
     return session_id
@@ -346,7 +346,11 @@ def test_pending_gate_resolves_exactly_once_with_one_atomic_task_effect(
     )
 
     # One atomic effect: the gate resolves with its stamp, the pointer
-    # clears, and the Task token rotates with its timestamp advancing.
+    # clears, and the Task token rotates with a real updated_at stamp.
+    # The two stamps may legitimately be equal: PostgreSQL now() is stable
+    # across the whole outer test transaction (including the nested
+    # SAVEPOINT-backed repository calls), so the resolution UPDATE can
+    # commit the exact same transaction timestamp the install used.
     assert resolution.outcome is OwnerGateResolutionOutcome.RESOLVED
     assert resolution.gate is not None
     assert resolution.gate.status is OwnerGateStatus.APPROVED
@@ -354,7 +358,7 @@ def test_pending_gate_resolves_exactly_once_with_one_atomic_task_effect(
     assert resolution.task is not None
     assert resolution.task.current_owner_gate_id is None
     assert resolution.task.state_token != installed.state_token
-    assert resolution.task.updated_at > installed.updated_at
+    assert resolution.task.updated_at >= installed.updated_at
 
     # A pending gate resolves only once: the historical record is immutable
     # and never recycled or overwritten.
@@ -485,8 +489,15 @@ def test_a_noncurrent_pending_gate_cannot_be_resolved_and_the_lifecycle_recovers
     assert installed_second is not None
     assert installed_second.current_owner_gate_id == second.id
     # The historical first gate is untouched by the later gate's install.
+    # Assert by identity rather than list position: the (created_at, id)
+    # ordering of list_task_owner_gates is deterministic, but under one
+    # shared test transaction with a stable now() it is not creation
+    # order — equal timestamps fall back to the UUID id tie-break.
     history = gate_repositories.list_task_owner_gates(pool, task_id=task_id)
-    assert [g.status for g in history] == [OwnerGateStatus.APPROVED, OwnerGateStatus.PENDING]
+    assert {g.id: g.status for g in history} == {
+        gate.id: OwnerGateStatus.APPROVED,
+        second.id: OwnerGateStatus.PENDING,
+    }
 
 
 def test_only_the_settled_gate_vocabularies_are_accepted(conn: Connection[Any]) -> None:
@@ -495,8 +506,8 @@ def test_only_the_settled_gate_vocabularies_are_accepted(conn: Connection[Any]) 
         pool,
         task_id,
         workspace_id=workspace_id,
-        gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
-        plan_revision_id=uuid.uuid4(),
+        gate_type=OwnerGateType.PR_AUTHORIZATION,
+        subject_head_sha="0123456789abcdef0123456789abcdef01234567",
     )
     # Only the four settled types are accepted. (The initial pending status
     # is inserted explicitly: the lifecycle column has no database default.)
@@ -517,7 +528,7 @@ def test_only_the_settled_gate_vocabularies_are_accepted(conn: Connection[Any]) 
 def test_gates_bind_their_exact_subject_and_reject_wrong_subjects(
     conn: Connection[Any],
 ) -> None:
-    workspace_id, _, task_id, pool = _fresh_task(conn)
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
     # An implementation-authorization gate binds the exact review-cleared
     # PlanRevision of the same Task/Workspace.
     revision = planning_repositories.create_plan_revision(
@@ -541,8 +552,15 @@ def test_gates_bind_their_exact_subject_and_reject_wrong_subjects(
     assert fetched.subject_head_sha is None
 
     # A PlanRevision belonging to a different Task can never become this
-    # gate's subject: cross-Task/cross-Workspace corruption is rejected.
-    _, _, other_task_id, _ = _fresh_task(conn, github_issue_id=7402)
+    # gate's subject: the composite FK rejects same-Workspace cross-Task
+    # subject corruption. The other Task lives inside the same original
+    # Workspace/Repository, so only its Task identity differs.
+    other_task_id = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=7402,
+    )
     other_revision = planning_repositories.create_plan_revision(
         pool,
         workspace_id=workspace_id,

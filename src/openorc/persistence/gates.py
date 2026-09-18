@@ -206,7 +206,7 @@ def get_owner_gate(pool: DatabasePool, *, owner_gate_id: UUID) -> OwnerGate | No
 
 
 def list_task_owner_gates(pool: DatabasePool, *, task_id: UUID) -> list[OwnerGate]:
-    """List a Task's complete gate history, in creation order.
+    """List a Task's complete gate history, in deterministic (created_at, id) order.
 
     Every gate of the Task — pending and resolved alike — is retained
     history: the Task's current-gate pointer identifies the gate it is

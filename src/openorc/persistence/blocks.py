@@ -108,7 +108,7 @@ def get_task_block(pool: DatabasePool, *, task_block_id: UUID) -> TaskBlock | No
 
 
 def list_task_blocks(pool: DatabasePool, *, task_id: UUID) -> list[TaskBlock]:
-    """List a Task's complete block history, in creation order.
+    """List a Task's complete block history, in deterministic (created_at, id) order.
 
     Every block of the Task — current and resolved alike — is retained:
     resolved blocks remain historical evidence with their reason and
@@ -124,7 +124,7 @@ def list_task_blocks(pool: DatabasePool, *, task_id: UUID) -> list[TaskBlock]:
 
 
 def list_current_task_blocks(pool: DatabasePool, *, task_id: UUID) -> list[TaskBlock]:
-    """List a Task's current (unresolved) blocks, in creation order."""
+    """List a Task's current (unresolved) blocks, in deterministic (created_at, id) order."""
     with transaction(pool) as conn:
         rows = conn.execute(
             f"select {_TASK_BLOCK_COLUMNS} from openorc.task_blocks "
