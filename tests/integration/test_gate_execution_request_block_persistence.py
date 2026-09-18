@@ -498,11 +498,12 @@ def test_only_the_settled_gate_vocabularies_are_accepted(conn: Connection[Any]) 
         gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
         plan_revision_id=uuid.uuid4(),
     )
-    # Only the four settled types are accepted.
+    # Only the four settled types are accepted. (The initial pending status
+    # is inserted explicitly: the lifecycle column has no database default.)
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
-            "insert into openorc.owner_gates (workspace_id, task_id, gate_type) "
-            "values (%s, %s, 'owner_question')",
+            "insert into openorc.owner_gates (workspace_id, task_id, gate_type, status) "
+            "values (%s, %s, 'owner_question', 'pending')",
             (workspace_id, task_id),
         )
     # Only the four settled statuses are accepted.
@@ -556,19 +557,20 @@ def test_gates_bind_their_exact_subject_and_reject_wrong_subjects(
             (other_revision.id, gate.id),
         )
     # A review_resolution gate binds exactly one subject: both subjects (or
-    # neither) violate the coherence CHECK.
+    # neither) violate the coherence CHECK. (The initial pending status is
+    # inserted explicitly: the lifecycle column has no database default.)
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.owner_gates "
-            "(workspace_id, task_id, gate_type, plan_revision_id, subject_head_sha) "
-            "values (%s, %s, 'review_resolution', %s, %s)",
+            "(workspace_id, task_id, gate_type, status, plan_revision_id, subject_head_sha) "
+            "values (%s, %s, 'review_resolution', 'pending', %s, %s)",
             (workspace_id, task_id, revision.id, "0123456789abcdef0123456789abcdef01234567"),
         )
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.owner_gates "
-            "(workspace_id, task_id, gate_type, plan_revision_id, subject_head_sha) "
-            "values (%s, %s, 'review_resolution', null, null)",
+            "(workspace_id, task_id, gate_type, status, plan_revision_id, subject_head_sha) "
+            "values (%s, %s, 'review_resolution', 'pending', null, null)",
             (workspace_id, task_id),
         )
 
