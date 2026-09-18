@@ -32,6 +32,7 @@ from openorc.persistence.tasks import (
     get_task,
     list_issue_attempts,
     list_workspace_tasks,
+    set_current_owner_gate,
     update_task_status,
 )
 
@@ -472,3 +473,81 @@ def test_bind_canonical_branch_returns_none_when_token_is_stale() -> None:
         )
         is None
     )
+
+
+def test_set_current_owner_gate_installs_only_when_the_pointer_is_null() -> None:
+    # Normal lifecycle: a pending gate is installed while the pointer is
+    # NULL, rotating the token like every other authoritative mutation.
+    row = _task_row(status="waiting_for_owner")
+    gate_id = uuid.uuid4()
+    updated = _task_row(
+        id=row[0],
+        status="waiting_for_owner",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=gate_id,
+    )
+    fake_conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = set_current_owner_gate(pool, row[0], expected_state_token=row[8], owner_gate_id=gate_id)
+
+    assert task is not None
+    assert task.current_owner_gate_id == gate_id
+    assert task.state_token != row[8]
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.tasks" in sql
+    assert "set current_owner_gate_id = %s" in sql
+    assert "state_token = gen_random_uuid(), updated_at = now()" in sql
+    assert "and current_owner_gate_id is null" in sql
+    assert "and exists (select 1 from openorc.owner_gates g" in sql
+    assert "g.status = 'pending'" in sql
+    assert "g.task_id = tasks.id" in sql and "g.workspace_id = tasks.workspace_id" in sql
+    assert params == (gate_id, row[0], row[8], gate_id)
+
+
+def test_set_current_owner_gate_cannot_replace_a_current_pending_gate() -> None:
+    # The NULL-guard makes a replacement attempt a rejected no-op: with a
+    # current gate already installed, the UPDATE matches no row and the
+    # Task (and its token) is left untouched.
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        set_current_owner_gate(
+            pool,
+            uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            owner_gate_id=uuid.uuid4(),
+        )
+        is None
+    )
+    assert len(fake_conn.executed) == 1  # one guarded UPDATE; no second write
+
+
+def test_set_current_owner_gate_returns_none_when_token_is_stale() -> None:
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        set_current_owner_gate(
+            pool,
+            uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            owner_gate_id=uuid.uuid4(),
+        )
+        is None
+    )
+
+
+def test_set_current_owner_gate_requires_a_uuid_gate_identity() -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    with pytest.raises(TaskDomainError, match="UUID"):
+        set_current_owner_gate(
+            pool,
+            uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            owner_gate_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+    assert fake_conn.executed == []

@@ -46,6 +46,7 @@ __all__ = [
     "list_issue_attempts",
     "list_workspace_tasks",
     "set_current_plan_revision",
+    "set_current_owner_gate",
     "update_task_status",
 ]
 
@@ -344,5 +345,52 @@ def set_current_plan_revision(
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",
             (plan_revision_id, task_id, expected_state_token),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def set_current_owner_gate(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    owner_gate_id: UUID,
+) -> Task | None:
+    """Install a pending same-Task/Workspace OwnerGate as the current gate.
+
+    A pending OwnerGate should never be superseded by another current gate:
+    the normal lifecycle installs one pending gate as current, resolves it
+    while current (which clears the pointer and rotates ``state_token``
+    atomically), and only then installs another pending gate. The update is
+    therefore conditional on ``current_owner_gate_id IS NULL`` — it can
+    never replace an existing current pending gate — in addition to the
+    usual ``expected_state_token``, non-archived, and one-fact-one-home
+    conditions. The subquery requires the referenced gate to be ``pending``
+    and to belong to the same Task and Workspace (the composite foreign key
+    ``tasks_current_owner_gate_fk`` durably backstops the same-Task/
+    Workspace scope; the pointer never duplicates the gate's type, subject,
+    or outcome on the Task row).
+
+    The update rotates the token like every other authoritative Task-state
+    mutation. Returns the updated Task, or ``None`` when the token no
+    longer matches, the Task is missing/already archived, a current gate is
+    already installed, or the gate is missing/not pending (a stale
+    operation that must not be retried blindly).
+    """
+    if not isinstance(owner_gate_id, UUID):
+        raise TaskDomainError("owner_gate_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set current_owner_gate_id = %s, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and current_owner_gate_id is null "
+            "and exists ("
+            "select 1 from openorc.owner_gates g "
+            "where g.id = %s and g.task_id = tasks.id "
+            "and g.workspace_id = tasks.workspace_id and g.status = 'pending') "
+            f"returning {_TASK_COLUMNS}",
+            (owner_gate_id, task_id, expected_state_token, owner_gate_id),
         ).fetchone()
     return None if row is None else _task_from_row(row)
