@@ -594,7 +594,7 @@ def test_gates_bind_their_exact_subject_and_reject_wrong_subjects(
 
 
 def test_task_pointer_fk_rejects_cross_task_gate_pointers(conn: Connection[Any]) -> None:
-    workspace_id, _, task_id, pool = _fresh_task(conn)
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
     gate, _ = _install_gate(
         pool,
         task_id,
@@ -603,8 +603,15 @@ def test_task_pointer_fk_rejects_cross_task_gate_pointers(conn: Connection[Any])
         subject_head_sha="0123456789abcdef0123456789abcdef01234567",
     )
     # A different Task in the same Workspace cannot point at this gate: the
-    # composite foreign key rejects cross-Task pointer corruption.
-    _, _, other_task_id, _ = _fresh_task(conn, github_issue_id=7403)
+    # composite foreign key rejects cross-Task pointer corruption. The other
+    # Task lives inside the same original Workspace/Repository, so only its
+    # Task identity differs.
+    other_task_id = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=7403,
+    )
     with pytest.raises(ForeignKeyViolation), conn.transaction():
         conn.execute(
             "update openorc.tasks set current_owner_gate_id = %s where id = %s",
@@ -723,7 +730,7 @@ def test_multiple_executions_coexist_without_exclusivity(conn: Connection[Any]) 
 
 
 def test_execution_creation_requires_the_producer_session(conn: Connection[Any]) -> None:
-    workspace_id, _, task_id, pool = _fresh_task(conn)
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
     producer_id = _producer_session(conn, workspace_id=workspace_id, task_id=task_id)
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
     reviewer_id = _insert_session(
@@ -754,7 +761,14 @@ def test_execution_creation_requires_the_producer_session(conn: Connection[Any])
     assert created.producer_session_id == producer_id
 
     # A session from a different Task is scope-rejected by the composite FK.
-    _, _, other_task_id, _ = _fresh_task(conn, github_issue_id=7404)
+    # The other Task lives inside the same original Workspace/Repository, so
+    # only its Task identity differs.
+    other_task_id = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=7404,
+    )
     other_session = _producer_session(conn, workspace_id=workspace_id, task_id=other_task_id)
     with pytest.raises(ForeignKeyViolation), conn.transaction():
         execution_repositories.create_execution(
@@ -873,7 +887,7 @@ def test_runtime_request_correlation_identity_is_unique_across_history(
 
 
 def test_runtime_requests_require_the_producer_session(conn: Connection[Any]) -> None:
-    workspace_id, _, task_id, pool = _fresh_task(conn)
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
     producer_id = _producer_session(conn, workspace_id=workspace_id, task_id=task_id)
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
     reviewer_id = _insert_session(
@@ -903,7 +917,14 @@ def test_runtime_requests_require_the_producer_session(conn: Connection[Any]) ->
     assert created.producer_session_id == producer_id
 
     # A session from a different Task is scope-rejected by the composite FK.
-    _, _, other_task_id, _ = _fresh_task(conn, github_issue_id=7405)
+    # The other Task lives inside the same original Workspace/Repository, so
+    # only its Task identity differs.
+    other_task_id = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=7405,
+    )
     other_session = _producer_session(conn, workspace_id=workspace_id, task_id=other_task_id)
     with pytest.raises(ForeignKeyViolation), conn.transaction():
         request_repositories.create_runtime_request(
