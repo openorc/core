@@ -319,11 +319,21 @@ def test_task_and_workspace_events_flow_through_the_read_paths(conn: Connection[
     assert workspace_event.task_id is None
     assert task_event.task_id == task_id
 
-    # The index-matched read paths reach both events.
+    # The index-matched read paths reach both events. Ordering follows the
+    # locked read contract (``created_at desc, id desc``), and this
+    # fixture's nested savepoints share one transaction timestamp — so
+    # tied ``created_at`` values order by event id, never by insertion
+    # order. The expectation is computed from the contract, never from
+    # insert chronology.
+    expected_recent = sorted(
+        [workspace_event, task_event],
+        key=lambda event: (event.created_at, event.id),
+        reverse=True,
+    )
     recent = event_repositories.list_recent_workspace_events(
         pool, workspace_id=workspace_id, limit=10
     )
-    assert [e.id for e in recent] == [task_event.id, workspace_event.id]
+    assert [e.id for e in recent] == [e.id for e in expected_recent]
     task_history = event_repositories.list_task_events(pool, task_id=task_id, limit=10)
     assert [e.id for e in task_history] == [task_event.id]
     by_type = event_repositories.list_recent_events_by_type(
