@@ -75,7 +75,8 @@ _REVIEW_LOOP_COLUMNS = (
 )
 _REVIEW_ITERATION_COLUMNS = (
     "id, workspace_id, task_id, review_loop_id, iteration_number, plan_revision_id, "
-    "outcome, summary, findings, decided_at, created_at"
+    "task_pull_request_id, reviewed_head_sha, outcome, summary, findings, "
+    "decided_at, created_at"
 )
 
 
@@ -94,7 +95,7 @@ def _review_loop_from_row(row: Sequence[Any]) -> ReviewLoop:
 
 
 def _review_iteration_from_row(row: Sequence[Any]) -> ReviewIteration:
-    decided_at = row[9]
+    decided_at = row[11]
     return ReviewIteration(
         id=row[0],
         workspace_id=row[1],
@@ -102,14 +103,16 @@ def _review_iteration_from_row(row: Sequence[Any]) -> ReviewIteration:
         review_loop_id=row[3],
         iteration_number=row[4],
         plan_revision_id=row[5],
-        outcome=None if row[6] is None else ReviewOutcome(row[6]),
-        summary=row[7],
+        task_pull_request_id=row[6],
+        reviewed_head_sha=row[7],
+        outcome=None if row[8] is None else ReviewOutcome(row[8]),
+        summary=row[9],
         # findings arrives as the psycopg-decoded jsonb array (a Python
         # list) or None; the domain canonicalizer re-validates canonical
         # form on construction.
-        findings=row[8],
+        findings=row[10],
         decided_at=None if decided_at is None else normalize_utc(decided_at),
-        created_at=normalize_utc(row[10]),
+        created_at=normalize_utc(row[12]),
     )
 
 
@@ -217,13 +220,22 @@ def create_review_iteration(
     task_id: UUID,
     review_loop_id: UUID,
     iteration_number: int,
-    plan_revision_id: UUID,
+    plan_revision_id: UUID | None = None,
+    task_pull_request_id: UUID | None = None,
+    reviewed_head_sha: str | None = None,
 ) -> ReviewIteration | None:
     """Create one unfinalized review iteration bound to its exact subject.
 
-    The iteration starts unfinalized: all four result facts (outcome,
-    summary, findings, decided_at) are NULL until
-    :func:`record_review_iteration_result` finalizes them atomically.
+    The subject is exactly one form, matching the loop's purpose: a
+    ``planning`` loop binds the exact PlanRevision under review
+    (``plan_revision_id``); a ``pr_review`` loop binds the exact
+    TaskPullRequest plus the exact reviewed head SHA (``task_pull_request_id``
+    plus non-empty ``reviewed_head_sha``). Reviewer acceptance identity is
+    the TaskPullRequest plus the exact reviewed head SHA: the exact reviewed
+    head is immutable iteration history, so PR identity stays stable while
+    the PR's current head moves across remediation rounds. Partial PR
+    forms (PR without head SHA, or head SHA without PR) are not subjects
+    and are rejected.
 
     The write is guarded by the loop's current lifecycle, concurrency-safely:
     the referenced loop row is locked ``FOR UPDATE`` inside the creation
@@ -235,35 +247,81 @@ def create_review_iteration(
     wins and the creation is rejected). This is lifecycle integrity, not
     ReviewLoop orchestration.
 
-    The same-Task/Workspace and exact-subject foreign keys are unchanged:
-    against an OPEN loop, an iteration whose Task/Workspace disagrees with
+    The same lock read carries the loop's ``purpose``, and purpose/subject
+    agreement is enforced here: a PR subject in a ``planning`` loop, or a
+    PlanRevision subject in a ``pr_review`` loop, raises
+    ``ReviewLoopDomainError`` and commits nothing (a deterministic caller
+    error, like the producer-role requirement on execution creation — the
+    loop row is locked, so the check cannot race). The same-Task/Workspace
+    and exact-subject foreign keys are unchanged: against an OPEN,
+    purpose-matching loop, an iteration whose Task/Workspace disagrees with
     the loop, or whose subject belongs to another Task, still raises
     ``ForeignKeyViolation``; a duplicate iteration number still raises
     ``UniqueViolation``.
     """
     _require_positive_int(iteration_number, "iteration_number")
-    if not isinstance(plan_revision_id, UUID):
+    has_plan = isinstance(plan_revision_id, UUID)
+    has_pr = (
+        isinstance(task_pull_request_id, UUID)
+        and isinstance(reviewed_head_sha, str)
+        and bool(reviewed_head_sha.strip())
+    )
+    if has_plan and (task_pull_request_id is not None or reviewed_head_sha is not None):
         raise ReviewLoopDomainError(
-            "ReviewIteration.plan_revision_id must be a UUID (the exact subject reviewed)"
+            "a planning iteration binds only the exact PlanRevision subject: "
+            "no TaskPullRequest and no reviewed head SHA"
+        )
+    if not has_plan and not has_pr:
+        raise ReviewLoopDomainError(
+            "a PR-review iteration binds the exact TaskPullRequest plus a "
+            "non-empty reviewed_head_sha (the exact reviewed head); a planning "
+            "iteration binds the exact PlanRevision"
         )
     with transaction(pool) as conn:
-        # Lifecycle guard, held to commit: locking the loop row FOR UPDATE
-        # makes the OPEN check and the insert atomic against a concurrent
-        # close_review_loop (which needs the same row lock), so an iteration
-        # can never commit after the loop has closed. A missing loop is
-        # equally "no OPEN loop to accept the iteration".
-        loop_state = conn.execute(
-            "select status from openorc.review_loops where id = %s for update",
+        # Lifecycle + purpose guard, held to commit: locking the loop row
+        # FOR UPDATE makes the OPEN check, the purpose/subject agreement
+        # check, and the insert atomic against a concurrent
+        # close_review_loop (which needs the same row lock), so an
+        # iteration can never commit after the loop has closed. A missing
+        # loop is equally "no OPEN loop to accept the iteration".
+        loop_row = conn.execute(
+            "select status, purpose from openorc.review_loops where id = %s for update",
             (review_loop_id,),
         ).fetchone()
-        if loop_state is None or loop_state[0] != "open":
+        if loop_row is None or loop_row[0] != "open":
             return None
+        # Purpose/subject agreement (issue #25): the loop's purpose decides
+        # the subject form, so a PR subject can never be inserted into a
+        # planning loop and vice versa. A mismatch is a deterministic
+        # caller error, not a rejected no-op: nothing was written.
+        purpose = loop_row[1]
+        if purpose == ReviewLoopPurpose.PLANNING.value and not has_plan:
+            raise ReviewLoopDomainError(
+                "a planning review loop accepts only PlanRevision subjects: "
+                "a PR-review subject (TaskPullRequest plus exact reviewed head "
+                "SHA) belongs to a pr_review loop"
+            )
+        if purpose == ReviewLoopPurpose.PR_REVIEW.value and not has_pr:
+            raise ReviewLoopDomainError(
+                "a pr_review loop accepts only PR-review subjects (the exact "
+                "TaskPullRequest plus the exact reviewed head SHA): a "
+                "PlanRevision subject belongs to a planning loop"
+            )
         row = conn.execute(
             "insert into openorc.review_iterations "
-            "(workspace_id, task_id, review_loop_id, iteration_number, plan_revision_id) "
-            "values (%s, %s, %s, %s, %s) "
+            "(workspace_id, task_id, review_loop_id, iteration_number, plan_revision_id, "
+            "task_pull_request_id, reviewed_head_sha) "
+            "values (%s, %s, %s, %s, %s, %s, %s) "
             f"returning {_REVIEW_ITERATION_COLUMNS}",
-            (workspace_id, task_id, review_loop_id, iteration_number, plan_revision_id),
+            (
+                workspace_id,
+                task_id,
+                review_loop_id,
+                iteration_number,
+                plan_revision_id,
+                task_pull_request_id,
+                reviewed_head_sha,
+            ),
         ).fetchone()
     assert row is not None
     return _review_iteration_from_row(row)

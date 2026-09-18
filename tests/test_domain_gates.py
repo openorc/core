@@ -38,6 +38,7 @@ def _gate(**overrides: Any) -> OwnerGate:
         "status": OwnerGateStatus.PENDING,
         "plan_revision_id": uuid4(),
         "subject_head_sha": None,
+        "task_pull_request_id": None,
         "decided_at": None,
         "created_at": _CREATED_AT,
     }
@@ -85,41 +86,113 @@ def test_implementation_authorization_binds_exactly_the_plan_revision() -> None:
         )
 
 
-def test_pr_authorization_and_merge_decision_bind_exactly_the_head_sha() -> None:
-    for gate_type in (OwnerGateType.PR_AUTHORIZATION, OwnerGateType.MERGE_DECISION):
-        gate = _gate(
-            gate_type=gate_type,
+def test_pr_authorization_binds_exactly_the_head_sha_without_pr_binding() -> None:
+    # PR_AUTHORIZATION happens before the canonical PR exists: its subject
+    # is only the exact committed Producer head SHA — no PlanRevision and
+    # no TaskPullRequest binding.
+    gate = _gate(
+        gate_type=OwnerGateType.PR_AUTHORIZATION,
+        plan_revision_id=None,
+        subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+        task_pull_request_id=None,
+    )
+    assert gate.subject_head_sha == "0123456789abcdef0123456789abcdef01234567"
+    assert gate.task_pull_request_id is None
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            plan_revision_id=uuid4(),
+            subject_head_sha=None,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            plan_revision_id=None,
+            subject_head_sha="",
+        )
+    # A PR-subject form of pr_authorization does not exist: the gate fires
+    # before the canonical PR exists.
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
             plan_revision_id=None,
             subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid4(),
         )
-        assert gate.subject_head_sha == "0123456789abcdef0123456789abcdef01234567"
-        with pytest.raises(OwnerGateDomainError):
-            _gate(gate_type=gate_type, plan_revision_id=uuid4(), subject_head_sha=None)
-        with pytest.raises(OwnerGateDomainError):
-            _gate(gate_type=gate_type, plan_revision_id=None, subject_head_sha="")
+
+
+def test_merge_decision_binds_exactly_the_pr_plus_exact_head_sha() -> None:
+    # A MERGE_DECISION binds the canonical TaskPullRequest plus the exact
+    # reviewed/authorized head SHA: a PR-subject gate is never representable
+    # as a bare head SHA.
+    pr_id = uuid4()
+    gate = _gate(
+        gate_type=OwnerGateType.MERGE_DECISION,
+        plan_revision_id=None,
+        subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+        task_pull_request_id=pr_id,
+    )
+    assert gate.task_pull_request_id == pr_id
+    assert gate.subject_head_sha == "0123456789abcdef0123456789abcdef01234567"
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.MERGE_DECISION,
+            plan_revision_id=None,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=None,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.MERGE_DECISION,
+            plan_revision_id=uuid4(),
+            subject_head_sha=None,
+            task_pull_request_id=pr_id,
+        )
 
 
 def test_review_resolution_binds_exactly_one_subject() -> None:
-    # Either the exhausted planning PlanRevision or the PR/head review
-    # subject — never both, never neither.
+    # Either the exhausted planning PlanRevision, or the PR-review subject
+    # as TaskPullRequest plus exact head SHA — never both forms, never
+    # neither, and never a bare head SHA without the canonical PR.
     resolved_plan = _gate(
         gate_type=OwnerGateType.REVIEW_RESOLUTION,
         plan_revision_id=uuid4(),
         subject_head_sha=None,
+        task_pull_request_id=None,
     )
     assert resolved_plan.plan_revision_id is not None
-    resolved_head = _gate(
+    pr_id = uuid4()
+    resolved_pr = _gate(
         gate_type=OwnerGateType.REVIEW_RESOLUTION,
         plan_revision_id=None,
         subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+        task_pull_request_id=pr_id,
     )
-    assert resolved_head.subject_head_sha is not None
+    assert resolved_pr.task_pull_request_id == pr_id
+    assert resolved_pr.subject_head_sha == "0123456789abcdef0123456789abcdef01234567"
     with pytest.raises(OwnerGateDomainError):
         _gate(
             gate_type=OwnerGateType.REVIEW_RESOLUTION,
             plan_revision_id=uuid4(),
             subject_head_sha="0123456789abcdef",
         )
+    # Bare head SHA without the canonical PR: not a subject form.
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=None,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=None,
+        )
+    # Both subject forms at once: forbidden.
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=uuid4(),
+            subject_head_sha=None,
+            task_pull_request_id=pr_id,
+        )
+    # Neither subject form: forbidden.
     with pytest.raises(OwnerGateDomainError):
         _gate(
             gate_type=OwnerGateType.REVIEW_RESOLUTION,
@@ -137,6 +210,8 @@ def test_gate_requires_uuid_identity_fields() -> None:
         _gate(task_id="not-a-uuid")  # type: ignore[arg-type]
     with pytest.raises(OwnerGateDomainError):
         _gate(plan_revision_id="not-a-uuid")  # type: ignore[arg-type]
+    with pytest.raises(OwnerGateDomainError):
+        _gate(task_pull_request_id="not-a-uuid")  # type: ignore[arg-type]
 
 
 def test_pending_gate_carries_no_decided_at_stamp() -> None:
@@ -192,6 +267,7 @@ def test_field_set_carries_only_authority_record_facts() -> None:
             "status",
             "plan_revision_id",
             "subject_head_sha",
+            "task_pull_request_id",
             "decided_at",
             "created_at",
         }

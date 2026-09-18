@@ -6,7 +6,8 @@ to prove row-to-domain-object mapping, UTC normalization at the persistence
 boundary, parameterization, the explicit-OPEN establishment SQL, the
 absorbing close transition, the lifecycle-guarded unfinalized-iteration
 insert (the loop row locked FOR UPDATE, the insert applying only while the
-loop is OPEN), the atomic one-shot finalize SQL (with the ``Jsonb``
+loop is OPEN, and the purpose/subject agreement that same lock read carries
+between subject forms), the atomic one-shot finalize SQL (with the ``Jsonb``
 findings adapter and the ``WHERE outcome IS NULL`` no-rewrite condition),
 and empty-result handling. Database constraint behavior is proven against a
 real database by the integration-marked suite in ``tests/integration/``.
@@ -140,6 +141,8 @@ def _iteration_row(**overrides: Any) -> tuple[Any, ...]:
         "review_loop_id": uuid.uuid4(),
         "iteration_number": 1,
         "plan_revision_id": uuid.uuid4(),
+        "task_pull_request_id": None,
+        "reviewed_head_sha": None,
         "outcome": None,
         "summary": None,
         "findings": None,
@@ -154,6 +157,8 @@ def _iteration_row(**overrides: Any) -> tuple[Any, ...]:
         values["review_loop_id"],
         values["iteration_number"],
         values["plan_revision_id"],
+        values["task_pull_request_id"],
+        values["reviewed_head_sha"],
         values["outcome"],
         values["summary"],
         values["findings"],
@@ -269,7 +274,7 @@ def test_close_review_loop_is_an_absorbing_conditional_transition() -> None:
 
 def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() -> None:
     row = _iteration_row()
-    fake_conn = FakeConnection(responses=[("open",), row])
+    fake_conn = FakeConnection(responses=[("open", "planning"), row])
     pool = cast(DatabasePool, FakePool(fake_conn))
 
     iteration = create_review_iteration(
@@ -291,9 +296,11 @@ def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() ->
     assert iteration.decided_at is None
     assert iteration.created_at == _utc_observed_at()
 
-    # Two statements: the lifecycle guard first, then the guarded insert.
+    # Two statements: the lifecycle+purpose guard first, then the insert.
+    # The same FOR UPDATE lock read carries the loop's purpose, so the
+    # purpose/subject agreement check cannot race (issue #25).
     guard_sql, guard_params = fake_conn.executed[0]
-    assert "select status from openorc.review_loops" in guard_sql
+    assert "select status, purpose from openorc.review_loops" in guard_sql
     assert "where id = %s for update" in guard_sql
     assert guard_params == (row[3],)
     sql, params = fake_conn.executed[1]
@@ -302,8 +309,86 @@ def test_create_review_iteration_inserts_unfinalized_with_the_exact_subject() ->
     # none of the four result columns.
     for excluded in ("outcome", "summary", "findings", "decided_at"):
         assert excluded not in sql.split("values")[0]
-    assert params == (row[1], row[2], row[3], row[4], row[5])
+    # The planning subject insert carries no PR binding.
+    assert params == (row[1], row[2], row[3], row[4], row[5], None, None)
     assert len(fake_conn.executed) == 2
+
+
+def test_pr_review_iteration_inserts_with_the_exact_pr_subject() -> None:
+    # The PR-review subject form (issue #25): the exact TaskPullRequest
+    # plus the exact reviewed head SHA, accepted only by a pr_review loop.
+    pr_id = uuid.uuid4()
+    head = "0123456789abcdef0123456789abcdef01234567"
+    row = _iteration_row(
+        plan_revision_id=None,
+        task_pull_request_id=pr_id,
+        reviewed_head_sha=head,
+    )
+    fake_conn = FakeConnection(responses=[("open", "pr_review"), row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    iteration = create_review_iteration(
+        pool,
+        workspace_id=row[1],
+        task_id=row[2],
+        review_loop_id=row[3],
+        iteration_number=1,
+        plan_revision_id=None,
+        task_pull_request_id=pr_id,
+        reviewed_head_sha=head,
+    )
+
+    assert iteration is not None
+    assert iteration.plan_revision_id is None
+    assert iteration.task_pull_request_id == pr_id
+    assert iteration.reviewed_head_sha == head
+    sql, params = fake_conn.executed[1]
+    assert "task_pull_request_id, reviewed_head_sha)" in sql
+    assert params == (row[1], row[2], row[3], 1, None, pr_id, head)
+
+
+def test_pr_subject_into_a_planning_loop_is_rejected_with_no_insert() -> None:
+    # Purpose/subject mismatch (issue #25): a PR subject can never enter a
+    # planning loop. The mismatch is a deterministic caller error raised
+    # under the loop lock — the insert is never attempted and nothing is
+    # written.
+    row = _iteration_row(
+        plan_revision_id=None,
+        task_pull_request_id=uuid.uuid4(),
+        reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    fake_conn = FakeConnection(responses=[("open", "planning")])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=row[1],
+            task_id=row[2],
+            review_loop_id=row[3],
+            iteration_number=1,
+            plan_revision_id=None,
+            task_pull_request_id=row[6],
+            reviewed_head_sha=row[7],
+        )
+    assert len(fake_conn.executed) == 1  # the guarded read only; no insert
+
+
+def test_plan_subject_into_a_pr_review_loop_is_rejected_with_no_insert() -> None:
+    # The inverse mismatch: a PlanRevision subject can never enter a
+    # pr_review loop.
+    row = _iteration_row()
+    fake_conn = FakeConnection(responses=[("open", "pr_review")])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=row[1],
+            task_id=row[2],
+            review_loop_id=row[3],
+            iteration_number=1,
+            plan_revision_id=row[5],
+        )
+    assert len(fake_conn.executed) == 1  # the guarded read only; no insert
 
 
 def test_create_review_iteration_validates_subject_and_number_before_sql() -> None:
@@ -327,6 +412,39 @@ def test_create_review_iteration_validates_subject_and_number_before_sql() -> No
             iteration_number=1,
             plan_revision_id=None,  # type: ignore[arg-type]
         )
+    # Partial PR forms are not subjects (issue #25): PR identity without
+    # the exact head SHA, and the exact head SHA without the PR identity.
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            review_loop_id=uuid.uuid4(),
+            iteration_number=1,
+            plan_revision_id=None,
+            task_pull_request_id=uuid.uuid4(),
+        )
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            review_loop_id=uuid.uuid4(),
+            iteration_number=1,
+            plan_revision_id=None,
+            reviewed_head_sha="0123456789abcdef",
+        )
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            review_loop_id=uuid.uuid4(),
+            iteration_number=1,
+            plan_revision_id=uuid.uuid4(),
+            task_pull_request_id=uuid.uuid4(),
+            reviewed_head_sha="0123456789abcdef",
+        )
     assert fake_conn.executed == []
 
 
@@ -335,7 +453,7 @@ def test_create_review_iteration_is_guarded_by_the_open_loop_state() -> None:
     # guard runs first, the insert is never attempted, and the rejected
     # no-op returns None (never retried blindly).
     row = _iteration_row()
-    closed_conn = FakeConnection(responses=[("closed",)])
+    closed_conn = FakeConnection(responses=[("closed", "planning")])
     closed_pool = cast(DatabasePool, FakePool(closed_conn))
     assert (
         create_review_iteration(
@@ -350,7 +468,7 @@ def test_create_review_iteration_is_guarded_by_the_open_loop_state() -> None:
     )
     assert len(closed_conn.executed) == 1
     guard_sql, guard_params = closed_conn.executed[0]
-    assert "select status from openorc.review_loops" in guard_sql
+    assert "select status, purpose from openorc.review_loops" in guard_sql
     assert "where id = %s for update" in guard_sql
     assert guard_params == (row[3],)
 

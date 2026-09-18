@@ -3,7 +3,9 @@
 The ordinary suite cannot execute Postgres; these tests use canned rows and
 a fake pool/connection seam (mirroring the planning/review mapping fakes)
 to prove row-to-domain-object mapping, UTC normalization at the persistence
-boundary, parameterization, the exact-subject validation before SQL, and —
+boundary, parameterization, the exact-subject validation before SQL (the
+pre-PR PR_AUTHORIZATION head subject, the TaskPullRequest plus exact head
+SHA merge-decision subject, and the single-subject REVIEW_RESOLUTION), and —
 above all — the shape of the authoritative resolution transaction: the
 Task row locked FOR UPDATE before any gate write, the currency/token/
 non-archived verification under that lock, the one-shot guarded gate
@@ -109,6 +111,7 @@ def _gate_row(**overrides: Any) -> tuple[Any, ...]:
         "status": "pending",
         "plan_revision_id": uuid.uuid4(),
         "subject_head_sha": None,
+        "task_pull_request_id": None,
         "decided_at": None,
         "created_at": _observed_at(),
     }
@@ -121,6 +124,7 @@ def _gate_row(**overrides: Any) -> tuple[Any, ...]:
         values["status"],
         values["plan_revision_id"],
         values["subject_head_sha"],
+        values["task_pull_request_id"],
         values["decided_at"],
         values["created_at"],
     )
@@ -180,6 +184,7 @@ def test_create_owner_gate_inserts_and_maps_the_pending_row() -> None:
     assert gate.status is OwnerGateStatus.PENDING
     assert gate.plan_revision_id == row[5]
     assert gate.subject_head_sha is None
+    assert gate.task_pull_request_id is None
     assert gate.decided_at is None
     assert gate.created_at == _utc_observed_at()
     assert gate.created_at.utcoffset() == timedelta(0)
@@ -190,8 +195,89 @@ def test_create_owner_gate_inserts_and_maps_the_pending_row() -> None:
     # status is explicit in the creation statement.
     assert "workspace_id, task_id, gate_type, status," in sql
     assert "implementation_authorization" not in sql  # enum values are parameters
-    assert params == (row[1], row[2], "implementation_authorization", "pending", row[5], None)
+    assert params == (
+        row[1],
+        row[2],
+        "implementation_authorization",
+        "pending",
+        row[5],
+        None,
+        None,
+    )
     assert len(fake_conn.executed) == 1
+
+
+def test_merge_decision_binds_the_task_pull_request_plus_head_sha() -> None:
+    # The PR-subject gate form (issue #25): a merge_decision binds the
+    # canonical TaskPullRequest plus the exact head SHA — persisted as the
+    # durable subject, never as a bare head SHA.
+    pr_id = uuid.uuid4()
+    head = "0123456789abcdef0123456789abcdef01234567"
+    row = _gate_row(
+        gate_type="merge_decision",
+        plan_revision_id=None,
+        subject_head_sha=head,
+        task_pull_request_id=pr_id,
+    )
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    gate = create_owner_gate(
+        pool,
+        workspace_id=row[1],
+        task_id=row[2],
+        gate_type=OwnerGateType.MERGE_DECISION,
+        subject_head_sha=head,
+        task_pull_request_id=pr_id,
+    )
+
+    assert gate.gate_type is OwnerGateType.MERGE_DECISION
+    assert gate.task_pull_request_id == pr_id
+    assert gate.subject_head_sha == head
+    assert gate.plan_revision_id is None
+    sql, params = fake_conn.executed[0]
+    assert "subject_head_sha, task_pull_request_id)" in sql
+    assert params == (row[1], row[2], "merge_decision", "pending", None, head, pr_id)
+
+
+def test_pr_subject_gate_shapes_are_validated_before_sql() -> None:
+    # Subject-shape caller errors never reach SQL (issue #25):
+    # MERGE_DECISION requires the TaskPullRequest plus the exact head SHA
+    # (never a bare head SHA, never a PlanRevision), and PR_AUTHORIZATION
+    # deliberately carries no PR binding — it happens before the canonical
+    # PR exists.
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    base: dict[str, Any] = {"workspace_id": uuid.uuid4(), "task_id": uuid.uuid4()}
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(pool, gate_type=OwnerGateType.MERGE_DECISION, **base)
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.MERGE_DECISION,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            **base,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.MERGE_DECISION,
+            plan_revision_id=uuid.uuid4(),
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
+    # PR_AUTHORIZATION keeps its pre-PR subject: head SHA only, and a PR
+    # binding on it is a caller error.
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
+    assert fake_conn.executed == []
 
 
 def test_create_owner_gate_validates_type_and_subject_before_sql() -> None:
@@ -222,6 +308,34 @@ def test_create_owner_gate_validates_type_and_subject_before_sql() -> None:
             subject_head_sha="abc",
             **base,
         )
+    # merge_decision requires exactly the TaskPullRequest plus head SHA.
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(pool, gate_type=OwnerGateType.MERGE_DECISION, **base)
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.MERGE_DECISION,
+            subject_head_sha="abc",
+            **base,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.MERGE_DECISION,
+            plan_revision_id=uuid.uuid4(),
+            subject_head_sha="abc",
+            task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
+    # PR_AUTHORIZATION deliberately carries no PR binding (pre-PR gate).
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            subject_head_sha="abc",
+            task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
     # review_resolution requires exactly one subject.
     with pytest.raises(OwnerGateDomainError):
         create_owner_gate(pool, gate_type=OwnerGateType.REVIEW_RESOLUTION, **base)
@@ -230,6 +344,13 @@ def test_create_owner_gate_validates_type_and_subject_before_sql() -> None:
             pool,
             gate_type=OwnerGateType.REVIEW_RESOLUTION,
             plan_revision_id=uuid.uuid4(),
+            subject_head_sha="abc",
+            **base,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
             subject_head_sha="abc",
             **base,
         )
@@ -277,7 +398,7 @@ def test_the_module_surface_carries_the_resolution_contract() -> None:
 def _resolved_gate_row(base: tuple[Any, ...], outcome: OwnerGateStatus) -> tuple[Any, ...]:
     row = list(base)
     row[4] = outcome.value
-    row[7] = _observed_at()
+    row[8] = _observed_at()
     return tuple(row)
 
 

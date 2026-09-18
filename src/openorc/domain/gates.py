@@ -18,10 +18,13 @@ exact Owner decision bound to the exact subject it governs.
   applies only to the Task's current gate.
 - Exact subjects: an IMPLEMENTATION_AUTHORIZATION gate binds the exact
   review-cleared PlanRevision it authorizes; a PR_AUTHORIZATION gate binds
-  the exact latest committed Producer head SHA presented to the Owner; a
-  MERGE_DECISION gate binds the exact reviewed or Owner-overridden PR/head
-  SHA; a REVIEW_RESOLUTION gate binds exactly one subject — the exhausted
-  planning PlanRevision or the PR/head review subject. Stale
+  only the exact latest committed Producer head SHA presented to the Owner
+  (it happens before the canonical PR exists, so it carries no PR
+  binding); a MERGE_DECISION gate binds the canonical TaskPullRequest plus
+  the exact reviewed or Owner-overridden head SHA; a REVIEW_RESOLUTION
+  gate binds exactly one subject — the exhausted planning PlanRevision, or
+  the PR-review subject as TaskPullRequest plus exact head SHA. A
+  PR-subject gate is never representable as a bare head SHA. Stale
   workflow-changing operations must never be applied to newer subjects or
   gates, so the exact binding is validated wherever the gate is used.
 - REVIEW_RESOLUTION approval is an explicit Owner override of an unresolved
@@ -103,10 +106,13 @@ class OwnerGate:
 
     ``gate_type`` selects the settled authority decision; the subject is
     carried exactly: ``plan_revision_id`` for plan-subject gates,
-    ``subject_head_sha`` for head-SHA-subject gates — exactly one form per
-    type, enforced in :meth:`__post_init__` to mirror the database CHECK.
-    ``status`` moves from PENDING to exactly one terminal outcome, stamped
-    with ``decided_at``; there is no rewrite path afterwards.
+    ``subject_head_sha`` for pre-PR head-subject gates, and
+    ``task_pull_request_id`` plus the exact ``subject_head_sha`` for the
+    PR-subject forms (merge decision, PR-review resolution) — exactly one
+    form per type, enforced in :meth:`__post_init__` to mirror the
+    database CHECK. ``status`` moves from PENDING to exactly one terminal
+    outcome, stamped with ``decided_at``; there is no rewrite path
+    afterwards.
     """
 
     id: UUID
@@ -116,6 +122,7 @@ class OwnerGate:
     status: OwnerGateStatus
     plan_revision_id: UUID | None
     subject_head_sha: str | None
+    task_pull_request_id: UUID | None
     decided_at: datetime | None
     created_at: datetime
 
@@ -135,6 +142,7 @@ class OwnerGate:
                 "(pending, approved, rejected, or cancelled)"
             )
         _require_uuid(self.plan_revision_id, "plan_revision_id", nullable=True)
+        _require_uuid(self.task_pull_request_id, "task_pull_request_id", nullable=True)
         if self.subject_head_sha is not None and (
             not isinstance(self.subject_head_sha, str) or not self.subject_head_sha.strip()
         ):
@@ -143,24 +151,56 @@ class OwnerGate:
             )
         # Exact-subject coherence per gate type, mirroring the database
         # CHECK: each gate binds exactly the authority subject it governs.
+        # PR_AUTHORIZATION is the pre-PR exact-head gate (no PR binding:
+        # it happens before the canonical PR exists); MERGE_DECISION and
+        # the PR form of REVIEW_RESOLUTION bind the canonical
+        # TaskPullRequest plus the exact head SHA.
         if self.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
-            if self.plan_revision_id is None or self.subject_head_sha is not None:
+            if (
+                self.plan_revision_id is None
+                or self.subject_head_sha is not None
+                or self.task_pull_request_id is not None
+            ):
                 raise OwnerGateDomainError(
                     "an implementation_authorization gate binds exactly the "
-                    "review-cleared PlanRevision subject (no head SHA)"
+                    "review-cleared PlanRevision subject (no head SHA, no PR binding)"
                 )
-        elif self.gate_type in (OwnerGateType.PR_AUTHORIZATION, OwnerGateType.MERGE_DECISION):
-            if self.plan_revision_id is not None or self.subject_head_sha is None:
+        elif self.gate_type is OwnerGateType.PR_AUTHORIZATION:
+            if (
+                self.plan_revision_id is not None
+                or self.subject_head_sha is None
+                or self.task_pull_request_id is not None
+            ):
                 raise OwnerGateDomainError(
-                    f"a {self.gate_type.value} gate binds exactly the head-SHA "
-                    "subject (no PlanRevision)"
+                    "a pr_authorization gate binds exactly the head-SHA subject "
+                    "(no PlanRevision and no PR binding: it happens before the "
+                    "canonical PR exists)"
+                )
+        elif self.gate_type is OwnerGateType.MERGE_DECISION:
+            if (
+                self.plan_revision_id is not None
+                or self.subject_head_sha is None
+                or not isinstance(self.task_pull_request_id, UUID)
+            ):
+                raise OwnerGateDomainError(
+                    "a merge_decision gate binds exactly the TaskPullRequest plus "
+                    "the exact head SHA (no PlanRevision)"
                 )
         else:  # REVIEW_RESOLUTION: exactly one subject form.
-            if (self.plan_revision_id is None) == (self.subject_head_sha is None):
-                raise OwnerGateDomainError(
-                    "a review_resolution gate binds exactly one subject: the "
-                    "exhausted planning PlanRevision or the PR/head review subject"
-                )
+            if self.plan_revision_id is not None:
+                # Planning-exhaustion form: the PlanRevision only.
+                if self.subject_head_sha is not None or self.task_pull_request_id is not None:
+                    raise OwnerGateDomainError(
+                        "a review_resolution gate on the planning subject binds "
+                        "exactly the exhausted PlanRevision: no head SHA and no PR binding"
+                    )
+            else:
+                # PR-review-exhaustion form: TaskPullRequest + exact head SHA.
+                if self.subject_head_sha is None or not isinstance(self.task_pull_request_id, UUID):
+                    raise OwnerGateDomainError(
+                        "a review_resolution gate on the PR-review subject binds "
+                        "exactly the TaskPullRequest plus the exact head SHA"
+                    )
         # Resolution coherence, mirroring the database CHECK: the terminal
         # stamp is non-NULL exactly when the status is terminal.
         if self.status is OwnerGateStatus.PENDING:

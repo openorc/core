@@ -41,9 +41,14 @@ result (Phase 1, issue #23).
   ``schema_version``) remains a protocol concern and is deliberately not
   stored on the iteration.
 - Each iteration references the exact subject reviewed: v1 planning
-  iterations bind a specific PlanRevision of the same Task. PR review
-  support later binds one TaskPullRequest plus exact head SHA on the same
-  review-history model.
+  iterations bind a specific PlanRevision of the same Task; PR-review
+  iterations bind one TaskPullRequest of the same Task plus the exact
+  reviewed head SHA (``reviewed_head_sha``). Reviewer acceptance identity
+  is the TaskPullRequest plus the exact reviewed head SHA: a changed PR
+  head invalidates prior acceptance, while movement of the PR target/base
+  branch alone does not. Review history references the same
+  TaskPullRequest plus per-iteration head SHAs rather than creating a new
+  PR record per iteration.
 - Iteration numbering is unique per ReviewLoop.
 
 This module carries transport-independent validation only. It performs no
@@ -233,8 +238,9 @@ def review_loop_field_names() -> frozenset[str]:
 class ReviewIteration:
     """One immutable-once-finalized review iteration inside a ReviewLoop.
 
-    Binds the exact subject reviewed (a PlanRevision of the same Task in
-    v1; PR-review head binding arrives later on the same model) and, once
+    Binds the exact subject reviewed — a PlanRevision of the same Task for
+    a planning iteration, or one TaskPullRequest of the same Task plus the
+    exact reviewed head SHA for a PR-review iteration — and, once
     finalized, carries the complete Reviewer result — outcome, summary,
     findings, decided_at — as one atomically recorded, never-rewritten fact
     set. Provider/runtime/protocol failures are not outcomes.
@@ -245,7 +251,9 @@ class ReviewIteration:
     task_id: UUID
     review_loop_id: UUID
     iteration_number: int
-    plan_revision_id: UUID
+    plan_revision_id: UUID | None
+    task_pull_request_id: UUID | None
+    reviewed_head_sha: str | None
     outcome: ReviewOutcome | None
     summary: str | None
     findings: list[object] | None
@@ -255,12 +263,27 @@ class ReviewIteration:
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "review_loop_id"):
             _require_uuid(getattr(self, name), name)
-        # v1 subjects are planning revisions: the exact PlanRevision under
-        # review is required. PR-review subject binding arrives later on the
-        # same model.
-        if not isinstance(self.plan_revision_id, UUID):
+        # Exact-subject coherence, mirrored by the database CHECK: a
+        # planning iteration binds the exact PlanRevision with no PR
+        # binding; a PR-review iteration binds the exact TaskPullRequest
+        # plus the exact (non-empty) reviewed head SHA. Exactly one
+        # complete subject form per iteration — partial PR forms are not
+        # subjects.
+        has_plan = isinstance(self.plan_revision_id, UUID)
+        has_pr_identity = isinstance(self.task_pull_request_id, UUID)
+        has_pr_head = isinstance(self.reviewed_head_sha, str) and bool(
+            self.reviewed_head_sha.strip()
+        )
+        if has_plan and (has_pr_identity or self.reviewed_head_sha is not None):
             raise ReviewLoopDomainError(
-                "ReviewIteration.plan_revision_id must be a UUID (the exact subject reviewed)"
+                "a planning ReviewIteration binds only the exact PlanRevision "
+                "subject: no TaskPullRequest and no reviewed head SHA"
+            )
+        if not has_plan and not (has_pr_identity and has_pr_head):
+            raise ReviewLoopDomainError(
+                "a PR-review ReviewIteration binds the exact TaskPullRequest plus "
+                "a non-empty reviewed_head_sha (the exact reviewed head); a "
+                "planning iteration binds the exact PlanRevision"
             )
         if (
             isinstance(self.iteration_number, bool)
