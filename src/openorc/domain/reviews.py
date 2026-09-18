@@ -263,14 +263,25 @@ class ReviewIteration:
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "review_loop_id"):
             _require_uuid(getattr(self, name), name)
+        # Nullable subject ids are validated independently of subject-form
+        # selection: a wrong-type non-NULL id is a caller error in its own
+        # right and can never masquerade as an absent subject that silently
+        # selects the other subject form.
+        if self.plan_revision_id is not None and not isinstance(self.plan_revision_id, UUID):
+            raise ReviewLoopDomainError("ReviewIteration.plan_revision_id must be a UUID")
+        if self.task_pull_request_id is not None and not isinstance(
+            self.task_pull_request_id, UUID
+        ):
+            raise ReviewLoopDomainError("ReviewIteration.task_pull_request_id must be a UUID")
         # Exact-subject coherence, mirrored by the database CHECK: a
         # planning iteration binds the exact PlanRevision with no PR
         # binding; a PR-review iteration binds the exact TaskPullRequest
         # plus the exact (non-empty) reviewed head SHA. Exactly one
         # complete subject form per iteration — partial PR forms are not
-        # subjects.
-        has_plan = isinstance(self.plan_revision_id, UUID)
-        has_pr_identity = isinstance(self.task_pull_request_id, UUID)
+        # subjects. Subject presence is derived from ``is not None`` (the
+        # type was validated above), never from ``isinstance``.
+        has_plan = self.plan_revision_id is not None
+        has_pr_identity = self.task_pull_request_id is not None
         has_pr_head = isinstance(self.reviewed_head_sha, str) and bool(
             self.reviewed_head_sha.strip()
         )

@@ -201,6 +201,27 @@ def test_review_resolution_binds_exactly_one_subject() -> None:
         )
 
 
+def test_review_resolution_rejects_wrong_type_subject_ids() -> None:
+    # The nullable UUID subject fields are validated independently of
+    # subject-form selection (issue #25 review amendment): a wrong-type
+    # non-NULL id is a caller error and can never masquerade as an absent
+    # subject that silently selects the other subject form.
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id="not-a-uuid",  # type: ignore[arg-type]
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid4(),
+        )
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=uuid4(),
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+
+
 def test_gate_requires_uuid_identity_fields() -> None:
     with pytest.raises(OwnerGateDomainError):
         _gate(id="not-a-uuid")  # type: ignore[arg-type]

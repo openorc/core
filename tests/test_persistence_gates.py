@@ -357,6 +357,37 @@ def test_create_owner_gate_validates_type_and_subject_before_sql() -> None:
     assert fake_conn.executed == []
 
 
+def test_review_resolution_wrong_type_subject_ids_are_rejected_before_sql() -> None:
+    # A wrong-type non-NULL subject id is a caller error before any SQL
+    # runs (issue #25 review amendment): it can never masquerade as an
+    # absent subject and silently select the other subject form.
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    base: dict[str, Any] = {"workspace_id": uuid.uuid4(), "task_id": uuid.uuid4()}
+    # A wrong-type non-NULL PlanRevision cannot masquerade as absent and
+    # select the otherwise-valid PR/head subject form.
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id="not-a-uuid",  # type: ignore[arg-type]
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
+    # A valid PlanRevision with a poisoned PR id.
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=uuid.uuid4(),
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id="not-a-uuid",  # type: ignore[arg-type]
+            **base,
+        )
+    assert fake_conn.executed == []
+
+
 def test_get_owner_gate_maps_or_returns_none() -> None:
     row = _gate_row()
     pool = cast(DatabasePool, FakePool(FakeConnection(row)))

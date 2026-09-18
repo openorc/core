@@ -136,13 +136,14 @@ alter table openorc.review_iterations
         check (reviewed_head_sha is null or reviewed_head_sha ~ '\S');
 
 -- v1 planning subjects were previously the only subject form (a bare
--- not-NULL check, auto-named by Postgres as ``review_iterations_check``).
+-- single-column not-NULL check, auto-named by Postgres as
+-- ``review_iterations_plan_revision_id_check``).
 -- Replace it with the settled exact-subject coherence: a planning subject
 -- is the exact PlanRevision with no PR binding; a PR subject is the exact
 -- TaskPullRequest plus the exact reviewed head SHA. Exactly one form per
 -- iteration.
 alter table openorc.review_iterations
-    drop constraint review_iterations_check;
+    drop constraint review_iterations_plan_revision_id_check;
 
 alter table openorc.review_iterations
     add constraint review_iterations_subject_form_check

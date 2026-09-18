@@ -187,6 +187,31 @@ def test_pr_review_iteration_binds_the_task_pull_request_plus_exact_head() -> No
             )
 
 
+def test_poisoned_mixed_subject_forms_are_rejected() -> None:
+    # A wrong-type non-NULL subject id is a caller error in its own right
+    # (issue #25 review amendment): it can never masquerade as an absent
+    # subject and silently select the other subject form. Validated before
+    # subject-form selection, independently.
+    # A valid PlanRevision with a poisoned PR id.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(task_pull_request_id="not-a-uuid")  # type: ignore[arg-type]
+    # A poisoned PlanRevision cannot masquerade as absent and select the
+    # otherwise-valid PR/head subject form.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(
+            plan_revision_id="not-a-uuid",  # type: ignore[arg-type]
+            task_pull_request_id=uuid4(),
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        )
+    # A valid PlanRevision with a poisoned PR id and a head SHA.
+    with pytest.raises(ReviewLoopDomainError):
+        _iteration(
+            plan_revision_id=uuid4(),
+            task_pull_request_id="not-a-uuid",  # type: ignore[arg-type]
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        )
+
+
 def test_iteration_outcome_must_be_a_reviewer_judgment_or_none() -> None:
     # Provider/runtime/protocol failures are not reviewer judgments; the
     # vocabulary structurally excludes them.

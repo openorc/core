@@ -164,7 +164,19 @@ def _require_subject(
                 "the exact head SHA and no PlanRevision"
             )
     else:  # REVIEW_RESOLUTION: exactly one subject form.
-        if isinstance(plan_revision_id, UUID):
+        # Nullable subject ids are validated independently of subject-form
+        # selection: a wrong-type non-NULL id is a caller error before any
+        # SQL runs and can never masquerade as an absent subject that
+        # silently selects the other subject form.
+        if plan_revision_id is not None and not isinstance(plan_revision_id, UUID):
+            raise OwnerGateDomainError(
+                "create_owner_gate requires a UUID plan_revision_id (or None)"
+            )
+        if task_pull_request_id is not None and not isinstance(task_pull_request_id, UUID):
+            raise OwnerGateDomainError(
+                "create_owner_gate requires a UUID task_pull_request_id (or None)"
+            )
+        if plan_revision_id is not None:
             # Planning-exhaustion form: the PlanRevision only.
             if subject_head_sha is not None or task_pull_request_id is not None:
                 raise OwnerGateDomainError(
@@ -174,9 +186,10 @@ def _require_subject(
                 )
         else:
             # PR-review-exhaustion form: the TaskPullRequest plus the exact
-            # head SHA — never a bare head SHA.
+            # head SHA — never a bare head SHA. Presence is ``is not None``
+            # (the type was validated above).
             if (
-                not isinstance(task_pull_request_id, UUID)
+                task_pull_request_id is None
                 or not isinstance(subject_head_sha, str)
                 or not subject_head_sha.strip()
             ):

@@ -260,9 +260,22 @@ def create_review_iteration(
     ``UniqueViolation``.
     """
     _require_positive_int(iteration_number, "iteration_number")
-    has_plan = isinstance(plan_revision_id, UUID)
+    # Nullable subject ids are validated independently of subject-form
+    # selection: a wrong-type non-NULL id is a caller error before any SQL
+    # runs and can never masquerade as an absent subject that silently
+    # selects the other subject form. Subject presence is then derived from
+    # ``is not None``, never from ``isinstance``.
+    if plan_revision_id is not None and not isinstance(plan_revision_id, UUID):
+        raise ReviewLoopDomainError(
+            "create_review_iteration requires a UUID plan_revision_id (or None)"
+        )
+    if task_pull_request_id is not None and not isinstance(task_pull_request_id, UUID):
+        raise ReviewLoopDomainError(
+            "create_review_iteration requires a UUID task_pull_request_id (or None)"
+        )
+    has_plan = plan_revision_id is not None
     has_pr = (
-        isinstance(task_pull_request_id, UUID)
+        task_pull_request_id is not None
         and isinstance(reviewed_head_sha, str)
         and bool(reviewed_head_sha.strip())
     )

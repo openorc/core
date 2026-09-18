@@ -448,6 +448,39 @@ def test_create_review_iteration_validates_subject_and_number_before_sql() -> No
     assert fake_conn.executed == []
 
 
+def test_poisoned_mixed_subject_forms_are_rejected_before_sql() -> None:
+    # A wrong-type non-NULL subject id is a caller error before any SQL
+    # runs (issue #25 review amendment): it can never masquerade as an
+    # absent subject and silently select the other subject form.
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    # A valid PlanRevision with a poisoned PR id.
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            review_loop_id=uuid.uuid4(),
+            iteration_number=1,
+            plan_revision_id=uuid.uuid4(),
+            task_pull_request_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+    # A poisoned PlanRevision cannot masquerade as absent and select the
+    # otherwise-valid PR/head subject form.
+    with pytest.raises(ReviewLoopDomainError):
+        create_review_iteration(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            review_loop_id=uuid.uuid4(),
+            iteration_number=1,
+            plan_revision_id="not-a-uuid",  # type: ignore[arg-type]
+            task_pull_request_id=uuid.uuid4(),
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        )
+    assert fake_conn.executed == []
+
+
 def test_create_review_iteration_is_guarded_by_the_open_loop_state() -> None:
     # A CLOSED loop accepts no further iterations: the FOR UPDATE lifecycle
     # guard runs first, the insert is never attempted, and the rejected

@@ -66,6 +66,20 @@ def _collapsed_raw_block(table: str) -> str:
     return re.sub(r"\s+", " ", _table_block(_migration_text_raw(), table))
 
 
+def _plan_review_iterations_table_block() -> str:
+    """The committed review_iterations table body from the prior migration.
+
+    Lets the constraint-name tests derive Postgres's auto-generated names
+    from the committed source instead of mirroring this migration's prose.
+    """
+    matches = sorted(p.name for p in MIGRATIONS_DIR.glob("*_create_plan_review_tables.sql"))
+    assert len(matches) == 1, (
+        f"expected exactly one create_plan_review_tables migration, found {matches}"
+    )
+    prior_text = (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8")
+    return _table_block(prior_text, REVIEW_ITERATIONS_TABLE)
+
+
 def test_migration_creates_the_task_pull_request_table() -> None:
     text = _migration_text()
     assert f"create table {TASK_PULL_REQUESTS_TABLE}" in text
@@ -139,8 +153,11 @@ def test_review_iterations_carry_the_exact_pr_review_subject() -> None:
     assert "add column reviewed_head_sha text" in raw
     assert "check (reviewed_head_sha is null or reviewed_head_sha ~ '\\S')" in raw
     # The settled XOR subject coherence replaces the prior bare not-NULL
-    # check: exactly one complete subject form per iteration.
-    assert "drop constraint review_iterations_check" in raw
+    # check: exactly one complete subject form per iteration. The drop
+    # target is the auto-generated name derived from the committed prior
+    # migration (asserted exactly by the dedicated test below).
+    assert "drop constraint review_iterations_plan_revision_id_check" in raw
+    assert "drop constraint review_iterations_check;" not in raw
     assert "add constraint review_iterations_subject_form_check" in raw
     block = re.search(
         r"add constraint review_iterations_subject_form_check\s*check \((.*?)\);",
@@ -158,6 +175,23 @@ def test_review_iterations_carry_the_exact_pr_review_subject() -> None:
     prose = _prose_text()
     assert "movement of the pr target/base branch alone does not invalidate acceptance" in prose
     assert "the exact reviewed head shas are historical facts on the review records" in prose
+
+
+def test_the_dropped_review_iterations_check_name_matches_the_prior_migration() -> None:
+    # The old subject CHECK is unnamed and single-column, so Postgres
+    # auto-named it ``<table>_<column>_check``. The drop target is derived
+    # here from the committed plan-review migration — not mirrored from
+    # this migration's prose — so a wrong drop name fails the convention
+    # test instead of the real migration run.
+    old_block = re.sub(r"\s+", " ", _plan_review_iterations_table_block())
+    # The prior subject rule is exactly one unnamed single-column CHECK on
+    # plan_revision_id, so its generated name has no numeric suffix.
+    assert "check (plan_revision_id is not null)," in old_block
+    assert old_block.count("plan_revision_id is not null") == 1
+    raw = re.sub(r"\s+", " ", _migration_text_raw())
+    assert "drop constraint review_iterations_plan_revision_id_check;" in raw
+    # The multi-column owner_gates CHECK keeps its plain table name.
+    assert "drop constraint owner_gates_check;" in raw
 
 
 def test_owner_gates_bind_the_settled_subject_forms_per_type() -> None:
