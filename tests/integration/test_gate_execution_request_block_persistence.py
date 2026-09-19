@@ -36,15 +36,12 @@ and the suite skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, LiteralString, cast
+from typing import Any, cast
 
 import pytest
-from psycopg import Connection, connect
+from psycopg import Connection
 from psycopg.errors import (
     CheckViolation,
     ForeignKeyViolation,
@@ -78,40 +75,6 @@ from openorc.persistence.pool import DatabasePool
 # it explicitly with "-m integration".
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
-
-
-@pytest.fixture(scope="session")
-def database_url() -> str:
-    url = os.environ.get("OPENORC_TEST_DATABASE_URL", "").strip()
-    if not url:
-        pytest.skip("OPENORC_TEST_DATABASE_URL is not configured")
-    return url
-
-
-@pytest.fixture(scope="session")
-def migrated_database(database_url: str) -> str:
-    """Reset the openorc schema and apply all committed migrations from scratch."""
-    with connect(database_url) as conn:
-        conn.execute("drop schema if exists openorc cascade")
-        for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            # Committed migration files are trusted repository content applied
-            # wholesale; LiteralString is the driver's injection-safe query
-            # contract, satisfied here by repository-controlled file text.
-            migration_sql = cast(LiteralString, migration_path.read_text(encoding="utf-8"))
-            conn.execute(migration_sql)
-        conn.commit()
-    return database_url
-
-
-@pytest.fixture
-def conn(migrated_database: str) -> Iterator[Connection[Any]]:
-    """One connection per test; each test runs inside one rolled-back transaction."""
-    with connect(migrated_database) as connection:
-        yield connection
-        connection.rollback()
-
 
 class _SingleConnectionPool:
     """Minimal DatabasePool adapter sharing the test connection and transaction.
@@ -141,6 +104,10 @@ class _SingleConnectionPool:
 
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     profile_id = uuid.uuid4()
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): every Profile needs its
+    # backing Auth user row. The inserts roll back with the test transaction.
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
     conn.execute("insert into openorc.profiles (id) values (%s)", (profile_id,))
     return profile_id
 
@@ -597,6 +564,12 @@ def test_gates_bind_their_exact_subject_and_reject_wrong_subjects(
             "update openorc.owner_gates set plan_revision_id = %s where id = %s",
             (other_revision.id, gate.id),
         )
+        # The subject foreign key is DEFERRABLE INITIALLY DEFERRED (issue #27
+        # deletion semantics); force the pending check at the assertion point.
+        conn.execute(
+            "set constraints "
+            "openorc.owner_gates_plan_revision_id_task_id_workspace_id_fkey immediate"
+        )
     # A review_resolution gate binds exactly one subject: both subjects (or
     # neither) violate the coherence CHECK. (The initial pending status is
     # inserted explicitly: the lifecycle column has no database default.)
@@ -640,6 +613,9 @@ def test_task_pointer_fk_rejects_cross_task_gate_pointers(conn: Connection[Any])
             "update openorc.tasks set current_owner_gate_id = %s where id = %s",
             (gate.id, other_task_id),
         )
+        # The pointer foreign key is DEFERRABLE INITIALLY DEFERRED (issue #27
+        # deletion semantics); force the pending check at the assertion point.
+        conn.execute("set constraints openorc.tasks_current_owner_gate_fk immediate")
 
 
 def test_review_resolution_approval_never_rewrites_reviewer_history(
@@ -801,6 +777,13 @@ def test_execution_creation_requires_the_producer_session(conn: Connection[Any])
             producer_session_id=other_session,
             execution_number=2,
         )
+        # The producer-session linkage foreign key is DEFERRABLE INITIALLY
+        # DEFERRED (issue #27 deletion semantics); force the pending check at
+        # the assertion point.
+        conn.execute(
+            "set constraints "
+            "openorc.executions_producer_session_id_task_id_workspace_id_fkey immediate"
+        )
 
 
 def test_finalized_executions_are_absorbing_history(conn: Connection[Any]) -> None:
@@ -956,6 +939,14 @@ def test_runtime_requests_require_the_producer_session(conn: Connection[Any]) ->
             task_id=task_id,
             producer_session_id=other_session,
             external_approval_id="cline-approval-2",
+        )
+        # The producer-session linkage foreign key is DEFERRABLE INITIALLY
+        # DEFERRED (issue #27 deletion semantics); force the pending check at
+        # the assertion point.
+        conn.execute(
+            "set constraints "
+            "openorc.runtime_requests_producer_session_id_task_id_workspace_id_fkey "
+            "immediate"
         )
 
 

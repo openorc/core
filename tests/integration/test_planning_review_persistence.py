@@ -33,15 +33,12 @@ skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, LiteralString, cast
+from typing import Any, cast
 
 import pytest
-from psycopg import Connection, connect
+from psycopg import Connection
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
 
 from openorc.domain.reviews import (
@@ -62,42 +59,8 @@ from openorc.persistence.pool import DatabasePool
 # it explicitly with "-m integration".
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
-
 # One exact reviewed head SHA for the PR-review subject fixtures.
 _EXACT_REVIEWED_HEAD = "0123456789abcdef0123456789abcdef01234567"
-
-
-@pytest.fixture(scope="session")
-def database_url() -> str:
-    url = os.environ.get("OPENORC_TEST_DATABASE_URL", "").strip()
-    if not url:
-        pytest.skip("OPENORC_TEST_DATABASE_URL is not configured")
-    return url
-
-
-@pytest.fixture(scope="session")
-def migrated_database(database_url: str) -> str:
-    """Reset the openorc schema and apply all committed migrations from scratch."""
-    with connect(database_url) as conn:
-        conn.execute("drop schema if exists openorc cascade")
-        for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            # Committed migration files are trusted repository content applied
-            # wholesale; LiteralString is the driver's injection-safe query
-            # contract, satisfied here by repository-controlled file text.
-            migration_sql = cast(LiteralString, migration_path.read_text(encoding="utf-8"))
-            conn.execute(migration_sql)
-        conn.commit()
-    return database_url
-
-
-@pytest.fixture
-def conn(migrated_database: str) -> Iterator[Connection[Any]]:
-    """One connection per test; each test runs inside one rolled-back transaction."""
-    with connect(migrated_database) as connection:
-        yield connection
-        connection.rollback()
 
 
 class _SingleConnectionPool:
@@ -128,6 +91,10 @@ class _SingleConnectionPool:
 
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     profile_id = uuid.uuid4()
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): every Profile needs its
+    # backing Auth user row. The inserts roll back with the test transaction.
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
     conn.execute("insert into openorc.profiles (id) values (%s)", (profile_id,))
     return profile_id
 
@@ -584,7 +551,7 @@ def test_iteration_creation_is_rejected_after_the_loop_has_closed(
         purpose=ReviewLoopPurpose.PLANNING,
         iteration_limit=DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
     )
-    with pytest.raises(ForeignKeyViolation):
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         review_repositories.create_review_iteration(
             pool,
             workspace_id=workspace_id,
@@ -592,6 +559,14 @@ def test_iteration_creation_is_rejected_after_the_loop_has_closed(
             review_loop_id=open_loop.id,
             iteration_number=1,
             plan_revision_id=revision.id,
+        )
+        # The loop linkage foreign key is DEFERRABLE INITIALLY DEFERRED
+        # (issue #27 deletion semantics); force the pending check at the
+        # assertion point.
+        conn.execute(
+            "set constraints "
+            "openorc.review_iterations_review_loop_id_task_id_workspace_id_fkey "
+            "immediate"
         )
 
 
@@ -748,14 +723,18 @@ def test_cross_task_pointer_corruption_is_rejected(conn: Connection[Any]) -> Non
     assert task is not None
 
     # A pointer to another Task's revision is rejected durably by the
-    # composite foreign key; the pointer and the Task are unchanged.
-    with pytest.raises(ForeignKeyViolation):
+    # composite foreign key; the pointer and the Task are unchanged. The
+    # pointer foreign key is DEFERRABLE INITIALLY DEFERRED (issue #27
+    # deletion semantics); force the pending check at the assertion point so
+    # the savepoint rollback also restores the untouched pointer.
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         task_repositories.set_current_plan_revision(
             pool,
             task_id,
             expected_state_token=task.state_token,
             plan_revision_id=foreign_revision.id,
         )
+        conn.execute("set constraints openorc.tasks_current_plan_revision_fk immediate")
     assert workspace_id != other_workspace_id
     after = task_repositories.get_task(pool, task_id)
     assert after is not None
@@ -795,7 +774,9 @@ def test_iteration_subject_must_belong_to_the_same_task(conn: Connection[Any]) -
 
     # The exact-subject rule is durable: an iteration of task_id's loop
     # cannot bind another Task's revision, even within the same Workspace.
-    with pytest.raises(ForeignKeyViolation):
+    # The subject foreign key is DEFERRABLE INITIALLY DEFERRED (issue #27
+    # deletion semantics); force the pending check at the assertion point.
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         review_repositories.create_review_iteration(
             pool,
             workspace_id=workspace_id,
@@ -803,6 +784,11 @@ def test_iteration_subject_must_belong_to_the_same_task(conn: Connection[Any]) -
             review_loop_id=loop.id,
             iteration_number=1,
             plan_revision_id=foreign_revision.id,
+        )
+        conn.execute(
+            "set constraints "
+            "openorc.review_iterations_plan_revision_id_task_id_workspace_id_fkey "
+            "immediate"
         )
 
 

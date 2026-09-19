@@ -17,6 +17,13 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Project identity comes from actual environment/repository configuration, never from values inherited from any prior project.
 - Schema changes require corresponding persistence/domain tests and affected generated types/contracts if such generation is adopted.
 
+## Deletion ownership and the sanctioned Auth boundary (issue #27)
+
+- The deletion-ownership migration re-declares every foreign key with an explicit, reviewed action: `ON DELETE CASCADE` for true ownership edges, `NO ACTION DEFERRABLE INITIALLY DEFERRED` for scope-consistency/cross-reference/linkage edges and the Task's upward current-object pointers. The classification is enforced by `tests/test_deletion_migration.py`; keep it reviewable rather than implicit.
+- `openorc.profiles.id → auth.users (id) ON DELETE CASCADE` is the single deliberate, sanctioned exception to managed-schema isolation: the canonical account identity. Direct Supabase-administrative deletion of an auth user must remove the complete OpenOrc-owned graph (no orphaned Profile/Workspace rows from administrative deletion outside the OpenOrc application). Supabase Auth owns its own Auth/OAuth/session cleanup; OpenOrc application code invokes no Supabase Auth admin API in Phase 1, and the future Delete Account service (Phase 2) converges on the same database behavior.
+- The Auth-root cascade fires only when the `auth.users` row is actually removed. Supabase soft deletion (`should_soft_delete=True`) preserves the Auth row and therefore never triggers the cascade or removes any OpenOrc data. The future OpenOrc Delete Account operation must, after its required external cleanup/revocation, ultimately perform a permanent/hard Auth-user deletion — never Supabase soft deletion — or OpenOrc-owned account data is stranded.
+- OpenOrc deletion must never delete or mutate GitHub engineering artifacts or runtime-owned credentials/configuration/filesystem state; the schema grants no deletion path into any external system.
+
 ## Security / isolation
 
 - Workspace isolation is a security boundary.

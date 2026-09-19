@@ -24,16 +24,13 @@ skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, LiteralString, cast
+from typing import Any, cast
 
 import pytest
-from psycopg import Connection, connect
+from psycopg import Connection
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 
 from openorc.domain.ownership import GitHubRepositoryIdentity, RepositoryMetadata
@@ -46,43 +43,13 @@ from openorc.persistence.pool import DatabasePool
 # it explicitly with "-m integration".
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
-
-
-@pytest.fixture(scope="session")
-def database_url() -> str:
-    url = os.environ.get("OPENORC_TEST_DATABASE_URL", "").strip()
-    if not url:
-        pytest.skip("OPENORC_TEST_DATABASE_URL is not configured")
-    return url
-
-
-@pytest.fixture(scope="session")
-def migrated_database(database_url: str) -> str:
-    """Reset the openorc schema and apply all committed migrations from scratch."""
-    with connect(database_url) as conn:
-        conn.execute("drop schema if exists openorc cascade")
-        for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            # Committed migration files are trusted repository content applied
-            # wholesale; LiteralString is the driver's injection-safe query
-            # contract, satisfied here by repository-controlled file text.
-            migration_sql = cast(LiteralString, migration_path.read_text(encoding="utf-8"))
-            conn.execute(migration_sql)
-        conn.commit()
-    return database_url
-
-
-@pytest.fixture
-def conn(migrated_database: str) -> Iterator[Connection[Any]]:
-    """One connection per test; each test runs inside one rolled-back transaction."""
-    with connect(migrated_database) as connection:
-        yield connection
-        connection.rollback()
-
 
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     profile_id = uuid.uuid4()
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): every Profile needs its
+    # backing Auth user row. The inserts roll back with the test transaction.
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
     conn.execute("insert into openorc.profiles (id) values (%s)", (profile_id,))
     return profile_id
 
@@ -156,6 +123,11 @@ class _SingleConnectionPool:
 
 def test_profile_id_is_caller_supplied_and_unique(conn: Connection[Any]) -> None:
     profile_id = uuid.uuid4()
+
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): create the backing Auth
+    # user first.
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
 
     row = conn.execute(
         "insert into openorc.profiles (id) values (%s) returning id",
@@ -283,7 +255,12 @@ def test_metadata_update_preserves_repository_identity(conn: Connection[Any]) ->
 def test_repository_round_trip_through_persistence_layer(conn: Connection[Any]) -> None:
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    profile = ownership_repositories.create_profile(pool, profile_id=uuid.uuid4())
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): create the backing Auth
+    # user first.
+    profile_id = uuid.uuid4()
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
+    profile = ownership_repositories.create_profile(pool, profile_id=profile_id)
     workspace = ownership_repositories.create_workspace(
         pool, owner_profile_id=profile.id, name="round-trip workspace"
     )

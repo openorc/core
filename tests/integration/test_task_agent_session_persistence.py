@@ -31,16 +31,13 @@ skips cleanly when ``OPENORC_TEST_DATABASE_URL`` is absent.
 
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, LiteralString, cast
+from typing import Any, cast
 
 import pytest
-from psycopg import Connection, connect
+from psycopg import Connection
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
 from psycopg.types.json import Jsonb
 
@@ -55,40 +52,6 @@ from openorc.persistence.pool import DatabasePool
 # (pyproject addopts "-m 'not integration'") and lets integration runs select
 # it explicitly with "-m integration".
 pytestmark = pytest.mark.integration
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
-
-
-@pytest.fixture(scope="session")
-def database_url() -> str:
-    url = os.environ.get("OPENORC_TEST_DATABASE_URL", "").strip()
-    if not url:
-        pytest.skip("OPENORC_TEST_DATABASE_URL is not configured")
-    return url
-
-
-@pytest.fixture(scope="session")
-def migrated_database(database_url: str) -> str:
-    """Reset the openorc schema and apply all committed migrations from scratch."""
-    with connect(database_url) as conn:
-        conn.execute("drop schema if exists openorc cascade")
-        for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            # Committed migration files are trusted repository content applied
-            # wholesale; LiteralString is the driver's injection-safe query
-            # contract, satisfied here by repository-controlled file text.
-            migration_sql = cast(LiteralString, migration_path.read_text(encoding="utf-8"))
-            conn.execute(migration_sql)
-        conn.commit()
-    return database_url
-
-
-@pytest.fixture
-def conn(migrated_database: str) -> Iterator[Connection[Any]]:
-    """One connection per test; each test runs inside one rolled-back transaction."""
-    with connect(migrated_database) as connection:
-        yield connection
-        connection.rollback()
 
 
 class _SingleConnectionPool:
@@ -119,6 +82,10 @@ class _SingleConnectionPool:
 
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     profile_id = uuid.uuid4()
+    # profiles.id references auth.users (id) ON DELETE CASCADE — the single
+    # sanctioned Supabase Auth boundary (issue #27): every Profile needs its
+    # backing Auth user row. The inserts roll back with the test transaction.
+    conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
     conn.execute("insert into openorc.profiles (id) values (%s)", (profile_id,))
     return profile_id
 
@@ -862,13 +829,19 @@ def test_workspace_scope_consistency_is_enforced(conn: Connection[Any]) -> None:
     )
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    with pytest.raises(ForeignKeyViolation):
+    # The Connection-reference foreign key is DEFERRABLE INITIALLY DEFERRED
+    # (issue #27 deletion semantics); a released repository SAVEPOINT does
+    # not check it, so force the pending check at the assertion point.
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         session_repositories.ensure_task_agent_session(
             pool,
             workspace_id=first_workspace,
             task_id=task_id,
             role=WorkflowRole.PRODUCER,
             connection_id=other_workspace_connection,
+        )
+        conn.execute(
+            "set constraints openorc.task_agent_sessions_connection_id_workspace_id_fkey immediate"
         )
 
 
