@@ -31,6 +31,7 @@ from openorc.adapters.supabase import (
     SupabaseJwksOutcomeUnknownError,
     SupabaseJwksUnavailableError,
 )
+from openorc.adapters.supabase.auth import DEFAULT_JWKS_CACHE_TTL_SECONDS
 from openorc.config import ConfigurationError
 from openorc.domain.identity import AuthenticatedPrincipal
 
@@ -426,15 +427,20 @@ class FakeFetch:
     """Injectable JWKS fetcher recording calls; serves queued documents.
 
     When the queue is exhausted the last document is served indefinitely, so
-    tests needing repeated identical fetches need not queue copies.
+    tests needing repeated identical fetches need not queue copies. An
+    ``errors`` queue (settable at any time) makes subsequent calls raise the
+    queued exception once each, before serving documents again.
     """
 
-    def __init__(self, documents: list[bytes]) -> None:
+    def __init__(self, documents: list[bytes], errors: list[Exception] | None = None) -> None:
         self._documents = list(documents)
+        self.errors: list[Exception] = list(errors) if errors is not None else []
         self.calls: list[tuple[str, float]] = []
 
     def __call__(self, url: str, timeout: float) -> bytes:
         self.calls.append((url, timeout))
+        if self.errors:
+            raise self.errors.pop(0)
         if len(self._documents) > 1:
             return self._documents.pop(0)
         return self._documents[0]
@@ -452,6 +458,12 @@ class FakeClock:
 
 def _jwks_document(private_key: Any, kid: str) -> bytes:
     return json.dumps({"keys": [_jwk_entry(private_key, kid, "ES256")]}).encode()
+
+
+def _http_failure() -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        JWKS_URL, 503, "Service Unavailable", cast(Any, None), cast(Any, None)
+    )
 
 
 def test_http_client_caches_the_document_between_lookups() -> None:
@@ -493,6 +505,93 @@ def test_http_client_forces_a_single_refresh_for_unknown_kid_then_rejects() -> N
     with pytest.raises(SupabaseAccessTokenRejectedError):
         client.get_signing_key("rotated-away")
     assert len(fetch.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("failures", "expected_type"),
+    [
+        (
+            [
+                _http_failure(),
+                _http_failure(),
+            ],
+            SupabaseJwksUnavailableError,
+        ),
+        (
+            [
+                urllib.error.URLError("connection refused"),
+                urllib.error.URLError("connection refused"),
+            ],
+            SupabaseJwksOutcomeUnknownError,
+        ),
+    ],
+    ids=["known_failure", "unknown_outcome"],
+)
+def test_failed_forced_refresh_is_bounded_and_keeps_the_failure_classification(
+    failures: list[Exception], expected_type: type[Exception]
+) -> None:
+    # Regression: the forced-refresh slot must be consumed by a FAILED
+    # refresh too. Otherwise a JWKS outage during unknown-kid lookups is
+    # amplified into a live fetch per token while the ordinary cache is still
+    # fresh, and the outage gets misreported as invalid credentials.
+    private_key = _ec_private_key()
+    fetch = FakeFetch([_jwks_document(private_key, "key-1")])
+    clock = FakeClock()
+    client = HttpJwksClient(JWKS_URL, clock=clock, fetch=fetch)
+    client.get_signing_key("key-1")
+    assert len(fetch.calls) == 1  # cache warmed by one successful fetch
+
+    fetch.errors = failures  # every fetch now fails, one error each
+
+    # Unknown kid: the epoch's forced refresh fails with the retrieval error.
+    with pytest.raises(expected_type):
+        client.get_signing_key("rotated-away")
+    assert len(fetch.calls) == 2
+
+    # The failed refresh consumed the epoch: the next unknown-kid lookup
+    # re-reports the same classified outcome WITHOUT another fetch — never
+    # reclassified as a token rejection.
+    with pytest.raises(expected_type):
+        client.get_signing_key("rotated-away")
+    assert len(fetch.calls) == 2
+
+    # A known kid is still served from the last good document during the
+    # failure epoch, without a fetch and without a failure.
+    client.get_signing_key("key-1")
+    assert len(fetch.calls) == 2
+
+    # A new epoch permits exactly one new load attempt, bounded again.
+    clock.now += DEFAULT_JWKS_CACHE_TTL_SECONDS
+    with pytest.raises(expected_type):
+        client.get_signing_key("rotated-away")
+    assert len(fetch.calls) == 3
+    with pytest.raises(expected_type):
+        client.get_signing_key("rotated-away")
+    assert len(fetch.calls) == 3
+
+
+def test_failed_natural_load_is_bounded_per_epoch() -> None:
+    # Regression: a failed natural (TTL-expired) load consumes its epoch the
+    # same way, so an outage cannot issue one fetch per request.
+    fetch = FakeFetch(
+        [],
+        errors=[
+            urllib.error.URLError("connection refused"),
+            urllib.error.URLError("connection refused"),
+        ],
+    )
+    clock = FakeClock()
+    client = HttpJwksClient(JWKS_URL, clock=clock, fetch=fetch)
+
+    with pytest.raises(SupabaseJwksOutcomeUnknownError):
+        client.get_signing_key("key-1")
+    assert len(fetch.calls) == 1
+
+    # Repeated lookups during the failure epoch report the cached outcome.
+    for _ in range(3):
+        with pytest.raises(SupabaseJwksOutcomeUnknownError):
+            client.get_signing_key("key-1")
+    assert len(fetch.calls) == 1
 
 
 def test_http_client_rejects_kidless_tokens_against_ambiguous_sets() -> None:

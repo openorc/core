@@ -173,14 +173,18 @@ def _fetch_jwks_keys(
     return _parse_jwks_document(raw)
 
 
-def _select_signing_key(keys: list[dict[str, object]], kid: str | None) -> dict[str, object] | None:
+def _select_signing_key(
+    keys: list[dict[str, object]] | None, kid: str | None
+) -> dict[str, object] | None:
     """Select the JWK entry matching the token header ``kid``.
 
     ``kid`` is optional in the JWT header: a token without ``kid`` matches a
-    single-key JWKS unambiguously; a multi-key set is never guessed. No or
-    ambiguous match returns ``None`` (a token-selection problem, not a
-    retrieval failure).
+    single-key JWKS unambiguously; a multi-key set is never guessed. No keys,
+    no match, or an ambiguous match returns ``None`` (a token-selection
+    problem, not a retrieval failure).
     """
+    if not keys:
+        return None
     if kid is None:
         return keys[0] if len(keys) == 1 else None
     matches = [key for key in keys if key.get("kid") == kid]
@@ -222,22 +226,45 @@ class HttpJwksClient:
         self._cached_keys: list[dict[str, object]] | None = None
         self._cached_at: float | None = None
         self._forced_refresh_used = False
+        self._epoch_failure: (
+            SupabaseJwksUnavailableError | SupabaseJwksOutcomeUnknownError | None
+        ) = None
 
     def get_signing_key(self, kid: str | None) -> PyJWK:
         """Return the current signing key matching ``kid``.
 
-        One refresh is forced per cache epoch when a fresh cache does not
-        contain the key (stale-cache safety during signing-key rotation); a
-        still-missing ``kid`` is a token rejection, not a retrieval failure,
-        and repeated unknown-kid lookups do not force further fetches.
+        One refresh is forced per cache epoch when the current document does
+        not contain the key (stale-cache safety during signing-key rotation).
+        The epoch slot is consumed by the refresh attempt whether it succeeds
+        or fails: a failed refresh (or a failed natural load) is cached for
+        the remainder of the epoch and re-reported without issuing another
+        fetch, so outages and unknown-kid streams cannot be amplified into
+        unbounded live JWKS calls. A cached-failure report keeps the
+        external-operation classification — a retrieval failure is never
+        reclassified as an invalid credential. A still-missing ``kid`` after
+        a bounded refresh is a token rejection.
         """
         with self._lock:
-            keys = self._load_keys(force_refresh=False)
+            try:
+                keys = self._load_keys(force_refresh=False)
+            except (SupabaseJwksUnavailableError, SupabaseJwksOutcomeUnknownError):
+                # The epoch load failed (bounded): fall back to the last good
+                # document for best-effort lookups within its TTL staleness.
+                keys = self._cached_keys
             key_data = _select_signing_key(keys, kid)
-            if key_data is None and self._cache_is_fresh() and not self._forced_refresh_used:
-                keys = self._load_keys(force_refresh=True)
-                self._forced_refresh_used = True
-                key_data = _select_signing_key(keys, kid)
+            if key_data is None and self._cache_is_fresh():
+                if self._epoch_failure is not None:
+                    # The current epoch already ended in a classified
+                    # retrieval failure: report that same outcome without
+                    # another fetch, preserving the external-operation
+                    # classification.
+                    raise self._epoch_failure
+                if not self._forced_refresh_used:
+                    # The slot is consumed by the attempt itself, whether the
+                    # refresh succeeds or fails.
+                    self._forced_refresh_used = True
+                    keys = self._load_keys(force_refresh=True)
+                    key_data = _select_signing_key(keys, kid)
             if key_data is None:
                 raise SupabaseAccessTokenRejectedError(
                     "authentication failed: the access token was not signed by "
@@ -251,21 +278,43 @@ class HttpJwksClient:
                 ) from exc
 
     def _cache_is_fresh(self) -> bool:
-        if self._cached_keys is None or self._cached_at is None:
+        """Whether a load attempt (successful or failed) is within the TTL.
+
+        Failed attempts start an epoch too: the failure is cached for the
+        window so repeated lookups do not issue additional fetches.
+        """
+        if self._cached_at is None:
             return False
         return self._clock() - self._cached_at < self._cache_ttl_seconds
 
     def _load_keys(self, *, force_refresh: bool) -> list[dict[str, object]]:
-        """Load (and cache) the raw JWK entries from the JWKS document."""
+        """Load (and cache) the raw JWK entries from the JWKS document.
+
+        One load attempt per epoch, bounded on failure as well as success: a
+        failed attempt records the classified outcome for the epoch and is
+        reported again by fresh lookups until the TTL expires.
+        """
         if not force_refresh and self._cache_is_fresh():
+            if self._epoch_failure is not None:
+                raise self._epoch_failure
             assert self._cached_keys is not None
             return self._cached_keys
 
-        keys = _fetch_jwks_keys(self._fetch, self._jwks_url, self._timeout_seconds)
+        try:
+            keys = _fetch_jwks_keys(self._fetch, self._jwks_url, self._timeout_seconds)
+        except (SupabaseJwksUnavailableError, SupabaseJwksOutcomeUnknownError) as exc:
+            # The failed load consumes the current epoch: within the TTL
+            # window, repeated lookups report this classified outcome instead
+            # of issuing repeated live fetches.
+            self._epoch_failure = exc
+            self._cached_at = self._clock()
+            raise
         self._cached_keys = keys
+        self._epoch_failure = None
         self._cached_at = self._clock()
         # A naturally loaded document starts a fresh epoch with one
-        # forced-refresh slot available for unknown-kid lookups.
+        # forced-refresh slot available for unknown-kid lookups; a forced
+        # refresh keeps its own slot consumed.
         if not force_refresh:
             self._forced_refresh_used = False
         return keys
