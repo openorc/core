@@ -33,6 +33,14 @@ Forbidden dependency directions include:
 
 Domain/services must be usable without an HTTP request or queue job object.
 
+## Module organization
+
+- Organize Python modules around cohesive capabilities and responsibilities rather than broad catch-all files.
+- Keep unrelated use cases and independently changing responsibilities in separate modules.
+- Prefer specific module names that communicate ownership and purpose. Do not use generic dumping-ground modules such as `utils.py`, `helpers.py`, or `common.py` for unrelated behavior.
+- Preserve architectural boundaries when extracting code: moving logic into another file must not move workflow authority into transports, adapters, or persistence.
+- Keep tests organized around the capability or module they exercise rather than allowing unrelated scenarios to accumulate in one catch-all test module.
+
 ## Shared rules
 
 - Use typed internal/domain/application errors for expected failures; transports map them to transport behavior.
