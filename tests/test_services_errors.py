@@ -78,13 +78,24 @@ def test_categories_do_not_shadow_each_other() -> None:
             )
 
 
-def test_error_instances_carry_no_secret_bearing_state() -> None:
+def test_error_instances_carry_no_custom_fields() -> None:
     for error_type in _CATEGORY_ERRORS:
         instance = error_type("boom")
-        # The vocabulary is message-only today. Later capabilities add
-        # explicit safe keyword fields — never credentials or tokens, and
-        # never a second copy of canonical domain state.
+        # Message-only vocabulary: no custom attribute state exists yet.
+        # Keeping secrets out of errors is an authoring obligation, not a
+        # mechanism — the types do not sanitize content, and later explicit
+        # fields must likewise hold only safe values.
         assert instance.__dict__ == {}
+
+
+def test_error_types_do_not_sanitize_message_content() -> None:
+    # Exceptions pass caller-supplied text through unchanged, so sensitive
+    # material in a message would surface wherever the error is rendered or
+    # logged. The vocabulary relies on service authors supplying safe
+    # application-level messages; it performs no sanitization itself.
+    error = ApplicationError("token=example-secret")
+    assert error.args == ("token=example-secret",)
+    assert str(error) == "token=example-secret"
 
 
 def test_service_foundation_imports_without_transport_or_runtime_objects(

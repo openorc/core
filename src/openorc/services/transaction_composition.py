@@ -66,7 +66,10 @@ class _ConnectionBoundPool:
     The view is deliberately not a pool: it never closes, replaces, or
     returns the underlying connection or the process pool, and it is
     expired when the outer transaction ends so it cannot escape the outer
-    transaction's lifetime.
+    transaction's lifetime. Both obtaining a connection context and
+    entering one re-check expiry, so a context obtained while the view was
+    active cannot open the bound connection after the composition has
+    ended.
     """
 
     def __init__(self, connection: Connection[Any]) -> None:
@@ -74,17 +77,19 @@ class _ConnectionBoundPool:
         self._active = True
 
     def connection(self) -> AbstractContextManager[Connection[Any]]:
-        if not self._active:
-            raise RuntimeError(
-                "the transaction-scoped pool view is expired: it cannot be "
-                "used outside the composed_transaction block that yielded it"
-            )
+        self._require_active()
 
         @contextmanager
         def scoped() -> Iterator[Connection[Any]]:
-            # A nested transaction block on the already-open outer
-            # transaction: psycopg turns this into a SAVEPOINT whose
-            # release/rollback is confined to this repository scope.
+            # Re-checked at entry: a context manager obtained while the view
+            # was active must not open the bound connection's transaction
+            # after the outer composition has ended — the connection has
+            # returned to the process pool by then and may be reused
+            # elsewhere. This is a nested transaction block on the
+            # already-open outer transaction: psycopg turns it into a
+            # SAVEPOINT whose release/rollback is confined to this
+            # repository scope.
+            self._require_active()
             with self._connection.transaction():
                 yield self._connection
 
@@ -98,6 +103,13 @@ class _ConnectionBoundPool:
 
     def _expire(self) -> None:
         self._active = False
+
+    def _require_active(self) -> None:
+        if not self._active:
+            raise RuntimeError(
+                "the transaction-scoped pool view is expired: it cannot be "
+                "used outside the composed_transaction block that yielded it"
+            )
 
 
 @contextmanager

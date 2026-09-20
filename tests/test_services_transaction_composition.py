@@ -28,6 +28,7 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any, cast
 
 import pytest
+from psycopg import Connection
 
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.transactions import transaction
@@ -268,4 +269,20 @@ def test_scoped_pool_cannot_escape_the_outer_transaction_lifetime() -> None:
     assert leaked is not None
 
     with pytest.raises(RuntimeError, match="expired"), transaction(cast(DatabasePool, leaked)):
+        pass  # pragma: no cover - the block can never be entered
+
+
+def test_context_created_while_active_cannot_be_entered_after_expiry() -> None:
+    conn = FakeConnection()
+    pool = FakePool(conn)
+    delayed: AbstractContextManager[Connection[Any]] | None = None
+
+    with composed_transaction(cast(DatabasePool, pool)) as scoped:
+        delayed = scoped.connection()
+    assert delayed is not None
+
+    # Entering a context obtained while the view was active must still fail
+    # after the outer composition has ended: the bound connection has
+    # returned to the process pool and may already be reused elsewhere.
+    with pytest.raises(RuntimeError, match="expired"), delayed:
         pass  # pragma: no cover - the block can never be entered

@@ -8,10 +8,12 @@ status-code semantics of its own.
 
 The vocabulary is minimal by design — only the categories demonstrated by
 Phase 2A needs. It is not an exception registry, a result-monad layer, or a
-command bus. Error instances are message-typed; when a later capability
-demonstrates the need, it adds explicit safe keyword fields — never
-credentials, tokens, or a second copy of canonical domain state — so errors
-remain safe to surface to callers and logs.
+command bus. Error instances are message-typed, and the types do not
+sanitize message content: keeping errors safe to surface is an authoring
+obligation. Service authors must provide safe application-level messages
+and must never place raw credentials, tokens, or a second copy of canonical
+domain state in an exception message; explicit keyword fields added by
+later capabilities are likewise required to hold only safe values.
 """
 
 from __future__ import annotations
@@ -33,8 +35,10 @@ class ApplicationError(Exception):
     """Base of the expected application-failure vocabulary.
 
     Transport-neutral by construction: translated into transport behavior
-    only by the transport that catches it, and safe to log — errors never
-    contain credentials, tokens, or a second copy of domain state.
+    only by the transport that catches it. The types do not sanitize
+    message content — service authors must provide safe application-level
+    messages and must never place credentials, tokens, or a second copy of
+    domain state in an error message or in any explicit field.
     """
 
 
@@ -43,7 +47,8 @@ class AuthenticationError(ApplicationError):
 
     Identity could not be established or verified (invalid or expired
     credential, or an identity whose backing account no longer exists).
-    Never reveals token or credential contents.
+    Failure messages must describe the failure without revealing token or
+    credential contents.
     """
 
 
