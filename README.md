@@ -136,6 +136,14 @@ API and worker processes access OpenOrc's dedicated `openorc` Postgres schema th
 - Connections are pooler-neutral by default (`prepare_threshold=None`; no session-local state), so direct, session-pooler, and transaction-pooler endpoints work identically.
 - A pool belongs to exactly one OS process and is created by the process that uses it — never inherited or reused across an RQ fork boundary. The durable invariants live in `src/openorc/persistence/AGENTS.md`.
 
+### Authentication (Supabase Auth)
+
+API and worker authentication verifies Supabase Auth access tokens against the project's asymmetric signing keys (JWKS) and resolves the verified user to the canonical OpenOrc `Profile` (idempotently bootstrapped on first use; see `src/openorc/services/authentication.py`).
+
+- `SUPABASE_URL` — the Supabase project URL; the Auth issuer (`<url>/auth/v1`) and JWKS source (`<url>/auth/v1/.well-known/jwks.json`) derive from it. In devserver runs it is exported per-run from the ephemeral branch; production deployments must supply it, and `OPENORC_ENV=production` fails startup when it is missing or malformed.
+- `OPENORC_SUPABASE_JWT_AUDIENCE` — the expected authenticated audience (default `authenticated`).
+- v1 is GitHub-only sign-in: configure Supabase Auth with GitHub as the only enabled user sign-in provider and asymmetric JWT signing keys (ES256/RS256). The verifier enforces the trusted `app_metadata` GitHub-origin checks as defense-in-depth and has no symmetric/HS256 shared-secret path.
+
 ## Local development (frontend)
 
 `apps/app` is the product SPA (Vue 3 + Vite + TypeScript) and targets Node 24. Its toolchain contract mirrors the Python one:

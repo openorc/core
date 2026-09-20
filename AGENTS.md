@@ -80,6 +80,7 @@ Read the nearest relevant guide before editing, and read all relevant guides for
 - `src/openorc/adapters/AGENTS.md`
 - `src/openorc/adapters/github/AGENTS.md`
 - `src/openorc/adapters/cline/AGENTS.md`
+- `src/openorc/adapters/supabase/AGENTS.md`
 - `src/openorc/persistence/AGENTS.md`
 - `packages/cline-sdk-bridge/AGENTS.md`
 - `supabase/AGENTS.md`
