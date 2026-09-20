@@ -496,12 +496,20 @@ def test_http_client_forces_a_single_refresh_for_unknown_kid_then_rejects() -> N
     fetch = FakeFetch([_jwks_document(private_key, "key-1")])
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=fetch)
 
+    # Cold cache: one natural load; the kid is missing from the just-fetched
+    # document, so it is rejected without a redundant immediate re-fetch.
     with pytest.raises(SupabaseAccessTokenRejectedError, match="signing key"):
         client.get_signing_key("rotated-away")
-    assert len(fetch.calls) == 2  # stale-cache safety: exactly one forced refresh
+    assert len(fetch.calls) == 1
 
-    # After the refresh confirms the key is still absent, the same lookup
-    # rejects without further fetches.
+    # Against the now-fresh cached document, exactly one forced refresh is
+    # attempted (stale-cache safety during rotation); the kid is still absent.
+    with pytest.raises(SupabaseAccessTokenRejectedError, match="signing key"):
+        client.get_signing_key("rotated-away")
+    assert len(fetch.calls) == 2
+
+    # After the forced refresh confirms the key is still absent, further
+    # lookups of the same kid reject without more fetches.
     with pytest.raises(SupabaseAccessTokenRejectedError):
         client.get_signing_key("rotated-away")
     assert len(fetch.calls) == 2
@@ -592,6 +600,46 @@ def test_failed_natural_load_is_bounded_per_epoch() -> None:
         with pytest.raises(SupabaseJwksOutcomeUnknownError):
             client.get_signing_key("key-1")
     assert len(fetch.calls) == 1
+
+
+def test_failed_fetches_do_not_extend_the_last_good_document_lifetime() -> None:
+    # Regression: a failed JWKS fetch renews only the bounded backoff epoch —
+    # never the freshness of the last successfully fetched document. Once the
+    # successful document is beyond its cache lifetime, the old known key is
+    # not served through any number of failed attempts across successive
+    # failure epochs; lookups fail closed until a fetch succeeds.
+    private_key = _ec_private_key()
+    fetch = FakeFetch([_jwks_document(private_key, "key-1")])
+    clock = FakeClock()
+    client = HttpJwksClient(JWKS_URL, cache_ttl_seconds=10.0, clock=clock, fetch=fetch)
+
+    client.get_signing_key("key-1")  # successful fetch at t=1000
+    assert len(fetch.calls) == 1
+
+    clock.now += 10.0  # the successful document's cache lifetime is over
+    fetch.errors = [urllib.error.URLError("down") for _ in range(3)]
+
+    # Across successive failure epochs, exactly one bounded fetch attempt is
+    # issued per epoch and the stale known key is never served on failure —
+    # neither mid-epoch (cached outcome) nor at an epoch boundary.
+    for expected_calls in (2, 3, 4):
+        with pytest.raises(SupabaseJwksOutcomeUnknownError):
+            client.get_signing_key("key-1")
+        assert len(fetch.calls) == expected_calls
+
+        clock.now += 5.0  # still within the failure epoch
+        with pytest.raises(SupabaseJwksOutcomeUnknownError):
+            client.get_signing_key("key-1")
+        assert len(fetch.calls) == expected_calls
+
+        clock.now += 5.0  # step onto the next epoch boundary
+
+    # Recovery: a successful fetch starts a fresh document epoch and the key
+    # is servable again.
+    fetch.errors = []
+    signing_key = client.get_signing_key("key-1")
+    assert len(fetch.calls) == 5
+    assert signing_key.key.public_numbers() == private_key.public_key().public_numbers()
 
 
 def test_http_client_rejects_kidless_tokens_against_ambiguous_sets() -> None:

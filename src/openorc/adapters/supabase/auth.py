@@ -200,6 +200,17 @@ class HttpJwksClient:
     fakes replace this class entirely in ordinary tests; the injected
     ``fetch``/``clock`` seams exist for testing this implementation without
     network access.
+
+    Two clocks are tracked separately:
+
+    - ``_document_fetched_at`` is when the last JWKS fetch SUCCEEDED. It is
+      the only gate for serving known keys from the cached document: failed
+      fetches never extend it, so last-good signing keys stay usable only
+      within their own cache lifetime and stale keys cannot survive a
+      prolonged outage (key-rotation/revocation safety).
+    - ``_epoch_attempted_at`` is when the last load attempt happened, success
+      or failure. It governs only the bounded backoff window during which a
+      failed load attempt is re-reported without issuing further fetches.
     """
 
     def __init__(
@@ -224,7 +235,8 @@ class HttpJwksClient:
         self._fetch: _JwksFetcher = fetch if fetch is not None else _fetch_jwks_document
         self._lock = threading.Lock()
         self._cached_keys: list[dict[str, object]] | None = None
-        self._cached_at: float | None = None
+        self._document_fetched_at: float | None = None
+        self._epoch_attempted_at: float | None = None
         self._forced_refresh_used = False
         self._epoch_failure: (
             SupabaseJwksUnavailableError | SupabaseJwksOutcomeUnknownError | None
@@ -233,86 +245,110 @@ class HttpJwksClient:
     def get_signing_key(self, kid: str | None) -> PyJWK:
         """Return the current signing key matching ``kid``.
 
-        One refresh is forced per cache epoch when the current document does
-        not contain the key (stale-cache safety during signing-key rotation).
-        The epoch slot is consumed by the refresh attempt whether it succeeds
-        or fails: a failed refresh (or a failed natural load) is cached for
-        the remainder of the epoch and re-reported without issuing another
-        fetch, so outages and unknown-kid streams cannot be amplified into
-        unbounded live JWKS calls. A cached-failure report keeps the
-        external-operation classification — a retrieval failure is never
-        reclassified as an invalid credential. A still-missing ``kid`` after
-        a bounded refresh is a token rejection.
+        Known keys are served from the last successfully fetched document
+        only while that document is within its own cache lifetime — failed
+        fetches never renew that gate. One refresh is forced per document
+        epoch when the document does not contain the key (stale-cache safety
+        during signing-key rotation), consumed by the attempt itself. A
+        failed load — natural or forced — starts a bounded backoff epoch
+        during which lookups needing the key source re-report the classified
+        outcome without issuing further fetches; a retrieval failure is never
+        reclassified as an invalid credential, and a still-missing ``kid``
+        after a bounded refresh is a token rejection. Once the last good
+        document expires, lookups fail closed until a JWKS fetch succeeds.
         """
         with self._lock:
-            try:
+            now = self._clock()
+            document_fresh = (
+                self._document_fetched_at is not None
+                and now - self._document_fetched_at < self._cache_ttl_seconds
+            )
+            backoff_active = (
+                self._epoch_attempted_at is not None
+                and now - self._epoch_attempted_at < self._cache_ttl_seconds
+            )
+
+            # 1) Known keys: served from the last successfully fetched
+            #    document, only while that document is within its own cache
+            #    lifetime. Failed fetches never renew this gate.
+            if document_fresh and self._cached_keys is not None:
+                key_data = _select_signing_key(self._cached_keys, kid)
+                if key_data is not None:
+                    return self._build_signing_key(key_data)
+
+            # 2) The key source is needed. Within an active backoff epoch the
+            #    previous attempt's classified outcome is re-reported without
+            #    another fetch, preserving the external-operation
+            #    classification.
+            if backoff_active and self._epoch_failure is not None:
+                raise self._epoch_failure
+
+            if document_fresh:
+                # Unknown kid against a still-fresh document: exactly one
+                # forced refresh per document epoch, consumed by the attempt
+                # itself whether it succeeds or fails.
+                if self._forced_refresh_used:
+                    raise SupabaseAccessTokenRejectedError(
+                        "authentication failed: the access token was not signed by "
+                        "a known project signing key"
+                    )
+                self._forced_refresh_used = True
+                keys = self._load_keys(force_refresh=True)
+            else:
+                # The last good document is stale (or absent): one natural
+                # load per backoff epoch. Expired keys are never revived by
+                # failed-attempt epochs — lookups fail closed until a fetch
+                # succeeds.
                 keys = self._load_keys(force_refresh=False)
-            except (SupabaseJwksUnavailableError, SupabaseJwksOutcomeUnknownError):
-                # The epoch load failed (bounded): fall back to the last good
-                # document for best-effort lookups within its TTL staleness.
-                keys = self._cached_keys
             key_data = _select_signing_key(keys, kid)
-            if key_data is None and self._cache_is_fresh():
-                if self._epoch_failure is not None:
-                    # The current epoch already ended in a classified
-                    # retrieval failure: report that same outcome without
-                    # another fetch, preserving the external-operation
-                    # classification.
-                    raise self._epoch_failure
-                if not self._forced_refresh_used:
-                    # The slot is consumed by the attempt itself, whether the
-                    # refresh succeeds or fails.
-                    self._forced_refresh_used = True
-                    keys = self._load_keys(force_refresh=True)
-                    key_data = _select_signing_key(keys, kid)
             if key_data is None:
                 raise SupabaseAccessTokenRejectedError(
                     "authentication failed: the access token was not signed by "
                     "a known project signing key"
                 )
-            try:
-                return PyJWK(key_data)
-            except jwt.PyJWTError as exc:
-                raise SupabaseJwksUnavailableError(
-                    "the Supabase Auth signing-key source published an unusable key"
-                ) from exc
+            return self._build_signing_key(key_data)
 
-    def _cache_is_fresh(self) -> bool:
-        """Whether a load attempt (successful or failed) is within the TTL.
-
-        Failed attempts start an epoch too: the failure is cached for the
-        window so repeated lookups do not issue additional fetches.
-        """
-        if self._cached_at is None:
-            return False
-        return self._clock() - self._cached_at < self._cache_ttl_seconds
+    def _build_signing_key(self, key_data: dict[str, object]) -> PyJWK:
+        try:
+            return PyJWK(key_data)
+        except jwt.PyJWTError as exc:
+            raise SupabaseJwksUnavailableError(
+                "the Supabase Auth signing-key source published an unusable key"
+            ) from exc
 
     def _load_keys(self, *, force_refresh: bool) -> list[dict[str, object]]:
-        """Load (and cache) the raw JWK entries from the JWKS document.
+        """Attempt one JWKS load, bounded by the backoff epoch.
 
-        One load attempt per epoch, bounded on failure as well as success: a
-        failed attempt records the classified outcome for the epoch and is
-        reported again by fresh lookups until the TTL expires.
+        A load attempt — successful or failed — consumes the current backoff
+        epoch: within the TTL window a failed attempt is re-reported without
+        issuing another fetch. The attempt timestamp is tracked separately
+        from the successful-document timestamp: a failed attempt never
+        extends the freshness (and therefore the servable lifetime) of the
+        last successfully fetched signing-key document.
         """
-        if not force_refresh and self._cache_is_fresh():
-            if self._epoch_failure is not None:
-                raise self._epoch_failure
-            assert self._cached_keys is not None
-            return self._cached_keys
+        now = self._clock()
+        backoff_active = (
+            self._epoch_attempted_at is not None
+            and now - self._epoch_attempted_at < self._cache_ttl_seconds
+        )
+        if backoff_active and self._epoch_failure is not None:
+            raise self._epoch_failure
 
         try:
             keys = _fetch_jwks_keys(self._fetch, self._jwks_url, self._timeout_seconds)
         except (SupabaseJwksUnavailableError, SupabaseJwksOutcomeUnknownError) as exc:
-            # The failed load consumes the current epoch: within the TTL
+            # The failed attempt consumes its backoff epoch: within the TTL
             # window, repeated lookups report this classified outcome instead
-            # of issuing repeated live fetches.
+            # of issuing repeated live fetches. The timestamp of the last
+            # SUCCESSFUL fetch is deliberately untouched.
             self._epoch_failure = exc
-            self._cached_at = self._clock()
+            self._epoch_attempted_at = self._clock()
             raise
         self._cached_keys = keys
         self._epoch_failure = None
-        self._cached_at = self._clock()
-        # A naturally loaded document starts a fresh epoch with one
+        self._document_fetched_at = self._clock()
+        self._epoch_attempted_at = self._document_fetched_at
+        # A naturally loaded document starts a fresh document epoch with one
         # forced-refresh slot available for unknown-kid lookups; a forced
         # refresh keeps its own slot consumed.
         if not force_refresh:
