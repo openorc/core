@@ -5,9 +5,11 @@ failures surface as these typed errors and the transport that catches them
 owns the translation. These tests prove the category hierarchy (stale
 operation as a distinct conflict subtype; known external failure and
 uncertain external outcome as distinct siblings), that categories do not
-shadow each other, that instances carry no secret-bearing state, and that
-the whole service foundation imports without FastAPI, RQ, Supabase, or
-GitHub client objects.
+shadow each other, that instances currently carry no custom attribute
+fields, that message content passes through unsanitized — keeping secrets
+out of errors is an authoring obligation, not a mechanism — and that the
+whole service foundation imports without FastAPI, RQ, Supabase, or GitHub
+client objects.
 """
 
 from __future__ import annotations
