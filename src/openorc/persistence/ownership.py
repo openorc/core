@@ -34,7 +34,9 @@ __all__ = [
     "create_project",
     "create_repository",
     "create_workspace",
+    "ensure_profile",
     "find_repository_by_github_identity",
+    "get_profile",
     "get_repository",
     "update_repository_metadata",
 ]
@@ -94,6 +96,53 @@ def create_profile(pool: DatabasePool, *, profile_id: UUID) -> Profile:
             "insert into openorc.profiles (id) values (%s) returning id, created_at",
             (profile_id,),
         ).fetchone()
+    assert row is not None
+    return _profile_from_row(row)
+
+
+def get_profile(pool: DatabasePool, profile_id: UUID) -> Profile | None:
+    """Return the Profile with the given Supabase Auth user UUID, or ``None``."""
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select id, created_at from openorc.profiles where id = %s",
+            (profile_id,),
+        ).fetchone()
+    return None if row is None else _profile_from_row(row)
+
+
+def ensure_profile(pool: DatabasePool, *, profile_id: UUID) -> Profile:
+    """Resolve or idempotently bootstrap the Profile for one Auth user UUID.
+
+    ``insert ... on conflict (id) do nothing`` converges concurrent first
+    requests for the same valid Supabase user onto exactly one Profile: the
+    winner's insert commits, the loser's insert no-ops, and the fallback
+    ``select`` (a fresh statement snapshot under ``READ COMMITTED``) returns
+    the winner's row. Repeated calls are idempotent and never surface a
+    duplicate-key error.
+
+    Fail-closed account-identity boundary: ``openorc.profiles.id`` references
+    ``auth.users (id) ON DELETE CASCADE`` (the single sanctioned Auth
+    boundary, issue #27). If the backing Auth user row does not exist — for
+    example, a previously issued but still cryptographically valid JWT whose
+    Auth user has been permanently deleted — the insert raises
+    ``psycopg.errors.ForeignKeyViolation``. Translating that into a typed
+    authentication failure (never re-creating the identity) is the service
+    layer's concern, not a persistence one.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "insert into openorc.profiles (id) values (%s) "
+            "on conflict (id) do nothing "
+            "returning id, created_at",
+            (profile_id,),
+        ).fetchone()
+        if row is None:
+            # Another request created (or is committing) this Profile; the
+            # on-conflict insert lost the race, so read the existing row.
+            row = conn.execute(
+                "select id, created_at from openorc.profiles where id = %s",
+                (profile_id,),
+            ).fetchone()
     assert row is not None
     return _profile_from_row(row)
 

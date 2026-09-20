@@ -174,3 +174,57 @@ def test_pool_max_below_pool_min_is_rejected() -> None:
 def test_invalid_pool_timeout_is_rejected(raw: str) -> None:
     with pytest.raises(ConfigurationError, match="OPENORC_DB_POOL_TIMEOUT"):
         Settings.from_env({"OPENORC_DB_POOL_TIMEOUT": raw})
+
+
+def test_supabase_auth_settings_default_to_optional_url_and_authenticated_audience() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.supabase_url is None
+    assert settings.supabase_jwt_audience == "authenticated"
+
+
+def test_supabase_url_and_audience_are_read_when_supplied() -> None:
+    settings = Settings.from_env(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "OPENORC_SUPABASE_JWT_AUDIENCE": "custom-audience",
+        }
+    )
+
+    assert settings.supabase_url == "https://example.supabase.co"
+    assert settings.supabase_jwt_audience == "custom-audience"
+
+
+def test_blank_supabase_values_fall_back_to_defaults() -> None:
+    settings = Settings.from_env({"SUPABASE_URL": "", "OPENORC_SUPABASE_JWT_AUDIENCE": ""})
+
+    assert settings.supabase_url is None
+    assert settings.supabase_jwt_audience == "authenticated"
+
+
+@pytest.mark.parametrize("raw", ["ftp://example.supabase.co", "not-a-url", "https://"])
+def test_malformed_supabase_url_is_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="SUPABASE_URL"):
+        Settings.from_env({"SUPABASE_URL": raw})
+
+
+def test_missing_supabase_url_fails_production_startup() -> None:
+    with pytest.raises(ConfigurationError, match="SUPABASE_URL"):
+        Settings.from_env({"OPENORC_ENV": "production"})
+
+
+def test_missing_supabase_url_is_allowed_outside_production() -> None:
+    for environment in ("development", "test", "staging"):
+        settings = Settings.from_env({"OPENORC_ENV": environment})
+        assert settings.supabase_url is None
+
+
+def test_supplied_supabase_url_satisfies_the_production_requirement() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENORC_ENV": "production",
+            "SUPABASE_URL": "https://prod.supabase.co",
+        }
+    )
+
+    assert settings.supabase_url == "https://prod.supabase.co"

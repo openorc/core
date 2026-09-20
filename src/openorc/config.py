@@ -21,8 +21,11 @@ DATABASE_URL_VAR = "DATABASE_URL"
 DB_POOL_MIN_VAR = "OPENORC_DB_POOL_MIN"
 DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
 DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
+SUPABASE_URL_VAR = "SUPABASE_URL"
+SUPABASE_JWT_AUDIENCE_VAR = "OPENORC_SUPABASE_JWT_AUDIENCE"
 
 DEFAULT_ENVIRONMENT = "development"
+PRODUCTION_ENVIRONMENT = "production"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 3000
 DEFAULT_VALKEY_URL = "redis://127.0.0.1:6379/0"
@@ -34,6 +37,9 @@ DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 DEFAULT_DB_POOL_MIN = 1
 DEFAULT_DB_POOL_MAX = 10
 DEFAULT_DB_POOL_TIMEOUT = 30.0
+# Expected authenticated audience of Supabase Auth access tokens. Supabase
+# Auth mints user access tokens with audience/role "authenticated".
+DEFAULT_SUPABASE_JWT_AUDIENCE = "authenticated"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -47,6 +53,11 @@ _VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
 # conninfo URLs). Driver-qualified schemes (e.g. SQLAlchemy-style suffixes)
 # are not part of this configuration boundary.
 _DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
+
+# Schemes accepted for the Supabase project URL (the auth issuer/JWKS root).
+# https is the production form; http is accepted for the documented local
+# Supabase stack and non-production branches.
+_SUPABASE_URL_SCHEMES = frozenset({"http", "https"})
 
 
 class ConfigurationError(Exception):
@@ -102,6 +113,8 @@ class Settings:
     db_pool_min: int = DEFAULT_DB_POOL_MIN
     db_pool_max: int = DEFAULT_DB_POOL_MAX
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
+    supabase_url: str | None = None
+    supabase_jwt_audience: str = DEFAULT_SUPABASE_JWT_AUDIENCE
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -165,8 +178,34 @@ class Settings:
             source, DB_POOL_TIMEOUT_VAR, default=DEFAULT_DB_POOL_TIMEOUT
         )
 
+        environment = _read(source, ENVIRONMENT_VAR) or DEFAULT_ENVIRONMENT
+
+        # Supabase Auth verification configuration. Malformed supplied values
+        # fail in every environment; a missing required project URL fails
+        # production startup outright (fail fast at startup). Non-production
+        # contexts (local development, tests, tooling) may omit it while they
+        # do not exercise authentication.
+        supabase_url = _read(source, SUPABASE_URL_VAR)
+        if supabase_url is not None:
+            url_scheme = urlparse(supabase_url).scheme.lower()
+            if url_scheme not in _SUPABASE_URL_SCHEMES or not urlparse(supabase_url).netloc:
+                raise ConfigurationError(
+                    f"{SUPABASE_URL_VAR} must be an http(s) Supabase project URL, "
+                    f"got {supabase_url!r}"
+                )
+        elif environment == PRODUCTION_ENVIRONMENT:
+            raise ConfigurationError(
+                f"{SUPABASE_URL_VAR} is required when {ENVIRONMENT_VAR} is "
+                f"{PRODUCTION_ENVIRONMENT}: authentication cannot verify project "
+                "JWTs without the Supabase Auth issuer/project URL"
+            )
+
+        supabase_jwt_audience = (
+            _read(source, SUPABASE_JWT_AUDIENCE_VAR) or DEFAULT_SUPABASE_JWT_AUDIENCE
+        )
+
         return cls(
-            environment=_read(source, ENVIRONMENT_VAR) or DEFAULT_ENVIRONMENT,
+            environment=environment,
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
             api_port=api_port,
             api_reload=api_reload,
@@ -175,4 +214,6 @@ class Settings:
             db_pool_min=db_pool_min,
             db_pool_max=db_pool_max,
             db_pool_timeout=db_pool_timeout,
+            supabase_url=supabase_url,
+            supabase_jwt_audience=supabase_jwt_audience,
         )

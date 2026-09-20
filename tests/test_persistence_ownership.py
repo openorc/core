@@ -25,7 +25,9 @@ from openorc.persistence.ownership import (
     create_profile,
     create_repository,
     create_workspace,
+    ensure_profile,
     find_repository_by_github_identity,
+    get_profile,
     get_repository,
     update_repository_metadata,
 )
@@ -103,6 +105,62 @@ def test_create_profile_uses_the_caller_supplied_auth_uuid() -> None:
     sql, params = conn.executed[0]
     assert "insert into openorc.profiles" in sql
     assert params == (profile_id,)
+
+
+class ScriptedProfileConnection(FakeConnection):
+    """FakeConnection variant playing back a sequence of results in order."""
+
+    def __init__(self, results: list[tuple[Any, ...] | None]) -> None:
+        super().__init__(row=None)
+        self.results = list(results)
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
+        self.executed.append((sql, params))
+        return FakeCursor(self.results.pop(0))
+
+
+def test_get_profile_maps_row_or_empty_result() -> None:
+    profile_id = uuid.uuid4()
+    conn = FakeConnection(row=(profile_id, _observed_at()))
+
+    profile = get_profile(cast(DatabasePool, FakePool(conn)), profile_id)
+
+    assert profile == Profile(id=profile_id, created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC))
+    sql, params = conn.executed[0]
+    assert "from openorc.profiles where id = %s" in sql
+    assert params == (profile_id,)
+
+    empty = get_profile(cast(DatabasePool, FakePool(FakeConnection(row=None))), profile_id)
+    assert empty is None
+
+
+def test_ensure_profile_maps_the_insert_returning_row() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedProfileConnection([(profile_id, _observed_at())])
+
+    profile = ensure_profile(cast(DatabasePool, FakePool(conn)), profile_id=profile_id)
+
+    assert profile == Profile(id=profile_id, created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC))
+    sql, params = conn.executed[0]
+    assert "insert into openorc.profiles" in sql
+    assert "on conflict (id) do nothing" in sql
+    assert params == (profile_id,)
+
+
+def test_ensure_profile_falls_back_to_select_when_conflict_returns_no_row() -> None:
+    # Losing the bootstrap race: the on-conflict insert returns no row and the
+    # winner's row is read with a fresh select in the same transaction.
+    profile_id = uuid.uuid4()
+    conn = ScriptedProfileConnection([None, (profile_id, _observed_at())])
+
+    profile = ensure_profile(cast(DatabasePool, FakePool(conn)), profile_id=profile_id)
+
+    assert profile == Profile(id=profile_id, created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC))
+    insert_sql, _ = conn.executed[0]
+    select_sql, select_params = conn.executed[1]
+    assert "on conflict (id) do nothing" in insert_sql
+    assert "from openorc.profiles where id = %s" in select_sql
+    assert select_params == (profile_id,)
 
 
 def test_create_workspace_maps_row_and_parameters() -> None:

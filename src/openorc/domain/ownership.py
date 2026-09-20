@@ -4,9 +4,13 @@ Profile, Workspace, Project, and Repository form the ownership hierarchy that
 scopes all later Workspace-owned OpenOrc state (Phase 1).
 
 - Profile is the canonical OpenOrc application identity. Its identifier is
-  deliberately the corresponding Supabase Auth user UUID (1:1 by value); it is
-  not a foreign key into Supabase-managed auth infrastructure, and ordinary
-  OpenOrc domain references point at Profile.
+  deliberately the corresponding Supabase Auth user UUID (1:1 by value) and is
+  enforced by the single sanctioned identity/deletion foreign key
+  ``openorc.profiles.id -> auth.users (id) ON DELETE CASCADE`` (issue #27): the
+  OpenOrc-owned application graph can never outlive its account identity, and
+  a Profile can never exist without its backing Auth user. Ordinary OpenOrc
+  domain references still point at Profile, never into Supabase-managed
+  schemas.
 - A Workspace is owned by exactly one Profile in v1. Membership, invitation,
   and RBAC concepts do not exist.
 - A Project belongs to one Workspace. A Repository belongs to one Project and
@@ -44,7 +48,10 @@ class Profile:
     """Canonical OpenOrc application identity.
 
     ``id`` is the corresponding Supabase Auth user UUID by value (a deliberate
-    1:1 infrastructure identity), not a foreign key into Supabase-managed
+    1:1 infrastructure identity), enforced by the single sanctioned identity/
+    deletion foreign key ``openorc.profiles.id -> auth.users (id) ON DELETE
+    CASCADE`` (issue #27): a Profile can never exist without its backing Auth
+    user. Ordinary OpenOrc domain references never point into Supabase-managed
     schemas.
     """
 

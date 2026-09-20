@@ -15,5 +15,6 @@ Adapters do not own Task-state semantics, Owner authority, review policy, workfl
 - Preserve exact external identifiers needed for deterministic routing/reconciliation.
 - Treat uncertain delivery/outcome explicitly; do not pretend timeout means non-delivery.
 - Keep runtime/provider-specific capabilities behind local adapter boundaries rather than expanding the universal contract casually.
+- Supabase Auth JWT verification is normalized adapter mechanics: token rejections and JWKS retrieval failures (known failure vs unknown outcome) are distinct adapter-local errors translated to typed application errors by the authentication service; adapters never import services and never conflate a JWKS outage with invalid caller credentials.
 
 Read the provider-specific nested guide plus services/domain guidance for cross-boundary changes.
