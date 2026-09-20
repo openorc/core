@@ -45,4 +45,13 @@ Services decide when workflow policy permits plan publication, PR composition/pu
 
 ReviewLoop exhaustion creates Owner intervention rather than silently extending the loop; Owner override remains distinct from Reviewer acceptance.
 
+## Established service foundation (Phase 2A)
+
+These conventions are established by issue #51; later Phase 2 leaves inherit them. Changing one is a deliberate architecture decision, not an implementation detail.
+
+- Expected application failures use the transport-neutral typed vocabulary in `errors.py` (`ApplicationError` base): authentication, authorization, not found, invalid command/input, conflict, stale operation (`StaleOperationError`, a distinct `ConflictError` subtype), known external-operation failure (`ExternalOperationFailedError`), and uncertain external-operation outcome (`ExternalOperationUncertainError`). Errors are message-typed and gain only explicit safe keyword fields when a capability demonstrates the need — never credentials/tokens, never a second copy of domain state. Transports own status/outcome mapping.
+- `transaction_composition.py:composed_transaction(pool)` is the one production-supported atomic-composition primitive: it explicitly enters one outer transaction on the process-local pool (`with pool.connection() as conn, conn.transaction()`) and yields a transaction-scoped `DatabasePool` view over that connection, so existing repository `transaction(...)` scopes become nested psycopg SAVEPOINTs and the whole composition commits or rolls back together. `pool.connection()` alone establishes no transaction; the explicit outer block is load-bearing.
+- The connection-bound pool view is transaction-scoped only: it never closes the underlying connection or process pool and expires with the outer transaction that yielded it.
+- The external-I/O rule is executable here: database-only validation/mutation composes inside one short transaction; GitHub, Supabase Auth HTTP, Cline/runtime, model, or any other external call occurs with no database transaction open; after an external call, reload/reconcile current durable state before a consequential follow-up mutation; timeout/connection loss is never reclassified as success or a safe retry.
+
 Read domain plus relevant adapter/persistence/API/worker guides for cross-boundary changes.
