@@ -84,7 +84,7 @@ Do not add speculative generic entities without a demonstrated v1 requirement.
 ## Core invariants
 
 - One GitHub issue has at most one current non-archived Task; cancellation archives/releases that mapping for a fresh Task.
-- Executable workflow runs on leaf Tasks; composite Tasks are tracking/orchestration containers.
+- Executable OpenOrc Tasks exist only for authoritative GitHub leaf issues in v1. Composite GitHub issues are mirrored for hierarchy/progress information and do not have OpenOrc Tasks; Task creation must re-check authoritative GitHub hierarchy before execution begins.
 - One executable Task has one Producer-created canonical branch and at most one canonical current PR.
 - One Task/role keeps one persistent external session identity for the Task lifetime.
 - Session creation is idempotent for `(Task, role)`; stage transitions, retries, Executions, and ReviewLoops do not create sessions.

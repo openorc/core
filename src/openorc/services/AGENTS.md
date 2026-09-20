@@ -18,6 +18,14 @@ FastAPI request / RQ job
 
 External results/errors return through the adapter to services, which decide the deterministic workflow consequence and durable effects.
 
+## Service organization
+
+- Organize service modules around coherent OpenOrc capabilities and use cases, not one global workflow/application service.
+- A service operation should orchestrate one coherent use case or closely related use-case family. Split distinct workflow responsibilities instead of accumulating unrelated phases into one module.
+- API routers and RQ jobs remain thin callers of services; do not duplicate or relocate application decisions into transport code for convenience.
+- Services coordinate domain, persistence, protocol results, and adapters. Provider-specific GitHub/Cline transport mechanics remain in adapters, while persistence modules remain responsible for durable representation rather than workflow policy.
+- Reuse focused application helpers only when they encode a genuine cross-service application concern. Do not create generic helper buckets as an alternative to clear capability ownership.
+
 ## Exact-subject and replay safety
 
 Before any delayed/replayed workflow-changing action:
