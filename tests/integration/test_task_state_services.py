@@ -8,9 +8,12 @@ concurrently-committed state change is not observable, so stale-token
 rejections surface through the currentness guard (also proven here against
 real state); the genuine write-``None`` classification path is proven
 through the write conditions the guard deliberately does not pre-check —
-the already-bound branch and the already-installed current gate — plus the
-real gate-resolution ``STALE`` outcome and the real ``gen_random_uuid()``
-token rotation with its continuation contract.
+the already-bound branch and the already-installed current gate — the
+repository-wide branch-ownership collision between two current Tasks of
+one Repository (the real partial unique index raising the driver
+``UniqueViolation`` the service translates), plus the real gate-resolution
+``STALE`` outcome and the real ``gen_random_uuid()`` token rotation with
+its continuation contract.
 
 Run explicitly when a target has been made available:
 
@@ -154,13 +157,20 @@ def _ownership_chain(
     return workspace_id, repository_id
 
 
-def _create_task(pool: DatabasePool, *, workspace_id: uuid.UUID, repository_id: uuid.UUID) -> Any:
+def _create_task(
+    pool: DatabasePool,
+    *,
+    workspace_id: uuid.UUID,
+    repository_id: uuid.UUID,
+    github_issue_id: int = 9001,
+    github_issue_number: int = 42,
+) -> Any:
     return task_repositories.create_task(
         pool,
         workspace_id=workspace_id,
         repository_id=repository_id,
-        github_issue_id=9001,
-        github_issue_number=42,
+        github_issue_id=github_issue_id,
+        github_issue_number=github_issue_number,
     )
 
 
@@ -218,6 +228,49 @@ def test_rebinding_conflict_classifies_as_conflict_against_real_sql(
     assert unchanged is not None
     assert unchanged.canonical_feature_branch == "feat/producer-branch"
     assert unchanged.state_token == bound.state_token
+
+
+def test_cross_task_branch_collision_translates_to_conflict_against_real_index(
+    conn: Connection[Any],
+) -> None:
+    """Two current Tasks of one Repository independently choosing the same
+    branch name: the repository-wide partial unique index rejects the second
+    bind with a driver ``UniqueViolation``, and the service translates it
+    into the stable typed conflict without exposing the other Task."""
+    workspace_id, repository_id = _ownership_chain(conn)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+    task_a = _create_task(pool, workspace_id=workspace_id, repository_id=repository_id)
+    task_b = _create_task(
+        pool,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=9002,
+        github_issue_number=43,
+    )
+
+    owned = task_mutations.bind_canonical_branch(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_a.id,
+        expected_state_token=task_a.state_token,
+        canonical_feature_branch="feat/shared-branch",
+    )
+    assert owned.canonical_feature_branch == "feat/shared-branch"
+
+    with pytest.raises(ConflictError):
+        task_mutations.bind_canonical_branch(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_b.id,
+            expected_state_token=task_b.state_token,
+            canonical_feature_branch="feat/shared-branch",
+        )
+
+    # Task B applied nothing: unbound branch, unrotated token.
+    unchanged = task_repositories.get_task(pool, task_b.id)
+    assert unchanged is not None
+    assert unchanged.canonical_feature_branch is None
+    assert unchanged.state_token == task_b.state_token
 
 
 def test_second_gate_install_classifies_as_conflict_against_real_sql(

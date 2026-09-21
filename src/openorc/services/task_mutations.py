@@ -26,8 +26,11 @@ The discipline every operation here enforces:
   ``NotFoundError``; an archived Task, a stale token, or raced subject
   state is a ``StaleOperationError``; a genuine current-state conflict
   (branch already bound, gate already installed) is a ``ConflictError``;
-  any otherwise unexplained rejection fails closed as a
-  ``StaleOperationError``.
+  a repository-wide canonical-branch collision (another current Task of
+  the Repository already owns the branch) surfaces as the driver's
+  ``UniqueViolation`` and is translated by the bind mutation into the same
+  stable ``ConflictError`` without exposing the other Task; any otherwise
+  unexplained rejection fails closed as a ``StaleOperationError``.
 - A successful mutation returns the post-write Task carrying the newly
   rotated ``state_token``. Callers must continue from the returned token;
   a failed mutation never fabricates a replacement token.
@@ -49,6 +52,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import NoReturn
 from uuid import UUID
+
+from psycopg.errors import UniqueViolation
 
 from openorc.domain.gates import OwnerGate, OwnerGateStatus
 from openorc.domain.tasks import Task, TaskStatus
@@ -245,8 +250,13 @@ def bind_canonical_branch(
     Canonical branch ownership is a one-time Task-level fact: the branch is
     bound only while it is still unbound, and a current Task never rebinds
     or releases it — a rebinding attempt against current state is a
-    ``ConflictError``, never a rewrite. A successful mutation returns the
-    post-write Task with its newly rotated token.
+    ``ConflictError``, never a rewrite. Branch names are also exclusive
+    across the Repository's current Tasks: when another current Task
+    already owns the branch, the durable partial unique index rejects the
+    write with a driver ``UniqueViolation`` that is translated here into
+    the same stable ``ConflictError`` without exposing the other Task. A
+    successful mutation returns the post-write Task with its newly rotated
+    token.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -259,12 +269,23 @@ def bind_canonical_branch(
             task_id=task_id,
             expected_state_token=expected_state_token,
         )
-        updated = task_records.bind_canonical_branch(
-            transaction_pool,
-            task_id,
-            expected_state_token=expected_state_token,
-            canonical_feature_branch=canonical_feature_branch,
-        )
+        try:
+            updated = task_records.bind_canonical_branch(
+                transaction_pool,
+                task_id,
+                expected_state_token=expected_state_token,
+                canonical_feature_branch=canonical_feature_branch,
+            )
+        except UniqueViolation as exc:
+            # The repository-wide branch-ownership index rejected the bind:
+            # another current Task of this Repository already owns the
+            # branch. Translated into the stable application conflict
+            # without exposing the other Task; the composition rolls back
+            # and nothing was applied.
+            raise ConflictError(
+                "the canonical feature branch is already owned by another "
+                "current task in this repository"
+            ) from exc
         if updated is None:
             current = _require_classified_currentness(
                 transaction_pool, task_id=task_id, expected_state_token=expected_state_token

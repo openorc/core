@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from psycopg.errors import UniqueViolation
 
 from openorc.domain.gates import OwnerGateStatus
 from openorc.domain.tasks import TaskStatus
@@ -62,13 +63,16 @@ class FakeCursor:
 class ScriptedConnection:
     """Plays back canned statement results in order, recording executed SQL."""
 
-    def __init__(self, results: list[tuple[Any, ...] | None]) -> None:
+    def __init__(self, results: list[tuple[Any, ...] | None | Exception]) -> None:
         self.results = list(results)
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
-        return FakeCursor(self.results.pop(0))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeCursor(result)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -92,7 +96,9 @@ class FakePool:
         raise AssertionError("mutation tests never close pools")
 
 
-def _pool(results: list[tuple[Any, ...] | None]) -> tuple[DatabasePool, ScriptedConnection]:
+def _pool(
+    results: list[tuple[Any, ...] | None | Exception],
+) -> tuple[DatabasePool, ScriptedConnection]:
     conn = ScriptedConnection(results)
     return cast(DatabasePool, FakePool(conn)), conn
 
@@ -281,6 +287,26 @@ def test_bind_canonical_branch_rebinding_is_a_conflict() -> None:
         )
     assert len(conn.executed) == 3
     assert "for update" in conn.executed[2][0]
+
+
+def test_bind_canonical_branch_cross_task_collision_is_a_conflict() -> None:
+    """The repository-wide branch-ownership unique index rejects a bind of a
+    branch another current Task of the Repository already owns; the driver
+    exception is translated into the stable conflict without exposing the
+    other Task."""
+    pool, conn = _pool([_task_row(), UniqueViolation()])
+    with pytest.raises(ConflictError) as excinfo:
+        task_mutations.bind_canonical_branch(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            canonical_feature_branch="feat/producer-branch",
+        )
+    assert "another current task" in str(excinfo.value)
+    assert str(_TASK_ID) not in str(excinfo.value)
+    assert len(conn.executed) == 2
+    assert "update openorc.tasks" in conn.executed[1][0]
 
 
 def test_bind_canonical_branch_stale_token_rejects_before_any_write() -> None:
