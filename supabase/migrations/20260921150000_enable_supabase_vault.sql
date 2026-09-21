@@ -1,28 +1,38 @@
 -- Supabase Vault for OpenOrc-owned Agent Runtime control credentials (Phase 2A, issue #55).
 --
--- Enables the supported Supabase Vault extension for the project and locks the
--- vault schema down to the direct backend Postgres path:
+-- Enables the supported Supabase Vault extension for the project and begins
+-- locking the vault schema down to the direct backend Postgres path. This is
+-- the FIRST of the two Vault migrations:
 --
 -- - OpenOrc's backend reaches Vault over the existing process-local Postgres
---   pool as the connecting (owning) role: vault.create_secret,
---   vault.update_secret, the decrypt-on-read vault.decrypted_secrets view, and
---   targeted vault.secrets existence/lookup/delete by exact UUID. That path
---   needs no grants: the extension objects are owned by the role that runs
---   the migrations.
--- - Every other access path is explicitly revoked. PUBLIC, and the Supabase
---   roles anon, authenticated, and service_role, get no privileges on the
---   vault schema, the secret table/view, or the secret-management functions.
---   This is a Vault-specific least-privilege restriction only: OpenOrc still
---   requires the Supabase privileged service-role/secret credential for other
---   Supabase-owned capabilities (Auth, administrative lifecycle), and nothing
---   here disables, removes, or broadly reduces service_role outside the vault
---   schema.
--- - The revokes run unconditionally so the posture is re-asserted on every
---   application of the committed migration, whether or not the extension was
---   already enabled on the target. The effective privilege posture is proven
---   against a real Supabase branch by the integration-marked suite
---   (tests/integration/test_connection_credential_services.py), not inferred
---   from this text.
+--   pool as the connecting role: vault.create_secret, vault.update_secret,
+--   the decrypt-on-read vault.decrypted_secrets view, and targeted
+--   vault.secrets existence/lookup/delete by exact UUID. That path needs no
+--   grants: the extension objects are administered by the migration role.
+-- - This migration revokes PUBLIC and the Supabase browser-facing roles
+--   (anon, authenticated) from the vault schema, the secret table/view, and
+--   the secret-management functions. Those revokes hold on deployed
+--   branches.
+-- - It deliberately contains NO service_role handling: Supabase's platform
+--   post-create handling re-establishes the platform's service_role Vault
+--   grants after the migration that enables the extension reports
+--   successful (observed on hosted previews, where service_role ended up
+--   with direct grants on the schema, the secret table/view, and the
+--   secret-management functions despite same-migration revokes). The
+--   follow-up migration `*_lock_vault_from_service_role.sql` enforces the
+--   service_role lockout after that platform handling has settled; keep the
+--   two migrations in this order.
+-- - The revokes that are present run unconditionally so the posture is
+--   re-asserted on every application of the committed migration. The
+--   effective privilege posture is proven against a real Supabase branch by
+--   the integration-marked suite
+--   (tests/integration/test_connection_credential_services.py), not
+--   inferred from this text.
+-- - This is a Vault-specific least-privilege restriction only: OpenOrc still
+--   requires the Supabase privileged service-role/secret credential for
+--   other Supabase-owned capabilities (Auth, administrative lifecycle), and
+--   nothing in either Vault migration disables, removes, or broadly reduces
+--   service_role outside the vault schema.
 --
 -- Vault stores the credential values encrypted at rest; ordinary openorc.*
 -- tables carry only the opaque v1 auth_reference boundary (issue #55).
@@ -44,23 +54,22 @@ create extension if not exists supabase_vault cascade;
 revoke all on schema vault from public;
 revoke all on schema vault from anon;
 revoke all on schema vault from authenticated;
-revoke all on schema vault from service_role;
 
 -- Encrypted secret storage and the decrypt-on-read view: denied to every
--- non-backend role. The view exposes decrypted secrets, so its SELECT is as
--- sensitive as the plaintext itself.
+-- browser-facing role. The view exposes decrypted secrets, so its SELECT is
+-- as sensitive as the plaintext itself. The service_role lockout is enforced
+-- by the follow-up migration, after the platform's post-enablement grant
+-- handling has settled.
 
 revoke all on vault.secrets from public;
 revoke all on vault.secrets from anon;
 revoke all on vault.secrets from authenticated;
-revoke all on vault.secrets from service_role;
 
 revoke all on vault.decrypted_secrets from public;
 revoke all on vault.decrypted_secrets from anon;
 revoke all on vault.decrypted_secrets from authenticated;
-revoke all on vault.decrypted_secrets from service_role;
 
--- Secret-management functions: denied to every non-backend role. The
+-- Secret-management functions: denied to every browser-facing role. The
 -- extension itself already revokes EXECUTE from PUBLIC; these per-role
 -- revokes make the posture deterministic regardless of image version or
 -- dashboard-era grants. The function references are name-only (exactly one
@@ -70,40 +79,9 @@ revoke all on vault.decrypted_secrets from service_role;
 revoke execute on function vault.create_secret from public;
 revoke execute on function vault.create_secret from anon;
 revoke execute on function vault.create_secret from authenticated;
-revoke execute on function vault.create_secret from service_role;
 
 revoke execute on function vault.update_secret from public;
 revoke execute on function vault.update_secret from anon;
 revoke execute on function vault.update_secret from authenticated;
-revoke execute on function vault.update_secret from service_role;
-
--- Decryption helper hardening, best-effort where the platform allows it:
--- current Supabase images may grant EXECUTE on the internal decryption
--- helper to non-backend roles. Revoke those grants where the function
--- exists and where the migration role is actually permitted to revoke them.
--- This block must never fail the migration: the schema and table/view
--- lockouts above already deny ordinary access to decrypted secrets, and the
--- encrypting/nonce-generation internals are platform-administered — upstream
--- already denies them to PUBLIC, OpenOrc neither uses nor administers them,
--- and a redundant revoke on those internals is refused by hosted Supabase
--- with `permission denied` (SQLSTATE 42501). The effective posture —
--- including that no non-backend role can reach the decryption helper — is
--- proven by the integration privilege assertions in
--- tests/integration/test_connection_credential_services.py, not by this
--- block's tolerance.
-
-do $$
-begin
-    if to_regprocedure(
-        'vault._crypto_aead_det_decrypt(bytea,bytea,bigint,bytea,bytea)'
-    ) is not null then
-        revoke execute on function vault._crypto_aead_det_decrypt from anon;
-        revoke execute on function vault._crypto_aead_det_decrypt from authenticated;
-        revoke execute on function vault._crypto_aead_det_decrypt from service_role;
-    end if;
-exception
-    when insufficient_privilege then
-        null;
-end $$;
 
 
