@@ -96,6 +96,21 @@ if argv[:2] == ["migration", "list"]:
     if os.environ.get("SUPABASE_STUB_DB_NOTREADY"):
         print("stub: database not ready", file=sys.stderr)
         raise SystemExit(1)
+    fail_calls = {
+        int(item)
+        for item in os.environ.get("SUPABASE_STUB_MIGRATION_LIST_FAIL_CALLS", "").split(",")
+        if item.strip()
+    }
+    if fail_calls:
+        # The current call was already appended to the log, so the number of
+        # log lines with this argv shape IS the 1-based ordinal of this call.
+        with open(os.environ["SUPABASE_STUB_LOG"], encoding="utf-8") as log:
+            ordinal = sum(
+                1 for line in log if json.loads(line)[:2] == ["migration", "list"]
+            )
+        if ordinal in fail_calls:
+            print("stub: probe lost during settling", file=sys.stderr)
+            raise SystemExit(1)
     raise SystemExit(0)
 
 if argv[:2] == ["db", "push"]:
@@ -186,6 +201,7 @@ def branch_env(**overrides: str) -> dict[str, str]:
     base: dict[str, str] = {
         "OPENORC_SUPABASE_PROJECT_REF": REF_PARENT,
         "OPENORC_SUPABASE_PRODUCTION_PROJECT_REF": REF_PRODUCTION,
+        "OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS": "0",
         "SUPABASE_ACCESS_TOKEN": BRANCH_SECRET_TOKEN,
         "SUPABASE_STUB_BRANCH_POSTGRES_URL": BRANCH_DIRECT_DB_URL,
         "SUPABASE_STUB_BRANCH_POOLER_URL": BRANCH_DB_URL,
@@ -403,6 +419,7 @@ def test_branch_resolved_production_identity_refused(
         ["--version"],
         ["branches", "get"],
         ["migration", "list"],
+        ["migration", "list"],
     ]
     assert "db push" not in result.stdout
 
@@ -458,6 +475,43 @@ def test_branch_database_not_ready_times_out(
     assert not any(call[:2] == ["db", "push"] for call in read_calls(tmp_path))
 
 
+def test_branch_settle_confirmation_failure_recovers_on_next_cycle(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    # Reachability is not stability (issue #105): the first confirmation
+    # probe fails during the settle window; the next successful probe
+    # settles and confirms AGAIN before migrations are applied.
+    env = branch_env(SUPABASE_STUB_MIGRATION_LIST_FAIL_CALLS="2")
+
+    result = run_tool(*BRANCH_ARGS, env=env, with_migration=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("allowing provisioning to settle") == 2
+    assert "database stopped answering during settling" in result.stdout
+    assert "Migrations applied successfully." in result.stdout
+    migration_calls = [call for call in read_calls(tmp_path) if call[:2] == ["migration", "list"]]
+    assert len(migration_calls) == 4
+
+
+def test_branch_repeated_settle_confirmation_failures_time_out(
+    run_tool: Callable[..., subprocess.CompletedProcess[str]], tmp_path: Path
+) -> None:
+    env = branch_env(
+        SUPABASE_STUB_MIGRATION_LIST_FAIL_CALLS="2,4",
+        OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS="2",
+        OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS="0",
+    )
+
+    result = run_tool(*BRANCH_ARGS, env=env, with_migration=True)
+
+    assert result.returncode != 0
+    assert "did not become ready" in result.stderr
+    assert "database stopped answering during settling" in result.stderr
+    assert not any(call[:2] == ["db", "push"] for call in read_calls(tmp_path))
+    migration_calls = [call for call in read_calls(tmp_path) if call[:2] == ["migration", "list"]]
+    assert len(migration_calls) == 4
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------
@@ -476,8 +530,11 @@ def test_branch_mode_happy_path_applies_migrations(
         ["--version"],
         ["branches", "get", "e2e", "--project-ref", REF_PARENT, "-o", "env"],
         ["migration", "list", "--db-url", BRANCH_DB_URL],
+        ["migration", "list", "--db-url", BRANCH_DB_URL],
         ["db", "push", "--db-url", BRANCH_DB_URL],
     ]
+    # The settle window ran once between the probe and its confirmation.
+    assert result.stdout.count("allowing provisioning to settle") == 1
     # Strict push: no history-drift masking flag.
     assert not any("--include-all" in call for call in calls)
     # Pooler preference (live-verified): when both URLs are published, the

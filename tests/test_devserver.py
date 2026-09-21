@@ -160,6 +160,9 @@ class FakeRunner:
         self.spawn_calls: list[SpawnCall] = []
         self.run_results: dict[tuple[str, ...], RunResult] = {}
         self.run_prefix_results: list[tuple[tuple[str, ...], RunResult]] = []
+        # One-shot FIFO results consumed in call order before the static
+        # results; lets tests script differing outcomes for identical argv.
+        self.run_once_results: dict[tuple[str, ...], list[RunResult]] = {}
         self.default_result = RunResult(returncode=0, stdout="", stderr="")
         self.spawn_children: dict[str, FakeChild] = {}
         self.default_child_exit_after_polls: int | None = None
@@ -195,6 +198,9 @@ class FakeRunner:
         )
         self.events.append(("run", " ".join(str(part) for part in argv[:3]), "run"))
         key = tuple(argv)
+        once = self.run_once_results.get(key)
+        if once:
+            return once.pop(0)
         if key in self.run_results:
             return self.run_results[key]
         for prefix, result in self.run_prefix_results:
@@ -374,6 +380,7 @@ def make_harness(
         "OPENORC_SUPABASE_PRODUCTION_PROJECT_REF": REF_PRODUCTION,
         "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS": "2",
         "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS": "0",
+        "OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS": "0",
     }
     if env:
         for key, value in env.items():
@@ -673,6 +680,7 @@ def make_supabase_manager(
     env: dict[str, str] | None = None,
     with_pin_file: bool = True,
     pin_content: str | None = None,
+    sleep_log: list[float] | None = None,
 ) -> tuple[SupabaseManager, RecordingLogger]:
     root = tmp_path / "repo"
     (root / "supabase").mkdir(parents=True, exist_ok=True)
@@ -687,7 +695,7 @@ def make_supabase_manager(
         root=root,
         env=env if env is not None else {},
         log=log,
-        sleep=lambda seconds: None,
+        sleep=(sleep_log.append if sleep_log is not None else (lambda seconds: None)),
         max_attempts=2,
         sleep_seconds=0.0,
     )
@@ -739,6 +747,120 @@ def test_cli_pin_requires_non_empty_pin(tmp_path: Path) -> None:
     manager, _ = make_supabase_manager(tmp_path, FakeRunner([]), pin_content="   ")
     with pytest.raises(DevserverError, match="pin file is empty"):
         manager.verify_cli_pin()
+
+
+# ---------------------------------------------------------------------------
+# Settle-window readiness gate (issue #105)
+# ---------------------------------------------------------------------------
+
+MIGRATION_PROBE_ARGV = ("supabase", "migration", "list", "--db-url", BRANCH_DB_URL)
+
+
+def make_ready_branch_manager(
+    tmp_path: Path,
+    runner: FakeRunner,
+    *,
+    env: dict[str, str] | None = None,
+    sleep_log: list[float] | None = None,
+) -> tuple[SupabaseManager, RecordingLogger]:
+    """Manager with a created branch whose `branches get` publishes credentials."""
+    merged_env = {"OPENORC_SUPABASE_PROJECT_REF": REF_PARENT}
+    if env:
+        merged_env.update(env)
+    runner.run_prefix_results.append(
+        (("supabase", "branches", "get"), RunResult(0, branch_env_output(), ""))
+    )
+    manager, log = make_supabase_manager(tmp_path, runner, env=merged_env, sleep_log=sleep_log)
+    manager.create_branch()
+    return manager, log
+
+
+def test_settle_ready_after_first_confirmation(tmp_path: Path) -> None:
+    """Probe success -> settle window -> confirmation success declares ready
+    exactly once."""
+    sleeps: list[float] = []
+    runner = FakeRunner([])
+    manager, log = make_ready_branch_manager(tmp_path, runner, sleep_log=sleeps)
+
+    environment = manager.wait_until_ready()
+
+    assert environment.database_url == BRANCH_DB_URL
+    probes = runner.calls_with_prefix(("supabase", "migration", "list"))
+    assert len(probes) == 2
+    assert all(call.argv == MIGRATION_PROBE_ARGV for call in probes)
+    # Only the settle window is slept (the poll sleep is 0 in this manager).
+    assert [seconds for seconds in sleeps if seconds > 0] == [10.0]
+    logs = log.messages_of("log")
+    assert sum("allowing provisioning to settle for 10s" in message for message in logs) == 1
+    assert sum("Supabase branch is ready." in message for message in logs) == 1
+
+
+def test_failed_settle_confirmation_requires_another_cycle(tmp_path: Path) -> None:
+    """A branch that stops answering during settling returns to the bounded
+    loop and must settle and confirm AGAIN on the next successful probe
+    before becoming ready."""
+    sleeps: list[float] = []
+    runner = FakeRunner([])
+    runner.run_once_results[MIGRATION_PROBE_ARGV] = [
+        RunResult(0, "", ""),  # attempt 1: probe
+        RunResult(1, "", "connection lost"),  # attempt 1: confirmation fails
+        RunResult(0, "", ""),  # attempt 2: probe
+        # attempt 2 confirmation falls through to the static success result.
+    ]
+    manager, log = make_ready_branch_manager(tmp_path, runner, sleep_log=sleeps)
+
+    environment = manager.wait_until_ready()
+
+    assert environment.database_url == BRANCH_DB_URL
+    assert len(runner.calls_with_prefix(("supabase", "migration", "list"))) == 4
+    # The settle window ran once per successful probe: re-settled, not skipped.
+    assert [seconds for seconds in sleeps if seconds > 0] == [10.0, 10.0]
+    assert log.text().count("allowing provisioning to settle") == 2
+    assert "database stopped answering during settling" in log.text()
+    assert sum("Supabase branch is ready." in message for message in log.messages_of("log")) == 1
+
+
+def test_repeated_settle_confirmation_failures_time_out(tmp_path: Path) -> None:
+    """Exhausted attempts after repeated failed confirmations fail cleanly."""
+    runner = FakeRunner([])
+    runner.run_once_results[MIGRATION_PROBE_ARGV] = [
+        RunResult(0, "", ""),
+        RunResult(1, "", "connection lost"),
+        RunResult(0, "", ""),
+        RunResult(1, "", "connection lost"),
+    ]
+    manager, log = make_ready_branch_manager(tmp_path, runner)
+
+    with pytest.raises(DevserverError, match="did not become ready"):
+        manager.wait_until_ready()
+
+    assert len(runner.calls_with_prefix(("supabase", "migration", "list"))) == 4
+    assert "database stopped answering during settling" in log.text()
+    assert sum("Supabase branch is ready." in message for message in log.messages_of("log")) == 0
+
+
+def test_credentials_never_published_never_probes_or_settles(tmp_path: Path) -> None:
+    """Without published credentials there is no probe and no settle sleep."""
+    sleeps: list[float] = []
+    runner = FakeRunner([])
+    runner.run_prefix_results.append(
+        (
+            ("supabase", "branches", "get"),
+            RunResult(
+                0,
+                branch_env_output(pooler_url=None, publishable=None, default_key=None),
+                "",
+            ),
+        )
+    )
+    manager, log = make_ready_branch_manager(tmp_path, runner, sleep_log=sleeps)
+
+    with pytest.raises(DevserverError, match="did not become ready"):
+        manager.wait_until_ready()
+
+    assert runner.calls_with_prefix(("supabase", "migration", "list")) == []
+    assert [seconds for seconds in sleeps if seconds > 0] == []
+    assert "database credentials not published yet" in log.text()
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +987,9 @@ def test_full_supabase_sequence_on_happy_path(tmp_path: Path) -> None:
 
     probe = harness.runner.calls_with_prefix(("supabase", "migration", "list"))[0]
     assert probe.argv[-1] == BRANCH_DB_URL
+    # Readiness settles: the probe succeeded and the confirmation probe ran
+    # after the settle window before migrations were applied.
+    assert len(harness.runner.calls_with_prefix(("supabase", "migration", "list"))) == 2
 
     migrations = [
         call

@@ -23,8 +23,10 @@ from openorc.devtools.devserver.processes import ProcessRunner
 BRANCH_NAME_PREFIX = "openorc-e2e"
 BRANCH_WAIT_MAX_ATTEMPTS_ENV = "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS"
 BRANCH_WAIT_SLEEP_SECONDS_ENV = "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS"
+BRANCH_SETTLE_SECONDS_ENV = "OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS"
 BRANCH_WAIT_MAX_ATTEMPTS_DEFAULT = 60
 BRANCH_WAIT_SLEEP_SECONDS_DEFAULT = 5.0
+BRANCH_SETTLE_SECONDS_DEFAULT = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,7 @@ class SupabaseManager:
         sleep: Callable[[float], None],
         max_attempts: int,
         sleep_seconds: float,
+        settle_seconds: float = BRANCH_SETTLE_SECONDS_DEFAULT,
     ) -> None:
         self._runner = runner
         self._root = root
@@ -135,6 +138,7 @@ class SupabaseManager:
         self._sleep = sleep
         self._max_attempts = max_attempts
         self._sleep_seconds = sleep_seconds
+        self._settle_seconds = settle_seconds
         self._branch_name: str | None = None
         self._created = False
         self._branch_environment: BranchEnvironment | None = None
@@ -237,14 +241,20 @@ class SupabaseManager:
         return _BranchFetchStatus.OK, branch_environment, ""
 
     def wait_until_ready(self) -> BranchEnvironment:
-        """Bounded wait for credentials publication AND a database that answers.
+        """Bounded wait for credentials publication AND a settled database.
 
         Creating the branch does not mean Postgres/Auth/API are immediately
         usable. Hosted branches publish credentials before their database
-        host resolves, so readiness requires BOTH signals. The production/
-        main branch never publishes database credentials through the API, so
-        it can never pass this gate. Authentication/authorization failures
-        fail immediately instead of retrying.
+        host resolves, so readiness requires BOTH signals. Reachability is
+        also not stability: every successful ``migration list`` probe is
+        followed by a fixed settle window and a confirmation probe, and
+        readiness requires the confirmation to succeed too, so a branch
+        that destabilizes while settling cannot pass on one instantaneous
+        connection. The production/main branch never publishes database
+        credentials through the API, so it can never pass this gate.
+        Authentication/authorization failures fail immediately instead of
+        retrying. The whole wait stays bounded by
+        ``max_attempts x (poll sleep + settle window)``.
         """
         branch_name = self._require_branch()
         self._log.log(f"Waiting for Supabase branch '{branch_name}' to become ready...")
@@ -256,10 +266,27 @@ class SupabaseManager:
                     ["supabase", "migration", "list", "--db-url", branch_environment.database_url]
                 )
                 if probe.returncode == 0:
-                    self._log.log("Supabase branch is ready.")
-                    self._branch_environment = branch_environment
-                    return branch_environment
-                reason = "database not answering yet"
+                    self._log.log(
+                        "Supabase branch is reachable; allowing provisioning to settle "
+                        f"for {self._settle_seconds:g}s..."
+                    )
+                    self._sleep(self._settle_seconds)
+                    confirm = self._runner.run(
+                        [
+                            "supabase",
+                            "migration",
+                            "list",
+                            "--db-url",
+                            branch_environment.database_url,
+                        ]
+                    )
+                    if confirm.returncode == 0:
+                        self._log.log("Supabase branch is ready.")
+                        self._branch_environment = branch_environment
+                        return branch_environment
+                    reason = "database stopped answering during settling"
+                else:
+                    reason = "database not answering yet"
             elif status is _BranchFetchStatus.CREDENTIALS_NOT_PUBLISHED:
                 reason = "database credentials not published yet"
             else:
@@ -281,7 +308,8 @@ class SupabaseManager:
 
         raise DevserverError(
             f"Supabase branch '{branch_name}' did not become ready within {self._max_attempts} "
-            f"attempts x {self._sleep_seconds:g}s (last status: {reason}). It may still be "
+            f"attempts x {self._sleep_seconds:g}s plus up to {self._settle_seconds:g}s "
+            f"provisioning-settle time per attempt (last status: {reason}). It may still be "
             "provisioning, or it may be the production/main branch (whose database credentials "
             "are never retrievable)."
         )

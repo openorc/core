@@ -158,6 +158,8 @@ baseline entry to make a mismatch disappear.
 - A failed push fails the script hard; partial application must be
   reconciled through new migrations, not manual patching.
 - URLs are logged redacted (host only); credentials are never logged.
+- Branch readiness is stability, not reachability: a successful probe must
+  survive the settle window and a confirmation probe (issue #105).
 
 ## Development lifecycle
 
@@ -174,6 +176,12 @@ local E2E stack, waits for genuine branch readiness, exports branch
 credentials to the local stack process tree, invokes this tooling to apply
 current-checkout migrations, and deletes the branch on exit. Branch
 creation/deletion is not this script's job.
+
+Branch readiness means stability, not just reachability: both the devserver
+and this tooling require published credentials, a reachable database, and a
+successful confirmation probe after a fixed settle window
+(`OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS`, default 10 seconds) before
+applying migrations. The overall wait remains bounded.
 
 `supabase/seed.sql` is reserved for future representative non-production
 seed data. The tooling skips seeding while the file is absent; do not invent
