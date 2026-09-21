@@ -251,7 +251,7 @@ def test_the_corrective_migration_upgrades_a_pre_correction_schema(
     assert row[3] is not None
     # ...and the three-fact coherence CHECK is enforced: a READY row missing
     # any initialization fact is rejected (the fully set coherent form was
-    # just read back above), and CONNECTING keeps rejecting any set fact.
+    # just read back above).
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.task_agent_sessions "
@@ -259,18 +259,30 @@ def test_the_corrective_migration_upgrades_a_pre_correction_schema(
             "lifecycle_status) values (%s, %s, %s, 'reviewer', %s, %s, 'ready')",
             (uuid.uuid4(), workspace_id, task_id, connection_id, "ext-session-partial"),
         )
+    # CONNECTING with one initialization fact set (mixed state: identity set,
+    # instant and snapshot still NULL) matches no CHECK branch and is
+    # rejected exactly like every other partially initialized status.
     with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.task_agent_sessions "
-            "(id, workspace_id, task_id, role, connection_id, lifecycle_status) "
-            "values (%s, %s, %s, 'reviewer', %s, 'connecting')",
-            (uuid.uuid4(), workspace_id, task_id, connection_id),
+            "(id, workspace_id, task_id, role, connection_id, external_session_id, "
+            "lifecycle_status) values (%s, %s, %s, 'reviewer', %s, %s, 'connecting')",
+            (uuid.uuid4(), workspace_id, task_id, connection_id, "ext-session-mixed"),
         )
+    # The valid pre-initialization CONNECTING form — all three facts NULL —
+    # still commits, proving the rejections above are selective enforcement
+    # and not a broken CHECK.
+    conn.execute(
+        "insert into openorc.task_agent_sessions "
+        "(id, workspace_id, task_id, role, connection_id, lifecycle_status) "
+        "values (%s, %s, %s, 'reviewer', %s, 'connecting')",
+        (uuid.uuid4(), workspace_id, task_id, connection_id),
+    )
     assert (
         _row_count(
             conn,
             "select count(*) from openorc.task_agent_sessions where task_id = %s",
             (task_id,),
         )
-        == 1
+        == 2
     )
