@@ -169,13 +169,16 @@ def test_vault_privilege_posture_is_backend_only(conn: Connection[Any]) -> None:
                 ).fetchone()
                 assert granted is not None and granted[0] is False, (table, privilege, role)
 
-    # Vault secret-management functions, resolved by exact signature. A
-    # signature absent from an older platform image is vacuous no-access and
-    # is skipped gracefully; the create/update round trips pin the supported
-    # surface regardless.
+    # Vault secret-management and decryption functions, resolved by exact
+    # signature. The decryption helper is included deliberately: current
+    # platform images may grant it to service_role, and the migration's
+    # guarded revoke must have removed that grant. A signature absent from an
+    # older platform image is vacuous no-access and is skipped gracefully;
+    # the create/update round trips pin the supported surface regardless.
     for signature in (
         "vault.create_secret(text,text,text,uuid)",
         "vault.update_secret(uuid,text,text,text,uuid)",
+        "vault._crypto_aead_det_decrypt(bytea,bytea,bigint,bytea,bytea)",
     ):
         function = conn.execute("select to_regprocedure(%s)", (signature,)).fetchone()
         if function is None or function[0] is None:

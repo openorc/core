@@ -77,18 +77,33 @@ revoke execute on function vault.update_secret from anon;
 revoke execute on function vault.update_secret from authenticated;
 revoke execute on function vault.update_secret from service_role;
 
-revoke execute on function vault._crypto_aead_det_encrypt from public;
-revoke execute on function vault._crypto_aead_det_encrypt from anon;
-revoke execute on function vault._crypto_aead_det_encrypt from authenticated;
-revoke execute on function vault._crypto_aead_det_encrypt from service_role;
+-- Decryption helper hardening, best-effort where the platform allows it:
+-- current Supabase images may grant EXECUTE on the internal decryption
+-- helper to non-backend roles. Revoke those grants where the function
+-- exists and where the migration role is actually permitted to revoke them.
+-- This block must never fail the migration: the schema and table/view
+-- lockouts above already deny ordinary access to decrypted secrets, and the
+-- encrypting/nonce-generation internals are platform-administered — upstream
+-- already denies them to PUBLIC, OpenOrc neither uses nor administers them,
+-- and a redundant revoke on those internals is refused by hosted Supabase
+-- with `permission denied` (SQLSTATE 42501). The effective posture —
+-- including that no non-backend role can reach the decryption helper — is
+-- proven by the integration privilege assertions in
+-- tests/integration/test_connection_credential_services.py, not by this
+-- block's tolerance.
 
-revoke execute on function vault._crypto_aead_det_decrypt from public;
-revoke execute on function vault._crypto_aead_det_decrypt from anon;
-revoke execute on function vault._crypto_aead_det_decrypt from authenticated;
-revoke execute on function vault._crypto_aead_det_decrypt from service_role;
+do $$
+begin
+    if to_regprocedure(
+        'vault._crypto_aead_det_decrypt(bytea,bytea,bigint,bytea,bytea)'
+    ) is not null then
+        revoke execute on function vault._crypto_aead_det_decrypt from anon;
+        revoke execute on function vault._crypto_aead_det_decrypt from authenticated;
+        revoke execute on function vault._crypto_aead_det_decrypt from service_role;
+    end if;
+exception
+    when insufficient_privilege then
+        null;
+end $$;
 
-revoke execute on function vault._crypto_aead_det_noncegen from public;
-revoke execute on function vault._crypto_aead_det_noncegen from anon;
-revoke execute on function vault._crypto_aead_det_noncegen from authenticated;
-revoke execute on function vault._crypto_aead_det_noncegen from service_role;
 
