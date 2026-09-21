@@ -42,7 +42,7 @@ def _event(**overrides: Any) -> WorkflowEvent:
     return WorkflowEvent(**values)
 
 
-def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
+def test_event_type_vocabulary_is_exactly_the_locked_32() -> None:
     locked = {
         "task_created",
         "agent_session_created",
@@ -66,7 +66,6 @@ def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
         "owner_gate_created",
         "owner_gate_resolved",
         "owner_reviewer_discussion_message",
-        "prompt_override_changed",
         "pr_created",
         "pr_reviewed",
         "task_relationship_synced",
@@ -79,7 +78,7 @@ def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
         "task_completed",
     }
     assert {member.value for member in WorkflowEventType} == locked
-    assert len(WorkflowEventType) == 33
+    assert len(WorkflowEventType) == 32
 
 
 def test_excluded_crud_event_types_do_not_exist() -> None:
@@ -185,18 +184,18 @@ def test_actor_id_is_optional_opaque_identity_and_blank_values_are_rejected() ->
 def test_the_subject_reference_is_a_pair() -> None:
     subject_id = uuid.uuid4()
     event = _event(
-        event_type=WorkflowEventType.PROMPT_OVERRIDE_CHANGED,
-        actor_type=WorkflowEventActor.OWNER,
-        subject_type="prompt_template_override",
+        event_type=WorkflowEventType.OWNER_GATE_CREATED,
+        actor_type=WorkflowEventActor.OPENORC,
+        subject_type="owner_gate",
         subject_id=subject_id,
     )
-    assert event.subject_type == "prompt_template_override"
+    assert event.subject_type == "owner_gate"
     assert event.subject_id == subject_id
 
 
 def test_a_half_present_subject_reference_is_rejected() -> None:
     with pytest.raises(WorkflowEventDomainError):
-        _event(subject_type="prompt_template_override")
+        _event(subject_type="owner_gate")
     with pytest.raises(WorkflowEventDomainError):
         _event(subject_id=uuid.uuid4())
 
@@ -204,7 +203,7 @@ def test_a_half_present_subject_reference_is_rejected() -> None:
 def test_subject_type_is_open_text_and_must_be_nonblank_when_present() -> None:
     # Deliberately open: a new auditable subject kind needs no schema
     # migration, so subject_type is plain validated text, not an enum.
-    for subject_type in ("prompt_template_override", "owner_gate", "some_future_subject"):
+    for subject_type in ("plan_revision", "owner_gate", "some_future_subject"):
         event = _event(subject_type=subject_type, subject_id=uuid.uuid4())
         assert event.subject_type == subject_type
     for blank in ("", "   ", 9, True):

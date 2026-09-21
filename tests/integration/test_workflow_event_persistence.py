@@ -1,23 +1,22 @@
-"""Integration-marked persistence tests for prompt overrides and events (#26).
+"""Integration-marked persistence tests for workflow events (#26, #100).
 
 These tests apply the committed Supabase migrations within the explicitly
 supplied non-production Supabase branch database and prove the durable
-invariants directly: Workspace prompt override set/update/reset semantics
-represented without materializing built-in defaults (row absence is the
-reset state), the upsert preserving identity and ``created_at``, the
-WorkflowEvent locked CHECK vocabularies (the actor vocabulary uses owner
-— a ``human`` actor is rejected by the database), direct Workspace scope
-with optional agreeing Task scope (cross-Workspace Task attachment
-rejected through the composite foreign key), the pair-shaped subject
-reference, canonical JSON-object context round-trips, and the
-index-matching read paths. They are excluded from the ordinary
-deterministic baseline by the repository pytest configuration.
+invariants directly: the WorkflowEvent locked CHECK vocabularies (the actor
+vocabulary uses owner — a ``human`` actor is rejected by the database, and
+the event-type CHECK matches the live Python enum after the corrective
+removal migration), direct Workspace scope with optional agreeing Task
+scope (cross-Workspace Task attachment rejected through the composite
+foreign key), the pair-shaped subject reference, canonical JSON-object
+context round-trips, and the index-matching read paths. They are excluded
+from the ordinary deterministic baseline by the repository pytest
+configuration.
 
 Run explicitly when a target has been made available:
 
     OPENORC_TEST_DATABASE_URL=<supplied non-production branch database URL> \\
       .venv/bin/python -m pytest -m integration \\
-      tests/integration/test_prompt_event_persistence.py
+      tests/integration/test_workflow_event_persistence.py
 
 The suite consumes the database it is given and never provisions one.
 Provisioning and teardown of the target sit outside the test suite and
@@ -48,7 +47,6 @@ from psycopg.errors import CheckViolation, ForeignKeyViolation
 
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.persistence import events as event_repositories
-from openorc.persistence import prompts as prompt_repositories
 from openorc.persistence.pool import DatabasePool
 
 # Every test in this module requires the explicitly supplied non-production
@@ -163,114 +161,19 @@ def _row_count(conn: Connection[Any], sql: str, params: tuple[Any, ...]) -> int:
     return int(conn.execute(sql, params).fetchone()[0])  # type: ignore[index]
 
 
-def test_prompt_override_set_update_reset_never_materializes_built_in_defaults(
-    conn: Connection[Any],
-) -> None:
-    workspace_id, pool = _fresh_workspace(conn)
-
-    # No row exists before any override: the built-in default applies and
-    # is never represented as a stored row.
-    assert (
-        prompt_repositories.get_prompt_template_override(
-            pool, workspace_id=workspace_id, template_key="producer.plan_instructions"
-        )
-        is None
-    )
-
-    created = prompt_repositories.set_prompt_template_override(
-        pool,
-        workspace_id=workspace_id,
-        template_key="producer.plan_instructions",
-        base_template_version="builtin-1.0.0",
-        instruction_text="Plan the task step by step.",
-    )
-    fetched = prompt_repositories.get_prompt_template_override(
-        pool, workspace_id=workspace_id, template_key="producer.plan_instructions"
-    )
-    assert fetched is not None and fetched.id == created.id
-    assert fetched.instruction_text == "Plan the task step by step."
-
-    # Reset deletes the row and returns the exact deleted record.
-    deleted = prompt_repositories.reset_prompt_template_override(
-        pool, workspace_id=workspace_id, template_key="producer.plan_instructions"
-    )
-    assert deleted is not None
-    assert deleted.id == created.id
-    assert deleted.template_key == created.template_key
-    assert deleted.instruction_text == created.instruction_text
-    # Row absence is the reset state: the built-in default applies again,
-    # and no tombstone or default copy exists anywhere.
-    assert (
-        prompt_repositories.get_prompt_template_override(
-            pool, workspace_id=workspace_id, template_key="producer.plan_instructions"
-        )
-        is None
-    )
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.prompt_template_overrides where workspace_id = %s",
-            (workspace_id,),
-        )
-        == 0
-    )
-
-    # Resetting an absent slot is a no-op returning None.
-    assert (
-        prompt_repositories.reset_prompt_template_override(
-            pool, workspace_id=workspace_id, template_key="producer.plan_instructions"
-        )
-        is None
-    )
-
-
-def test_the_override_upsert_preserves_identity_and_created_at(conn: Connection[Any]) -> None:
-    workspace_id, pool = _fresh_workspace(conn)
-
-    first = prompt_repositories.set_prompt_template_override(
-        pool,
-        workspace_id=workspace_id,
-        template_key="reviewer.plan_review_instructions",
-        base_template_version="builtin-1.0.0",
-        instruction_text="Original instructions.",
-    )
-    second = prompt_repositories.set_prompt_template_override(
-        pool,
-        workspace_id=workspace_id,
-        template_key="reviewer.plan_review_instructions",
-        base_template_version="builtin-1.1.0",
-        instruction_text="Revised instructions.",
-    )
-
-    # The slot change updates content in place: same row identity and
-    # creation instant; only the text/version moved.
-    assert second.id == first.id
-    assert second.created_at == first.created_at
-    assert second.instruction_text == "Revised instructions."
-    assert second.base_template_version == "builtin-1.1.0"
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.prompt_template_overrides where workspace_id = %s",
-            (workspace_id,),
-        )
-        == 1
-    )
-
-
 def test_task_and_workspace_events_flow_through_the_read_paths(conn: Connection[Any]) -> None:
     workspace_id, repository_id, task_id, pool = _fresh_task(conn)
-    override_subject_id = uuid.uuid4()
+    gate_subject_id = uuid.uuid4()
 
     workspace_event = event_repositories.record_workflow_event(
         pool,
         workspace_id=workspace_id,
-        event_type=WorkflowEventType.PROMPT_OVERRIDE_CHANGED,
-        actor_type=WorkflowEventActor.OWNER,
+        event_type=WorkflowEventType.OWNER_GATE_CREATED,
+        actor_type=WorkflowEventActor.OPENORC,
         actor_id=str(uuid.uuid4()),
-        subject_type="prompt_template_override",
-        subject_id=override_subject_id,
-        context={"change": "reset", "template_key": "producer.plan_instructions"},
+        subject_type="owner_gate",
+        subject_id=gate_subject_id,
+        context={"gate_kind": "plan_approval"},
     )
     task_event = event_repositories.record_workflow_event(
         pool,
@@ -306,7 +209,7 @@ def test_task_and_workspace_events_flow_through_the_read_paths(conn: Connection[
     by_type = event_repositories.list_recent_events_by_type(
         pool,
         workspace_id=workspace_id,
-        event_type=WorkflowEventType.PROMPT_OVERRIDE_CHANGED,
+        event_type=WorkflowEventType.OWNER_GATE_CREATED,
         limit=10,
     )
     assert [e.id for e in by_type] == [workspace_event.id]
@@ -317,8 +220,8 @@ def test_task_and_workspace_events_flow_through_the_read_paths(conn: Connection[
     by_subject = event_repositories.find_events_by_subject(
         pool,
         workspace_id=workspace_id,
-        subject_type="prompt_template_override",
-        subject_id=override_subject_id,
+        subject_type="owner_gate",
+        subject_id=gate_subject_id,
         limit=10,
     )
     assert [e.id for e in by_subject] == [workspace_event.id]
@@ -414,15 +317,15 @@ def test_event_context_round_trips_as_a_canonical_json_object(conn: Connection[A
     event = event_repositories.record_workflow_event(
         pool,
         workspace_id=workspace_id,
-        event_type=WorkflowEventType.PROMPT_OVERRIDE_CHANGED,
-        actor_type=WorkflowEventActor.OWNER,
-        subject_type="prompt_template_override",
+        event_type=WorkflowEventType.OWNER_GATE_CREATED,
+        actor_type=WorkflowEventActor.OPENORC,
+        subject_type="owner_gate",
         subject_id=uuid.uuid4(),
-        context={"change": "update", "slot": "producer.plan_instructions", "detail": None},
+        context={"gate_kind": "plan_approval", "note": None},
     )
     reread = event_repositories.get_workflow_event(pool, workflow_event_id=event.id)
     assert reread is not None
     assert reread.context == event.context
-    assert reread.context["slot"] == "producer.plan_instructions"
-    assert reread.context["detail"] is None
-    assert reread.subject_type == "prompt_template_override"
+    assert reread.context["gate_kind"] == "plan_approval"
+    assert reread.context["note"] is None
+    assert reread.subject_type == "owner_gate"

@@ -221,11 +221,10 @@ def _insert_session(
     """Establish and initialize one coherent READY Task/role binding.
 
     Goes through the canonical session persistence primitives instead of raw
-    fixture SQL: a READY binding is only coherent together with its four
+    fixture SQL: a READY binding is only coherent together with its three
     initialization facts (external_session_id, initialized_at,
-    initialization_protocol_version, effective_config_snapshot), so the
-    fixture takes the same CONNECTING -> READY path production code uses,
-    with test-only values.
+    effective_config_snapshot), so the fixture takes the same CONNECTING ->
+    READY path production code uses, with test-only values.
     """
     workflow_role = WorkflowRole(role)
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
@@ -242,7 +241,6 @@ def _insert_session(
         task_id=task_id,
         role=workflow_role,
         external_session_id=f"integration-{binding.id}",
-        initialization_protocol_version="test-1",
         effective_config_snapshot={},
     )
     assert initialized is not None

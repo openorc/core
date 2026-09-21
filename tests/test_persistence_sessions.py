@@ -109,7 +109,6 @@ def _session_row(**overrides: Any) -> tuple[Any, ...]:
         "connection_id": uuid.uuid4(),
         "external_session_id": None,
         "lifecycle_status": "connecting",
-        "initialization_protocol_version": None,
         "effective_config_snapshot": None,
         "reported_provider": None,
         "reported_model": None,
@@ -128,7 +127,6 @@ def _session_row(**overrides: Any) -> tuple[Any, ...]:
         values["connection_id"],
         values["external_session_id"],
         values["lifecycle_status"],
-        values["initialization_protocol_version"],
         values["effective_config_snapshot"],
         values["reported_provider"],
         values["reported_model"],
@@ -250,7 +248,6 @@ def test_initialize_maps_the_ready_row_and_wraps_the_snapshot_in_jsonb() -> None
     row = _session_row(
         external_session_id="ext-session-1",
         lifecycle_status="ready",
-        initialization_protocol_version="1",
         effective_config_snapshot={"stage": "plan"},
         initialized_at=_observed_at(),
         updated_at=_observed_at(),
@@ -263,14 +260,12 @@ def test_initialize_maps_the_ready_row_and_wraps_the_snapshot_in_jsonb() -> None
         task_id=row[2],
         role=WorkflowRole.PRODUCER,
         external_session_id="ext-session-1",
-        initialization_protocol_version="1",
         effective_config_snapshot={"stage": "plan"},
     )
 
     assert session is not None
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
     assert session.external_session_id == "ext-session-1"
-    assert session.initialization_protocol_version == "1"
     assert dict(session.effective_config_snapshot) == {"stage": "plan"}  # type: ignore[arg-type]
     assert session.initialized_at == _utc_observed_at()
     assert session.ended_at is None
@@ -285,13 +280,12 @@ def test_initialize_maps_the_ready_row_and_wraps_the_snapshot_in_jsonb() -> None
     assert "initialized_at = now()" in sql
     assert params is not None
     assert params[0] == "ext-session-1"
-    assert params[1] == "1"
     # psycopg 3 does not adapt plain mappings to jsonb without an explicit
     # wrapper: the repository must supply the Jsonb adapter itself.
-    assert isinstance(params[2], Jsonb)
-    assert params[2].obj == {"stage": "plan"}
-    assert params[3:6] == (None, None, None)
-    assert params[6:8] == (row[2], "producer")
+    assert isinstance(params[1], Jsonb)
+    assert params[1].obj == {"stage": "plan"}
+    assert params[2:5] == (None, None, None)
+    assert params[5:7] == (row[2], "producer")
 
 
 def test_initialize_with_an_empty_snapshot_wraps_jsonb_empty_object() -> None:
@@ -301,7 +295,6 @@ def test_initialize_with_an_empty_snapshot_wraps_jsonb_empty_object() -> None:
     row = _session_row(
         external_session_id="ext-session-2",
         lifecycle_status="ready",
-        initialization_protocol_version="1",
         effective_config_snapshot={},
         initialized_at=_observed_at(),
         updated_at=_observed_at(),
@@ -314,7 +307,6 @@ def test_initialize_with_an_empty_snapshot_wraps_jsonb_empty_object() -> None:
         task_id=row[2],
         role=WorkflowRole.REVIEWER,
         external_session_id="ext-session-2",
-        initialization_protocol_version="1",
         effective_config_snapshot={},
     )
 
@@ -322,14 +314,14 @@ def test_initialize_with_an_empty_snapshot_wraps_jsonb_empty_object() -> None:
     assert dict(session.effective_config_snapshot) == {}  # type: ignore[arg-type]
     _, params = fake_conn.executed[0]
     assert params is not None
-    assert isinstance(params[2], Jsonb)
-    assert params[2].obj == {}
+    assert isinstance(params[1], Jsonb)
+    assert params[1].obj == {}
 
 
-def test_initialize_requires_the_initialization_facts() -> None:
-    # The initialization facts move atomically: a missing protocol version or
-    # snapshot is rejected at the boundary, never stored as a partially
-    # initialized READY row. The reported provenance fields stay optional.
+def test_initialize_requires_the_snapshot() -> None:
+    # The initialization facts move atomically: a missing snapshot is
+    # rejected at the boundary, never stored as a partially initialized READY
+    # row. The reported provenance fields stay optional.
     pool = cast(DatabasePool, FakePool(FakeConnection()))
     with pytest.raises(TaskAgentSessionDomainError):
         initialize_task_agent_session(
@@ -337,16 +329,6 @@ def test_initialize_requires_the_initialization_facts() -> None:
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
             external_session_id="ext-session-1",
-            initialization_protocol_version=None,  # type: ignore[arg-type]
-            effective_config_snapshot={},
-        )
-    with pytest.raises(TaskAgentSessionDomainError):
-        initialize_task_agent_session(
-            pool,
-            task_id=uuid.uuid4(),
-            role=WorkflowRole.PRODUCER,
-            external_session_id="ext-session-1",
-            initialization_protocol_version="1",
             effective_config_snapshot=None,  # type: ignore[arg-type]
         )
 
@@ -359,19 +341,6 @@ def test_initialize_rejects_blank_external_session_ids(bad_identity: str) -> Non
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
             external_session_id=bad_identity,
-            initialization_protocol_version="1",
-            effective_config_snapshot={},
-        )
-
-
-def test_initialize_rejects_blank_protocol_versions() -> None:
-    with pytest.raises(TaskAgentSessionDomainError):
-        initialize_task_agent_session(
-            cast(DatabasePool, FakePool(FakeConnection())),
-            task_id=uuid.uuid4(),
-            role=WorkflowRole.PRODUCER,
-            external_session_id="ext-session-1",
-            initialization_protocol_version="   ",
             effective_config_snapshot={},
         )
 
@@ -380,7 +349,6 @@ def test_mark_lost_applies_only_from_ready_and_preserves_the_identity() -> None:
     row = _session_row(
         external_session_id="ext-session-1",
         lifecycle_status="lost",
-        initialization_protocol_version="1",
         effective_config_snapshot={"stage": "plan"},
         initialized_at=_observed_at(),
         updated_at=_observed_at(),
@@ -416,7 +384,6 @@ def test_mark_ended_stamps_the_semantic_timestamp() -> None:
     row = _session_row(
         external_session_id="ext-session-1",
         lifecycle_status="ended",
-        initialization_protocol_version="1",
         effective_config_snapshot={"stage": "plan"},
         initialized_at=_observed_at(),
         ended_at=_observed_at(),
@@ -474,7 +441,6 @@ def test_list_active_task_agent_sessions_maps_rows_and_filters_active() -> None:
             role="reviewer",
             external_session_id="ext-session-2",
             lifecycle_status="ready",
-            initialization_protocol_version="1",
             effective_config_snapshot={"stage": "plan"},
             initialized_at=_observed_at(),
             updated_at=_observed_at(),

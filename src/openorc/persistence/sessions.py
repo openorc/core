@@ -15,10 +15,9 @@ Continuity invariants enforced here:
   silently adopts different routing.
 - ``initialize_task_agent_session`` is the only writer of
   ``external_session_id`` and applies only while the binding is CONNECTING
-  with a NULL identity. The four initialization facts (``external_session_id``,
-  ``initialized_at``, ``initialization_protocol_version``, and
-  ``effective_config_snapshot``) move atomically with the binding. Once
-  initialized, no code path in this module can
+  with a NULL identity. The initialization facts (``external_session_id``,
+  ``initialized_at``, and ``effective_config_snapshot``) move atomically with
+  the binding. Once initialized, no code path in this module can
   replace the external session: LOST and ENDED are lifecycle states on the
   same row, never replacement triggers. ``effective_config_snapshot`` is
   written only from the caller-assembled explicit parameter through the
@@ -70,7 +69,7 @@ __all__ = [
 
 _SESSION_COLUMNS = (
     "id, workspace_id, task_id, role, connection_id, external_session_id, "
-    "lifecycle_status, initialization_protocol_version, effective_config_snapshot, "
+    "lifecycle_status, effective_config_snapshot, "
     "reported_provider, reported_model, reported_runtime_version, "
     "initialized_at, ended_at, created_at, updated_at"
 )
@@ -85,15 +84,14 @@ def _session_from_row(row: Sequence[Any]) -> TaskAgentSession:
         connection_id=row[4],
         external_session_id=row[5],
         lifecycle_status=TaskSessionLifecycleStatus(row[6]),
-        initialization_protocol_version=row[7],
-        effective_config_snapshot=row[8],
-        reported_provider=row[9],
-        reported_model=row[10],
-        reported_runtime_version=row[11],
-        initialized_at=None if row[12] is None else normalize_utc(row[12]),
-        ended_at=None if row[13] is None else normalize_utc(row[13]),
-        created_at=normalize_utc(row[14]),
-        updated_at=normalize_utc(row[15]),
+        effective_config_snapshot=row[7],
+        reported_provider=row[8],
+        reported_model=row[9],
+        reported_runtime_version=row[10],
+        initialized_at=None if row[11] is None else normalize_utc(row[11]),
+        ended_at=None if row[12] is None else normalize_utc(row[12]),
+        created_at=normalize_utc(row[13]),
+        updated_at=normalize_utc(row[14]),
     )
 
 
@@ -185,7 +183,6 @@ def initialize_task_agent_session(
     task_id: UUID,
     role: WorkflowRole,
     external_session_id: str,
-    initialization_protocol_version: str,
     effective_config_snapshot: Mapping[str, object],
     reported_provider: str | None = None,
     reported_model: str | None = None,
@@ -212,9 +209,8 @@ def initialize_task_agent_session(
     historical for the initialized session, and later Connection/role-binding
     configuration changes affect only future sessions.
 
-    ``initialization_protocol_version`` is the required opaque protocol
-    version used to initialize the session. The reported provenance fields
-    remain nullable opaque observations; absence is valid for them.
+    The reported provenance fields remain nullable opaque observations;
+    absence is valid for them.
 
     Returns the updated binding, or ``None`` when the binding is missing or
     not in the CONNECTING state (a rejected no-op that must not be retried
@@ -224,12 +220,6 @@ def initialize_task_agent_session(
     _require_role(role)
     if not isinstance(external_session_id, str) or not external_session_id.strip():
         raise TaskAgentSessionDomainError("external_session_id must be a non-empty opaque string")
-    if not isinstance(initialization_protocol_version, str) or (
-        not initialization_protocol_version.strip()
-    ):
-        raise TaskAgentSessionDomainError(
-            "initialization_protocol_version must be a non-empty opaque string"
-        )
     if effective_config_snapshot is None:
         raise TaskAgentSessionDomainError(
             "effective_config_snapshot must be supplied at initialization; use an "
@@ -240,7 +230,7 @@ def initialize_task_agent_session(
         row = conn.execute(
             "update openorc.task_agent_sessions "
             "set external_session_id = %s, lifecycle_status = 'ready', "
-            "initialization_protocol_version = %s, effective_config_snapshot = %s, "
+            "effective_config_snapshot = %s, "
             "reported_provider = %s, reported_model = %s, reported_runtime_version = %s, "
             "initialized_at = now(), updated_at = now() "
             "where task_id = %s and role = %s "
@@ -248,7 +238,6 @@ def initialize_task_agent_session(
             f"returning {_SESSION_COLUMNS}",
             (
                 external_session_id,
-                initialization_protocol_version,
                 Jsonb(dict(snapshot)),
                 reported_provider,
                 reported_model,

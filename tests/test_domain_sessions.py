@@ -42,7 +42,6 @@ def _session(**overrides: Any) -> TaskAgentSession:
         "connection_id": uuid4(),
         "external_session_id": "ext-session-1",
         "lifecycle_status": TaskSessionLifecycleStatus.READY,
-        "initialization_protocol_version": "1",
         "effective_config_snapshot": {"stage": "plan"},
         "reported_provider": None,
         "reported_model": None,
@@ -101,12 +100,6 @@ def test_external_session_id_rejects_blank_strings(bad_identity: str) -> None:
         _session(external_session_id=bad_identity)
 
 
-@pytest.mark.parametrize("bad_version", ["", "   "])
-def test_initialization_protocol_version_rejects_blank_strings(bad_version: str) -> None:
-    with pytest.raises(TaskAgentSessionDomainError):
-        _session(initialization_protocol_version=bad_version)
-
-
 def test_absence_is_valid_for_reported_provenance() -> None:
     # The runtime-reported provenance fields are independent nullable
     # observations, not part of the initialization-facts coherence.
@@ -143,7 +136,6 @@ def test_connecting_requires_no_initialization_facts() -> None:
     connecting = _session(
         lifecycle_status=TaskSessionLifecycleStatus.CONNECTING,
         external_session_id=None,
-        initialization_protocol_version=None,
         effective_config_snapshot=None,
         initialized_at=None,
     )
@@ -165,11 +157,6 @@ def test_connecting_requires_no_initialization_facts() -> None:
         )
     with pytest.raises(TaskAgentSessionDomainError):
         _session(
-            lifecycle_status=TaskSessionLifecycleStatus.CONNECTING,
-            initialization_protocol_version="1",
-        )
-    with pytest.raises(TaskAgentSessionDomainError):
-        _session(
             lifecycle_status=TaskSessionLifecycleStatus.CONNECTING, effective_config_snapshot={}
         )
 
@@ -184,7 +171,6 @@ def test_ready_and_lost_require_coherent_initialization_facts() -> None:
         for missing_fact in (
             {"external_session_id": None},
             {"initialized_at": None},
-            {"initialization_protocol_version": None},
             {"effective_config_snapshot": None},
         ):
             with pytest.raises(TaskAgentSessionDomainError):
@@ -192,26 +178,23 @@ def test_ready_and_lost_require_coherent_initialization_facts() -> None:
 
 
 def test_ended_permits_both_coherent_initialization_forms() -> None:
-    # Ended before initialization: all four initialization facts are NULL.
+    # Ended before initialization: all three initialization facts are NULL.
     before = _session(
         lifecycle_status=TaskSessionLifecycleStatus.ENDED,
         external_session_id=None,
-        initialization_protocol_version=None,
         effective_config_snapshot=None,
         initialized_at=None,
         ended_at=_INITIALIZED_AT,
     )
     assert before.external_session_id is None
     assert before.initialized_at is None
-    assert before.initialization_protocol_version is None
     assert before.effective_config_snapshot is None
     assert before.ended_at is not None
-    # Ended after a successful initialization: all four facts are set and the
+    # Ended after a successful initialization: all three facts are set and the
     # bound identity is preserved on the same binding.
     after = _session(lifecycle_status=TaskSessionLifecycleStatus.ENDED, ended_at=_INITIALIZED_AT)
     assert after.external_session_id == "ext-session-1"
     assert after.initialized_at == _INITIALIZED_AT
-    assert after.initialization_protocol_version == "1"
     assert dict(after.effective_config_snapshot) == {"stage": "plan"}  # type: ignore[arg-type]
     assert after.ended_at is not None
 
@@ -228,14 +211,12 @@ def test_partially_set_initialization_facts_are_rejected_for_every_status(
         "lifecycle_status": status,
         "external_session_id": None,
         "initialized_at": None,
-        "initialization_protocol_version": None,
         "effective_config_snapshot": None,
         "ended_at": ended_at,
     }
     partially_set: list[dict[str, Any]] = [
         {"external_session_id": "ext-session-1"},
         {"initialized_at": _INITIALIZED_AT},
-        {"initialization_protocol_version": "1"},
         {"effective_config_snapshot": {}},
     ]
     for fact in partially_set:
@@ -255,14 +236,12 @@ def test_partially_null_initialization_facts_are_rejected_for_every_status(
         "lifecycle_status": status,
         "external_session_id": "ext-session-1",
         "initialized_at": _INITIALIZED_AT,
-        "initialization_protocol_version": "1",
         "effective_config_snapshot": {"stage": "plan"},
         "ended_at": ended_at,
     }
     partially_null: list[dict[str, Any]] = [
         {"external_session_id": None},
         {"initialized_at": None},
-        {"initialization_protocol_version": None},
         {"effective_config_snapshot": None},
     ]
     for fact in partially_null:
@@ -353,7 +332,6 @@ def test_no_replacement_secret_or_telemetry_fields_exist() -> None:
             "connection_id",
             "external_session_id",
             "lifecycle_status",
-            "initialization_protocol_version",
             "effective_config_snapshot",
             "reported_provider",
             "reported_model",

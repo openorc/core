@@ -96,7 +96,6 @@ class WorkflowEventType(StrEnum):
     OWNER_GATE_CREATED = "owner_gate_created"
     OWNER_GATE_RESOLVED = "owner_gate_resolved"
     OWNER_REVIEWER_DISCUSSION_MESSAGE = "owner_reviewer_discussion_message"
-    PROMPT_OVERRIDE_CHANGED = "prompt_override_changed"
     PR_CREATED = "pr_created"
     PR_REVIEWED = "pr_reviewed"
     TASK_RELATIONSHIP_SYNCED = "task_relationship_synced"

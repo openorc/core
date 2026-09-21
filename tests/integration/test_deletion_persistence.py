@@ -68,9 +68,6 @@ from openorc.persistence import (
     planning as planning_repositories,
 )
 from openorc.persistence import (
-    prompts as prompt_repositories,
-)
-from openorc.persistence import (
     pull_requests as pull_request_repositories,
 )
 from openorc.persistence import (
@@ -114,7 +111,6 @@ _WORKSPACE_SCOPED_TABLES = (
     "runtime_requests",
     "task_blocks",
     "task_pull_requests",
-    "prompt_template_overrides",
     "workflow_events",
 )
 
@@ -489,13 +485,6 @@ def test_account_deletion_from_the_auth_users_root_removes_the_complete_openorc_
         role=WorkflowRole.PRODUCER,
         connection_id=primary_connection.id,
     )
-    prompt_repositories.set_prompt_template_override(
-        pool,
-        workspace_id=primary_workspace,
-        template_key="producer_plan",
-        base_template_version="builtin-v1",
-        instruction_text="Override instruction.",
-    )
     event_repositories.record_workflow_event(
         pool,
         workspace_id=primary_workspace,
@@ -630,13 +619,6 @@ def test_scoped_workspace_project_and_repository_deletion_preserves_siblings_and
         role=WorkflowRole.PRODUCER,
         connection_id=connection.id,
     )
-    prompt_repositories.set_prompt_template_override(
-        pool,
-        workspace_id=main_workspace,
-        template_key="producer_plan",
-        base_template_version="builtin-v1",
-        instruction_text="Override text.",
-    )
     event_repositories.record_workflow_event(
         pool,
         workspace_id=main_workspace,
@@ -691,7 +673,6 @@ def test_scoped_workspace_project_and_repository_deletion_preserves_siblings_and
     assert _count_rows(conn, "tasks", "id", task_two.id) == 1
     assert _count_rows(conn, "connections", "id", connection.id) == 1
     assert _count_rows(conn, "workflow_role_bindings", "connection_id", connection.id) == 1
-    assert _count_rows(conn, "prompt_template_overrides", "workspace_id", main_workspace) == 1
 
     # Deleting one Repository mapping removes only its OpenOrc Task subtree —
     # OpenOrc's mapping/state for the external GitHub repository only.
