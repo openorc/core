@@ -323,13 +323,18 @@ def require_workspace_event(
 
     Workspace scope is the authorization boundary for event reads (a
     Workspace-level event legitimately has no Task). A present ``task_id``
-    agrees with the Workspace through the durable
+    is validated explicitly through the private Task-scope resolver — the
+    referenced Task must belong to the authorized Workspace — rather than
+    relying on the durable
     ``(task_id, workspace_id) → tasks (id, workspace_id)`` composite foreign
-    key backstop; the Workspace scope check here is the authorization
-    mechanism.
+    key: those keys are integrity backstops, never the service
+    authorization mechanism. A Workspace-level event (``task_id=None``)
+    resolves without any Task lookup.
     """
     workspace = _require_owned_workspace(pool, profile_id=profile_id, workspace_id=workspace_id)
     event = get_workflow_event(pool, workflow_event_id=workflow_event_id)
     if event is None or event.workspace_id != workspace.id:
         raise NotFoundError("the requested workflow event is not available in this workspace")
+    if event.task_id is not None:
+        _require_task_in_workspace(pool, workspace, event.task_id)
     return event

@@ -196,9 +196,7 @@ def test_configuration_updates_round_trip_and_durable_constraint_holds(
     reloaded = ownership_repositories.get_workspace(pool, workspace.id)
     assert reloaded is not None
     assert reloaded.guidance == prose
-    reset_result = ownership_repositories.update_workspace_guidance(
-        pool, workspace.id, guidance=""
-    )
+    reset_result = ownership_repositories.update_workspace_guidance(pool, workspace.id, guidance="")
     assert reset_result is not None
     workspace, previous, changed = reset_result
     assert changed is True

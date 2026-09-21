@@ -673,3 +673,74 @@ def test_session_and_role_binding_resolution_scopes_fail_closed() -> None:
                 workspace_id=workspace_id,
                 role=WorkflowRole.PRODUCER,
             )
+
+
+def test_task_scoped_workflow_event_reads_validate_the_task_linkage() -> None:
+    from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    ws_row = _ws_row(workspace_id, profile_id)
+    task_rows = _family_rows(workspace_id)
+    authorized_task_id = task_rows["task"][0]
+    workspace_level_event = task_rows["workflow event"]  # task_id=None by construction
+
+    def event_row(task_id: uuid.UUID) -> tuple[Any, ...]:
+        return (
+            uuid.uuid4(),
+            workspace_id,
+            task_id,
+            WorkflowEventType.TASK_CREATED.value,
+            WorkflowEventActor.OWNER.value,
+            None,
+            "task",
+            task_id,
+            {},
+            _OBSERVED,
+        )
+
+    # A Workspace-level event resolves with no Task lookup at all.
+    ok_workspace_level = ScriptedConnection([ws_row, workspace_level_event])
+    resolved = workspace_authorization.require_workspace_event(
+        _pool(ok_workspace_level),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        workflow_event_id=workspace_level_event[0],
+    )
+    assert resolved.task_id is None
+    assert len(ok_workspace_level.executed) == 2
+
+    # A task-scoped event of the authorized Workspace resolves through the
+    # Task-scope resolver.
+    ok_task_scoped = ScriptedConnection([ws_row, event_row(authorized_task_id), task_rows["task"]])
+    resolved = workspace_authorization.require_workspace_event(
+        _pool(ok_task_scoped),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        workflow_event_id=event_row(authorized_task_id)[0],
+    )
+    assert resolved.task_id == authorized_task_id
+    assert len(ok_task_scoped.executed) == 3
+    task_lookup_sql = ok_task_scoped.executed[2][0]
+    assert "from openorc.tasks where id = %s" in task_lookup_sql
+
+    # A task-scoped event whose Task resolves outside the authorized
+    # Workspace is uniformly not found — the composite foreign key is a
+    # backstop, not the authorization mechanism.
+    foreign_workspace_id = uuid.uuid4()
+    foreign_task_id = _family_rows(foreign_workspace_id)["task"][0]
+    with pytest.raises(NotFoundError):
+        workspace_authorization.require_workspace_event(
+            _pool(
+                ScriptedConnection(
+                    [
+                        ws_row,
+                        event_row(foreign_task_id),
+                        _family_rows(foreign_workspace_id)["task"],
+                    ]
+                )
+            ),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            workflow_event_id=event_row(foreign_task_id)[0],
+        )
