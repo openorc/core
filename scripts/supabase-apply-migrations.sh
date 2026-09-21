@@ -57,11 +57,14 @@ cd "$ROOT_DIR"
 
 # Bounded wait for a freshly created branch to publish its database
 # credentials (a reliable readiness signal: production/main branches never
-# expose database credentials through the API).
+# expose database credentials through the API). Reachability alone is not
+# stability, so every successful probe is followed by a fixed settle window
+# and a confirmation probe before the target is declared ready.
 # The timing constants are overridable for deterministic tests; the defaults
 # are the supported developer values and are not part of the .env contract.
 BRANCH_WAIT_MAX_ATTEMPTS="${OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS:-60}"
 BRANCH_WAIT_SLEEP_SECONDS="${OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS:-5}"
+BRANCH_SETTLE_SECONDS="${OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS:-10}"
 
 DRY_RUN=false
 
@@ -415,7 +418,10 @@ require_non_production_db_url() {
 #
 # Readiness is verified with an actual database connection (`supabase
 # migration list`): publishing credentials alone is NOT sufficient - hosted
-# branches expose credentials before their database host resolves.
+# branches expose credentials before their database host resolves. A
+# successful probe is additionally followed by a fixed settle window and a
+# confirmation probe, because reachability alone is not stability for a
+# freshly created branch (issue #105).
 # ---------------------------------------------------------------------------
 
 # Populates from `supabase branches get ... -o env`:
@@ -511,7 +517,16 @@ branch_get_error_is_auth() {
 #   - authentication/authorization failure  -> fail immediately;
 #   - credentials not published yet         -> retry;
 #   - credentials published, DB not ready   -> retry;
-#   - database answers                      -> proceed.
+#   - database answers but stops answering
+#     during the settle window             -> retry;
+#   - database answers across the settle
+#     window                               -> proceed.
+#
+# Reachability alone is not stability (issue #105): every successful
+# `migration list` probe is followed by BRANCH_SETTLE_SECONDS and a
+# confirmation probe; readiness requires the confirmation to succeed too.
+# The whole wait stays bounded by
+# BRANCH_WAIT_MAX_ATTEMPTS x (BRANCH_WAIT_SLEEP_SECONDS + settle window).
 wait_for_branch_database() {
     local branch_name="$1"
     local attempt=1 reason="" status=0
@@ -523,9 +538,15 @@ wait_for_branch_database() {
         case "$status" in
             0)
                 if supabase migration list --db-url "$BRANCH_POSTGRES_URL" >/dev/null 2>&1 </dev/null; then
-                    return 0
+                    log "Branch '$branch_name' is reachable; allowing provisioning to settle for ${BRANCH_SETTLE_SECONDS}s..."
+                    sleep "$BRANCH_SETTLE_SECONDS"
+                    if supabase migration list --db-url "$BRANCH_POSTGRES_URL" >/dev/null 2>&1 </dev/null; then
+                        return 0
+                    fi
+                    reason="database stopped answering during settling"
+                else
+                    reason="database not answering yet"
                 fi
-                reason="database not answering yet"
                 ;;
             2)
                 reason="database credentials not published yet"

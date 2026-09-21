@@ -37,6 +37,8 @@ from openorc.devtools.devserver.processes import (
     SubprocessRunner,
 )
 from openorc.devtools.devserver.supabase import (
+    BRANCH_SETTLE_SECONDS_DEFAULT,
+    BRANCH_SETTLE_SECONDS_ENV,
     BRANCH_WAIT_MAX_ATTEMPTS_DEFAULT,
     BRANCH_WAIT_MAX_ATTEMPTS_ENV,
     BRANCH_WAIT_SLEEP_SECONDS_DEFAULT,
@@ -289,6 +291,12 @@ class Devserver:
                 self._env,
                 BRANCH_WAIT_SLEEP_SECONDS_ENV,
                 BRANCH_WAIT_SLEEP_SECONDS_DEFAULT,
+                self._log,
+            ),
+            settle_seconds=_env_float(
+                self._env,
+                BRANCH_SETTLE_SECONDS_ENV,
+                BRANCH_SETTLE_SECONDS_DEFAULT,
                 self._log,
             ),
         )
