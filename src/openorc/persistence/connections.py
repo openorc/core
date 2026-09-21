@@ -38,9 +38,11 @@ from openorc.persistence.transactions import transaction
 __all__ = [
     "create_connection",
     "get_connection",
+    "get_connection_for_update",
     "get_role_binding",
     "list_connection_bindings",
     "list_workspace_connections",
+    "set_connection_auth_reference",
     "set_role_binding",
     "update_connection",
 ]
@@ -173,6 +175,45 @@ def update_connection(
                 auth_reference,
                 connection_id,
             ),
+        ).fetchone()
+    return None if row is None else _connection_from_row(row)
+
+
+def get_connection_for_update(pool: DatabasePool, connection_id: UUID) -> Connection | None:
+    """Row-locked read of one Connection for credential compositions (issue #55).
+
+    The deliberate ``SELECT ... FOR UPDATE`` serializes credential
+    configure/rotate against concurrent configuration changes and disconnect:
+    the composition's decision about the current ``auth_reference`` is made
+    under the same lock that guards the follow-up write. The lock is held
+    only within the caller's short transaction (inside
+    ``composed_transaction``, the outer composition).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_CONNECTION_COLUMNS} from openorc.connections where id = %s for update",
+            (connection_id,),
+        ).fetchone()
+    return None if row is None else _connection_from_row(row)
+
+
+def set_connection_auth_reference(
+    pool: DatabasePool, connection_id: UUID, *, auth_reference: str
+) -> Connection | None:
+    """Install one opaque v1 auth_reference on a Connection (issue #55).
+
+    Credential compositions call this after the row-locked read, inside the
+    same outer transaction, so the Vault secret created alongside cannot
+    commit without the reference (and vice versa). ``updated_at`` advances to
+    the database clock. Returns ``None`` when the Connection does not exist.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.connections "
+            "set auth_reference = %s, updated_at = now() "
+            "where id = %s "
+            f"returning {_CONNECTION_COLUMNS}",
+            (auth_reference, connection_id),
         ).fetchone()
     return None if row is None else _connection_from_row(row)
 
