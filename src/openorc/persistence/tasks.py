@@ -43,6 +43,7 @@ __all__ = [
     "find_current_task_by_branch",
     "find_current_task_for_issue",
     "get_task",
+    "get_task_for_update",
     "list_issue_attempts",
     "list_workspace_tasks",
     "set_current_plan_revision",
@@ -122,6 +123,28 @@ def get_task(pool: DatabasePool, task_id: UUID) -> Task | None:
     with transaction(pool) as conn:
         row = conn.execute(
             f"select {_TASK_COLUMNS} from openorc.tasks where id = %s", (task_id,)
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def get_task_for_update(pool: DatabasePool, task_id: UUID) -> Task | None:
+    """Read one Task row under an exclusive row lock.
+
+    Serves service-layer stale/conflict classification (issue #54) after a
+    rejected conditional Task write: composed inside the same outer
+    transaction as the failed write, the locked re-read observes the durable
+    state at write time — a concurrent token rotation or archival serializes
+    on the row lock — so the application-level classification never comes
+    from a racy re-read (the same deliberate locked-read-plus-conditional-
+    write pattern as Workspace configuration). Outside a composition the
+    lock is held only for this function's own short transaction.
+    Translating the reloaded state into typed application outcomes is a
+    service-layer concern, never a persistence one.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_TASK_COLUMNS} from openorc.tasks where id = %s for update",
+            (task_id,),
         ).fetchone()
     return None if row is None else _task_from_row(row)
 
