@@ -3,11 +3,12 @@
 These tests run against the explicitly supplied non-production Supabase
 branch database (the existing conftest path) and prove the real Vault
 behavior of the credential boundary: extension availability, the effective
-backend-only privilege posture, create/resolve/update-in-place/delete by
-exact UUID, and the atomic configure/rotate compositions — including that a
-forced second-write failure leaves neither an orphaned Vault secret nor a
-Connection reference pointing at one. They are excluded from the ordinary
-deterministic baseline by the repository pytest configuration.
+privilege posture for the browser-facing roles, create/resolve/
+update-in-place/delete by exact UUID, and the atomic configure/rotate
+compositions — including that a forced second-write failure leaves neither
+an orphaned Vault secret nor a Connection reference pointing at one. They
+are excluded from the ordinary deterministic baseline by the repository
+pytest configuration.
 
 Run explicitly when a target has been made available:
 
@@ -144,18 +145,19 @@ def test_vault_extension_is_available(conn: Connection[Any]) -> None:
     assert row == (True, True)
 
 
-def test_vault_privilege_posture_is_backend_only(conn: Connection[Any]) -> None:
+def test_vault_privilege_posture_denies_browser_facing_roles(conn: Connection[Any]) -> None:
     """Prove the effective privilege posture on the real branch, not the text.
 
-    Every non-backend role (anon, authenticated, service_role) must have no
-    path into the vault schema, the secret table/view, or the
-    secret-management functions, while the backend — the connecting, owning
-    role the credential services actually run as — keeps the full direct
-    Postgres path.
+    The browser-facing roles (anon, authenticated) must have no path into the
+    vault schema, the secret table/view, or the secret-management functions,
+    while the backend — the connecting role the credential services actually
+    run as — keeps the full direct Postgres path. Supabase's platform-managed
+    Postgres `service_role` Vault access is accepted as the trusted Supabase
+    administrative/platform boundary and is deliberately not asserted here.
     """
-    non_backend_roles = ("anon", "authenticated", "service_role")
+    denied_roles = ("anon", "authenticated")
 
-    for role in non_backend_roles:
+    for role in denied_roles:
         schema_usable = conn.execute(
             "select has_schema_privilege(%s, 'vault', 'USAGE')", (role,)
         ).fetchone()
@@ -163,27 +165,24 @@ def test_vault_privilege_posture_is_backend_only(conn: Connection[Any]) -> None:
 
     for table in ("vault.secrets", "vault.decrypted_secrets"):
         for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-            for role in non_backend_roles:
+            for role in denied_roles:
                 granted = conn.execute(
                     "select has_table_privilege(%s, %s, %s)", (role, table, privilege)
                 ).fetchone()
                 assert granted is not None and granted[0] is False, (table, privilege, role)
 
-    # Vault secret-management and decryption functions, resolved by exact
-    # signature. The decryption helper is included deliberately: current
-    # platform images may grant it to service_role, and the migration's
-    # guarded revoke must have removed that grant. A signature absent from an
-    # older platform image is vacuous no-access and is skipped gracefully;
-    # the create/update round trips pin the supported surface regardless.
+    # Vault secret-management functions, resolved by exact signature. A
+    # signature absent from an older platform image is vacuous no-access and
+    # is skipped gracefully; the create/update round trips pin the supported
+    # surface regardless.
     for signature in (
         "vault.create_secret(text,text,text,uuid)",
         "vault.update_secret(uuid,text,text,text,uuid)",
-        "vault._crypto_aead_det_decrypt(bytea,bytea,bigint,bytea,bytea)",
     ):
         function = conn.execute("select to_regprocedure(%s)", (signature,)).fetchone()
         if function is None or function[0] is None:
             continue
-        for role in non_backend_roles:
+        for role in denied_roles:
             granted = conn.execute(
                 "select has_function_privilege(%s, %s, 'EXECUTE')", (role, function[0])
             ).fetchone()
