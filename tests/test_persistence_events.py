@@ -177,7 +177,7 @@ def test_record_omitted_fields_persist_as_null_and_empty_context() -> None:
     event = record_workflow_event(
         pool,
         workspace_id=row[1],
-        event_type=WorkflowEventType.PROMPT_OVERRIDE_CHANGED,
+        event_type=WorkflowEventType.TASK_CREATED,
         actor_type=WorkflowEventActor.OWNER,
     )
 

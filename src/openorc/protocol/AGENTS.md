@@ -2,7 +2,7 @@
 
 ## Boundary
 
-`protocol/` is the canonical home for runtime-independent OpenOrc agent protocol contracts and pure protocol helpers: the versioned v1 formal response families (`session_ready`, `plan_result`, `review_result`, `implementation_result`, `pr_result`), formal request/protocol envelopes, session-initialization protocol content and protocol metadata, runtime-independent parsing/validation helpers for formal protocol objects, and shared typed protocol models/schemas.
+`protocol/` is the canonical home for runtime-independent OpenOrc agent protocol contracts and pure protocol helpers: the versioned v1 formal response families (`session_ready`, `plan_result`, `review_result`, `implementation_result`, `pr_result`), formal request/protocol envelopes, session-initialization protocol content, runtime-independent parsing/validation helpers for formal protocol objects, and shared typed protocol models/schemas.
 
 This package is not a network service, runtime adapter, workflow engine, or general agent-to-agent messaging framework.
 
@@ -15,8 +15,9 @@ This package is not a network service, runtime adapter, workflow engine, or gene
 ## Protocol ownership
 
 - OpenOrc owns the protocol. Connected agents/runtimes implement or satisfy it; they do not redefine it.
-- Protocol schemas and protocol versions are explicit and stable enough for deterministic validation and audit reconstruction.
-- Workspace prompt customization may change instructions/emphasis but must not redefine formal schemas, authority semantics, session semantics, exact review-subject identity, or workflow transitions.
+- Formal protocol schemas are OpenOrc-owned and runtime-neutral. Formal responses carry explicit schema versions so machine compatibility and deterministic validation never depend on prose inference.
+- Session initialization is OpenOrc-owned and non-overridable: canonical role-initialization content — which may render the canonical formal schemas into controlled insertion points — is supplied by OpenOrc, never authored or replaced by a Workspace or a runtime. Initialization records no separately persisted protocol version; there is no prompt/template version or hash requirement and no historical effective-prompt reconstruction.
+- Neither Workspace-authored prose nor runtime behavior may redefine formal schemas, authority semantics, session semantics, exact review-subject identity, or workflow transitions.
 
 ## Formal response semantics
 

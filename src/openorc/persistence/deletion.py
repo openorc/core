@@ -22,8 +22,7 @@ migration (issue #27):
     openorc.profiles
         | on delete cascade
     workspaces -> projects -> repositories -> tasks -> (task-owned graph)
-        + connections, workflow_role_bindings,
-          prompt_template_overrides, workspace-level workflow_events
+        + connections, workflow_role_bindings, workspace-level workflow_events
 
 True ownership edges cascade in the database; restrictive edges are
 ``NO ACTION DEFERRABLE INITIALLY DEFERRED`` and block deletion of a referenced

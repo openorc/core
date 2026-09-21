@@ -1,17 +1,22 @@
 """Convention tests for the prompt override / workflow event migration (#26).
 
 The ordinary suite cannot execute Postgres. These tests assert only the
-durable, architectural properties of the committed migration that runtime
-behavior does not naturally establish: the instruction-only prompt
-override slot (built-in defaults never materialized, reset = row
-absence), the append-oriented audit stream (locked CHECK vocabularies
-exactly matching the Python enums, direct Workspace scope with optional
-agreeing Task scope, the pair-shaped foreign-key-free subject reference,
-canonical-JSON-object context, no updated_at, no trigger), the exact
-query-driven index set, and the deliberate absences (no grants, no
-native enums, no speculative tables/columns). Behavioral invariants are
-proven against a real database by the integration-marked suite in
-``tests/integration/``.
+durable, architectural properties of the committed migration — kept as
+truthful historical assertions, since merged migrations are append-only
+and are not retroactively reinterpreted by later corrections: the
+instruction-only prompt override slot (built-in defaults never
+materialized, reset = row absence), the append-oriented audit stream
+(the frozen historical event-type vocabulary at authoring time, the
+actor CHECK matching the locked six-actor Python enum, direct Workspace
+scope with optional agreeing Task scope, the pair-shaped
+foreign-key-free subject reference, canonical-JSON-object context, no
+updated_at, no trigger), the exact query-driven index set, and the
+deliberate absences (no grants, no native enums, no speculative
+tables/columns). The current live-vocabulary lock — the database CHECK
+matching the current Python enum after the corrective removal migration
+— is owned by ``tests/test_prompt_override_removal_migration.py``.
+Behavioral invariants are proven against a real database by the
+integration-marked suite in ``tests/integration/``.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+from openorc.domain.events import WorkflowEventActor
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
@@ -35,6 +40,46 @@ EXCLUDED_EVENT_TYPES = (
     "task_pull_request_updated",
     "prompt_override_set",
     "prompt_override_reset",
+)
+
+# The event_type vocabulary this migration locked at authoring time, frozen
+# here as history: the migration is append-only and still contains all 33
+# values, including the since-removed prompt_override_changed. The live
+# vocabulary lock is asserted by the corrective-migration convention tests.
+HISTORICAL_EVENT_TYPE_VOCABULARY = (
+    "task_created",
+    "agent_session_created",
+    "agent_session_bound",
+    "agent_session_lost",
+    "planning_started",
+    "plan_revision_created",
+    "plan_reviewed",
+    "review_limit_reached",
+    "plan_revision_revised",
+    "plan_ready",
+    "implementation_authorized",
+    "execution_started",
+    "execution_completed",
+    "execution_failed",
+    "runtime_request_created",
+    "runtime_request_resolved",
+    "runtime_request_cancelled",
+    "retry_started",
+    "task_blocked",
+    "owner_gate_created",
+    "owner_gate_resolved",
+    "owner_reviewer_discussion_message",
+    "prompt_override_changed",
+    "pr_created",
+    "pr_reviewed",
+    "task_relationship_synced",
+    "task_dependency_synced",
+    "pr_head_changed",
+    "merge_requested",
+    "merge_rejected_by_github",
+    "pr_merged",
+    "task_cancelled",
+    "task_completed",
 )
 
 
@@ -123,9 +168,9 @@ def test_the_override_cannot_redefine_protocol_or_workflow_semantics() -> None:
     assert "can never redefine protocol, authority, session, or workflow semantics" in prose
 
 
-def test_event_type_check_matches_the_locked_domain_vocabulary_exactly() -> None:
+def test_event_type_check_is_the_frozen_historical_vocabulary() -> None:
     values = _check_values(_table_block(WORKFLOW_EVENTS_TABLE), "event_type")
-    assert values == [member.value for member in WorkflowEventType]
+    assert values == list(HISTORICAL_EVENT_TYPE_VOCABULARY)
     assert len(values) == 33
     # The excluded CRUD-ish names appear nowhere in the migration at all.
     raw_lower = _migration_text()
