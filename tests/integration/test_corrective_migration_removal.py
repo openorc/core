@@ -200,8 +200,22 @@ def test_the_corrective_migration_upgrades_a_pre_correction_schema(
         ),
     )
 
-    # Stage 3: apply the committed corrective migration.
+    # Stage 3: flush pending deferred-constraint events, then apply the
+    # committed corrective migration. The issue #27 foreign keys are
+    # ``NO ACTION DEFERRABLE INITIALLY DEFERRED``, so the seeded rows carry
+    # pending referential checks that would otherwise fire only at commit —
+    # but a real migration runs against committed data with no pending
+    # constraint events. ``SET CONSTRAINTS ALL IMMEDIATE`` forces every
+    # seeded foreign key to be checked right now, emulating the committed-data
+    # boundary preceding a real migration while the whole staged upgrade
+    # stays inside this single rollback-only transaction.
+    conn.execute("set constraints all immediate")
     _apply(conn, corrective_path)
+    # Restore the transaction's original deferred-checking state immediately
+    # after the migration: nothing downstream of the applied DDL needs
+    # immediate checking, so the committed-boundary emulation stays local to
+    # the flush above.
+    conn.execute("set constraints all deferred")
 
     # Stage 4a: the obsolete prompt-override table is gone, with its legacy
     # row removed together with it.
