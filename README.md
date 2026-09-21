@@ -1,21 +1,23 @@
 # OpenOrc
 
-OpenOrc is an open, provider-neutral control plane for governed agentic software development.
+OpenOrc turns Cline Hub into a governed autonomous software-engineering workflow.
 
-It keeps the engineering workflow stable while coding runtimes, models, inference providers, and review systems remain replaceable. OpenOrc coordinates GitHub-backed work, independent Producer/Reviewer roles, explicit human authority, Task-scoped runtime sessions, deterministic workflow state, pull-request review, and audit history. It does not replace coding agents, GitHub, CI, or observability systems.
+Give OpenOrc a GitHub issue and it coordinates persistent Cline Producer and Reviewer sessions through planning, independent review, human authorization, implementation, pull-request review, remediation, and merge.
+
+Cline remains responsible for the agent runtime, model/provider choice, tools, filesystem, and execution environment. OpenOrc is responsible for engineering workflow, authority, exact review subjects, GitHub reconciliation, and durable audit state. OpenOrc is deliberately Cline-first in v1 and runtime-neutral by architecture.
 
 ## Repository status
 
-Phase 0 repository bootstrap is complete. The development environment, app/API/worker shells, CI baseline, Supabase migration workflow, Redis-compatible queue integration, and ephemeral local dev stack are established and operational.
+Phase 0 repository bootstrap and Phase 1 domain/persistence foundation are complete. The development environment, app/API/worker shells, CI baseline, durable control-plane model, Supabase migration workflow, Redis-compatible queue integration, and ephemeral local dev stack are established and operational.
 
-Phase 1 is the current implementation focus: building OpenOrc's durable domain and persistence foundation. OpenOrc remains under active development and is not yet a complete end-to-end product.
+Phase 2 is the current implementation focus: building the headless backend control plane and Cline/GitHub integration. OpenOrc remains under active development and is not yet a complete end-to-end product.
 
 `openorc/core` is the complete source-available product. Self-hosting must remain complete.
 
 ```text
 Phase 0  Repository foundation           ✓ complete
-Phase 1  Domain + persistence            ← current
-Phase 2  Backend control plane
+Phase 1  Domain + persistence            ✓ complete
+Phase 2  Backend control plane            ← current
 Phase 3  Real headless E2E
 Phase 4  Frontend control surface
 Phase 5  Product E2E + hardening
@@ -47,7 +49,7 @@ Owner requests merge
 GitHub confirms merge
 ```
 
-Automation handles coordination between those boundaries; consequential progression remains explicit Owner authority. Producer and Reviewer are independent logical roles with separate Task-scoped sessions. v1 uses Cline Hub for both roles through `ClineAdapter`, while the workflow architecture keeps the connected runtime replaceable behind the Connection/adapter boundary.
+Automation handles coordination between those boundaries; consequential progression remains explicit Owner authority. Producer and Reviewer are independent logical roles with separate Task-scoped sessions. v1 deliberately uses Cline Hub for both roles: Cline provides persistent agent sessions, model/provider flexibility, tools, and execution, while OpenOrc governs how those sessions participate in the GitHub engineering lifecycle. The Connection/adapter boundary keeps the workflow architecture runtime-neutral without making adapter breadth a v1 objective.
 
 The ownership split is deliberate: GitHub remains the durable engineering record for issues, committed code, pull requests, CI, and merge outcomes. OpenOrc owns deterministic workflow/control truth such as Task state, reviews, Owner gates, runtime-session bindings, and audit history. Connected agent runtimes own their conversational and execution context, tools, filesystem state, and runtime-owned credentials. In v1 those runtimes are bring-your-own, Owner-controlled execution infrastructure rather than part of the OpenOrc control plane.
 
@@ -58,14 +60,19 @@ GitHub
   durable engineering record
         ⇅
 OpenOrc control plane
+  workflow / review / authority
   Vue + FastAPI + RQ
         │
   Postgres / Valkey
         │
-Connection + adapter layer
-        │
-Agent runtimes
-  v1: Cline Hub via ClineAdapter
+   ┌────┴────┐
+   ↓         ↓
+Producer   Reviewer
+   ↓         ↓
+ClineAdapter
+   ↓         ↓
+ Cline Hub / Cline Hub
+   agent runtime + execution
 ```
 
 The repository structure is intentionally explicit:
