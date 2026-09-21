@@ -103,7 +103,7 @@ def test_delete_workspace_deletes_in_deliberate_dependency_order() -> None:
             None,
             None,
             None,
-            (workspace_id, profile_id, "platform", observed, observed),
+            (workspace_id, profile_id, "platform", observed, observed, 5, ""),
         ]
     )
 

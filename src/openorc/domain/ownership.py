@@ -61,13 +61,42 @@ class Profile:
 
 @dataclass(frozen=True, slots=True)
 class Workspace:
-    """A Workspace owned by exactly one Profile in v1."""
+    """A Workspace owned by exactly one Profile in v1.
+
+    ``review_iteration_limit`` is the first-class Workspace setting (issue
+    #53) supplying the effective iteration limit for future ReviewLoops; the
+    limit stored on each existing ReviewLoop at creation is immutable
+    historical configuration and is never rewritten when this setting
+    changes. ``guidance`` is one current, Owner-authored prose value — blank
+    means no Workspace-specific guidance. It is current mutable Workspace
+    configuration with no template, version, hash, snapshot, or history
+    semantics, and it can never redefine formal schemas, initialization
+    semantics, workflow controls, authority, communication topology, exact
+    review-subject identity, session boundaries, or state transitions.
+    """
 
     id: UUID
     owner_profile_id: UUID
     name: str
     created_at: datetime
     updated_at: datetime
+    review_iteration_limit: int
+    guidance: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.review_iteration_limit, bool)
+            or not isinstance(self.review_iteration_limit, int)
+            or self.review_iteration_limit <= 0
+        ):
+            raise OwnershipError(
+                "Workspace.review_iteration_limit must be a positive integer, "
+                f"got {self.review_iteration_limit!r}"
+            )
+        if not isinstance(self.guidance, str):
+            raise OwnershipError(
+                f"Workspace.guidance must be a string, got {type(self.guidance).__name__}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
