@@ -267,6 +267,11 @@ def test_repository_round_trip_through_persistence_layer(conn: Connection[Any]) 
     project = ownership_repositories.create_project(
         pool, workspace_id=workspace.id, name="round-trip project"
     )
+
+    # Direct ownership-scope reads round-trip exactly (issue #53).
+    assert ownership_repositories.get_workspace(pool, workspace.id) == workspace
+    assert ownership_repositories.get_project(pool, project.id) == project
+
     identity = GitHubRepositoryIdentity(github_repository_id=5000)
     metadata = RepositoryMetadata(
         owner_login="octocat",

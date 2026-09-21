@@ -45,6 +45,14 @@ These are durable Phase 1 conventions. Later issues inherit them; do not re-liti
 - External identities that must be canonical per Workspace use `UNIQUE (workspace_id, <stable external identity>)` (for example the GitHub repository ID). Mutable observed metadata changes through explicit repository UPDATE statements that also advance `updated_at`; identity columns are never part of such updates.
 - Violated durable invariants surface as driver exceptions (`UniqueViolation`, `ForeignKeyViolation`, ...). Translating them into typed application errors is a service-layer concern, not a persistence one.
 
+## Workspace configuration conventions (Phase 2A)
+
+Established by the Workspace configuration migration (issue #53); later issues inherit them.
+
+- `workspaces` carries the first-class typed settings directly — `review_iteration_limit integer not null default 5 check (review_iteration_limit > 0)` and `guidance text not null default ''` — with no settings JSON bag, no prompt/template/version/hash columns, and no membership/RBAC columns. The column defaults ARE the backfill: every Workspace created before or without explicit values carries the configured boundary (`DEFAULT_REVIEW_LOOP_ITERATION_LIMIT` = 5, asserted against the migration by tests) and blank guidance.
+- Configuration changes are row-locked conditional writes: `update_workspace_review_iteration_limit` / `update_workspace_guidance` run one deliberate `SELECT ... FOR UPDATE`, capture the exact before-state, write only when the value differs (a same-value write is a no-op that does not advance `updated_at`), and return `(updated Workspace, previous value, changed)`. The locked same-transaction before/after facts are the safe audit handoff for a consequential configuration-change event (#56) — callers never re-read a racy before-state.
+- Workspace-scoped reads for authorization (issue #53) live here (`get_workspace`, `get_project`); every other record family already exposes its single-record getter. Authorization policy never moves into SQL repositories: the composite foreign keys remain durable backstops only.
+
 ## Connection and workflow role binding conventions (Phase 1)
 
 These conventions are established by the Connection/role-binding persistence (issue #20); later issues inherit them.

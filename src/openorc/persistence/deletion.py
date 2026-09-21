@@ -64,6 +64,7 @@ from uuid import UUID
 from openorc.domain.tasks import Task, TaskDomainError
 from openorc.persistence.connections import _CONNECTION_COLUMNS, _connection_from_row
 from openorc.persistence.ownership import (
+    _WORKSPACE_COLUMNS,
     _project_from_row,
     _repository_from_row,
     _workspace_from_row,
@@ -140,8 +141,7 @@ def delete_workspace(pool: DatabasePool, workspace_id: UUID) -> Workspace | None
             (workspace_id,),
         )
         row = conn.execute(
-            "delete from openorc.workspaces where id = %s "
-            "returning id, owner_profile_id, name, created_at, updated_at",
+            f"delete from openorc.workspaces where id = %s returning {_WORKSPACE_COLUMNS}",
             (workspace_id,),
         ).fetchone()
     return None if row is None else _workspace_from_row(row)

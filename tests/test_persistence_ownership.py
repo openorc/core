@@ -17,6 +17,7 @@ from typing import Any, cast
 from openorc.domain.ownership import (
     GitHubRepositoryIdentity,
     Profile,
+    Project,
     Repository,
     RepositoryMetadata,
     Workspace,
@@ -28,8 +29,12 @@ from openorc.persistence.ownership import (
     ensure_profile,
     find_repository_by_github_identity,
     get_profile,
+    get_project,
     get_repository,
+    get_workspace,
     update_repository_metadata,
+    update_workspace_guidance,
+    update_workspace_review_iteration_limit,
 )
 from openorc.persistence.pool import DatabasePool
 
@@ -167,7 +172,9 @@ def test_create_workspace_maps_row_and_parameters() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     observed = _observed_at()
-    conn = FakeConnection(row=(workspace_id, profile_id, "platform", observed, observed))
+    # The configuration settings are not insert inputs: the row is completed
+    # by the durable column defaults (review_iteration_limit 5, guidance '').
+    conn = FakeConnection(row=(workspace_id, profile_id, "platform", observed, observed, 5, ""))
 
     workspace = create_workspace(
         cast(DatabasePool, FakePool(conn)), owner_profile_id=profile_id, name="platform"
@@ -177,12 +184,19 @@ def test_create_workspace_maps_row_and_parameters() -> None:
         id=workspace_id,
         owner_profile_id=profile_id,
         name="platform",
-        created_at=observed,
-        updated_at=observed,
+        created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        review_iteration_limit=5,
+        guidance="",
     )
+    assert workspace.created_at.utcoffset() == timedelta(0)
     sql, params = conn.executed[0]
     assert "insert into openorc.workspaces" in sql
     assert params == (profile_id, "platform")
+    # The insert names no configuration columns; defaults apply durably.
+    insert_columns = sql.split("(", 1)[1].split(")", 1)[0]
+    assert "review_iteration_limit" not in insert_columns
+    assert "guidance" not in insert_columns
 
 
 def test_create_repository_maps_row_to_domain_object() -> None:
@@ -287,3 +301,174 @@ def test_update_repository_metadata_maps_updated_row_and_handles_missing() -> No
         update_repository_metadata(cast(DatabasePool, FakePool(missing)), row[0], metadata=metadata)
         is None
     )
+
+
+def _workspace_row(
+    workspace_id: uuid.UUID,
+    owner_profile_id: uuid.UUID,
+    *,
+    review_iteration_limit: int = 5,
+    guidance: str = "",
+) -> tuple[Any, ...]:
+    observed = _observed_at()
+    return (
+        workspace_id,
+        owner_profile_id,
+        "platform",
+        observed,
+        observed,
+        review_iteration_limit,
+        guidance,
+    )
+
+
+def _workspace_from_row_values(row: tuple[Any, ...]) -> Workspace:
+    return Workspace(
+        id=row[0],
+        owner_profile_id=row[1],
+        name=row[2],
+        created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        review_iteration_limit=row[5],
+        guidance=row[6],
+    )
+
+
+def test_get_workspace_maps_row_or_empty_result() -> None:
+    workspace_id = uuid.uuid4()
+    owner_profile_id = uuid.uuid4()
+    row = _workspace_row(workspace_id, owner_profile_id, review_iteration_limit=7, guidance="prose")
+    conn = FakeConnection(row=row)
+
+    workspace = get_workspace(cast(DatabasePool, FakePool(conn)), workspace_id)
+
+    assert workspace == Workspace(
+        id=workspace_id,
+        owner_profile_id=owner_profile_id,
+        name="platform",
+        created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        review_iteration_limit=7,
+        guidance="prose",
+    )
+    sql, params = conn.executed[0]
+    assert "from openorc.workspaces where id = %s" in sql
+    assert params == (workspace_id,)
+
+    empty = get_workspace(cast(DatabasePool, FakePool(FakeConnection(row=None))), workspace_id)
+    assert empty is None
+
+
+def test_get_project_maps_row_or_empty_result() -> None:
+    workspace_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    observed = _observed_at()
+    conn = FakeConnection(row=(project_id, workspace_id, "project", observed, observed))
+
+    project = get_project(cast(DatabasePool, FakePool(conn)), project_id)
+
+    assert project == Project(
+        id=project_id,
+        workspace_id=workspace_id,
+        name="project",
+        created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+    )
+    sql, params = conn.executed[0]
+    assert "from openorc.projects where id = %s" in sql
+    assert params == (project_id,)
+
+    empty = get_project(cast(DatabasePool, FakePool(FakeConnection(row=None))), project_id)
+    assert empty is None
+
+
+def test_update_workspace_review_iteration_limit_writes_only_on_change() -> None:
+    workspace_id = uuid.uuid4()
+    owner_profile_id = uuid.uuid4()
+    old_row = _workspace_row(workspace_id, owner_profile_id, review_iteration_limit=5)
+    new_row = _workspace_row(workspace_id, owner_profile_id, review_iteration_limit=7)
+    conn = ScriptedProfileConnection([old_row, new_row])
+
+    result = update_workspace_review_iteration_limit(
+        cast(DatabasePool, FakePool(conn)), workspace_id, review_iteration_limit=7
+    )
+    assert result is not None
+    workspace, previous, changed = result
+
+    assert changed is True
+    assert previous == 5
+    assert workspace.review_iteration_limit == 7
+    select_sql, select_params = conn.executed[0]
+    assert "for update" in select_sql
+    assert select_params == (workspace_id,)
+    update_sql, update_params = conn.executed[1]
+    assert "update openorc.workspaces" in update_sql
+    assert "review_iteration_limit = %s" in update_sql
+    assert "updated_at = now()" in update_sql
+    assert update_params == (7, workspace_id)
+
+    # Same-value write: no update statement, unchanged row, changed=False.
+    same_conn = ScriptedProfileConnection([old_row])
+    same_result = update_workspace_review_iteration_limit(
+        cast(DatabasePool, FakePool(same_conn)), workspace_id, review_iteration_limit=5
+    )
+    assert same_result is not None
+    workspace, previous, changed = same_result
+    assert changed is False
+    assert previous == 5
+    assert workspace == _workspace_from_row_values(old_row)
+    assert len(same_conn.executed) == 1
+
+    missing_conn = ScriptedProfileConnection([None])
+    assert (
+        update_workspace_review_iteration_limit(
+            cast(DatabasePool, FakePool(missing_conn)), workspace_id, review_iteration_limit=7
+        )
+        is None
+    )
+
+
+def test_update_workspace_guidance_replaces_the_current_value() -> None:
+    workspace_id = uuid.uuid4()
+    owner_profile_id = uuid.uuid4()
+    prose = "Review findings carefully.\nΟἶναι νόμοι.\n✔ done"
+    blank_row = _workspace_row(workspace_id, owner_profile_id, guidance="")
+    prose_row = _workspace_row(workspace_id, owner_profile_id, guidance=prose)
+    conn = ScriptedProfileConnection([blank_row, prose_row])
+
+    guidance_result = update_workspace_guidance(
+        cast(DatabasePool, FakePool(conn)), workspace_id, guidance=prose
+    )
+    assert guidance_result is not None
+    workspace, previous, changed = guidance_result
+
+    assert changed is True
+    assert previous == ""
+    assert workspace.guidance == prose  # arbitrary Owner-authored prose, verbatim
+
+    update_sql, update_params = conn.executed[1]
+    assert "update openorc.workspaces" in update_sql
+    assert "guidance = %s" in update_sql
+    assert "updated_at = now()" in update_sql
+    assert update_params == (prose, workspace_id)
+
+    # Reset to blank is itself a change; the previous prose is the before fact.
+    reset_conn = ScriptedProfileConnection([prose_row, blank_row])
+    reset_result = update_workspace_guidance(
+        cast(DatabasePool, FakePool(reset_conn)), workspace_id, guidance=""
+    )
+    assert reset_result is not None
+    _, previous, changed = reset_result
+    assert changed is True
+    assert previous == prose
+
+    # Same-value write: no-op with changed=False and no UPDATE statement.
+    noop_conn = ScriptedProfileConnection([prose_row])
+    noop_result = update_workspace_guidance(
+        cast(DatabasePool, FakePool(noop_conn)), workspace_id, guidance=prose
+    )
+    assert noop_result is not None
+    _, previous, changed = noop_result
+    assert changed is False
+    assert previous == prose
+    assert len(noop_conn.executed) == 1

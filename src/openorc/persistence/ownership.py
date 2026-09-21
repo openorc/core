@@ -37,9 +37,19 @@ __all__ = [
     "ensure_profile",
     "find_repository_by_github_identity",
     "get_profile",
+    "get_project",
     "get_repository",
+    "get_workspace",
     "update_repository_metadata",
+    "update_workspace_guidance",
+    "update_workspace_review_iteration_limit",
 ]
+
+# The full Workspace column list, including the first-class configuration
+# settings added by issue #53 (review_iteration_limit, guidance).
+_WORKSPACE_COLUMNS = (
+    "id, owner_profile_id, name, created_at, updated_at, review_iteration_limit, guidance"
+)
 
 
 def _profile_from_row(row: Sequence[Any]) -> Profile:
@@ -53,6 +63,8 @@ def _workspace_from_row(row: Sequence[Any]) -> Workspace:
         name=row[2],
         created_at=normalize_utc(row[3]),
         updated_at=normalize_utc(row[4]),
+        review_iteration_limit=row[5],
+        guidance=row[6],
     )
 
 
@@ -148,16 +160,119 @@ def ensure_profile(pool: DatabasePool, *, profile_id: UUID) -> Profile:
 
 
 def create_workspace(pool: DatabasePool, *, owner_profile_id: UUID, name: str) -> Workspace:
-    """Insert a Workspace owned by exactly one Profile."""
+    """Insert a Workspace owned by exactly one Profile.
+
+    The first-class Workspace configuration settings are not insert inputs:
+    the durable column defaults supply them, so a fresh Workspace carries the
+    configured review-iteration boundary (``review_iteration_limit`` default
+    5) and blank guidance unless explicitly changed afterwards.
+    """
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.workspaces (owner_profile_id, name) "
             "values (%s, %s) "
-            "returning id, owner_profile_id, name, created_at, updated_at",
+            f"returning {_WORKSPACE_COLUMNS}",
             (owner_profile_id, name),
         ).fetchone()
     assert row is not None
     return _workspace_from_row(row)
+
+
+def get_workspace(pool: DatabasePool, workspace_id: UUID) -> Workspace | None:
+    """Return one Workspace with its configuration settings, or ``None``."""
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces where id = %s",
+            (workspace_id,),
+        ).fetchone()
+    return None if row is None else _workspace_from_row(row)
+
+
+def get_project(pool: DatabasePool, project_id: UUID) -> Project | None:
+    """Return one Project by id, or ``None`` when it does not exist."""
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select id, workspace_id, name, created_at, updated_at "
+            "from openorc.projects where id = %s",
+            (project_id,),
+        ).fetchone()
+    return None if row is None else _project_from_row(row)
+
+
+def update_workspace_review_iteration_limit(
+    pool: DatabasePool, workspace_id: UUID, *, review_iteration_limit: int
+) -> tuple[Workspace, int, bool] | None:
+    """Set the Workspace review-loop iteration limit (issue #53).
+
+    One deliberate ``SELECT ... FOR UPDATE`` inside one short transaction
+    captures the exact before-state, then the write happens only when the
+    value actually differs. The locked same-transaction previous/new facts
+    are the safe audit handoff for a consequential configuration-change
+    event (#56) — the caller never re-reads a racy before-state. The change
+    affects future ReviewLoops only: ``ReviewLoop.iteration_limit`` values
+    stored on existing loops are immutable historical configuration and are
+    never touched.
+
+    Returns ``(updated Workspace, previous limit, changed)``; a no-op
+    returns the unchanged Workspace with ``changed=False`` and does not
+    advance ``updated_at``. Returns ``None`` when the Workspace does not
+    exist.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces where id = %s for update",
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        previous = _workspace_from_row(row)
+        if previous.review_iteration_limit == review_iteration_limit:
+            return previous, previous.review_iteration_limit, False
+        updated_row = conn.execute(
+            "update openorc.workspaces "
+            "set review_iteration_limit = %s, updated_at = now() "
+            "where id = %s "
+            f"returning {_WORKSPACE_COLUMNS}",
+            (review_iteration_limit, workspace_id),
+        ).fetchone()
+    assert updated_row is not None
+    return _workspace_from_row(updated_row), previous.review_iteration_limit, True
+
+
+def update_workspace_guidance(
+    pool: DatabasePool, workspace_id: UUID, *, guidance: str
+) -> tuple[Workspace, str, bool] | None:
+    """Set the Workspace guidance prose (issue #53).
+
+    Guidance is one current, Owner-authored value: the write replaces the
+    current value and creates no history, hash, snapshot, or revision. The
+    same deliberate ``SELECT ... FOR UPDATE`` plus conditional-write shape as
+    the review-limit update provides the exact locked before-state for the
+    #56 audit handoff — the previous prose is returned to the caller but the
+    guidance-change event needs only the semantic fact that the setting
+    changed, never the prose itself. Returns ``(updated Workspace, previous
+    guidance, changed)``; a no-op returns the unchanged Workspace with
+    ``changed=False``. Returns ``None`` when the Workspace does not exist.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces where id = %s for update",
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        previous = _workspace_from_row(row)
+        if previous.guidance == guidance:
+            return previous, previous.guidance, False
+        updated_row = conn.execute(
+            "update openorc.workspaces "
+            "set guidance = %s, updated_at = now() "
+            "where id = %s "
+            f"returning {_WORKSPACE_COLUMNS}",
+            (guidance, workspace_id),
+        ).fetchone()
+    assert updated_row is not None
+    return _workspace_from_row(updated_row), previous.guidance, True
 
 
 def create_project(pool: DatabasePool, *, workspace_id: UUID, name: str) -> Project:
