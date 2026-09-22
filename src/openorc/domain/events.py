@@ -106,6 +106,7 @@ class WorkflowEventType(StrEnum):
     PR_MERGED = "pr_merged"
     TASK_CANCELLED = "task_cancelled"
     TASK_COMPLETED = "task_completed"
+    WORKSPACE_CONFIGURATION_CHANGED = "workspace_configuration_changed"
 
 
 class WorkflowEventActor(StrEnum):

@@ -80,11 +80,18 @@ def test_the_narrowed_event_type_check_matches_the_live_vocabulary_exactly() -> 
     )
     assert match is not None, "expected the narrowed event_type CHECK"
     values = re.findall(r"'([a-z_]+)'", match.group(1))
-    # The live lock: the database CHECK vocabulary is exactly the current
-    # Python enum, value for value, with the removed type gone.
-    assert values == [member.value for member in WorkflowEventType]
+    # The lock at this migration's point in history: the database CHECK
+    # vocabulary is exactly the current Python enum minus the values later
+    # demonstrated additive migrations extended it with (#56's
+    # workspace_configuration_changed), value for value, with the removed
+    # type gone.
+    later_extension_values = {"workspace_configuration_changed"}
+    assert values == [
+        member.value for member in WorkflowEventType if member.value not in later_extension_values
+    ]
     assert len(values) == 32
     assert "prompt_override_changed" not in values
+    assert "workspace_configuration_changed" not in values
 
 
 def test_the_initialization_protocol_version_column_is_dropped() -> None:

@@ -42,7 +42,7 @@ def _event(**overrides: Any) -> WorkflowEvent:
     return WorkflowEvent(**values)
 
 
-def test_event_type_vocabulary_is_exactly_the_locked_32() -> None:
+def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
     locked = {
         "task_created",
         "agent_session_created",
@@ -76,9 +76,12 @@ def test_event_type_vocabulary_is_exactly_the_locked_32() -> None:
         "pr_merged",
         "task_cancelled",
         "task_completed",
+        # The one demonstrated Phase 2A extension (issue #56): the
+        # consequential Workspace configuration change.
+        "workspace_configuration_changed",
     }
     assert {member.value for member in WorkflowEventType} == locked
-    assert len(WorkflowEventType) == 32
+    assert len(WorkflowEventType) == 33
 
 
 def test_excluded_crud_event_types_do_not_exist() -> None:

@@ -16,13 +16,15 @@ validation and mutation compose inside one short ``composed_transaction``
 capture the exact before-state, so the returned audit-handoff facts never
 come from a racy re-read.
 
-Audit handoff (#56): each setter returns only the exact safe data needed to
-record a consequential configuration-change event. For the review limit that
-is the precise previous/new integer values; for guidance it is only the
-semantic fact that the setting changed — Owner-authored prose is never
-copied into event context. This module deliberately does not record
-WorkflowEvents (#56 owns the event stream) and does not invent a generic
-settings/audit framework.
+Audit coordination (#56): when a row-locked update reports an actual change,
+the same composed transaction records the consequential
+``WORKSPACE_CONFIGURATION_CHANGED`` event through
+:mod:`openorc.services.event_coordination` — canonical mutation and event
+insert commit or roll back together, and a failed/stale canonical mutation
+writes no event. The review-limit event carries the precise previous/new
+integer values; the guidance event identifies only the setting change, so
+Owner-authored prose is never copied into event context. Same-value no-op
+writes record no event, and no generic "row updated" events exist.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from openorc.persistence.ownership import (
     update_workspace_review_iteration_limit,
 )
 from openorc.persistence.pool import DatabasePool
+from openorc.services import event_coordination
 from openorc.services.errors import InvalidCommandError, NotFoundError
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_profile_workspace
@@ -113,9 +116,17 @@ def set_review_iteration_limit(
         result = update_workspace_review_iteration_limit(
             transaction_pool, workspace_id, review_iteration_limit=review_iteration_limit
         )
-    if result is None:
-        raise NotFoundError("the requested workspace is not available to this Profile")
-    updated_workspace, previous_limit, changed = result
+        if result is None:
+            raise NotFoundError("the requested workspace is not available to this Profile")
+        updated_workspace, previous_limit, changed = result
+        if changed:
+            event_coordination.record_review_iteration_limit_changed_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                actor=event_coordination.owner_actor(profile_id),
+                previous_limit=previous_limit,
+                new_limit=updated_workspace.review_iteration_limit,
+            )
     return ReviewIterationLimitUpdate(
         workspace_id=workspace_id,
         changed=changed,
@@ -141,7 +152,13 @@ def set_guidance(
             transaction_pool, profile_id=profile_id, workspace_id=workspace_id
         )
         result = update_workspace_guidance(transaction_pool, workspace_id, guidance=guidance)
-    if result is None:
-        raise NotFoundError("the requested workspace is not available to this Profile")
-    _, _, changed = result
+        if result is None:
+            raise NotFoundError("the requested workspace is not available to this Profile")
+        _, _, changed = result
+        if changed:
+            event_coordination.record_guidance_changed_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                actor=event_coordination.owner_actor(profile_id),
+            )
     return WorkspaceGuidanceUpdate(workspace_id=workspace_id, changed=changed)
