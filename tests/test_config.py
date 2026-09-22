@@ -267,10 +267,41 @@ def test_supabase_secret_key_is_read_when_supplied() -> None:
     assert settings.supabase_secret_key == "sb_secret_example"
 
 
-def test_blank_supabase_secret_key_falls_back_to_unset() -> None:
-    settings = Settings.from_env({"SUPABASE_SECRET_KEY": ""})
+def test_blank_supabase_secret_key_is_rejected() -> None:
+    # Unlike ordinary optional settings, a supplied-but-blank secret fails
+    # closed (without echoing the value): secrets are never silently unset.
+    with pytest.raises(ConfigurationError, match="SUPABASE_SECRET_KEY") as error:
+        Settings.from_env({"SUPABASE_SECRET_KEY": ""})
 
-    assert settings.supabase_secret_key is None
+    assert "was supplied blank" in str(error.value)
+
+
+def test_whitespace_only_supabase_secret_key_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="was supplied blank"):
+        Settings.from_env({"SUPABASE_SECRET_KEY": "   "})
+
+
+def test_supplied_secret_value_is_preserved_verbatim() -> None:
+    settings = Settings.from_env({"SUPABASE_SECRET_KEY": "  sb_secret padded  "})
+
+    # Credential bytes are meaningful: supplied values are never stripped.
+    assert settings.supabase_secret_key == "  sb_secret padded  "
+
+
+def test_the_secret_key_never_appears_in_settings_representation() -> None:
+    raw_key = "sb_secret_repr-leak-probe"
+    settings = Settings.from_env(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_SECRET_KEY": raw_key,
+        }
+    )
+
+    # The generated dataclass repr/str must never carry the raw credential.
+    assert raw_key not in repr(settings)
+    assert raw_key not in str(settings)
+    # The representation stays useful for non-secret fields.
+    assert "https://example.supabase.co" in repr(settings)
 
 
 def test_supabase_secret_key_is_optional_in_production() -> None:

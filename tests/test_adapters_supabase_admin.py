@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import urllib.error
 from collections.abc import Mapping
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -182,6 +183,123 @@ def test_construction_fails_fast_without_usable_configuration() -> None:
             HttpSupabaseAuthAdminClient(
                 project_url=_PROJECT_URL, secret_key=_SECRET_KEY, timeout_seconds=bad_timeout
             )
+
+
+def test_plaintext_http_endpoints_are_rejected() -> None:
+    # The privileged Admin transport requires HTTPS: the administrative
+    # credential is never sent over plaintext HTTP.
+    with pytest.raises(ConfigurationError, match="must use https"):
+        HttpSupabaseAuthAdminClient(
+            project_url="http://project.example.supabase.co", secret_key=_SECRET_KEY
+        )
+
+
+def test_loopback_http_is_the_narrowly_constrained_local_exception() -> None:
+    transport = FakeAdminTransport([(204, b"")])
+    client = HttpSupabaseAuthAdminClient(
+        project_url="http://127.0.0.1:54321", secret_key=_SECRET_KEY, fetch=transport
+    )
+
+    # The loopback exception constructs; the endpoint still derives from the
+    # supplied project URL.
+    client.delete_user(uuid4())
+    assert transport.calls[0][0].startswith("http://127.0.0.1:54321/auth/v1/admin/users/")
+
+
+class _RedirectingAdminServer:
+    """One local HTTP server that answers every Admin request with a redirect.
+
+    Records each request (method, path, apikey header) it actually receives,
+    so the redirect tests can prove the transport never followed the redirect
+    and never forwarded the credential to the redirect target.
+    """
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _record_and_redirect(self) -> None:
+                server.requests.append(("GET", self.path, self.headers.get("apikey")))
+                self.send_response(302)
+                self.send_header("Location", "/auth/v1/admin/users/redirected")
+                self.end_headers()
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server contract
+                self._record_and_redirect()
+
+            def do_DELETE(self) -> None:  # noqa: N802 - http.server contract
+                server.requests.append(("DELETE", self.path, self.headers.get("apikey")))
+                self.send_response(302)
+                self.send_header("Location", "/auth/v1/admin/users/redirected")
+                self.end_headers()
+
+            def log_message(self, *args: Any) -> None:
+                return
+
+        self.requests: list[tuple[str, str, str | None]] = []
+        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        # Bound to 127.0.0.1, so the address is an IPv4 (host, port) tuple;
+        # the Any cast keeps the stdlib union away from the typing surface.
+        address = cast(Any, self._httpd.server_address)
+        return f"http://127.0.0.1:{address[1]}"
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join()
+
+
+def test_a_redirect_is_never_followed_and_surfaces_as_an_unknown_outcome() -> None:
+    # The Admin transport never follows redirects: urllib copies non-content
+    # request headers (the apikey credential) into redirected requests, so a
+    # followed cross-origin redirect would forward the administrative secret
+    # to another host. A redirect that is not followed surfaces as an
+    # unclassified 3xx — an unknown outcome, never success.
+    redirector = _RedirectingAdminServer()
+    try:
+        user_id = uuid4()
+        client = HttpSupabaseAuthAdminClient(
+            project_url=redirector.base_url, secret_key=_SECRET_KEY
+        )
+
+        with pytest.raises(SupabaseAuthAdminOutcomeUnknownError):
+            client.fetch_user(user_id)
+
+        # Exactly ONE request arrived at the original host: the redirect was
+        # not followed, so the credential was never forwarded anywhere.
+        assert len(redirector.requests) == 1
+        method, path, apikey = redirector.requests[0]
+        assert method == "GET"
+        assert path == f"/auth/v1/admin/users/{user_id}"
+        assert apikey == _SECRET_KEY
+    finally:
+        redirector.stop()
+
+
+def test_a_delete_redirect_is_never_followed() -> None:
+    redirector = _RedirectingAdminServer()
+    try:
+        client = HttpSupabaseAuthAdminClient(
+            project_url=redirector.base_url, secret_key=_SECRET_KEY
+        )
+
+        with pytest.raises(SupabaseAuthAdminOutcomeUnknownError):
+            client.delete_user(uuid4())
+
+        # One request only; the apikey stayed on the original host.
+        assert len(redirector.requests) == 1
+        assert redirector.requests[0][0] == "DELETE"
+        assert redirector.requests[0][2] == _SECRET_KEY
+    finally:
+        redirector.stop()
 
 
 def test_the_secret_key_is_redacted_from_ordinary_representation() -> None:

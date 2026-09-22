@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 ENVIRONMENT_VAR = "OPENORC_ENV"
@@ -88,6 +88,27 @@ def _read(env: Mapping[str, str], name: str) -> str | None:
     return value
 
 
+def _read_secret(env: Mapping[str, str], name: str) -> str | None:
+    """Read one secret setting, distinguishing absent from supplied-blank.
+
+    Secrets are process bootstrap material under a strict
+    never-log/never-return boundary. Unlike ordinary optional settings, a
+    supplied-but-blank or whitespace-only value is a configuration error
+    raised WITHOUT echoing the value — a silently-unset secret would only
+    fail later, misleadingly, at its point of consumption. A supplied value
+    is otherwise preserved verbatim: credential bytes are meaningful and are
+    never stripped or normalized.
+    """
+    value = env.get(name)
+    if value is None:
+        return None
+    if not value.strip():
+        raise ConfigurationError(
+            f"{name} was supplied blank: provide the secret value or leave the variable unset"
+        )
+    return value
+
+
 def _read_int(env: Mapping[str, str], name: str, *, minimum: int, default: int) -> int:
     """Read an integer setting enforcing a minimum; blank/unset uses default."""
     raw = _read(env, name)
@@ -131,7 +152,9 @@ class Settings:
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
     supabase_url: str | None = None
     supabase_jwt_audience: str = DEFAULT_SUPABASE_JWT_AUDIENCE
-    supabase_secret_key: str | None = None
+    # Representation-safe: the generated dataclass repr/str must never carry
+    # the raw administrative credential (issue #97 secret-handling boundary).
+    supabase_secret_key: str | None = field(default=None, repr=False)
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -226,11 +249,13 @@ class Settings:
         # surface in every environment — including production: the
         # administrative credential belongs only to the component that
         # constructs the Auth Admin client, and that component fails fast at
-        # construction when its required key is absent. A blank supplied value
-        # counts as unset like every other optional setting. The key is never
-        # validated for shape here (it is opaque deployment material) and is
-        # never logged or returned.
-        supabase_secret_key = _read(source, SUPABASE_SECRET_KEY_VAR)
+        # construction when its required key is absent. A supplied-but-blank
+        # or whitespace-only value is a configuration error (fail closed
+        # without echoing the value): secrets are never silently unset. The
+        # field is representation-safe (excluded from the dataclass
+        # repr/str), never validated for shape here (it is opaque deployment
+        # material), and never logged or returned.
+        supabase_secret_key = _read_secret(source, SUPABASE_SECRET_KEY_VAR)
 
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an

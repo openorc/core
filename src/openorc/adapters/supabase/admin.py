@@ -22,6 +22,15 @@ secret API key travels on the ``apikey`` request header, never as
 ``Authorization: Bearer`` and never in a URL or query parameter. Only the
 ``apikey`` header carries credential material on these calls.
 
+Privileged-transport hardening: the project URL must be HTTPS (the
+administrative credential is never sent over plaintext HTTP; a narrowly-
+constrained local development exception permits http only for loopback
+hosts), and redirects are never followed — ``urllib`` copies non-content
+headers into redirected requests, so a followed redirect could forward the
+credential to another host. A redirect that is not followed surfaces as an
+unclassified 3xx and is classified as an unknown outcome, never success and
+never a safe replay.
+
 Key hygiene: the secret key is process bootstrap material supplied at
 construction. It is held in a private field, its ordinary representation is
 redacted, and it never appears in errors, logs, span attributes, or returned
@@ -52,6 +61,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Protocol
+from urllib.parse import urlparse
 from uuid import UUID
 
 from openorc.adapters.supabase.auth import _require_project_url
@@ -77,6 +87,11 @@ AUTH_ADMIN_USERS_PATH = "/auth/v1/admin/users"
 # documented safety margin), so the lease provably outlives any live request.
 DEFAULT_ADMIN_REQUEST_TIMEOUT_SECONDS = 5.0
 
+# The privileged Admin transport requires HTTPS: the deployment's secret API
+# key is never sent over plaintext HTTP. A narrowly-constrained local
+# development exception permits http only for loopback hosts.
+_ADMIN_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
 # Representative external-adapter span boundaries (issues #108/#109): one
 # instrumented external operation per Admin call, mirroring the JWKS
 # retrieval span. The request URL carries the Supabase project reference and
@@ -98,6 +113,48 @@ class SupabaseAuthAdminUserAbsentError(Exception):
     :meth:`SupabaseAuthAdminClient.fetch_user` it is a confirmed-absent
     lookup. Messages carry no user-record contents.
     """
+
+
+def _require_admin_project_url(project_url: str) -> None:
+    """Validate the project URL for the privileged Admin transport.
+
+    Builds on the well-formed http(s) URL check and then requires HTTPS: the
+    deployment's secret API key is privileged administrative credential
+    material and is never sent over plaintext HTTP. A narrowly-constrained
+    local development exception permits http only for loopback hosts. The
+    error message is safe by construction (it never echoes the URL or any
+    credential material).
+    """
+    _require_project_url(project_url)
+    if urlparse(project_url).scheme == "https":
+        return
+    host = (urlparse(project_url).hostname or "").lower()
+    if host in _ADMIN_LOOPBACK_HOSTS:
+        return
+    raise ConfigurationError(
+        "the Supabase Auth Admin project URL must use https: the "
+        "administrative credential is never sent over plaintext HTTP"
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Admin-transport hardening: never follow redirects.
+
+    ``urllib`` copies non-content request headers into redirected requests,
+    so following a cross-origin redirect would forward the ``apikey``
+    credential (the administrative secret) to another host. A redirect that
+    is not followed surfaces as an HTTPError carrying the redirect status,
+    which the client classifies as an unknown outcome — never followed with
+    credentials, never reclassified as success or as a safe replay.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+# One module-level opener with redirect following disabled for the default
+# (stdlib) Admin transport path. Injectable fetchers bypass it.
+_ADMIN_HTTP_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 class SupabaseAuthAdminRejectedError(Exception):
@@ -174,15 +231,22 @@ def _fetch_admin_response(
     headers: Mapping[str, str],
     timeout_seconds: float,
 ) -> tuple[int, bytes]:
-    """Perform one Admin HTTP request through the injected (or stdlib) fetcher."""
+    """Perform one Admin HTTP request through the injected (or stdlib) fetcher.
+
+    The default stdlib path uses the module opener with redirect following
+    disabled: a redirect is never followed with the ``apikey`` credential and
+    surfaces as an HTTPError carrying the redirect status, which the caller
+    classifies as an unknown outcome.
+    """
     if fetch is not None:
         return fetch(url, method, dict(headers), timeout_seconds)
     request = urllib.request.Request(url, method=method, headers=dict(headers))
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with _ADMIN_HTTP_OPENER.open(request, timeout=timeout_seconds) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
-        # The endpoint answered with an HTTP error status: return it for
+        # The endpoint answered with an HTTP error status — including a
+        # redirect that was deliberately not followed. Return it for
         # status-driven classification at the call site. The error body is
         # never needed for the outcome classification and is deliberately
         # discarded so no response content can leak into errors or logs.
@@ -208,7 +272,7 @@ class HttpSupabaseAuthAdminClient:
         timeout_seconds: float = DEFAULT_ADMIN_REQUEST_TIMEOUT_SECONDS,
         fetch: _AdminFetcher | None = None,
     ) -> None:
-        _require_project_url(project_url)
+        _require_admin_project_url(project_url)
         if not isinstance(secret_key, str) or not secret_key.strip():
             raise ConfigurationError(
                 "the Supabase Auth Admin secret key must be a non-empty string"
