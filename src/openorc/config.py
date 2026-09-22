@@ -23,6 +23,7 @@ DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
 DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
 SUPABASE_URL_VAR = "SUPABASE_URL"
 SUPABASE_JWT_AUDIENCE_VAR = "OPENORC_SUPABASE_JWT_AUDIENCE"
+OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
 PRODUCTION_ENVIRONMENT = "production"
@@ -58,6 +59,10 @@ _DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
 # https is the production form; http is accepted for the documented local
 # Supabase stack and non-production branches.
 _SUPABASE_URL_SCHEMES = frozenset({"http", "https"})
+
+# Schemes accepted for the OTLP collector base URL (issue #108). Telemetry
+# export is deployment configuration; unconfigured telemetry stays a no-op.
+_OTLP_URL_SCHEMES = frozenset({"http", "https"})
 
 
 class ConfigurationError(Exception):
@@ -115,6 +120,7 @@ class Settings:
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
     supabase_url: str | None = None
     supabase_jwt_audience: str = DEFAULT_SUPABASE_JWT_AUDIENCE
+    otlp_endpoint: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -204,6 +210,19 @@ class Settings:
             _read(source, SUPABASE_JWT_AUDIENCE_VAR) or DEFAULT_SUPABASE_JWT_AUDIENCE
         )
 
+        # Application observability export boundary (issue #108). An unset
+        # endpoint means unconfigured telemetry: the process runs without an
+        # OpenTelemetry export runtime. Malformed supplied values fail in
+        # every environment so misconfiguration never surfaces at runtime.
+        otlp_endpoint = _read(source, OTLP_ENDPOINT_VAR)
+        if otlp_endpoint is not None:
+            parsed = urlparse(otlp_endpoint)
+            if parsed.scheme.lower() not in _OTLP_URL_SCHEMES or not parsed.netloc:
+                raise ConfigurationError(
+                    f"{OTLP_ENDPOINT_VAR} must be an http(s) OTLP collector "
+                    f"base URL, got {otlp_endpoint!r}"
+                )
+
         return cls(
             environment=environment,
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
@@ -216,4 +235,5 @@ class Settings:
             db_pool_timeout=db_pool_timeout,
             supabase_url=supabase_url,
             supabase_jwt_audience=supabase_jwt_audience,
+            otlp_endpoint=otlp_endpoint,
         )

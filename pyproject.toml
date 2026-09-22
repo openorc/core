@@ -14,6 +14,12 @@ dependencies = [
     "psycopg[binary]==3.3.5",
     "psycopg-pool==3.3.1",
     "PyJWT[crypto]==2.14.0",
+    # Application observability (issue #108): vendor-neutral OpenTelemetry
+    # foundation with OTLP as the export boundary. Latest stable release at
+    # implementation time, verified on PyPI (2026-09-22).
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
 ]
 
 [project.urls]

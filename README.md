@@ -151,6 +151,15 @@ API and worker authentication verifies Supabase Auth access tokens against the p
 - `OPENORC_SUPABASE_JWT_AUDIENCE` — the expected authenticated audience (default `authenticated`).
 - v1 is GitHub-only sign-in: configure Supabase Auth with GitHub as the only enabled user sign-in provider and asymmetric JWT signing keys (ES256/RS256). The verifier enforces the trusted `app_metadata` GitHub-origin checks as defense-in-depth and has no symmetric/HS256 shared-secret path.
 
+### Application observability (OpenTelemetry)
+
+OpenOrc's own Python control-plane code emits operational telemetry through OpenTelemetry with OTLP as the vendor-neutral export boundary (`OpenOrc API / worker / services / adapters → OpenTelemetry traces + logs + metrics → OTLP → deployment-selected collector/backend`). The destination is deployment configuration, not a core dependency; core ships no backend-specific SDK.
+
+- `OPENORC_OTLP_ENDPOINT` — optional OTLP collector base URL (http/https). Per-signal paths (`/v1/traces`, `/v1/logs`, `/v1/metrics`) are derived from it. Unset means unconfigured telemetry: processes run with the local stderr log baseline and no OpenTelemetry export runtime. Malformed values fail startup like other configuration errors.
+- API and worker processes share one contract with distinct service/resource identity (`openorc-api` / `openorc-worker`, `service.version`, deployment environment). Initialization happens exactly once per serving process and is terminal after shutdown; runtime export failures never crash the application.
+- Every API response carries an `x-openorc-request-id` header — a safe opaque correlation ID for operator/frontend diagnostics that is observational only (never authority or idempotency). Ordinary Python `logging` participates in the configured pipeline and correlates with the active trace/span context.
+- Durable `WorkflowEvent` audit history remains in Postgres and is not operational logging; connected-runtime telemetry stays runtime-owned. See `src/openorc/AGENTS.md` for the canonical rules.
+
 ## Local development (frontend)
 
 `apps/app` is the product SPA (Vue 3 + Vite + TypeScript) and targets Node 24. Its toolchain contract mirrors the Python one:

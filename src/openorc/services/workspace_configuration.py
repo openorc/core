@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from openorc.domain.ownership import Workspace
+from openorc.observability import annotate_span, application_span
 from openorc.persistence.ownership import (
     update_workspace_guidance,
     update_workspace_review_iteration_limit,
@@ -50,6 +51,12 @@ __all__ = [
     "set_guidance",
     "set_review_iteration_limit",
 ]
+
+# Representative application-service span boundary (issue #108): one
+# instrumented operation proves the trace foundation; the broad Phase 2A
+# retrofit belongs to a dedicated follow-up leaf.
+_SERVICE_TRACER_SCOPE = "openorc.services.workspace_configuration"
+_REVIEW_LIMIT_SPAN_NAME = "workspace_configuration.set_review_iteration_limit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,30 +110,38 @@ def set_review_iteration_limit(
     limit as immutable historical configuration, and this operation never
     touches them. Same-value writes are no-ops.
     """
-    if (
-        isinstance(review_iteration_limit, bool)
-        or not isinstance(review_iteration_limit, int)
-        or review_iteration_limit <= 0
-    ):
-        raise InvalidCommandError("Workspace review iteration limit must be a positive integer")
-    with composed_transaction(pool) as transaction_pool:
-        require_profile_workspace(
-            transaction_pool, profile_id=profile_id, workspace_id=workspace_id
+    with application_span(_SERVICE_TRACER_SCOPE, _REVIEW_LIMIT_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_REVIEW_LIMIT_SPAN_NAME,
+            workspace_id=str(workspace_id),
         )
-        result = update_workspace_review_iteration_limit(
-            transaction_pool, workspace_id, review_iteration_limit=review_iteration_limit
-        )
-        if result is None:
-            raise NotFoundError("the requested workspace is not available to this Profile")
-        updated_workspace, previous_limit, changed = result
-        if changed:
-            event_coordination.record_review_iteration_limit_changed_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                actor=event_coordination.owner_actor(profile_id),
-                previous_limit=previous_limit,
-                new_limit=updated_workspace.review_iteration_limit,
+        if (
+            isinstance(review_iteration_limit, bool)
+            or not isinstance(review_iteration_limit, int)
+            or review_iteration_limit <= 0
+        ):
+            raise InvalidCommandError("Workspace review iteration limit must be a positive integer")
+        with composed_transaction(pool) as transaction_pool:
+            require_profile_workspace(
+                transaction_pool, profile_id=profile_id, workspace_id=workspace_id
             )
+            result = update_workspace_review_iteration_limit(
+                transaction_pool,
+                workspace_id,
+                review_iteration_limit=review_iteration_limit,
+            )
+            if result is None:
+                raise NotFoundError("the requested workspace is not available to this Profile")
+            updated_workspace, previous_limit, changed = result
+            if changed:
+                event_coordination.record_review_iteration_limit_changed_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    actor=event_coordination.owner_actor(profile_id),
+                    previous_limit=previous_limit,
+                    new_limit=updated_workspace.review_iteration_limit,
+                )
     return ReviewIterationLimitUpdate(
         workspace_id=workspace_id,
         changed=changed,
