@@ -149,6 +149,7 @@ API and worker authentication verifies Supabase Auth access tokens against the p
 
 - `SUPABASE_URL` — the Supabase project URL; the Auth issuer (`<url>/auth/v1`) and JWKS source (`<url>/auth/v1/.well-known/jwks.json`) derive from it. In devserver runs it is exported per-run from the ephemeral branch; production deployments must supply it, and `OPENORC_ENV=production` fails startup when it is missing or malformed.
 - `OPENORC_SUPABASE_JWT_AUDIENCE` — the expected authenticated audience (default `authenticated`).
+- `SUPABASE_SECRET_KEY` — the deployment's Supabase secret API key (`sb_secret_...`), the non-JWT administrative credential for the server-side Auth Admin boundary (permanent account deletion; see `src/openorc/services/account_lifecycle.py`). Deliberately optional on the shared environment surface: it is required only by the component that constructs the Auth Admin client (that construction fails fast without it), so no other process — the worker included — needs to receive it. It travels on the `apikey` request header only, is never browser-visible, never persisted in `openorc.*` tables or Vault, and never logged.
 - v1 is GitHub-only sign-in: configure Supabase Auth with GitHub as the only enabled user sign-in provider and asymmetric JWT signing keys (ES256/RS256). The verifier enforces the trusted `app_metadata` GitHub-origin checks as defense-in-depth and has no symmetric/HS256 shared-secret path.
 
 ### Application observability (OpenTelemetry)

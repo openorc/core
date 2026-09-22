@@ -38,6 +38,12 @@ from openorc.services.errors import InvalidCommandError, NotFoundError
 
 _OBSERVED = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
 
+# The account-deletion Owner-mutation barrier (issue #97) composes as the
+# FIRST database read of every set_* flow; the scripted result row for an
+# operational account carries the all-NULL attempt-state tuple. Read-only
+# flows (get_workspace_configuration) compose no barrier.
+_GUARD_OPERATIONAL_ROW = (None, None, None)
+
 
 class FakeCursor:
     def __init__(self, row: tuple[Any, ...] | None) -> None:
@@ -157,6 +163,7 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     prose_row = _ws_row(profile_id, guidance=prose)
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             blank_row,
             prose_row,
@@ -171,7 +178,7 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     assert result == workspace_configuration.WorkspaceGuidanceUpdate(
         workspace_id=workspace_id, changed=True
     )
-    update_sql, update_params = conn.executed[2]
+    update_sql, update_params = conn.executed[3]
     assert "update openorc.workspaces" in update_sql
     assert update_params == (prose, workspace_id)
     assert all("review_loops" not in sql for sql, _ in conn.executed)
@@ -179,7 +186,7 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     # The coordinated #56 event: Workspace-scoped, subject the Workspace,
     # OWNER actor carrying the authenticated Profile UUID, and a context
     # that identifies only the guidance setting change.
-    event_sql, event_params = conn.executed[3]
+    event_sql, event_params = conn.executed[4]
     assert "insert into openorc.workflow_events" in event_sql
     assert event_params is not None
     assert event_params[0] == workspace_id
@@ -208,6 +215,7 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     # records the same semantic event, never a prose delta.
     reset = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             prose_row,
             blank_row,
@@ -218,18 +226,18 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
         _pool(reset), profile_id=profile_id, workspace_id=workspace_id, guidance=""
     )
     assert result.changed is True
-    assert len(reset.executed) == 4
-    assert reset.executed[3][1] is not None
-    assert reset.executed[3][1][7].obj == {"setting": "guidance"}
+    assert len(reset.executed) == 5
+    assert reset.executed[4][1] is not None
+    assert reset.executed[4][1][7].obj == {"setting": "guidance"}
     assert all(prose not in repr(params) for _, params in reset.executed)
 
     # Same-value write: no-op, and no event insert.
-    noop = ScriptedConnection([_ws_row(profile_id), prose_row])
+    noop = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), prose_row])
     result = workspace_configuration.set_guidance(
         _pool(noop), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
     )
     assert result.changed is False
-    assert len(noop.executed) == 2
+    assert len(noop.executed) == 3
     assert all("insert into openorc.workflow_events" not in sql for sql, _ in noop.executed)
 
 
@@ -247,6 +255,7 @@ def test_set_guidance_event_insert_failure_rolls_back_the_mutation() -> None:
     prose_row = _ws_row(profile_id, guidance=prose)
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             blank_row,
             prose_row,
@@ -259,22 +268,22 @@ def test_set_guidance_event_insert_failure_rolls_back_the_mutation() -> None:
             _pool(conn), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
         )
 
-    assert len(conn.executed) == 4
-    assert "update openorc.workspaces" in conn.executed[2][0]
-    assert "insert into openorc.workflow_events" in conn.executed[3][0]
+    assert len(conn.executed) == 5
+    assert "update openorc.workspaces" in conn.executed[3][0]
+    assert "insert into openorc.workflow_events" in conn.executed[4][0]
 
 
 def test_set_guidance_fails_closed_for_non_owners_with_no_event() -> None:
     profile_id = uuid.uuid4()
-    conn = ScriptedConnection([_ws_row(uuid.uuid4())])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(uuid.uuid4())])
 
     with pytest.raises(NotFoundError):
         workspace_configuration.set_guidance(
             _pool(conn), profile_id=profile_id, workspace_id=uuid.uuid4(), guidance="prose"
         )
 
-    # Only the ownership gate ran: neither the write nor any event insert.
-    assert len(conn.executed) == 1
+    # The barrier and ownership-gate reads ran: neither the write nor any event insert.
+    assert len(conn.executed) == 2
     assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
@@ -299,6 +308,7 @@ def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
     new_row = _ws_row(profile_id, review_iteration_limit=7)
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             old_row,
             new_row,
@@ -318,12 +328,12 @@ def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
     )
     # One composed transaction: ownership gate, row-locked before-state,
     # then the conditional write.
-    ownership_sql, _ = conn.executed[0]
+    ownership_sql, _ = conn.executed[1]
     assert "from openorc.workspaces where id = %s" in ownership_sql
     assert "for update" not in ownership_sql
-    lock_sql, _ = conn.executed[1]
+    lock_sql, _ = conn.executed[2]
     assert "for update" in lock_sql
-    update_sql, update_params = conn.executed[2]
+    update_sql, update_params = conn.executed[3]
     assert "update openorc.workspaces" in update_sql
     assert update_params == (7, workspace_id)
     # Existing ReviewLoop history is never touched by the configuration flow.
@@ -331,7 +341,7 @@ def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
 
     # The coordinated #56 event: setting key plus the exact locked
     # previous/new integers — the Workspace row is never shadowed.
-    event_sql, event_params = conn.executed[3]
+    event_sql, event_params = conn.executed[4]
     assert "insert into openorc.workflow_events" in event_sql
     assert event_params is not None
     assert event_params[0] == workspace_id
@@ -369,6 +379,7 @@ def test_set_review_iteration_limit_event_insert_failure_rolls_back_the_mutation
     workspace_id = uuid.uuid4()
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id, review_iteration_limit=5),
             _ws_row(profile_id, review_iteration_limit=5),
             _ws_row(profile_id, review_iteration_limit=7),
@@ -381,9 +392,9 @@ def test_set_review_iteration_limit_event_insert_failure_rolls_back_the_mutation
             _pool(conn), profile_id=profile_id, workspace_id=workspace_id, review_iteration_limit=7
         )
 
-    assert len(conn.executed) == 4
-    assert "update openorc.workspaces" in conn.executed[2][0]
-    assert "insert into openorc.workflow_events" in conn.executed[3][0]
+    assert len(conn.executed) == 5
+    assert "update openorc.workspaces" in conn.executed[3][0]
+    assert "insert into openorc.workflow_events" in conn.executed[4][0]
 
 
 def test_set_review_iteration_limit_rejects_invalid_commands_before_any_io() -> None:
@@ -405,7 +416,7 @@ def test_set_review_iteration_limit_rejects_invalid_commands_before_any_io() -> 
 def test_set_review_iteration_limit_same_value_is_a_no_op() -> None:
     profile_id = uuid.uuid4()
     row = _ws_row(profile_id, review_iteration_limit=5)
-    conn = ScriptedConnection([_ws_row(profile_id), row])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), row])
 
     result = workspace_configuration.set_review_iteration_limit(
         _pool(conn), profile_id=profile_id, workspace_id=uuid.uuid4(), review_iteration_limit=5
@@ -414,24 +425,25 @@ def test_set_review_iteration_limit_same_value_is_a_no_op() -> None:
     assert result.changed is False
     assert result.previous_review_iteration_limit == 5
     assert result.new_review_iteration_limit == 5
-    # Ownership select + locked before-state select; no UPDATE executed and
+    # Barrier read, ownership select, and locked before-state select; no
+    # UPDATE executed and
     # no event insert attempted.
-    assert len(conn.executed) == 2
+    assert len(conn.executed) == 3
     assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_set_review_iteration_limit_fails_closed_for_non_owners() -> None:
     profile_id = uuid.uuid4()
-    conn = ScriptedConnection([_ws_row(uuid.uuid4())])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(uuid.uuid4())])
 
     with pytest.raises(NotFoundError):
         workspace_configuration.set_review_iteration_limit(
             _pool(conn), profile_id=profile_id, workspace_id=uuid.uuid4(), review_iteration_limit=7
         )
 
-    # Only the ownership gate ran; no configuration write and no event
-    # insert was attempted.
-    assert len(conn.executed) == 1
+    # The barrier and ownership-gate reads ran; no configuration write and
+    # no event insert was attempted.
+    assert len(conn.executed) == 2
     assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
@@ -469,6 +481,7 @@ def test_set_guidance_opens_its_service_span_without_the_prose() -> None:
     prose = "Always re-run the full suite before dispatching the Reviewer."
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             _ws_row(profile_id, guidance=""),
             _ws_row(profile_id, guidance=prose),
@@ -499,6 +512,7 @@ def test_set_review_iteration_limit_opens_its_service_span() -> None:
     workspace_id = uuid.uuid4()
     conn = ScriptedConnection(
         [
+            _GUARD_OPERATIONAL_ROW,
             _ws_row(profile_id),
             _ws_row(profile_id, review_iteration_limit=5),
             _ws_row(profile_id, review_iteration_limit=7),

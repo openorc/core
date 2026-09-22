@@ -41,6 +41,7 @@ from openorc.persistence.ownership import (
 from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination
 from openorc.services.errors import InvalidCommandError, NotFoundError
+from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_profile_workspace
 
@@ -132,6 +133,10 @@ def set_review_iteration_limit(
         ):
             raise InvalidCommandError("Workspace review iteration limit must be a positive integer")
         with composed_transaction(pool) as transaction_pool:
+            # The account-wide Owner-mutation barrier first (issue #97): the
+            # Profile FOR KEY SHARE read is the first lock acquisition and
+            # fails closed while an account deletion attempt is unresolved.
+            require_account_operational(transaction_pool, profile_id=profile_id)
             require_profile_workspace(
                 transaction_pool, profile_id=profile_id, workspace_id=workspace_id
             )
@@ -178,6 +183,9 @@ def set_guidance(
         if not isinstance(guidance, str):
             raise InvalidCommandError("Workspace guidance must be a string")
         with composed_transaction(pool) as transaction_pool:
+            # The account-wide Owner-mutation barrier first (issue #97): the
+            # Profile FOR KEY SHARE read precedes any subject lock.
+            require_account_operational(transaction_pool, profile_id=profile_id)
             require_profile_workspace(
                 transaction_pool, profile_id=profile_id, workspace_id=workspace_id
             )

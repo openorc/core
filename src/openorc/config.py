@@ -23,6 +23,17 @@ DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
 DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
 SUPABASE_URL_VAR = "SUPABASE_URL"
 SUPABASE_JWT_AUDIENCE_VAR = "OPENORC_SUPABASE_JWT_AUDIENCE"
+# The deployment's Supabase secret API key (issue #97): the non-JWT
+# administrative credential for the supported server-side Supabase Auth Admin
+# boundary (permanent account deletion). Deliberately OPTIONAL on this shared
+# surface: both the API and worker process surfaces boot through
+# Settings.from_env, and authentication ownership follows direct consumption —
+# no process may receive this administrative credential merely because it is
+# required elsewhere. The requirement is enforced where the Auth Admin client
+# is constructed, in the component that owns account deletion. The key is
+# process bootstrap material only: never browser-visible, never persisted in
+# openorc.* tables or Vault, never logged or returned.
+SUPABASE_SECRET_KEY_VAR = "SUPABASE_SECRET_KEY"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
@@ -120,6 +131,7 @@ class Settings:
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
     supabase_url: str | None = None
     supabase_jwt_audience: str = DEFAULT_SUPABASE_JWT_AUDIENCE
+    supabase_secret_key: str | None = None
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -210,6 +222,16 @@ class Settings:
             _read(source, SUPABASE_JWT_AUDIENCE_VAR) or DEFAULT_SUPABASE_JWT_AUDIENCE
         )
 
+        # Supabase Auth Admin credential (issue #97). Optional on this shared
+        # surface in every environment — including production: the
+        # administrative credential belongs only to the component that
+        # constructs the Auth Admin client, and that component fails fast at
+        # construction when its required key is absent. A blank supplied value
+        # counts as unset like every other optional setting. The key is never
+        # validated for shape here (it is opaque deployment material) and is
+        # never logged or returned.
+        supabase_secret_key = _read(source, SUPABASE_SECRET_KEY_VAR)
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -235,5 +257,6 @@ class Settings:
             db_pool_timeout=db_pool_timeout,
             supabase_url=supabase_url,
             supabase_jwt_audience=supabase_jwt_audience,
+            supabase_secret_key=supabase_secret_key,
             otlp_endpoint=otlp_endpoint,
         )

@@ -18,6 +18,7 @@ from typing import Any
 from uuid import UUID
 
 from openorc.domain.ownership import (
+    AccountDeletionAttemptState,
     GitHubRepositoryIdentity,
     Profile,
     Project,
@@ -30,6 +31,8 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "clear_account_deletion_attempt",
+    "claim_account_deletion_attempt",
     "create_profile",
     "create_project",
     "create_repository",
@@ -37,9 +40,15 @@ __all__ = [
     "ensure_profile",
     "find_repository_by_github_identity",
     "get_profile",
+    "get_profile_for_account_deletion",
     "get_project",
     "get_repository",
     "get_workspace",
+    "get_workspace_for_update",
+    "mark_account_deletion_attempt_uncertain",
+    "read_account_deletion_state_for_key_share",
+    "reclaim_expired_account_deletion_attempt",
+    "reclaim_uncertain_account_deletion_attempt",
     "update_repository_metadata",
     "update_workspace_guidance",
     "update_workspace_review_iteration_limit",
@@ -382,3 +391,229 @@ def update_repository_metadata(
             ),
         ).fetchone()
     return None if row is None else _repository_from_row(row)
+
+
+def get_workspace_for_update(pool: DatabasePool, workspace_id: UUID) -> Workspace | None:
+    """Row-locked read of one Workspace (issue #97 administrative deletion).
+
+    The deliberate ``SELECT ... FOR UPDATE`` on the Workspace root is the
+    aggregate-deletion barrier: a concurrent child ``INSERT`` into any table
+    foreign-keyed to this Workspace (connections, projects, repositories,
+    tasks) takes a conflicting ``FOR KEY SHARE`` lock on this row during its
+    foreign-key check, so no child row can enter the aggregate after the
+    locked read — and before the aggregate deletion — commits. The lock is
+    held within the caller's composed transaction only.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces where id = %s for update",
+            (workspace_id,),
+        ).fetchone()
+    return None if row is None else _workspace_from_row(row)
+
+
+# Durable account-deletion attempt state (issue #97): three nullable Profile
+# columns bound together by the migration's composite CHECK — either every
+# column is NULL (normal operation) or the state is 'active'/'uncertain' with
+# both the attempt UUID and the database-clock establishment time non-NULL.
+# Every mutation below is a conditional write guarded by the exact attempt
+# UUID it owns (or the exact state tuple it transitions), so one invocation
+# can never clear or move another invocation's protection. All comparisons
+# involving time use the database clock, never the application clock.
+_ATTEMPT_STATE_COLUMNS = (
+    "account_deletion_state, account_deletion_attempt_id, account_deletion_started_at"
+)
+
+
+def _attempt_state_from_row(
+    profile_id: UUID, row: Sequence[Any]
+) -> AccountDeletionAttemptState | None:
+    if row[0] is None:
+        # Normal operation: the composite CHECK keeps the whole tuple NULL.
+        return None
+    return AccountDeletionAttemptState(
+        profile_id=profile_id,
+        state=row[0],
+        attempt_id=row[1],
+        started_at=normalize_utc(row[2]),
+    )
+
+
+def read_account_deletion_state_for_key_share(
+    pool: DatabasePool, *, profile_id: UUID
+) -> tuple[bool, AccountDeletionAttemptState | None]:
+    """Locked-but-compatible read of one Profile's deletion-attempt state.
+
+    ``SELECT ... FOR KEY SHARE`` is the Owner-mutation barrier read (issue
+    #97): it conflicts with the account-deletion transaction's Profile-root
+    ``FOR UPDATE`` — so a guarded mutation concurrent with that transaction
+    blocks until the revocation commit and then re-reads the committed state
+    under its lock — while remaining compatible with other guarded mutations
+    and with every ordinary read. Returns ``(profile_exists, state)``; a
+    present state row carries the attempt identity the caller's fail-closed
+    decision is made on.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_ATTEMPT_STATE_COLUMNS} from openorc.profiles where id = %s for key share",
+            (profile_id,),
+        ).fetchone()
+    if row is None:
+        return False, None
+    return True, _attempt_state_from_row(profile_id, row)
+
+
+def get_profile_for_account_deletion(
+    pool: DatabasePool, *, profile_id: UUID, lease_seconds: float
+) -> tuple[Profile, AccountDeletionAttemptState | None, bool] | None:
+    """Profile-root locked read of the deletion-attempt state and its lease.
+
+    ``SELECT ... FOR UPDATE`` on the Profile row is the account-deletion
+    transaction's anchor: it conflicts with the guard's ``FOR KEY SHARE``
+    reads, so a concurrent guarded Owner mutation either commits before this
+    read (its effects are then visible to the revocation below) or blocks and
+    re-reads the committed state after the revocation commits. The
+    ``lease_expired`` flag compares ``account_deletion_started_at`` plus the
+    documented lease interval against the database clock inside the same
+    statement — an expired 'active' attempt is an abandoned attempt to be
+    recovered through reconciliation, never replayed blindly. Returns ``None``
+    when the Profile does not exist (the caller decides absent semantics).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select id, created_at, "
+            "account_deletion_state, account_deletion_attempt_id, account_deletion_started_at, "
+            "(account_deletion_state is not null and account_deletion_state = 'active' "
+            "and account_deletion_started_at + make_interval(secs => %s) < now()) "
+            "as lease_expired "
+            "from openorc.profiles where id = %s for update",
+            (lease_seconds, profile_id),
+        ).fetchone()
+    if row is None:
+        return None
+    profile = _profile_from_row((row[0], row[1]))
+    state = _attempt_state_from_row(profile_id, (row[2], row[3], row[4]))
+    return profile, state, bool(row[5])
+
+
+def claim_account_deletion_attempt(
+    pool: DatabasePool, *, profile_id: UUID, attempt_id: UUID
+) -> bool:
+    """Claim the normal→'active' transition with a fresh attempt UUID.
+
+    Conditional on a completely NULL state tuple (normal operation), so a
+    concurrent claim that won the race is never overwritten. Returns whether
+    the claim applied.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.profiles "
+            "set account_deletion_state = 'active', account_deletion_attempt_id = %s, "
+            "account_deletion_started_at = now() "
+            "where id = %s and account_deletion_state is null "
+            "and account_deletion_attempt_id is null and account_deletion_started_at is null "
+            "returning 1",
+            (attempt_id, profile_id),
+        ).fetchone()
+    return row is not None
+
+
+def reclaim_expired_account_deletion_attempt(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    expired_attempt_id: UUID,
+    new_attempt_id: UUID,
+    lease_seconds: float,
+) -> bool:
+    """Compare-and-swap an EXPIRED 'active' attempt into a fresh 'active' one.
+
+    Conditional on the exact abandoned attempt UUID, the 'active' state, and
+    the database-clock lease expiry — a fresh concurrent attempt is never
+    displaced and a state that moved on matches zero rows (the caller then
+    reloads and reclassifies). Composed with the revocation re-run inside one
+    short transaction after reconciliation confirmed the Auth user present.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.profiles "
+            "set account_deletion_attempt_id = %s, account_deletion_started_at = now() "
+            "where id = %s and account_deletion_state = 'active' "
+            "and account_deletion_attempt_id = %s "
+            "and account_deletion_started_at + make_interval(secs => %s) < now() "
+            "returning 1",
+            (new_attempt_id, profile_id, expired_attempt_id, lease_seconds),
+        ).fetchone()
+    return row is not None
+
+
+def reclaim_uncertain_account_deletion_attempt(
+    pool: DatabasePool, *, profile_id: UUID, reconciled_attempt_id: UUID, new_attempt_id: UUID
+) -> bool:
+    """Compare-and-swap the EXACT reconciled 'uncertain' attempt into 'active'.
+
+    Conditional on ``account_deletion_state = 'uncertain'`` AND the exact
+    attempt UUID that was reconciled through the Admin read surface: a
+    reconciliation result is bound to the attempt it reconciled, and only
+    that attempt may be replaced by a fresh replay claim — a second retrier
+    that reconciled an older attempt must never consume a newer attempt's
+    'uncertain' state. Returns whether the compare-and-swap applied; zero
+    rows means the durable state moved on and the caller reloads and
+    reclassifies without using the stale reconciliation.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.profiles "
+            "set account_deletion_state = 'active', account_deletion_attempt_id = %s, "
+            "account_deletion_started_at = now() "
+            "where id = %s and account_deletion_state = 'uncertain' "
+            "and account_deletion_attempt_id = %s "
+            "returning 1",
+            (new_attempt_id, profile_id, reconciled_attempt_id),
+        ).fetchone()
+    return row is not None
+
+
+def mark_account_deletion_attempt_uncertain(
+    pool: DatabasePool, *, profile_id: UUID, attempt_id: UUID
+) -> bool:
+    """Attempt-scoped transition of the owning 'active' attempt to 'uncertain'.
+
+    Persisted only when reconciliation of an unknown Auth outcome itself
+    cannot determine existence. Conditional on the exact attempt UUID so a
+    foreign or moved-on attempt is never overwritten. Returns whether the
+    transition applied.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.profiles "
+            "set account_deletion_state = 'uncertain' "
+            "where id = %s and account_deletion_state = 'active' "
+            "and account_deletion_attempt_id = %s "
+            "returning 1",
+            (profile_id, attempt_id),
+        ).fetchone()
+    return row is not None
+
+
+def clear_account_deletion_attempt(
+    pool: DatabasePool, *, profile_id: UUID, attempt_id: UUID
+) -> bool:
+    """Attempt-scoped clear of the owning 'active' attempt back to normal.
+
+    Conditional on the exact attempt UUID and the 'active' state, so one
+    invocation can never clear another invocation's protection (and an
+    'uncertain' state is never cleared by a stale failure handler). Returns
+    whether the clear applied.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.profiles "
+            "set account_deletion_state = null, account_deletion_attempt_id = null, "
+            "account_deletion_started_at = null "
+            "where id = %s and account_deletion_state = 'active' "
+            "and account_deletion_attempt_id = %s "
+            "returning 1",
+            (profile_id, attempt_id),
+        ).fetchone()
+    return row is not None

@@ -253,3 +253,36 @@ def test_supplied_supabase_url_satisfies_the_production_requirement() -> None:
     )
 
     assert settings.supabase_url == "https://prod.supabase.co"
+
+
+def test_supabase_secret_key_defaults_to_unset() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.supabase_secret_key is None
+
+
+def test_supabase_secret_key_is_read_when_supplied() -> None:
+    settings = Settings.from_env({"SUPABASE_SECRET_KEY": "sb_secret_example"})
+
+    assert settings.supabase_secret_key == "sb_secret_example"
+
+
+def test_blank_supabase_secret_key_falls_back_to_unset() -> None:
+    settings = Settings.from_env({"SUPABASE_SECRET_KEY": ""})
+
+    assert settings.supabase_secret_key is None
+
+
+def test_supabase_secret_key_is_optional_in_production() -> None:
+    # Authentication ownership follows direct consumption: the shared
+    # Settings surface boots both API and worker processes, so the
+    # administrative credential is never globally required — the component
+    # constructing the Auth Admin client enforces its own requirement.
+    settings = Settings.from_env(
+        {
+            "OPENORC_ENV": "production",
+            "SUPABASE_URL": "https://prod.supabase.co",
+        }
+    )
+
+    assert settings.supabase_secret_key is None

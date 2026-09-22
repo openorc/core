@@ -29,6 +29,7 @@ from datetime import datetime
 from uuid import UUID
 
 __all__ = [
+    "AccountDeletionAttemptState",
     "GitHubRepositoryIdentity",
     "OwnershipError",
     "Profile",
@@ -57,6 +58,30 @@ class Profile:
 
     id: UUID
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AccountDeletionAttemptState:
+    """The durable account-deletion attempt state of one Profile (issue #97).
+
+    Present only while an account-deletion attempt is durably unresolved:
+    ``active`` while one attempt is in flight (single-flight durable lock
+    against concurrent invocations), ``uncertain`` after a prior Auth Admin
+    delete outcome could not be classified (the next explicit invocation must
+    reconcile through the Admin read surface before any replay). The attempt
+    UUID is the ownership identity of the state: every durable transition and
+    clear is conditional on this exact UUID, so one invocation can never clear
+    or move another invocation's protection. ``started_at`` is the
+    database-clock establishment time and the basis of the active-attempt
+    lease. All three facts are non-NULL together or all NULL (the composite
+    CHECK makes any other tuple unrepresentable), and the whole row cascades
+    away with the Profile when permanent deletion succeeds.
+    """
+
+    profile_id: UUID
+    state: str
+    attempt_id: UUID
+    started_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
