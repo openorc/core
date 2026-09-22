@@ -13,6 +13,7 @@ boundary.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 from typing import Any, cast
@@ -23,6 +24,10 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from jwt import PyJWK
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from openorc.adapters.supabase import (
     HttpJwksClient,
@@ -34,11 +39,19 @@ from openorc.adapters.supabase import (
 from openorc.adapters.supabase.auth import DEFAULT_JWKS_CACHE_TTL_SECONDS
 from openorc.config import ConfigurationError
 from openorc.domain.identity import AuthenticatedPrincipal
+from openorc.observability import injected_tracer_source
 
 PROJECT_URL = "https://example.supabase.co"
 ISSUER = "https://example.supabase.co/auth/v1"
 JWKS_URL = ISSUER + "/.well-known/jwks.json"
 AUDIENCE = "authenticated"
+
+
+def _local_provider_with_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
 
 
 def _now() -> int:
@@ -652,7 +665,9 @@ def test_http_client_rejects_kidless_tokens_against_ambiguous_sets() -> None:
         client.get_signing_key(None)  # ambiguous: never guessed
 
 
-def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
+def test_http_client_maps_http_failure_to_known_retrieval_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     def fetch(url: str, timeout: float) -> bytes:
         raise urllib.error.HTTPError(
             url, 503, "Service Unavailable", cast(Any, None), cast(Any, None)
@@ -660,8 +675,17 @@ def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
 
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=fetch)
 
-    with pytest.raises(SupabaseJwksUnavailableError):
+    with caplog.at_level(logging.WARNING), pytest.raises(SupabaseJwksUnavailableError):
         client.get_signing_key("key-1")
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    # Operational visibility with a fixed safe message (issue #109): never the
+    # URL (it carries the project reference), the kid, or any key material.
+    message = warnings[0].getMessage()
+    assert "JWKS retrieval failed" in message
+    assert JWKS_URL not in message
+    assert "key-1" not in message
 
 
 @pytest.mark.parametrize(
@@ -673,22 +697,53 @@ def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
     ],
     ids=["url_error", "timeout", "os_error"],
 )
-def test_http_client_maps_transport_failure_to_unknown_outcome(raised: Exception) -> None:
+def test_http_client_maps_transport_failure_to_unknown_outcome(
+    caplog: pytest.LogCaptureFixture, raised: Exception
+) -> None:
     def fetch(url: str, timeout: float) -> bytes:
         raise raised
 
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=fetch)
 
-    with pytest.raises(SupabaseJwksOutcomeUnknownError):
+    with caplog.at_level(logging.WARNING), pytest.raises(SupabaseJwksOutcomeUnknownError):
         client.get_signing_key("key-1")
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "outcome is unknown" in message
+    assert JWKS_URL not in message
 
 
 @pytest.mark.parametrize("raw", [b"not json", b'{"nope": 1}', b'{"keys": []}', b'{"keys": ["x"]}'])
-def test_unusable_documents_are_known_retrieval_failures(raw: bytes) -> None:
+def test_unusable_documents_are_known_retrieval_failures(
+    caplog: pytest.LogCaptureFixture, raw: bytes
+) -> None:
+    provider, exporter = _local_provider_with_exporter()
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=lambda url, timeout: raw)
 
-    with pytest.raises(SupabaseJwksUnavailableError):
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        caplog.at_level(logging.WARNING),
+        pytest.raises(SupabaseJwksUnavailableError),
+    ):
         client.get_signing_key("key-1")
+
+    # An unusable document is a known failure of the retrieval itself, inside
+    # the retrieval span: one fixed safe warning (issue #109) — never the raw
+    # document, the URL, or key material.
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "unusable" in message
+    assert JWKS_URL not in message
+    assert raw.decode("utf-8", "replace") not in message
+
+    # The adapter span classifies the failure (ERROR status, type name only).
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "supabase.jwks_retrieval"
+    assert exported.status.status_code is StatusCode.ERROR
+    assert exported.status.description == "SupabaseJwksUnavailableError"
 
 
 def test_http_client_validates_construction_arguments() -> None:

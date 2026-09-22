@@ -18,6 +18,10 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from psycopg.errors import ForeignKeyViolation
 
 from openorc.adapters.supabase import (
@@ -27,6 +31,7 @@ from openorc.adapters.supabase import (
     SupabaseJwksUnavailableError,
 )
 from openorc.domain.identity import AuthenticatedPrincipal
+from openorc.observability import OPERATION, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
 from openorc.services.authentication import AuthenticatedUser, authenticate
 from openorc.services.errors import (
@@ -243,3 +248,80 @@ def test_deleted_account_error_does_not_leak_the_user_uuid() -> None:
         authenticate(pool, cast(SupabaseAccessTokenVerifier, verifier), token=TOKEN)
 
     assert "authentication failed" in str(excinfo.value)
+
+
+def _local_provider_with_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_successful_authentication_opens_one_service_span_with_only_safe_attributes() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    principal = _principal()
+    verifier = FakeVerifier(principal)
+    pool = cast(DatabasePool, FakePool(ScriptedConnection([(principal.user_id, OBSERVED_AT)])))
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        authenticate(pool, cast(SupabaseAccessTokenVerifier, verifier), token=TOKEN)
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "authentication.authenticate"
+    attributes = exported.attributes
+    assert attributes is not None
+    # The vocabulary carries the operation only: no identity material and no
+    # supported path for the bearer token into telemetry attributes.
+    assert set(attributes) == {OPERATION}
+    assert attributes[OPERATION] == "authentication.authenticate"
+    assert exported.status.status_code is StatusCode.UNSET
+    assert all(TOKEN not in str(value) for value in attributes.values())
+
+
+@pytest.mark.parametrize(
+    ("verifier_error", "expected_error"),
+    [
+        (SupabaseAccessTokenRejectedError("expired token"), AuthenticationError),
+        (SupabaseJwksUnavailableError("jwks lookup rejected"), ExternalOperationFailedError),
+        (SupabaseJwksOutcomeUnknownError("jwks unreachable"), ExternalOperationUncertainError),
+    ],
+)
+def test_failure_paths_keep_typed_errors_and_export_only_the_classification(
+    verifier_error: Exception, expected_error: type[ApplicationError]
+) -> None:
+    provider, exporter = _local_provider_with_exporter()
+    verifier = RejectingVerifier(verifier_error)
+    pool = cast(DatabasePool, FakePool(ScriptedConnection([])))
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(expected_error),
+    ):
+        authenticate(pool, cast(SupabaseAccessTokenVerifier, verifier), token=TOKEN)
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.status.status_code is StatusCode.ERROR
+    # Safe failure classification only: the exception type name — never the
+    # exception text and never any bearer-token material.
+    assert exported.status.description == expected_error.__name__
+    attributes = exported.attributes or {}
+    assert all(TOKEN not in str(value) for value in attributes.values())
+
+
+def test_deleted_account_path_keeps_the_typed_error_with_telemetry() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    verifier = FakeVerifier(_principal())
+    pool = cast(
+        DatabasePool,
+        FakePool(ScriptedConnection([ForeignKeyViolation("profiles_id_auth_users_fk")])),
+    )
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(AuthenticationError),
+    ):
+        authenticate(pool, cast(SupabaseAccessTokenVerifier, verifier), token=TOKEN)
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.status.status_code is StatusCode.ERROR
+    assert exported.status.description == "AuthenticationError"

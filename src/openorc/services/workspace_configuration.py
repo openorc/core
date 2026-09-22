@@ -52,11 +52,14 @@ __all__ = [
     "set_review_iteration_limit",
 ]
 
-# Representative application-service span boundary (issue #108): one
-# instrumented operation proves the trace foundation; the broad Phase 2A
-# retrofit belongs to a dedicated follow-up leaf.
+# Application-service span boundaries (issues #108/#109): every public
+# use-case operation of this module opens one span at the established service
+# boundary. Only safe vocabulary attributes are attachable, so Workspace
+# guidance prose has no supported path into telemetry.
 _SERVICE_TRACER_SCOPE = "openorc.services.workspace_configuration"
 _REVIEW_LIMIT_SPAN_NAME = "workspace_configuration.set_review_iteration_limit"
+_GET_CONFIGURATION_SPAN_NAME = "workspace_configuration.get_workspace_configuration"
+_SET_GUIDANCE_SPAN_NAME = "workspace_configuration.set_guidance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +95,13 @@ def get_workspace_configuration(
     pool: DatabasePool, *, profile_id: UUID, workspace_id: UUID
 ) -> Workspace:
     """Ownership-gated read of the Workspace with its current settings."""
-    return require_profile_workspace(pool, profile_id=profile_id, workspace_id=workspace_id)
+    with application_span(_SERVICE_TRACER_SCOPE, _GET_CONFIGURATION_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_GET_CONFIGURATION_SPAN_NAME,
+            workspace_id=str(workspace_id),
+        )
+        return require_profile_workspace(pool, profile_id=profile_id, workspace_id=workspace_id)
 
 
 def set_review_iteration_limit(
@@ -160,20 +169,26 @@ def set_guidance(
     verbatim as the single current value — no revision, hash, or snapshot is
     created. Same-value writes are no-ops.
     """
-    if not isinstance(guidance, str):
-        raise InvalidCommandError("Workspace guidance must be a string")
-    with composed_transaction(pool) as transaction_pool:
-        require_profile_workspace(
-            transaction_pool, profile_id=profile_id, workspace_id=workspace_id
+    with application_span(_SERVICE_TRACER_SCOPE, _SET_GUIDANCE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_SET_GUIDANCE_SPAN_NAME,
+            workspace_id=str(workspace_id),
         )
-        result = update_workspace_guidance(transaction_pool, workspace_id, guidance=guidance)
-        if result is None:
-            raise NotFoundError("the requested workspace is not available to this Profile")
-        _, _, changed = result
-        if changed:
-            event_coordination.record_guidance_changed_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                actor=event_coordination.owner_actor(profile_id),
+        if not isinstance(guidance, str):
+            raise InvalidCommandError("Workspace guidance must be a string")
+        with composed_transaction(pool) as transaction_pool:
+            require_profile_workspace(
+                transaction_pool, profile_id=profile_id, workspace_id=workspace_id
             )
+            result = update_workspace_guidance(transaction_pool, workspace_id, guidance=guidance)
+            if result is None:
+                raise NotFoundError("the requested workspace is not available to this Profile")
+            _, _, changed = result
+            if changed:
+                event_coordination.record_guidance_changed_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    actor=event_coordination.owner_actor(profile_id),
+                )
     return WorkspaceGuidanceUpdate(workspace_id=workspace_id, changed=changed)

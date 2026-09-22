@@ -43,9 +43,11 @@ paths contains only safe content.
 
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
 from openorc.domain.connections import Connection
+from openorc.observability import annotate_span, application_span
 from openorc.persistence import runtime_control_secrets
 from openorc.persistence.connections import (
     get_connection,
@@ -64,6 +66,17 @@ __all__ = [
     "resolve_connection_runtime_credential",
     "rotate_connection_credential",
 ]
+
+# Application-service span boundaries (issues #108/#109): configure, rotate,
+# and trusted resolution each open one span at their use-case boundary. The
+# credential value and its opaque reference have no supported path into
+# telemetry; the safe vocabulary carries the Workspace/Connection identity.
+_CONNECTION_CREDENTIALS_TRACER_SCOPE = "openorc.services.connection_credentials"
+_CONFIGURE_SPAN_NAME = "connection_credentials.configure_connection_credential"
+_ROTATE_SPAN_NAME = "connection_credentials.rotate_connection_credential"
+_RESOLVE_SPAN_NAME = "connection_credentials.resolve_connection_runtime_credential"
+
+logger = logging.getLogger(__name__)
 
 
 class ControlEndpointSecret:
@@ -147,33 +160,41 @@ def configure_connection_credential(
     orphaned Vault secret and no reference to a secret that did not commit.
     Configuring over an existing credential is a conflict: rotate instead.
     """
-    _require_credential_value(credential)
-    with composed_transaction(pool) as transaction_pool:
-        connection = _require_owner_authorized_connection(
-            transaction_pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            connection_id=connection_id,
+    with application_span(_CONNECTION_CREDENTIALS_TRACER_SCOPE, _CONFIGURE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_CONFIGURE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            connection_id=str(connection_id),
         )
-        if connection.auth_reference is not None:
-            raise ConflictError(
-                "the connection already has a configured credential; rotate it instead"
+        _require_credential_value(credential)
+        with composed_transaction(pool) as transaction_pool:
+            connection = _require_owner_authorized_connection(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
             )
-        secret_id = runtime_control_secrets.create_runtime_control_secret(
-            transaction_pool,
-            secret=credential,
-            connection_id=connection_id,
-            workspace_id=workspace_id,
-        )
-        updated = set_connection_auth_reference(
-            transaction_pool,
-            connection_id,
-            auth_reference=runtime_control_secrets.encode_connection_auth_reference(secret_id),
-        )
-        if updated is None:
-            # Unreachable while the composition holds the row lock; treated as
-            # failure so the created Vault secret rolls back with the write.
-            raise NotFoundError("the requested connection is not available in this workspace")
+            if connection.auth_reference is not None:
+                raise ConflictError(
+                    "the connection already has a configured credential; rotate it instead"
+                )
+            secret_id = runtime_control_secrets.create_runtime_control_secret(
+                transaction_pool,
+                secret=credential,
+                connection_id=connection_id,
+                workspace_id=workspace_id,
+            )
+            updated = set_connection_auth_reference(
+                transaction_pool,
+                connection_id,
+                auth_reference=runtime_control_secrets.encode_connection_auth_reference(secret_id),
+            )
+            if updated is None:
+                # Unreachable while the composition holds the row lock; treated
+                # as failure so the created Vault secret rolls back with the
+                # write.
+                raise NotFoundError("the requested connection is not available in this workspace")
     return updated
 
 
@@ -194,30 +215,47 @@ def rotate_connection_credential(
     unrecognized reference format, or a dangling secret pointer fails closed
     inside the composition with nothing written.
     """
-    _require_credential_value(credential)
-    with composed_transaction(pool) as transaction_pool:
-        connection = _require_owner_authorized_connection(
-            transaction_pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            connection_id=connection_id,
+    with application_span(_CONNECTION_CREDENTIALS_TRACER_SCOPE, _ROTATE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_ROTATE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            connection_id=str(connection_id),
         )
-        if connection.auth_reference is None:
-            raise ConflictError("the connection has no configured credential to rotate")
-        try:
-            secret_id = runtime_control_secrets.parse_connection_auth_reference(
-                connection.auth_reference
+        _require_credential_value(credential)
+        with composed_transaction(pool) as transaction_pool:
+            connection = _require_owner_authorized_connection(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
             )
-        except RuntimeControlSecretReferenceError as exc:
-            raise ConflictError(
-                "the connection's credential reference is not a recognized v1 reference"
-            ) from exc
-        if not runtime_control_secrets.update_runtime_control_secret(
-            transaction_pool, secret_id=secret_id, secret=credential
-        ):
-            raise ConflictError(
-                "the connection's credential reference does not point at an existing secret"
-            )
+            if connection.auth_reference is None:
+                raise ConflictError("the connection has no configured credential to rotate")
+            try:
+                secret_id = runtime_control_secrets.parse_connection_auth_reference(
+                    connection.auth_reference
+                )
+            except RuntimeControlSecretReferenceError as exc:
+                # Invariant state: configure writes only recognized v1
+                # references, so an unrecognized reference is a durable-state
+                # inconsistency worth operational visibility (issue #109).
+                logger.warning(
+                    "connection credential rotation rejected an unrecognized auth reference"
+                )
+                raise ConflictError(
+                    "the connection's credential reference is not a recognized v1 reference"
+                ) from exc
+            if not runtime_control_secrets.update_runtime_control_secret(
+                transaction_pool, secret_id=secret_id, secret=credential
+            ):
+                # Dangling invariant: the opaque reference points at a secret
+                # that does not exist. Fixed safe message — never the reference
+                # value or any credential material.
+                logger.warning("connection credential rotation rejected a dangling auth reference")
+                raise ConflictError(
+                    "the connection's credential reference does not point at an existing secret"
+                )
     # The Connection row is deliberately unchanged by rotation: the reference
     # stays stable, so the locked row read is the post-rotation state.
     return connection
@@ -238,24 +276,38 @@ def resolve_connection_runtime_credential(
     :class:`ControlEndpointSecret` — never in an ordinary return or
     configuration object.
     """
-    connection = get_connection(pool, connection_id)
-    if connection is None or connection.workspace_id != workspace_id:
-        raise NotFoundError("the requested connection is not available in this workspace")
-    if not connection.enabled:
-        raise ConflictError("the connection is disabled; its credential cannot be used")
-    if connection.auth_reference is None:
-        raise ConflictError("the connection has no configured credential")
-    try:
-        secret_id = runtime_control_secrets.parse_connection_auth_reference(
-            connection.auth_reference
+    with application_span(_CONNECTION_CREDENTIALS_TRACER_SCOPE, _RESOLVE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_RESOLVE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            connection_id=str(connection_id),
         )
-    except RuntimeControlSecretReferenceError as exc:
-        raise ConflictError(
-            "the connection's credential reference is not a recognized v1 reference"
-        ) from exc
-    secret = runtime_control_secrets.read_runtime_control_secret(pool, secret_id=secret_id)
-    if secret is None:
-        raise ConflictError(
-            "the connection's credential reference does not point at an existing secret"
-        )
-    return connection, ControlEndpointSecret(secret)
+        connection = get_connection(pool, connection_id)
+        if connection is None or connection.workspace_id != workspace_id:
+            raise NotFoundError("the requested connection is not available in this workspace")
+        if not connection.enabled:
+            raise ConflictError("the connection is disabled; its credential cannot be used")
+        if connection.auth_reference is None:
+            raise ConflictError("the connection has no configured credential")
+        try:
+            secret_id = runtime_control_secrets.parse_connection_auth_reference(
+                connection.auth_reference
+            )
+        except RuntimeControlSecretReferenceError as exc:
+            # Invariant: only configure writes references, so an unrecognized
+            # reference is a durable-state inconsistency (issue #109).
+            logger.warning(
+                "connection credential resolution rejected an unrecognized auth reference"
+            )
+            raise ConflictError(
+                "the connection's credential reference is not a recognized v1 reference"
+            ) from exc
+        secret = runtime_control_secrets.read_runtime_control_secret(pool, secret_id=secret_id)
+        if secret is None:
+            # Dangling invariant: the reference points at a nonexistent secret.
+            logger.warning("connection credential resolution rejected a dangling auth reference")
+            raise ConflictError(
+                "the connection's credential reference does not point at an existing secret"
+            )
+        return connection, ControlEndpointSecret(secret)

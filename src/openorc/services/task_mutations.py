@@ -66,6 +66,7 @@ from psycopg.errors import UniqueViolation
 
 from openorc.domain.gates import OwnerGate, OwnerGateStatus
 from openorc.domain.tasks import Task, TaskStatus
+from openorc.observability import annotate_span, application_span
 from openorc.persistence import gates as gate_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
@@ -92,6 +93,21 @@ __all__ = [
     "set_current_plan_revision",
     "update_task_status",
 ]
+
+# Application-service span boundaries (issues #108/#109): every authoritative
+# Task mutation opens one span at its use-case boundary. Subject guards, the
+# locked re-read, and the conditional persistence writes run inside these
+# spans without spans of their own; telemetry is observational and never
+# workflow authority. Caller-supplied identifiers are validated as UUID
+# commands before attachment, so malformed command values are classified
+# without ever entering telemetry.
+_TASK_MUTATIONS_TRACER_SCOPE = "openorc.services.task_mutations"
+_UPDATE_TASK_STATUS_SPAN_NAME = "task_mutations.update_task_status"
+_ARCHIVE_TASK_SPAN_NAME = "task_mutations.archive_task"
+_BIND_CANONICAL_BRANCH_SPAN_NAME = "task_mutations.bind_canonical_branch"
+_SET_CURRENT_PLAN_REVISION_SPAN_NAME = "task_mutations.set_current_plan_revision"
+_SET_CURRENT_OWNER_GATE_SPAN_NAME = "task_mutations.set_current_owner_gate"
+_RESOLVE_OWNER_GATE_SPAN_NAME = "task_mutations.resolve_owner_gate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,32 +187,41 @@ def update_task_status(
     when a particular transition is allowed. A successful mutation returns
     the post-write Task carrying the newly rotated token.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    if not isinstance(status, TaskStatus) or status.is_terminal:
-        raise InvalidCommandError(
-            "update_task_status requires a nonterminal TaskStatus; "
-            "terminal outcomes go exclusively through archive_task"
+    with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _UPDATE_TASK_STATUS_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
+        annotate_span(
+            span,
+            operation=_UPDATE_TASK_STATUS_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-    with composed_transaction(pool) as transaction_pool:
-        require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
-        updated = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=expected_state_token,
-            status=status,
-        )
-        if updated is None:
-            _require_classified_currentness(
-                transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+        if not isinstance(status, TaskStatus) or status.is_terminal:
+            raise InvalidCommandError(
+                "update_task_status requires a nonterminal TaskStatus; "
+                "terminal outcomes go exclusively through archive_task"
             )
-            _raise_unexplained_rejection()
+        with composed_transaction(pool) as transaction_pool:
+            require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+            )
+            updated = task_records.update_task_status(
+                transaction_pool,
+                task_id,
+                expected_state_token=expected_state_token,
+                status=status,
+            )
+            if updated is None:
+                _require_classified_currentness(
+                    transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+                )
+                _raise_unexplained_rejection()
     return updated
 
 
@@ -222,39 +247,46 @@ def archive_task(
     transaction through the supplied actor context; a stale or failed
     mutation writes no event.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    if not isinstance(terminal_status, TaskStatus) or not terminal_status.is_terminal:
-        raise InvalidCommandError(
-            "archive_task requires a terminal TaskStatus (cancelled or completed); "
-            "nonterminal transitions use update_task_status"
+    with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _ARCHIVE_TASK_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        annotate_span(
+            span,
+            operation=_ARCHIVE_TASK_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-    with composed_transaction(pool) as transaction_pool:
-        require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
-        updated = task_records.archive_task(
-            transaction_pool,
-            task_id,
-            expected_state_token=expected_state_token,
-            terminal_status=terminal_status,
-        )
-        if updated is None:
-            _require_classified_currentness(
-                transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+        if not isinstance(terminal_status, TaskStatus) or not terminal_status.is_terminal:
+            raise InvalidCommandError(
+                "archive_task requires a terminal TaskStatus (cancelled or completed); "
+                "nonterminal transitions use update_task_status"
             )
-            _raise_unexplained_rejection()
-        event_coordination.record_task_terminal_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            actor=actor,
-            terminal_status=terminal_status,
-        )
+        with composed_transaction(pool) as transaction_pool:
+            require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+            )
+            updated = task_records.archive_task(
+                transaction_pool,
+                task_id,
+                expected_state_token=expected_state_token,
+                terminal_status=terminal_status,
+            )
+            if updated is None:
+                _require_classified_currentness(
+                    transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+                )
+                _raise_unexplained_rejection()
+            event_coordination.record_task_terminal_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                actor=actor,
+                terminal_status=terminal_status,
+            )
     return updated
 
 
@@ -279,44 +311,51 @@ def bind_canonical_branch(
     successful mutation returns the post-write Task with its newly rotated
     token.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    _require_nonblank_command(canonical_feature_branch, "canonical_feature_branch")
-    with composed_transaction(pool) as transaction_pool:
-        require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
+    with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _BIND_CANONICAL_BRANCH_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_nonblank_command(canonical_feature_branch, "canonical_feature_branch")
+        annotate_span(
+            span,
+            operation=_BIND_CANONICAL_BRANCH_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-        try:
-            updated = task_records.bind_canonical_branch(
+        with composed_transaction(pool) as transaction_pool:
+            require_current_task(
                 transaction_pool,
-                task_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
                 expected_state_token=expected_state_token,
-                canonical_feature_branch=canonical_feature_branch,
             )
-        except UniqueViolation as exc:
-            # The repository-wide branch-ownership index rejected the bind:
-            # another current Task of this Repository already owns the
-            # branch. Translated into the stable application conflict
-            # without exposing the other Task; the composition rolls back
-            # and nothing was applied.
-            raise ConflictError(
-                "the canonical feature branch is already owned by another "
-                "current task in this repository"
-            ) from exc
-        if updated is None:
-            current = _require_classified_currentness(
-                transaction_pool, task_id=task_id, expected_state_token=expected_state_token
-            )
-            if current.canonical_feature_branch is not None:
-                raise ConflictError(
-                    "the task's canonical feature branch is already bound; "
-                    "a current Task never rebinds or releases it"
+            try:
+                updated = task_records.bind_canonical_branch(
+                    transaction_pool,
+                    task_id,
+                    expected_state_token=expected_state_token,
+                    canonical_feature_branch=canonical_feature_branch,
                 )
-            _raise_unexplained_rejection()
+            except UniqueViolation as exc:
+                # The repository-wide branch-ownership index rejected the bind:
+                # another current Task of this Repository already owns the
+                # branch. Translated into the stable application conflict
+                # without exposing the other Task; the composition rolls back
+                # and nothing was applied.
+                raise ConflictError(
+                    "the canonical feature branch is already owned by another "
+                    "current task in this repository"
+                ) from exc
+            if updated is None:
+                current = _require_classified_currentness(
+                    transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+                )
+                if current.canonical_feature_branch is not None:
+                    raise ConflictError(
+                        "the task's canonical feature branch is already bound; "
+                        "a current Task never rebinds or releases it"
+                    )
+                _raise_unexplained_rejection()
     return updated
 
 
@@ -339,31 +378,40 @@ def set_current_plan_revision(
     Task's attempt). A successful mutation returns the post-write Task
     with its newly rotated token.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    _require_uuid_command(plan_revision_id, "plan_revision_id")
-    with composed_transaction(pool) as transaction_pool:
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
+    with application_span(
+        _TASK_MUTATIONS_TRACER_SCOPE, _SET_CURRENT_PLAN_REVISION_SPAN_NAME
+    ) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(plan_revision_id, "plan_revision_id")
+        annotate_span(
+            span,
+            operation=_SET_CURRENT_PLAN_REVISION_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-        require_plan_revision_in_task(
-            transaction_pool, task=task, plan_revision_id=plan_revision_id
-        )
-        updated = task_records.set_current_plan_revision(
-            transaction_pool,
-            task_id,
-            expected_state_token=expected_state_token,
-            plan_revision_id=plan_revision_id,
-        )
-        if updated is None:
-            _require_classified_currentness(
-                transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+        with composed_transaction(pool) as transaction_pool:
+            task = require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
             )
-            _raise_unexplained_rejection()
+            require_plan_revision_in_task(
+                transaction_pool, task=task, plan_revision_id=plan_revision_id
+            )
+            updated = task_records.set_current_plan_revision(
+                transaction_pool,
+                task_id,
+                expected_state_token=expected_state_token,
+                plan_revision_id=plan_revision_id,
+            )
+            if updated is None:
+                _require_classified_currentness(
+                    transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+                )
+                _raise_unexplained_rejection()
     return updated
 
 
@@ -385,41 +433,50 @@ def set_current_owner_gate(
     pending status in a race classifies as a stale operation. A successful
     mutation returns the post-write Task with its newly rotated token.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    _require_uuid_command(owner_gate_id, "owner_gate_id")
-    with composed_transaction(pool) as transaction_pool:
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
+    with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _SET_CURRENT_OWNER_GATE_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
+        annotate_span(
+            span,
+            operation=_SET_CURRENT_OWNER_GATE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-        require_pending_owner_gate_in_task(transaction_pool, task=task, owner_gate_id=owner_gate_id)
-        updated = task_records.set_current_owner_gate(
-            transaction_pool,
-            task_id,
-            expected_state_token=expected_state_token,
-            owner_gate_id=owner_gate_id,
-        )
-        if updated is None:
-            current = _require_classified_currentness(
-                transaction_pool, task_id=task_id, expected_state_token=expected_state_token
+        with composed_transaction(pool) as transaction_pool:
+            task = require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
             )
-            if current.current_owner_gate_id is not None:
-                raise ConflictError(
-                    "the task already has a current owner gate installed; "
-                    "resolve it before installing another"
+            require_pending_owner_gate_in_task(
+                transaction_pool, task=task, owner_gate_id=owner_gate_id
+            )
+            updated = task_records.set_current_owner_gate(
+                transaction_pool,
+                task_id,
+                expected_state_token=expected_state_token,
+                owner_gate_id=owner_gate_id,
+            )
+            if updated is None:
+                current = _require_classified_currentness(
+                    transaction_pool, task_id=task_id, expected_state_token=expected_state_token
                 )
-            gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=owner_gate_id)
-            if gate is None:
-                raise NotFoundError("the requested owner gate is not available for this task")
-            if gate.status is not OwnerGateStatus.PENDING:
-                raise StaleOperationError(
-                    "the owner gate is no longer pending; the operation is stale"
-                )
-            _raise_unexplained_rejection()
+                if current.current_owner_gate_id is not None:
+                    raise ConflictError(
+                        "the task already has a current owner gate installed; "
+                        "resolve it before installing another"
+                    )
+                gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=owner_gate_id)
+                if gate is None:
+                    raise NotFoundError("the requested owner gate is not available for this task")
+                if gate.status is not OwnerGateStatus.PENDING:
+                    raise StaleOperationError(
+                        "the owner gate is no longer pending; the operation is stale"
+                    )
+                _raise_unexplained_rejection()
     return updated
 
 
@@ -449,49 +506,58 @@ def resolve_owner_gate(
     same composed transaction through the supplied actor context; every
     failure path writes no event.
     """
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    _require_uuid_command(owner_gate_id, "owner_gate_id")
-    if not isinstance(outcome, OwnerGateStatus) or outcome is OwnerGateStatus.PENDING:
-        raise InvalidCommandError(
-            "resolve_owner_gate requires a terminal OwnerGateStatus outcome "
-            "(approved, rejected, or cancelled)"
+    with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _RESOLVE_OWNER_GATE_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
+        annotate_span(
+            span,
+            operation=_RESOLVE_OWNER_GATE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
         )
-    with composed_transaction(pool) as transaction_pool:
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
-        require_pending_owner_gate_in_task(transaction_pool, task=task, owner_gate_id=owner_gate_id)
-        resolution = gate_records.resolve_owner_gate(
-            transaction_pool,
-            owner_gate_id=owner_gate_id,
-            outcome=outcome,
-            expected_task_state_token=expected_state_token,
-        )
-        if resolution.outcome is gate_records.OwnerGateResolutionOutcome.RESOLVED:
-            resolved_gate = resolution.gate
-            resolved_task = resolution.task
-            if resolved_gate is None or resolved_task is None:
-                _raise_unexplained_rejection()
-            event_coordination.record_owner_gate_resolved_event(
+        if not isinstance(outcome, OwnerGateStatus) or outcome is OwnerGateStatus.PENDING:
+            raise InvalidCommandError(
+                "resolve_owner_gate requires a terminal OwnerGateStatus outcome "
+                "(approved, rejected, or cancelled)"
+            )
+        with composed_transaction(pool) as transaction_pool:
+            task = require_current_task(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
+                expected_state_token=expected_state_token,
+            )
+            require_pending_owner_gate_in_task(
+                transaction_pool, task=task, owner_gate_id=owner_gate_id
+            )
+            resolution = gate_records.resolve_owner_gate(
+                transaction_pool,
                 owner_gate_id=owner_gate_id,
-                actor=actor,
                 outcome=outcome,
+                expected_task_state_token=expected_state_token,
             )
-            return ResolvedOwnerGate(gate=resolved_gate, task=resolved_task)
-        if resolution.gate is None:
-            raise NotFoundError("the requested owner gate is not available for this task")
-        if resolution.outcome is gate_records.OwnerGateResolutionOutcome.NO_OP:
+            if resolution.outcome is gate_records.OwnerGateResolutionOutcome.RESOLVED:
+                resolved_gate = resolution.gate
+                resolved_task = resolution.task
+                if resolved_gate is None or resolved_task is None:
+                    _raise_unexplained_rejection()
+                event_coordination.record_owner_gate_resolved_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    owner_gate_id=owner_gate_id,
+                    actor=actor,
+                    outcome=outcome,
+                )
+                return ResolvedOwnerGate(gate=resolved_gate, task=resolved_task)
+            if resolution.gate is None:
+                raise NotFoundError("the requested owner gate is not available for this task")
+            if resolution.outcome is gate_records.OwnerGateResolutionOutcome.NO_OP:
+                raise StaleOperationError(
+                    "the owner gate has already been resolved; the operation is stale"
+                )
             raise StaleOperationError(
-                "the owner gate has already been resolved; the operation is stale"
+                "the owner gate is no longer the task's current gate; the operation is stale"
             )
-        raise StaleOperationError(
-            "the owner gate is no longer the task's current gate; the operation is stale"
-        )

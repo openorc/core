@@ -11,6 +11,7 @@ suite.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,7 +19,16 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from openorc.observability import (
+    CONNECTION_ID,
+    OPERATION,
+    WORKSPACE_ID,
+    injected_tracer_source,
+)
 from openorc.persistence import runtime_control_secrets
 from openorc.persistence.pool import DatabasePool
 from openorc.services import connection_credentials
@@ -511,3 +521,217 @@ def test_resolution_failure_messages_never_contain_the_secret() -> None:
         )
 
     assert _CREDENTIAL not in str(error.value)
+
+
+def _local_provider_with_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_configure_opens_its_service_span_without_credential_material() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    locked = _connection_row(workspace_id)
+    reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
+    updated = _connection_row(workspace_id, auth_reference=reference)
+    conn = ScriptedConnection([_ws_row(profile_id), locked, (secret_id,), updated])
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        connection_credentials.configure_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=locked[0],
+            credential=_CREDENTIAL,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "connection_credentials.configure_connection_credential"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert attributes[OPERATION] == "connection_credentials.configure_connection_credential"
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+    assert attributes[CONNECTION_ID] == str(locked[0])
+    # The credential value and the opaque reference have no supported path
+    # into telemetry attributes.
+    exported_blob = str(attributes)
+    assert _CREDENTIAL not in exported_blob
+    assert reference not in exported_blob
+
+
+def test_rotate_opens_its_service_span_without_credential_material() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    reference = runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4())
+    locked = _connection_row(workspace_id, auth_reference=reference)
+    conn = ScriptedConnection([_ws_row(profile_id), locked, (1,), (None,)])
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        connection_credentials.rotate_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=locked[0],
+            credential=_ROTATED_CREDENTIAL,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "connection_credentials.rotate_connection_credential"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+    assert attributes[CONNECTION_ID] == str(locked[0])
+    exported_blob = str(attributes)
+    assert _ROTATED_CREDENTIAL not in exported_blob
+    assert reference not in exported_blob
+
+
+def test_resolution_opens_its_service_span_without_credential_material() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    workspace_id = uuid.uuid4()
+    row = _connection_row(
+        workspace_id,
+        auth_reference=runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4()),
+    )
+    conn = ScriptedConnection([row, (_CREDENTIAL,)])
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        _, secret = connection_credentials.resolve_connection_runtime_credential(
+            _pool(conn), workspace_id=workspace_id, connection_id=row[0]
+        )
+
+    assert secret.secret_value() == _CREDENTIAL
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "connection_credentials.resolve_connection_runtime_credential"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+    assert attributes[CONNECTION_ID] == str(row[0])
+    assert _CREDENTIAL not in str(attributes)
+
+
+def test_resolution_dangling_reference_logs_a_safe_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    workspace_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
+    row = _connection_row(workspace_id, auth_reference=reference)
+    conn = ScriptedConnection([row, None])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
+        pytest.raises(ConflictError),
+    ):
+        connection_credentials.resolve_connection_runtime_credential(
+            _pool(conn), workspace_id=workspace_id, connection_id=row[0]
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "openorc.services.connection_credentials"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    # Fixed safe message only: never the reference value or credential material.
+    message = warnings[0].getMessage()
+    assert "dangling auth reference" in message
+    assert _CREDENTIAL not in message
+    assert reference not in message
+    assert str(secret_id) not in message
+
+
+def test_resolution_unrecognized_reference_logs_a_safe_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    workspace_id = uuid.uuid4()
+    row = _connection_row(workspace_id, auth_reference="openorc:connection-auth:v1:notvault:x")
+    conn = ScriptedConnection([row])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
+        pytest.raises(ConflictError),
+    ):
+        connection_credentials.resolve_connection_runtime_credential(
+            _pool(conn), workspace_id=workspace_id, connection_id=row[0]
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "openorc.services.connection_credentials"
+    ]
+    assert len(warnings) == 1
+    assert "unrecognized auth reference" in warnings[0].getMessage()
+
+
+def test_rotation_dangling_reference_logs_a_safe_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
+    row = _connection_row(workspace_id, auth_reference=reference)
+    conn = ScriptedConnection([_ws_row(profile_id), row, None])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
+        pytest.raises(ConflictError),
+    ):
+        connection_credentials.rotate_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=row[0],
+            credential=_ROTATED_CREDENTIAL,
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "openorc.services.connection_credentials"
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "dangling auth reference" in message
+    assert _ROTATED_CREDENTIAL not in message
+    assert reference not in message
+    assert str(secret_id) not in message
+
+
+def test_rotation_unrecognized_reference_logs_a_safe_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    row = _connection_row(workspace_id, auth_reference="vault://openorc/connection-auth/abc")
+    conn = ScriptedConnection([_ws_row(profile_id), row])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
+        pytest.raises(ConflictError),
+    ):
+        connection_credentials.rotate_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=row[0],
+            credential=_ROTATED_CREDENTIAL,
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "openorc.services.connection_credentials"
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "unrecognized auth reference" in message
+    assert _ROTATED_CREDENTIAL not in message
