@@ -59,6 +59,7 @@ from jwt import PyJWK
 
 from openorc.config import ConfigurationError
 from openorc.domain.identity import AuthenticatedPrincipal
+from openorc.observability import annotate_span, application_tracer
 
 __all__ = [
     "EXPECTED_TOKEN_ROLE",
@@ -91,6 +92,12 @@ GITHUB_PROVIDER = "github"
 
 DEFAULT_JWKS_TIMEOUT_SECONDS = 5.0
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
+
+# Representative external-adapter span boundary (issue #108): one
+# instrumented external operation proves the trace foundation; the broad
+# adapter retrofit belongs to a dedicated follow-up leaf.
+_JWKS_TRACER_SCOPE = "openorc.adapters.supabase.auth"
+_JWKS_RETRIEVAL_SPAN_NAME = "supabase.jwks_retrieval"
 
 
 class SupabaseAccessTokenRejectedError(Exception):
@@ -156,20 +163,28 @@ def _fetch_jwks_keys(
     adapter-local retrieval errors regardless of the underlying fetch
     implementation, so verification infrastructure failures are never
     confused with token rejections.
+
+    Representative external-adapter span boundary (issue #108): the JWKS
+    URL carries the Supabase project reference and is not part of the safe
+    attribute vocabulary, so only the operation name is attached.
     """
-    try:
-        raw = fetch(jwks_url, timeout_seconds)
-    except urllib.error.HTTPError as exc:
-        # The source answered with a definitive failure: known non-success.
-        raise SupabaseJwksUnavailableError(
-            "the Supabase Auth signing-key source rejected the JWKS lookup"
-        ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        # Timeout or connection loss leaves the outcome unknown; never
-        # reclassified as a known failure or success.
-        raise SupabaseJwksOutcomeUnknownError(
-            "the Supabase Auth signing-key source could not be reached"
-        ) from exc
+    with application_tracer(_JWKS_TRACER_SCOPE).start_as_current_span(
+        _JWKS_RETRIEVAL_SPAN_NAME
+    ) as span:
+        annotate_span(span, operation=_JWKS_RETRIEVAL_SPAN_NAME)
+        try:
+            raw = fetch(jwks_url, timeout_seconds)
+        except urllib.error.HTTPError as exc:
+            # The source answered with a definitive failure: known non-success.
+            raise SupabaseJwksUnavailableError(
+                "the Supabase Auth signing-key source rejected the JWKS lookup"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Timeout or connection loss leaves the outcome unknown; never
+            # reclassified as a known failure or success.
+            raise SupabaseJwksOutcomeUnknownError(
+                "the Supabase Auth signing-key source could not be reached"
+            ) from exc
     return _parse_jwks_document(raw)
 
 

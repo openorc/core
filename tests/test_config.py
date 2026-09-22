@@ -21,6 +21,7 @@ from openorc.config import (
     DEFAULT_ENVIRONMENT,
     DEFAULT_VALKEY_URL,
     ENVIRONMENT_VAR,
+    OTLP_ENDPOINT_VAR,
     VALKEY_URL_VAR,
     ConfigurationError,
     Settings,
@@ -67,6 +68,30 @@ def test_blank_values_fall_back_to_defaults() -> None:
 def test_invalid_port_values_are_rejected(raw: str) -> None:
     with pytest.raises(ConfigurationError, match="OPENORC_API_PORT"):
         Settings.from_env({"OPENORC_API_PORT": raw})
+
+
+def test_otlp_endpoint_defaults_to_unconfigured() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.otlp_endpoint is None
+
+
+def test_blank_otlp_endpoint_falls_back_to_unconfigured() -> None:
+    settings = Settings.from_env({OTLP_ENDPOINT_VAR: ""})
+
+    assert settings.otlp_endpoint is None
+
+
+def test_otlp_endpoint_is_read_from_the_environment() -> None:
+    settings = Settings.from_env({OTLP_ENDPOINT_VAR: "https://collector.example:4318"})
+
+    assert settings.otlp_endpoint == "https://collector.example:4318"
+
+
+@pytest.mark.parametrize("raw", ["ftp://collector.example", "https://", "not a url"])
+def test_malformed_otlp_endpoint_values_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_OTLP_ENDPOINT"):
+        Settings.from_env({OTLP_ENDPOINT_VAR: raw})
 
 
 @pytest.mark.parametrize("raw", ["maybe", "2"])
