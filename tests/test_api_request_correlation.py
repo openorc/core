@@ -21,7 +21,7 @@ from opentelemetry.sdk._logs.export import (
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import SpanKind, StatusCode
 
 from openorc.api.app import create_app
 from openorc.api.request_correlation import REQUEST_ID_HEADER
@@ -160,6 +160,47 @@ def test_request_id_enrichment_resets_outside_the_request(
     matching = [record for record in capture.records if record.getMessage() == "after request"]
     assert matching
     assert REQUEST_ID_ATTRIBUTE not in vars(matching[0])
+
+
+def test_unhandled_exception_response_still_carries_the_request_id(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    span_exporter = InMemorySpanExporter()
+    provider = SdkTracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    app = create_app(settings_factory())
+
+    @app.get("/_observability-test/raise")
+    def _raise_unhandled() -> None:
+        raise RuntimeError("unhandled boom")
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        TestClient(app) as client,
+    ):
+        response = client.get("/_observability-test/raise")
+
+    # The last-resort error path is owned by the same middleware: the final
+    # 500 carries the server-generated request ID, records the failure on
+    # the same request span, and creates no second request span.
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    request_id = response.headers[REQUEST_ID_HEADER]
+    assert request_id
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    (span,) = spans
+    assert span.attributes is not None
+    assert span.attributes[REQUEST_ID_ATTRIBUTE] == request_id
+    assert span.status.status_code is StatusCode.ERROR
+    events = span.events
+    assert events is not None
+    assert any(
+        event.name == "exception"
+        and event.attributes is not None
+        and event.attributes.get("exception.type") == "RuntimeError"
+        for event in events
+    )
 
 
 def test_unconfigured_request_returns_header_without_telemetry(

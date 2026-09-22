@@ -279,16 +279,23 @@ def shutdown_observability() -> None:
     exists, its processors/readers are flushed and shut down once and the
     process state becomes terminal (later initialization raises
     :class:`ObservabilityTerminalError`). Without a configured runtime there
-    is nothing to terminate: the logging baseline is removed and the
-    boundary stays re-initializable.
+    is no telemetry runtime to terminate: the bootstrap-owned logging
+    baseline is removed and the lifecycle state is cleared so the boundary
+    is cleanly re-initializable.
     """
     global _state, _tracer_provider, _logger_provider, _meter_provider
     if _state is None:
         return
-    if not _state.configured or _state.terminal:
+    if _state.terminal:
+        return
+    log_pipeline.uninstall_root_logging()
+    if not _state.configured:
+        # No telemetry runtime was installed: undo the bootstrap-owned
+        # logging mutation and clear the lifecycle state so the boundary is
+        # cleanly re-initializable (no stale unconfigured identity remains).
+        _state = None
         return
     _state.terminal = True
-    log_pipeline.uninstall_root_logging()
     for provider in (_meter_provider, _logger_provider, _tracer_provider):
         if provider is None:
             continue

@@ -68,7 +68,7 @@ Logging contract:
 Traces, spans, and attributes:
 
 - Manual spans belong at meaningful boundaries only: application/service operations, external adapter operations, API request and worker job entrypoints, queue handoff where trace context propagates safely, and external HTTP through supported instrumentation or explicit adapter spans. Never instrument every helper, SQL statement, or dataclass conversion.
-- The API request middleware owns exactly one canonical request-entry span per request; any future framework instrumentation must be reconciled so exactly one request-entry span exists.
+- The API request middleware owns exactly one canonical request-entry span per request; any future framework instrumentation must be reconciled so exactly one request-entry span exists. The middleware also produces the final last-resort 500 response (with the same server-generated request ID) when an unhandled exception escapes the application, so the correlation header is present on every response without a second request span or a client-supplied ID.
 - Attach only the safe vocabulary from `observability.attributes` (Workspace/Task/Execution/Connection IDs, workflow role, OpenOrc operation name, GitHub stable repository/issue/PR identifiers and exact head SHA, RQ job identity, request ID). Attributes are contextual diagnostics: not workflow authority and not a second copy of canonical state.
 - Never emit raw secrets, bearer/authorization tokens, Supabase secret/admin keys, GitHub installation tokens, runtime credentials, Workspace guidance prose, prompt bodies, agent transcripts/private reasoning, or arbitrary request/response bodies.
 

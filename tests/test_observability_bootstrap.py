@@ -8,6 +8,7 @@ that keeps the global runtime untouched.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 import pytest
@@ -43,17 +44,36 @@ def test_initialize_without_endpoint_installs_no_telemetry_runtime(
     assert not isinstance(get_meter_provider(), SdkMeterProvider)
 
 
-def test_unconfigured_shutdown_keeps_the_boundary_reinitializable(
+def test_unconfigured_shutdown_removes_the_logging_baseline_and_clears_state(
     settings_factory: Callable[..., Settings],
 ) -> None:
+    # Clear any pre-existing unconfigured state deterministically first.
+    shutdown_observability()
+    root = logging.getLogger()
+    previous_level = root.level
+    previous_handlers = set(root.handlers)
+
     initialize_observability(settings_factory(), ObservabilitySurface.WORKER)
+
+    assert root.level == logging.INFO
+    assert set(root.handlers) != previous_handlers
 
     shutdown_observability()
 
-    assert observability_status().terminal is False
+    status = observability_status()
+    assert status.initialized is False
+    assert status.configured is False
+    assert status.terminal is False
+    assert root.level == previous_level
+    assert set(root.handlers) == previous_handlers
+
+    # The boundary is cleanly re-initializable after the cleanup.
     initialize_observability(settings_factory(), ObservabilitySurface.WORKER)
     assert observability_status().initialized is True
     assert observability_status().configured is False
+    assert root.level == logging.INFO
+    shutdown_observability()
+    assert observability_status().initialized is False
 
 
 def test_repeated_shutdown_is_safe(settings_factory: Callable[..., Settings]) -> None:
