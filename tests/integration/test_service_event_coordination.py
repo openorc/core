@@ -214,17 +214,32 @@ def test_the_migrated_check_rejects_removed_and_unknown_event_types(
     conn: Connection[Any],
 ) -> None:
     """The additive migration kept the #100 narrowed vocabulary: the removed
-    prompt-override value and any unknown value are rejected by the database."""
+    prompt-override value and any unknown value are rejected by the database.
+
+    Each expected violation runs inside its own ``conn.transaction()``
+    SAVEPOINT: a constraint violation aborts the surrounding transaction
+    block it occurred in, so isolating every rejected insert in its own
+    savepoint keeps the per-test transaction valid for the next iteration.
+    """
     profile_id = _insert_profile(conn)
     workspace_id = _insert_workspace(conn, profile_id)
     for rejected in ("prompt_override_changed", "not_a_real_event_type"):
-        with pytest.raises(CheckViolation):
-            conn.execute(
-                "insert into openorc.workflow_events "
-                "(workspace_id, event_type, actor_type, context) "
-                "values (%s, %s, %s, '{}'::jsonb)",
-                (workspace_id, rejected, "owner"),
-            )
+        # Nesting order is load-bearing: psycopg's transaction manager must
+        # be the INNER context so its __exit__ sees the CheckViolation and
+        # rolls back the SAVEPOINT first; pytest.raises (outer) then consumes
+        # the re-raised exception. The reverse order (or a combined `with`)
+        # would let pytest.raises consume the exception first, leaving
+        # psycopg to RELEASE a savepoint in an aborted transaction state
+        # (InFailedSqlTransaction). The noqa keeps ruff's SIM117 from
+        # suggesting exactly that wrong combined form.
+        with pytest.raises(CheckViolation):  # noqa: SIM117
+            with conn.transaction():
+                conn.execute(
+                    "insert into openorc.workflow_events "
+                    "(workspace_id, event_type, actor_type, context) "
+                    "values (%s, %s, %s, '{}'::jsonb)",
+                    (workspace_id, rejected, "owner"),
+                )
 
 
 def test_set_review_iteration_limit_commits_the_mutation_and_its_event_together(
