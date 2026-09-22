@@ -20,16 +20,18 @@ so a failing test cannot leak its source into other tests.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.util.types import AttributeValue
 
 if TYPE_CHECKING:
-    from opentelemetry.trace import Tracer
+    from opentelemetry.trace import Span, Tracer
 
-TracerSource = Callable[[str], "Tracer"]
+TracerSource = Callable[[str], "Tracer"] | None
 
 _tracer_source: TracerSource | None = None
 
@@ -46,9 +48,44 @@ def injected_tracer_source(source: TracerSource) -> Iterator[None]:
         _tracer_source = previous
 
 
-def application_tracer(name: str) -> Tracer:
+def application_tracer(tracer_scope: str) -> Tracer:
     """Return the tracer for an OpenOrc instrumentation scope name."""
     source = _tracer_source
     if source is not None:
-        return source(name)
-    return trace.get_tracer(name)
+        return source(tracer_scope)
+    return trace.get_tracer(tracer_scope)
+
+
+@contextmanager
+def application_span(
+    tracer_scope: str,
+    span_name: str,
+    *,
+    kind: SpanKind = SpanKind.INTERNAL,
+    attributes: Mapping[str, AttributeValue] | None = None,
+) -> Iterator[Span]:
+    """Open an OpenOrc application span with safe failure classification.
+
+    Automatic OpenTelemetry exception recording is disabled at this
+    boundary: ``record_exception`` exports ``exception.message`` and
+    ``exception.stacktrace``, and ``set_status_on_exception`` places the
+    full exception message into the status description — arbitrary
+    exception text may carry secret-bearing content and must never be
+    exported. On failure the span receives an ERROR status whose
+    description is only the exception type name; diagnostics beyond that
+    classification belong to framework-owned server-side logging, not
+    telemetry export.
+    """
+    tracer = application_tracer(tracer_scope)
+    with tracer.start_as_current_span(
+        span_name,
+        kind=kind,
+        attributes=attributes,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            yield span
+        except Exception as exc:
+            span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+            raise

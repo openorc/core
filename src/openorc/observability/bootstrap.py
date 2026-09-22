@@ -34,6 +34,15 @@ Lifecycle contract (verified against the pinned SDK 1.44.0):
   continues to run correctly. Malformed configuration fails fast at startup
   like other configuration errors; runtime export failures never crash the
   application.
+- Initialization fails closed when a foreign global OpenTelemetry provider
+  is already installed: the OpenTelemetry setters are set-once but do not
+  raise on an override attempt (they retain the existing provider and log a
+  warning), so a pre-instrumented process must never silently run with the
+  wrong runtime. Each installed global provider is verified by identity
+  before initialization reports success.
+- OTLP log export is scoped to the ``openorc`` logger hierarchy; dependency,
+  framework, and connected-runtime loggers stay on the local stderr
+  baseline and never become OpenOrc operational telemetry.
 """
 
 from __future__ import annotations
@@ -44,11 +53,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from opentelemetry._logs import set_logger_provider
+from opentelemetry import metrics as metrics_api
+from opentelemetry import trace as trace_api
+from opentelemetry._logs import get_logger_provider, set_logger_provider
+from opentelemetry._logs._internal import ProxyLoggerProvider
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.metrics import set_meter_provider
+from opentelemetry.metrics._internal import _ProxyMeterProvider
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs._internal import LogRecordProcessor
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, LogRecordExporter
@@ -57,7 +70,7 @@ from opentelemetry.sdk.metrics.export import MetricReader, PeriodicExportingMetr
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
-from opentelemetry.trace import set_tracer_provider
+from opentelemetry.trace import ProxyTracerProvider, set_tracer_provider
 
 from openorc import __version__
 from openorc.config import Settings
@@ -202,20 +215,45 @@ def initialize_observability(
         assert installed_logger_provider is not None
         # Upgrade the logging pipeline from the plain baseline to the
         # enriched configured pipeline (unconfigured -> configured path).
-        log_pipeline.uninstall_root_logging()
-        log_pipeline.install_root_logging(
-            [
-                log_pipeline.otel_logging_handler(installed_logger_provider),
-                log_pipeline.stderr_baseline_handler(enrich=True),
-            ]
+        log_pipeline.uninstall()
+        log_pipeline.install(
+            application_handlers=[log_pipeline.otel_logging_handler(installed_logger_provider)],
+            process_handlers=[log_pipeline.stderr_baseline_handler(enrich=True)],
         )
         _state = _State(identity=identity, configured=True)
         _register_process_exit_flush()
     elif _state is None:
-        log_pipeline.install_root_logging([log_pipeline.stderr_baseline_handler(enrich=False)])
+        log_pipeline.install(
+            application_handlers=[],
+            process_handlers=[log_pipeline.stderr_baseline_handler(enrich=False)],
+        )
         _state = _State(identity=identity, configured=False)
     # Remaining case: staying unconfigured with a different identity. No
     # global runtime exists, so there is nothing to conflict with or change.
+
+
+def _ensure_no_foreign_runtime() -> None:
+    """Fail closed when a foreign global OpenTelemetry runtime exists.
+
+    The OpenTelemetry global setters are set-once but do not raise on an
+    override attempt: they retain the existing provider and only log a
+    warning. A pre-instrumented process would therefore silently keep a
+    different global runtime (wrong resource/export configuration) while
+    OpenOrc reported a configured telemetry identity, so initialization
+    fails closed before installing anything.
+    """
+    checks: tuple[tuple[str, Callable[[], object], tuple[type[object], ...]], ...] = (
+        ("tracer", trace_api.get_tracer_provider, (ProxyTracerProvider,)),
+        ("meter", metrics_api.get_meter_provider, (_ProxyMeterProvider,)),
+        ("logger", get_logger_provider, (ProxyLoggerProvider,)),
+    )
+    for label, getter, proxy_types in checks:
+        if not isinstance(getter(), proxy_types):
+            raise ObservabilityConfigurationError(
+                f"A foreign global OpenTelemetry {label} provider is already "
+                "installed in this process; OpenOrc does not override or "
+                "share an existing telemetry runtime"
+            )
 
 
 def _install_telemetry_runtime(
@@ -226,6 +264,7 @@ def _install_telemetry_runtime(
 ) -> None:
     """Build and install the tracing/logging/metrics runtime atomically."""
     global _tracer_provider, _logger_provider, _meter_provider
+    _ensure_no_foreign_runtime()
     resource = _build_resource(settings, surface)
     tracer_provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
@@ -248,6 +287,18 @@ def _install_telemetry_runtime(
         set_tracer_provider(tracer_provider)
         set_logger_provider(logger_provider)
         set_meter_provider(meter_provider)
+        # The OpenTelemetry setters are set-once without raising on override
+        # attempts, so identity verification is what makes silent
+        # wrong-identity retention impossible.
+        if (
+            trace_api.get_tracer_provider() is not tracer_provider
+            or get_logger_provider() is not logger_provider
+            or metrics_api.get_meter_provider() is not meter_provider
+        ):
+            raise ObservabilityConfigurationError(
+                "OpenOrc observability could not take ownership of the global "
+                "telemetry runtime; a different provider retained control"
+            )
     except BaseException:
         # Leave no half-installed runtime behind and keep the boundary
         # re-initializable; the process never runs with a broken telemetry
@@ -288,7 +339,7 @@ def shutdown_observability() -> None:
         return
     if _state.terminal:
         return
-    log_pipeline.uninstall_root_logging()
+    log_pipeline.uninstall()
     if not _state.configured:
         # No telemetry runtime was installed: undo the bootstrap-owned
         # logging mutation and clear the lifecycle state so the boundary is

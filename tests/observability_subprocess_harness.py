@@ -38,6 +38,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import set_tracer_provider
 
 from openorc.config import Settings
 from openorc.observability import (
@@ -85,7 +86,9 @@ def _emit_one_span_and_one_log() -> None:
     tracer = trace.get_tracer("harness.scope")
     with tracer.start_as_current_span("harness.operation") as span:
         span.set_attribute("openorc.operation", "harness.operation")
-    logging.getLogger("harness.logger").info("harness message")
+    # Application-scoped logger name: OTLP export covers the openorc
+    # hierarchy only (issue #108).
+    logging.getLogger("openorc.harness").info("harness message")
 
 
 def _register_post_exit_report(harness: _Harness) -> None:
@@ -252,6 +255,35 @@ def run_worker_mode() -> None:
     )
 
 
+def run_foreign() -> None:
+    """A pre-instrumented process must fail closed, not silently adopt."""
+    foreign_provider = SdkTracerProvider()
+    set_tracer_provider(foreign_provider)
+    harness = _Harness()
+    conflict = _expect(
+        ObservabilityConfigurationError,
+        lambda: initialize_observability(
+            _settings("https://collector.example"),
+            ObservabilitySurface.API,
+            factories=harness.factories(),
+        ),
+    )
+    status = observability_status()
+    untouched = trace.get_tracer_provider() is foreign_provider
+    print(
+        json.dumps(
+            {
+                "kind": "pre_exit",
+                "initialized": status.initialized,
+                "configured": status.configured,
+                "conflict": conflict,
+                "foreign_untouched": untouched,
+            }
+        ),
+        flush=True,
+    )
+
+
 def run_atexit_flush() -> None:
     harness = _Harness()
     _register_post_exit_report(harness)
@@ -281,6 +313,8 @@ def main() -> None:
         run_unconfigured()
     elif mode == "worker":
         run_worker_mode()
+    elif mode == "foreign":
+        run_foreign()
     elif mode == "atexit_flush":
         run_atexit_flush()
     else:

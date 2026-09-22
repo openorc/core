@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from openorc.domain.ownership import Workspace
-from openorc.observability import annotate_span, application_tracer
+from openorc.observability import annotate_span, application_span
 from openorc.persistence.ownership import (
     update_workspace_guidance,
     update_workspace_review_iteration_limit,
@@ -110,9 +110,7 @@ def set_review_iteration_limit(
     limit as immutable historical configuration, and this operation never
     touches them. Same-value writes are no-ops.
     """
-    with application_tracer(_SERVICE_TRACER_SCOPE).start_as_current_span(
-        _REVIEW_LIMIT_SPAN_NAME
-    ) as span:
+    with application_span(_SERVICE_TRACER_SCOPE, _REVIEW_LIMIT_SPAN_NAME) as span:
         annotate_span(
             span,
             operation=_REVIEW_LIMIT_SPAN_NAME,

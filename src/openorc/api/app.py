@@ -8,7 +8,10 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from fastapi import FastAPI
 
 from openorc import __version__
-from openorc.api.request_correlation import RequestCorrelationMiddleware
+from openorc.api.request_correlation import (
+    RequestCorrelationMiddleware,
+    server_error_response,
+)
 from openorc.api.routers.health import router as health_router
 from openorc.config import Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
@@ -54,6 +57,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=API_TITLE,
         version=__version__,
         lifespan=_observability_lifespan(resolved),
+        # The correlation module owns the application's registered Exception
+        # handler so the framework's outermost server-error layer keeps its
+        # semantics while the final response carries the request ID (issue
+        # #108).
+        exception_handlers={Exception: server_error_response},
     )
     app.add_middleware(RequestCorrelationMiddleware)
     app.include_router(health_router)

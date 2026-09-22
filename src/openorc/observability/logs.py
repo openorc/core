@@ -16,6 +16,10 @@ request-scoped ``ContextVar`` that the API request middleware sets and
 resets in ``finally``. The pinned OpenTelemetry SDK maps non-reserved
 ``LogRecord`` attributes into exported OTel log attributes, so the enriched
 record exports ``openorc.request_id`` alongside its trace/span identifiers.
+
+OTLP export is scoped to the ``openorc`` logger hierarchy: dependency,
+framework, and connected-runtime loggers reach only the local stderr
+baseline, never OpenOrc operational telemetry.
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ from openorc.observability.attributes import REQUEST_ID
 
 REQUEST_ID_CONTEXT: ContextVar[str | None] = ContextVar("openorc_request_id", default=None)
 """Request-scoped safe opaque request ID (set/reset by the API middleware)."""
+
+APPLICATION_LOGGER_NAME = "openorc"
+"""Root of the OpenOrc application logger hierarchy used for OTLP export."""
 
 STDERR_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -77,34 +84,50 @@ def otel_logging_handler(logger_provider: LoggerProvider) -> logging.Handler:
     return handler
 
 
-_installed_handlers: list[logging.Handler] = []
+_installed_application_handlers: list[logging.Handler] = []
+_installed_process_handlers: list[logging.Handler] = []
 _previous_root_level: int | None = None
 
 
-def install_root_logging(handlers: Sequence[logging.Handler]) -> None:
-    """Attach bootstrap-owned handlers and make INFO-level logs visible.
+def install(
+    application_handlers: Sequence[logging.Handler],
+    process_handlers: Sequence[logging.Handler],
+) -> None:
+    """Attach the bootstrap-owned logging handlers.
 
-    The root logger keeps its previous level for restore at uninstall;
-    setting INFO is what makes the baseline (and the OTel handler) receive
-    ordinary application lifecycle records.
+    OpenOrc application handlers attach to the ``openorc`` logger hierarchy
+    so OTLP export is scoped to OpenOrc's own selective, secret-excluded
+    logging — dependency, framework, and connected-runtime loggers never
+    become OpenOrc operational telemetry. Process handlers (the stderr
+    baseline) attach to the root logger and stay process-wide. The root
+    level becomes INFO so ordinary application lifecycle records are
+    visible; the previous level is restored at uninstall.
     """
     global _previous_root_level
     root = logging.getLogger()
     if _previous_root_level is None:
         _previous_root_level = root.level
         root.setLevel(logging.INFO)
-    for handler in handlers:
+    for handler in process_handlers:
         root.addHandler(handler)
-        _installed_handlers.append(handler)
+        _installed_process_handlers.append(handler)
+    application_logger = logging.getLogger(APPLICATION_LOGGER_NAME)
+    for handler in application_handlers:
+        application_logger.addHandler(handler)
+        _installed_application_handlers.append(handler)
 
 
-def uninstall_root_logging() -> None:
+def uninstall() -> None:
     """Remove bootstrap-owned handlers and restore the previous root level."""
     global _previous_root_level
     root = logging.getLogger()
-    for handler in _installed_handlers:
+    for handler in _installed_process_handlers:
         root.removeHandler(handler)
-    _installed_handlers.clear()
+    _installed_process_handlers.clear()
+    application_logger = logging.getLogger(APPLICATION_LOGGER_NAME)
+    for handler in _installed_application_handlers:
+        application_logger.removeHandler(handler)
+    _installed_application_handlers.clear()
     if _previous_root_level is not None:
         root.setLevel(_previous_root_level)
         _previous_root_level = None

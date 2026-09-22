@@ -38,7 +38,11 @@ from openorc.observability.logs import (
     REQUEST_ID_CONTEXT,
     request_log_enrichment_filter,
 )
-from openorc.observability.tracing import application_tracer, injected_tracer_source
+from openorc.observability.tracing import (
+    application_span,
+    application_tracer,
+    injected_tracer_source,
+)
 
 __all__ = [
     "CONNECTION_ID",
@@ -61,6 +65,7 @@ __all__ = [
     "ObservabilityTerminalError",
     "REQUEST_ID_CONTEXT",
     "annotate_span",
+    "application_span",
     "application_tracer",
     "initialize_observability",
     "injected_tracer_source",

@@ -59,7 +59,7 @@ from jwt import PyJWK
 
 from openorc.config import ConfigurationError
 from openorc.domain.identity import AuthenticatedPrincipal
-from openorc.observability import annotate_span, application_tracer
+from openorc.observability import annotate_span, application_span
 
 __all__ = [
     "EXPECTED_TOKEN_ROLE",
@@ -168,9 +168,7 @@ def _fetch_jwks_keys(
     URL carries the Supabase project reference and is not part of the safe
     attribute vocabulary, so only the operation name is attached.
     """
-    with application_tracer(_JWKS_TRACER_SCOPE).start_as_current_span(
-        _JWKS_RETRIEVAL_SPAN_NAME
-    ) as span:
+    with application_span(_JWKS_TRACER_SCOPE, _JWKS_RETRIEVAL_SPAN_NAME) as span:
         annotate_span(span, operation=_JWKS_RETRIEVAL_SPAN_NAME)
         try:
             raw = fetch(jwks_url, timeout_seconds)

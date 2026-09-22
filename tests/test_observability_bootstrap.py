@@ -16,6 +16,10 @@ from opentelemetry import trace as trace_api
 from opentelemetry._logs import get_logger_provider
 from opentelemetry.metrics import get_meter_provider
 from opentelemetry.sdk._logs import LoggerProvider as SdkLoggerProvider
+from opentelemetry.sdk._logs.export import (
+    InMemoryLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
 
@@ -27,6 +31,12 @@ from openorc.observability import (
     injected_tracer_source,
     observability_status,
     shutdown_observability,
+)
+from openorc.observability.logs import (
+    install,
+    otel_logging_handler,
+    stderr_baseline_handler,
+    uninstall,
 )
 
 
@@ -85,6 +95,25 @@ def test_repeated_shutdown_is_safe(settings_factory: Callable[..., Settings]) ->
 
     after = observability_status()
     assert after.terminal == before.terminal
+
+
+def test_otel_log_export_is_scoped_to_the_openorc_logger_hierarchy() -> None:
+    shutdown_observability()  # deterministic bootstrap-owned logging state
+    log_exporter = InMemoryLogRecordExporter()
+    local_logger_provider = SdkLoggerProvider()
+    local_logger_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
+    install(
+        application_handlers=[otel_logging_handler(local_logger_provider)],
+        process_handlers=[stderr_baseline_handler(enrich=False)],
+    )
+    try:
+        logging.getLogger("openorc.test.scoped").info("application record")
+        logging.getLogger("thirdparty.dependency").info("foreign record")
+    finally:
+        uninstall()
+
+    bodies = [data.log_record.body for data in log_exporter.get_finished_logs()]
+    assert bodies == ["application record"]
 
 
 def test_application_tracer_defaults_to_the_global_runtime() -> None:

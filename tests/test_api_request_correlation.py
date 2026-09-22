@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+import pytest
 from fastapi.testclient import TestClient
 from opentelemetry import trace as trace_api
 from opentelemetry.sdk._logs import LoggerProvider as SdkLoggerProvider
@@ -32,8 +33,16 @@ from openorc.observability import (
 from openorc.observability import (
     injected_tracer_source,
     request_log_enrichment_filter,
+    shutdown_observability,
 )
-from openorc.observability.logs import otel_logging_handler
+from openorc.observability.logs import (
+    install,
+    otel_logging_handler,
+    stderr_baseline_handler,
+    uninstall,
+)
+
+_SECRET = "super-secret-token-value"
 
 
 class _CaptureHandler(logging.Handler):
@@ -106,7 +115,7 @@ def test_request_id_is_enriched_onto_correlated_log_records(
 
         @app.get("/_observability-test/log")
         def _log_once() -> dict[str, str]:
-            logging.getLogger(__name__).info("inside request")
+            logging.getLogger("openorc.test.request").info("inside request")
             return {"logged": "true"}
 
         with (
@@ -162,45 +171,76 @@ def test_request_id_enrichment_resets_outside_the_request(
     assert REQUEST_ID_ATTRIBUTE not in vars(matching[0])
 
 
-def test_unhandled_exception_response_still_carries_the_request_id(
+def test_unhandled_exception_keeps_framework_semantics_and_safe_telemetry(
     settings_factory: Callable[..., Settings],
 ) -> None:
     span_exporter = InMemorySpanExporter()
     provider = SdkTracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    log_exporter = InMemoryLogRecordExporter()
+    local_logger_provider = SdkLoggerProvider()
+    local_logger_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
     app = create_app(settings_factory())
 
     @app.get("/_observability-test/raise")
     def _raise_unhandled() -> None:
-        raise RuntimeError("unhandled boom")
+        raise RuntimeError(f"token={_SECRET}")
 
-    with (
-        injected_tracer_source(lambda name: provider.get_tracer(name)),
-        TestClient(app) as client,
-    ):
-        response = client.get("/_observability-test/raise")
+    # Deterministic bootstrap-owned logging state, then a configured-shape
+    # log export pipeline built entirely from local providers.
+    shutdown_observability()
+    install(
+        application_handlers=[otel_logging_handler(local_logger_provider)],
+        process_handlers=[stderr_baseline_handler(enrich=False)],
+    )
+    try:
+        with (
+            injected_tracer_source(lambda name: provider.get_tracer(name)),
+            TestClient(app) as client,
+            # Framework server-error semantics are preserved: the exception
+            # propagates out of the ASGI stack (ServerErrorMiddleware
+            # re-raises after sending the final response) and TestClient
+            # re-raises it.
+            pytest.raises(RuntimeError),
+        ):
+            client.get("/_observability-test/raise")
+        spans_after_first_request = len(span_exporter.get_finished_spans())
 
-    # The last-resort error path is owned by the same middleware: the final
-    # 500 carries the server-generated request ID, records the failure on
-    # the same request span, and creates no second request span.
+        with (
+            injected_tracer_source(lambda name: provider.get_tracer(name)),
+            TestClient(app, raise_server_exceptions=False) as safe_client,
+        ):
+            response = safe_client.get("/_observability-test/raise")
+    finally:
+        uninstall()
+
+    # The registered application Exception handler ran through the
+    # framework's outermost server-error layer: same safe payload, same
+    # server-generated request ID.
     assert response.status_code == 500
     assert response.json() == {"detail": "Internal Server Error"}
     request_id = response.headers[REQUEST_ID_HEADER]
     assert request_id
+    assert _SECRET not in response.text
+
     spans = span_exporter.get_finished_spans()
-    assert len(spans) == 1
-    (span,) = spans
+    assert len(spans) == spans_after_first_request + 1
+    (span,) = spans[spans_after_first_request:]
     assert span.attributes is not None
     assert span.attributes[REQUEST_ID_ATTRIBUTE] == request_id
+    # Failure telemetry is a safe classification only: ERROR status with the
+    # exception type name, and no exception events carrying messages or
+    # stacktraces.
     assert span.status.status_code is StatusCode.ERROR
-    events = span.events
-    assert events is not None
-    assert any(
-        event.name == "exception"
-        and event.attributes is not None
-        and event.attributes.get("exception.type") == "RuntimeError"
-        for event in events
-    )
+    assert span.status.description == "RuntimeError"
+    assert not span.events
+    assert _SECRET not in str(span.attributes)
+    assert _SECRET not in (span.status.description or "")
+
+    # Exported logs never contain the sentinel either.
+    for data in log_exporter.get_finished_logs():
+        assert _SECRET not in str(data.log_record.body)
+        assert _SECRET not in str(data.log_record.attributes or {})
 
 
 def test_unconfigured_request_returns_header_without_telemetry(

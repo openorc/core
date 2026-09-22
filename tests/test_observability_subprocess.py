@@ -83,6 +83,16 @@ def test_worker_surface_uses_worker_identity_and_terminal_shutdown() -> None:
     assert post_exit["logs"] == 0
 
 
+def test_foreign_global_runtime_fails_closed() -> None:
+    payloads = _run_mode("foreign")
+    pre_exit = payloads["pre_exit"]
+
+    assert pre_exit["conflict"] is True
+    assert pre_exit["initialized"] is False
+    assert pre_exit["configured"] is False
+    assert pre_exit["foreign_untouched"] is True
+
+
 def test_process_exit_hook_flushes_ended_spans_and_logs() -> None:
     payloads = _run_mode("atexit_flush")
     pre_exit = payloads["pre_exit"]
