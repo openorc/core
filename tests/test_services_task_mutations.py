@@ -993,3 +993,34 @@ def test_unconfigured_telemetry_does_not_change_mutation_behavior() -> None:
     assert updated.state_token == _NEW_TOKEN
     assert len(conn.executed) == 2
     assert not isinstance(trace_api.get_tracer_provider(), SdkTracerProvider)
+
+
+def test_malformed_identifiers_never_enter_exported_telemetry() -> None:
+    """Malformed command values are classified without being exported."""
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool([])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(InvalidCommandError),
+    ):
+        task_mutations.update_task_status(
+            pool,
+            workspace_id="not-a-workspace-uuid",  # type: ignore[arg-type]
+            task_id="not-a-task-uuid",  # type: ignore[arg-type]
+            expected_state_token="not-a-token-uuid",  # type: ignore[arg-type]
+            status=TaskStatus.PLANNING,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "task_mutations.update_task_status"
+    assert exported.status.status_code is StatusCode.ERROR
+    assert exported.status.description == "InvalidCommandError"
+    # The caller-supplied identifiers are validated before attachment: the
+    # malformed values never become safe-vocabulary span attributes.
+    attributes = exported.attributes or {}
+    assert WORKSPACE_ID not in attributes
+    assert TASK_ID not in attributes
+    assert "not-a-workspace-uuid" not in str(attributes)
+    assert "not-a-task-uuid" not in str(attributes)
+    assert conn.executed == []

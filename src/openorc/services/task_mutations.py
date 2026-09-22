@@ -98,7 +98,9 @@ __all__ = [
 # Task mutation opens one span at its use-case boundary. Subject guards, the
 # locked re-read, and the conditional persistence writes run inside these
 # spans without spans of their own; telemetry is observational and never
-# workflow authority.
+# workflow authority. Caller-supplied identifiers are validated as UUID
+# commands before attachment, so malformed command values are classified
+# without ever entering telemetry.
 _TASK_MUTATIONS_TRACER_SCOPE = "openorc.services.task_mutations"
 _UPDATE_TASK_STATUS_SPAN_NAME = "task_mutations.update_task_status"
 _ARCHIVE_TASK_SPAN_NAME = "task_mutations.archive_task"
@@ -186,15 +188,17 @@ def update_task_status(
     the post-write Task carrying the newly rotated token.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _UPDATE_TASK_STATUS_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
         annotate_span(
             span,
             operation=_UPDATE_TASK_STATUS_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
         if not isinstance(status, TaskStatus) or status.is_terminal:
             raise InvalidCommandError(
                 "update_task_status requires a nonterminal TaskStatus; "
@@ -244,15 +248,15 @@ def archive_task(
     mutation writes no event.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _ARCHIVE_TASK_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
         annotate_span(
             span,
             operation=_ARCHIVE_TASK_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
         if not isinstance(terminal_status, TaskStatus) or not terminal_status.is_terminal:
             raise InvalidCommandError(
                 "archive_task requires a terminal TaskStatus (cancelled or completed); "
@@ -308,16 +312,16 @@ def bind_canonical_branch(
     token.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _BIND_CANONICAL_BRANCH_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_nonblank_command(canonical_feature_branch, "canonical_feature_branch")
         annotate_span(
             span,
             operation=_BIND_CANONICAL_BRANCH_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_nonblank_command(canonical_feature_branch, "canonical_feature_branch")
         with composed_transaction(pool) as transaction_pool:
             require_current_task(
                 transaction_pool,
@@ -377,16 +381,16 @@ def set_current_plan_revision(
     with application_span(
         _TASK_MUTATIONS_TRACER_SCOPE, _SET_CURRENT_PLAN_REVISION_SPAN_NAME
     ) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(plan_revision_id, "plan_revision_id")
         annotate_span(
             span,
             operation=_SET_CURRENT_PLAN_REVISION_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_uuid_command(plan_revision_id, "plan_revision_id")
         with composed_transaction(pool) as transaction_pool:
             task = require_current_task(
                 transaction_pool,
@@ -430,16 +434,16 @@ def set_current_owner_gate(
     mutation returns the post-write Task with its newly rotated token.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _SET_CURRENT_OWNER_GATE_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
         annotate_span(
             span,
             operation=_SET_CURRENT_OWNER_GATE_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_uuid_command(owner_gate_id, "owner_gate_id")
         with composed_transaction(pool) as transaction_pool:
             task = require_current_task(
                 transaction_pool,
@@ -503,16 +507,16 @@ def resolve_owner_gate(
     failure path writes no event.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _RESOLVE_OWNER_GATE_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
         annotate_span(
             span,
             operation=_RESOLVE_OWNER_GATE_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_uuid_command(owner_gate_id, "owner_gate_id")
         if not isinstance(outcome, OwnerGateStatus) or outcome is OwnerGateStatus.PENDING:
             raise InvalidCommandError(
                 "resolve_owner_gate requires a terminal OwnerGateStatus outcome "

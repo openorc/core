@@ -159,17 +159,19 @@ def _fetch_jwks_document(jwks_url: str, timeout_seconds: float) -> bytes:
 def _fetch_jwks_keys(
     fetch: _JwksFetcher, jwks_url: str, timeout_seconds: float
 ) -> list[dict[str, object]]:
-    """Fetch and classify: transport errors classify here, at the call site.
+    """Fetch and classify: retrieval failures classify here, at the call site.
 
-    HTTP failure is a known non-success of the JWKS retrieval; timeout or
-    connection loss leaves the outcome unknown. Both are normalized to the
-    adapter-local retrieval errors regardless of the underlying fetch
-    implementation, so verification infrastructure failures are never
-    confused with token rejections.
+    HTTP failure and an unusable document are known non-successes of the JWKS
+    retrieval; timeout or connection loss leaves the outcome unknown. All are
+    normalized to the adapter-local retrieval errors regardless of the
+    underlying fetch/parse behavior, so verification infrastructure failures
+    are never confused with token rejections.
 
-    Representative external-adapter span boundary (issue #108): the JWKS
-    URL carries the Supabase project reference and is not part of the safe
-    attribute vocabulary, so only the operation name is attached.
+    External-adapter span boundary (issues #108/#109): the span covers the
+    whole retrieval including document parsing, so every known-failure path
+    is classified by the same span. The JWKS URL carries the Supabase project
+    reference and is not part of the safe attribute vocabulary, so only the
+    operation name is attached.
     """
     with application_span(_JWKS_TRACER_SCOPE, _JWKS_RETRIEVAL_SPAN_NAME) as span:
         annotate_span(span, operation=_JWKS_RETRIEVAL_SPAN_NAME)
@@ -196,7 +198,17 @@ def _fetch_jwks_keys(
             raise SupabaseJwksOutcomeUnknownError(
                 "the Supabase Auth signing-key source could not be reached"
             ) from exc
-    return _parse_jwks_document(raw)
+        try:
+            keys = _parse_jwks_document(raw)
+        except SupabaseJwksUnavailableError:
+            # An unusable document is a known failure of the retrieval itself,
+            # inside the same span: the same fixed safe operational warning —
+            # never the raw document, the URL, or any key material.
+            logger.warning(
+                "Supabase Auth JWKS retrieval failed: the signing-key document was unusable"
+            )
+            raise
+    return keys
 
 
 def _select_signing_key(
