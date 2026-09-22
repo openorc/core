@@ -49,7 +49,7 @@ Domain/services must be usable without an HTTP request or queue job object.
 - Never infer workflow meaning from database shape or provider-native response shape.
 - External-operation uncertainty is neither success nor known failure.
 
-## Application observability (issue #108)
+## Application observability
 
 OpenOrc application telemetry is OpenTelemetry with OTLP as the vendor-neutral export boundary, owned by the focused boundary in `openorc.observability/`. Durable `WorkflowEvent` audit history stays in Postgres and is never operational logging; connected-runtime telemetry stays runtime-owned and separate.
 
