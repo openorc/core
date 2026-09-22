@@ -14,7 +14,7 @@ A replayed job must never create replacement Task sessions, resend a known-deliv
 
 RQ status is not workflow truth. Postgres is. Workers must be restartable without reconstructing domain state from process memory.
 
-## Queue telemetry (issue #108)
+## Queue telemetry
 
 - The worker process initializes observability once per process at start and performs the terminal shutdown/flush in `run_worker`'s `finally`; telemetry misconfiguration fails fast like other configuration errors, and runtime export failures never crash the worker.
 - Job entrypoints create spans through `observability.tracing.application_tracer` with the RQ job identity from the safe attribute vocabulary (`openorc.rq_job_id`). Queue handoff may propagate trace context through job metadata where it can do so safely; queue state is never workflow truth and trace context is telemetry-only.
