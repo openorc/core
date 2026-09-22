@@ -24,7 +24,7 @@ from typing import Any, cast
 
 import pytest
 from psycopg import Connection, connect
-from psycopg.errors import CheckViolation, LockNotAvailable
+from psycopg.errors import CheckViolation, LockNotAvailable, QueryCanceled
 
 from openorc.domain.connections import AdapterType
 from openorc.persistence import connections as connection_repositories
@@ -61,36 +61,57 @@ def _seed_account(conn: Connection[Any], user_id: uuid.UUID) -> None:
     conn.execute("insert into openorc.profiles (id) values (%s)", (user_id,))
 
 
+def _apply_probe_timeouts(conn: Connection[Any]) -> None:
+    """Apply the deliberate lock-probe timeouts with transaction-local SQL.
+
+    The suite consumes the Supabase branch database through its pooler URL,
+    where connection-startup ``options`` are not reliably forwarded, so the
+    timeouts are set inside the racer's own transaction: they are then
+    guaranteed to be in force on the exact server connection that executes
+    the blocked statement. Whichever timeout raises first — ``lock_timeout``
+    maps to ``LockNotAvailable`` and ``statement_timeout`` to
+    ``QueryCanceled`` — is the blocking signal the racers treat as
+    ``blocked``; without one, the probe would wait indefinitely on the
+    deliberately held root lock.
+    """
+    conn.execute("set local lock_timeout = '500ms'")
+    conn.execute("set local statement_timeout = '2s'")
+
+
 def test_composite_check_rejects_impossible_state_tuples(conn: Connection[Any]) -> None:
     user_id = uuid.uuid4()
     _seed_account(conn, user_id)
 
+    # Each deliberately rejected tuple is attempted inside a nested
+    # transaction (a SAVEPOINT on this connection): the expected
+    # CheckViolation rolls back only that savepoint, so the outer fixture
+    # transaction — and the seeded account inside it — survives every probe.
+    # A transaction-abort rollback here would also drop the seed, silently
+    # turning a later invalid UPDATE into a zero-row write that never
+    # evaluates the CHECK.
+
     # state without the attempt UUID/timestamp is unrepresentable.
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "update openorc.profiles set account_deletion_state = 'active' where id = %s",
             (user_id,),
         )
-    conn.rollback()
-    _seed_account(conn, user_id)
 
     # A state without the establishment time is unrepresentable.
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "update openorc.profiles "
             "set account_deletion_state = 'active', account_deletion_attempt_id = %s "
             "where id = %s",
             (uuid.uuid4(), user_id),
         )
-    conn.rollback()
 
     # A non-NULL attempt UUID with a NULL state is unrepresentable.
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "update openorc.profiles set account_deletion_attempt_id = %s where id = %s",
             (uuid.uuid4(), user_id),
         )
-    conn.rollback()
 
     # The coherent 'active' tuple is representable.
     attempt_id = uuid.uuid4()
@@ -203,21 +224,28 @@ def test_workspace_root_lock_blocks_child_inserts_during_the_cleanup_set(
 
     def racer() -> None:
         try:
-            racer_conn = connect(
-                migrated_database,
-                options="-c lock_timeout=500 -c statement_timeout=2000",
-            )
-            start.wait()
-            connection_repositories.create_connection(
-                cast(DatabasePool, _SingleConnectionPool(racer_conn)),
-                workspace_id=workspace.id,
-                adapter=AdapterType.CLINE,
-                name="late-entry",
-            )
-            racer_outcomes.append("allowed")
-        except LockNotAvailable:
-            # The blocked INSERT hit its lock timeout: the root lock held.
-            racer_outcomes.append("blocked")
+            with connect(migrated_database) as racer_conn:
+                start.wait()
+                try:
+                    with racer_conn.transaction():
+                        _apply_probe_timeouts(racer_conn)
+                        connection_repositories.create_connection(
+                            cast(DatabasePool, _SingleConnectionPool(racer_conn)),
+                            workspace_id=workspace.id,
+                            adapter=AdapterType.CLINE,
+                            name="late-entry",
+                        )
+                    racer_outcomes.append("allowed")
+                except (LockNotAvailable, QueryCanceled):
+                    # A deliberate probe timeout raising on the blocked INSERT
+                    # is direct evidence the Workspace-root lock held: either
+                    # lock_timeout (LockNotAvailable) or statement_timeout
+                    # (QueryCanceled) may fire first, and both count as
+                    # blocked. QueryCanceled is accepted ONLY in this
+                    # deliberate timeout-based contention probe; every other
+                    # database error still surfaces through the collector
+                    # below.
+                    racer_outcomes.append("blocked")
         except BaseException as exc:  # noqa: BLE001 — collected and asserted below
             errors.append(exc)
 
@@ -260,21 +288,28 @@ def test_account_deletion_profile_lock_serializes_guarded_mutations(
 
     def racer() -> None:
         try:
-            racer_conn = connect(
-                migrated_database,
-                options="-c lock_timeout=500 -c statement_timeout=2000",
-            )
-            start.wait()
-            require_account_operational(
-                cast(DatabasePool, _SingleConnectionPool(racer_conn)), profile_id=user_id
-            )
-            racer_outcomes.append("passed")
-        except LockNotAvailable:
-            # The guarded mutation blocked on the Profile-root lock held by
-            # the revocation transaction.
-            racer_outcomes.append("blocked")
-        except ConflictError:
-            racer_outcomes.append("rejected")
+            with connect(migrated_database) as racer_conn:
+                start.wait()
+                try:
+                    with racer_conn.transaction():
+                        _apply_probe_timeouts(racer_conn)
+                        require_account_operational(
+                            cast(DatabasePool, _SingleConnectionPool(racer_conn)),
+                            profile_id=user_id,
+                        )
+                    racer_outcomes.append("passed")
+                except (LockNotAvailable, QueryCanceled):
+                    # A deliberate probe timeout raising on the blocked
+                    # FOR KEY SHARE read is direct evidence the Profile-root
+                    # lock held: either lock_timeout (LockNotAvailable) or
+                    # statement_timeout (QueryCanceled) may fire first, and
+                    # both count as blocked. QueryCanceled is accepted ONLY
+                    # in this deliberate timeout-based contention probe;
+                    # every other database error still surfaces through the
+                    # collector below.
+                    racer_outcomes.append("blocked")
+                except ConflictError:
+                    racer_outcomes.append("rejected")
         except BaseException as exc:  # noqa: BLE001 — collected and asserted below
             errors.append(exc)
 
