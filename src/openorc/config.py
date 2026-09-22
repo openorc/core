@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 ENVIRONMENT_VAR = "OPENORC_ENV"
@@ -23,6 +23,17 @@ DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
 DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
 SUPABASE_URL_VAR = "SUPABASE_URL"
 SUPABASE_JWT_AUDIENCE_VAR = "OPENORC_SUPABASE_JWT_AUDIENCE"
+# The deployment's Supabase secret API key (issue #97): the non-JWT
+# administrative credential for the supported server-side Supabase Auth Admin
+# boundary (permanent account deletion). Deliberately OPTIONAL on this shared
+# surface: both the API and worker process surfaces boot through
+# Settings.from_env, and authentication ownership follows direct consumption —
+# no process may receive this administrative credential merely because it is
+# required elsewhere. The requirement is enforced where the Auth Admin client
+# is constructed, in the component that owns account deletion. The key is
+# process bootstrap material only: never browser-visible, never persisted in
+# openorc.* tables or Vault, never logged or returned.
+SUPABASE_SECRET_KEY_VAR = "SUPABASE_SECRET_KEY"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
@@ -77,6 +88,27 @@ def _read(env: Mapping[str, str], name: str) -> str | None:
     return value
 
 
+def _read_secret(env: Mapping[str, str], name: str) -> str | None:
+    """Read one secret setting, distinguishing absent from supplied-blank.
+
+    Secrets are process bootstrap material under a strict
+    never-log/never-return boundary. Unlike ordinary optional settings, a
+    supplied-but-blank or whitespace-only value is a configuration error
+    raised WITHOUT echoing the value — a silently-unset secret would only
+    fail later, misleadingly, at its point of consumption. A supplied value
+    is otherwise preserved verbatim: credential bytes are meaningful and are
+    never stripped or normalized.
+    """
+    value = env.get(name)
+    if value is None:
+        return None
+    if not value.strip():
+        raise ConfigurationError(
+            f"{name} was supplied blank: provide the secret value or leave the variable unset"
+        )
+    return value
+
+
 def _read_int(env: Mapping[str, str], name: str, *, minimum: int, default: int) -> int:
     """Read an integer setting enforcing a minimum; blank/unset uses default."""
     raw = _read(env, name)
@@ -120,6 +152,9 @@ class Settings:
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
     supabase_url: str | None = None
     supabase_jwt_audience: str = DEFAULT_SUPABASE_JWT_AUDIENCE
+    # Representation-safe: the generated dataclass repr/str must never carry
+    # the raw administrative credential (issue #97 secret-handling boundary).
+    supabase_secret_key: str | None = field(default=None, repr=False)
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -210,6 +245,18 @@ class Settings:
             _read(source, SUPABASE_JWT_AUDIENCE_VAR) or DEFAULT_SUPABASE_JWT_AUDIENCE
         )
 
+        # Supabase Auth Admin credential (issue #97). Optional on this shared
+        # surface in every environment — including production: the
+        # administrative credential belongs only to the component that
+        # constructs the Auth Admin client, and that component fails fast at
+        # construction when its required key is absent. A supplied-but-blank
+        # or whitespace-only value is a configuration error (fail closed
+        # without echoing the value): secrets are never silently unset. The
+        # field is representation-safe (excluded from the dataclass
+        # repr/str), never validated for shape here (it is opaque deployment
+        # material), and never logged or returned.
+        supabase_secret_key = _read_secret(source, SUPABASE_SECRET_KEY_VAR)
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -235,5 +282,6 @@ class Settings:
             db_pool_timeout=db_pool_timeout,
             supabase_url=supabase_url,
             supabase_jwt_audience=supabase_jwt_audience,
+            supabase_secret_key=supabase_secret_key,
             otlp_endpoint=otlp_endpoint,
         )

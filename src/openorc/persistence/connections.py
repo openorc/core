@@ -41,11 +41,27 @@ __all__ = [
     "get_connection_for_update",
     "get_role_binding",
     "list_connection_bindings",
+    "list_profile_connections_for_update",
     "list_workspace_connections",
+    "list_workspace_connections_for_update",
     "set_connection_auth_reference",
     "set_role_binding",
     "update_connection",
 ]
+
+_CONNECTION_COLUMNS = (
+    "id, workspace_id, adapter_type, name, safe_config, session_capacity, "
+    "enabled, auth_reference, reported_provider, reported_model, created_at, updated_at"
+)
+
+# Qualified column list for join queries that alias openorc.connections as
+# ``c`` (issue #97 locked profile-wide enumeration): unqualified names would
+# be ambiguous against the joined workspaces table.
+_CONNECTION_QUALIFIED_COLUMNS = (
+    "c.id, c.workspace_id, c.adapter_type, c.name, c.safe_config, c.session_capacity, "
+    "c.enabled, c.auth_reference, c.reported_provider, c.reported_model, "
+    "c.created_at, c.updated_at"
+)
 
 _CONNECTION_COLUMNS = (
     "id, workspace_id, adapter_type, name, safe_config, session_capacity, "
@@ -136,6 +152,52 @@ def list_workspace_connections(pool: DatabasePool, *, workspace_id: UUID) -> lis
             f"select {_CONNECTION_COLUMNS} from openorc.connections "
             "where workspace_id = %s order by created_at, id",
             (workspace_id,),
+        ).fetchall()
+    return [_connection_from_row(row) for row in rows]
+
+
+def list_workspace_connections_for_update(
+    pool: DatabasePool, *, workspace_id: UUID
+) -> list[Connection]:
+    """Row-locked enumeration of one Workspace's Connections (issue #97).
+
+    The deliberate ``SELECT ... FOR UPDATE`` in deterministic ``id`` order
+    serializes administrative credential cleanup against concurrent
+    configure/rotate (which lock the same rows through
+    :func:`get_connection_for_update`): every Connection's current
+    ``auth_reference`` is inspected under the same lock that guards the
+    follow-up Vault mutation, so a concurrent rotation can neither install a
+    secret the cleanup misses nor repoint a reference after it was read. The
+    lock is held within the caller's composed transaction only.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_CONNECTION_COLUMNS} from openorc.connections "
+            "where workspace_id = %s order by id for update",
+            (workspace_id,),
+        ).fetchall()
+    return [_connection_from_row(row) for row in rows]
+
+
+def list_profile_connections_for_update(
+    pool: DatabasePool, *, owner_profile_id: UUID
+) -> list[Connection]:
+    """Row-locked enumeration of every Connection across a Profile's Workspaces.
+
+    Account-deletion revocation enumerates the complete Workspace-owned
+    Connection set of one Profile in one deterministic (``ORDER BY c.id``)
+    ``SELECT ... FOR UPDATE OF c``: only the Connection rows are locked — the
+    joined Workspace rows are deliberately NOT locked here (a Workspace root
+    lock, where one is required, is always an explicit dedicated operation).
+    Like the Workspace-scoped enumeration, this serializes cleanup against
+    concurrent configure/rotate under the same row locks those flows use.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_CONNECTION_QUALIFIED_COLUMNS} from openorc.connections c "
+            "join openorc.workspaces w on c.workspace_id = w.id "
+            "where w.owner_profile_id = %s order by c.id for update of c",
+            (owner_profile_id,),
         ).fetchall()
     return [_connection_from_row(row) for row in rows]
 

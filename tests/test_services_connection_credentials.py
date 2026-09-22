@@ -40,6 +40,11 @@ _OBSERVED = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
 _CREDENTIAL = "s3cr3t-credential-value"
 _ROTATED_CREDENTIAL = "n3w-creden7i4l-v4lu3"
 
+# The account-deletion Owner-mutation barrier (issue #97) composes as the
+# FIRST database read of every configure/rotate flow; the scripted result
+# row for an operational account carries the all-NULL attempt-state tuple.
+_GUARD_OPERATIONAL_ROW = (None, None, None)
+
 
 class FakeCursor:
     """Returns one canned row, like a psycopg cursor."""
@@ -158,7 +163,15 @@ def test_configure_preserves_non_empty_values_verbatim() -> None:
     locked = _connection_row(workspace_id)
     reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
     updated = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), locked, (secret_id,), updated])
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(profile_id),
+            locked,
+            (secret_id,),
+            updated,
+        ]
+    )
 
     connection_credentials.configure_connection_credential(
         _pool(conn),
@@ -168,7 +181,7 @@ def test_configure_preserves_non_empty_values_verbatim() -> None:
         credential="  spaced value  ",
     )
 
-    create_sql, create_params = conn.executed[2]
+    create_sql, create_params = conn.executed[3]
     assert create_sql == "select vault.create_secret(%s, null, %s)"
     assert create_params is not None
     # No stripping or normalization: credential bytes are meaningful.
@@ -182,7 +195,15 @@ def test_configure_creates_the_secret_and_installs_the_reference_atomically() ->
     locked = _connection_row(workspace_id)
     reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
     updated = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), locked, (secret_id,), updated])
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(profile_id),
+            locked,
+            (secret_id,),
+            updated,
+        ]
+    )
 
     result = connection_credentials.configure_connection_credential(
         _pool(conn),
@@ -195,15 +216,15 @@ def test_configure_creates_the_secret_and_installs_the_reference_atomically() ->
     assert result.auth_reference == reference
     # One composed transaction: ownership gate, row-locked read, Vault secret
     # creation, then the opaque reference install.
-    ownership_sql, _ = conn.executed[0]
+    ownership_sql, _ = conn.executed[1]
     assert "from openorc.workspaces where id = %s" in ownership_sql
-    lock_sql, _ = conn.executed[1]
+    lock_sql, _ = conn.executed[2]
     assert "for update" in lock_sql
-    create_sql, create_params = conn.executed[2]
+    create_sql, create_params = conn.executed[3]
     assert create_sql == "select vault.create_secret(%s, null, %s)"
     assert create_params is not None
     assert create_params[0] == _CREDENTIAL
-    install_sql, install_params = conn.executed[3]
+    install_sql, install_params = conn.executed[4]
     assert "update openorc.connections" in install_sql
     assert "set auth_reference = %s" in install_sql
     assert install_params == (reference, locked[0])
@@ -216,7 +237,7 @@ def test_configure_conflicts_when_a_credential_is_already_configured() -> None:
         workspace_id,
         auth_reference=runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4()),
     )
-    conn = ScriptedConnection([_ws_row(profile_id), locked])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked])
 
     with pytest.raises(ConflictError):
         connection_credentials.configure_connection_credential(
@@ -227,8 +248,8 @@ def test_configure_conflicts_when_a_credential_is_already_configured() -> None:
             credential=_CREDENTIAL,
         )
 
-    # Ownership gate + locked read ran; no Vault secret was created.
-    assert len(conn.executed) == 2
+    # Barrier read, ownership gate, and locked read ran; no Vault secret was created.
+    assert len(conn.executed) == 3
     assert all("vault.create_secret" not in sql for sql, _ in conn.executed)
 
 
@@ -237,7 +258,7 @@ def test_configure_fails_closed_for_missing_and_cross_workspace_connections() ->
     workspace_id = uuid.uuid4()
     other_workspace = uuid.uuid4()
 
-    missing = ScriptedConnection([_ws_row(profile_id), None])
+    missing = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), None])
     with pytest.raises(NotFoundError):
         connection_credentials.configure_connection_credential(
             _pool(missing),
@@ -246,11 +267,11 @@ def test_configure_fails_closed_for_missing_and_cross_workspace_connections() ->
             connection_id=uuid.uuid4(),
             credential=_CREDENTIAL,
         )
-    assert len(missing.executed) == 2
+    assert len(missing.executed) == 3
     assert all("vault" not in sql for sql, _ in missing.executed)
 
     other_row = _connection_row(other_workspace)
-    cross = ScriptedConnection([_ws_row(profile_id), other_row])
+    cross = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), other_row])
     with pytest.raises(NotFoundError):
         connection_credentials.configure_connection_credential(
             _pool(cross),
@@ -259,12 +280,12 @@ def test_configure_fails_closed_for_missing_and_cross_workspace_connections() ->
             connection_id=other_row[0],
             credential=_CREDENTIAL,
         )
-    assert len(cross.executed) == 2
+    assert len(cross.executed) == 3
     assert all("vault" not in sql for sql, _ in cross.executed)
 
 
 def test_configure_fails_closed_for_non_owners() -> None:
-    conn = ScriptedConnection([_ws_row(uuid.uuid4())])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(uuid.uuid4())])
 
     with pytest.raises(NotFoundError):
         connection_credentials.configure_connection_credential(
@@ -275,8 +296,8 @@ def test_configure_fails_closed_for_non_owners() -> None:
             credential=_CREDENTIAL,
         )
 
-    # Only the ownership gate ran; nothing else was attempted.
-    assert len(conn.executed) == 1
+    # The barrier and ownership-gate reads ran; nothing else was attempted.
+    assert len(conn.executed) == 2
 
 
 def test_rotate_updates_the_secret_in_place_and_keeps_the_reference() -> None:
@@ -285,7 +306,7 @@ def test_rotate_updates_the_secret_in_place_and_keeps_the_reference() -> None:
     secret_id = uuid.uuid4()
     reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
     locked = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), locked, (1,), (None,)])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked, (1,), (None,)])
 
     result = connection_credentials.rotate_connection_credential(
         _pool(conn),
@@ -298,10 +319,10 @@ def test_rotate_updates_the_secret_in_place_and_keeps_the_reference() -> None:
     assert result.auth_reference == reference
     # In-place update: the Vault function is called with the exact secret id
     # and the new value; the Connection row is never rewritten.
-    assert len(conn.executed) == 4
-    existence_sql, _ = conn.executed[2]
+    assert len(conn.executed) == 5
+    existence_sql, _ = conn.executed[3]
     assert existence_sql == "select 1 from vault.secrets where id = %s"
-    update_sql, update_params = conn.executed[3]
+    update_sql, update_params = conn.executed[4]
     assert update_sql == "select vault.update_secret(%s, %s)"
     assert update_params == (secret_id, _ROTATED_CREDENTIAL)
     assert all("update openorc.connections" not in sql for sql, _ in conn.executed)
@@ -311,7 +332,7 @@ def test_rotate_conflicts_without_a_configured_credential() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     locked = _connection_row(workspace_id, auth_reference=None)
-    conn = ScriptedConnection([_ws_row(profile_id), locked])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked])
 
     with pytest.raises(ConflictError):
         connection_credentials.rotate_connection_credential(
@@ -322,7 +343,7 @@ def test_rotate_conflicts_without_a_configured_credential() -> None:
             credential=_ROTATED_CREDENTIAL,
         )
 
-    assert len(conn.executed) == 2
+    assert len(conn.executed) == 3
     assert all("vault.update_secret" not in sql for sql, _ in conn.executed)
 
 
@@ -330,7 +351,7 @@ def test_rotate_conflicts_on_a_malformed_reference() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     locked = _connection_row(workspace_id, auth_reference="vault://openorc/connection-auth/abc")
-    conn = ScriptedConnection([_ws_row(profile_id), locked])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked])
 
     with pytest.raises(ConflictError):
         connection_credentials.rotate_connection_credential(
@@ -341,7 +362,7 @@ def test_rotate_conflicts_on_a_malformed_reference() -> None:
             credential=_ROTATED_CREDENTIAL,
         )
 
-    assert len(conn.executed) == 2
+    assert len(conn.executed) == 3
     assert all("vault.update_secret" not in sql for sql, _ in conn.executed)
 
 
@@ -352,7 +373,7 @@ def test_rotate_conflicts_on_a_dangling_secret() -> None:
         workspace_id,
         auth_reference=runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4()),
     )
-    conn = ScriptedConnection([_ws_row(profile_id), locked, None])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked, None])
 
     with pytest.raises(ConflictError):
         connection_credentials.rotate_connection_credential(
@@ -363,8 +384,8 @@ def test_rotate_conflicts_on_a_dangling_secret() -> None:
             credential=_ROTATED_CREDENTIAL,
         )
 
-    # Existence check ran; the in-place update did not.
-    assert len(conn.executed) == 3
+    # Barrier read, existence check ran; the in-place update did not.
+    assert len(conn.executed) == 4
     assert all("vault.update_secret" not in sql for sql, _ in conn.executed)
 
 
@@ -375,7 +396,7 @@ def test_rotate_failure_messages_never_contain_the_credential() -> None:
         workspace_id,
         auth_reference=runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4()),
     )
-    conn = ScriptedConnection([_ws_row(profile_id), locked, None])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked, None])
 
     with pytest.raises(ConflictError) as error:
         connection_credentials.rotate_connection_credential(
@@ -538,7 +559,15 @@ def test_configure_opens_its_service_span_without_credential_material() -> None:
     locked = _connection_row(workspace_id)
     reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
     updated = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), locked, (secret_id,), updated])
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(profile_id),
+            locked,
+            (secret_id,),
+            updated,
+        ]
+    )
 
     with injected_tracer_source(lambda name: provider.get_tracer(name)):
         connection_credentials.configure_connection_credential(
@@ -569,7 +598,7 @@ def test_rotate_opens_its_service_span_without_credential_material() -> None:
     workspace_id = uuid.uuid4()
     reference = runtime_control_secrets.encode_connection_auth_reference(uuid.uuid4())
     locked = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), locked, (1,), (None,)])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), locked, (1,), (None,)])
 
     with injected_tracer_source(lambda name: provider.get_tracer(name)):
         connection_credentials.rotate_connection_credential(
@@ -679,7 +708,7 @@ def test_rotation_dangling_reference_logs_a_safe_warning(
     secret_id = uuid.uuid4()
     reference = runtime_control_secrets.encode_connection_auth_reference(secret_id)
     row = _connection_row(workspace_id, auth_reference=reference)
-    conn = ScriptedConnection([_ws_row(profile_id), row, None])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), row, None])
 
     with (
         caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
@@ -712,11 +741,11 @@ def test_rotation_unrecognized_reference_logs_a_safe_warning(
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     row = _connection_row(workspace_id, auth_reference="vault://openorc/connection-auth/abc")
-    conn = ScriptedConnection([_ws_row(profile_id), row])
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), row])
 
     with (
         caplog.at_level(logging.WARNING, logger="openorc.services.connection_credentials"),
-        pytest.raises(ConflictError),
+        pytest.raises(ConflictError, match="recognized v1 reference"),
     ):
         connection_credentials.rotate_connection_credential(
             _pool(conn),
@@ -735,3 +764,121 @@ def test_rotation_unrecognized_reference_logs_a_safe_warning(
     message = warnings[0].getMessage()
     assert "unrecognized auth reference" in message
     assert _ROTATED_CREDENTIAL not in message
+
+
+def test_configure_is_rejected_for_a_disabled_connection() -> None:
+    # The revocation barrier (issue #97): disconnect is the durable revoke —
+    # a disabled Connection can never acquire a new Vault secret, so a
+    # successful Auth deletion can no longer orphan a secret installed behind
+    # a cascaded-away Connection.
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    disabled = _connection_row(workspace_id, enabled=False)
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), disabled])
+
+    with pytest.raises(ConflictError, match="disabled connection"):
+        connection_credentials.configure_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=disabled[0],
+            credential=_CREDENTIAL,
+        )
+
+    # The barrier read, ownership gate, and row-locked read ran; no Vault
+    # secret was created and no reference installed.
+    assert len(conn.executed) == 3
+    assert all("vault" not in sql for sql, _ in conn.executed)
+
+
+def test_rotation_is_rejected_for_a_disabled_connection() -> None:
+    # Rotation is not the create path (it cannot create secrets), so the
+    # revocation-barrier rule targets configuration; a disconnected
+    # Connection has no credential reference to rotate and fails closed
+    # through the no-configured-credential conflict instead. This test
+    # documents the coherent boundary: configuration is the only path that
+    # can create Vault secrets, and it is the one guarded.
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    disconnected = _connection_row(workspace_id, auth_reference=None, enabled=False)
+    conn = ScriptedConnection([_GUARD_OPERATIONAL_ROW, _ws_row(profile_id), disconnected])
+
+    with pytest.raises(ConflictError, match="no configured credential"):
+        connection_credentials.rotate_connection_credential(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=disconnected[0],
+            credential=_CREDENTIAL,
+        )
+
+    assert all("vault" not in sql for sql, _ in conn.executed)
+
+
+def test_owner_credential_flows_fail_closed_while_a_deletion_attempt_exists() -> None:
+    # The account-wide barrier (issue #97): any existing attempt state
+    # ('active' or 'uncertain') rejects the mutation before any subject lock.
+    # Rotation is guarded identically: it cannot create secrets, but it is an
+    # Owner mutation and takes the barrier read first.
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    for state in ("active", "uncertain"):
+        attempt = uuid.uuid4()
+        blocked = ScriptedConnection([(state, attempt, _OBSERVED)])
+        with pytest.raises(ConflictError, match="account is being deleted"):
+            connection_credentials.configure_connection_credential(
+                _pool(blocked),
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                connection_id=uuid.uuid4(),
+                credential=_CREDENTIAL,
+            )
+        # Only the barrier read ran — the Connection was never locked.
+        assert len(blocked.executed) == 1
+        assert "for key share" in blocked.executed[0][0]
+
+        blocked_rotation = ScriptedConnection([(state, attempt, _OBSERVED)])
+        with pytest.raises(ConflictError, match="account is being deleted"):
+            connection_credentials.rotate_connection_credential(
+                _pool(blocked_rotation),
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                connection_id=uuid.uuid4(),
+                credential=_CREDENTIAL,
+            )
+        assert len(blocked_rotation.executed) == 1
+
+
+def test_owner_credential_flows_take_the_barrier_read_before_any_subject_lock() -> None:
+    # The Profile FOR KEY SHARE read is the FIRST lock acquisition of every
+    # guarded mutation, before the Workspace read and before the Connection
+    # row lock (issue #97 ordering rule).
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    locked = _connection_row(workspace_id)
+    secret_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(profile_id),
+            locked,
+            (secret_id,),
+            _connection_row(
+                workspace_id,
+                auth_reference=runtime_control_secrets.encode_connection_auth_reference(secret_id),
+            ),
+        ]
+    )
+
+    connection_credentials.configure_connection_credential(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        connection_id=locked[0],
+        credential=_CREDENTIAL,
+    )
+
+    sqls = [sql for sql, _ in conn.executed]
+    assert "for key share" in sqls[0]
+    assert "openorc.profiles" in sqls[0]
+    assert "for update" in sqls[2]  # the Connection lock comes after the barrier

@@ -57,6 +57,7 @@ from openorc.persistence.connections import (
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.runtime_control_secrets import RuntimeControlSecretReferenceError
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
+from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_profile_workspace
 
@@ -169,12 +170,25 @@ def configure_connection_credential(
         )
         _require_credential_value(credential)
         with composed_transaction(pool) as transaction_pool:
+            # The account-wide Owner-mutation barrier first (issue #97): the
+            # Profile FOR KEY SHARE read is the first lock acquisition, before
+            # any Connection row lock, and fails closed while an account
+            # deletion attempt is unresolved.
+            require_account_operational(transaction_pool, profile_id=profile_id)
             connection = _require_owner_authorized_connection(
                 transaction_pool,
                 profile_id=profile_id,
                 workspace_id=workspace_id,
                 connection_id=connection_id,
             )
+            if not connection.enabled:
+                # Disconnection is the revocation barrier: a disabled
+                # Connection can never acquire a new Vault secret (issue #97
+                # defense in depth — the account-wide deletion barrier is the
+                # primary guard).
+                raise ConflictError(
+                    "a disabled connection cannot be configured with a new credential"
+                )
             if connection.auth_reference is not None:
                 raise ConflictError(
                     "the connection already has a configured credential; rotate it instead"
@@ -224,6 +238,9 @@ def rotate_connection_credential(
         )
         _require_credential_value(credential)
         with composed_transaction(pool) as transaction_pool:
+            # The account-wide Owner-mutation barrier first (issue #97): the
+            # Profile FOR KEY SHARE read precedes any Connection row lock.
+            require_account_operational(transaction_pool, profile_id=profile_id)
             connection = _require_owner_authorized_connection(
                 transaction_pool,
                 profile_id=profile_id,
