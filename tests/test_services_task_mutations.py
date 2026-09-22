@@ -11,6 +11,14 @@ the token-continuation contract: a successful mutation returns the
 post-write Task, and a caller continuing with the returned token succeeds
 while the pre-mutation token is stale. Real conditional-SQL classification
 is proven by the integration-marked suite.
+
+Since #56, the terminal archival and exact current-gate resolution also
+coordinate their locked event types through
+``openorc.services.event_coordination`` inside the same composition: these
+tests prove a successful mutation executes its event insert with the exact
+safe actor/subject/context mapping, while every stale/failed path and the
+deliberately non-evented mutations (coarse-status movement, canonical-branch
+binding, plan/gate installation) execute no event insert at all.
 """
 
 from __future__ import annotations
@@ -24,10 +32,11 @@ from typing import Any, cast
 import pytest
 from psycopg.errors import UniqueViolation
 
+from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGateStatus
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
-from openorc.services import task_mutations
+from openorc.services import event_coordination, task_mutations
 from openorc.services.errors import (
     ConflictError,
     InvalidCommandError,
@@ -48,6 +57,8 @@ _THIRD_TOKEN = uuid.uuid4()
 _REVISION_ID = uuid.uuid4()
 _GATE_ID = uuid.uuid4()
 _OTHER_GATE_ID = uuid.uuid4()
+_OWNER_PROFILE_ID = uuid.uuid4()
+_OWNER_ACTOR = event_coordination.owner_actor(_OWNER_PROFILE_ID)
 
 
 class FakeCursor:
@@ -154,7 +165,31 @@ def _gate_row(
     )
 
 
+def _event_row(
+    *,
+    event_type: str = "task_cancelled",
+    task_id: uuid.UUID | None = _TASK_ID,
+    actor_id: str | None = str(_OWNER_PROFILE_ID),
+    subject: tuple[str, uuid.UUID] | None = None,
+) -> tuple[Any, ...]:
+    """A canned `record_workflow_event` INSERT ... RETURNING row."""
+    subject_type, subject_id = subject if subject is not None else (None, None)
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        task_id,
+        event_type,
+        "owner",
+        actor_id,
+        subject_type,
+        subject_id,
+        {},
+        _OBSERVED,
+    )
+
+
 def test_update_task_status_success_rotates_token() -> None:
+    """A deliberately non-evented mutation executes no event insert."""
     pool, conn = _pool([_task_row(), _task_row(status="planning", state_token=_NEW_TOKEN)])
     task = task_mutations.update_task_status(
         pool,
@@ -168,6 +203,7 @@ def test_update_task_status_success_rotates_token() -> None:
     assert len(conn.executed) == 2
     assert "for update" not in conn.executed[0][0]
     assert "update openorc.tasks" in conn.executed[1][0]
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_update_task_status_stale_token_rejects_before_any_write() -> None:
@@ -211,9 +247,13 @@ def test_update_task_status_terminal_status_is_invalid_command() -> None:
     assert conn.executed == []
 
 
-def test_archive_task_success_rotates_token_and_archives() -> None:
+def test_archive_task_cancel_success_rotates_token_and_records_event() -> None:
     pool, conn = _pool(
-        [_task_row(), _task_row(status="cancelled", archived_at=_OBSERVED, state_token=_NEW_TOKEN)]
+        [
+            _task_row(),
+            _task_row(status="cancelled", archived_at=_OBSERVED, state_token=_NEW_TOKEN),
+            _event_row(event_type="task_cancelled"),
+        ]
     )
     task = task_mutations.archive_task(
         pool,
@@ -221,14 +261,54 @@ def test_archive_task_success_rotates_token_and_archives() -> None:
         task_id=_TASK_ID,
         expected_state_token=_TOKEN,
         terminal_status=TaskStatus.CANCELLED,
+        actor=_OWNER_ACTOR,
     )
     assert task.status is TaskStatus.CANCELLED
     assert task.archived_at is not None
     assert task.state_token == _NEW_TOKEN != _TOKEN
-    assert len(conn.executed) == 2
+    # Currentness guard, conditional archival write, then the coordinated
+    # event insert — all one composed transaction.
+    assert len(conn.executed) == 3
+    event_sql, event_params = conn.executed[2]
+    assert "insert into openorc.workflow_events" in event_sql
+    assert event_params is not None
+    assert event_params[:7] == (
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "task_cancelled",
+        "owner",
+        str(_OWNER_PROFILE_ID),
+        None,
+        None,
+    )
+    # The terminal archival event carries no context payload.
+    assert event_params[7].obj == {}
 
 
-def test_archive_task_stale_token_rejects_before_any_write() -> None:
+def test_archive_task_complete_success_records_task_completed_event() -> None:
+    pool, conn = _pool(
+        [
+            _task_row(),
+            _task_row(status="completed", archived_at=_OBSERVED, state_token=_NEW_TOKEN),
+            _event_row(event_type="task_completed"),
+        ]
+    )
+    task = task_mutations.archive_task(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_TOKEN,
+        terminal_status=TaskStatus.COMPLETED,
+        actor=_OWNER_ACTOR,
+    )
+    assert task.status is TaskStatus.COMPLETED
+    assert task.archived_at is not None
+    event_params = conn.executed[2][1]
+    assert event_params is not None
+    assert event_params[2] == "task_completed"
+
+
+def test_archive_task_stale_token_rejects_before_any_write_and_event() -> None:
     pool, conn = _pool([_task_row(state_token=_NEW_TOKEN)])
     with pytest.raises(StaleOperationError):
         task_mutations.archive_task(
@@ -237,8 +317,69 @@ def test_archive_task_stale_token_rejects_before_any_write() -> None:
             task_id=_TASK_ID,
             expected_state_token=_TOKEN,
             terminal_status=TaskStatus.CANCELLED,
+            actor=_OWNER_ACTOR,
         )
     assert len(conn.executed) == 1
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
+
+
+def test_archive_task_event_insert_failure_rolls_back_the_mutation() -> None:
+    """A failed event insertion propagates — the mutation never stands alone.
+
+    The deterministic seam proves the event insert is attempted inside the
+    same composition after the canonical write; the real all-or-nothing
+    rollback is proven by the integration-marked suite.
+    """
+    pool, conn = _pool(
+        [
+            _task_row(),
+            _task_row(status="cancelled", archived_at=_OBSERVED, state_token=_NEW_TOKEN),
+            RuntimeError("event insertion failed"),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="event insertion failed"):
+        task_mutations.archive_task(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            terminal_status=TaskStatus.CANCELLED,
+            actor=_OWNER_ACTOR,
+        )
+    assert len(conn.executed) == 3
+    assert "update openorc.tasks" in conn.executed[1][0]
+    assert "insert into openorc.workflow_events" in conn.executed[2][0]
+
+
+def test_archive_task_requires_the_actor_context() -> None:
+    """The audited mutation has no unaudited path: actor context is required."""
+    kwargs: dict[str, Any] = {
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "expected_state_token": _TOKEN,
+        "terminal_status": TaskStatus.CANCELLED,
+    }
+    pool, conn = _pool([])
+    with pytest.raises(TypeError):
+        task_mutations.archive_task(pool, **kwargs)
+    assert conn.executed == []
+
+
+def test_archive_task_rejects_unsafe_actor_context_before_any_io() -> None:
+    """OWNER actor identity is the canonical Profile UUID, never a GitHub login."""
+    pool, conn = _pool([])
+    with pytest.raises(InvalidCommandError):
+        task_mutations.archive_task(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            terminal_status=TaskStatus.CANCELLED,
+            actor=event_coordination.WorkflowActorContext(
+                WorkflowEventActor.OWNER, "octocat-github-login"
+            ),
+        )
+    assert conn.executed == []
 
 
 def test_archive_task_nonterminal_status_is_invalid_command() -> None:
@@ -250,6 +391,7 @@ def test_archive_task_nonterminal_status_is_invalid_command() -> None:
             task_id=_TASK_ID,
             expected_state_token=_TOKEN,
             terminal_status=TaskStatus.READY_TO_PLAN,
+            actor=_OWNER_ACTOR,
         )
     assert conn.executed == []
 
@@ -515,6 +657,7 @@ def test_resolve_owner_gate_success_returns_resolved_gate_and_rotated_task() -> 
             _task_row(current_owner_gate_id=_GATE_ID),
             _gate_row(status="approved", decided_at=_OBSERVED),
             _task_row(current_owner_gate_id=None, state_token=_NEW_TOKEN),
+            _event_row(event_type="owner_gate_resolved", subject=("owner_gate", _GATE_ID)),
         ]
     )
     resolution = task_mutations.resolve_owner_gate(
@@ -524,11 +667,26 @@ def test_resolve_owner_gate_success_returns_resolved_gate_and_rotated_task() -> 
         expected_state_token=_TOKEN,
         owner_gate_id=_GATE_ID,
         outcome=OwnerGateStatus.APPROVED,
+        actor=_OWNER_ACTOR,
     )
     assert resolution.gate.status is OwnerGateStatus.APPROVED
     assert resolution.task.current_owner_gate_id is None
     assert resolution.task.state_token == _NEW_TOKEN != _TOKEN
-    assert len(conn.executed) == 6
+    # The resolved gate is the coordinated event's primary subject over the
+    # Task scope; context is the single safe outcome value.
+    assert len(conn.executed) == 7
+    event_sql, event_params = conn.executed[6]
+    assert "insert into openorc.workflow_events" in event_sql
+    assert event_params is not None
+    assert event_params[:5] == (
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "owner_gate_resolved",
+        "owner",
+        str(_OWNER_PROFILE_ID),
+    )
+    assert event_params[5:7] == ("owner_gate", _GATE_ID)
+    assert event_params[7].obj == {"outcome": "approved"}
 
 
 def test_resolve_owner_gate_stale_token_outcome_is_stale() -> None:
@@ -549,10 +707,13 @@ def test_resolve_owner_gate_stale_token_outcome_is_stale() -> None:
             expected_state_token=_TOKEN,
             owner_gate_id=_GATE_ID,
             outcome=OwnerGateStatus.APPROVED,
+            actor=_OWNER_ACTOR,
         )
-    # The gate was read and the Task was locked, but neither write applied.
+    # The gate was read and the Task was locked, but neither write applied
+    # and no event was written.
     assert len(conn.executed) == 4
     assert all("update openorc" not in sql for sql, _ in conn.executed)
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_resolve_owner_gate_non_current_gate_outcome_is_stale() -> None:
@@ -573,8 +734,10 @@ def test_resolve_owner_gate_non_current_gate_outcome_is_stale() -> None:
             expected_state_token=_TOKEN,
             owner_gate_id=_GATE_ID,
             outcome=OwnerGateStatus.REJECTED,
+            actor=_OWNER_ACTOR,
         )
     assert len(conn.executed) == 4
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_resolve_owner_gate_pending_outcome_is_invalid_command() -> None:
@@ -587,6 +750,7 @@ def test_resolve_owner_gate_pending_outcome_is_invalid_command() -> None:
             expected_state_token=_TOKEN,
             owner_gate_id=_GATE_ID,
             outcome=OwnerGateStatus.PENDING,
+            actor=_OWNER_ACTOR,
         )
     assert conn.executed == []
 
@@ -601,6 +765,7 @@ def test_resolve_owner_gate_cross_task_gate_is_not_found() -> None:
             expected_state_token=_TOKEN,
             owner_gate_id=_GATE_ID,
             outcome=OwnerGateStatus.APPROVED,
+            actor=_OWNER_ACTOR,
         )
     assert len(conn.executed) == 2
 
@@ -615,8 +780,10 @@ def test_resolve_owner_gate_already_resolved_gate_is_stale() -> None:
             expected_state_token=_TOKEN,
             owner_gate_id=_GATE_ID,
             outcome=OwnerGateStatus.APPROVED,
+            actor=_OWNER_ACTOR,
         )
     assert len(conn.executed) == 2
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_caller_proceeds_with_returned_token_not_the_old_one() -> None:

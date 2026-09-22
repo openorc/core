@@ -47,6 +47,7 @@ from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_mutations
 from openorc.services.errors import ConflictError, StaleOperationError
+from openorc.services.event_coordination import owner_actor
 
 # Every test in this module requires the explicitly supplied non-production
 # branch database. The marker excludes the module from ordinary DB-free runs
@@ -172,6 +173,20 @@ def _create_task(
         github_issue_id=github_issue_id,
         github_issue_number=github_issue_number,
     )
+
+
+def _owner_actor_for(conn: Connection[Any], workspace_id: uuid.UUID) -> Any:
+    """The OWNER actor context for the Workspace's owning Profile.
+
+    The audited #56 mutations require the safe actor identity; stale paths
+    never record an event, but the success path (the first archival in the
+    re-archiving test) records the real owner's Profile UUID.
+    """
+    row = conn.execute(
+        "select owner_profile_id from openorc.workspaces where id = %s", (workspace_id,)
+    ).fetchone()
+    assert row is not None
+    return owner_actor(row[0])
 
 
 def test_stale_token_is_rejected_by_the_guard_against_real_state(
@@ -348,6 +363,7 @@ def test_non_current_gate_resolution_translates_the_stale_outcome(
             expected_state_token=task.state_token,
             owner_gate_id=gate.id,
             outcome=OwnerGateStatus.APPROVED,
+            actor=_owner_actor_for(conn, workspace_id),
         )
 
     unchanged = task_repositories.get_task(pool, task.id)
@@ -370,6 +386,7 @@ def test_re_archiving_an_archived_task_is_stale(conn: Connection[Any]) -> None:
         task_id=task.id,
         expected_state_token=task.state_token,
         terminal_status=TaskStatus.CANCELLED,
+        actor=_owner_actor_for(conn, workspace_id),
     )
     assert archived.status is TaskStatus.CANCELLED
     assert archived.archived_at is not None
@@ -381,6 +398,7 @@ def test_re_archiving_an_archived_task_is_stale(conn: Connection[Any]) -> None:
             task_id=task.id,
             expected_state_token=archived.state_token,
             terminal_status=TaskStatus.CANCELLED,
+            actor=_owner_actor_for(conn, workspace_id),
         )
 
     unchanged = task_repositories.get_task(pool, task.id)

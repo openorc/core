@@ -2,9 +2,14 @@
 
 The ordinary suite cannot execute Postgres: canned rows and a scripted fake
 connection seam prove the ownership-gated configuration flows — defaults,
-valid updates, invalid-command rejection, no-op semantics, and the safe #56
-audit-handoff shape (no guidance prose, no ReviewLoop history rewrite).
-Database defaults/constraints are proven by the integration-marked suite.
+valid updates, invalid-command rejection, no-op semantics — and the #56
+audit coordination: an actual change records its
+``WORKSPACE_CONFIGURATION_CHANGED`` event inside the same composed
+transaction with the exact safe actor/subject/context mapping (no guidance
+prose, no ReviewLoop history rewrite), a failed event insertion leaves the
+mutation uncommitted, and no-op/failed paths write no event. Database
+defaults/constraints and the real all-or-nothing rollback are proven by the
+integration-marked suite.
 """
 
 from __future__ import annotations
@@ -41,13 +46,16 @@ class FakeCursor:
 class ScriptedConnection:
     """Plays back canned statement results in order, recording executed SQL."""
 
-    def __init__(self, results: list[tuple[Any, ...] | None]) -> None:
+    def __init__(self, results: list[tuple[Any, ...] | None | Exception]) -> None:
         self.results = list(results)
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
-        return FakeCursor(self.results.pop(0))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeCursor(result)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -94,6 +102,26 @@ def _ws_row(
     )
 
 
+def _event_row(
+    *,
+    actor_id: str,
+    context: dict[str, object] | None = None,
+) -> tuple[Any, ...]:
+    """A canned `record_workflow_event` INSERT ... RETURNING row."""
+    return (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        None,
+        "workspace_configuration_changed",
+        "owner",
+        actor_id,
+        "workspace",
+        uuid.uuid4(),
+        context or {},
+        _OBSERVED,
+    )
+
+
 def test_get_workspace_configuration_is_ownership_gated() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
@@ -123,7 +151,14 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     prose = "Always re-run the full suite before dispatching the Reviewer.\n第二段落。"
     blank_row = _ws_row(profile_id, guidance="")
     prose_row = _ws_row(profile_id, guidance=prose)
-    conn = ScriptedConnection([_ws_row(profile_id), blank_row, prose_row])
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            blank_row,
+            prose_row,
+            _event_row(actor_id=str(profile_id)),
+        ]
+    )
 
     result = workspace_configuration.set_guidance(
         _pool(conn), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
@@ -137,6 +172,27 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
     assert update_params == (prose, workspace_id)
     assert all("review_loops" not in sql for sql, _ in conn.executed)
 
+    # The coordinated #56 event: Workspace-scoped, subject the Workspace,
+    # OWNER actor carrying the authenticated Profile UUID, and a context
+    # that identifies only the guidance setting change.
+    event_sql, event_params = conn.executed[3]
+    assert "insert into openorc.workflow_events" in event_sql
+    assert event_params is not None
+    assert event_params[0] == workspace_id
+    assert event_params[1] is None
+    assert event_params[2] == "workspace_configuration_changed"
+    assert event_params[3] == "owner"
+    assert event_params[4] == str(profile_id)
+    assert event_params[5] == "workspace"
+    assert event_params[6] == workspace_id
+    assert event_params[7].obj == {"setting": "guidance"}
+
+    # Owner-authored prose is never copied into the event: no prose appears
+    # in the executed statement or its parameters.
+    for sql, params in conn.executed:
+        assert prose not in sql
+        assert prose not in repr(params)
+
     # The handoff result carries only the semantic change fact — the
     # dataclass has no field that could carry the prose into event context.
     assert set(workspace_configuration.WorkspaceGuidanceUpdate.__dataclass_fields__) == {
@@ -144,23 +200,81 @@ def test_set_guidance_replaces_the_current_value_without_history() -> None:
         "changed",
     }
 
-    # Resetting to blank is itself a change of the current value.
-    reset = ScriptedConnection([_ws_row(profile_id), prose_row, blank_row])
+    # Resetting to blank is itself a change of the current value — and it
+    # records the same semantic event, never a prose delta.
+    reset = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            prose_row,
+            blank_row,
+            _event_row(actor_id=str(profile_id)),
+        ]
+    )
     result = workspace_configuration.set_guidance(
         _pool(reset), profile_id=profile_id, workspace_id=workspace_id, guidance=""
     )
     assert result.changed is True
+    assert len(reset.executed) == 4
+    assert reset.executed[3][1] is not None
+    assert reset.executed[3][1][7].obj == {"setting": "guidance"}
+    assert all(prose not in repr(params) for _, params in reset.executed)
 
-    # Same-value write: no-op.
+    # Same-value write: no-op, and no event insert.
     noop = ScriptedConnection([_ws_row(profile_id), prose_row])
     result = workspace_configuration.set_guidance(
         _pool(noop), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
     )
     assert result.changed is False
     assert len(noop.executed) == 2
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in noop.executed)
 
 
-def test_set_guidance_rejects_non_string_input_and_fails_closed_for_non_owners() -> None:
+def test_set_guidance_event_insert_failure_rolls_back_the_mutation() -> None:
+    """A failed event insertion propagates — the canonical change never stands alone.
+
+    The deterministic seam proves the event insert is attempted inside the
+    same composition after the row-locked update; the real all-or-nothing
+    rollback is proven by the integration-marked suite.
+    """
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    prose = "Updated guidance."
+    blank_row = _ws_row(profile_id, guidance="")
+    prose_row = _ws_row(profile_id, guidance=prose)
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            blank_row,
+            prose_row,
+            RuntimeError("event insertion failed"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="event insertion failed"):
+        workspace_configuration.set_guidance(
+            _pool(conn), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
+        )
+
+    assert len(conn.executed) == 4
+    assert "update openorc.workspaces" in conn.executed[2][0]
+    assert "insert into openorc.workflow_events" in conn.executed[3][0]
+
+
+def test_set_guidance_fails_closed_for_non_owners_with_no_event() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection([_ws_row(uuid.uuid4())])
+
+    with pytest.raises(NotFoundError):
+        workspace_configuration.set_guidance(
+            _pool(conn), profile_id=profile_id, workspace_id=uuid.uuid4(), guidance="prose"
+        )
+
+    # Only the ownership gate ran: neither the write nor any event insert.
+    assert len(conn.executed) == 1
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
+
+
+def test_set_guidance_rejects_non_string_input() -> None:
     profile_id = uuid.uuid4()
     conn = ScriptedConnection([])
 
@@ -173,21 +287,20 @@ def test_set_guidance_rejects_non_string_input_and_fails_closed_for_non_owners()
         )
     assert conn.executed == []
 
-    with pytest.raises(NotFoundError):
-        workspace_configuration.set_guidance(
-            _pool(ScriptedConnection([_ws_row(uuid.uuid4())])),
-            profile_id=profile_id,
-            workspace_id=uuid.uuid4(),
-            guidance="prose",
-        )
-
 
 def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     old_row = _ws_row(profile_id, review_iteration_limit=5)
     new_row = _ws_row(profile_id, review_iteration_limit=7)
-    conn = ScriptedConnection([_ws_row(profile_id), old_row, new_row])
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            old_row,
+            new_row,
+            _event_row(actor_id=str(profile_id)),
+        ]
+    )
 
     result = workspace_configuration.set_review_iteration_limit(
         _pool(conn), profile_id=profile_id, workspace_id=workspace_id, review_iteration_limit=7
@@ -212,6 +325,24 @@ def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
     # Existing ReviewLoop history is never touched by the configuration flow.
     assert all("review_loops" not in sql for sql, _ in conn.executed)
 
+    # The coordinated #56 event: setting key plus the exact locked
+    # previous/new integers — the Workspace row is never shadowed.
+    event_sql, event_params = conn.executed[3]
+    assert "insert into openorc.workflow_events" in event_sql
+    assert event_params is not None
+    assert event_params[0] == workspace_id
+    assert event_params[1] is None
+    assert event_params[2] == "workspace_configuration_changed"
+    assert event_params[3] == "owner"
+    assert event_params[4] == str(profile_id)
+    assert event_params[5] == "workspace"
+    assert event_params[6] == workspace_id
+    assert event_params[7].obj == {
+        "setting": "review_iteration_limit",
+        "previous": 5,
+        "new": 7,
+    }
+
     # The updated value is exactly what a newly created ReviewLoop is
     # supplied through the setting boundary (the loop's own persistence
     # round-trip is proven by the reviews tests and integration suite).
@@ -226,6 +357,29 @@ def test_set_review_iteration_limit_updates_future_loop_configuration() -> None:
         created_at=_OBSERVED,
     )
     assert loop.iteration_limit == 7
+
+
+def test_set_review_iteration_limit_event_insert_failure_rolls_back_the_mutation() -> None:
+    """A failed event insertion propagates — the canonical change never stands alone."""
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id, review_iteration_limit=5),
+            _ws_row(profile_id, review_iteration_limit=5),
+            _ws_row(profile_id, review_iteration_limit=7),
+            RuntimeError("event insertion failed"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="event insertion failed"):
+        workspace_configuration.set_review_iteration_limit(
+            _pool(conn), profile_id=profile_id, workspace_id=workspace_id, review_iteration_limit=7
+        )
+
+    assert len(conn.executed) == 4
+    assert "update openorc.workspaces" in conn.executed[2][0]
+    assert "insert into openorc.workflow_events" in conn.executed[3][0]
 
 
 def test_set_review_iteration_limit_rejects_invalid_commands_before_any_io() -> None:
@@ -256,8 +410,10 @@ def test_set_review_iteration_limit_same_value_is_a_no_op() -> None:
     assert result.changed is False
     assert result.previous_review_iteration_limit == 5
     assert result.new_review_iteration_limit == 5
-    # Ownership select + locked before-state select; no UPDATE executed.
+    # Ownership select + locked before-state select; no UPDATE executed and
+    # no event insert attempted.
     assert len(conn.executed) == 2
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
 
 
 def test_set_review_iteration_limit_fails_closed_for_non_owners() -> None:
@@ -269,5 +425,7 @@ def test_set_review_iteration_limit_fails_closed_for_non_owners() -> None:
             _pool(conn), profile_id=profile_id, workspace_id=uuid.uuid4(), review_iteration_limit=7
         )
 
-    # Only the ownership gate ran; no configuration write was attempted.
+    # Only the ownership gate ran; no configuration write and no event
+    # insert was attempted.
     assert len(conn.executed) == 1
+    assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)

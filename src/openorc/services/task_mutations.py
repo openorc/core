@@ -41,10 +41,19 @@ The discipline every operation here enforces:
 These operations preserve the repository/domain rules and validate
 currentness only: they decide no workflow-stage transition policy (later
 Phase 2E workflow capabilities decide when a particular transition is
-allowed), record no WorkflowEvents (#56 owns the event stream), and call
-no external system. Actor authorization is composed by the command
-capabilities that call these; the primitives here enforce exact-subject
-currentness and Workspace linkage only.
+allowed) and call no external system. Terminal archival and exact
+current-gate resolution coordinate their locked event types
+(``TASK_CANCELLED``/``TASK_COMPLETED``, ``OWNER_GATE_RESOLVED``) through
+:mod:`openorc.services.event_coordination` inside the same composed
+transaction (#56): a successful mutation commits its event with it, and a
+failed or stale mutation writes no event. The remaining foundational
+mutations (coarse-status movement, canonical-branch binding, plan/gate
+installation) are deliberately non-evented Phase 1 facts. Actor
+authorization is composed by the command capabilities that call these; the
+audited mutations require the safe
+:class:`~openorc.services.event_coordination.WorkflowActorContext`, while
+the primitives here enforce exact-subject currentness and Workspace
+linkage only.
 """
 
 from __future__ import annotations
@@ -60,6 +69,7 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence import gates as gate_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
+from openorc.services import event_coordination
 from openorc.services.errors import (
     ConflictError,
     InvalidCommandError,
@@ -197,6 +207,7 @@ def archive_task(
     task_id: UUID,
     expected_state_token: UUID,
     terminal_status: TaskStatus,
+    actor: event_coordination.WorkflowActorContext,
 ) -> Task:
     """Archive the current Task attempt with its terminal outcome.
 
@@ -206,7 +217,10 @@ def archive_task(
     OpenOrc orchestration without implicitly mutating GitHub artifacts —
     that external discipline belongs to later workflow capabilities, never
     to this primitive. A successful mutation returns the post-write Task
-    with its newly rotated token.
+    with its newly rotated token, and its terminal event
+    (``TASK_CANCELLED``/``TASK_COMPLETED``) commits in the same composed
+    transaction through the supplied actor context; a stale or failed
+    mutation writes no event.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -234,6 +248,13 @@ def archive_task(
                 transaction_pool, task_id=task_id, expected_state_token=expected_state_token
             )
             _raise_unexplained_rejection()
+        event_coordination.record_task_terminal_event(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            actor=actor,
+            terminal_status=terminal_status,
+        )
     return updated
 
 
@@ -410,6 +431,7 @@ def resolve_owner_gate(
     expected_state_token: UUID,
     owner_gate_id: UUID,
     outcome: OwnerGateStatus,
+    actor: event_coordination.WorkflowActorContext,
 ) -> ResolvedOwnerGate:
     """Resolve the Task's exact current OwnerGate with the expected Task token.
 
@@ -422,7 +444,10 @@ def resolve_owner_gate(
     gate that is no longer current, or a raced already-resolved gate is a
     ``StaleOperationError`` and a vanished gate a ``NotFoundError``.
     Gate outcomes are one-shot facts; nothing is applied on any failure
-    and the pending gate is never rewritten after losing currency.
+    and the pending gate is never rewritten after losing currency. A
+    successful resolution commits its ``OWNER_GATE_RESOLVED`` event in the
+    same composed transaction through the supplied actor context; every
+    failure path writes no event.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -452,6 +477,14 @@ def resolve_owner_gate(
             resolved_task = resolution.task
             if resolved_gate is None or resolved_task is None:
                 _raise_unexplained_rejection()
+            event_coordination.record_owner_gate_resolved_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+                actor=actor,
+                outcome=outcome,
+            )
             return ResolvedOwnerGate(gate=resolved_gate, task=resolved_task)
         if resolution.gate is None:
             raise NotFoundError("the requested owner gate is not available for this task")
