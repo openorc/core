@@ -45,6 +45,7 @@ contents.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import urllib.error
@@ -72,6 +73,8 @@ __all__ = [
     "SupabaseJwksOutcomeUnknownError",
     "SupabaseJwksUnavailableError",
 ]
+
+logger = logging.getLogger(__name__)
 
 # Supabase Auth issuer path under the project URL; appending the JWKS path
 # exposes the project's public signing keys (Supabase JWT documentation).
@@ -174,12 +177,22 @@ def _fetch_jwks_keys(
             raw = fetch(jwks_url, timeout_seconds)
         except urllib.error.HTTPError as exc:
             # The source answered with a definitive failure: known non-success.
+            # Operational visibility for the degraded dependency (issue #109):
+            # a fixed safe message only — never the URL (it carries the
+            # project reference), the token, or any key material.
+            logger.warning(
+                "Supabase Auth JWKS retrieval failed: the signing-key source rejected the lookup"
+            )
             raise SupabaseJwksUnavailableError(
                 "the Supabase Auth signing-key source rejected the JWKS lookup"
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             # Timeout or connection loss leaves the outcome unknown; never
             # reclassified as a known failure or success.
+            logger.warning(
+                "Supabase Auth JWKS retrieval outcome is unknown: the signing-key "
+                "source could not be reached"
+            )
             raise SupabaseJwksOutcomeUnknownError(
                 "the Supabase Auth signing-key source could not be reached"
             ) from exc

@@ -13,6 +13,7 @@ boundary.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 from typing import Any, cast
@@ -652,7 +653,9 @@ def test_http_client_rejects_kidless_tokens_against_ambiguous_sets() -> None:
         client.get_signing_key(None)  # ambiguous: never guessed
 
 
-def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
+def test_http_client_maps_http_failure_to_known_retrieval_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     def fetch(url: str, timeout: float) -> bytes:
         raise urllib.error.HTTPError(
             url, 503, "Service Unavailable", cast(Any, None), cast(Any, None)
@@ -660,8 +663,17 @@ def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
 
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=fetch)
 
-    with pytest.raises(SupabaseJwksUnavailableError):
+    with caplog.at_level(logging.WARNING), pytest.raises(SupabaseJwksUnavailableError):
         client.get_signing_key("key-1")
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    # Operational visibility with a fixed safe message (issue #109): never the
+    # URL (it carries the project reference), the kid, or any key material.
+    message = warnings[0].getMessage()
+    assert "JWKS retrieval failed" in message
+    assert JWKS_URL not in message
+    assert "key-1" not in message
 
 
 @pytest.mark.parametrize(
@@ -673,14 +685,22 @@ def test_http_client_maps_http_failure_to_known_retrieval_failure() -> None:
     ],
     ids=["url_error", "timeout", "os_error"],
 )
-def test_http_client_maps_transport_failure_to_unknown_outcome(raised: Exception) -> None:
+def test_http_client_maps_transport_failure_to_unknown_outcome(
+    caplog: pytest.LogCaptureFixture, raised: Exception
+) -> None:
     def fetch(url: str, timeout: float) -> bytes:
         raise raised
 
     client = HttpJwksClient(JWKS_URL, clock=FakeClock(), fetch=fetch)
 
-    with pytest.raises(SupabaseJwksOutcomeUnknownError):
+    with caplog.at_level(logging.WARNING), pytest.raises(SupabaseJwksOutcomeUnknownError):
         client.get_signing_key("key-1")
+
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "outcome is unknown" in message
+    assert JWKS_URL not in message
 
 
 @pytest.mark.parametrize("raw", [b"not json", b'{"nope": 1}', b'{"keys": []}', b'{"keys": ["x"]}'])

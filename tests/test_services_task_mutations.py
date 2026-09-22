@@ -30,11 +30,22 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from psycopg.errors import UniqueViolation
 
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGateStatus
 from openorc.domain.tasks import TaskStatus
+from openorc.observability import (
+    OPERATION,
+    TASK_ID,
+    WORKSPACE_ID,
+    injected_tracer_source,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination, task_mutations
 from openorc.services.errors import (
@@ -827,3 +838,158 @@ def test_caller_proceeds_with_returned_token_not_the_old_one() -> None:
     )
     assert continued.state_token == _THIRD_TOKEN
     assert len(next_conn.executed) == 2
+
+
+def _local_provider_with_exporter() -> tuple[SdkTracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = SdkTracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_update_task_status_opens_its_service_span_with_safe_subject_attributes() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool([_task_row(), _task_row(status="planning", state_token=_NEW_TOKEN)])
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        task_mutations.update_task_status(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            status=TaskStatus.PLANNING,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "task_mutations.update_task_status"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert set(attributes) == {OPERATION, WORKSPACE_ID, TASK_ID}
+    assert attributes[WORKSPACE_ID] == str(_WORKSPACE_ID)
+    assert attributes[TASK_ID] == str(_TASK_ID)
+    assert exported.status.status_code is StatusCode.UNSET
+    # The workflow-authority state token never becomes telemetry.
+    assert str(_TOKEN) not in str(attributes)
+    # The mutation itself is unchanged under the surrounding span.
+    assert len(conn.executed) == 2
+
+
+def test_stale_rejection_preserves_the_typed_error_and_exports_only_the_classification() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool([_task_row(state_token=_NEW_TOKEN)])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(StaleOperationError),
+    ):
+        task_mutations.update_task_status(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            status=TaskStatus.PLANNING,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.status.status_code is StatusCode.ERROR
+    # Safe classification only — the exception type name, never its text.
+    assert exported.status.description == "StaleOperationError"
+    # The typed outcome is unchanged: no write was attempted.
+    assert len(conn.executed) == 1
+
+
+def test_invalid_commands_open_the_operation_span_with_the_safe_classification() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool([])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(InvalidCommandError),
+    ):
+        task_mutations.update_task_status(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            status=TaskStatus.CANCELLED,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "task_mutations.update_task_status"
+    assert exported.status.description == "InvalidCommandError"
+    assert conn.executed == []
+
+
+def test_branch_collision_keeps_the_typed_conflict_with_telemetry() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool([_task_row(), UniqueViolation("tasks_canonical_branch_repo_unique")])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(ConflictError),
+    ):
+        task_mutations.bind_canonical_branch(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            canonical_feature_branch="feat/issue-109-otel-retrofit",
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "task_mutations.bind_canonical_branch"
+    assert exported.status.description == "ConflictError"
+    assert len(conn.executed) == 2
+
+
+def test_evented_archival_records_the_workflow_event_with_telemetry_active() -> None:
+    """State + event atomicity is untouched by the surrounding span."""
+    provider, exporter = _local_provider_with_exporter()
+    pool, conn = _pool(
+        [
+            _task_row(),
+            _task_row(status="cancelled", archived_at=_OBSERVED, state_token=_NEW_TOKEN),
+            _event_row(event_type="task_cancelled"),
+        ]
+    )
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        task = task_mutations.archive_task(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            terminal_status=TaskStatus.CANCELLED,
+            actor=_OWNER_ACTOR,
+        )
+
+    # The coordinated event insert still runs inside the same composed
+    # transaction, independent of the telemetry backend.
+    assert task.state_token == _NEW_TOKEN
+    assert len(conn.executed) == 3
+    assert "insert into openorc.workflow_events" in conn.executed[2][0]
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "task_mutations.archive_task"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert attributes[WORKSPACE_ID] == str(_WORKSPACE_ID)
+    assert attributes[TASK_ID] == str(_TASK_ID)
+
+
+def test_unconfigured_telemetry_does_not_change_mutation_behavior() -> None:
+    # No global provider is installed in the deterministic suite: the tracer
+    # seam resolves the no-op proxy and the mutation behaves identically with
+    # no OpenTelemetry runtime installed (issues #108/#109).
+    pool, conn = _pool([_task_row(), _task_row(status="planning", state_token=_NEW_TOKEN)])
+
+    updated = task_mutations.update_task_status(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_TOKEN,
+        status=TaskStatus.PLANNING,
+    )
+
+    assert updated.state_token == _NEW_TOKEN
+    assert len(conn.executed) == 2
+    assert not isinstance(trace_api.get_tracer_provider(), SdkTracerProvider)

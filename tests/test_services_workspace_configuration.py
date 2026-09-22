@@ -21,6 +21,9 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from openorc.domain.reviews import (
     DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
@@ -28,6 +31,7 @@ from openorc.domain.reviews import (
     ReviewLoopPurpose,
     ReviewLoopStatus,
 )
+from openorc.observability import OPERATION, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
 from openorc.services import workspace_configuration
 from openorc.services.errors import InvalidCommandError, NotFoundError
@@ -429,3 +433,89 @@ def test_set_review_iteration_limit_fails_closed_for_non_owners() -> None:
     # insert was attempted.
     assert len(conn.executed) == 1
     assert all("insert into openorc.workflow_events" not in sql for sql, _ in conn.executed)
+
+
+def _local_provider_with_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+def test_get_workspace_configuration_opens_its_service_span() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        workspace_configuration.get_workspace_configuration(
+            _pool(ScriptedConnection([_ws_row(profile_id)])),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "workspace_configuration.get_workspace_configuration"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert set(attributes) == {OPERATION, WORKSPACE_ID}
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+
+
+def test_set_guidance_opens_its_service_span_without_the_prose() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    prose = "Always re-run the full suite before dispatching the Reviewer."
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            _ws_row(profile_id, guidance=""),
+            _ws_row(profile_id, guidance=prose),
+            _event_row(actor_id=str(profile_id)),
+        ]
+    )
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        workspace_configuration.set_guidance(
+            _pool(conn), profile_id=profile_id, workspace_id=workspace_id, guidance=prose
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "workspace_configuration.set_guidance"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert set(attributes) == {OPERATION, WORKSPACE_ID}
+    assert attributes[OPERATION] == "workspace_configuration.set_guidance"
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+    # The safe vocabulary is the only supported attribute path: the Owner
+    # guidance prose never appears in exported telemetry.
+    assert all(prose not in str(value) for value in attributes.values())
+
+
+def test_set_review_iteration_limit_opens_its_service_span() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _ws_row(profile_id),
+            _ws_row(profile_id, review_iteration_limit=5),
+            _ws_row(profile_id, review_iteration_limit=7),
+            _event_row(actor_id=str(profile_id)),
+        ]
+    )
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        result = workspace_configuration.set_review_iteration_limit(
+            _pool(conn), profile_id=profile_id, workspace_id=workspace_id, review_iteration_limit=7
+        )
+
+    assert result.changed is True
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "workspace_configuration.set_review_iteration_limit"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert set(attributes) == {OPERATION, WORKSPACE_ID}
+    assert attributes[OPERATION] == "workspace_configuration.set_review_iteration_limit"
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
