@@ -103,6 +103,7 @@ def test_delete_workspace_deletes_in_deliberate_dependency_order() -> None:
             None,
             None,
             None,
+            None,
             (workspace_id, profile_id, "platform", observed, observed, 5, ""),
         ]
     )
@@ -120,9 +121,10 @@ def test_delete_workspace_deletes_in_deliberate_dependency_order() -> None:
     assert sqls[1].startswith("delete from openorc.tasks")
     assert sqls[2].startswith("delete from openorc.workflow_role_bindings")
     assert sqls[3].startswith("delete from openorc.connections")
-    assert sqls[4].startswith("delete from openorc.workspaces")
-    assert "returning" in sqls[4]
-    assert len(sqls) == 5
+    assert sqls[4].startswith("delete from openorc.github_installations")
+    assert sqls[5].startswith("delete from openorc.workspaces")
+    assert "returning" in sqls[5]
+    assert len(sqls) == 6
     assert all(params == (workspace_id,) for _, params in conn.executed)
 
 
@@ -176,6 +178,7 @@ def test_delete_repository_deletes_its_task_subtree_in_order() -> None:
                 "main",
                 observed,
                 observed,
+                None,
             ),
         ]
     )

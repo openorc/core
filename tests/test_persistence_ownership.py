@@ -32,6 +32,7 @@ from openorc.persistence.ownership import (
     get_project,
     get_repository,
     get_workspace,
+    set_repository_installation_route,
     update_repository_metadata,
     update_workspace_guidance,
     update_workspace_review_iteration_limit,
@@ -96,6 +97,7 @@ def _repository_row(default_branch: str | None = "main") -> tuple[Any, ...]:
         default_branch,
         _observed_at(),
         _observed_at(),
+        None,
     )
 
 
@@ -223,6 +225,9 @@ def test_create_repository_maps_row_to_domain_object() -> None:
     assert created.id == row[0]
     assert created.identity == identity
     assert created.metadata == metadata
+    # Phase 1 rows carry no installation route: valid historical state, not
+    # usable for GitHub operations until explicitly routed (issue #57).
+    assert created.github_installation_id is None
     assert created.created_at.utcoffset() == timedelta(0)
     assert created.updated_at.utcoffset() == timedelta(0)
     sql, params = conn.executed[0]
@@ -264,6 +269,40 @@ def test_find_repository_by_github_identity_scopes_to_the_workspace() -> None:
     sql, params = conn.executed[0]
     assert "where workspace_id = %s and github_repository_id = %s" in sql
     assert params == (row[2], 987654321)
+
+
+def test_set_repository_installation_route_maps_the_route_write() -> None:
+    row = _repository_row()
+    installation_id = uuid.uuid4()
+    routed_row = (*row[:11], installation_id)
+    conn = FakeConnection(row=routed_row)
+
+    updated = set_repository_installation_route(
+        cast(DatabasePool, FakePool(conn)),
+        repository_id=row[0],
+        workspace_id=row[2],
+        github_installation_id=installation_id,
+    )
+
+    assert updated is not None
+    assert updated.id == row[0]
+    assert updated.github_installation_id == installation_id
+    sql, params = conn.executed[0]
+    assert (
+        "update openorc.repositories set github_installation_id = %s, updated_at = now() "
+        "where id = %s and workspace_id = %s" in sql
+    )
+    assert params == (installation_id, row[0], row[2])
+
+    # Clearing the route represents loss of configuration, not deletion.
+    cleared = set_repository_installation_route(
+        cast(DatabasePool, FakePool(FakeConnection(row=row))),
+        repository_id=row[0],
+        workspace_id=row[2],
+        github_installation_id=None,
+    )
+    assert cleared is not None
+    assert cleared.github_installation_id is None
 
 
 def test_update_repository_metadata_maps_updated_row_and_handles_missing() -> None:

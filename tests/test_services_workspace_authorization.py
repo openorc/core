@@ -241,6 +241,7 @@ def test_authorization_never_consults_github_identity_or_repository_metadata() -
         "trunk",
         _OBSERVED,
         _OBSERVED,
+        None,
     )
     conn = ScriptedConnection([ws_row, repo_row])
 
@@ -279,6 +280,7 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             "main",
             _OBSERVED,
             _OBSERVED,
+            None,
         ),
         "connection": (
             connection_id,
