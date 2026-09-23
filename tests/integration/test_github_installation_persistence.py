@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
 import pytest
@@ -37,7 +37,7 @@ from openorc.persistence import github_installations as installation_repositorie
 from openorc.persistence import ownership as ownership_repositories
 from openorc.persistence.pool import DatabasePool
 from openorc.services import github_installations as installation_services
-from openorc.services.errors import NotFoundError
+from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 
 pytestmark = pytest.mark.integration
 
@@ -275,7 +275,7 @@ def test_durable_checks_reject_invalid_installation_facts(conn: Connection[Any])
         (12345678, 501, "   ", "Organization"),
         (12345678, 501, "octocat", ""),
     ):
-        with conn.transaction(), pytest.raises(CheckViolation):
+        with pytest.raises(CheckViolation), conn.transaction():
             conn.execute(
                 "insert into openorc.github_installations "
                 "(workspace_id, github_installation_id, github_account_id, "
@@ -432,3 +432,96 @@ def test_workspace_aggregate_deletion_removes_routed_repositories_and_installati
     ).fetchone()
     assert installations_row is not None and installations_row[0] == 0
     assert repositories_row is not None and repositories_row[0] == 0
+
+
+def test_a_changed_stable_account_id_cannot_rewrite_the_record(conn: Connection[Any]) -> None:
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+
+    created = installation_services.record_workspace_installation(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        github_installation_id=12345678,
+        github_account_id=501,
+        account_login="octocat",
+        account_type="Organization",
+        suspended_at=None,
+    )
+
+    # Trusted facts reporting a different stable account ID for the same
+    # (Workspace, external installation) identity fail closed: reconciliation
+    # never rewrites stable identity, and the conflicting reconcile applies
+    # nothing.
+    with pytest.raises(ConflictError):
+        installation_services.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=999,
+            account_login="attacker-controlled-rename",
+            account_type="User",
+            suspended_at=_OBSERVED,
+        )
+    unchanged = installation_repositories.get_github_installation(_pool(conn), created.id)
+    assert unchanged is not None
+    assert unchanged.account.github_account_id == 501
+    assert unchanged.account.login == "octocat"
+    assert unchanged.account.type == "Organization"
+    assert unchanged.suspended_at is None
+
+    # The mutable observations DO reconcile when the stable identity agrees:
+    # login/type/suspended_at change while the account ID is preserved.
+    reconciled = installation_services.record_workspace_installation(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        github_installation_id=12345678,
+        github_account_id=501,
+        account_login="renamed",
+        account_type="User",
+        suspended_at=_OBSERVED,
+    )
+    assert reconciled.id == created.id
+    assert reconciled.account.github_account_id == 501
+    assert reconciled.account.login == "renamed"
+    assert reconciled.account.type == "User"
+    assert reconciled.suspended_at == _OBSERVED
+
+
+def test_naive_and_non_utc_suspended_instants_at_the_service_boundary(
+    conn: Connection[Any],
+) -> None:
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+
+    # A naive datetime is rejected as malformed caller input before any
+    # database work — it can never acquire session-timezone semantics at the
+    # TIMESTAMPTZ cast.
+    with pytest.raises(InvalidCommandError):
+        installation_services.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=501,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=datetime(2026, 9, 23, 12, 0, 0),  # naive: no tzinfo
+        )
+
+    # An aware non-UTC value normalizes to the same UTC instant.
+    non_utc = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    utc_instant = datetime(2026, 9, 23, 10, 0, 0, tzinfo=UTC)
+    installation = installation_services.record_workspace_installation(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        github_installation_id=12345678,
+        github_account_id=501,
+        account_login="octocat",
+        account_type="Organization",
+        suspended_at=non_utc,
+    )
+    assert installation.suspended_at == utc_instant

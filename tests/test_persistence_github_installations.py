@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
+import pytest
+
 from openorc.domain.github_installations import (
     GitHubInstallation,
     GitHubInstallationAccount,
@@ -29,6 +31,7 @@ from openorc.persistence.github_installations import (
     list_workspace_installations,
 )
 from openorc.persistence.pool import DatabasePool
+from openorc.persistence.time import NaiveDatetimeError
 
 _OBSERVED_AT = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
 _UTC_OBSERVED = datetime(2026, 9, 23, 10, 0, 0, tzinfo=UTC)
@@ -150,6 +153,9 @@ def test_create_or_reconcile_maps_the_upsert_and_parameters() -> None:
     assert not re.search(r"\bid = excluded\b", sql)
     assert not re.search(r"\bworkspace_id = excluded\b", sql)
     assert not re.search(r"\bgithub_installation_id = excluded\b", sql)
+    # The GitHub account ID is a stable external identifier, not an
+    # observation: reconciliation preserves the stored value.
+    assert not re.search(r"\bgithub_account_id = excluded\b", sql)
     assert "updated_at = now()" in sql
     assert params == (workspace_id, 12345678, 501, "octocat", "Organization", _UTC_OBSERVED)
 
@@ -188,3 +194,35 @@ def test_delete_github_installation_returns_none_without_forcing_constraints() -
     assert delete_github_installation(_pool(conn), uuid.uuid4()) is None
     assert len(conn.executed) == 1
     assert "set constraints" not in conn.executed[0][0]
+
+
+def test_reconcile_normalizes_a_non_utc_suspended_instant_to_utc() -> None:
+    workspace_id = uuid.uuid4()
+    conn = FakeConnection(row=_installation_row(workspace_id=workspace_id))
+
+    create_or_reconcile_github_installation(
+        _pool(conn),
+        workspace_id=workspace_id,
+        identity=_identity(),
+        account=_account(),
+        suspended_at=_OBSERVED_AT,
+    )
+
+    _, params = conn.executed[0]
+    assert params is not None
+    # The same instant, expressed in UTC: no session-timezone semantics may
+    # apply at the TIMESTAMPTZ boundary.
+    assert params[5] == _UTC_OBSERVED
+
+
+def test_reconcile_rejects_a_naive_suspended_instant_at_the_boundary() -> None:
+    naive = datetime(2026, 9, 23, 12, 0, 0)
+
+    with pytest.raises(NaiveDatetimeError):
+        create_or_reconcile_github_installation(
+            _pool(FakeConnection(row=None)),
+            workspace_id=uuid.uuid4(),
+            identity=_identity(),
+            account=_account(),
+            suspended_at=naive,
+        )

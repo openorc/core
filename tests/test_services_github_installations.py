@@ -13,12 +13,17 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from psycopg.errors import ForeignKeyViolation
 
+from openorc.observability import injected_tracer_source
+from openorc.persistence.pool import DatabasePool
 from openorc.services import github_installations
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 
@@ -72,8 +77,8 @@ class FakePool:
         raise AssertionError("github installation service tests never close pools")
 
 
-def _pool(conn: ScriptedConnection) -> Any:
-    return FakePool(conn)
+def _pool(conn: ScriptedConnection) -> DatabasePool:
+    return cast(DatabasePool, FakePool(conn))
 
 
 def _ws_row(workspace_id: Any, profile_id: Any) -> tuple[Any, ...]:
@@ -84,12 +89,13 @@ def _installation_row(
     installation_id: Any,
     workspace_id: Any,
     suspended_at: datetime | None = None,
+    github_account_id: int = 501,
 ) -> tuple[Any, ...]:
     return (
         installation_id,
         workspace_id,
         12345678,
-        501,
+        github_account_id,
         "octocat",
         "Organization",
         suspended_at,
@@ -222,6 +228,86 @@ def test_record_workspace_installation_fails_closed_for_a_foreign_workspace() ->
         )
     assert len(conn.executed) == 2
     assert all("insert" not in sql for sql, _ in conn.executed)
+
+
+def test_record_workspace_installation_fails_closed_on_a_changed_stable_account_id() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    # The stored record carries stable account 501; the trusted facts report
+    # 999 for the same (workspace, external installation) identity.
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(workspace_id, profile_id),
+            _installation_row(installation_id, workspace_id, github_account_id=501),
+        ]
+    )
+
+    with pytest.raises(ConflictError):
+        github_installations.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=999,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=None,
+        )
+    assert len(conn.executed) == 3
+
+
+def test_record_workspace_installation_rejects_a_naive_suspended_at() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    conn = ScriptedConnection([])
+
+    with pytest.raises(InvalidCommandError):
+        github_installations.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=501,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=datetime(2026, 9, 23, 12, 0, 0),  # naive: no tzinfo
+        )
+    assert conn.executed == []
+
+
+def test_record_workspace_installation_normalizes_a_non_utc_observation_to_utc() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    non_utc = datetime(2026, 9, 23, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    utc_instant = datetime(2026, 9, 23, 10, 0, 0, tzinfo=UTC)
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(workspace_id, profile_id),
+            _installation_row(installation_id, workspace_id, suspended_at=utc_instant),
+        ]
+    )
+
+    installation = github_installations.record_workspace_installation(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        github_installation_id=12345678,
+        github_account_id=501,
+        account_login="octocat",
+        account_type="Organization",
+        suspended_at=non_utc,
+    )
+
+    assert installation.suspended_at == utc_instant
+    upsert_sql, upsert_params = conn.executed[2]
+    assert upsert_params is not None
+    # The same instant, expressed in UTC: no session-timezone semantics may
+    # apply at the TIMESTAMPTZ boundary.
+    assert upsert_params[5] == utc_instant
 
 
 def test_bind_sets_the_route_through_the_guarded_composition() -> None:
@@ -417,3 +503,93 @@ def test_resolution_is_uniformly_not_found_for_foreign_or_missing_workspaces() -
             repository_id=uuid.uuid4(),
         )
     assert len(foreign.executed) == 1
+
+
+def test_malformed_uuid_commands_are_rejected_before_any_database_work() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+
+    # A malformed identifier text is a command failure classified before any
+    # database work, in every operation that accepts UUID command fields.
+    conn = ScriptedConnection([])
+    with pytest.raises(InvalidCommandError):
+        github_installations.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            github_installation_id=12345678,
+            github_account_id=501,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=None,
+        )
+    with pytest.raises(InvalidCommandError):
+        github_installations.record_workspace_installation(
+            _pool(conn),
+            profile_id="not-a-uuid",  # type: ignore[arg-type]
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=501,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=None,
+        )
+    with pytest.raises(InvalidCommandError):
+        github_installations.bind_repository_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id="not-a-uuid",  # type: ignore[arg-type]
+            github_installation_id=installation_id,
+        )
+    with pytest.raises(InvalidCommandError):
+        github_installations.bind_repository_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_installation_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+    with pytest.raises(InvalidCommandError):
+        github_installations.unbind_repository_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            repository_id=repository_id,
+        )
+    with pytest.raises(InvalidCommandError):
+        github_installations.require_configured_repository_installation_route(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id=None,  # type: ignore[arg-type]
+        )
+    assert conn.executed == []
+
+
+def test_malformed_command_is_classified_without_exporting_its_values() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    conn = ScriptedConnection([])
+    malformed = "not-a-uuid"
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(InvalidCommandError),
+    ):
+        github_installations.require_configured_repository_installation_route(
+            _pool(conn),
+            profile_id=uuid.uuid4(),
+            workspace_id=malformed,  # type: ignore[arg-type]
+            repository_id=uuid.uuid4(),
+        )
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "github_installations.require_configured_repository_installation_route"
+    assert exported.status.description == "InvalidCommandError"
+    # The malformed identifier never reaches exported telemetry: annotation
+    # happens only after the caller-supplied identifiers proved valid.
+    assert malformed not in str(exported.attributes)

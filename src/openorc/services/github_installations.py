@@ -54,6 +54,7 @@ from openorc.persistence.github_installations import (
 )
 from openorc.persistence.ownership import set_repository_installation_route
 from openorc.persistence.pool import DatabasePool
+from openorc.persistence.time import NaiveDatetimeError, normalize_utc
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
@@ -80,6 +81,12 @@ _UNBIND_SPAN_NAME = "github_installations.unbind_repository_installation"
 _RESOLVE_SPAN_NAME = "github_installations.require_configured_repository_installation_route"
 
 
+def _require_uuid_command(value: object, name: str) -> None:
+    """Reject a malformed UUID command argument before any state is touched."""
+    if not isinstance(value, UUID):
+        raise InvalidCommandError(f"{name} must be a UUID")
+
+
 def record_workspace_installation(
     pool: DatabasePool,
     *,
@@ -98,15 +105,25 @@ def record_workspace_installation(
     obtained them from GitHub (the transport that produces them is outside
     this leaf); validation is transport-independent domain validation.
     Reconciliation persists the reported facts as the current observations —
-    account ID as reported, login/type, ``suspended_at`` — and never replaces
-    the durable record identity (OpenOrc UUID, Workspace, external
-    installation ID). No credential material is accepted or stored, and the
-    operation requires no GitHub call.
+    login/type and ``suspended_at`` — and never replaces the durable record
+    identity: the OpenOrc UUID, the Workspace, the external installation ID,
+    and the stable GitHub account ID. Trusted facts reporting a different
+    account ID for a known installation fail closed as a conflict instead of
+    rewriting stable identity. ``suspended_at`` must be timezone-aware (it is
+    normalized to UTC before persistence; naive values are rejected). No
+    credential material is accepted or stored, and the operation requires no
+    GitHub call.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _RECORD_SPAN_NAME) as span:
-        annotate_span(span, operation=_RECORD_SPAN_NAME, workspace_id=str(workspace_id))
-        if suspended_at is not None and not isinstance(suspended_at, datetime):
-            raise InvalidCommandError("suspended_at must be a datetime or None")
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        if suspended_at is not None:
+            if not isinstance(suspended_at, datetime):
+                raise InvalidCommandError("suspended_at must be a datetime or None")
+            try:
+                suspended_at = normalize_utc(suspended_at)
+            except NaiveDatetimeError as error:
+                raise InvalidCommandError("suspended_at must be timezone-aware") from error
         try:
             identity = GitHubInstallationIdentity(github_installation_id=github_installation_id)
             account = GitHubInstallationAccount(
@@ -116,6 +133,9 @@ def record_workspace_installation(
             )
         except GitHubInstallationDomainError as error:
             raise InvalidCommandError(f"invalid GitHub installation facts: {error}") from error
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
+        annotate_span(span, operation=_RECORD_SPAN_NAME, workspace_id=str(workspace_id))
         with composed_transaction(pool) as transaction_pool:
             # The account-wide Owner-mutation barrier first (issue #97): the
             # Profile FOR KEY SHARE read is the first lock acquisition and
@@ -124,13 +144,23 @@ def record_workspace_installation(
             workspace = require_profile_workspace(
                 transaction_pool, profile_id=profile_id, workspace_id=workspace_id
             )
-            return create_or_reconcile_github_installation(
+            reconciled = create_or_reconcile_github_installation(
                 transaction_pool,
                 workspace_id=workspace.id,
                 identity=identity,
                 account=account,
                 suspended_at=suspended_at,
             )
+            if reconciled.account.github_account_id != account.github_account_id:
+                # The stored stable account identity cannot be rewritten by
+                # reconciliation; trusted facts reporting a different account
+                # for a known installation fail closed and the whole
+                # composition (including any observation updates) rolls back.
+                raise ConflictError(
+                    "the trusted installation facts report a different GitHub "
+                    "account than the reconciled installation record"
+                )
+            return reconciled
 
 
 def bind_repository_installation(
@@ -153,6 +183,12 @@ def bind_repository_installation(
     reconciliation establishes that.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _BIND_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(repository_id, "repository_id")
+        _require_uuid_command(github_installation_id, "github_installation_id")
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
         annotate_span(span, operation=_BIND_SPAN_NAME, workspace_id=str(workspace_id))
         with composed_transaction(pool) as transaction_pool:
             # The account-wide Owner-mutation barrier first (issue #97).
@@ -204,6 +240,11 @@ def unbind_repository_installation(
     GitHub artifacts.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _UNBIND_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(repository_id, "repository_id")
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
         annotate_span(span, operation=_UNBIND_SPAN_NAME, workspace_id=str(workspace_id))
         with composed_transaction(pool) as transaction_pool:
             # The account-wide Owner-mutation barrier first (issue #97).
@@ -252,6 +293,11 @@ def require_configured_repository_installation_route(
     permissions before any GitHub operation runs.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _RESOLVE_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(repository_id, "repository_id")
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
         annotate_span(span, operation=_RESOLVE_SPAN_NAME, workspace_id=str(workspace_id))
         # require_workspace_repository re-enforces ownership before resolving
         # the subject — no separate Workspace read is composed.

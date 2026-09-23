@@ -37,11 +37,13 @@
 --   explicitly routed. Later services must fail closed on unconfigured
 --   repositories rather than guessing an installation.
 -- - Stable identity vs observation: reconciling an installation updates the
---   observed facts (account ID as reported, login/type, suspended_at) and
---   never replaces the record identity (OpenOrc UUID, Workspace, external
---   installation ID). ``suspended_at`` is an observation carried verbatim;
---   no column or view derives a usability/authorization claim from it —
---   current repository access is established by later reconciliation work.
+--   mutable observations (account login/type, suspended_at) and never
+--   replaces stable identity — the OpenOrc UUID, Workspace, external
+--   installation ID, or the stored GitHub account ID (trusted facts
+--   reporting a different account ID fail closed at the service boundary).
+--   ``suspended_at`` is an observation carried verbatim; no column or view
+--   derives a usability/authorization claim from it — current repository
+--   access is established by later reconciliation work.
 --
 -- FOREIGN-KEY CLASSIFICATION (the deletion-ownership vocabulary, issue #27):
 -- - github_installations.workspace_id -> workspaces: TRUE OWNERSHIP edge,

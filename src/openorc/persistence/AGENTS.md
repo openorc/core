@@ -49,7 +49,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - github_installations carries direct Workspace scope, stable external installation/account IDs, and mutable observed account/suspension facts; one canonical record exists per (Workspace, external installation ID), and the same external installation may exist independently in other Workspaces.
 - Repository routing is a single nullable github_installation_id column: one route by construction, and the composite (github_installation_id, workspace_id) foreign key hooked on github_installations (id, workspace_id) makes cross-Workspace routing unrepresentable.
 - The route FK is NO ACTION DEFERRABLE INITIALLY DEFERRED: hard installation deletion is blocked while a Repository routes to it (forced IMMEDIATE inside the delete transaction, mirroring the Connection-reference pattern), and unbinding the route is the explicit operation. Workspace aggregate deletion removes installation records in its ordered sequence.
-- Reconciliation upserts observations (account ID as reported, login/type, suspended_at) and never rewrites record identity. No GitHub token, private key, PAT, or human OAuth credential is persisted.
+- Reconciliation upserts observations (login/type, suspended_at) and never rewrites stable identity — the OpenOrc UUID, Workspace, external installation ID, or the stored GitHub account ID (trusted facts reporting a different account ID fail closed at the service boundary as a conflict). Datetimes cross into TIMESTAMPTZ columns only UTC-normalized; naive values are rejected at the persistence boundary. No GitHub token, private key, PAT, or human OAuth credential is persisted.
 
 ## Connections and runtime-control credentials
 

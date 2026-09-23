@@ -87,16 +87,26 @@ def create_or_reconcile_github_installation(
     """Create or reconcile one Workspace installation record from trusted facts.
 
     The durable record identity is the ``(workspace_id, github_installation_id)``
-    pair: an existing record keeps its OpenOrc UUID and creation time and
-    receives the reported facts as the current observations (account ID as
-    reported, login/type, ``suspended_at``). Reconciliation never replaces the
-    record identity, and no credential material is accepted or stored.
+    pair, and both stable external identifiers — the GitHub installation ID and
+    the GitHub account ID — are never rewritten by reconciliation: an existing
+    record keeps its OpenOrc UUID, creation time, and stored account ID, and
+    receives only the mutable reported observations (login/type,
+    ``suspended_at``). A reconcile that reports a different account ID leaves
+    the stored stable identity intact; deciding the conflict belongs to the
+    service boundary, not to persistence. No credential material is accepted
+    or stored.
+
+    ``suspended_at`` crosses into the TIMESTAMPTZ column only through the
+    established UTC-normalization boundary: naive datetimes are rejected
+    (:class:`~openorc.persistence.time.NaiveDatetimeError`) and aware values
+    are normalized to UTC, so no session-timezone semantics can apply.
 
     The single ``insert ... on conflict do update`` statement is atomic and
     serializes concurrent reconciles on the unique index — a losing writer
     takes the update path after the winner commits — so no separate
     ``SELECT ... FOR UPDATE`` read is needed.
     """
+    suspended_at = None if suspended_at is None else normalize_utc(suspended_at)
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.github_installations "
@@ -104,8 +114,7 @@ def create_or_reconcile_github_installation(
             "account_login, account_type, suspended_at) "
             "values (%s, %s, %s, %s, %s, %s) "
             "on conflict (workspace_id, github_installation_id) do update "
-            "set github_account_id = excluded.github_account_id, "
-            "account_login = excluded.account_login, "
+            "set account_login = excluded.account_login, "
             "account_type = excluded.account_type, "
             "suspended_at = excluded.suspended_at, "
             "updated_at = now() "
