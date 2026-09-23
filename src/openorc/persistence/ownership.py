@@ -5,6 +5,12 @@ Project, and Repository (Phase 1). Rows map to transport-independent domain
 objects from :mod:`openorc.domain.ownership`; instants returned from Postgres
 are normalized to timezone-aware UTC at this boundary.
 
+Repository routing (issue #57): ``set_repository_installation_route`` sets or
+clears one Repository's explicit route to a Workspace-scoped GitHubInstallation
+record. The composite route foreign key makes cross-Workspace routing a
+driver-level impossibility, and this module stays policy-free — durable
+representation, not product semantics.
+
 Violated database invariants surface as driver exceptions (for example
 ``psycopg.errors.UniqueViolation`` and ``ForeignKeyViolation``); translating
 them into typed application errors is a service-layer concern, not a
@@ -49,6 +55,7 @@ __all__ = [
     "read_account_deletion_state_for_key_share",
     "reclaim_expired_account_deletion_attempt",
     "reclaim_uncertain_account_deletion_attempt",
+    "set_repository_installation_route",
     "update_repository_metadata",
     "update_workspace_guidance",
     "update_workspace_review_iteration_limit",
@@ -58,6 +65,14 @@ __all__ = [
 # settings added by issue #53 (review_iteration_limit, guidance).
 _WORKSPACE_COLUMNS = (
     "id, owner_profile_id, name, created_at, updated_at, review_iteration_limit, guidance"
+)
+
+# The full Repository column list, including the issue #57 explicit
+# GitHub-installation route (nullable: unconfigured historical records).
+_REPOSITORY_COLUMNS = (
+    "id, project_id, workspace_id, github_repository_id, owner_login, name, "
+    "html_url, is_private, default_branch, created_at, updated_at, "
+    "github_installation_id"
 )
 
 
@@ -102,6 +117,7 @@ def _repository_from_row(row: Sequence[Any]) -> Repository:
         ),
         created_at=normalize_utc(row[9]),
         updated_at=normalize_utc(row[10]),
+        github_installation_id=row[11],
     )
 
 
@@ -318,9 +334,7 @@ def create_repository(
             "(project_id, workspace_id, github_repository_id, owner_login, name, "
             "html_url, is_private, default_branch) "
             "values (%s, %s, %s, %s, %s, %s, %s, %s) "
-            "returning id, project_id, workspace_id, github_repository_id, "
-            "owner_login, name, html_url, is_private, default_branch, "
-            "created_at, updated_at",
+            f"returning {_REPOSITORY_COLUMNS}",
             (
                 project_id,
                 workspace_id,
@@ -339,10 +353,7 @@ def create_repository(
 def get_repository(pool: DatabasePool, repository_id: UUID) -> Repository | None:
     with transaction(pool) as conn:
         row = conn.execute(
-            "select id, project_id, workspace_id, github_repository_id, "
-            "owner_login, name, html_url, is_private, default_branch, "
-            "created_at, updated_at "
-            "from openorc.repositories where id = %s",
+            f"select {_REPOSITORY_COLUMNS} from openorc.repositories where id = %s",
             (repository_id,),
         ).fetchone()
     return None if row is None else _repository_from_row(row)
@@ -353,9 +364,7 @@ def find_repository_by_github_identity(
 ) -> Repository | None:
     with transaction(pool) as conn:
         row = conn.execute(
-            "select id, project_id, workspace_id, github_repository_id, "
-            "owner_login, name, html_url, is_private, default_branch, "
-            "created_at, updated_at "
+            f"select {_REPOSITORY_COLUMNS} "
             "from openorc.repositories "
             "where workspace_id = %s and github_repository_id = %s",
             (workspace_id, identity.github_repository_id),
@@ -378,9 +387,7 @@ def update_repository_metadata(
             "set owner_login = %s, name = %s, html_url = %s, is_private = %s, "
             "default_branch = %s, updated_at = now() "
             "where id = %s "
-            "returning id, project_id, workspace_id, github_repository_id, "
-            "owner_login, name, html_url, is_private, default_branch, "
-            "created_at, updated_at",
+            f"returning {_REPOSITORY_COLUMNS}",
             (
                 metadata.owner_login,
                 metadata.name,
@@ -389,6 +396,37 @@ def update_repository_metadata(
                 metadata.default_branch,
                 repository_id,
             ),
+        ).fetchone()
+    return None if row is None else _repository_from_row(row)
+
+
+def set_repository_installation_route(
+    pool: DatabasePool,
+    *,
+    repository_id: UUID,
+    workspace_id: UUID,
+    github_installation_id: UUID | None,
+) -> Repository | None:
+    """Set or clear one Repository's explicit GitHub installation route (issue #57).
+
+    ``github_installation_id`` is the OpenOrc GitHubInstallation record UUID
+    the Repository is routed to; ``None`` clears the route — valid historical /
+    configuration state that is not usable for GitHub operations. A single
+    nullable column makes multiple competing routes unrepresentable; the
+    composite route foreign key durably rejects a route into another Workspace
+    as ``ForeignKeyViolation``, and translating driver exceptions into typed
+    application errors is a service-layer concern, not a persistence one. The
+    Repository's stable GitHub identity is never touched by this write.
+    Returns the updated Repository, or ``None`` when the Repository does not
+    exist within the given direct Workspace scope.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.repositories "
+            "set github_installation_id = %s, updated_at = now() "
+            "where id = %s and workspace_id = %s "
+            f"returning {_REPOSITORY_COLUMNS}",
+            (github_installation_id, repository_id, workspace_id),
         ).fetchone()
     return None if row is None else _repository_from_row(row)
 

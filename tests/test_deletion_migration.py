@@ -8,6 +8,11 @@ classification of true ownership edges, and the DEFERRABLE INITIALLY DEFERRED
 restrictive classification of scope-consistency, cross-reference, and
 within-aggregate linkage edges. Behavioral deletion semantics are proven
 against a real database by ``tests/integration/test_deletion_persistence.py``.
+
+Later migrations classify their own new edges with the same vocabulary (issue
+#57 classifies the GitHub-installation edges in their own migration); the
+classification lookup below searches every committed migration so the
+classified constraint names stay exactly-once across the migration history.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ OWNERSHIP_CASCADE_CONSTRAINTS = (
     "workspaces_owner_profile_id_fkey",
     "projects_workspace_id_fkey",
     "repositories_project_id_workspace_id_fkey",
+    "github_installations_workspace_id_fkey",
     "tasks_repository_id_workspace_id_fkey",
     "task_agent_sessions_task_id_workspace_id_fkey",
     "plan_revisions_task_id_workspace_id_fkey",
@@ -49,6 +55,9 @@ OWNERSHIP_CASCADE_CONSTRAINTS = (
 # Restrictive edges: direct Workspace scope-consistency facts of Task-owned
 # rows, Connection historical/config cross-references, within-Task-aggregate
 # linkage, and the Task's upward current-object pointers. Never ownership.
+# The issue #57 Repository -> GitHubInstallation route is the same class: a
+# configuration linkage that must never cascade an installation record away
+# through the route.
 DEFERRED_RESTRICTIVE_CONSTRAINTS = (
     "tasks_workspace_id_fkey",
     "task_agent_sessions_workspace_id_fkey",
@@ -62,6 +71,7 @@ DEFERRED_RESTRICTIVE_CONSTRAINTS = (
     "task_pull_requests_workspace_id_fkey",
     "task_agent_sessions_connection_id_workspace_id_fkey",
     "workflow_role_bindings_connection_id_workspace_id_fkey",
+    "repositories_github_installation_id_workspace_id_fkey",
     "review_iterations_review_loop_id_task_id_workspace_id_fkey",
     "review_iterations_plan_revision_id_task_id_workspace_id_fkey",
     "review_iterations_task_pull_request_fk",
@@ -87,9 +97,28 @@ def _deletion_migration_text() -> str:
     return (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8").lower()
 
 
-def _add_constraint_statement(text: str, constraint: str) -> str:
+def _add_constraint_statement(constraint: str) -> str:
+    """Return the one add-constraint statement for ``constraint``.
+
+    The deletion-ownership migration re-declares the Phase 1 graph, so its
+    constraint names are looked up there first. A classified constraint that
+    the deletion migration does not declare is an edge classified by its own
+    later migration (issue #57 classifies the GitHub-installation edges in
+    their own migration) and must be declared exactly once across the rest
+    of the migration history.
+    """
+    deletion_text = _deletion_migration_text()
     pattern = re.compile(rf"\badd constraint {constraint}\b")
-    statements = [s for s in text.split(";") if pattern.search(s)]
+    if pattern.search(deletion_text):
+        statements = [s for s in deletion_text.split(";") if pattern.search(s)]
+        assert len(statements) == 1, f"expected exactly one add constraint for {constraint}"
+        return statements[0]
+    statements = []
+    for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if DELETION_MIGRATION_SUFFIX in migration_path.name:
+            continue
+        text = migration_path.read_text(encoding="utf-8").lower()
+        statements.extend(s for s in text.split(";") if pattern.search(s))
     assert len(statements) == 1, f"expected exactly one add constraint for {constraint}"
     return statements[0]
 
@@ -106,8 +135,7 @@ def test_exactly_one_sanctioned_auth_users_boundary_exists_across_migrations() -
 
 
 def test_the_auth_users_boundary_cascades_the_account_root() -> None:
-    text = _deletion_migration_text()
-    statement = _add_constraint_statement(text, "profiles_id_auth_users_fk")
+    statement = _add_constraint_statement("profiles_id_auth_users_fk")
     assert "references auth.users (id)" in statement
     assert "on delete cascade" in statement
 
@@ -122,25 +150,22 @@ def test_no_other_migration_references_supabase_managed_schemas() -> None:
 
 
 def test_true_ownership_edges_cascade() -> None:
-    text = _deletion_migration_text()
     for constraint in OWNERSHIP_CASCADE_CONSTRAINTS:
-        statement = _add_constraint_statement(text, constraint)
+        statement = _add_constraint_statement(constraint)
         assert "on delete cascade" in statement, constraint
         assert "deferrable" not in statement, constraint
 
 
 def test_restrictive_edges_are_deferred_and_never_cascade() -> None:
-    text = _deletion_migration_text()
     for constraint in DEFERRED_RESTRICTIVE_CONSTRAINTS:
-        statement = _add_constraint_statement(text, constraint)
+        statement = _add_constraint_statement(constraint)
         assert "deferrable initially deferred" in statement, constraint
         assert "on delete cascade" not in statement, constraint
 
 
 def test_connection_reference_edges_never_cascade_through_history() -> None:
-    text = _deletion_migration_text()
     for constraint in _CONNECTION_REFERENCE_CONSTRAINTS:
-        statement = _add_constraint_statement(text, constraint)
+        statement = _add_constraint_statement(constraint)
         assert "deferrable initially deferred" in statement, constraint
         assert "on delete cascade" not in statement, constraint
         # The Connection-reference edges guard historical TaskAgentSession
@@ -152,12 +177,18 @@ def test_connection_reference_edges_never_cascade_through_history() -> None:
 def test_migration_classifies_every_relationship_explicitly() -> None:
     # Every FK constraint re-declared by the deletion migration carries an
     # explicit action: cascade or deferrable restriction — nothing implicit.
-    text = _deletion_migration_text()
+    # Later migrations classify their own new edges with the same vocabulary
+    # (issue #57), so the count here covers exactly the classified names this
+    # migration declares.
+    text = _deletion_migration_text().lower()
     adds = [s for s in text.split(";") if "add constraint" in s]
     foreign_key_adds = [s for s in adds if "foreign key" in s]
-    assert len(foreign_key_adds) == len(OWNERSHIP_CASCADE_CONSTRAINTS) + len(
-        DEFERRED_RESTRICTIVE_CONSTRAINTS
-    )
+    classified_in_this_migration = [
+        constraint
+        for constraint in OWNERSHIP_CASCADE_CONSTRAINTS + DEFERRED_RESTRICTIVE_CONSTRAINTS
+        if f"add constraint {constraint}" in text
+    ]
+    assert len(foreign_key_adds) == len(classified_in_this_migration)
     for statement in foreign_key_adds:
         assert "on delete cascade" in statement or "deferrable initially deferred" in statement, (
             statement

@@ -31,6 +31,12 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - `vault` must remain OUTSIDE the exposed Data API schemas. The platform's Data API schema exposure list is Supabase project/API configuration that repository migrations cannot enforce, so this is a deployment invariant: browser clients reach OpenOrc workflow data only through the OpenOrc application API, never through Supabase Data APIs. The schema-level revokes above deny anon/authenticated access to `vault` regardless of the exposure list.
 - The effective privilege posture is proven against a real Supabase branch by integration assertions (`has_schema_privilege`/`has_table_privilege`/`has_function_privilege` in `tests/integration/test_connection_credential_services.py`): anon/authenticated denied, the backend Postgres path allowed. Postgres `service_role`'s platform-managed Vault access is accepted and deliberately not asserted; preview-deployment success alone does not prove the posture.
 
+## GitHub App installations (issue #57)
+
+- `openorc.github_installations` persists Workspace-scoped GitHub App installation facts and the explicit Repository route. No GitHub App private key, installation access token, PAT, or human OAuth credential is stored in `openorc.*` tables.
+- Foreign-key classification follows the deletion-ownership vocabulary: `github_installations.workspace_id → workspaces` is a true-ownership `ON DELETE CASCADE` edge; the Repository route composite FK is `NO ACTION DEFERRABLE INITIALLY DEFERRED`, so a referenced installation record is never cascaded away through the route. The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_installation_migration.py`.
+- Deleting or disconnecting OpenOrc configuration never uninstalls the GitHub App and never mutates external GitHub artifacts.
+
 ## Security / isolation
 
 - Workspace isolation is a security boundary.

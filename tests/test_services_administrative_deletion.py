@@ -159,6 +159,7 @@ def _repository_row(workspace_id: Any, project_id: Any) -> tuple[Any, ...]:
         "main",
         _OBSERVED,
         _OBSERVED,
+        None,
     )
 
 
@@ -552,6 +553,7 @@ def test_delete_workspace_record_cleans_every_referenced_vault_secret() -> None:
             None,  # aggregate: tasks delete
             None,  # aggregate: role bindings delete
             None,  # aggregate: connections delete
+            None,  # aggregate: github installations delete (issue #57)
             deleted_workspace,  # aggregate: workspaces delete returning
         ]
     )
@@ -598,6 +600,7 @@ def test_delete_workspace_with_zero_connections_still_locks_the_root() -> None:
             None,  # aggregate: tasks delete
             None,  # aggregate: role bindings delete
             None,  # aggregate: connections delete
+            None,  # aggregate: github installations delete (issue #57)
             deleted_workspace,  # aggregate: workspaces delete returning
         ]
     )
@@ -716,6 +719,7 @@ def test_delete_workspace_opens_one_service_span_with_safe_attributes() -> None:
             _ws_row(profile_id),
             workspace_row,
             [],
+            None,
             None,
             None,
             None,

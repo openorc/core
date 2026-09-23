@@ -8,7 +8,7 @@ Do not import FastAPI, RQ, Supabase/GitHub/Cline SDKs, persistence, adapters, br
 
 ## Adopted v1 model
 
-Use the settled concepts rather than inventing parallel abstractions: Profile, Workspace, Project, Repository, Connection, WorkflowRoleBinding, Task, TaskAgentSession, PlanRevision, ReviewLoop, ReviewIteration, OwnerGate, Execution, RuntimeRequest, TaskBlock, TaskPullRequest, and WorkflowEvent.
+Use the settled concepts rather than inventing parallel abstractions: Profile, Workspace, Project, Repository, Connection, WorkflowRoleBinding, GitHubInstallation, Task, TaskAgentSession, PlanRevision, ReviewLoop, ReviewIteration, OwnerGate, Execution, RuntimeRequest, TaskBlock, TaskPullRequest, and WorkflowEvent.
 
 Do not add speculative generic entities, settings bags, workflow nodes, credential records, or replacement abstractions without a demonstrated product requirement.
 
@@ -30,6 +30,13 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - reported_provider, reported_model, and reported runtime metadata are nullable opaque observations, never configuration authority or enums.
 - safe_config contains canonical non-secret JSON only.
 - Exactly one WorkflowRoleBinding exists per (Workspace, role) in v1. Producer and Reviewer bindings may reference the same Connection or separate Connections. Runtime pools/failover are not v1 concepts.
+
+## GitHub App installations and Repository routing (Phase 2B)
+
+- A GitHubInstallation is the durable, Workspace-scoped record of one GitHub App installation available to a Workspace — a separate integration concept from Connection (agent-runtime route). A Workspace may hold several installations, and the same external installation may be represented independently in several Workspaces; Workspace isolation stays explicit.
+- The record carries durable routing and observation facts only: stable external installation/account IDs, mutable observed account login/type, and the observed suspended_at. Raw GitHub App private keys, installation access tokens, PATs, and human OAuth tokens never appear in domain or persistence objects.
+- Repository.github_installation_id is the explicit route to one installation record of the same Workspace: a durable configuration fact establishing which installation later GitHub operations must use — never an authorization claim, never inferred from mutable GitHub metadata. None means unconfigured: valid historical state that is not usable for GitHub operations until explicitly routed.
+- No usability/authorization predicate is derived from observations anywhere in the domain: suspended_at is carried verbatim. Whether a routed installation currently grants access to a routed repository is later GitHub reconciliation work, never a property of the record or route.
 
 ## Task identity and lifecycle
 

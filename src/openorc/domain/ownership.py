@@ -20,6 +20,11 @@ scopes all later Workspace-owned OpenOrc state (Phase 1).
   is the stable external identity used for reconciliation and per-Workspace
   canonicalization. Owner login, name, URL, visibility, and similar fields are
   mutable observed metadata and never identity.
+- A Repository may carry an explicit route (issue #57) to one Workspace-scoped
+  GitHubInstallation record (:mod:`openorc.domain.github_installations`): the
+  route is a durable configuration fact establishing which installation later
+  GitHub operations must use — never an authorization claim, never inferred
+  from mutable metadata.
 """
 
 from __future__ import annotations
@@ -188,6 +193,14 @@ class Repository:
     stable external GitHub repository identity used for reconciliation and
     per-Workspace canonicalization. ``workspace_id`` carries the direct
     Workspace scope and must agree with the owning Project's Workspace.
+    ``github_installation_id`` is the explicit route (issue #57) to the one
+    Workspace-scoped GitHubInstallation record that later GitHub operations
+    must use: ``None`` means no route is configured, so the Repository is a
+    valid historical record but is not usable for GitHub operations. The route
+    is a durable configuration fact addressed by the OpenOrc installation
+    record UUID — never inferred from mutable GitHub metadata — and it does
+    not itself assert current repository access; later GitHub reconciliation
+    establishes current access and permissions.
     """
 
     id: UUID
@@ -197,3 +210,4 @@ class Repository:
     metadata: RepositoryMetadata
     created_at: datetime
     updated_at: datetime
+    github_installation_id: UUID | None = None

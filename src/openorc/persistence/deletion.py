@@ -23,6 +23,8 @@ migration (issue #27):
         | on delete cascade
     workspaces -> projects -> repositories -> tasks -> (task-owned graph)
         + connections, workflow_role_bindings, workspace-level workflow_events
+        + github_installations (issue #57 Workspace-scoped GitHub App
+          installation records)
 
 True ownership edges cascade in the database; restrictive edges are
 ``NO ACTION DEFERRABLE INITIALLY DEFERRED`` and block deletion of a referenced
@@ -64,6 +66,7 @@ from uuid import UUID
 from openorc.domain.tasks import Task, TaskDomainError
 from openorc.persistence.connections import _CONNECTION_COLUMNS, _connection_from_row
 from openorc.persistence.ownership import (
+    _REPOSITORY_COLUMNS,
     _WORKSPACE_COLUMNS,
     _project_from_row,
     _repository_from_row,
@@ -117,7 +120,13 @@ def delete_workspace(pool: DatabasePool, workspace_id: UUID) -> Workspace | None
     2. delete the Workspace's workflow role bindings;
     3. delete the Workspace's Connections (no session or binding references
        remain);
-    4. delete the Workspace row (cascading Projects, Repositories, prompt
+    4. delete the Workspace's GitHub installation records (issue #57): the
+       Workspace row has not been removed yet, but no Repository still routes
+       through the deferred route foreign key at commit time once Repositories
+       are cascaded away with the Workspace row, so the deferred check
+       settles; the GitHub App itself is never uninstalled and no external
+       GitHub artifact is touched;
+    5. delete the Workspace row (cascading Projects, Repositories, prompt
        overrides, and Workspace-level workflow events).
 
     Returns the deleted Workspace, or ``None`` when it does not exist. The
@@ -138,6 +147,10 @@ def delete_workspace(pool: DatabasePool, workspace_id: UUID) -> Workspace | None
         )
         conn.execute(
             "delete from openorc.connections where workspace_id = %s",
+            (workspace_id,),
+        )
+        conn.execute(
+            "delete from openorc.github_installations where workspace_id = %s",
             (workspace_id,),
         )
         row = conn.execute(
@@ -210,10 +223,7 @@ def delete_repository(pool: DatabasePool, repository_id: UUID) -> Repository | N
         )
         conn.execute("delete from openorc.tasks where repository_id = %s", (repository_id,))
         row = conn.execute(
-            "delete from openorc.repositories where id = %s "
-            "returning id, project_id, workspace_id, github_repository_id, "
-            "owner_login, name, html_url, is_private, default_branch, "
-            "created_at, updated_at",
+            f"delete from openorc.repositories where id = %s returning {_REPOSITORY_COLUMNS}",
             (repository_id,),
         ).fetchone()
     return None if row is None else _repository_from_row(row)

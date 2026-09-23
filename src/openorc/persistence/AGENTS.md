@@ -44,6 +44,13 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - review_iteration_limit is positive and guidance defaults to blank text. Same-value configuration writes are no-ops and must not fabricate audit changes.
 - Authorization policy never moves into SQL repositories merely because persistence can join the necessary rows.
 
+## GitHub installation routing (issue #57)
+
+- github_installations carries direct Workspace scope, stable external installation/account IDs, and mutable observed account/suspension facts; one canonical record exists per (Workspace, external installation ID), and the same external installation may exist independently in other Workspaces.
+- Repository routing is a single nullable github_installation_id column: one route by construction, and the composite (github_installation_id, workspace_id) foreign key hooked on github_installations (id, workspace_id) makes cross-Workspace routing unrepresentable.
+- The route FK is NO ACTION DEFERRABLE INITIALLY DEFERRED: hard installation deletion is blocked while a Repository routes to it (forced IMMEDIATE inside the delete transaction, mirroring the Connection-reference pattern), and unbinding the route is the explicit operation. Workspace aggregate deletion removes installation records in its ordered sequence.
+- Reconciliation upserts observations (account ID as reported, login/type, suspended_at) and never rewrites record identity. No GitHub token, private key, PAT, or human OAuth credential is persisted.
+
 ## Connections and runtime-control credentials
 
 - connections and workflow_role_bindings carry direct Workspace scope.
