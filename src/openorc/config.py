@@ -34,6 +34,18 @@ SUPABASE_JWT_AUDIENCE_VAR = "OPENORC_SUPABASE_JWT_AUDIENCE"
 # process bootstrap material only: never browser-visible, never persisted in
 # openorc.* tables or Vault, never logged or returned.
 SUPABASE_SECRET_KEY_VAR = "SUPABASE_SECRET_KEY"
+# The deployed OpenOrc GitHub App identity (issue #58): the App ID and the
+# App private key are deployment/bootstrap secret material — never Workspace
+# data, never stored in ordinary openorc.* tables, never stored in Supabase
+# Vault, never returned through ordinary APIs, never logged or attached to
+# telemetry. Deliberately OPTIONAL on this shared surface: both the API and
+# worker process surfaces boot through Settings.from_env, and authentication
+# ownership follows direct consumption — no process may receive the private
+# key merely because it is required elsewhere. The requirement is enforced
+# where the GitHub App client/authenticator is constructed, which fails fast
+# when either value is absent.
+GITHUB_APP_ID_VAR = "OPENORC_GITHUB_APP_ID"
+GITHUB_APP_PRIVATE_KEY_VAR = "OPENORC_GITHUB_APP_PRIVATE_KEY"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
@@ -137,6 +149,26 @@ def _read_positive_float(env: Mapping[str, str], name: str, *, default: float) -
     return value
 
 
+def _read_optional_int(env: Mapping[str, str], name: str, *, minimum: int) -> int | None:
+    """Read an optional integer setting enforcing a minimum; unset stays unset.
+
+    Unlike the bounded optional settings above, absence is a valid outcome for
+    integration identity that only its consuming component requires
+    (issue #58). A supplied value must still be a well-formed integer meeting
+    the minimum, so misconfiguration never surfaces later at runtime.
+    """
+    raw = _read(env, name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < minimum:
+        raise ConfigurationError(f"{name} must be at least {minimum}, got {value}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Process configuration resolved from the environment boundary."""
@@ -155,6 +187,13 @@ class Settings:
     # Representation-safe: the generated dataclass repr/str must never carry
     # the raw administrative credential (issue #97 secret-handling boundary).
     supabase_secret_key: str | None = field(default=None, repr=False)
+    # GitHub App identity (issue #58). The App ID is not secret material but
+    # is validated as a positive integer when supplied. The private key is
+    # deployment/bootstrap secret material: representation-safe (excluded
+    # from the dataclass repr/str), never persisted in openorc.* tables or
+    # Vault, never logged or returned.
+    github_app_id: int | None = None
+    github_app_private_key: str | None = field(default=None, repr=False)
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -257,6 +296,16 @@ class Settings:
         # material), and never logged or returned.
         supabase_secret_key = _read_secret(source, SUPABASE_SECRET_KEY_VAR)
 
+        # GitHub App identity (issue #58). Optional on this shared surface in
+        # every environment — including production: the App identity belongs
+        # only to the component that constructs the GitHub App client, and
+        # that component fails fast at construction when either value is
+        # absent. The App ID is validated as a positive integer when supplied;
+        # a supplied-but-blank private key is a configuration error (fail
+        # closed without echoing the value, per _read_secret).
+        github_app_id = _read_optional_int(source, GITHUB_APP_ID_VAR, minimum=1)
+        github_app_private_key = _read_secret(source, GITHUB_APP_PRIVATE_KEY_VAR)
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -283,5 +332,7 @@ class Settings:
             supabase_url=supabase_url,
             supabase_jwt_audience=supabase_jwt_audience,
             supabase_secret_key=supabase_secret_key,
+            github_app_id=github_app_id,
+            github_app_private_key=github_app_private_key,
             otlp_endpoint=otlp_endpoint,
         )

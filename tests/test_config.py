@@ -317,3 +317,86 @@ def test_supabase_secret_key_is_optional_in_production() -> None:
     )
 
     assert settings.supabase_secret_key is None
+
+
+# --- GitHub App identity (issue #58) -----------------------------------------
+
+
+def test_github_app_identity_defaults_to_unconfigured() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.github_app_id is None
+    assert settings.github_app_private_key is None
+
+
+def test_github_app_identity_is_read_from_the_environment() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENORC_GITHUB_APP_ID": "12345",
+            "OPENORC_GITHUB_APP_PRIVATE_KEY": (
+                "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+            ),
+        }
+    )
+
+    assert settings.github_app_id == 12345
+    assert settings.github_app_private_key == (
+        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "1.5", "not-a-number"])
+def test_invalid_github_app_id_values_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError):
+        Settings.from_env({"OPENORC_GITHUB_APP_ID": raw})
+
+
+def test_github_app_id_must_be_a_positive_integer() -> None:
+    settings = Settings.from_env({"OPENORC_GITHUB_APP_ID": "1"})
+
+    assert settings.github_app_id == 1
+
+
+def test_blank_github_app_private_key_fails_closed_without_echo() -> None:
+    with pytest.raises(ConfigurationError, match="was supplied blank"):
+        Settings.from_env({"OPENORC_GITHUB_APP_PRIVATE_KEY": "   "})
+
+
+def test_github_app_private_key_is_preserved_verbatim() -> None:
+    pem = "  -----BEGIN PRIVATE KEY-----  \n"
+    settings = Settings.from_env({"OPENORC_GITHUB_APP_PRIVATE_KEY": pem})
+
+    # Key bytes are meaningful: supplied values are never stripped.
+    assert settings.github_app_private_key == pem
+
+
+def test_the_github_app_private_key_never_appears_in_settings_representation() -> None:
+    pem = "-----BEGIN PRIVATE KEY-----repr-leak-probe-----END PRIVATE KEY-----"
+    settings = Settings.from_env(
+        {
+            "OPENORC_GITHUB_APP_ID": "12345",
+            "OPENORC_GITHUB_APP_PRIVATE_KEY": pem,
+        }
+    )
+
+    # The generated dataclass repr/str must never carry the raw key material.
+    assert pem not in repr(settings)
+    assert pem not in str(settings)
+    # The representation stays useful for non-secret fields.
+    assert "12345" in repr(settings)
+
+
+def test_github_app_identity_is_optional_in_production() -> None:
+    # Authentication ownership follows direct consumption: the shared
+    # Settings surface boots both API and worker processes, so the GitHub App
+    # identity is never globally required — the component constructing the
+    # GitHub App client enforces its own requirement.
+    settings = Settings.from_env(
+        {
+            "OPENORC_ENV": "production",
+            "SUPABASE_URL": "https://prod.supabase.co",
+        }
+    )
+
+    assert settings.github_app_id is None
+    assert settings.github_app_private_key is None
