@@ -30,6 +30,7 @@ from openorc.adapters.github.transport import (
     GITHUB_JSON_ACCEPT_HEADER,
     SUPPORTED_GITHUB_API_VERSION,
     HttpGitHubRestClient,
+    _github_request_for,
     is_github_api_origin,
 )
 from openorc.config import ConfigurationError
@@ -42,17 +43,23 @@ class FakeFetcher:
 
     Each queued entry is either a ``(status, headers, body)`` tuple or an
     exception instance to raise once (transport-level failures the
-    classification maps to uncertain outcomes).
+    classification maps to uncertain outcomes). The recorded calls include
+    the request body the transport presented to the seam.
     """
 
     def __init__(self, results: list[tuple[int, Mapping[str, str], bytes] | Exception]) -> None:
         self.results = list(results)
-        self.calls: list[tuple[str, str, dict[str, str], float]] = []
+        self.calls: list[tuple[str, str, dict[str, str], float, bytes | None]] = []
 
     def __call__(
-        self, url: str, method: str, headers: Mapping[str, str], timeout_seconds: float
+        self,
+        url: str,
+        method: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        body: bytes | None,
     ) -> tuple[int, Mapping[str, str], bytes]:
-        self.calls.append((url, method, dict(headers), timeout_seconds))
+        self.calls.append((url, method, dict(headers), timeout_seconds, body))
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -68,7 +75,7 @@ def test_requests_carry_the_centralized_header_and_timeout_contract() -> None:
 
     _client(fetch).request("/test/path", method="GET", authorization="Bearer test-token")
 
-    url, method, headers, timeout = fetch.calls[0]
+    url, method, headers, timeout, _ = fetch.calls[0]
     assert url == GITHUB_API_BASE_URL + "/test/path"
     assert method == "GET"
     assert headers["Accept"] == GITHUB_JSON_ACCEPT_HEADER
@@ -86,8 +93,45 @@ def test_json_request_body_sets_the_content_type() -> None:
         "/test/path", method="POST", authorization="Bearer t", body=b'{"k": "v"}'
     )
 
-    _, _, headers, _ = fetch.calls[0]
+    _, _, headers, _, _ = fetch.calls[0]
     assert headers["Content-Type"] == "application/json"
+
+
+def test_request_bodies_reach_the_fetch_seam_verbatim() -> None:
+    # Regression guard: the seam carries the caller's request body — a
+    # POST/PUT/PATCH operation must not silently send an empty request.
+    fetch = FakeFetcher([(201, {}, b"{}")])
+    payload = b'{"title": "the exact bytes reach the seam"}'
+
+    _client(fetch).request("/test/path", method="POST", authorization="Bearer t", body=payload)
+
+    assert fetch.calls[0][4] == payload
+
+
+def test_bodyless_calls_present_no_body_to_the_fetch_seam() -> None:
+    fetch = FakeFetcher([(200, {}, b"{}")])
+
+    _client(fetch).request("/test/path", method="GET", authorization="Bearer t")
+
+    assert fetch.calls[0][4] is None
+
+
+def test_the_real_fetch_construction_carries_the_request_body() -> None:
+    # Regression guard against the real urllib wiring: the constructed
+    # request transmits the supplied body as its data.
+    request = _github_request_for(
+        "https://api.github.com/test", "POST", {"Accept": "application/json"}, b'{"a": 1}'
+    )
+
+    assert request.data == b'{"a": 1}'
+    assert request.get_method() == "POST"
+
+
+def test_the_real_fetch_construction_is_bodyless_without_a_body() -> None:
+    request = _github_request_for("https://api.github.com/test", "GET", {}, None)
+
+    assert request.data is None
+    assert request.get_method() == "GET"
 
 
 def test_successful_answers_return_the_header_retaining_response() -> None:

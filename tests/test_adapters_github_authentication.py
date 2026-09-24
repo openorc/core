@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from openorc.adapters.github.authentication import (
+    INSTALLATION_TOKEN_CACHE_MAX_ENTRIES,
     INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS,
     GitHubAppAuthenticator,
 )
@@ -61,12 +62,17 @@ class FakeFetcher:
 
     def __init__(self, results: list[tuple[int, Mapping[str, str], bytes] | Exception]) -> None:
         self.results = list(results)
-        self.calls: list[tuple[str, str, dict[str, str], float]] = []
+        self.calls: list[tuple[str, str, dict[str, str], float, bytes | None]] = []
 
     def __call__(
-        self, url: str, method: str, headers: Mapping[str, str], timeout_seconds: float
+        self,
+        url: str,
+        method: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        body: bytes | None,
     ) -> tuple[int, Mapping[str, str], bytes]:
-        self.calls.append((url, method, dict(headers), timeout_seconds))
+        self.calls.append((url, method, dict(headers), timeout_seconds, body))
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -97,7 +103,7 @@ def test_app_jwt_carries_the_expected_contract_without_secret_leakage() -> None:
 
     authenticator.mint_installation_token(4242)
 
-    url, method, headers, _ = fetch.calls[0]
+    url, method, headers, _, _ = fetch.calls[0]
     assert method == "POST"
     assert url.endswith("/app/installations/4242/access_tokens")
     assert url.startswith("https://api.github.com/")
@@ -225,6 +231,86 @@ def test_installations_are_cached_independently_by_stable_id() -> None:
 
     assert first is not second
     assert {call[0].rsplit("/", 2)[-2] for call in fetch.calls} == {"1", "2"}
+
+
+def test_expired_cache_entries_are_pruned_opportunistically() -> None:
+    # Regression guard: expired secret values do not linger for the process
+    # lifetime — the sweep on the next cache touch drops them.
+    fetch = FakeFetcher([(201, {}, _mint_body()) for _ in range(3)])
+    clock = FakeClock()
+    authenticator = _authenticator(fetch, clock)
+
+    authenticator.installation_token(1)
+    authenticator.installation_token(2)
+    assert set(authenticator._cache) == {1, 2}
+
+    clock.now += 3000 + INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS
+    authenticator.installation_token(3)
+
+    assert set(authenticator._cache) == {3}
+    assert len(fetch.calls) == 3
+
+
+def test_unusable_near_expiry_entries_are_pruned_too() -> None:
+    # A token inside the safety margin can never be served, so retaining it
+    # would retain a dead secret value: it is pruned on the next cache touch.
+    fetch = FakeFetcher([(201, {}, _mint_body(lifetime_seconds=30)), (201, {}, _mint_body())])
+    authenticator = _authenticator(fetch, FakeClock())
+
+    authenticator.installation_token(1)
+    authenticator.installation_token(2)
+
+    assert set(authenticator._cache) == {2}
+    assert len(fetch.calls) == 2
+
+
+def test_cache_eviction_is_lru_not_fifo() -> None:
+    # Regression guard: a hit refreshes the entry's LRU position, so the
+    # least-recently-used entry — not the first-inserted one — is evicted.
+    fetch = FakeFetcher([(201, {}, _mint_body()) for _ in range(3)])
+    authenticator = GitHubAppAuthenticator(
+        app_id=_APP_ID,
+        private_key_pem=_PRIVATE_KEY_PEM,
+        clock=FakeClock(),
+        fetch=fetch,
+        cache_max_entries=2,
+    )
+
+    authenticator.installation_token(1)
+    authenticator.installation_token(2)
+    authenticator.installation_token(1)
+    authenticator.installation_token(3)
+
+    assert set(authenticator._cache) == {1, 3}
+    assert len(fetch.calls) == 3
+
+
+def test_the_default_cache_bound_is_enforced() -> None:
+    # Regression guard: cardinality cannot grow without limit on the
+    # documented default bound either.
+    fetch = FakeFetcher(
+        [(201, {}, _mint_body()) for _ in range(INSTALLATION_TOKEN_CACHE_MAX_ENTRIES + 2)]
+    )
+    authenticator = _authenticator(fetch, FakeClock())
+
+    for installation_id in range(1, INSTALLATION_TOKEN_CACHE_MAX_ENTRIES + 3):
+        authenticator.installation_token(installation_id)
+
+    assert len(authenticator._cache) == INSTALLATION_TOKEN_CACHE_MAX_ENTRIES
+    assert set(authenticator._cache) == set(range(3, INSTALLATION_TOKEN_CACHE_MAX_ENTRIES + 3))
+
+
+def test_invalid_cache_bounds_fail_fast() -> None:
+    bad_bounds: list[Any] = [0, -1, True, "2"]
+    for bad_bound in bad_bounds:
+        with pytest.raises(ConfigurationError):
+            GitHubAppAuthenticator(
+                app_id=_APP_ID,
+                private_key_pem=_PRIVATE_KEY_PEM,
+                clock=FakeClock(),
+                fetch=FakeFetcher([]),
+                cache_max_entries=bad_bound,
+            )
 
 
 def test_installation_tokens_are_redacted_on_every_ordinary_surface() -> None:

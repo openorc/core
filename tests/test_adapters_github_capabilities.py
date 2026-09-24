@@ -63,12 +63,17 @@ class FakeFetcher:
 
     def __init__(self, results: list[tuple[int, Mapping[str, str], bytes] | Exception]) -> None:
         self.results = list(results)
-        self.calls: list[tuple[str, str, dict[str, str], float]] = []
+        self.calls: list[tuple[str, str, dict[str, str], float, bytes | None]] = []
 
     def __call__(
-        self, url: str, method: str, headers: Mapping[str, str], timeout_seconds: float
+        self,
+        url: str,
+        method: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        body: bytes | None,
     ) -> tuple[int, Mapping[str, str], bytes]:
-        self.calls.append((url, method, dict(headers), timeout_seconds))
+        self.calls.append((url, method, dict(headers), timeout_seconds, body))
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -336,9 +341,9 @@ def test_validation_targets_the_exact_routed_installation_and_documented_paths()
         github_installation_id=4242, github_repository_id=987654321
     )
 
-    lookup_url, lookup_method, _, _ = fetch.calls[0]
-    mint_url, mint_method, _, _ = fetch.calls[1]
-    listing_url, listing_method, _, _ = fetch.calls[2]
+    lookup_url, lookup_method, _, _, _ = fetch.calls[0]
+    mint_url, mint_method, _, _, _ = fetch.calls[1]
+    listing_url, listing_method, _, _, _ = fetch.calls[2]
     # Exact installation routing: the token is minted for the addressed
     # installation only, and the listing proves membership for it.
     assert lookup_url == f"{GITHUB_API_BASE_URL}/app/installations/4242"
@@ -388,9 +393,9 @@ def test_validation_credential_presentation_follows_the_documented_contract() ->
         github_installation_id=4242, github_repository_id=987654321
     )
 
-    _, _, lookup_headers, _ = fetch.calls[0]
-    _, _, mint_headers, _ = fetch.calls[1]
-    _, _, listing_headers, _ = fetch.calls[2]
+    _, _, lookup_headers, _, _ = fetch.calls[0]
+    _, _, mint_headers, _, _ = fetch.calls[1]
+    _, _, listing_headers, _, _ = fetch.calls[2]
     assert lookup_headers["Authorization"].startswith("Bearer ey")
     assert mint_headers["Authorization"].startswith("Bearer ey")
     assert listing_headers["Authorization"] == "Bearer ghs_listing_token"

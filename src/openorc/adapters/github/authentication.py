@@ -40,6 +40,7 @@ import json
 import logging
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
 
@@ -59,6 +60,7 @@ from openorc.config import ConfigurationError
 from openorc.observability import annotate_span, application_span
 
 __all__ = [
+    "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
     "GitHubAppAuthenticator",
     "InstallationAccessToken",
@@ -77,9 +79,15 @@ _JWT_IAT_BACKWARD_SECONDS = 60
 # A cached installation token is treated as unusable this many seconds
 # before its documented ``expires_at``: GitHub installation tokens live at
 # most one hour, and the margin keeps a live request from presenting a token
-# that expires mid-flight. The cache is process-memory only and bounded by
-# the installations actually used by the process.
+# that expires mid-flight. The cache is process-memory only.
 INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60.0
+
+# The cache is genuinely bounded: at most this many installation entries are
+# retained per process, with expired entries pruned opportunistically and
+# least-recently-used entries evicted when the bound would be exceeded. A
+# long-running process therefore never retains arbitrarily many — or
+# arbitrarily old — installation-token secret values.
+INSTALLATION_TOKEN_CACHE_MAX_ENTRIES = 128
 
 # Representative external-adapter span boundary (issues #108/#109): one
 # instrumented external operation per token mint. Only the operation name
@@ -144,8 +152,13 @@ class GitHubAppAuthenticator:
 
     Constructed with the deployment-held GitHub App identity (the App ID and
     the App private key), which are validated once and held privately; the
-    ordinary representation is redacted. The bounded token cache is process
-    memory keyed by the stable external installation ID.
+    ordinary representation is redacted. The token cache is process memory
+    keyed by the stable external installation ID and is genuinely bounded:
+    expired entries are pruned opportunistically under the cache lock, and
+    retention is LRU-bounded at
+    :data:`INSTALLATION_TOKEN_CACHE_MAX_ENTRIES` entries (configurable at
+    construction), so a long-running process never retains arbitrarily many
+    or arbitrarily old installation-token secret values.
     """
 
     def __init__(
@@ -156,11 +169,20 @@ class GitHubAppAuthenticator:
         clock: Callable[[], float] | None = None,
         fetch: GitHubFetcher | None = None,
         timeout_seconds: float = DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
+        cache_max_entries: int = INSTALLATION_TOKEN_CACHE_MAX_ENTRIES,
     ) -> None:
         if isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0:
             raise ConfigurationError("the GitHub App ID must be a positive integer")
         if not isinstance(private_key_pem, str) or not private_key_pem.strip():
             raise ConfigurationError("the GitHub App private key must be a non-empty PEM string")
+        if (
+            isinstance(cache_max_entries, bool)
+            or not isinstance(cache_max_entries, int)
+            or (cache_max_entries <= 0)
+        ):
+            raise ConfigurationError(
+                "the installation token cache bound must be a positive integer"
+            )
         try:
             # Validate the key once by signing a throwaway payload: a private
             # key that cannot produce an RS256 signature fails fast here. The
@@ -175,8 +197,9 @@ class GitHubAppAuthenticator:
         self._app_id = app_id
         self._clock = clock if clock is not None else time.time
         self._transport = HttpGitHubRestClient(timeout_seconds=timeout_seconds, fetch=fetch)
-        self._cache: dict[int, InstallationAccessToken] = {}
+        self._cache: OrderedDict[int, InstallationAccessToken] = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._cache_max_entries = cache_max_entries
 
     @property
     def app_id(self) -> int:
@@ -208,18 +231,38 @@ class GitHubAppAuthenticator:
         at the current clock reading; otherwise mints a fresh token through
         the documented endpoint. The cache key is the stable external
         installation ID resolved from the #57 route — never a login, URL, or
-        other mutable address.
+        other mutable address. Retention is bounded: expired/unusable entries
+        are pruned opportunistically under the cache lock, hits refresh the
+        LRU position, and storing beyond the configured bound evicts the
+        least-recently-used entry.
         """
         require_positive_int(github_installation_id, "github_installation_id")
         now = self._clock()
         with self._cache_lock:
+            self._prune_expired_locked(now)
             cached = self._cache.get(github_installation_id)
-        if cached is not None and cached.usable_at(now):
-            return cached
+            if cached is not None:
+                self._cache.move_to_end(github_installation_id)
+                return cached
         fresh = self.mint_installation_token(github_installation_id)
         with self._cache_lock:
+            self._prune_expired_locked(self._clock())
             self._cache[github_installation_id] = fresh
+            self._cache.move_to_end(github_installation_id)
+            while len(self._cache) > self._cache_max_entries:
+                self._cache.popitem(last=False)
         return fresh
+
+    def _prune_expired_locked(self, now_epoch: float) -> None:
+        """Remove expired/unusable entries; the caller holds the cache lock.
+
+        An entry whose token is past its expiry minus the safety margin can
+        never be served again, so retaining it would only retain a dead
+        secret value; such entries are dropped whenever the cache is touched.
+        """
+        expired = [key for key, token in self._cache.items() if not token.usable_at(now_epoch)]
+        for key in expired:
+            del self._cache[key]
 
     def invalidate_installation_token(self, github_installation_id: int) -> None:
         """Evict the cached token for the exact installation.

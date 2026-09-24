@@ -10,6 +10,7 @@ anywhere in this boundary: human GitHub sign-in is identity only.
 """
 
 from openorc.adapters.github.authentication import (
+    INSTALLATION_TOKEN_CACHE_MAX_ENTRIES,
     INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS,
     GitHubAppAuthenticator,
     InstallationAccessToken,
@@ -59,6 +60,7 @@ __all__ = [
     "GITHUB_INSTALLATION_REPOSITORIES_PATH",
     "GITHUB_JSON_ACCEPT_HEADER",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
+    "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
     "REQUIRED_V1_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",

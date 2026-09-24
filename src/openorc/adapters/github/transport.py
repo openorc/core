@@ -85,10 +85,15 @@ GITHUB_USER_AGENT = "OpenOrc"
 # Bounded timeout for one GitHub HTTP request.
 DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS = 10.0
 
-# The fetch seam: one bounded HTTP call returning status, response headers,
-# and body. Response headers are part of the seam because documented
-# pagination (Link headers) and rate-limit exhaustion surface as headers.
-GitHubFetcher = Callable[[str, str, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes]]
+# The fetch seam: one bounded HTTP call carrying an optional request body,
+# returning status, response headers, and body. Response headers are part of
+# the seam because documented pagination (Link headers) and rate-limit
+# exhaustion surface as headers; the request body is part of the seam
+# because later GitHub operations send JSON payloads.
+GitHubFetcher = Callable[
+    [str, str, Mapping[str, str], float, "bytes | None"],
+    tuple[int, Mapping[str, str], bytes],
+]
 
 # Rate-limit exhaustion is signaled by a 403/429 answer with an exhausted
 # X-RateLimit-Remaining budget (the primary limit) or with a Retry-After
@@ -131,21 +136,38 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _github_request_for(
+    url: str, method: str, headers: Mapping[str, str], body: bytes | None
+) -> urllib.request.Request:
+    """Construct the urllib request for one GitHub call, carrying the body.
+
+    The request body — when the caller supplied one — is transmitted as the
+    request data; a body-less call transmits nothing.
+    """
+    request = urllib.request.Request(url, data=body, method=method)
+    for name, value in headers.items():
+        request.add_header(name, value)
+    return request
+
+
 def http_fetch(
-    url: str, method: str, headers: Mapping[str, str], timeout_seconds: float
+    url: str,
+    method: str,
+    headers: Mapping[str, str],
+    timeout_seconds: float,
+    body: bytes | None,
 ) -> tuple[int, Mapping[str, str], bytes]:
     """The real GitHub fetch seam: one bounded urllib request.
 
-    Non-2xx answers return with a bounded error-body prefix so the caller's
-    classifier can recognize GitHub's documented secondary-rate-limit
-    markers; error content is never stored, echoed, or exported beyond that
-    boolean check. Transport-level failures (timeout, connection loss)
-    propagate as exceptions the caller maps to the uncertain-outcome
-    classification.
+    The caller-supplied request body (when present) is transmitted verbatim
+    as the request data. Non-2xx answers return with a bounded error-body
+    prefix so the caller's classifier can recognize GitHub's documented
+    secondary-rate-limit markers; error content is never stored, echoed, or
+    exported beyond that boolean check. Transport-level failures (timeout,
+    connection loss) propagate as exceptions the caller maps to the
+    uncertain-outcome classification.
     """
-    request = urllib.request.Request(url, data=None, method=method)
-    for name, value in headers.items():
-        request.add_header(name, value)
+    request = _github_request_for(url, method, headers, body)
     opener = urllib.request.build_opener(_NoRedirectHandler)
     try:
         with opener.open(request, timeout=timeout_seconds) as response:
@@ -262,7 +284,7 @@ class HttpGitHubRestClient:
             headers["Content-Type"] = "application/json"
         try:
             status, response_headers, response_body = self._fetch(
-                url, method, headers, self._timeout_seconds
+                url, method, headers, self._timeout_seconds, body
             )
         except GitHubOutcomeUncertainError:
             raise
