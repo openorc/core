@@ -27,6 +27,7 @@ EXECUTION_ID = "openorc.execution_id"
 CONNECTION_ID = "openorc.connection_id"
 WORKFLOW_ROLE = "openorc.workflow_role"
 OPERATION = "openorc.operation"
+GITHUB_INSTALLATION_ID = "openorc.github_installation_id"
 GITHUB_REPOSITORY = "openorc.github_repository"
 GITHUB_ISSUE_NUMBER = "openorc.github_issue_number"
 GITHUB_PULL_REQUEST_NUMBER = "openorc.github_pull_request_number"
@@ -43,6 +44,7 @@ def annotate_span(
     execution_id: str | None = None,
     connection_id: str | None = None,
     workflow_role: str | None = None,
+    github_installation_id: str | None = None,
     github_repository: str | None = None,
     github_issue_number: int | None = None,
     github_pull_request_number: int | None = None,
@@ -62,6 +64,7 @@ def annotate_span(
         (EXECUTION_ID, execution_id),
         (CONNECTION_ID, connection_id),
         (WORKFLOW_ROLE, workflow_role),
+        (GITHUB_INSTALLATION_ID, github_installation_id),
         (GITHUB_REPOSITORY, github_repository),
         (GITHUB_ISSUE_NUMBER, github_issue_number),
         (GITHUB_PULL_REQUEST_NUMBER, github_pull_request_number),

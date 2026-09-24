@@ -152,6 +152,15 @@ API and worker authentication verifies Supabase Auth access tokens against the p
 - `SUPABASE_SECRET_KEY` — the deployment's Supabase secret API key (`sb_secret_...`), the non-JWT administrative credential for the server-side Auth Admin boundary (permanent account deletion; see `src/openorc/services/account_lifecycle.py`). Deliberately optional on the shared environment surface: it is required only by the component that constructs the Auth Admin client (that construction fails fast without it), so no other process — the worker included — needs to receive it. It travels on the `apikey` request header only, is never browser-visible, never persisted in `openorc.*` tables or Vault, and never logged.
 - v1 is GitHub-only sign-in: configure Supabase Auth with GitHub as the only enabled user sign-in provider and asymmetric JWT signing keys (ES256/RS256). The verifier enforces the trusted `app_metadata` GitHub-origin checks as defense-in-depth and has no symmetric/HS256 shared-secret path.
 
+### GitHub integration (OpenOrc GitHub App)
+
+Durable repository automation authenticates as the deployed OpenOrc GitHub App and mints short-lived installation access tokens for the exact installation routed to each Repository (see `src/openorc/adapters/github/` and `src/openorc/services/github_repository_access.py`). Human GitHub sign-in is identity only: there is no PAT or human OAuth token fallback for repository operations anywhere in the boundary.
+
+- `OPENORC_GITHUB_APP_ID` — the deployed OpenOrc GitHub App's numeric App ID. Optional on the shared environment surface: the requirement is enforced where the GitHub App client is constructed (`HttpGitHubAppClient.from_settings`), which fails fast without it, so unrelated processes never need it.
+- `OPENORC_GITHUB_APP_PRIVATE_KEY` — the GitHub App's PEM private key. Deployment/bootstrap secret material: never Workspace data, never stored in `openorc.*` tables or Supabase Vault, never returned through ordinary APIs, never logged or attached to telemetry. Optional on the shared environment surface for the same construction-point reason; a supplied-but-blank value fails closed without echoing it.
+- The supported GitHub REST API version is pinned in one adapter location (`SUPPORTED_GITHUB_API_VERSION` in `src/openorc/adapters/github/transport.py`) and sent on every request through `X-GitHub-Api-Version`.
+- Installation tokens and the App private key are held in memory only, redacted in ordinary representations, and never persisted in domain objects, events, logs, or telemetry attributes.
+
 ### Application observability (OpenTelemetry)
 
 OpenOrc's own Python control-plane code emits operational telemetry through OpenTelemetry with OTLP as the vendor-neutral export boundary (`OpenOrc API / worker / services / adapters → OpenTelemetry traces + logs + metrics → OTLP → deployment-selected collector/backend`). The destination is deployment configuration, not a core dependency; core ships no backend-specific SDK.
