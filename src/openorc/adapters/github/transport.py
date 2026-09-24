@@ -89,7 +89,9 @@ DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS = 10.0
 GitHubFetcher = Callable[[str, str, Mapping[str, str], float], tuple[int, Mapping[str, str], bytes]]
 
 # Rate-limit exhaustion is signaled by a 403/429 answer with an exhausted
-# X-RateLimit-Remaining budget (GitHub rate-limit documentation).
+# X-RateLimit-Remaining budget (the primary limit) or with a Retry-After
+# header (the documented secondary-limit signal, which may be present while
+# the primary budget is not exhausted) — GitHub rate-limit documentation.
 _RATE_LIMITED_STATUSES = frozenset({403, 429})
 
 
@@ -150,19 +152,29 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
 def is_github_api_origin(url: str) -> bool:
     """Whether an absolute URL targets the exact HTTPS GitHub API origin.
 
-    Parsed-origin validation, never a string-prefix check: a hostname that
-    merely shares the base-URL prefix (``https://api.github.com.evil.example``)
-    or embeds foreign userinfo (``https://api.github.com@evil.example``) is
-    not the GitHub API origin and can never carry the Authorization
-    credential across the credential boundary.
+    Total for arbitrary strings: URL parsing and port access can raise
+    ``ValueError`` for malformed authorities (an unparseable port, an
+    out-of-range port, a malformed bracketed host) — a malformed target is
+    not the GitHub API origin. Parsed-origin validation, never a
+    string-prefix check: a hostname that merely shares the base-URL prefix
+    (``https://api.github.com.evil.example``) or embeds foreign userinfo
+    (``https://api.github.com@evil.example``) is not the GitHub API origin
+    and can never carry the Authorization credential across the credential
+    boundary.
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        # ``port`` parses lazily: an unparseable or out-of-range port raises
+        # ``ValueError`` here, which classifies as "not the GitHub origin".
+        port = parsed.port
+    except ValueError:
+        return False
     return (
         parsed.scheme == "https"
         and parsed.hostname == "api.github.com"
         and parsed.username is None
         and parsed.password is None
-        and parsed.port in (None, 443)
+        and port in (None, 443)
     )
 
 
@@ -233,7 +245,12 @@ class HttpGitHubRestClient:
         if 200 <= status < 300:
             return GitHubHttpResponse(status=status, headers=response_headers, body=response_body)
         remaining = _header_value(response_headers, "X-RateLimit-Remaining")
-        if status in _RATE_LIMITED_STATUSES and remaining == "0":
+        retry_after = _header_value(response_headers, "Retry-After")
+        # GitHub signals the primary rate limit with an exhausted
+        # X-RateLimit-Remaining budget and secondary rate limits with a
+        # Retry-After header — either signal on a 403/429 is a known rate
+        # limit, deliberately NOT an authorization absence.
+        if status in _RATE_LIMITED_STATUSES and (remaining == "0" or retry_after is not None):
             raise GitHubRateLimitedError(f"the GitHub request was rate limited (status {status})")
         if status == 401:
             raise GitHubAuthenticationRejectedError(

@@ -60,8 +60,12 @@ class GitHubAuthorizationRejectedError(GitHubRequestRejectedError):
 
 
 class GitHubRateLimitedError(GitHubRequestRejectedError):
-    """GitHub exhausted the rate-limit budget for the presented credential.
+    """GitHub rate limited the presented credential (403/429).
 
+    Either documented signal classifies here: an exhausted
+    ``X-RateLimit-Remaining`` budget (the primary limit) or a
+    ``Retry-After`` header (the documented secondary-limit signal, which
+    may be present while the primary budget is not exhausted).
     Deliberately distinct from :class:`GitHubAuthorizationRejectedError`:
     a rate limit is not lost repository access.
     """

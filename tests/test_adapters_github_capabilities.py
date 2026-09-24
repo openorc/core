@@ -630,3 +630,38 @@ def test_validation_results_never_carry_credential_material() -> None:
 
     assert "ghs_secret_probe" not in repr(validation)
     assert "ghs_secret_probe" not in str(validation)
+
+
+@pytest.mark.parametrize(
+    "next_target",
+    [
+        "https://api.github.com:not-a-port/installation/repositories?page=2",
+        "https://api.github.com:99999/installation/repositories?page=2",
+        "https://[::1/installation/repositories?page=2",
+        "https://[::1]:99999/installation/repositories?page=2",
+    ],
+)
+def test_malformed_pagination_authorities_classify_as_uncertain(next_target: str) -> None:
+    # Regression guard: a malformed provider-supplied pagination authority
+    # cannot escape the adapter boundary as a raw URL-parser error — the
+    # origin predicate is total, so the target classifies as an uninterpretable
+    # outcome and the fetch seam is never invoked for it.
+    fetch = FakeFetcher(
+        [
+            _json(200, {}, _installation_payload()),
+            _mint_response(),
+            _json(
+                200,
+                {"Link": "<" + next_target + '>; rel="next"'},
+                _listing_payload([111]),
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch, FakeClock()).validate_installation_repository_access(
+            github_installation_id=4242, github_repository_id=987654321
+        )
+
+    # The malformed target never triggers a fourth fetch call.
+    assert len(fetch.calls) == 3

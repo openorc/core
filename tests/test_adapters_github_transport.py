@@ -30,6 +30,7 @@ from openorc.adapters.github.transport import (
     GITHUB_JSON_ACCEPT_HEADER,
     SUPPORTED_GITHUB_API_VERSION,
     HttpGitHubRestClient,
+    is_github_api_origin,
 )
 from openorc.config import ConfigurationError
 
@@ -133,6 +134,27 @@ def test_exhausted_rate_limits_classify_apart_from_authorization(
     status: int, header_name: str
 ) -> None:
     fetch = FakeFetcher([(status, {header_name: "0"}, _SECRET_BODY)])
+
+    with pytest.raises(GitHubRateLimitedError):
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [
+        (403, {"Retry-After": "60"}),
+        (429, {"Retry-After": "60"}),
+        (429, {"X-RateLimit-Remaining": "42", "Retry-After": "30"}),
+        (403, {"retry-after": "30"}),
+    ],
+)
+def test_secondary_rate_limits_classify_apart_from_authorization(
+    status: int, headers: dict[str, str]
+) -> None:
+    # Regression guard: a documented secondary rate limit answers with a
+    # Retry-After header while the primary budget is not exhausted — it must
+    # classify as a rate limit, never as lost authorization.
+    fetch = FakeFetcher([(status, headers, _SECRET_BODY)])
 
     with pytest.raises(GitHubRateLimitedError):
         _client(fetch).request("/x", method="GET", authorization="Bearer t")
@@ -242,6 +264,49 @@ def test_same_origin_absolute_targets_are_accepted() -> None:
     )
 
     assert fetch.calls[0][0] == "https://api.github.com:443/installation/repositories?page=2"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.github.com/x",
+        "https://api.github.com:443/x",
+        "https://api.github.com.evil.example/steal",
+        "https://api.github.com@evil.example/steal",
+        "https://api.github.com:not-a-port/steal",
+        "https://api.github.com:99999/steal",
+        "https://[::1/steal",
+        "https://[::1]:99999/steal",
+        "",
+    ],
+)
+def test_is_github_api_origin_is_total_and_never_raises(url: str) -> None:
+    # Regression guard: URL parsing and port access raise ValueError for
+    # malformed authorities; the origin predicate must classify them as
+    # "not the GitHub origin" instead of escaping a raw parser error.
+    assert isinstance(is_github_api_origin(url), bool)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "https://api.github.com:not-a-port/steal",
+        "https://api.github.com:99999/steal",
+        "https://[::1/steal",
+        "https://[::1]:99999/steal",
+    ],
+)
+def test_malformed_target_authorities_are_rejected_without_reaching_the_seam(
+    path: str,
+) -> None:
+    # Regression guard: a malformed direct target classifies as
+    # ConfigurationError and the fetch seam is never invoked.
+    fetch = FakeFetcher([(200, {}, b"{}")])
+
+    with pytest.raises(ConfigurationError):
+        _client(fetch).request(path, method="GET", authorization="Bearer t")
+
+    assert fetch.calls == []
 
 
 @pytest.mark.parametrize("timeout", [0, -1, "10", True, None])
