@@ -40,6 +40,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
@@ -59,6 +60,7 @@ __all__ = [
     "GitHubHttpResponse",
     "HttpGitHubRestClient",
     "http_fetch",
+    "is_github_api_origin",
 ]
 
 logger = logging.getLogger(__name__)
@@ -143,6 +145,25 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
         if key.lower() == lowered:
             return value
     return None
+
+
+def is_github_api_origin(url: str) -> bool:
+    """Whether an absolute URL targets the exact HTTPS GitHub API origin.
+
+    Parsed-origin validation, never a string-prefix check: a hostname that
+    merely shares the base-URL prefix (``https://api.github.com.evil.example``)
+    or embeds foreign userinfo (``https://api.github.com@evil.example``) is
+    not the GitHub API origin and can never carry the Authorization
+    credential across the credential boundary.
+    """
+    parsed = urlparse(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "api.github.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in (None, 443)
+    )
 
 
 class HttpGitHubRestClient:
@@ -232,10 +253,15 @@ class HttpGitHubRestClient:
     def _url_for(self, path: str) -> str:
         if not isinstance(path, str) or not path:
             raise ConfigurationError("a GitHub request path must be a non-empty string")
-        if path.startswith(GITHUB_API_BASE_URL):
+        if path.startswith("/"):
+            return GITHUB_API_BASE_URL + path
+        # An absolute target (a documented Link pagination target) must
+        # target the exact HTTPS GitHub API origin — validated by parsing,
+        # never by string prefix — so the Authorization credential can never
+        # cross the credential boundary.
+        if is_github_api_origin(path):
             return path
-        if not path.startswith("/"):
-            raise ConfigurationError(
-                "a GitHub request path must be an absolute path under the API base URL"
-            )
-        return GITHUB_API_BASE_URL + path
+        raise ConfigurationError(
+            "a GitHub request target outside the exact HTTPS GitHub API "
+            "origin is rejected: the credential boundary is never crossed"
+        )

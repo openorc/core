@@ -61,10 +61,10 @@ from openorc.adapters.github.errors import (
 )
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
-    GITHUB_API_BASE_URL,
     GitHubFetcher,
     GitHubHttpResponse,
     HttpGitHubRestClient,
+    is_github_api_origin,
 )
 from openorc.config import (
     GITHUB_APP_ID_VAR,
@@ -296,9 +296,12 @@ class HttpGitHubAppClient:
     def _next_page_url(self, response: GitHubHttpResponse) -> str | None:
         """Extract the documented ``Link``-header ``rel="next"`` target.
 
-        A next target outside the GitHub API base classifies as an
-        uninterpretable outcome instead of silently moving the credential
-        boundary to another host.
+        A next target is validated against the exact HTTPS GitHub API origin
+        through the centralized parsed-origin rule (never a string-prefix
+        check, which hostname-prefix or userinfo URLs would bypass); a target
+        outside that origin classifies as an uninterpretable outcome instead
+        of silently moving the Authorization credential boundary to another
+        host.
         """
         link = _header_value(response.headers, "Link")
         if link is None:
@@ -306,10 +309,10 @@ class HttpGitHubAppClient:
         next_url = _parse_link_next_target(link)
         if next_url is None:
             return None
-        if not next_url.startswith(GITHUB_API_BASE_URL):
+        if not is_github_api_origin(next_url):
             raise GitHubOutcomeUncertainError(
                 "the installation repository listing is not interpretable: "
-                "the pagination target leaves the GitHub API boundary"
+                "the pagination target leaves the exact GitHub API origin"
             )
         return next_url
 

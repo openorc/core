@@ -205,6 +205,45 @@ def test_targets_outside_the_api_boundary_are_rejected(path: str) -> None:
     assert fetch.calls == []
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Hostname-prefix confusion: the string shares the base-URL prefix
+        # but resolves to a foreign origin.
+        "https://api.github.com.evil.example/steal",
+        # Foreign userinfo embedding the GitHub hostname.
+        "https://api.github.com@evil.example/steal",
+        # Downgraded scheme.
+        "http://api.github.com/steal",
+        # Foreign port.
+        "https://api.github.com:8443/steal",
+    ],
+)
+def test_origin_confusion_targets_never_reach_the_fetch_seam(path: str) -> None:
+    # Regression guard: parsed-origin validation replaces the string-prefix
+    # check, so no URL that merely shares the base-URL prefix — and no URL
+    # with foreign userinfo — can ever receive the Authorization credential.
+    fetch = FakeFetcher([(200, {}, b"{}")])
+
+    with pytest.raises(ConfigurationError):
+        _client(fetch).request(path, method="GET", authorization="Bearer t")
+
+    assert fetch.calls == []
+
+
+def test_same_origin_absolute_targets_are_accepted() -> None:
+    # An explicit default port is the same origin as the implicit one.
+    fetch = FakeFetcher([(200, {}, b"{}")])
+
+    _client(fetch).request(
+        "https://api.github.com:443/installation/repositories?page=2",
+        method="GET",
+        authorization="Bearer t",
+    )
+
+    assert fetch.calls[0][0] == "https://api.github.com:443/installation/repositories?page=2"
+
+
 @pytest.mark.parametrize("timeout", [0, -1, "10", True, None])
 def test_invalid_timeouts_fail_fast_at_construction(timeout: Any) -> None:
     with pytest.raises(ConfigurationError):

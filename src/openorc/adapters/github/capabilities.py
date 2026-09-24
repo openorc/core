@@ -35,8 +35,9 @@ Required v1 capabilities use least privilege — no broad "admin" assumption:
   creation/reconciliation authority but never merge authority.
 - ``issues`` write covers issue state, sub-issues, dependencies, and issue
   comments; ``pull_requests`` write covers PR read/create/reconciliation;
-  ``checks`` read covers checks and commit statuses; ``metadata`` read is
-  GitHub's mandatory baseline.
+  ``checks`` read covers check runs and suites, while commit-status reads
+  require GitHub's separate ``statuses`` (Commit statuses) permission;
+  ``metadata`` read is GitHub's mandatory baseline.
 """
 
 from __future__ import annotations
@@ -77,16 +78,19 @@ class GitHubWorkflowCapability(Enum):
     PULL_REQUEST_READ = "pull_request_read"
     PULL_REQUEST_WRITE = "pull_request_write"
     CHECKS_READ = "checks_read"
+    COMMIT_STATUS_READ = "commit_status_read"
     METADATA_READ = "metadata_read"
 
 
 # The settled v1 OpenOrc GitHub workflow capability requirement (least
 # privilege): issue state/sub-issues/dependencies/comments, repository
-# refs/committed state, PR read/create/reconciliation, checks and commit
-# statuses, and exact-head merge authority. Exact-head merge derives from
-# ``contents: write`` (the documented merge contract) plus the merge
+# refs/committed state, PR read/create/reconciliation, check runs/suites,
+# commit statuses, and exact-head merge authority. Exact-head merge derives
+# from ``contents: write`` (the documented merge contract) plus the merge
 # endpoint's exact-head ``sha`` parameter — never from the pull-request
-# permission. ``metadata: read`` is GitHub's mandatory baseline.
+# permission. Commit-status reads require GitHub's separate Commit statuses
+# permission (exposed under ``statuses`` in the installation object), not
+# the Checks permission. ``metadata: read`` is GitHub's mandatory baseline.
 REQUIRED_V1_WORKFLOW_CAPABILITIES = frozenset(
     {
         GitHubWorkflowCapability.ISSUE_WRITE,
@@ -94,6 +98,7 @@ REQUIRED_V1_WORKFLOW_CAPABILITIES = frozenset(
         GitHubWorkflowCapability.CONTENTS_WRITE,
         GitHubWorkflowCapability.PULL_REQUEST_WRITE,
         GitHubWorkflowCapability.CHECKS_READ,
+        GitHubWorkflowCapability.COMMIT_STATUS_READ,
         GitHubWorkflowCapability.METADATA_READ,
     }
 )
@@ -182,6 +187,8 @@ _INSTALLATION_PERMISSION_TO_CAPABILITIES: dict[tuple[str, str], _CapabilitySet] 
     ),
     ("checks", "read"): frozenset({GitHubWorkflowCapability.CHECKS_READ}),
     ("checks", "write"): frozenset({GitHubWorkflowCapability.CHECKS_READ}),
+    ("statuses", "read"): frozenset({GitHubWorkflowCapability.COMMIT_STATUS_READ}),
+    ("statuses", "write"): frozenset({GitHubWorkflowCapability.COMMIT_STATUS_READ}),
     ("metadata", "read"): frozenset({GitHubWorkflowCapability.METADATA_READ}),
 }
 

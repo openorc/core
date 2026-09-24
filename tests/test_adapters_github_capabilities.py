@@ -95,12 +95,14 @@ def _mint_response(token: str = "ghs_listing_token") -> tuple[int, Mapping[str, 
 
 
 # The full documented v1 permission set: exactly what the settled workflow
-# needs, at least privilege (no administration write, no broad admin).
+# needs, at least privilege (no administration write, no broad admin). Commit
+# statuses require GitHub's separate statuses permission, not Checks.
 _FULL_V1_PERMISSIONS = {
     "issues": "write",
     "contents": "write",
     "pull_requests": "write",
     "checks": "read",
+    "statuses": "read",
     "metadata": "read",
 }
 _FULL_V1_EVENTS = [
@@ -164,9 +166,12 @@ def test_required_v1_capability_set_is_least_privilege_and_includes_contents_wri
     assert GitHubWorkflowCapability.ISSUE_WRITE in REQUIRED_V1_WORKFLOW_CAPABILITIES
     assert GitHubWorkflowCapability.PULL_REQUEST_WRITE in REQUIRED_V1_WORKFLOW_CAPABILITIES
     assert GitHubWorkflowCapability.CHECKS_READ in REQUIRED_V1_WORKFLOW_CAPABILITIES
+    # Commit-status reads are a distinct GitHub permission (statuses), so the
+    # required set carries the separate semantic capability.
+    assert GitHubWorkflowCapability.COMMIT_STATUS_READ in REQUIRED_V1_WORKFLOW_CAPABILITIES
     assert GitHubWorkflowCapability.REPOSITORY_READ in REQUIRED_V1_WORKFLOW_CAPABILITIES
-    # Least privilege: exactly the six settled v1 capabilities, no more.
-    assert len(REQUIRED_V1_WORKFLOW_CAPABILITIES) == 6
+    # Least privilege: exactly the seven settled v1 capabilities, no more.
+    assert len(REQUIRED_V1_WORKFLOW_CAPABILITIES) == 7
 
 
 def test_full_v1_permission_set_satisfies_the_required_capabilities() -> None:
@@ -206,6 +211,23 @@ def test_unknown_permission_keys_grant_no_semantic_capability() -> None:
 def test_non_string_permission_values_are_uninterpretable() -> None:
     with pytest.raises(GitHubOutcomeUncertainError):
         map_installation_permissions({"issues": 2})
+
+
+def test_commit_status_reads_require_the_separate_statuses_permission() -> None:
+    # GitHub documents commit-status reads as the separate Commit statuses
+    # repository permission: the Checks permission never supplies it.
+    capabilities = map_installation_permissions({"checks": "read"})
+
+    assert GitHubWorkflowCapability.CHECKS_READ in capabilities
+    assert GitHubWorkflowCapability.COMMIT_STATUS_READ not in capabilities
+    missing = missing_required_capabilities(capabilities)
+    assert GitHubWorkflowCapability.COMMIT_STATUS_READ in missing
+
+
+def test_statuses_write_grants_the_commit_status_read_capability() -> None:
+    capabilities = map_installation_permissions({"statuses": "write"})
+
+    assert GitHubWorkflowCapability.COMMIT_STATUS_READ in capabilities
 
 
 def test_required_webhook_events_are_a_single_explicit_set() -> None:
@@ -422,6 +444,22 @@ def test_capability_shortfall_is_a_classified_denial_before_listing() -> None:
     assert len(fetch.calls) == 1
 
 
+def test_installation_without_the_commit_status_permission_is_rejected() -> None:
+    # Regression guard: an installation granting Checks read but not the
+    # separate statuses (Commit statuses) permission fails the required v1
+    # capability validation — Checks never covers commit statuses.
+    permissions = dict(_FULL_V1_PERMISSIONS)
+    del permissions["statuses"]
+    fetch = FakeFetcher([_json(200, {}, _installation_payload(permissions=permissions))])
+
+    with pytest.raises(GitHubAuthorizationRejectedError):
+        _client(fetch, FakeClock()).validate_installation_repository_access(
+            github_installation_id=4242, github_repository_id=987654321
+        )
+
+    assert len(fetch.calls) == 1
+
+
 def test_missing_webhook_subscription_is_a_classified_denial() -> None:
     fetch = FakeFetcher([_json(200, {}, _installation_payload(events=["issues"]))])
 
@@ -512,6 +550,48 @@ def test_pagination_targets_outside_the_api_boundary_classify_as_uncertain() -> 
         _client(fetch, FakeClock()).validate_installation_repository_access(
             github_installation_id=4242, github_repository_id=987654321
         )
+
+
+@pytest.mark.parametrize(
+    "next_target",
+    [
+        # Hostname-prefix confusion: the string shares the base-URL prefix
+        # but resolves to a foreign origin.
+        "https://api.github.com.evil.example/steal",
+        # Foreign userinfo embedding the GitHub hostname.
+        "https://api.github.com@evil.example/steal",
+        # Downgraded scheme.
+        "http://api.github.com/installation/repositories?page=2",
+        # Foreign port.
+        "https://api.github.com:8443/installation/repositories?page=2",
+    ],
+)
+def test_pagination_targets_off_the_exact_github_origin_classify_as_uncertain(
+    next_target: str,
+) -> None:
+    # Regression guard: the parsed-origin rule (not a string-prefix check)
+    # governs Link pagination targets, so the Authorization credential is
+    # never presented to a URL that merely shares the base-URL prefix.
+    fetch = FakeFetcher(
+        [
+            _json(200, {}, _installation_payload()),
+            _mint_response(),
+            _json(
+                200,
+                {"Link": "<" + next_target + '>; rel="next"'},
+                _listing_payload([111]),
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch, FakeClock()).validate_installation_repository_access(
+            github_installation_id=4242, github_repository_id=987654321
+        )
+
+    # The credential is never presented to the foreign target: the listing
+    # page that carried the forged Link header is the last fetch call.
+    assert len(fetch.calls) == 3
 
 
 def test_exceeding_the_bounded_listing_page_count_classifies_as_uncertain() -> None:
