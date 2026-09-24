@@ -23,9 +23,11 @@ Transport hardening:
   outcome — never success, never a safe replay.
 - Every request carries a bounded timeout; the fetch seam receives it so a
   stalled connection cannot hang the calling process.
-- The response body is never echoed into errors, logs, or span attributes;
-  classification uses the status code and (for rate limits) response
-  headers only.
+- Failure classification uses the status code, rate-limit response headers,
+  and — solely to recognize GitHub's documented secondary-rate-limit
+  markers — a bounded prefix of the response body. The body content itself
+  is never stored, echoed into errors, logs, or span attributes, or
+  exported in any form; the marker check returns a boolean only.
 
 The low-level fetch seam is deliberately header-retaining: a
 ``(status, headers, body)`` result is required by the documented
@@ -92,7 +94,20 @@ GitHubFetcher = Callable[[str, str, Mapping[str, str], float], tuple[int, Mappin
 # X-RateLimit-Remaining budget (the primary limit) or with a Retry-After
 # header (the documented secondary-limit signal, which may be present while
 # the primary budget is not exhausted) — GitHub rate-limit documentation.
+# A secondary limit can also answer without Retry-After, documented only by
+# the response error message; the bounded body-marker check below recognizes
+# that form without exposing any provider content.
 _RATE_LIMITED_STATUSES = frozenset({403, 429})
+
+# A bounded prefix of a non-2xx body is retained solely for the classifier
+# to recognize GitHub's documented secondary-rate-limit markers. The content
+# is never stored, echoed, or exported.
+_ERROR_BODY_CLASSIFICATION_LIMIT_BYTES = 4096
+
+# The stable documented phrases GitHub uses for secondary rate limits
+# (GitHub rate-limit documentation). Matched case-insensitively; no other
+# body content is ever inspected or retained.
+_SECONDARY_LIMIT_BODY_MARKERS = ("secondary rate limit", "abuse detection mechanism")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,11 +136,12 @@ def http_fetch(
 ) -> tuple[int, Mapping[str, str], bytes]:
     """The real GitHub fetch seam: one bounded urllib request.
 
-    Non-2xx answers return as ``(status, headers, b"")`` so the caller
-    classifies the outcome; the error body is deliberately discarded so no
-    provider content can leak into errors or logs. Transport-level failures
-    (timeout, connection loss) propagate as exceptions the caller maps to
-    the uncertain-outcome classification.
+    Non-2xx answers return with a bounded error-body prefix so the caller's
+    classifier can recognize GitHub's documented secondary-rate-limit
+    markers; error content is never stored, echoed, or exported beyond that
+    boolean check. Transport-level failures (timeout, connection loss)
+    propagate as exceptions the caller maps to the uncertain-outcome
+    classification.
     """
     request = urllib.request.Request(url, data=None, method=method)
     for name, value in headers.items():
@@ -137,7 +153,20 @@ def http_fetch(
     except urllib.error.HTTPError as exc:
         # A definitive HTTP answer, including 3xx (the handler refuses to
         # follow redirects, surfacing them here): classify from the status.
-        return exc.code, dict(exc.headers.items()), b""
+        return exc.code, dict(exc.headers.items()), exc.read(_ERROR_BODY_CLASSIFICATION_LIMIT_BYTES)
+
+
+def _body_reports_secondary_rate_limit(body: bytes) -> bool:
+    """Whether a bounded non-2xx body carries GitHub's documented secondary-limit marker.
+
+    Content-safe by construction: the check decodes a bounded prefix, matches
+    only the stable documented phrases, and returns a boolean — no provider
+    content is ever stored, echoed into errors, or exported.
+    """
+    if not body:
+        return False
+    text = body[:_ERROR_BODY_CLASSIFICATION_LIMIT_BYTES].decode("utf-8", "ignore").lower()
+    return any(marker in text for marker in _SECONDARY_LIMIT_BODY_MARKERS)
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -244,13 +273,19 @@ class HttpGitHubRestClient:
 
         if 200 <= status < 300:
             return GitHubHttpResponse(status=status, headers=response_headers, body=response_body)
-        remaining = _header_value(response_headers, "X-RateLimit-Remaining")
-        retry_after = _header_value(response_headers, "Retry-After")
         # GitHub signals the primary rate limit with an exhausted
         # X-RateLimit-Remaining budget and secondary rate limits with a
-        # Retry-After header — either signal on a 403/429 is a known rate
-        # limit, deliberately NOT an authorization absence.
-        if status in _RATE_LIMITED_STATUSES and (remaining == "0" or retry_after is not None):
+        # Retry-After header or a documented secondary-limit error message
+        # (which can be present while the primary budget is not exhausted and
+        # Retry-After is absent). Any of these on a 403/429 — and the 429
+        # status itself — is a known rate limit, deliberately NOT an
+        # authorization absence.
+        if status in _RATE_LIMITED_STATUSES and (
+            status == 429
+            or _header_value(response_headers, "X-RateLimit-Remaining") == "0"
+            or _header_value(response_headers, "Retry-After") is not None
+            or _body_reports_secondary_rate_limit(response_body)
+        ):
             raise GitHubRateLimitedError(f"the GitHub request was rate limited (status {status})")
         if status == 401:
             raise GitHubAuthenticationRejectedError(

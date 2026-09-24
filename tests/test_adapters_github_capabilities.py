@@ -41,6 +41,7 @@ from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+    GitHubRateLimitedError,
 )
 from openorc.adapters.github.transport import GITHUB_API_BASE_URL, HttpGitHubRestClient
 
@@ -665,3 +666,27 @@ def test_malformed_pagination_authorities_classify_as_uncertain(next_target: str
 
     # The malformed target never triggers a fourth fetch call.
     assert len(fetch.calls) == 3
+
+
+def test_secondary_rate_limited_listing_is_never_authorization_loss() -> None:
+    # End-to-end regression for the documented secondary form: a listing that
+    # answers 403 with a documented secondary-limit message, no Retry-After,
+    # and a nonzero primary budget classifies as a rate limit — the adapter
+    # never raises the authorization rejection the service would translate
+    # into false lost-installation authority.
+    fetch = FakeFetcher(
+        [
+            _json(200, {}, _installation_payload()),
+            _mint_response(),
+            (
+                403,
+                {"X-RateLimit-Remaining": "4747"},
+                b'{"message": "You have exceeded a secondary rate limit"}',
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubRateLimitedError):
+        _client(fetch, FakeClock()).validate_installation_repository_access(
+            github_installation_id=4242, github_repository_id=987654321
+        )

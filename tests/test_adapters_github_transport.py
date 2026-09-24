@@ -108,7 +108,7 @@ def test_successful_answers_return_the_header_retaining_response() -> None:
         (404, GitHubAuthorizationRejectedError),
         (400, GitHubRequestRejectedError),
         (422, GitHubRequestRejectedError),
-        (429, GitHubRequestRejectedError),
+        (429, GitHubRateLimitedError),
         (302, GitHubOutcomeUncertainError),
         (304, GitHubOutcomeUncertainError),
         (500, GitHubOutcomeUncertainError),
@@ -157,6 +157,70 @@ def test_secondary_rate_limits_classify_apart_from_authorization(
     fetch = FakeFetcher([(status, headers, _SECRET_BODY)])
 
     with pytest.raises(GitHubRateLimitedError):
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+
+def test_secondary_403_without_retry_after_is_recognized_from_the_documented_marker() -> None:
+    # Regression guard for the remaining documented form: a secondary rate
+    # limit can answer 403 with neither Retry-After nor an exhausted primary
+    # budget, documented only by the error message. The bounded body-marker
+    # check recognizes it, so it can never be promoted to authorization loss.
+    fetch = FakeFetcher(
+        [
+            (
+                403,
+                {"X-RateLimit-Remaining": "4747"},
+                b'{"message": "You have exceeded a secondary rate limit"}',
+            )
+        ]
+    )
+
+    with pytest.raises(GitHubRateLimitedError):
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+
+def test_abuse_detection_marker_is_recognized_as_a_rate_limit() -> None:
+    fetch = FakeFetcher(
+        [
+            (
+                403,
+                {},
+                b'{"message": "You have exceeded an abuse detection mechanism"}',
+            )
+        ]
+    )
+
+    with pytest.raises(GitHubRateLimitedError):
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+
+def test_secondary_limit_marker_content_never_enters_the_error_message() -> None:
+    # The marker check is boolean-only: the provider body (secret-looking or
+    # not) is never echoed into the raised error.
+    body = b'{"message": "You have exceeded a secondary rate limit ghs_secret_value"}'
+    fetch = FakeFetcher([(403, {"X-RateLimit-Remaining": "4747"}, body)])
+
+    with pytest.raises(GitHubRateLimitedError) as caught:
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+    assert "ghs_secret_value" not in str(caught.value)
+
+
+def test_a_standard_403_denial_body_remains_an_authorization_rejection() -> None:
+    # A 403 carrying GitHub's standard authorization-denial message (no
+    # secondary-limit marker, no rate-limit headers) is affirmative evidence
+    # of denial and keeps the classified authorization rejection.
+    fetch = FakeFetcher(
+        [
+            (
+                403,
+                {"X-RateLimit-Remaining": "4747"},
+                b'{"message": "Resource not accessible by integration"}',
+            )
+        ]
+    )
+
+    with pytest.raises(GitHubAuthorizationRejectedError):
         _client(fetch).request("/x", method="GET", authorization="Bearer t")
 
 
