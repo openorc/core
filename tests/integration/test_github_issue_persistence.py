@@ -28,6 +28,10 @@ import pytest
 from psycopg import Connection
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
 
+from openorc.adapters.github import (
+    GitHubIssueObservation,
+    GitHubRepositoryObservation,
+)
 from openorc.domain.github_issues import (
     GitHubIssueState,
     github_issue_requirements_fingerprint,
@@ -36,11 +40,12 @@ from openorc.persistence import deletion as deletion_repositories
 from openorc.persistence import github_issues as issue_repositories
 from openorc.persistence.pool import DatabasePool
 from openorc.services import github_reconciliation as reconciliation_services
-from openorc.services.errors import NotFoundError
+from openorc.services.errors import ConflictError, NotFoundError
 
 pytestmark = pytest.mark.integration
 
 _OBSERVED = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
+_EXTERNAL_INSTALLATION_ID = 12345678
 
 
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
@@ -208,30 +213,108 @@ def test_an_identical_re_reconciliation_preserves_updated_at(conn: Connection[An
     assert second.previous_fingerprint == first.projection.requirements_fingerprint
 
 
-def test_issue_identity_uniqueness_and_the_number_backstop(conn: Connection[Any]) -> None:
+def test_issue_number_reuse_and_address_coherence_are_classified_outcomes(
+    conn: Connection[Any],
+) -> None:
     workspace_id, repository_id = _workspace_with_repository(conn)
     first = issue_repositories.reconcile_github_issue(
         _pool(conn), **_reconcile_kwargs(workspace_id=workspace_id, repository_id=repository_id)
     )
     assert first.outcome is issue_repositories.GitHubIssueReconcileOutcome.INSERTED
+    assert first.projection is not None
 
-    # A different stable identity under the same durably mapped number
-    # violates the number backstop.
+    # A different stable identity losing the race for the durably mapped
+    # number: the reconciliation API absorbs the unique violation (its
+    # savepoint-scoped insert rolls back), classifies from the re-read
+    # durable mappings, and reports the durable NUMBER_CONFLICT — it never
+    # propagates the driver exception and never rebinds identity.
+    loser = issue_repositories.reconcile_github_issue(
+        _pool(conn),
+        **_reconcile_kwargs(
+            workspace_id=workspace_id, repository_id=repository_id, github_issue_id=999
+        ),
+    )
+    assert loser.outcome is issue_repositories.GitHubIssueReconcileOutcome.NUMBER_CONFLICT
+    assert loser.projection is not None
+    assert loser.projection.identity.github_issue_id == 503
+
+    # The same stable identity reconciled under a different number is
+    # detected by the initial locked identity read — before any insert —
+    # and returns the classified IDENTITY_NUMBER_MISMATCH.
+    mismatch = issue_repositories.reconcile_github_issue(
+        _pool(conn),
+        **_reconcile_kwargs(
+            workspace_id=workspace_id, repository_id=repository_id, issue_number=43
+        ),
+    )
+    assert (
+        mismatch.outcome is issue_repositories.GitHubIssueReconcileOutcome.IDENTITY_NUMBER_MISMATCH
+    )
+    assert mismatch.projection is not None
+    assert mismatch.projection.issue_number == 42
+
+    # Both classified conflicts applied nothing: the canonical projection is
+    # exactly the one the first reconciliation created.
+    reloaded = issue_repositories.find_github_issue(
+        _pool(conn), repository_id=repository_id, github_issue_id=503
+    )
+    assert reloaded is not None
+    assert reloaded.id == first.projection.id
+    assert reloaded.issue_number == 42
+
+
+def test_the_durable_uniqueness_constraints_reject_conflicting_inserts(
+    conn: Connection[Any],
+) -> None:
+    # The database constraints themselves are proven directly: the
+    # reconciliation API deliberately absorbs and classifies these
+    # violations, so the raw durable backstops are exercised with SQL here.
+    workspace_id, repository_id = _workspace_with_repository(conn)
+    inserted = issue_repositories.reconcile_github_issue(
+        _pool(conn), **_reconcile_kwargs(workspace_id=workspace_id, repository_id=repository_id)
+    )
+    assert inserted.outcome is issue_repositories.GitHubIssueReconcileOutcome.INSERTED
+
+    insert_sql = (
+        "insert into openorc.github_issues "
+        "(workspace_id, repository_id, github_issue_id, issue_number, title, body, "
+        "state, requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    base_params = (
+        workspace_id,
+        repository_id,
+    )
+
+    # A different stable identity under the durably mapped number violates
+    # the issue-number backstop.
     with pytest.raises(UniqueViolation):
-        issue_repositories.reconcile_github_issue(
-            _pool(conn),
-            **_reconcile_kwargs(
-                workspace_id=workspace_id, repository_id=repository_id, github_issue_id=999
+        conn.execute(
+            insert_sql,
+            (
+                *base_params,
+                999,
+                42,
+                "Another issue",
+                None,
+                "open",
+                github_issue_requirements_fingerprint("Another issue", None),
             ),
         )
 
     # The same stable identity under a different number violates the
-    # canonical identity uniqueness's address coherence.
+    # canonical identity uniqueness.
     with pytest.raises(UniqueViolation):
-        issue_repositories.reconcile_github_issue(
-            _pool(conn),
-            **_reconcile_kwargs(
-                workspace_id=workspace_id, repository_id=repository_id, issue_number=43
+        conn.execute(
+            insert_sql,
+            (
+                *base_params,
+                503,
+                43,
+                "Found a bug",
+                "Requirements body",
+                "open",
+                github_issue_requirements_fingerprint("Found a bug", "Requirements body"),
             ),
         )
 
@@ -376,22 +459,155 @@ def test_the_service_boundary_fails_closed_on_an_unrouted_or_foreign_repository(
         )
 
 
-def test_number_reuse_fails_closed_without_rebinding_identity(conn: Connection[Any]) -> None:
+class _FakeGitHubClient:
+    """Minimal GitHubAppClient fake: typed observations, never the network."""
+
+    def __init__(
+        self,
+        repository_observation: GitHubRepositoryObservation,
+        issue_observation: GitHubIssueObservation,
+    ) -> None:
+        self._repository_observation = repository_observation
+        self._issue_observation = issue_observation
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> GitHubRepositoryObservation:
+        assert github_installation_id == _EXTERNAL_INSTALLATION_ID
+        assert github_repository_id == 987654321
+        return self._repository_observation
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueObservation:
+        assert github_installation_id == _EXTERNAL_INSTALLATION_ID
+        assert (owner_login, repository_name, issue_number) == ("octocat", "hello-world", 42)
+        return self._issue_observation
+
+    def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the service must not compose raw #58 validation operations")
+
+    def get_installation_capabilities(self, github_installation_id: int) -> Any:
+        raise AssertionError("the service must not compose raw adapter operations")
+
+
+def _workspace_with_routed_repository(
+    conn: Connection[Any],
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A Phase 1 aggregate plus the #57 installation route, all real rows."""
     workspace_id, repository_id = _workspace_with_repository(conn)
+    installation_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.github_installations "
+        "(id, workspace_id, github_installation_id, github_account_id, account_login, "
+        "account_type, suspended_at) "
+        "values (%s, %s, %s, %s, %s, %s, %s)",
+        (
+            installation_id,
+            workspace_id,
+            _EXTERNAL_INSTALLATION_ID,
+            501,
+            "octocat",
+            "Organization",
+            None,
+        ),
+    )
+    conn.execute(
+        "update openorc.repositories set github_installation_id = %s where id = %s",
+        (installation_id, repository_id),
+    )
+    return workspace_id, repository_id
+
+
+def test_the_service_reconciles_an_issue_end_to_end_against_the_real_schema(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id = _workspace_with_routed_repository(conn)
+    github = _FakeGitHubClient(
+        GitHubRepositoryObservation(
+            github_repository_id=987654321,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        ),
+        GitHubIssueObservation(
+            github_issue_id=503,
+            issue_number=42,
+            title="Found a bug",
+            body="Requirements body",
+            state="open",
+            provider_updated_at=_OBSERVED,
+            is_pull_request=False,
+        ),
+    )
+
+    result = reconciliation_services.reconcile_repository_issue(
+        _pool(conn),
+        github,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        issue_number=42,
+    )
+
+    assert result.issue_created is True
+    assert result.requirements_changed is False
+    assert result.repository_metadata_changed is False
+    assert result.previous_fingerprint is None
+    durable = issue_repositories.find_github_issue(
+        _pool(conn), repository_id=repository_id, github_issue_id=503
+    )
+    assert durable is not None
+    assert durable.title == "Found a bug"
+    assert durable.state is GitHubIssueState.OPEN
+
+
+def test_the_service_fails_closed_on_number_reuse_without_rebinding_identity(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id = _workspace_with_routed_repository(conn)
     first = issue_repositories.reconcile_github_issue(
         _pool(conn), **_reconcile_kwargs(workspace_id=workspace_id, repository_id=repository_id)
     )
     assert first.projection is not None
 
-    # A different stable issue losing the race for the durably mapped
-    # number: the bounded insert surfaces the durable violation the number
-    # backstop exists to enforce; the existing row is untouched.
-    with pytest.raises(UniqueViolation):
-        issue_repositories.reconcile_github_issue(
+    # The authoritative read reports a different stable issue for the
+    # durably mapped number: the serialized classification reaches the
+    # service boundary as a typed conflict, and the canonical projection is
+    # never rebound.
+    github = _FakeGitHubClient(
+        GitHubRepositoryObservation(
+            github_repository_id=987654321,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        ),
+        GitHubIssueObservation(
+            github_issue_id=999,
+            issue_number=42,
+            title="Found a bug",
+            body="Requirements body",
+            state="open",
+            provider_updated_at=_OBSERVED,
+            is_pull_request=False,
+        ),
+    )
+
+    with pytest.raises(ConflictError):
+        reconciliation_services.reconcile_repository_issue(
             _pool(conn),
-            **_reconcile_kwargs(
-                workspace_id=workspace_id, repository_id=repository_id, github_issue_id=999
-            ),
+            github,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            issue_number=42,
         )
 
     reloaded = issue_repositories.find_github_issue(
@@ -399,3 +615,4 @@ def test_number_reuse_fails_closed_without_rebinding_identity(conn: Connection[A
     )
     assert reloaded is not None
     assert reloaded.id == first.projection.id
+    assert reloaded.issue_number == 42
