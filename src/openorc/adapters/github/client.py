@@ -46,6 +46,7 @@ from openorc.adapters.github.authentication import GitHubAppAuthenticator
 from openorc.adapters.github.capabilities import (
     GITHUB_INSTALLATION_PATH,
     GITHUB_INSTALLATION_REPOSITORIES_PATH,
+    GITHUB_REPOSITORY_ISSUE_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
     missing_required_capabilities,
@@ -58,6 +59,12 @@ from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+)
+from openorc.adapters.github.observations import (
+    GitHubIssueObservation,
+    GitHubRepositoryObservation,
+    parse_installation_repository_entry,
+    parse_issue_payload,
 )
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
@@ -90,6 +97,7 @@ logger = logging.getLogger(__name__)
 _TRACER_SCOPE = "openorc.adapters.github.client"
 _INSTALLATION_LOOKUP_SPAN_NAME = "github.get_installation_capabilities"
 _LISTING_SPAN_NAME = "github.list_installation_repositories"
+_ISSUE_SPAN_NAME = "github.get_repository_issue"
 
 # The installation repository listing requests the maximum documented page
 # size (100) and is bounded so a broken pagination chain cannot loop.
@@ -111,6 +119,23 @@ class GitHubAppClient(Protocol):
         self, *, github_installation_id: int, github_repository_id: int
     ) -> GitHubAccessValidation:
         """Validate current repository access and the required v1 capabilities."""
+        ...
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> GitHubRepositoryObservation:
+        """Return the normalized current observation of the stable repository."""
+        ...
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueObservation:
+        """Return the normalized current observation of one repository issue."""
         ...
 
     def get_installation_capabilities(
@@ -209,6 +234,93 @@ class HttpGitHubAppClient:
         """
         require_positive_int(github_installation_id, "github_installation_id")
         require_positive_int(github_repository_id, "github_repository_id")
+        capabilities = self._require_validated_capabilities(github_installation_id)
+        self._require_installation_repository_entry(github_installation_id, github_repository_id)
+        return GitHubAccessValidation(
+            github_installation_id=github_installation_id,
+            github_repository_id=github_repository_id,
+            capabilities=capabilities.capabilities,
+            subscribed_events=capabilities.subscribed_events,
+        )
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> GitHubRepositoryObservation:
+        """Return the authoritative observation of the stable repository.
+
+        Performs the full v1 access validation for the exact routed
+        installation (suspension, capabilities, subscribed events) and, in
+        the same bounded walk of the documented
+        ``GET /installation/repositories`` listing, returns the normalized
+        observation of the entry matching the exact stable repository ID.
+        There is no documented REST operation to fetch a repository by
+        stable ID, and a stored owner/name address breaks exactly when a
+        rename or ownership transfer must be reconciled, so the stable-ID
+        listing entry is the observation source. Absence of the stable
+        identity raises the classified authorization rejection; the
+        bounded-page exhaustion raises the uncertain outcome.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(github_repository_id, "github_repository_id")
+        self._require_validated_capabilities(github_installation_id)
+        entry = self._require_installation_repository_entry(
+            github_installation_id, github_repository_id
+        )
+        return parse_installation_repository_entry(entry, github_repository_id=github_repository_id)
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueObservation:
+        """Return the authoritative observation of one repository issue.
+
+        The documented ``GET /repos/{owner}/{repo}/issues/{issue_number}``
+        operation under the installation access token. ``owner_login`` and
+        ``repository_name`` must be the freshly observed repository address
+        (from :meth:`get_installation_repository`), never stored mutable
+        metadata: a rename or ownership transfer is reconciled through the
+        fresh stable-ID observation first, so the issue read is addressed
+        consistently. A documented ``pull_request`` member is carried
+        through as a typed discriminator; application services decide its
+        workflow meaning.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(issue_number, "issue_number")
+        if not isinstance(owner_login, str) or not owner_login.strip():
+            raise ValueError("owner_login must be a non-empty string")
+        if not isinstance(repository_name, str) or not repository_name.strip():
+            raise ValueError("repository_name must be a non-empty string")
+        with application_span(_TRACER_SCOPE, _ISSUE_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_ISSUE_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_issue_number=issue_number,
+            )
+            path = GITHUB_REPOSITORY_ISSUE_PATH.format(
+                owner=owner_login, repo=repository_name, issue_number=issue_number
+            )
+            response = self._request_with_installation_token(github_installation_id, path)
+            return parse_issue_payload(
+                _json_body(response),
+                owner_login=owner_login,
+                repository_name=repository_name,
+                issue_number=issue_number,
+            )
+
+    def _require_validated_capabilities(
+        self, github_installation_id: int
+    ) -> GitHubInstallationCapabilities:
+        """Return installation capability facts after full v1 validation.
+
+        The JWT-authenticated documented installation lookup; a suspended
+        installation, or one lacking the required v1 capabilities or
+        subscribed events, raises the classified authorization rejection.
+        """
         capabilities = self.get_installation_capabilities(github_installation_id)
         if capabilities.suspended_at is not None:
             raise GitHubAuthorizationRejectedError(
@@ -222,27 +334,22 @@ class HttpGitHubAppClient:
                 "GitHub App permissions the required OpenOrc repository "
                 "operations need"
             )
-        self._require_repository_membership(github_installation_id, github_repository_id)
-        return GitHubAccessValidation(
-            github_installation_id=github_installation_id,
-            github_repository_id=github_repository_id,
-            capabilities=capabilities.capabilities,
-            subscribed_events=capabilities.subscribed_events,
-        )
+        return capabilities
 
-    def _require_repository_membership(
+    def _require_installation_repository_entry(
         self, github_installation_id: int, github_repository_id: int
-    ) -> None:
-        """Prove the installation currently grants access to the stable repository.
+    ) -> dict[str, object]:
+        """Return the documented listing entry proving stable-ID repository access.
 
         The documented ``GET /installation/repositories`` operation under the
         installation access token, paginated through GitHub's documented
         ``Link`` headers, matching each entry's numeric stable ``id``. The
-        listing is used solely for membership: its per-entry ``permissions``
-        member is the ordinary repository access shape and is never consumed
-        as capability authority. Absence of the stable identity after the
-        complete listing — or exceeding the bounded page count, which leaves
-        the question unanswered — classifies accordingly.
+        listing is used solely for membership and repository observation: its
+        per-entry ``permissions`` member is the ordinary repository access
+        shape and is never consumed as capability authority. Absence of the
+        stable identity after the complete listing — or exceeding the bounded
+        page count, which leaves the question unanswered — classifies
+        accordingly.
         """
         with application_span(_TRACER_SCOPE, _LISTING_SPAN_NAME) as span:
             annotate_span(
@@ -255,10 +362,9 @@ class HttpGitHubAppClient:
             page_count = 0
             while page_count < _MAX_LISTING_PAGES:
                 response = self._request_with_installation_token(github_installation_id, path)
-                if github_repository_id in parse_installation_repositories_page(
-                    _json_body(response)
-                ):
-                    return
+                payload = _json_body(response)
+                if github_repository_id in parse_installation_repositories_page(payload):
+                    return _matching_repository_entry(payload, github_repository_id)
                 next_url = self._next_page_url(response)
                 if next_url is None:
                     raise GitHubAuthorizationRejectedError(
@@ -332,6 +438,32 @@ def _json_body(response: GitHubHttpResponse) -> dict[str, object]:
             "the GitHub response is not interpretable: the object shape is unexpected"
         )
     return payload
+
+
+def _matching_repository_entry(
+    payload: dict[str, object], github_repository_id: int
+) -> dict[str, object]:
+    """Return the raw listing entry for the validated stable repository identity.
+
+    ``parse_installation_repositories_page`` has already validated the page
+    shape and matched the identity, so the entry must exist and be
+    well-formed; anything else is an inconsistency that cannot be trusted
+    as a fact.
+    """
+    repositories = payload.get("repositories")
+    if isinstance(repositories, list):
+        for entry in repositories:
+            if (
+                isinstance(entry, dict)
+                and not isinstance(entry.get("id"), bool)
+                and isinstance(entry.get("id"), int)
+                and entry["id"] == github_repository_id
+            ):
+                return entry
+    raise GitHubOutcomeUncertainError(
+        "the installation repository listing is not interpretable: "
+        "the matched repository entry is malformed"
+    )
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:

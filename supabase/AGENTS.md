@@ -37,6 +37,13 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Foreign-key classification follows the deletion-ownership vocabulary: `github_installations.workspace_id → workspaces` is a true-ownership `ON DELETE CASCADE` edge; the Repository route composite FK is `NO ACTION DEFERRABLE INITIALLY DEFERRED`, so a referenced installation record is never cascaded away through the route. The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_installation_migration.py`.
 - Deleting or disconnecting OpenOrc configuration never uninstalls the GitHub App and never mutates external GitHub artifacts.
 
+## GitHub issue projection (issue #59)
+
+- `openorc.github_issues` is the durable projection of authoritative GitHub Issue observations, keyed by `(repository_id, github_issue_id)` — the stable external issue identity within one Workspace Repository. The repository-local `issue_number` is durable address metadata with its own uniqueness (`unique (repository_id, issue_number)`), so issue-number reuse can never race past or substitute for stable identity.
+- The projection stores only the facts Phase 2 reconciliation/workflow need: stable issue ID, number, title, verbatim nullable body, open/closed state, the deterministic title+body `requirements_fingerprint` (lowercase hex SHA-256 over `title + NUL + body-or-empty`), ordinary observed `provider_updated_at` metadata, and the OpenOrc observation instants. Comments (including OpenOrc's future published plan comment), labels, assignees, reactions, and timeline events have no column and can never move the fingerprint.
+- Foreign-key classification: `(repository_id, workspace_id) → repositories` is a true-ownership `ON DELETE CASCADE` edge (the projection exists solely within its Workspace Repository's aggregate, like Tasks), hooked by the deliberate `repositories` `unique (id, workspace_id)`. The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_issue_migration.py`.
+- Issue facts are never copied onto `tasks`; Task identity/workflow state stays separate, and later workflow services own any `BLOCKED / GITHUB_SOURCE_CHANGED` consequence outside this table.
+
 ## Security / isolation
 
 - Workspace isolation is a security boundary.

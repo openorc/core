@@ -54,6 +54,7 @@ __all__ = [
     "GITHUB_INSTALLATION_PATH",
     "GITHUB_INSTALLATION_REPOSITORIES_PATH",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
+    "GITHUB_REPOSITORY_ISSUE_PATH",
     "REQUIRED_V1_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",
     "GitHubAccessValidation",
@@ -62,6 +63,7 @@ __all__ = [
     "map_installation_permissions",
     "missing_required_capabilities",
     "missing_required_webhook_events",
+    "parse_instant",
     "parse_installation_payload",
     "parse_installation_repositories_page",
     "require_positive_int",
@@ -112,10 +114,11 @@ REQUIRED_V1_WEBHOOK_EVENTS = frozenset(
     {"issues", "issue_comment", "pull_request", "push", "status", "check_run", "check_suite"}
 )
 
-# Documented GitHub REST paths owned by this adapter (issue #58 scope).
+# Documented GitHub REST paths owned by this adapter (issues #58 and #59).
 GITHUB_MINT_INSTALLATION_TOKEN_PATH = "/app/installations/{installation_id}/access_tokens"
 GITHUB_INSTALLATION_PATH = "/app/installations/{installation_id}"
 GITHUB_INSTALLATION_REPOSITORIES_PATH = "/installation/repositories"
+GITHUB_REPOSITORY_ISSUE_PATH = "/repos/{owner}/{repo}/issues/{issue_number}"
 
 
 def require_positive_int(value: object, name: str) -> int:
@@ -228,7 +231,7 @@ def missing_required_webhook_events(subscribed_events: frozenset[str]) -> frozen
     return REQUIRED_V1_WEBHOOK_EVENTS - subscribed_events
 
 
-def _parse_instant(value: object, description: str) -> datetime:
+def parse_instant(value: object, description: str) -> datetime:
     """Parse a provider ISO-8601 instant; malformed shapes are uninterpretable."""
     if not isinstance(value, str):
         raise GitHubOutcomeUncertainError(
@@ -283,7 +286,7 @@ def parse_installation_payload(
     suspended_at = (
         None
         if suspended_raw is None
-        else _parse_instant(suspended_raw, "the suspension observation")
+        else parse_instant(suspended_raw, "the suspension observation")
     )
     return GitHubInstallationCapabilities(
         github_installation_id=reported_id,
