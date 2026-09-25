@@ -130,10 +130,13 @@ class RepositoryIssueReconciliation:
     for the invocation whose insert created the projection;
     ``requirements_changed`` is true only when a prior projection existed
     and its fingerprint differs (creation is by definition not a
-    requirements change); ``repository_metadata_changed`` and
-    ``issue_state_changed`` report actual durable writes only. An unchanged
-    or otherwise no-op reconciliation reports false everywhere and performs
-    no write.
+    requirements change); ``issue_state_changed`` is true only when the
+    authoritative open/closed ``GitHubIssueState`` changed between the
+    serialized pre-image and the post-write projection — a
+    requirements-only or provider-metadata-only durable write reports
+    false; ``repository_metadata_changed`` reports an actual durable
+    repository-metadata write. An unchanged or otherwise no-op
+    reconciliation reports false everywhere and performs no write.
     """
 
     repository: Repository
@@ -371,7 +374,12 @@ def _map_reconcile_result(
             repository_metadata_changed=metadata_changed,
             issue=result.projection,
             issue_created=False,
-            issue_state_changed=True,
+            # Only a genuine open/closed transition is a state change: a
+            # requirements-only or provider-metadata-only write is not one.
+            issue_state_changed=(
+                result.previous_state is not None
+                and result.previous_state is not result.projection.state
+            ),
             requirements_changed=result.previous_fingerprint != requirements_fingerprint,
             previous_fingerprint=result.previous_fingerprint,
         )

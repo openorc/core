@@ -107,12 +107,17 @@ class GitHubIssueReconcileResult:
     ``previous_fingerprint`` is the serialized pre-image fingerprint of an
     ``UPDATED`` outcome, the unchanged fingerprint for ``UNCHANGED``, and
     ``None`` for ``INSERTED`` (creation is by definition not a requirements
-    change).
+    change). ``previous_state`` is the serialized pre-image open/closed
+    ``GitHubIssueState`` under the identical population rule — the pre-image
+    state for ``UPDATED``, ``UNCHANGED``, and the classified conflict rows,
+    and ``None`` for ``INSERTED`` and ``UNRESOLVABLE`` — so callers can
+    compare previous vs current state after the serialized write.
     """
 
     outcome: GitHubIssueReconcileOutcome
     projection: GitHubIssueProjection | None
     previous_fingerprint: str | None
+    previous_state: GitHubIssueState | None
 
 
 def _github_issue_from_row(row: Sequence[Any]) -> GitHubIssueProjection:
@@ -179,6 +184,7 @@ def _apply_conditional_update(
             outcome=GitHubIssueReconcileOutcome.UNCHANGED,
             projection=current,
             previous_fingerprint=current.requirements_fingerprint,
+            previous_state=current.state,
         )
     row = conn.execute(
         f"update openorc.github_issues set "
@@ -210,11 +216,13 @@ def _apply_conditional_update(
             outcome=GitHubIssueReconcileOutcome.UNCHANGED,
             projection=current,
             previous_fingerprint=current.requirements_fingerprint,
+            previous_state=current.state,
         )
     return GitHubIssueReconcileResult(
         outcome=GitHubIssueReconcileOutcome.UPDATED,
         projection=_github_issue_from_row(row),
         previous_fingerprint=current.requirements_fingerprint,
+        previous_state=current.state,
     )
 
 
@@ -246,6 +254,7 @@ def _reconcile_locked_row(
             outcome=GitHubIssueReconcileOutcome.IDENTITY_NUMBER_MISMATCH,
             projection=current,
             previous_fingerprint=current.requirements_fingerprint,
+            previous_state=current.state,
         )
     return _apply_conditional_update(
         conn,
@@ -282,6 +291,7 @@ def _classify_insert_race(
                 outcome=GitHubIssueReconcileOutcome.IDENTITY_NUMBER_MISMATCH,
                 projection=current,
                 previous_fingerprint=current.requirements_fingerprint,
+                previous_state=current.state,
             )
         return None
     number_row = _select_for_update_by_number(conn, repository_id, issue_number)
@@ -291,6 +301,7 @@ def _classify_insert_race(
             outcome=GitHubIssueReconcileOutcome.NUMBER_CONFLICT,
             projection=conflicting,
             previous_fingerprint=conflicting.requirements_fingerprint,
+            previous_state=conflicting.state,
         )
     return None
 
@@ -377,6 +388,7 @@ def reconcile_github_issue(
                         outcome=GitHubIssueReconcileOutcome.INSERTED,
                         projection=_github_issue_from_row(inserted),
                         previous_fingerprint=None,
+                        previous_state=None,
                     )
             except UniqueViolation:
                 # A concurrent reconcile won the insert race: classify from
@@ -397,6 +409,7 @@ def reconcile_github_issue(
             outcome=GitHubIssueReconcileOutcome.UNRESOLVABLE,
             projection=None,
             previous_fingerprint=None,
+            previous_state=None,
         )
 
 

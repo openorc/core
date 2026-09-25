@@ -21,7 +21,7 @@ import inspect
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -274,6 +274,7 @@ def _issue_row(
     body: str | None = "Requirements body",
     issue_number: int = _ISSUE_NUMBER,
     github_issue_id: int = _GITHUB_ISSUE_ID,
+    provider_updated_at: datetime | None = _OBSERVED,
 ) -> tuple[Any, ...]:
     return (
         uuid.uuid4(),
@@ -285,7 +286,7 @@ def _issue_row(
         body,
         state,
         fingerprint,
-        _OBSERVED,
+        provider_updated_at,
         _OBSERVED,
         _OBSERVED,
     )
@@ -311,6 +312,7 @@ def _issue_observation(
     body: str | None = "Requirements body",
     state: str = "open",
     is_pull_request: bool = False,
+    provider_updated_at: datetime = _OBSERVED,
 ) -> GitHubIssueObservation:
     return GitHubIssueObservation(
         github_issue_id=github_issue_id,
@@ -318,7 +320,7 @@ def _issue_observation(
         title=title,
         body=body,
         state=state,
-        provider_updated_at=_OBSERVED,
+        provider_updated_at=provider_updated_at,
         is_pull_request=is_pull_request,
     )
 
@@ -582,7 +584,8 @@ def test_requirements_changes_are_detected_title_only_body_only_and_both() -> No
 
         assert result.requirements_changed is True
         assert result.issue_created is False
-        assert result.issue_state_changed is True
+        # A requirements-only durable write is not an open/closed state change.
+        assert result.issue_state_changed is False
         assert result.previous_fingerprint == _FINGERPRINT_A
 
 
@@ -616,6 +619,83 @@ def test_a_state_only_change_updates_the_projection_but_not_the_fingerprint() ->
     assert result.issue_state_changed is True
     assert result.requirements_changed is False
     assert result.previous_fingerprint == _FINGERPRINT_A
+
+
+def test_a_requirements_and_state_change_reports_both_semantic_flags() -> None:
+    workspace_id = uuid.uuid4()
+    route = _INSTALLATION_RECORD
+    conn = ScriptedConnection()
+    _route_resolution_scripts(conn, route, workspace_id)
+    _write_phase_scripts(
+        conn, workspace_id, _repository_row(uuid.uuid4(), uuid.uuid4(), workspace_id, route)
+    )
+    conn.on("from openorc.github_issues", _issue_row(workspace_id=workspace_id))
+    conn.on(
+        "update openorc.github_issues",
+        _issue_row(
+            workspace_id=workspace_id,
+            title="Found a bug v2",
+            state="closed",
+            fingerprint=_FINGERPRINT_B,
+        ),
+    )
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        issue_observation=_issue_observation(title="Found a bug v2", state="closed"),
+    )
+
+    result = github_reconciliation.reconcile_repository_issue(
+        _pool(conn),
+        github,
+        workspace_id=workspace_id,
+        repository_id=uuid.uuid4(),
+        issue_number=_ISSUE_NUMBER,
+    )
+
+    assert result.issue_created is False
+    assert result.requirements_changed is True
+    assert result.issue_state_changed is True
+    assert result.previous_fingerprint == _FINGERPRINT_A
+
+
+def test_a_provider_timestamp_only_change_is_not_a_semantic_change() -> None:
+    workspace_id = uuid.uuid4()
+    route = _INSTALLATION_RECORD
+    conn = ScriptedConnection()
+    _route_resolution_scripts(conn, route, workspace_id)
+    _write_phase_scripts(
+        conn, workspace_id, _repository_row(uuid.uuid4(), uuid.uuid4(), workspace_id, route)
+    )
+    conn.on("from openorc.github_issues", _issue_row(workspace_id=workspace_id))
+    conn.on(
+        "update openorc.github_issues",
+        _issue_row(
+            workspace_id=workspace_id,
+            provider_updated_at=_OBSERVED + timedelta(hours=1),
+        ),
+    )
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        issue_observation=_issue_observation(provider_updated_at=_OBSERVED + timedelta(hours=1)),
+    )
+
+    result = github_reconciliation.reconcile_repository_issue(
+        _pool(conn),
+        github,
+        workspace_id=workspace_id,
+        repository_id=uuid.uuid4(),
+        issue_number=_ISSUE_NUMBER,
+    )
+
+    # The projection row is durably advanced, but only provider metadata
+    # changed: neither semantic flag moves.
+    assert result.issue_created is False
+    assert result.requirements_changed is False
+    assert result.issue_state_changed is False
+    assert result.previous_fingerprint == _FINGERPRINT_A
+    assert result.issue.provider_updated_at == _OBSERVED + timedelta(hours=1)
 
 
 def test_an_unchanged_authoritative_state_is_a_durable_no_op() -> None:
