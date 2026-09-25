@@ -204,6 +204,7 @@ def test_a_first_projection_inserts_and_reports_creation() -> None:
     assert result.outcome is GitHubIssueReconcileOutcome.INSERTED
     assert _projection(result.projection).identity.github_issue_id == _GITHUB_ISSUE_ID
     assert result.previous_fingerprint is None
+    assert result.previous_state is None
     select_sql, _ = conn.executed[0]
     assert "from openorc.github_issues" in select_sql
     assert "for update" in select_sql
@@ -232,6 +233,7 @@ def test_an_unchanged_observation_is_a_true_durable_no_op() -> None:
 
     assert result.outcome is GitHubIssueReconcileOutcome.UNCHANGED
     assert result.previous_fingerprint == _FINGERPRINT
+    assert result.previous_state is GitHubIssueState.OPEN
     # No UPDATE statement is executed at all: the durable row (including
     # updated_at) is untouched by an unchanged reconciliation.
     assert len(conn.executed) == 1
@@ -249,12 +251,29 @@ def test_a_changed_observation_updates_conditionally_and_reports_the_transition(
     assert result.outcome is GitHubIssueReconcileOutcome.UPDATED
     assert _projection(result.projection).body == "Steps to reproduce"
     assert result.previous_fingerprint == _FINGERPRINT
+    assert result.previous_state is GitHubIssueState.OPEN
     update_sql, update_params = conn.executed[1]
     assert "is distinct from" in update_sql
     assert "updated_at = now()" in update_sql
     # Stable identity and Workspace scope are never rewritten.
     assert "id = excluded" not in update_sql
     assert "workspace_id = excluded" not in update_sql
+
+
+def test_a_state_change_reports_the_serialized_pre_image_state() -> None:
+    previous = _issue_row(state="open")
+    conn = ScriptedConnection()
+    conn.on("select", previous)
+    conn.on("update openorc.github_issues", _issue_row(state="closed"))
+
+    result = reconcile_github_issue(_pool(conn), **_incoming_kwargs(state=GitHubIssueState.CLOSED))
+
+    assert result.outcome is GitHubIssueReconcileOutcome.UPDATED
+    # The reported pre-image is the locked before-state, not the post-write
+    # state: this is what lets the service distinguish a real open/closed
+    # transition from a requirements-only durable write.
+    assert result.previous_state is GitHubIssueState.OPEN
+    assert _projection(result.projection).state is GitHubIssueState.CLOSED
 
 
 def test_a_number_recorded_for_a_different_stable_identity_is_a_durable_conflict() -> None:
@@ -286,6 +305,7 @@ def test_insert_race_classified_through_the_number_unique_violation_converges() 
 
     assert result.outcome is GitHubIssueReconcileOutcome.UNCHANGED
     assert result.previous_fingerprint == _FINGERPRINT
+    assert result.previous_state is GitHubIssueState.OPEN
     # Exactly one insert attempt happened; no write followed convergence.
     inserts = [sql for sql, _ in conn.executed if "insert into" in sql.lower()]
     assert len(inserts) == 1
@@ -310,6 +330,7 @@ def test_insert_race_with_a_divergent_observation_reports_the_true_transition() 
     # pre-image fingerprint.
     assert result.outcome is GitHubIssueReconcileOutcome.UPDATED
     assert result.previous_fingerprint == _FINGERPRINT
+    assert result.previous_state is GitHubIssueState.OPEN
 
 
 def test_insert_race_with_a_differently_mapped_number_is_the_number_conflict() -> None:
@@ -343,6 +364,7 @@ def test_an_unresolvable_race_fails_closed() -> None:
 
     assert result.outcome is GitHubIssueReconcileOutcome.UNRESOLVABLE
     assert result.projection is None
+    assert result.previous_state is None
 
 
 def test_malformed_command_arguments_are_rejected_before_any_sql() -> None:
