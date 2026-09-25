@@ -172,6 +172,21 @@ class FakeGitHubAppClient:
         assert self._result is not None
         return self._result
 
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> Any:
+        raise AssertionError("the service must not compose raw reconciliation operations")
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> Any:
+        raise AssertionError("the service must not compose raw reconciliation operations")
+
     def get_installation_capabilities(self, github_installation_id: int) -> Any:
         raise AssertionError("the service must not compose raw adapter operations")
 

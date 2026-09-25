@@ -359,6 +359,23 @@ def get_repository(pool: DatabasePool, repository_id: UUID) -> Repository | None
     return None if row is None else _repository_from_row(row)
 
 
+def get_repository_for_update(pool: DatabasePool, repository_id: UUID) -> Repository | None:
+    """Return one Repository row locked ``FOR UPDATE``, or ``None``.
+
+    The deliberate row lock is the serialized-reconciliation read (issue
+    #59): the current durable route and metadata must be inspected under
+    lock before any consequential write, so a concurrent route rebind or
+    metadata change either precedes the locked read (its effect is visible)
+    or follows it (blocked until the caller's transaction commits).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_REPOSITORY_COLUMNS} from openorc.repositories where id = %s for update",
+            (repository_id,),
+        ).fetchone()
+    return None if row is None else _repository_from_row(row)
+
+
 def find_repository_by_github_identity(
     pool: DatabasePool, *, workspace_id: UUID, identity: GitHubRepositoryIdentity
 ) -> Repository | None:

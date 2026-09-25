@@ -19,6 +19,7 @@ from openorc.adapters.github.capabilities import (
     GITHUB_INSTALLATION_PATH,
     GITHUB_INSTALLATION_REPOSITORIES_PATH,
     GITHUB_MINT_INSTALLATION_TOKEN_PATH,
+    GITHUB_REPOSITORY_ISSUE_PATH,
     REQUIRED_V1_WEBHOOK_EVENTS,
     REQUIRED_V1_WORKFLOW_CAPABILITIES,
     GitHubAccessValidation,
@@ -29,6 +30,7 @@ from openorc.adapters.github.capabilities import (
     missing_required_webhook_events,
     parse_installation_payload,
     parse_installation_repositories_page,
+    parse_instant,
     require_positive_int,
 )
 from openorc.adapters.github.client import (
@@ -41,6 +43,12 @@ from openorc.adapters.github.errors import (
     GitHubOutcomeUncertainError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+)
+from openorc.adapters.github.observations import (
+    GitHubIssueObservation,
+    GitHubRepositoryObservation,
+    parse_installation_repository_entry,
+    parse_issue_payload,
 )
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
@@ -60,6 +68,7 @@ __all__ = [
     "GITHUB_INSTALLATION_REPOSITORIES_PATH",
     "GITHUB_JSON_ACCEPT_HEADER",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
+    "GITHUB_REPOSITORY_ISSUE_PATH",
     "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
     "REQUIRED_V1_WEBHOOK_EVENTS",
@@ -71,6 +80,8 @@ __all__ = [
     "GitHubFetcher",
     "GitHubHttpResponse",
     "GitHubInstallationCapabilities",
+    "GitHubIssueObservation",
+    "GitHubRepositoryObservation",
     "GitHubWorkflowCapability",
     "HttpGitHubAppClient",
     "HttpGitHubRestClient",
@@ -83,8 +94,11 @@ __all__ = [
     "map_installation_permissions",
     "missing_required_capabilities",
     "missing_required_webhook_events",
+    "parse_instant",
     "parse_installation_payload",
+    "parse_installation_repository_entry",
     "parse_installation_repositories_page",
+    "parse_issue_payload",
     "http_fetch",
     "require_positive_int",
 ]
