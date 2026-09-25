@@ -287,8 +287,10 @@ def test_the_durable_uniqueness_constraints_reject_conflicting_inserts(
     )
 
     # A different stable identity under the durably mapped number violates
-    # the issue-number backstop.
-    with pytest.raises(UniqueViolation):
+    # the issue-number backstop. Each expected violation runs inside its own
+    # savepoint: the failed statement aborts only its savepoint, leaving the
+    # test transaction usable for the next assertion.
+    with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             insert_sql,
             (
@@ -304,7 +306,7 @@ def test_the_durable_uniqueness_constraints_reject_conflicting_inserts(
 
     # The same stable identity under a different number violates the
     # canonical identity uniqueness.
-    with pytest.raises(UniqueViolation):
+    with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             insert_sql,
             (
@@ -325,8 +327,10 @@ def test_cross_workspace_scope_disagreement_is_unrepresentable(conn: Connection[
     other_workspace = _insert_workspace(conn, other_profile)
 
     # A projection row whose direct Workspace scope disagrees with the
-    # owning Repository is rejected by the composite foreign key.
-    with pytest.raises(ForeignKeyViolation):
+    # owning Repository is rejected by the composite foreign key. The
+    # expected violation runs inside its own savepoint so the test
+    # transaction stays usable afterwards.
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         conn.execute(
             "insert into openorc.github_issues "
             "(workspace_id, repository_id, github_issue_id, issue_number, title, body, "
@@ -374,7 +378,7 @@ def test_the_same_external_issue_is_independent_per_workspace(conn: Connection[A
 def test_state_and_fingerprint_checks_are_durable(conn: Connection[Any]) -> None:
     workspace_id, repository_id = _workspace_with_repository(conn)
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.github_issues "
             "(workspace_id, repository_id, github_issue_id, issue_number, title, body, "
@@ -392,7 +396,7 @@ def test_state_and_fingerprint_checks_are_durable(conn: Connection[Any]) -> None
             ),
         )
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.github_issues "
             "(workspace_id, repository_id, github_issue_id, issue_number, title, body, "
