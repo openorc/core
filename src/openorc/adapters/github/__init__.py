@@ -16,10 +16,14 @@ from openorc.adapters.github.authentication import (
     InstallationAccessToken,
 )
 from openorc.adapters.github.capabilities import (
+    GITHUB_GRAPHQL_PATH,
     GITHUB_INSTALLATION_PATH,
     GITHUB_INSTALLATION_REPOSITORIES_PATH,
+    GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH,
+    GITHUB_ISSUE_SUB_ISSUES_PATH,
     GITHUB_MINT_INSTALLATION_TOKEN_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
+    GITHUB_REPOSITORY_PATH,
     REQUIRED_V1_WEBHOOK_EVENTS,
     REQUIRED_V1_WORKFLOW_CAPABILITIES,
     GitHubAccessValidation,
@@ -50,6 +54,14 @@ from openorc.adapters.github.observations import (
     parse_installation_repository_entry,
     parse_issue_payload,
 )
+from openorc.adapters.github.observations_relations import (
+    GitHubIssueParentObservation,
+    GitHubRelatedIssueEndpoint,
+    GitHubRelatedIssueObservation,
+    parse_graphql_issue_parent,
+    parse_related_issue_payload,
+    parse_related_issue_payloads,
+)
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
     GITHUB_API_BASE_URL,
@@ -66,8 +78,12 @@ __all__ = [
     "GITHUB_API_BASE_URL",
     "GITHUB_INSTALLATION_PATH",
     "GITHUB_INSTALLATION_REPOSITORIES_PATH",
+    "GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH",
+    "GITHUB_ISSUE_SUB_ISSUES_PATH",
     "GITHUB_JSON_ACCEPT_HEADER",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
+    "GITHUB_GRAPHQL_PATH",
+    "GITHUB_REPOSITORY_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
@@ -81,6 +97,9 @@ __all__ = [
     "GitHubHttpResponse",
     "GitHubInstallationCapabilities",
     "GitHubIssueObservation",
+    "GitHubIssueParentObservation",
+    "GitHubRelatedIssueEndpoint",
+    "GitHubRelatedIssueObservation",
     "GitHubRepositoryObservation",
     "GitHubWorkflowCapability",
     "HttpGitHubAppClient",
@@ -98,7 +117,10 @@ __all__ = [
     "parse_installation_payload",
     "parse_installation_repository_entry",
     "parse_installation_repositories_page",
+    "parse_graphql_issue_parent",
     "parse_issue_payload",
+    "parse_related_issue_payload",
+    "parse_related_issue_payloads",
     "http_fetch",
     "require_positive_int",
 ]

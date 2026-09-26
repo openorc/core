@@ -52,6 +52,7 @@ Task identity and lifecycle semantics (Phase 1, issue #21):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
@@ -64,6 +65,8 @@ __all__ = [
     "TaskStatus",
     "task_field_names",
 ]
+
+_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TaskDomainError(Exception):
@@ -134,6 +137,7 @@ class Task:
     state_token: UUID
     current_plan_revision_id: UUID | None
     current_owner_gate_id: UUID | None
+    source_requirements_fingerprint: str
     created_at: datetime
     updated_at: datetime
 
@@ -163,6 +167,18 @@ class Task:
         _require_uuid(self.state_token, "state_token", nullable=False)
         _require_uuid(self.current_plan_revision_id, "current_plan_revision_id", nullable=True)
         _require_uuid(self.current_owner_gate_id, "current_owner_gate_id", nullable=True)
+        # The immutable Task source baseline (issue #60): the exact B3
+        # requirements fingerprint the issue carried when this attempt's
+        # eligibility was authoritatively established. It is historical
+        # authority for later source-drift detection and is never rewritten
+        # when GitHub requirements change. The issue body/title itself is
+        # deliberately not duplicated here.
+        if not isinstance(
+            self.source_requirements_fingerprint, str
+        ) or not _FINGERPRINT_PATTERN.match(self.source_requirements_fingerprint):
+            raise TaskDomainError(
+                "Task.source_requirements_fingerprint must be a lowercase hex SHA-256 digest"
+            )
 
 
 def task_field_names() -> frozenset[str]:

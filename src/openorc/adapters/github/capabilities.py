@@ -53,7 +53,11 @@ from openorc.adapters.github.errors import GitHubOutcomeUncertainError
 __all__ = [
     "GITHUB_INSTALLATION_PATH",
     "GITHUB_INSTALLATION_REPOSITORIES_PATH",
+    "GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH",
+    "GITHUB_ISSUE_SUB_ISSUES_PATH",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
+    "GITHUB_GRAPHQL_PATH",
+    "GITHUB_REPOSITORY_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "REQUIRED_V1_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",
@@ -119,6 +123,23 @@ GITHUB_MINT_INSTALLATION_TOKEN_PATH = "/app/installations/{installation_id}/acce
 GITHUB_INSTALLATION_PATH = "/app/installations/{installation_id}"
 GITHUB_INSTALLATION_REPOSITORIES_PATH = "/installation/repositories"
 GITHUB_REPOSITORY_ISSUE_PATH = "/repos/{owner}/{repo}/issues/{issue_number}"
+
+# Documented issue-relationship read paths (issue #60; REST API endpoints for
+# issue dependencies and sub-issues).
+GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH = (
+    "/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by"
+)
+GITHUB_ISSUE_SUB_ISSUES_PATH = "/repos/{owner}/{repo}/issues/{issue_number}/sub_issues"
+
+# Documented repository-metadata read (REST): resolves one owner/name address
+# to the stable numeric repository identity, used by the cross-repository
+# related-repository resolution step.
+GITHUB_REPOSITORY_PATH = "/repos/{owner}/{repo}"
+
+# The documented GitHub GraphQL endpoint: the one authoritative surface that
+# can express an issue's parent ABSENCE (the nullable ``Issue.parent`` field);
+# the REST parent endpoint documents no distinct successful no-parent answer.
+GITHUB_GRAPHQL_PATH = "/graphql"
 
 
 def require_positive_int(value: object, name: str) -> int:

@@ -107,6 +107,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "state_token": uuid.uuid4(),
         "current_plan_revision_id": None,
         "current_owner_gate_id": None,
+        "source_requirements_fingerprint": "a" * 64,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
     }
@@ -123,6 +124,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["state_token"],
         values["current_plan_revision_id"],
         values["current_owner_gate_id"],
+        values["source_requirements_fingerprint"],
         values["created_at"],
         values["updated_at"],
     )
@@ -141,6 +143,7 @@ def test_create_task_maps_row_and_normalizes_utc() -> None:
         repository_id=row[2],
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
         status=TaskStatus.PLANNING,
     )
 
@@ -160,9 +163,12 @@ def test_create_task_maps_row_and_normalizes_utc() -> None:
     # The insert's column list never sets a canonical branch: create-NULL is
     # the contract (the RETURNING projection legitimately reads it back).
     columns = sql.split("(", 1)[1].split(")", 1)[0]
-    assert columns == "workspace_id, repository_id, github_issue_id, github_issue_number, status"
+    assert (
+        columns == "workspace_id, repository_id, github_issue_id, github_issue_number, "
+        "status, source_requirements_fingerprint"
+    )
     assert params is not None
-    assert params == (row[1], row[2], 9001, 42, "planning")
+    assert params == (row[1], row[2], 9001, 42, "planning", "a" * 64)
     # Values are parameterized, never interpolated into the SQL text.
     assert "9001" not in sql
 
@@ -178,6 +184,7 @@ def test_create_task_rejects_terminal_status_before_any_sql() -> None:
             repository_id=uuid.uuid4(),
             github_issue_id=1,
             github_issue_number=1,
+            source_requirements_fingerprint="a" * 64,
             status=TaskStatus.CANCELLED,
         )
     assert fake_conn.executed == []
@@ -189,6 +196,7 @@ def test_create_task_rejects_terminal_status_before_any_sql() -> None:
             repository_id=uuid.uuid4(),
             github_issue_id=1,
             github_issue_number=1,
+            source_requirements_fingerprint="a" * 64,
             status=TaskStatus.COMPLETED,
         )
     assert fake_conn.executed == []

@@ -172,6 +172,7 @@ def _create_task(
         repository_id=repository_id,
         github_issue_id=github_issue_id,
         github_issue_number=github_issue_number,
+        source_requirements_fingerprint="a" * 64,
     )
 
 

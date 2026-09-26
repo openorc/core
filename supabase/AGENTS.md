@@ -44,6 +44,14 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Foreign-key classification: `(repository_id, workspace_id) → repositories` is a true-ownership `ON DELETE CASCADE` edge (the projection exists solely within its Workspace Repository's aggregate, like Tasks), hooked by the deliberate `repositories` `unique (id, workspace_id)`. The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_issue_migration.py`.
 - Issue facts are never copied onto `tasks`; Task identity/workflow state stays separate, and later workflow services own any `BLOCKED / GITHUB_SOURCE_CHANGED` consequence outside this table.
 
+## GitHub issue relationships and Task source baseline (issue #60)
+
+- `openorc.github_issue_hierarchy` (at most one parent edge per subject issue), `openorc.github_issue_sub_issues` (the observed child listing), and `openorc.github_issue_dependencies` (the observed blocked-by edges) are presentation-only mirrors of authoritative GitHub relationship observations. Hierarchy is descriptive and carries no Task-eligibility effect; the current blocked state is derived from the dependency edge set (an empty set is not blocked) — never a duplicated boolean and never derived from hierarchy.
+- Both identity spaces are explicit: the subject side is the local `(workspace_id, repository_id, github_issue_id)` triple; related endpoints are plain stable numeric GitHub facts (`*_github_repository_id`, `*_github_issue_id`) with deliberately NO foreign key to `openorc.repositories` — a related repository need not be configured as an OpenOrc Repository, and mutable owner/name/URL data is never identity.
+- The mirrors carry no freshness/observation-instant columns: they are, by definition, the last successfully observed projection. Failed or unobservable GitHub reads leave them byte-identical; errors are never reinterpreted as authoritative relationship state, and an authoritative empty observation removes rows rather than stamping anything.
+- `openorc.tasks.source_requirements_fingerprint` (NOT NULL, lowercase hex SHA-256 CHECK) is the immutable Task source baseline: the exact #59 requirements fingerprint of the issue as freshly reconciled at authoritative intake. It is historical authority for later source-drift detection and is never rewritten when GitHub requirements change; the issue body/title is deliberately not duplicated onto the Task.
+- Foreign-key classification follows the deletion-ownership vocabulary: each mirror's `(repository_id, workspace_id) → repositories` composite edge is true ownership (ON DELETE CASCADE, the #59 pattern). The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_issue_relations_migration.py`.
+
 ## Security / isolation
 
 - Workspace isolation is a security boundary.

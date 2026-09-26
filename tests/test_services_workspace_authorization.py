@@ -309,6 +309,7 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             uuid.uuid4(),
             None,
             None,
+            "a" * 64,
             _OBSERVED,
             _OBSERVED,
         ),
