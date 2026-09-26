@@ -21,6 +21,7 @@ from openorc.config import (
     DEFAULT_ENVIRONMENT,
     DEFAULT_VALKEY_URL,
     ENVIRONMENT_VAR,
+    GITHUB_WEBHOOK_SECRET_VAR,
     OTLP_ENDPOINT_VAR,
     VALKEY_URL_VAR,
     ConfigurationError,
@@ -400,3 +401,45 @@ def test_github_app_identity_is_optional_in_production() -> None:
 
     assert settings.github_app_id is None
     assert settings.github_app_private_key is None
+
+
+# --- GitHub App webhook secret (issue #61) ------------------------------------
+
+
+def test_github_webhook_secret_defaults_to_unconfigured() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.github_webhook_secret is None
+
+
+def test_github_webhook_secret_is_read_from_the_environment() -> None:
+    settings = Settings.from_env({GITHUB_WEBHOOK_SECRET_VAR: "whsec_test_value"})
+
+    assert settings.github_webhook_secret == "whsec_test_value"
+
+
+def test_blank_github_webhook_secret_fails_closed_without_echo() -> None:
+    with pytest.raises(ConfigurationError, match="was supplied blank"):
+        Settings.from_env({GITHUB_WEBHOOK_SECRET_VAR: "   "})
+
+
+def test_github_webhook_secret_is_optional_in_production() -> None:
+    # The webhook secret is consumed only where the verification boundary is
+    # constructed; the shared surface never requires it.
+    settings = Settings.from_env(
+        {
+            "OPENORC_ENV": "production",
+            "SUPABASE_URL": "https://prod.supabase.co",
+        }
+    )
+
+    assert settings.github_webhook_secret is None
+
+
+def test_the_github_webhook_secret_never_appears_in_settings_representation() -> None:
+    secret = "whsec-repr-leak-probe"
+    settings = Settings.from_env({GITHUB_WEBHOOK_SECRET_VAR: secret})
+
+    # The generated dataclass repr/str must never carry the raw secret.
+    assert secret not in repr(settings)
+    assert secret not in str(settings)

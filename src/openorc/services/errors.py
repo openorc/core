@@ -25,6 +25,7 @@ __all__ = [
     "ConflictError",
     "ExternalOperationFailedError",
     "ExternalOperationUncertainError",
+    "IntegrationNotConfiguredError",
     "InvalidCommandError",
     "NotFoundError",
     "StaleOperationError",
@@ -58,6 +59,17 @@ class AuthorizationError(ApplicationError):
 
 class NotFoundError(ApplicationError):
     """The addressed subject does not exist."""
+
+
+class IntegrationNotConfiguredError(ApplicationError):
+    """The operation's required integration configuration is absent.
+
+    The caller addressed a boundary whose required deployment/bootstrap
+    configuration or secret material is not configured for this process. The
+    operation fails closed: it never proceeds on a best-effort basis and
+    never manufactures a substitute. Messages must describe the absence
+    without carrying the missing configuration's value.
+    """
 
 
 class InvalidCommandError(ApplicationError):

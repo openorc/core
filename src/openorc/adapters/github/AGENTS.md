@@ -33,4 +33,34 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
 - Merge requests carry the exact reviewed/Owner-overridden head as expected SHA.
 - CI/check projection presents GitHub-owned facts and must not become a second merge-policy engine.
 
+## Webhook ingress boundary (issue #61)
+
+- Inbound GitHub webhook deliveries verify GitHub's SHA-256 signature
+  (`X-Hub-Signature-256`, a `sha256=`-prefixed hex HMAC-SHA256 digest) over
+  the exact raw request bytes through
+  `webhook_verification.GitHubWebhookSignatureVerifier` — stdlib `hmac` with
+  constant-time `hmac.compare_digest` — before any payload is trusted or
+  semantically parsed and before any payload-derived effect. Missing,
+  malformed, and invalid signatures are distinct adapter-local typed
+  rejections the intake service translates to `AuthenticationError`; the
+  transport maps them to a uniform, detail-free rejection. The raw body is
+  verified exactly once and is never persisted.
+- The webhook secret is deployment/bootstrap secret material on the shared
+  Settings surface (`OPENORC_GITHUB_WEBHOOK_SECRET`, representation-safe,
+  supplied-blank fails closed, #58 discipline). It is required at the point
+  the verification boundary is constructed (unconfigured deployments fail
+  closed rather than accept unverified deliveries) and is never Workspace
+  data, `openorc.*` state, Vault content, log/error text, or telemetry.
+- Payload semantics stay inside `webhook_classification`: a verified payload
+  is parsed only far enough to classify it — a relevant settled v1 event
+  family (`REQUIRED_V1_WEBHOOK_EVENTS`) with sufficient stable routing
+  identity maps onto the normalized `GitHubWebhookRoutingTarget` vocabulary;
+  valid-but-irrelevant deliveries (including `issue_comment` — no v1
+  capability reads comments) are safely ignored; structurally unusable
+  payloads are safely classified without inventing authority. Only stable
+  identity members (installation/repository IDs, issue/PR numbers) are ever
+  extracted; titles, bodies, and content members have no read path, and
+  provider event names/actions never leak above this boundary into
+  services/domain code.
+
 Do not let GitHub comments, labels, or webhook payloads become implicit Producer authority.

@@ -16,6 +16,7 @@ It does not own workflow transitions, review/session lifecycle decisions, GitHub
 - SSE is live delivery, not durable workflow truth.
 - FastAPI `BackgroundTasks` is not used for deferred or workflow execution; that work goes through RQ/Valkey queues and shared application services.
 - v1 persistence is synchronous: async/event-loop handlers must not perform blocking database I/O directly.
+- Provider webhook ingress routes (e.g. `POST /api/github/webhooks`, issue #61) are authenticated by the provider's own signature material, not by Supabase Auth: the route bounds the body while reading it (an oversized request is rejected without ever being fully buffered; a Content-Length precheck is only an additional fast rejection), reads the exact raw request bytes and the required provider headers, delegates the blocking intake — process-local pool acquisition included — off the event loop (threadpool), and maps only typed intake outcomes/errors to HTTP. Signature failures map to a uniform, detail-free rejection; the route contains no reconciliation, queue, or workflow logic.
 - API contracts consumed by the SPA require coordinated changes with `apps/app/AGENTS.md`.
 
 Read services/domain guidance and persistence guidance where relevant.
