@@ -150,22 +150,27 @@ def parse_graphql_issue_parent(payload: object) -> GitHubIssueParentObservation:
     <issue object or null>}}}}`` where the parent object exposes the stable
     numeric identifiers through the documented fields (``databaseId`` on the
     parent issue and on its ``repository``). A ``null`` parent inside a
-    well-formed answer is the authoritative no-parent fact. Errors in the
-    GraphQL answer, or any other uninterpretable shape, raise the classified
-    uncertain outcome — never a parent fact.
+    well-formed answer is the authoritative no-parent fact. A non-empty
+    top-level ``errors`` array — the GraphQL error location, a sibling of
+    ``data`` — is rejected BEFORE any data is accepted: an errored answer
+    (even one carrying otherwise parseable partial data) can never produce
+    a parent or no-parent fact. Any other uninterpretable shape raises the
+    classified uncertain outcome too — never a parent fact.
     """
     if not isinstance(payload, dict):
         raise GitHubOutcomeUncertainError(
             "the GitHub response is not interpretable: the object shape is unexpected"
         )
+    if isinstance(payload.get("errors"), list) and payload["errors"]:
+        # GraphQL documents ``errors`` as a top-level sibling of ``data``;
+        # partial data alongside errors is not authoritative truth.
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the GraphQL answer reports errors"
+        )
     data = payload.get("data")
     if not isinstance(data, dict):
         raise GitHubOutcomeUncertainError(
             "the GitHub response is not interpretable: the GraphQL data member is missing"
-        )
-    if isinstance(data.get("errors"), list) and data["errors"]:
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the GraphQL answer reports errors"
         )
     repository = data.get("repository")
     if not isinstance(repository, dict):

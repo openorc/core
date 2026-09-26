@@ -100,6 +100,23 @@ def test_a_null_graphql_parent_is_the_authoritative_no_parent_fact() -> None:
         {},
         {"data": None},
         {"data": {}},
+        # GraphQL documents ``errors`` as a top-level sibling of ``data``:
+        # an errored answer with otherwise parseable partial data is never
+        # an authoritative parent fact.
+        {
+            "errors": [{"message": "boom"}],
+            "data": {
+                "repository": {
+                    "issue": {"parent": {"databaseId": 501, "repository": {"databaseId": 555}}}
+                }
+            },
+        },
+        # ...and a top-level errors answer with a null parent is never the
+        # authoritative no-parent fact either.
+        {
+            "errors": [{"message": "boom"}],
+            "data": {"repository": {"issue": {"parent": None}}},
+        },
         {"errors": [{"message": "boom"}], "data": {"repository": None}},
         {"data": {"errors": [{"message": "boom"}]}},
         {"data": {"repository": {"issue": {"parent": "broken"}}}},

@@ -186,18 +186,21 @@ def _resolve_system_repository_installation_route(
 def _repository_address_from_url(repository_url: str) -> tuple[str, str] | None:
     """Extract the (owner, name) address from a documented repository_url.
 
-    Returns ``None`` when the URL is not an https github.com repository
-    reference: the caller then treats the relation as unresolvable rather
-    than guessing. The URL is a transient resolution input inside one fresh
-    observation — never identity, never persisted.
+    GitHub REST issue objects document ``repository_url`` in the API form
+    ``https://api.github.com/repos/{owner}/{repo}`` (the same documented
+    member the #59 issue projection fact set carries). Returns ``None``
+    when the URL is not exactly that https API origin/path shape: the
+    caller then treats the relation as unresolvable rather than guessing.
+    The URL is a transient resolution input inside one fresh observation —
+    never identity, never persisted.
     """
     parsed = urlparse(repository_url)
-    if parsed.scheme != "https" or parsed.hostname != "github.com":
+    if parsed.scheme != "https" or parsed.hostname != "api.github.com":
         return None
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 2:
+    if len(parts) != 3 or parts[0] != "repos":
         return None
-    return parts[0], parts[1]
+    return parts[1], parts[2]
 
 
 def _resolve_related_endpoints(
@@ -205,38 +208,47 @@ def _resolve_related_endpoints(
     *,
     github_installation_id: int,
     local_github_repository_id: int,
+    fresh_owner_login: str,
+    fresh_repository_name: str,
     related: list[GitHubRelatedIssueObservation],
 ) -> list[RelatedIssueEndpoint]:
     """Resolve related-issue observations into stable numeric endpoints.
 
     Same-repository references (the documented ``repository_url`` naming the
-    local repository itself) reuse the known stable GitHub repository ID
-    with zero extra reads. Each distinct cross-repository reference is
+    local repository itself, case-insensitively — GitHub repository/owner
+    names are not case sensitive) reuse the known stable GitHub repository
+    ID with zero extra reads. Each distinct cross-repository reference is
     resolved — deduplicated within the observation — through one documented
-    REST repository read. A non-GitHub or unparseable reference fails the
-    observation closed: mutable address data is never treated as identity.
+    REST repository read. A non-API-origin or unparseable reference fails
+    the observation closed: mutable address data is never treated as
+    identity.
     """
+    local_address = (fresh_owner_login.lower(), fresh_repository_name.lower())
     resolved: list[RelatedIssueEndpoint] = []
     resolution_cache: dict[tuple[str, str], int] = {}
     for observation in related:
         address = _repository_address_from_url(observation.repository_url)
         if address is None:
-            # An unparseable/non-GitHub reference cannot establish the stable
-            # identity this mirror requires: fail the observation closed.
+            # An unparseable/non-API-origin reference cannot establish the
+            # stable identity this mirror requires: fail the observation
+            # closed.
             raise ExternalOperationUncertainError(
                 "the related issue's repository reference is not resolvable "
                 "to a stable GitHub repository identity"
             )
-        cached = resolution_cache.get(address)
-        if cached is not None:
-            github_repository_id = cached
+        if (address[0].lower(), address[1].lower()) == local_address:
+            github_repository_id = local_github_repository_id
         else:
-            github_repository_id = github.get_repository_by_address(
-                github_installation_id=github_installation_id,
-                owner_login=address[0],
-                repository_name=address[1],
-            )
-            resolution_cache[address] = github_repository_id
+            cached = resolution_cache.get(address)
+            if cached is not None:
+                github_repository_id = cached
+            else:
+                github_repository_id = github.get_repository_by_address(
+                    github_installation_id=github_installation_id,
+                    owner_login=address[0],
+                    repository_name=address[1],
+                )
+                resolution_cache[address] = github_repository_id
         resolved.append(
             RelatedIssueEndpoint(
                 github_repository_id=github_repository_id,
@@ -352,6 +364,8 @@ def synchronize_repository_issue_dependencies(
                 github,
                 github_installation_id=external_installation_id,
                 local_github_repository_id=repository.identity.github_repository_id,
+                fresh_owner_login=fresh_address.owner_login,
+                fresh_repository_name=fresh_address.name,
                 related=related,
             )
         except (
@@ -509,6 +523,8 @@ def synchronize_repository_issue_hierarchy(
                 github,
                 github_installation_id=external_installation_id,
                 local_github_repository_id=repository.identity.github_repository_id,
+                fresh_owner_login=fresh_address.owner_login,
+                fresh_repository_name=fresh_address.name,
                 related=related_children,
             )
         except (

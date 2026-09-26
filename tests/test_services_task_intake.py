@@ -469,7 +469,8 @@ def test_an_issue_with_parent_and_sub_issues_remains_intake_eligible() -> None:
         sub_issues=[
             GitHubRelatedIssueObservation(
                 github_issue_id=2,
-                repository_url="https://github.com/octocat/other-repo",
+                # The documented REST API-form repository_url.
+                repository_url="https://api.github.com/repos/octocat/other-repo",
             )
         ],
     )
@@ -495,7 +496,9 @@ def test_a_github_blocked_issue_cannot_create_a_task() -> None:
     github = FakeGitHubAppClient(
         blocked_by=[
             GitHubRelatedIssueObservation(
-                github_issue_id=7, repository_url="https://github.com/octocat/repo"
+                github_issue_id=7,
+                # The documented REST API-form repository_url (same repo).
+                repository_url="https://api.github.com/repos/octocat/repo",
             )
         ],
     )
@@ -508,6 +511,101 @@ def test_a_github_blocked_issue_cannot_create_a_task() -> None:
             issue_number=_ISSUE_NUMBER,
         )
     assert not any("insert into openorc.tasks" in sql for sql, _ in conn.executed)
+
+
+def test_a_documented_api_form_repository_url_is_resolved_not_rejected() -> None:
+    """Regression: GitHub's documented REST ``repository_url`` shape resolves.
+
+    GitHub REST issue objects carry ``repository_url`` as
+    ``https://api.github.com/repos/{owner}/{repo}``; the blocked-by mirror
+    must accept that documented shape (not a browser-style github.com URL)
+    and derive the blocked state from the resolved endpoints.
+    """
+    conn = ScriptedConnection()
+    _script_reconciliation_write(conn)
+    _script_dependency_mirror(
+        conn,
+        durable_blockers=[(555, 7)],  # resolved endpoint mirrored durably
+    )
+    pool = _pool(conn)
+    github = FakeGitHubAppClient(
+        blocked_by=[
+            GitHubRelatedIssueObservation(
+                github_issue_id=7,
+                repository_url="https://api.github.com/repos/octocat/repo",
+            )
+        ],
+    )
+    with pytest.raises(ConflictError, match="blocked"):
+        task_intake.intake_repository_task(
+            pool,
+            github,
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            issue_number=_ISSUE_NUMBER,
+        )
+    # The blocked state is derived from the resolved endpoint, never from
+    # the mutable URL text, and no Task is created.
+    assert not any("insert into openorc.tasks" in sql for sql, _ in conn.executed)
+
+
+def test_a_browser_style_repository_url_fails_the_observation_closed() -> None:
+    """A non-API-origin reference is not the documented shape: fail closed."""
+    conn = ScriptedConnection()
+    _script_reconciliation_write(conn)
+    _script_route_resolution(conn)  # dependency unit's route resolution
+    pool = _pool(conn)
+    github = FakeGitHubAppClient(
+        blocked_by=[
+            GitHubRelatedIssueObservation(
+                github_issue_id=7,
+                repository_url="https://github.com/octocat/repo",
+            )
+        ],
+    )
+    with pytest.raises(ExternalOperationUncertainError, match="not resolvable"):
+        task_intake.intake_repository_task(
+            pool,
+            github,
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            issue_number=_ISSUE_NUMBER,
+        )
+    assert not any("insert into openorc.tasks" in sql for sql, _ in conn.executed)
+
+
+def test_same_repository_references_reuse_the_known_stable_id() -> None:
+    """Same-repo edges need zero extra adapter reads (the rev-6 contract)."""
+    conn = ScriptedConnection()
+    _script_reconciliation_write(conn)
+    _script_dependency_mirror(conn, durable_blockers=[])
+    _script_creation(conn, current_task=None, insert_result=_task_row())
+    _script_hierarchy_after_creation(
+        conn,
+        child_rows=[(555, 7)],  # same-repo child resolves to the local ID
+    )
+    _script_route_resolution(conn)  # hierarchy unit resolves its own route
+    pool = _pool(conn)
+    github = FakeGitHubAppClient(
+        blocked_by=[],
+        sub_issues=[
+            GitHubRelatedIssueObservation(
+                github_issue_id=7,
+                repository_url="https://api.github.com/repos/octocat/repo",
+            )
+        ],
+    )
+    result = task_intake.intake_repository_task(
+        pool,
+        github,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        issue_number=_ISSUE_NUMBER,
+    )
+    assert result.created is True
+    # Same-repository references reused the local stable ID with zero
+    # cross-repository REST resolution reads.
+    assert "resolve_repository" not in github.calls
 
 
 def test_an_unobservable_blocking_state_fails_intake_closed() -> None:
