@@ -132,9 +132,10 @@ def _insert_task(
     task_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.tasks "
-        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status) "
-        "values (%s, %s, %s, %s, %s, 'ready_to_plan')",
-        (task_id, workspace_id, repository_id, 7601, 200),
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, 'ready_to_plan', %s)",
+        (task_id, workspace_id, repository_id, 7601, 200, "a" * 64),
     )
     return task_id
 

@@ -165,6 +165,7 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     assert first.status is TaskStatus.READY_TO_PLAN
     assert first.archived_at is None
@@ -181,13 +182,15 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
             repository_id=repository_id,
             github_issue_id=9001,
             github_issue_number=42,
+            source_requirements_fingerprint="a" * 64,
         )
     with pytest.raises(UniqueViolation), conn.transaction():
         conn.execute(
             "insert into openorc.tasks "
-            "(workspace_id, repository_id, github_issue_id, github_issue_number, status) "
-            "values (%s, %s, %s, %s, 'ready_to_plan')",
-            (workspace_id, repository_id, 9001, 42),
+            "(workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+            "source_requirements_fingerprint) "
+            "values (%s, %s, %s, %s, 'ready_to_plan', %s)",
+            (workspace_id, repository_id, 9001, 42, "a" * 64),
         )
 
     # The stable identity (not the repository-local number) is what conflicts:
@@ -199,6 +202,7 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
             repository_id=repository_id,
             github_issue_id=9001,
             github_issue_number=43,
+            source_requirements_fingerprint="b" * 64,
         )
 
     # Independent Tasks for different issues coexist.
@@ -208,6 +212,7 @@ def test_two_current_tasks_for_the_same_issue_conflict(conn: Connection[Any]) ->
         repository_id=repository_id,
         github_issue_id=9002,
         github_issue_number=43,
+        source_requirements_fingerprint="b" * 64,
     )
     assert second.id != first.id
 
@@ -234,6 +239,7 @@ def test_tasks_for_the_same_external_issue_in_different_workspaces_coexist(
         repository_id=repo_a,
         github_issue_id=555,
         github_issue_number=7,
+        source_requirements_fingerprint="c" * 64,
     )
     task_b = task_repositories.create_task(
         pool,
@@ -241,6 +247,7 @@ def test_tasks_for_the_same_external_issue_in_different_workspaces_coexist(
         repository_id=repo_b,
         github_issue_id=555,
         github_issue_number=7,
+        source_requirements_fingerprint="c" * 64,
     )
     assert task_a.id != task_b.id
     assert task_a.workspace_id != task_b.workspace_id
@@ -261,6 +268,7 @@ def test_task_workspace_scope_must_agree_with_the_repository(
             repository_id=repository_id,
             github_issue_id=9001,
             github_issue_number=42,
+            source_requirements_fingerprint="a" * 64,
         )
     assert workspace_id is not None
 
@@ -277,6 +285,7 @@ def test_canonical_branch_ownership_is_exclusive_among_current_tasks(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     task_b = task_repositories.create_task(
         pool,
@@ -284,6 +293,7 @@ def test_canonical_branch_ownership_is_exclusive_among_current_tasks(
         repository_id=repository_id,
         github_issue_id=9002,
         github_issue_number=43,
+        source_requirements_fingerprint="b" * 64,
     )
 
     bound_a = task_repositories.bind_canonical_branch(
@@ -328,6 +338,7 @@ def test_canonical_branch_binding_is_one_time(conn: Connection[Any]) -> None:
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     # The branch is created NULL; it is bound only after verification.
     assert task.canonical_feature_branch is None
@@ -375,6 +386,7 @@ def test_canonical_branch_binding_is_one_time(conn: Connection[Any]) -> None:
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     fresh_bound = task_repositories.bind_canonical_branch(
         pool,
@@ -398,6 +410,7 @@ def test_archived_attempt_releases_the_issue_and_the_branch(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     task_b = task_repositories.create_task(
         pool,
@@ -405,6 +418,7 @@ def test_archived_attempt_releases_the_issue_and_the_branch(
         repository_id=repository_id,
         github_issue_id=9002,
         github_issue_number=43,
+        source_requirements_fingerprint="b" * 64,
     )
     task_repositories.bind_canonical_branch(
         pool,
@@ -436,6 +450,7 @@ def test_archived_attempt_releases_the_issue_and_the_branch(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     assert fresh.status is TaskStatus.READY_TO_PLAN
     assert fresh.archived_at is None
@@ -465,6 +480,7 @@ def test_cancelled_and_completed_attempts_remain_distinguishable_history(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     task_repositories.archive_task(
         pool,
@@ -478,6 +494,7 @@ def test_cancelled_and_completed_attempts_remain_distinguishable_history(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     task_repositories.archive_task(
         pool,
@@ -491,6 +508,7 @@ def test_cancelled_and_completed_attempts_remain_distinguishable_history(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
 
     attempts = task_repositories.list_issue_attempts(
@@ -547,6 +565,7 @@ def test_fresh_task_after_a_completed_issue_is_reopened(conn: Connection[Any]) -
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     task_repositories.archive_task(
         pool,
@@ -563,6 +582,7 @@ def test_fresh_task_after_a_completed_issue_is_reopened(conn: Connection[Any]) -
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     assert reopened.id != completed.id
     assert reopened.status is TaskStatus.READY_TO_PLAN
@@ -581,6 +601,7 @@ def test_stale_state_token_mutations_fail_and_success_rotates_the_token(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     original_token = task.state_token
 
@@ -680,6 +701,7 @@ def test_terminal_transitions_go_exclusively_through_archive_task(
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
 
     # update_task_status is nonterminal-only at the API boundary.
@@ -724,9 +746,10 @@ def test_archival_check_constraint_mirrors_the_domain_invariant(
     # READY_TO_PLAN at the write boundary.
     conn.execute(
         "insert into openorc.tasks "
-        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status) "
-        "values (%s, %s, %s, %s, %s, 'ready_to_plan')",
-        (task_id, workspace_id, repository_id, 9001, 42),
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, 'ready_to_plan', %s)",
+        (task_id, workspace_id, repository_id, 9001, 42, "a" * 64),
     )
 
     # A terminal status without archival violates the lifecycle CHECK...
@@ -763,6 +786,7 @@ def test_task_round_trip_and_instants_are_utc_normalized(conn: Connection[Any]) 
         repository_id=repository_id,
         github_issue_id=9001,
         github_issue_number=42,
+        source_requirements_fingerprint="a" * 64,
     )
     fetched = task_repositories.get_task(pool, created.id)
     assert fetched == created

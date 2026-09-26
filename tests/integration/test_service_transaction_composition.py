@@ -187,6 +187,7 @@ def test_composition_rolls_back_all_repository_effects_when_a_later_write_fails(
             repository_id=repository_id,
             github_issue_id=910_101,
             github_issue_number=42,
+            source_requirements_fingerprint="a" * 64,
         )
         task_repositories.create_task(
             scoped,
@@ -194,6 +195,7 @@ def test_composition_rolls_back_all_repository_effects_when_a_later_write_fails(
             repository_id=repository_id,
             github_issue_id=910_101,
             github_issue_number=42,
+            source_requirements_fingerprint="a" * 64,
         )
 
     # The second (failing) write invalidated the whole composition: the first
@@ -218,6 +220,7 @@ def test_composition_presents_all_composed_effects_together(conn: Connection[Any
             repository_id=repository_id,
             github_issue_id=910_102,
             github_issue_number=43,
+            source_requirements_fingerprint="a" * 64,
         )
         event = event_repositories.record_workflow_event(
             scoped,
@@ -246,6 +249,7 @@ def test_composition_recovers_from_a_handled_nested_failure(conn: Connection[Any
             repository_id=repository_id,
             github_issue_id=920_101,
             github_issue_number=44,
+            source_requirements_fingerprint="a" * 64,
         )
         with pytest.raises(UniqueViolation):
             task_repositories.create_task(
@@ -254,6 +258,7 @@ def test_composition_recovers_from_a_handled_nested_failure(conn: Connection[Any
                 repository_id=repository_id,
                 github_issue_id=920_101,
                 github_issue_number=44,
+                source_requirements_fingerprint="a" * 64,
             )
         # The outer transaction survived the handled savepoint rollback.
         task_repositories.create_task(
@@ -262,6 +267,7 @@ def test_composition_recovers_from_a_handled_nested_failure(conn: Connection[Any
             repository_id=repository_id,
             github_issue_id=930_201,
             github_issue_number=45,
+            source_requirements_fingerprint="a" * 64,
         )
 
     assert _task_count(conn, 920_101) == 1

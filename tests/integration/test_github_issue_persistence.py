@@ -499,6 +499,41 @@ class _FakeGitHubClient:
     def get_installation_capabilities(self, github_installation_id: int) -> Any:
         raise AssertionError("the service must not compose raw adapter operations")
 
+    def get_issue_blocked_by(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> Any:
+        raise AssertionError("this B3 reconciliation fake must not observe relationships")
+
+    def get_issue_sub_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> Any:
+        raise AssertionError("this B3 reconciliation fake must not observe relationships")
+
+    def get_issue_parent(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> Any:
+        raise AssertionError("this B3 reconciliation fake must not observe relationships")
+
+    def get_repository_by_address(
+        self, *, github_installation_id: int, owner_login: str, repository_name: str
+    ) -> int:
+        raise AssertionError("this B3 reconciliation fake must not resolve addresses")
+
 
 def _workspace_with_routed_repository(
     conn: Connection[Any],

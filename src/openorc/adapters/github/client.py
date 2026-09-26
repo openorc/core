@@ -44,9 +44,13 @@ from typing import Protocol
 
 from openorc.adapters.github.authentication import GitHubAppAuthenticator
 from openorc.adapters.github.capabilities import (
+    GITHUB_GRAPHQL_PATH,
     GITHUB_INSTALLATION_PATH,
     GITHUB_INSTALLATION_REPOSITORIES_PATH,
+    GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH,
+    GITHUB_ISSUE_SUB_ISSUES_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
+    GITHUB_REPOSITORY_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
     missing_required_capabilities,
@@ -65,6 +69,12 @@ from openorc.adapters.github.observations import (
     GitHubRepositoryObservation,
     parse_installation_repository_entry,
     parse_issue_payload,
+)
+from openorc.adapters.github.observations_relations import (
+    GitHubIssueParentObservation,
+    GitHubRelatedIssueObservation,
+    parse_graphql_issue_parent,
+    parse_related_issue_payloads,
 )
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
@@ -98,11 +108,48 @@ _TRACER_SCOPE = "openorc.adapters.github.client"
 _INSTALLATION_LOOKUP_SPAN_NAME = "github.get_installation_capabilities"
 _LISTING_SPAN_NAME = "github.list_installation_repositories"
 _ISSUE_SPAN_NAME = "github.get_repository_issue"
+_BLOCKED_BY_SPAN_NAME = "github.get_issue_blocked_by"
+_SUB_ISSUES_SPAN_NAME = "github.get_issue_sub_issues"
+_PARENT_SPAN_NAME = "github.get_issue_parent"
+_REPOSITORY_RESOLVE_SPAN_NAME = "github.get_repository_by_address"
 
 # The installation repository listing requests the maximum documented page
 # size (100) and is bounded so a broken pagination chain cannot loop.
 _LISTING_PAGE_SIZE = 100
 _MAX_LISTING_PAGES = 100
+
+# The minimal documented GraphQL query for the one parent fact REST cannot
+# authoritatively express: the nullable ``Issue.parent`` field plus the
+# documented ``databaseId`` stable numeric identifiers of the parent issue
+# and its repository (GitHub GraphQL schema). Nothing else is selected. The
+# owner/name strings are embedded as escaped GraphQL string literals by the
+# caller (the escape helper below); the issue number is a validated integer.
+_ISSUE_PARENT_QUERY_TEMPLATE = (
+    "query { repository(owner: __OWNER__, name: __NAME__) {"
+    " issue(number: __NUMBER__) {"
+    " parent { databaseId repository { databaseId } }"
+    " }"
+    " }"
+)
+
+
+def _issue_parent_query(*, owner_login: str, repository_name: str, issue_number: int) -> str:
+    """Build the minimal documented parent query for one addressed issue."""
+    return (
+        _ISSUE_PARENT_QUERY_TEMPLATE.replace("__OWNER__", _graphql_string_literal(owner_login))
+        .replace("__NAME__", _graphql_string_literal(repository_name))
+        .replace("__NUMBER__", str(issue_number))
+    )
+
+
+def _graphql_string_literal(value: str) -> str:
+    """Escape one caller-supplied string as a GraphQL string literal.
+
+    Only the two documented string values (owner login, repository name)
+    pass through here; backslashes and double quotes are escaped so the
+    value cannot break out of the literal.
+    """
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 class GitHubAppClient(Protocol):
@@ -142,6 +189,49 @@ class GitHubAppClient(Protocol):
         self, github_installation_id: int
     ) -> GitHubInstallationCapabilities:
         """Return the normalized capability facts for the exact installation."""
+        ...
+
+    def get_issue_blocked_by(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> list[GitHubRelatedIssueObservation]:
+        """Return the authoritative blocked-by dependency listing of one issue."""
+        ...
+
+    def get_issue_sub_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> list[GitHubRelatedIssueObservation]:
+        """Return the authoritative sub-issue listing of one issue."""
+        ...
+
+    def get_issue_parent(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueParentObservation:
+        """Return the authoritative parent-or-no-parent fact of one issue."""
+        ...
+
+    def get_repository_by_address(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> int:
+        """Return the stable numeric repository ID at one owner/name address."""
         ...
 
 
@@ -312,6 +402,155 @@ class HttpGitHubAppClient:
                 issue_number=issue_number,
             )
 
+    def get_issue_blocked_by(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> list[GitHubRelatedIssueObservation]:
+        """Return the authoritative blocked-by dependency listing of one issue.
+
+        The documented
+        ``GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by``
+        operation under the installation access token (Issues read). The
+        listing is observed through the freshly observed repository address,
+        never stored mutable metadata. An uninterpretable listing raises the
+        classified uncertain outcome; a failed answer raises its classified
+        error — neither is ever returned as an authoritative (possibly
+        empty) dependency fact.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(issue_number, "issue_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _BLOCKED_BY_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_BLOCKED_BY_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_issue_number=issue_number,
+            )
+            path = (
+                GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH.format(
+                    owner=owner_login, repo=repository_name, issue_number=issue_number
+                )
+                + f"?per_page={_LISTING_PAGE_SIZE}"
+            )
+            entries: list[object] = []
+            self._collect_paginated_entries(github_installation_id, path, entries)
+            return parse_related_issue_payloads(entries)
+
+    def get_issue_sub_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> list[GitHubRelatedIssueObservation]:
+        """Return the authoritative sub-issue listing of one issue.
+
+        The documented
+        ``GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues``
+        operation under the installation access token (Issues read), with
+        the same fail-closed discipline as the blocked-by listing.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(issue_number, "issue_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _SUB_ISSUES_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_SUB_ISSUES_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_issue_number=issue_number,
+            )
+            path = (
+                GITHUB_ISSUE_SUB_ISSUES_PATH.format(
+                    owner=owner_login, repo=repository_name, issue_number=issue_number
+                )
+                + f"?per_page={_LISTING_PAGE_SIZE}"
+            )
+            entries: list[object] = []
+            self._collect_paginated_entries(github_installation_id, path, entries)
+            return parse_related_issue_payloads(entries)
+
+    def get_issue_parent(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueParentObservation:
+        """Return the authoritative parent-or-no-parent fact of one issue.
+
+        The documented GitHub GraphQL query reading the nullable
+        ``Issue.parent`` field (with the documented ``databaseId`` fields of
+        the parent issue and its repository) under the installation access
+        token. A null parent inside a well-formed answer is the
+        authoritative no-parent fact — the REST parent endpoint documents
+        only 200/301/404/410 and can never authoritatively express absence,
+        so a REST 404 is never reinterpreted as ``NO_PARENT``. A GraphQL
+        error answer, or any uninterpretable shape, raises the classified
+        uncertain outcome and leaves any durable mirror untouched.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(issue_number, "issue_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _PARENT_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_PARENT_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_issue_number=issue_number,
+            )
+            query = _issue_parent_query(
+                owner_login=owner_login,
+                repository_name=repository_name,
+                issue_number=issue_number,
+            )
+            body = json.dumps({"query": query}).encode("utf-8")
+            response = self._post_with_installation_token(
+                github_installation_id, GITHUB_GRAPHQL_PATH, body
+            )
+            return parse_graphql_issue_parent(_json_body(response))
+
+    def get_repository_by_address(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> int:
+        """Return the stable numeric repository ID at one owner/name address.
+
+        The documented ``GET /repos/{owner}/{repo}`` operation under the
+        installation access token: the REST-only resolution step for
+        cross-repository related-repository identity. The mutable
+        owner/name address is used transiently within one fresh observation
+        to establish the stable identity — it is never an identity itself
+        and never persisted as one.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _REPOSITORY_RESOLVE_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_REPOSITORY_RESOLVE_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+            )
+            path = GITHUB_REPOSITORY_PATH.format(owner=owner_login, repo=repository_name)
+            payload = _json_body(
+                self._request_with_installation_token(github_installation_id, path)
+            )
+            return require_positive_int(payload.get("id"), "repository id")
+
     def _require_validated_capabilities(
         self, github_installation_id: int
     ) -> GitHubInstallationCapabilities:
@@ -399,6 +638,56 @@ class HttpGitHubAppClient:
                 path, method="GET", authorization=f"Bearer {token.token_value()}"
             )
 
+    def _post_with_installation_token(
+        self, github_installation_id: int, path: str, body: bytes
+    ) -> GitHubHttpResponse:
+        """Perform one installation-token POST with bounded 401 recovery.
+
+        The same bounded recovery contract as the GET helper: one token
+        eviction and re-mint on an authentication rejection; uncertain
+        outcomes are never replayed.
+        """
+        token = self._authenticator.installation_token(github_installation_id)
+        try:
+            return self._transport.request(
+                path,
+                method="POST",
+                authorization=f"Bearer {token.token_value()}",
+                body=body,
+            )
+        except GitHubAuthenticationRejectedError:
+            self._authenticator.invalidate_installation_token(github_installation_id)
+            token = self._authenticator.installation_token(github_installation_id)
+            return self._transport.request(
+                path,
+                method="POST",
+                authorization=f"Bearer {token.token_value()}",
+                body=body,
+            )
+
+    def _collect_paginated_entries(
+        self, github_installation_id: int, initial_path: str, entries: list[object]
+    ) -> None:
+        """Walk one bounded paginated JSON-array listing into ``entries``.
+
+        Follows the documented ``Link`` headers with the established
+        origin-validated pagination discipline; exceeding the bounded page
+        count classifies as an uncertain outcome because the authoritative
+        listing cannot be completed.
+        """
+        path: str | None = initial_path
+        page_count = 0
+        while path is not None:
+            if page_count >= _MAX_LISTING_PAGES:
+                raise GitHubOutcomeUncertainError(
+                    "the GitHub relationship listing could not be completed "
+                    "within the bounded page count: the outcome is unknown"
+                )
+            response = self._request_with_installation_token(github_installation_id, path)
+            entries.extend(_json_array_body(response))
+            path = self._next_page_url(response)
+            page_count += 1
+
     def _next_page_url(self, response: GitHubHttpResponse) -> str | None:
         """Extract the documented ``Link``-header ``rel="next"`` target.
 
@@ -438,6 +727,29 @@ def _json_body(response: GitHubHttpResponse) -> dict[str, object]:
             "the GitHub response is not interpretable: the object shape is unexpected"
         )
     return payload
+
+
+def _json_array_body(response: GitHubHttpResponse) -> list[object]:
+    """Decode a 2xx GitHub response body as a JSON array.
+
+    The documented blocked-by and sub-issue listings answer arrays; an
+    uninterpretable 2xx body classifies as an uncertain outcome.
+    """
+    try:
+        payload = json.loads(response.body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise GitHubOutcomeUncertainError("the GitHub response is not interpretable") from exc
+    if not isinstance(payload, list):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the listing shape is unexpected"
+        )
+    return payload
+
+
+def _require_non_empty_command_str(value: object, name: str) -> None:
+    """Reject a malformed caller-supplied address string (fail closed)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
 
 
 def _matching_repository_entry(

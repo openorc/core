@@ -110,6 +110,7 @@ def _task_row(
         state_token,
         current_plan_revision_id,
         current_owner_gate_id,
+        "a" * 64,
         _OBSERVED,
         _OBSERVED,
     )

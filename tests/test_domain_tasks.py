@@ -38,6 +38,7 @@ def _task(**overrides: object) -> Task:
         "state_token": uuid4(),
         "current_plan_revision_id": None,
         "current_owner_gate_id": None,
+        "source_requirements_fingerprint": "a" * 64,
         "created_at": datetime.now(UTC),
         "updated_at": datetime.now(UTC),
     }
@@ -98,6 +99,8 @@ def test_task_is_frozen() -> None:
         ({"state_token": "not-a-uuid"}, "state_token"),
         ({"current_plan_revision_id": 123}, "current_plan_revision_id"),
         ({"current_owner_gate_id": "abc"}, "current_owner_gate_id"),
+        ({"source_requirements_fingerprint": "not-a-digest"}, "source_requirements_fingerprint"),
+        ({"source_requirements_fingerprint": "A" * 64}, "source_requirements_fingerprint"),
     ],
 )
 def test_task_rejects_invalid_fields(overrides: dict[str, object], message: str) -> None:
@@ -139,6 +142,7 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "state_token",
             "current_plan_revision_id",
             "current_owner_gate_id",
+            "source_requirements_fingerprint",
             "created_at",
             "updated_at",
         }

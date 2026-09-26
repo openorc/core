@@ -88,6 +88,7 @@ def _task_row(archived: bool) -> tuple[Any, ...]:
         uuid.uuid4(),
         None,
         None,
+        "a" * 64,
         _observed_at(),
         _observed_at(),
     )

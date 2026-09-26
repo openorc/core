@@ -54,7 +54,8 @@ __all__ = [
 _TASK_COLUMNS = (
     "id, workspace_id, repository_id, github_issue_id, github_issue_number, "
     "status, archived_at, canonical_feature_branch, state_token, "
-    "current_plan_revision_id, current_owner_gate_id, created_at, updated_at"
+    "current_plan_revision_id, current_owner_gate_id, "
+    "source_requirements_fingerprint, created_at, updated_at"
 )
 
 
@@ -72,8 +73,9 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         state_token=row[8],
         current_plan_revision_id=row[9],
         current_owner_gate_id=row[10],
-        created_at=normalize_utc(row[11]),
-        updated_at=normalize_utc(row[12]),
+        source_requirements_fingerprint=row[11],
+        created_at=normalize_utc(row[12]),
+        updated_at=normalize_utc(row[13]),
     )
 
 
@@ -84,17 +86,21 @@ def create_task(
     repository_id: UUID,
     github_issue_id: int,
     github_issue_number: int,
+    source_requirements_fingerprint: str,
     status: TaskStatus = TaskStatus.READY_TO_PLAN,
 ) -> Task:
     """Insert one Task attempt for a stable GitHub issue within a Repository.
 
     A fresh Task starts nonterminal (default ``ready_to_plan``) with a NULL
-    canonical branch: terminal attempts only arise through
-    :func:`archive_task`, the canonical branch is only bound once later
-    workflow/runtime logic has verified it (:func:`bind_canonical_branch`),
-    and at most one non-archived Task may exist per
-    ``(repository_id, github_issue_id)`` (the database partial unique index
-    enforces it).
+    canonical branch and its immutable source baseline: the exact B3
+    requirements fingerprint the issue carried when the caller's fresh
+    authoritative eligibility observation was made
+    (``source_requirements_fingerprint``, issue #60). Terminal attempts only
+    arise through :func:`archive_task`, the canonical branch is only bound
+    once later workflow/runtime logic has verified it
+    (:func:`bind_canonical_branch`), and at most one non-archived Task may
+    exist per ``(repository_id, github_issue_id)`` (the database partial
+    unique index enforces it).
     """
     if status.is_terminal:
         raise TaskDomainError(
@@ -103,8 +109,9 @@ def create_task(
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.tasks "
-            "(workspace_id, repository_id, github_issue_id, github_issue_number, status) "
-            "values (%s, %s, %s, %s, %s) "
+            "(workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+            "source_requirements_fingerprint) "
+            "values (%s, %s, %s, %s, %s, %s) "
             f"returning {_TASK_COLUMNS}",
             (
                 workspace_id,
@@ -112,6 +119,7 @@ def create_task(
                 github_issue_id,
                 github_issue_number,
                 status.value,
+                source_requirements_fingerprint,
             ),
         ).fetchone()
     assert row is not None

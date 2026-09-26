@@ -143,6 +143,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "state_token": uuid.uuid4(),
         "current_plan_revision_id": None,
         "current_owner_gate_id": None,
+        "source_requirements_fingerprint": "a" * 64,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
     }
@@ -159,6 +160,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["state_token"],
         values["current_plan_revision_id"],
         values["current_owner_gate_id"],
+        values["source_requirements_fingerprint"],
         values["created_at"],
         values["updated_at"],
     )

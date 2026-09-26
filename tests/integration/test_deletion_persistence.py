@@ -279,6 +279,7 @@ def _populate_full_task_aggregate(
         repository_id=repository_id,
         github_issue_id=github_issue_id,
         github_issue_number=github_issue_number,
+        source_requirements_fingerprint="a" * 64,
     )
     session = session_repositories.ensure_task_agent_session(
         pool,
@@ -416,6 +417,7 @@ def _populate_light_task(
         repository_id=repository_id,
         github_issue_id=github_issue_id,
         github_issue_number=github_issue_number,
+        source_requirements_fingerprint="a" * 64,
     )
     session_repositories.ensure_task_agent_session(
         pool,
@@ -734,6 +736,7 @@ def test_purging_an_archived_task_removes_its_complete_aggregate(
         repository_id=repository_id,
         github_issue_id=73_002,
         github_issue_number=2,
+        source_requirements_fingerprint="a" * 64,
     )
 
     # A current (non-archived) Task is never purgeable through this
@@ -801,6 +804,7 @@ def test_connection_deletion_is_restricted_and_disconnect_is_explicit(
         repository_id=repository_id,
         github_issue_id=74_001,
         github_issue_number=1,
+        source_requirements_fingerprint="a" * 64,
     )
     session_repositories.ensure_task_agent_session(
         pool,

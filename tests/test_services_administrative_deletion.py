@@ -177,6 +177,7 @@ def _task_row(workspace_id: Any, *, archived: bool) -> tuple[Any, ...]:
         uuid.uuid4(),
         uuid.uuid4(),
         None,
+        "a" * 64,
         _OBSERVED,
         _OBSERVED,
     )
