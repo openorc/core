@@ -12,6 +12,7 @@ from openorc.api.request_correlation import (
     RequestCorrelationMiddleware,
     server_error_response,
 )
+from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
 from openorc.config import Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
@@ -65,6 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.add_middleware(RequestCorrelationMiddleware)
     app.include_router(health_router)
+    app.include_router(github_webhooks_router)
     app.state.settings = resolved
     return app
 

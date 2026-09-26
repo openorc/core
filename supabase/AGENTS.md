@@ -60,4 +60,35 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Browser clients use Supabase for authentication, not as a bypass around the OpenOrc application API for workflow data.
 - Raw OpenOrc-owned secrets do not belong in ordinary tables.
 
+## GitHub webhook delivery intake (issue #61)
+
+- `openorc.github_webhook_deliveries` records each verified webhook delivery
+  exactly once, keyed by the GitHub delivery GUID (durably unique — the
+  provider deduplication identity; a re-delivered GUID is acknowledged
+  idempotently and never creates a second accepted record). It persists only
+  safe metadata: event name, optional action, the bounded intake
+  classification, the bounded routing resolution and normalized semantic
+  routing target (CHECK-consistent: a `relevant` classification requires
+  them and both stable installation/repository identities), nullable stable
+  installation/repository/issue/PR identifiers, and the received instant.
+  Raw webhook bodies, signatures, secrets, and customer content have no
+  column. The table carries no Workspace foreign key: the dedup identity is
+  provider-owned.
+- `openorc.github_webhook_delivery_routes` retains the resolved Workspace
+  routing facts of an accepted delivery — one row per exact route match;
+  fan-out over several Workspaces (the same external repository connected
+  independently in several Workspaces) is representable. Foreign-key
+  classification (deletion-ownership vocabulary): `delivery_id ->
+  github_webhook_deliveries` is true ownership (ON DELETE CASCADE);
+  `workspace_id -> workspaces` is true ownership (ON DELETE CASCADE — the
+  linkage is a Workspace-scoped operational row and the dedup record
+  survives Workspace deletion); `(repository_id, workspace_id) ->
+  repositories (id, workspace_id)` is the true-ownership composite cascade
+  (the #59 pattern). The classification is enforced by
+  `tests/test_deletion_migration.py` and
+  `tests/test_github_webhook_deliveries_migration.py`.
+- Delivery/routing records are notification/recovery metadata, not workflow
+  authority and not an event-sourced copy of GitHub; dispatch (#120)
+  re-validates current routing before any effect.
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

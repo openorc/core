@@ -46,6 +46,17 @@ SUPABASE_SECRET_KEY_VAR = "SUPABASE_SECRET_KEY"
 # when either value is absent.
 GITHUB_APP_ID_VAR = "OPENORC_GITHUB_APP_ID"
 GITHUB_APP_PRIVATE_KEY_VAR = "OPENORC_GITHUB_APP_PRIVATE_KEY"
+# The GitHub App webhook secret (issue #61): deployment/bootstrap secret
+# material used to verify the SHA-256 signature of inbound GitHub webhook
+# deliveries before any payload-derived application effect. Same discipline
+# as the App identity above: never Workspace data, never stored in ordinary
+# openorc.* tables, never stored in Supabase Vault, never returned through
+# ordinary APIs, never logged or attached to telemetry. Deliberately OPTIONAL
+# on this shared surface: both the API and worker process surfaces boot
+# through Settings.from_env, and authentication ownership follows direct
+# consumption — the requirement is enforced where the webhook verification
+# boundary is constructed, which fails fast when the value is absent.
+GITHUB_WEBHOOK_SECRET_VAR = "OPENORC_GITHUB_WEBHOOK_SECRET"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
@@ -194,6 +205,7 @@ class Settings:
     # Vault, never logged or returned.
     github_app_id: int | None = None
     github_app_private_key: str | None = field(default=None, repr=False)
+    github_webhook_secret: str | None = field(default=None, repr=False)
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -306,6 +318,15 @@ class Settings:
         github_app_id = _read_optional_int(source, GITHUB_APP_ID_VAR, minimum=1)
         github_app_private_key = _read_secret(source, GITHUB_APP_PRIVATE_KEY_VAR)
 
+        # GitHub App webhook secret (issue #61). Optional on this shared
+        # surface in every environment — including production: the webhook
+        # secret belongs only to the component that constructs the webhook
+        # verification boundary, and that component fails fast at
+        # construction when the value is absent. A supplied-but-blank value
+        # is a configuration error (fail closed without echoing the value,
+        # per _read_secret).
+        github_webhook_secret = _read_secret(source, GITHUB_WEBHOOK_SECRET_VAR)
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -334,5 +355,6 @@ class Settings:
             supabase_secret_key=supabase_secret_key,
             github_app_id=github_app_id,
             github_app_private_key=github_app_private_key,
+            github_webhook_secret=github_webhook_secret,
             otlp_endpoint=otlp_endpoint,
         )

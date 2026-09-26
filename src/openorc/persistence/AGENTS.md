@@ -118,3 +118,29 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - Owner-mutation barrier reads use FOR KEY SHARE so ordinary guarded mutations serialize correctly against the account-deletion FOR UPDATE claim while remaining compatible with one another.
 
 Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/services guidance for semantic changes.
+
+## GitHub webhook delivery intake (issue #61)
+
+- `persistence/github_webhook_deliveries.py` owns the GUID-keyed delivery
+  records (`openorc.github_webhook_deliveries`) and their resolved Workspace
+  routing linkages (`openorc.github_webhook_delivery_routes`). A delivery
+  record exists only for a verified delivery; it carries provider-stable
+  identifiers and bounded classification/resolution metadata, never raw
+  payloads, signatures, secrets, or customer content, and carries no
+  Workspace foreign key (the delivery GUID is provider-owned identity that
+  survives Workspace lifecycle).
+- The deduplication insert is a single statement
+  (`INSERT ... ON CONFLICT (delivery_guid) DO NOTHING RETURNING`): the
+  returned row is the accepted record, a missing row is the already-accepted
+  duplicate, and concurrent duplicate inserts converge deterministically on
+  the durable unique constraint.
+- `persistence/github_webhook_routing.py` resolves a delivery's stable
+  installation/repository identity against the explicit B1 routing tables —
+  the webhook-direction complement of the #57 configuration-direction
+  resolvers, exact match only, never authorization, never owner/login
+  heuristics. Zero/mismatched routes are bounded fail-closed observations
+  (`unmapped_installation` / `unconfigured_repository` / `route_mismatch`),
+  never Workspace/Repository/Task authority.
+- Delivery and routing records are notification/recovery metadata, not
+  workflow authority; dispatch (#120) re-validates current durable routing
+  before any reconciliation effect.
