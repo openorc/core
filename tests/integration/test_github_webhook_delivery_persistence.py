@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import threading
 import uuid
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
 from psycopg import Connection
@@ -124,45 +126,100 @@ def test_delivery_guid_is_durably_unique_and_duplicates_are_idempotent(conn: Con
 
 
 def test_concurrent_same_guid_inserts_converge_on_the_unique_rule(
-    conn: Connection, migrated_database: str
+    migrated_database: str,
 ) -> None:
+    """Two independently committing connections race the same delivery GUID.
+
+    Both contenders start behind a barrier on their own connection and run
+    the PRODUCTION deduplication insert (``ON CONFLICT (delivery_guid) DO
+    NOTHING RETURNING``, via the repository seam): exactly one acceptance
+    and one idempotent duplicate, converging on the durable unique rule.
+    The contention is real cross-connection unique-index arbitration: the
+    losing insert waits on the winner's in-progress key and then observes
+    the committed row. The race row is committed, so this test removes it in
+    a finally block (the account-deletion suite is the commit precedent).
+    """
     from psycopg import connect
 
-    # The committed delivery on the test connection + a concurrent insert on
-    # a second connection both target the same GUID: exactly one row wins.
-    _insert_delivery(conn, "guid-race")
+    from openorc.domain.github_webhooks import (
+        GitHubWebhookDeliveryClassification,
+        GitHubWebhookDeliveryIntake,
+        GitHubWebhookRoutingResolution,
+        GitHubWebhookRoutingTarget,
+    )
+    from openorc.persistence.github_webhook_deliveries import record_github_webhook_delivery
+
+    class _SingleConnectionPool:
+        """Mirrors psycopg_pool connection-context commit/rollback semantics."""
+
+        def __init__(self, connection: Connection) -> None:
+            self._connection = connection
+
+        def connection(self) -> Any:
+            @contextmanager
+            def managed() -> Any:
+                try:
+                    yield self._connection
+                    self._connection.commit()
+                except Exception:
+                    self._connection.rollback()
+                    raise
+
+            return managed()
+
+        def close(self) -> None:
+            raise AssertionError("the race contenders own their connections")
+
+    def _race_intake(guid: str) -> GitHubWebhookDeliveryIntake:
+        return GitHubWebhookDeliveryIntake(
+            delivery_guid=guid,
+            event_name="issues",
+            action="edited",
+            classification=GitHubWebhookDeliveryClassification.RELEVANT,
+            routing_target=GitHubWebhookRoutingTarget.ISSUE_STATE,
+            routing_resolution=GitHubWebhookRoutingResolution.RESOLVED,
+            github_installation_id=123,
+            github_repository_id=456,
+            github_issue_number=42,
+            github_pull_request_number=None,
+        )
+
+    guid = f"guid-race-{uuid.uuid4()}"
     outcomes: list[str] = []
     barrier = threading.Barrier(2)
 
-    def _concurrent_insert() -> None:
-        with connect(migrated_database) as other:
+    def _contender() -> None:
+        with connect(migrated_database) as connection:
             barrier.wait()
-            try:
-                with other.transaction():
-                    other.execute(
-                        "insert into openorc.github_webhook_deliveries "
-                        "(delivery_guid, event_name, classification, routing_target, "
-                        "routing_resolution, github_installation_id, github_repository_id) "
-                        "values (%s, 'issues', 'relevant', 'issue_state', 'resolved', 123, 456)",
-                        ("guid-race",),
-                    )
-                other.commit()
-                outcomes.append("inserted")
-            except UniqueViolation:
-                other.rollback()
-                outcomes.append("deduplicated")
+            outcome = record_github_webhook_delivery(
+                _SingleConnectionPool(connection), _race_intake(guid)
+            )
+            outcomes.append("accepted" if outcome is not None else "duplicate")
 
-    thread = threading.Thread(target=_concurrent_insert)
-    thread.start()
-    barrier.wait()
-    thread.join()
+    threads = [threading.Thread(target=_contender) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads), (
+            "the concurrent same-GUID race deadlocked"
+        )
+        assert sorted(outcomes) == ["accepted", "duplicate"]
 
-    count = conn.execute(
-        "select count(*) from openorc.github_webhook_deliveries where delivery_guid = %s",
-        ("guid-race",),
-    ).fetchone()
-    assert count is not None and count[0] == 1
-    assert outcomes == ["deduplicated"]
+        with connect(migrated_database) as verification:
+            row = verification.execute(
+                "select count(*) from openorc.github_webhook_deliveries where delivery_guid = %s",
+                (guid,),
+            ).fetchone()
+            assert row is not None and row[0] == 1
+    finally:
+        with connect(migrated_database) as cleanup:
+            cleanup.execute(
+                "delete from openorc.github_webhook_deliveries where delivery_guid = %s",
+                (guid,),
+            )
+            cleanup.commit()
 
 
 @pytest.mark.parametrize(
