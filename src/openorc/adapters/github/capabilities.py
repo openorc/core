@@ -59,6 +59,11 @@ __all__ = [
     "GITHUB_GRAPHQL_PATH",
     "GITHUB_REPOSITORY_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
+    "GITHUB_REPOSITORY_BRANCH_PATH",
+    "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
+    "GITHUB_PULL_REQUEST_MERGE_PATH",
+    "GITHUB_COMMIT_CHECK_RUNS_PATH",
+    "GITHUB_COMMIT_COMBINED_STATUS_PATH",
     "REQUIRED_V1_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",
     "GitHubAccessValidation",
@@ -123,6 +128,11 @@ GITHUB_MINT_INSTALLATION_TOKEN_PATH = "/app/installations/{installation_id}/acce
 GITHUB_INSTALLATION_PATH = "/app/installations/{installation_id}"
 GITHUB_INSTALLATION_REPOSITORIES_PATH = "/installation/repositories"
 GITHUB_REPOSITORY_ISSUE_PATH = "/repos/{owner}/{repo}/issues/{issue_number}"
+GITHUB_REPOSITORY_BRANCH_PATH = "/repos/{owner}/{repo}/branches/{branch}"
+GITHUB_REPOSITORY_PULL_REQUEST_PATH = "/repos/{owner}/{repo}/pulls/{pull_number}"
+GITHUB_PULL_REQUEST_MERGE_PATH = "/repos/{owner}/{repo}/pulls/{pull_number}/merge"
+GITHUB_COMMIT_CHECK_RUNS_PATH = "/repos/{owner}/{repo}/commits/{ref}/check-runs"
+GITHUB_COMMIT_COMBINED_STATUS_PATH = "/repos/{owner}/{repo}/commits/{ref}/status"
 
 # Documented issue-relationship read paths (issue #60; REST API endpoints for
 # issue dependencies and sub-issues).

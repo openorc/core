@@ -44,7 +44,20 @@ __all__ = [
 
 
 class GitHubRequestRejectedError(Exception):
-    """GitHub answered a definitive non-success (known failure)."""
+    """GitHub answered a definitive non-success (known failure).
+
+    ``status_code`` carries the bare HTTP status of the definitive answer so
+    a documented operation can apply its own finer documented response
+    classification inside the adapter (for example the merge endpoint's
+    documented 409 expected-head-mismatch answer). It is adapter-internal
+    request mechanics: application services consume only the normalized
+    adapter outcomes and never branch on raw provider status codes, and the
+    attribute never carries provider content beyond the numeric status.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GitHubAuthenticationRejectedError(GitHubRequestRejectedError):

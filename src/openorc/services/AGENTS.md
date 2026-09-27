@@ -58,6 +58,13 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
 - Failed/stale/no-op mutations emit no event.
 - WorkflowActorContext contains only safe logical actor identity. Event context is small, event-specific, and never contains credentials, raw request bodies, guidance prose, prompts/templates, or duplicated canonical state.
 
+## Canonical branch/PR/checks/merge operations (issue #63)
+
+- Canonical branch verification turns a Producer-reported branch claim into canonical state through GitHub only: the exact committed head SHA comes from the documented branch read for the Task's exact Repository, addressed through the freshly observed repository address; binding goes through the Phase 2A `bind_canonical_branch` primitive (exact currentness/state-token, bind-once, repository-wide ownership exclusivity). Once bound, later remediation continues on the canonical branch rather than replacing it — a claim naming a different branch is a conflict, never a silent rebind. A missing/deleted branch or access failure is the normalized `AuthorizationError` integration condition, never permission to trust runtime-local Git state.
+- TaskPullRequest reconciliation addresses the one already-created canonical record and is strictly update-only (`reconcile_task_pull_request_observed`); a missing record is the uniform `NotFoundError`, and a PR number reporting a different stable `github_pr_id` is a conflict, never a rebind or a replacement row. The returned before→current facts distinguish a changed head (the review subject changed) from a base-only change (which never invalidates exact-head acceptance). Reconciliation emits no WorkflowEvent and decides no Task-state transition.
+- The checks/commit-status projection is read-only for the exact durable reconciled head SHA, persists nothing, and presents GitHub-owned facts only — never an OpenOrc merge-policy engine.
+- The merge primitive binds authority through `require_task_pull_request_head` in one short transaction that closes before any GitHub call, sends the documented `sha` expected-head parameter, classifies the documented head-mismatch answer as `StaleOperationError` and other definitive rejections as known `ExternalOperationFailedError` (GitHub owns the policy), and — only on known success — immediately reconciles the PR authoritatively to persist the durable merged facts. An uncertain merge is never automatically replayed; recovery belongs to the later reconciliation/recovery layer. No Task-state transition (including `COMPLETED`) or Owner merge-decision policy lives here.
+
 ## Connection credentials
 
 - Credential configure/rotate is Owner-authorized and operates under the Connection row lock.

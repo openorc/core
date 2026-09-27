@@ -144,3 +144,18 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
 - Delivery and routing records are notification/recovery metadata, not
   workflow authority; dispatch (#120) re-validates current durable routing
   before any reconciliation effect.
+
+## Canonical TaskPullRequest reconciliation (issue #63)
+
+- `reconcile_task_pull_request_observed` is the serialized, strictly
+  **update-only** observed-snapshot write for the one canonical
+  TaskPullRequest: the existing row is locked (`SELECT ... FOR UPDATE`) under
+  its exact Workspace/Task/record scope, an actually-different observation is
+  updated in place as one whole snapshot (an identical observation is a true
+  durable no-op that preserves `updated_at`), and the locked pre-image is
+  returned so head-change/base-change facts are computed from durable
+  serialized state, never a racy re-read.
+- There is deliberately no insert path: an absent row or mismatched scope is
+  the `MISSING` outcome. The canonical record's only creator is the later
+  race-safe PR publication operation (#64); no external-PR adoption path
+  exists at any layer.

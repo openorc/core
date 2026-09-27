@@ -25,6 +25,17 @@ here. ``github_pr_number`` is creation-time address metadata and is not
 part of the observed snapshot (mutable display fields are never sole
 identity).
 
+Reconciliation (issue #63): :func:`reconcile_task_pull_request_observed` is
+the serialized, strictly **update-only** observed-snapshot write. The
+existing row is locked (``SELECT ... FOR UPDATE``) under its exact
+Workspace/Task/record scope, the incoming observation is compared against
+the locked pre-image, and only an actually-different snapshot is written;
+the serialized pre-image is returned so head-change/base-change facts are
+computed from durable state, never a racy re-read. There is deliberately no
+insert path: an absent row or mismatched scope is the ``MISSING`` outcome —
+the canonical record's only creator is the later race-safe PR publication
+operation, and no external-PR adoption path exists.
+
 Violated database invariants (uniqueness, foreign keys, CHECK constraints)
 surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``
 and ``ForeignKeyViolation``); translating driver exceptions into typed
@@ -34,7 +45,9 @@ application errors is a service-layer concern, not a persistence one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any
 from uuid import UUID
 
@@ -48,10 +61,13 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "TaskPullRequestReconcileOutcome",
+    "TaskPullRequestReconcileResult",
     "create_task_pull_request",
     "find_task_pull_request_by_github_identity",
     "get_task_pull_request",
     "get_task_pull_request_for_task",
+    "reconcile_task_pull_request_observed",
     "update_task_pull_request_observed",
 ]
 
@@ -252,3 +268,137 @@ def update_task_pull_request_observed(
             (head_ref, base_ref, head_sha, state.value, merged_at, task_pull_request_id),
         ).fetchone()
     return None if row is None else _task_pull_request_from_row(row)
+
+
+class TaskPullRequestReconcileOutcome(Enum):
+    """The classified durable outcome of one observed-snapshot reconciliation.
+
+    Strictly update-only (issue #63): reconciliation addresses the one
+    already-created canonical record and never inserts or replaces it — the
+    canonical TaskPullRequest's only creator is the later race-safe PR
+    publication operation, and there is no external-PR adoption path.
+
+    - ``UPDATED`` — this invocation durably advanced the existing record's
+      observed snapshot; the serialized pre-image describes what changed.
+    - ``UNCHANGED`` — the observation matched current durable state exactly;
+      no write was performed and ``updated_at`` is preserved.
+    - ``MISSING`` — the addressed canonical record (or its Workspace/Task
+      scope) does not exist durably; nothing was written.
+    """
+
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPullRequestReconcileResult:
+    """The serialized before→current facts of one observed-snapshot reconcile.
+
+    ``previous_*`` is the pre-image locked under ``SELECT ... FOR UPDATE``
+    before any write, so the head-change/base-change/state-change facts a
+    caller computes are computed from durable serialized state, never from a
+    racy re-read. ``pull_request`` is the post-write record (``None`` only
+    for ``MISSING``).
+    """
+
+    outcome: TaskPullRequestReconcileOutcome
+    pull_request: TaskPullRequest | None
+    previous_head_ref: str | None
+    previous_base_ref: str | None
+    previous_head_sha: str | None
+    previous_state: TaskPullRequestState | None
+    previous_merged_at: datetime | None
+
+
+def reconcile_task_pull_request_observed(
+    pool: DatabasePool,
+    *,
+    task_pull_request_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    head_ref: str,
+    base_ref: str,
+    head_sha: str,
+    state: TaskPullRequestState,
+    merged_at: datetime | None,
+) -> TaskPullRequestReconcileResult:
+    """Reconcile the one canonical record's observed snapshot, update-only.
+
+    The serialized write: the existing row is locked (``SELECT ... FOR
+    UPDATE``) addressed by its exact Workspace/Task/record scope, the
+    incoming observation is compared against the locked pre-image, and an
+    actually-different snapshot is updated in place as one whole snapshot
+    with ``updated_at`` advancing. An identical observation is a true durable
+    no-op (``updated_at`` preserved). There is deliberately no insert path:
+    an absent row — or a scope that no longer matches — is the ``MISSING``
+    outcome, and the caller applies the typed application-error semantics.
+
+    The payload is validated here (mirroring the domain and the database
+    CHECK) before any SQL runs.
+    """
+    _require_uuid(task_pull_request_id, "id")
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(task_id, "task_id")
+    _require_nonblank_str(head_ref, "head_ref")
+    _require_nonblank_str(base_ref, "base_ref")
+    _require_nonblank_str(head_sha, "head_sha")
+    if not isinstance(state, TaskPullRequestState):
+        raise TaskPullRequestDomainError(
+            "reconcile_task_pull_request_observed requires a TaskPullRequestState"
+        )
+    if merged_at is not None and state is not TaskPullRequestState.CLOSED:
+        raise TaskPullRequestDomainError(
+            "a merged TaskPullRequest is closed: merged_at requires the closed state"
+        )
+    with transaction(pool) as conn:
+        current_row = conn.execute(
+            f"select {_TASK_PULL_REQUEST_COLUMNS} from openorc.task_pull_requests "
+            "where id = %s and workspace_id = %s and task_id = %s for update",
+            (task_pull_request_id, workspace_id, task_id),
+        ).fetchone()
+        if current_row is None:
+            return TaskPullRequestReconcileResult(
+                outcome=TaskPullRequestReconcileOutcome.MISSING,
+                pull_request=None,
+                previous_head_ref=None,
+                previous_base_ref=None,
+                previous_head_sha=None,
+                previous_state=None,
+                previous_merged_at=None,
+            )
+        current = _task_pull_request_from_row(current_row)
+        if (
+            current.head_ref == head_ref
+            and current.base_ref == base_ref
+            and current.head_sha == head_sha
+            and current.state == state
+            and current.merged_at == merged_at
+        ):
+            return TaskPullRequestReconcileResult(
+                outcome=TaskPullRequestReconcileOutcome.UNCHANGED,
+                pull_request=current,
+                previous_head_ref=current.head_ref,
+                previous_base_ref=current.base_ref,
+                previous_head_sha=current.head_sha,
+                previous_state=current.state,
+                previous_merged_at=current.merged_at,
+            )
+        row = conn.execute(
+            "update openorc.task_pull_requests "
+            "set head_ref = %s, base_ref = %s, head_sha = %s, state = %s, "
+            "merged_at = %s, updated_at = now() "
+            "where id = %s "
+            f"returning {_TASK_PULL_REQUEST_COLUMNS}",
+            (head_ref, base_ref, head_sha, state.value, merged_at, task_pull_request_id),
+        ).fetchone()
+        assert row is not None  # the FOR UPDATE lock excludes concurrent deletion
+        return TaskPullRequestReconcileResult(
+            outcome=TaskPullRequestReconcileOutcome.UPDATED,
+            pull_request=_task_pull_request_from_row(row),
+            previous_head_ref=current.head_ref,
+            previous_base_ref=current.base_ref,
+            previous_head_sha=current.head_sha,
+            previous_state=current.state,
+            previous_merged_at=current.merged_at,
+        )

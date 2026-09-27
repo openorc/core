@@ -225,6 +225,21 @@ class FakeGitHubAppClient:
     ) -> int:
         raise AssertionError("this fake must not resolve addresses")
 
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe branches")
+
+    def get_repository_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe pull requests")
+
+    def get_commit_check_runs(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project check runs")
+
+    def get_commit_combined_status(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project combined status")
+
+    def merge_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not request merges")
+
 
 def _pool(conn: ScriptedConnection) -> DatabasePool:
     return cast(DatabasePool, FakePool(conn))
