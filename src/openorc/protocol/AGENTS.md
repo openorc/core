@@ -16,6 +16,7 @@ This package is not a network service, runtime adapter, workflow engine, or gene
 
 - OpenOrc owns the protocol. Connected agents/runtimes implement or satisfy it; they do not redefine it.
 - Formal protocol schemas are OpenOrc-owned and runtime-neutral. Formal responses carry explicit schema versions so machine compatibility and deterministic validation never depend on prose inference.
+- The canonical v1 machine-contract definitions are the five JSON Schema files under `src/openorc/protocol/schemas/`: `session_ready.json`, `plan_result.json`, `review_result.json`, `implementation_result.json`, and `pr_result.json`. Their semantic shapes are settled protocol contracts, not implementation discretion; code and documentation must load/reference these assets rather than maintain competing handwritten definitions.
 - Session initialization is OpenOrc-owned and non-overridable: canonical role-initialization content — which may render the canonical formal schemas into controlled insertion points — is supplied by OpenOrc, never authored or replaced by a Workspace or a runtime. Initialization records no separately persisted protocol version; there is no prompt/template version or hash requirement and no historical effective-prompt reconstruction.
 - Neither Workspace-authored prose nor runtime behavior may redefine formal schemas, authority semantics, session semantics, exact review-subject identity, or workflow transitions.
 

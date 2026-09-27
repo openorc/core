@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "schema_version",
+    "status"
+  ],
+  "properties": {
+    "type": {
+      "const": "session_ready"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "const": "READY"
+    }
+  }
+}
