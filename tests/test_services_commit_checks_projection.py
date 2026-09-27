@@ -267,6 +267,9 @@ class FakeGitHubAppClient:
         assert self._repository_observation is not None
         return self._repository_observation
 
+    def create_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not create pull requests")
+
     def get_commit_check_runs(
         self, *, github_installation_id: int, owner_login: str, repository_name: str, head_sha: str
     ) -> list[GitHubCheckRunObservation]:

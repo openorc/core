@@ -26,6 +26,15 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
 - The merge request normalizes GitHub's documented response classes: the successful merge (with the merge commit SHA GitHub reports), the documented 409 expected-head mismatch (`HEAD_MISMATCH` — a concurrent head change can never satisfy a stale merge request), and any other definitive rejection (`REJECTED` — required checks, conflicts, branch protection: GitHub owns the policy). Authentication/access absence, rate limits, and uncertain outcomes raise the classified errors; an uncertain merge is never silently replayed by this adapter.
 - The definitive-rejection classification for the merge endpoint uses the bare HTTP status carried on `GitHubRequestRejectedError.status_code` — adapter-internal request mechanics only: application services never branch on raw provider status codes, and the attribute never carries provider content.
 
+
+## Pull-request create operation (issue #64)
+
+- The documented `POST /repos/{owner}/{repo}/pulls` create operation is branch-addressed and carries no atomic expected-head guard: the exact-head race is closed by the publication service above (exact preflight + immediate post-create reconciliation), never inside this adapter. The operation carries only the validated presentation title/body and the branch/base routing facts; the response is normalized into the stable PR identity/fact set (`GitHubPullRequestFacts`), and an uninterpretable response classifies as uncertain.
+- The documented "pull request already exists" definitive rejection (422) is classified adapter-locally as `GitHubPullRequestExistsError` carrying only the bare status — application services never branch on raw provider status codes, and whether that condition means a conflict or a replay is workflow meaning decided strictly above the adapter. Uncertain create outcomes are never replayed by this adapter.
+- A bare 422 is the create endpoint's GENERAL documented validation failure (invalid base/head, malformed title, endpoint abuse), never by itself the duplicate condition: the duplicate classification requires the documented response members — the explicit "a pull request already exists" validation message, or a structured validation error that itself proves duplication (`field == base` AND the documented `already_exists` code). A `base`-field error with an ordinary `invalid` code is an invalid-base validation failure and stays an ordinary definitive `GitHubRequestRejectedError`; the bounded body attached to definitive rejections is adapter-internal classification input and is never echoed into messages, logs, or telemetry.
+
+## Provider hardening (issue #122)
+
 ## Provider hardening (issue #122)
 
 - REST redirects are followed only when the request is read-style

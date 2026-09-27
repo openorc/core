@@ -29,6 +29,7 @@ never contain provider URLs, response bodies, or credential material.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -40,12 +41,71 @@ from openorc.adapters.github.transport import github_repository_api_address, is_
 __all__ = [
     "GitHubMergeRequestOutcome",
     "GitHubMergeRequestResult",
+    "GitHubPullRequestFacts",
     "GitHubPullRequestObservation",
+    "body_reports_pull_request_already_exists",
     "parse_merge_response_payload",
+    "parse_pull_request_facts",
     "parse_pull_request_payload",
 ]
 
 _DOCUMENTED_PR_STATES = frozenset({"open", "closed"})
+
+# The stable documented members GitHub's REST error model uses to report the
+# specific 'pull request already exists' validation failure (the general
+# REST error documentation defines the structured validation-error `code`
+# vocabulary, with `already_exists` distinct from `invalid`; the
+# create-pull-request endpoint's documented duplicate rejection names the
+# `base` field). Only the explicit documented message or a structured
+# error whose `code` itself proves duplication classifies as the duplicate
+# condition — a `field == base` entry with an ordinary `invalid` code is an
+# ordinary invalid-base validation failure and must never classify as the
+# duplicate. Matched case-insensitively over a bounded body prefix; no
+# provider content is ever stored, echoed into errors, or exported (the
+# same content-safe bounded-classification discipline as the transport's
+# secondary-limit marker check).
+_ALREADY_EXISTS_BODY_MARKERS = ("a pull request already exists",)
+_ALREADY_EXISTS_ERROR_FIELD = "base"
+_ALREADY_EXISTS_ERROR_CODE = "already_exists"
+_ALREADY_EXISTS_MESSAGE_MARKER = "validation failed"
+_ALREADY_EXISTS_BOUND_BYTES = 4096
+
+
+def body_reports_pull_request_already_exists(body: bytes) -> bool:
+    """Whether a bounded 422 body carries the documented already-exists failure.
+
+    The create-pull-request endpoint documents 422 for ANY validation
+    failure (invalid base/head, malformed title, endpoint abuse), so the
+    bare status — or even a `base`-field error with an ordinary `invalid`
+    code — must never classify as the duplicate condition. The body is
+    decoded over a bounded prefix and matched only against the documented
+    stable members: GitHub's explicit 'a pull request already exists'
+    validation message, or a structured validation error that itself proves
+    duplication (`field == base` AND the documented `already_exists` code).
+    Returns a boolean; no provider content ever crosses this boundary.
+    """
+    if not body:
+        return False
+    text = body[:_ALREADY_EXISTS_BOUND_BYTES].decode("utf-8", "ignore").lower()
+    if any(marker in text for marker in _ALREADY_EXISTS_BODY_MARKERS):
+        return True
+    try:
+        payload = json.loads(text) if text.lstrip().startswith("{") else None
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    message = payload.get("message")
+    if isinstance(message, str) and _ALREADY_EXISTS_MESSAGE_MARKER in message.lower():
+        errors = payload.get("errors")
+        if isinstance(errors, list) and any(
+            isinstance(entry, dict)
+            and entry.get("field") == _ALREADY_EXISTS_ERROR_FIELD
+            and entry.get("code") == _ALREADY_EXISTS_ERROR_CODE
+            for entry in errors
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +245,113 @@ def parse_pull_request_payload(
             "no merge instant"
         )
     return GitHubPullRequestObservation(
+        github_pr_id=reported_id,
+        pull_number=reported_number,
+        head_ref=head_ref,
+        head_sha=head_sha,
+        base_ref=base_ref,
+        state=state,
+        merged=merged,
+        merged_at=merged_at,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubPullRequestFacts:
+    """The stable identity and mutable facts one PR response reports.
+
+    The identity/fact extraction shared by the PR read and the PR-create
+    response: the create response carries the same documented fact set but
+    cannot bind through an addressed ``number``/``url`` (the number is the
+    response's own output, not a caller-supplied address), so the shared
+    extraction validates only what is provider-authoritative in both
+    responses: the stable ``id``, a positive ``number``, the head/base
+    facts, and the documented state/merge coherence. A shape that cannot
+    be interpreted classifies as an uncertain outcome.
+    """
+
+    github_pr_id: int
+    pull_number: int
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    state: str
+    merged: bool
+    merged_at: datetime | None
+
+
+def _extract_required_string(payload: dict[str, object], member: str, description: str) -> str:
+    value = payload.get(member)
+    if not isinstance(value, str) or not value.strip():
+        raise GitHubOutcomeUncertainError(
+            f"the GitHub response is not interpretable: the {description} is malformed"
+        )
+    return value
+
+
+def parse_pull_request_facts(payload: object) -> GitHubPullRequestFacts:
+    """Extract the documented PR fact set from one PR response payload."""
+    if not isinstance(payload, dict):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the object shape is unexpected"
+        )
+    reported_id = payload.get("id")
+    if isinstance(reported_id, bool) or not isinstance(reported_id, int) or reported_id <= 0:
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request identity is malformed"
+        )
+    reported_number = payload.get("number")
+    if (
+        isinstance(reported_number, bool)
+        or not isinstance(reported_number, int)
+        or reported_number <= 0
+    ):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request number is malformed"
+        )
+    head = payload.get("head")
+    if not isinstance(head, dict):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request head is missing"
+        )
+    head_ref = _extract_required_string(head, "ref", "pull request head ref")
+    head_sha = _extract_required_string(head, "sha", "pull request head SHA")
+    base = payload.get("base")
+    if not isinstance(base, dict):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request base is missing"
+        )
+    base_ref = _extract_required_string(base, "ref", "pull request base ref")
+    state = payload.get("state")
+    if not isinstance(state, str) or state not in _DOCUMENTED_PR_STATES:
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request state is unexpected"
+        )
+    merged = payload.get("merged")
+    if not isinstance(merged, bool):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the merge observation is malformed"
+        )
+    merged_at_raw = payload.get("merged_at")
+    merged_at = (
+        None
+        if merged_at_raw is None
+        else parse_instant(merged_at_raw, "the pull request merge instant")
+    )
+    # The documented merge coherence, mirrored by the durable model's CHECK:
+    # a merged PR is a closed PR carrying its merge instant; an unmerged PR
+    # carries none.
+    if merged and (state != "closed" or merged_at is None):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: a merged pull request is closed "
+            "and carries its merge instant"
+        )
+    if not merged and merged_at is not None:
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: an unmerged pull request carries "
+            "no merge instant"
+        )
+    return GitHubPullRequestFacts(
         github_pr_id=reported_id,
         pull_number=reported_number,
         head_ref=head_ref,

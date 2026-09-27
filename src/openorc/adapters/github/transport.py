@@ -429,7 +429,9 @@ class HttpGitHubRestClient:
             )
         if 400 <= status < 500:
             raise GitHubRequestRejectedError(
-                f"GitHub rejected the request (status {status})", status_code=status
+                f"GitHub rejected the request (status {status})",
+                status_code=status,
+                response_body=response_body,
             )
         # 3xx the safe redirect policy refused to follow and 5xx: the
         # outcome is unknown.

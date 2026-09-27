@@ -50,6 +50,7 @@ from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+    GitHubPullRequestExistsError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
 )
@@ -73,8 +74,11 @@ from openorc.adapters.github.observations_checks import (
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
+    GitHubPullRequestFacts,
     GitHubPullRequestObservation,
+    body_reports_pull_request_already_exists,
     parse_merge_response_payload,
+    parse_pull_request_facts,
     parse_pull_request_payload,
 )
 from openorc.adapters.github.observations_relations import (
@@ -131,7 +135,9 @@ __all__ = [
     "GitHubIssueParentObservation",
     "GitHubMergeRequestOutcome",
     "GitHubMergeRequestResult",
+    "GitHubPullRequestFacts",
     "GitHubPullRequestObservation",
+    "body_reports_pull_request_already_exists",
     "GitHubRelatedIssueEndpoint",
     "GitHubRelatedIssueObservation",
     "GitHubRepositoryObservation",
@@ -143,6 +149,7 @@ __all__ = [
     "GitHubAuthenticationRejectedError",
     "GitHubAuthorizationRejectedError",
     "GitHubOutcomeUncertainError",
+    "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
     "map_installation_permissions",
@@ -158,6 +165,7 @@ __all__ = [
     "parse_graphql_issue_parent",
     "parse_issue_payload",
     "parse_merge_response_payload",
+    "parse_pull_request_facts",
     "parse_pull_request_payload",
     "parse_related_issue_payload",
     "parse_related_issue_payloads",

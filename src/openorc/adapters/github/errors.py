@@ -44,6 +44,7 @@ __all__ = [
     "GitHubAuthenticationRejectedError",
     "GitHubAuthorizationRejectedError",
     "GitHubOutcomeUncertainError",
+    "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
 ]
@@ -55,19 +56,40 @@ class GitHubRequestRejectedError(Exception):
     ``status_code`` carries the bare HTTP status of the definitive answer so
     a documented operation can apply its own finer documented response
     classification inside the adapter (for example the merge endpoint's
-    documented 409 expected-head-mismatch answer). It is adapter-internal
-    request mechanics: application services consume only the normalized
-    adapter outcomes and never branch on raw provider status codes, and the
-    attribute never carries provider content beyond the numeric status.
+    documented 409 expected-head-mismatch answer). ``response_body`` carries
+    the transport's already-bounded failure body for the same adapter-
+    internal finer classification only (the create-pull-request operation's
+    documented duplicate-PR 422 members) — it is never echoed into error
+    messages, logs, or telemetry, and application services never see it: the
+    attribute is adapter-internal request mechanics.
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: bytes | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.response_body = response_body
 
 
 class GitHubAuthenticationRejectedError(GitHubRequestRejectedError):
     """GitHub rejected the presented App JWT or installation token (401)."""
+
+
+class GitHubPullRequestExistsError(GitHubRequestRejectedError):
+    """GitHub answered the documented 'pull request already exists' rejection.
+
+    The PR-create operation's own documented finer classification of a
+    definitive rejection (a branch already has an open PR toward the base).
+    Carries only the bare HTTP status like every definitive rejection —
+    never provider content. Whether this means a silent adoption, a
+    conflict, or a replay condition is workflow meaning decided strictly
+    above the adapter.
+    """
 
 
 class GitHubAuthorizationRejectedError(GitHubRequestRejectedError):
