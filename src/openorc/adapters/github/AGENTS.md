@@ -16,7 +16,7 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
 - Validation uses documented operations only. The installation object (`GET /app/installations/{installation_id}`, App-JWT authenticated) is the sole source of the fine-grained permission dictionary, subscribed events, and suspension state used by capability validation. The installation-repositories listing (`GET /installation/repositories`, installation token, `Link`-header paginated with a bounded page count) proves repository membership by matching the numeric stable repository `id` — its per-entry `permissions` member is the ordinary repository access shape and is never capability authority.
 - Reconciliation reads (issue #59) use documented operations only: the repository observation comes from the same stable-ID installation-repositories listing entry (there is no documented repo-by-ID read, and a stored owner/name address breaks exactly when a rename/transfer must be reconciled), and the issue observation from `GET /repos/{owner}/{repo}/issues/{issue_number}`, addressed by the freshly observed owner/name and bound to the addressed subject by the response's `number`/`repository_url`. The documented `pull_request` member is the response's own discriminator and is carried as a typed fact; services decide its meaning.
 - Capability semantics (including that exact-head merge authority derives from `contents: write` plus the merge endpoint's `sha` exact-head parameter, never from the pull-request permission) live inside the adapter/config boundary; workflow code asks the semantic question and never inspects provider-native permission dictionaries.
-- Known failures (definitive rejections, including rate limits — classified apart from authorization absence) and uncertain outcomes (timeout, connection loss, unfollowed redirect, uninterpretable response) remain observably distinct adapter-local errors; services translate them into the typed application vocabulary.
+- Known failures (definitive rejections, including rate limits — classified apart from authorization absence) and uncertain outcomes (timeout, connection loss, a redirect the safe redirect policy refuses, uninterpretable response) remain observably distinct adapter-local errors; services translate them into the typed application vocabulary.
 
 ## Canonical branch/PR/checks/merge operations (issue #63)
 
@@ -25,6 +25,38 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
 - The checks/status projection is a typed read model of GitHub-owned facts. It never becomes an OpenOrc merge-policy engine and never synthesizes a universal pass/fail gate that would disagree with GitHub branch protection.
 - The merge request normalizes GitHub's documented response classes: the successful merge (with the merge commit SHA GitHub reports), the documented 409 expected-head mismatch (`HEAD_MISMATCH` — a concurrent head change can never satisfy a stale merge request), and any other definitive rejection (`REJECTED` — required checks, conflicts, branch protection: GitHub owns the policy). Authentication/access absence, rate limits, and uncertain outcomes raise the classified errors; an uncertain merge is never silently replayed by this adapter.
 - The definitive-rejection classification for the merge endpoint uses the bare HTTP status carried on `GitHubRequestRejectedError.status_code` — adapter-internal request mechanics only: application services never branch on raw provider status codes, and the attribute never carries provider content.
+
+## Provider hardening (issue #122)
+
+- REST redirects are followed only when the request is read-style
+  (`GET`/`HEAD`) and the resolved target stays on the exact trusted HTTPS
+  GitHub API origin (centralized parsed-origin validation); the followed
+  count and per-target repeats are bounded. Cross-origin, malformed, loop,
+  excess, and non-read-method redirect outcomes classify as uncertain and
+  never forward credentials off the trusted origin; a redirect answer to a
+  consequential (mutating) operation is never auto-replayed.
+- Classified rate-limit errors carry normalized safe scheduling facts when
+  GitHub supplies them (`Retry-After` as normalized seconds,
+  `X-RateLimit-Reset` as a UTC instant). Provider headers never leak above
+  the adapter, and the adapter never sleeps, queues, or retries: scheduling
+  policy stays in services/deployment, and uncertain operations are
+  reconciled, never blindly replayed.
+- GitHub-returned API URLs are opaque navigation references: the adapter
+  validates them against the exact trusted origin and follows them verbatim;
+  stable identity comes from the returned object's documented fields, and
+  repository owner/name stays observed address/presentation fact. No OpenOrc
+  code above the adapter constructs, parses, or provider-normalizes GitHub
+  API URLs.
+- Webhook subscriptions: `issue_comment` is deliberately NOT required
+  (issue #122). Comments are GitHub-owned presentation/discussion data;
+  publishing OpenOrc's own issue comments rides the `issues` write
+  permission, not the subscription. The `issues` family stays required.
+- Request pacing: future high-concurrency GitHub work must keep provider
+  traffic bounded, avoid indiscriminately concurrent REST mutations, respect
+  GitHub secondary-rate-limit guidance (including pacing high-volume
+  mutative requests), and coordinate pacing at an appropriate
+  installation/provider boundary rather than scattering sleeps through
+  adapter calls. No scheduler or semaphore framework exists by design.
 
 ## Authority and reconciliation
 

@@ -38,6 +38,8 @@ from openorc.adapters.github import (
     GitHubRelatedIssueObservation,
     GitHubRepositoryObservation,
 )
+from openorc.adapters.github.transport import is_github_api_origin
+from openorc.domain.github_issue_relations import RelatedIssueEndpoint
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_intake
 from openorc.services.errors import (
@@ -222,11 +224,43 @@ class FakeGitHubAppClient:
         self.calls.append("sub_issues")
         return self._sub_issues
 
-    def get_repository_by_address(
-        self, *, github_installation_id: int, owner_login: str, repository_name: str
-    ) -> int:
-        self.calls.append("resolve_repository")
-        return 555
+    def resolve_related_issue_endpoints(
+        self,
+        *,
+        github_installation_id: int,
+        local_github_repository_id: int,
+        fresh_owner_login: str,
+        fresh_repository_name: str,
+        related: list[GitHubRelatedIssueObservation],
+    ) -> list[RelatedIssueEndpoint]:
+        self.calls.append("resolve_related_endpoints")
+        # The fake mirrors the adapter's owned URL semantics in miniature:
+        # same-repository references reuse the local stable ID with zero
+        # extra reads (no "resolve_repository" record); each distinct
+        # cross-repository reference records one resolution read; a
+        # non-API-origin reference cannot establish identity.
+        local_address = (
+            f"https://api.github.com/repos/{fresh_owner_login}/{fresh_repository_name}"
+        ).lower()
+        resolved: list[RelatedIssueEndpoint] = []
+        for observation in related:
+            if not is_github_api_origin(observation.repository_url):
+                raise GitHubOutcomeUncertainError(
+                    "the related issue's repository reference is not resolvable "
+                    "to a stable GitHub repository identity"
+                )
+            if observation.repository_url.lower() == local_address:
+                github_repository_id = local_github_repository_id
+            else:
+                self.calls.append("resolve_repository")
+                github_repository_id = 555
+            resolved.append(
+                RelatedIssueEndpoint(
+                    github_repository_id=github_repository_id,
+                    github_issue_id=observation.github_issue_id,
+                )
+            )
+        return resolved
 
     def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
         raise AssertionError("the service must not compose raw #58 validation operations")
@@ -565,7 +599,11 @@ def test_a_documented_api_form_repository_url_is_resolved_not_rejected() -> None
 
 
 def test_a_browser_style_repository_url_fails_the_observation_closed() -> None:
-    """A non-API-origin reference is not the documented shape: fail closed."""
+    """A non-API-origin reference is not the documented shape: fail closed.
+
+    The adapter classifies the unresolvable reference as an uncertain
+    outcome; the service translates it and the unit fails closed.
+    """
     conn = ScriptedConnection()
     _script_reconciliation_write(conn)
     _script_route_resolution(conn)  # dependency unit's route resolution
@@ -578,7 +616,10 @@ def test_a_browser_style_repository_url_fails_the_observation_closed() -> None:
             )
         ],
     )
-    with pytest.raises(ExternalOperationUncertainError, match="not resolvable"):
+    with pytest.raises(
+        ExternalOperationUncertainError,
+        match="outcome of the GitHub relationship observation is unknown",
+    ):
         task_intake.intake_repository_task(
             pool,
             github,
@@ -618,8 +659,10 @@ def test_same_repository_references_reuse_the_known_stable_id() -> None:
         issue_number=_ISSUE_NUMBER,
     )
     assert result.created is True
-    # Same-repository references reused the local stable ID with zero
-    # cross-repository REST resolution reads.
+    # Resolution is delegated to the adapter exactly once; the same-repository
+    # fast path inside it reused the local stable ID with zero cross-repo
+    # resolution reads.
+    assert "resolve_related_endpoints" in github.calls
     assert "resolve_repository" not in github.calls
 
 

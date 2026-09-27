@@ -55,7 +55,6 @@ from openorc.adapters.github.capabilities import (
     GITHUB_PULL_REQUEST_MERGE_PATH,
     GITHUB_REPOSITORY_BRANCH_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
-    GITHUB_REPOSITORY_PATH,
     GITHUB_REPOSITORY_PULL_REQUEST_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
@@ -107,6 +106,7 @@ from openorc.adapters.github.transport import (
     GitHubFetcher,
     GitHubHttpResponse,
     HttpGitHubRestClient,
+    github_repository_api_address,
     is_github_api_origin,
 )
 from openorc.config import (
@@ -115,6 +115,7 @@ from openorc.config import (
     ConfigurationError,
     Settings,
 )
+from openorc.domain.github_issue_relations import RelatedIssueEndpoint
 from openorc.observability import annotate_span, application_span
 
 __all__ = [
@@ -137,7 +138,7 @@ _ISSUE_SPAN_NAME = "github.get_repository_issue"
 _BLOCKED_BY_SPAN_NAME = "github.get_issue_blocked_by"
 _SUB_ISSUES_SPAN_NAME = "github.get_issue_sub_issues"
 _PARENT_SPAN_NAME = "github.get_issue_parent"
-_REPOSITORY_RESOLVE_SPAN_NAME = "github.get_repository_by_address"
+_RELATED_ENDPOINTS_SPAN_NAME = "github.resolve_related_issue_endpoints"
 _BRANCH_SPAN_NAME = "github.get_repository_branch"
 _PULL_REQUEST_SPAN_NAME = "github.get_repository_pull_request"
 _CHECK_RUNS_SPAN_NAME = "github.get_commit_check_runs"
@@ -311,14 +312,16 @@ class GitHubAppClient(Protocol):
         """Return the authoritative parent-or-no-parent fact of one issue."""
         ...
 
-    def get_repository_by_address(
+    def resolve_related_issue_endpoints(
         self,
         *,
         github_installation_id: int,
-        owner_login: str,
-        repository_name: str,
-    ) -> int:
-        """Return the stable numeric repository ID at one owner/name address."""
+        local_github_repository_id: int,
+        fresh_owner_login: str,
+        fresh_repository_name: str,
+        related: list[GitHubRelatedIssueObservation],
+    ) -> list[RelatedIssueEndpoint]:
+        """Resolve related-issue repository references into stable endpoint identities."""
         ...
 
 
@@ -884,36 +887,83 @@ class HttpGitHubAppClient:
             )
             return parse_graphql_issue_parent(_json_body(response))
 
-    def get_repository_by_address(
+    def resolve_related_issue_endpoints(
         self,
         *,
         github_installation_id: int,
-        owner_login: str,
-        repository_name: str,
-    ) -> int:
-        """Return the stable numeric repository ID at one owner/name address.
+        local_github_repository_id: int,
+        fresh_owner_login: str,
+        fresh_repository_name: str,
+        related: list[GitHubRelatedIssueObservation],
+    ) -> list[RelatedIssueEndpoint]:
+        """Resolve related-issue references into stable endpoint identities.
 
-        The documented ``GET /repos/{owner}/{repo}`` operation under the
-        installation access token: the REST-only resolution step for
-        cross-repository related-repository identity. The mutable
-        owner/name address is used transiently within one fresh observation
-        to establish the stable identity — it is never an identity itself
-        and never persisted as one.
+        Each related-issue observation carries GitHub's documented opaque
+        repository API reference. This operation owns every URL semantic
+        (issue #122): the reference is validated against the exact trusted
+        HTTPS GitHub API origin and followed verbatim through the transport —
+        never decomposed into owner/name parts — and the stable identity
+        comes from the returned repository object's documented numeric
+        ``id``. The addressed repository's own documented API address is
+        established here from its freshly observed owner/name fields, so
+        same-repository references reuse the local stable identity with zero
+        extra reads, and each distinct reference resolves at most once per
+        call. A reference that cannot establish a stable identity classifies
+        as an uncertain outcome. Stable numeric IDs remain the only
+        authority; mutable owner/name data never crosses this boundary as
+        identity, and the resolved references never enter telemetry.
         """
         require_positive_int(github_installation_id, "github_installation_id")
-        _require_non_empty_command_str(owner_login, "owner_login")
-        _require_non_empty_command_str(repository_name, "repository_name")
-        with application_span(_TRACER_SCOPE, _REPOSITORY_RESOLVE_SPAN_NAME) as span:
+        require_positive_int(local_github_repository_id, "local_github_repository_id")
+        _require_non_empty_command_str(fresh_owner_login, "fresh_owner_login")
+        _require_non_empty_command_str(fresh_repository_name, "fresh_repository_name")
+        with application_span(_TRACER_SCOPE, _RELATED_ENDPOINTS_SPAN_NAME) as span:
             annotate_span(
                 span,
-                operation=_REPOSITORY_RESOLVE_SPAN_NAME,
+                operation=_RELATED_ENDPOINTS_SPAN_NAME,
                 github_installation_id=str(github_installation_id),
             )
-            path = GITHUB_REPOSITORY_PATH.format(owner=owner_login, repo=repository_name)
-            payload = _json_body(
-                self._request_with_installation_token(github_installation_id, path)
-            )
-            return require_positive_int(payload.get("id"), "repository id")
+            local_address = github_repository_api_address(
+                owner_login=fresh_owner_login, repository_name=fresh_repository_name
+            ).lower()
+            resolved: list[RelatedIssueEndpoint] = []
+            resolved_references: dict[str, int] = {}
+            for observation in related:
+                reference = observation.repository_url
+                if not is_github_api_origin(reference):
+                    raise GitHubOutcomeUncertainError(
+                        "the related issue's repository reference is not resolvable "
+                        "to a stable GitHub repository identity"
+                    )
+                if reference.lower() == local_address:
+                    github_repository_id = local_github_repository_id
+                else:
+                    cached = resolved_references.get(reference.lower())
+                    if cached is None:
+                        payload = _json_body(
+                            self._request_with_installation_token(github_installation_id, reference)
+                        )
+                        reported_id = payload.get("id")
+                        if (
+                            isinstance(reported_id, bool)
+                            or not isinstance(reported_id, int)
+                            or reported_id <= 0
+                        ):
+                            raise GitHubOutcomeUncertainError(
+                                "the GitHub response is not interpretable: "
+                                "the repository identity is missing"
+                            )
+                        github_repository_id = reported_id
+                        resolved_references[reference.lower()] = github_repository_id
+                    else:
+                        github_repository_id = cached
+                resolved.append(
+                    RelatedIssueEndpoint(
+                        github_repository_id=github_repository_id,
+                        github_issue_id=observation.github_issue_id,
+                    )
+                )
+            return resolved
 
     def _require_validated_capabilities(
         self, github_installation_id: int

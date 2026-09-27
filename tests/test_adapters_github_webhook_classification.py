@@ -44,7 +44,6 @@ def _classify(event_name: str, payload: object) -> GitHubWebhookDeliveryFacts:
     ("event_name", "expected_target"),
     [
         ("issues", GitHubWebhookRoutingTarget.ISSUE_STATE),
-        ("issue_comment", None),
         ("pull_request", GitHubWebhookRoutingTarget.TASK_BRANCH_OR_PULL_REQUEST),
         ("push", GitHubWebhookRoutingTarget.TASK_BRANCH_OR_PULL_REQUEST),
         ("status", GitHubWebhookRoutingTarget.CHECKS),
@@ -103,6 +102,24 @@ def test_pull_request_state_actions_route_to_the_state_surface(action: str) -> N
 
     assert facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
     assert facts.routing_target is GitHubWebhookRoutingTarget.PULL_REQUEST_STATE
+
+
+def test_issue_comment_is_not_a_settled_family_and_is_safely_ignored() -> None:
+    # issue #122: the subscription is deliberately not required; a delivery
+    # received anyway is valid-but-irrelevant and never extracts content.
+    facts = _classify(
+        "issue_comment",
+        {"action": "created", "installation": {"id": 1}, "comment": {"body": "SECRET-BODY"}},
+    )
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.IGNORED
+    assert facts.routing_target is None
+    fields = {field for field in dir(facts) if not field.startswith("_")}
+    assert "comment" not in fields
+    extracted = {
+        getattr(facts, field) for field in fields if isinstance(getattr(facts, field), str)
+    }
+    assert "SECRET-BODY" not in extracted
 
 
 def test_unsupported_events_are_safely_ignored() -> None:

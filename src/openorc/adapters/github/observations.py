@@ -14,8 +14,10 @@ reconciliation boundary performs:
    both the access proof and the observation source.
 2. **Issue observation** — parsed from the documented
    ``GET /repos/{owner}/{repo}/issues/{issue_number}`` response, bound to
-   the addressed subject by the response's own ``number`` and
-   ``repository_url`` members.
+   the addressed subject by the response's own ``number`` member and by its
+   GitHub-returned ``repository_url`` reference validated as the addressed
+   repository's documented opaque API address (issue #122: the URL is never
+   decomposed into owner/name parts).
 
 Both parsers fail closed: any shape that cannot be interpreted as the
 documented fact set classifies as an uncertain outcome, never as silently
@@ -33,6 +35,7 @@ from datetime import datetime
 
 from openorc.adapters.github.capabilities import parse_instant
 from openorc.adapters.github.errors import GitHubOutcomeUncertainError
+from openorc.adapters.github.transport import github_repository_api_address, is_github_api_origin
 
 __all__ = [
     "GitHubIssueObservation",
@@ -165,11 +168,13 @@ def parse_issue_payload(
 
     The response binds to the exact subject the adapter addressed: its
     ``number`` must equal the addressed number and its ``repository_url``
-    must name the addressed owner/repository (case-insensitively, matching
-    GitHub's documented case-insensitive name handling). A mismatch means
-    the answer does not bind to the addressed subject — for example a
-    transfer racing the two reconciliation reads — and classifies as an
-    uninterpretable outcome rather than a silently accepted fact.
+    must be the addressed repository's documented opaque API address on the
+    exact trusted GitHub API origin (case-insensitively, matching GitHub's
+    documented case-insensitive name handling; never decomposed into
+    owner/name parts — issue #122). A mismatch means the answer does not
+    bind to the addressed subject — for example a transfer racing the two
+    reconciliation reads — and classifies as an uninterpretable outcome
+    rather than a silently accepted fact.
     """
     if not isinstance(payload, dict):
         raise GitHubOutcomeUncertainError(
@@ -196,12 +201,21 @@ def parse_issue_payload(
     repository_url = _require_non_empty_str(
         payload.get("repository_url"), "the issue repository reference"
     )
-    addressed = f"{owner_login}/{repository_name}".lower()
-    # The documented repository_url ends with /repos/{owner}/{repo}; anything
-    # else — including a URL without the documented marker — fails the
-    # comparison and classifies as uninterpretable.
-    reported_address = repository_url.rsplit("/repos/", 1)[-1]
-    if reported_address.lower() != addressed:
+    # The GitHub-returned repository reference is an opaque navigation fact
+    # (issue #122): it must target the exact trusted HTTPS GitHub API origin
+    # and equal the addressed repository's documented API address in full
+    # (case-insensitively). The URL is never decomposed into owner/name
+    # parts — repository identity/address facts are never recovered by
+    # dissecting the returned URL path.
+    if not is_github_api_origin(repository_url):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the repository reference "
+            "does not target the exact trusted GitHub API origin"
+        )
+    addressed = github_repository_api_address(
+        owner_login=owner_login, repository_name=repository_name
+    ).lower()
+    if repository_url.lower() != addressed:
         raise GitHubOutcomeUncertainError(
             "the GitHub response is not interpretable: it does not bind to the addressed repository"
         )

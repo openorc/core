@@ -57,7 +57,6 @@ __all__ = [
     "GITHUB_ISSUE_SUB_ISSUES_PATH",
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
     "GITHUB_GRAPHQL_PATH",
-    "GITHUB_REPOSITORY_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "GITHUB_REPOSITORY_BRANCH_PATH",
     "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
@@ -119,8 +118,14 @@ REQUIRED_V1_WORKFLOW_CAPABILITIES = frozenset(
 # reconciliation never depends on deliveries alone). The set is a single,
 # explicit configuration point: later Phase 2B leaves adjust it here,
 # deliberately, rather than scattering event names through services.
+# ``issue_comment`` is deliberately NOT required (issue #122): current v1
+# does not react to GitHub comments and does not mirror them into canonical
+# state — comments are GitHub-owned presentation/discussion data that a
+# future on-demand UI read would not need the subscription for either. This
+# does not touch the ``issues`` write permission OpenOrc needs to publish
+# its own issue comments.
 REQUIRED_V1_WEBHOOK_EVENTS = frozenset(
-    {"issues", "issue_comment", "pull_request", "push", "status", "check_run", "check_suite"}
+    {"issues", "pull_request", "push", "status", "check_run", "check_suite"}
 )
 
 # Documented GitHub REST paths owned by this adapter (issues #58 and #59).
@@ -140,11 +145,6 @@ GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH = (
     "/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by"
 )
 GITHUB_ISSUE_SUB_ISSUES_PATH = "/repos/{owner}/{repo}/issues/{issue_number}/sub_issues"
-
-# Documented repository-metadata read (REST): resolves one owner/name address
-# to the stable numeric repository identity, used by the cross-repository
-# related-repository resolution step.
-GITHUB_REPOSITORY_PATH = "/repos/{owner}/{repo}"
 
 # The documented GitHub GraphQL endpoint: the one authoritative surface that
 # can express an issue's parent ABSENCE (the nullable ``Issue.parent`` field);

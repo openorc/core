@@ -5,9 +5,12 @@ The documented ``GET /repos/{owner}/{repo}/pulls/{pull_number}`` response is
 normalized into the stable PR identity, the repository-local PR number, the
 mutable head/base observations, and the observed lifecycle facts the
 canonical TaskPullRequest model carries. The parser binds the response to
-the addressed subject through the response's own documented ``number`` and
-``url`` members (the same self-reference binding discipline the issue
-observation uses) and fails closed: any shape that cannot be interpreted as
+the addressed subject through the response's own documented ``number``
+member and its GitHub-returned ``url`` self-reference validated as the
+addressed pull request's documented opaque API address (the same
+self-reference binding discipline the issue observation uses; issue #122:
+the URL is never decomposed into owner/repo/pull-number parts) and fails
+closed: any shape that cannot be interpreted as
 the documented fact set classifies as an uncertain outcome, never silently
 accepted partial truth. The documented merge coherence is enforced at the
 parse boundary — a merged PR is a closed PR and carries its merge instant —
@@ -32,6 +35,7 @@ from enum import Enum
 
 from openorc.adapters.github.capabilities import parse_instant
 from openorc.adapters.github.errors import GitHubOutcomeUncertainError
+from openorc.adapters.github.transport import github_repository_api_address, is_github_api_origin
 
 __all__ = [
     "GitHubMergeRequestOutcome",
@@ -73,9 +77,11 @@ def parse_pull_request_payload(
 
     The response binds to the exact subject the adapter addressed: its
     documented ``number`` member must equal the addressed pull number and
-    its documented ``url`` member must name the addressed owner/repository
+    its documented ``url`` member must be the addressed pull request's
+    documented opaque API address on the exact trusted GitHub API origin
     (case-insensitively, matching GitHub's documented case-insensitive name
-    handling). A mismatch means the answer does not bind to the addressed
+    handling; never decomposed into owner/repo/pull-number parts —
+    issue #122). A mismatch means the answer does not bind to the addressed
     subject and classifies as an uninterpretable outcome rather than a
     silently accepted fact.
     """
@@ -106,12 +112,21 @@ def parse_pull_request_payload(
         raise GitHubOutcomeUncertainError(
             "the GitHub response is not interpretable: the pull request reference is malformed"
         )
-    # The documented url member ends with /repos/{owner}/{repo}/pulls/{number};
-    # anything else — including a URL without the documented marker — fails
-    # the comparison and classifies as uninterpretable.
-    addressed = f"{owner_login}/{repository_name}/pulls/{pull_number}".lower()
-    reported_address = reported_url.rsplit("/repos/", 1)[-1].lower()
-    if reported_address != addressed:
+    # The GitHub-returned self-reference is an opaque navigation fact
+    # (issue #122): it must target the exact trusted HTTPS GitHub API origin
+    # and equal the addressed pull request's documented API address in full
+    # (case-insensitively). The URL is never decomposed into
+    # owner/repo/pull-number parts.
+    if not is_github_api_origin(reported_url):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the pull request reference "
+            "does not target the exact trusted GitHub API origin"
+        )
+    addressed = (
+        github_repository_api_address(owner_login=owner_login, repository_name=repository_name)
+        + f"/pulls/{pull_number}"
+    ).lower()
+    if reported_url.lower() != addressed:
         raise GitHubOutcomeUncertainError(
             "the GitHub response is not interpretable: it does not bind to the addressed repository"
         )

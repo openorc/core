@@ -3,7 +3,8 @@
 The focused HTTP transport for the OpenOrc GitHub App adapter boundary. It
 owns the provider-native request mechanics — URL construction, the
 ``Accept``/``X-GitHub-Api-Version``/``Authorization``/``User-Agent`` header
-contract, bounded timeouts, redirect refusal, and outcome classification —
+contract, bounded timeouts, the safe bounded redirect policy, and outcome
+classification —
 and nothing else: normalization into OpenOrc facts, capability semantics,
 installation routing, and all workflow meaning belong to the modules above
 and the services above the adapter.
@@ -16,11 +17,20 @@ verified against GitHub's API-versions documentation.
 
 Transport hardening:
 
-- Redirects are never followed. ``urllib`` copies non-content headers into
-  redirected requests, so a followed redirect could forward the
-  ``Authorization`` credential to another host. A redirect that is not
-  followed surfaces as an unclassified 3xx and classifies as an uncertain
-  outcome — never success, never a safe replay.
+- Redirect policy (issue #122): redirects are followed only when the request
+  is read-style (``GET``/``HEAD``) and the resolved target remains on the
+  exact trusted HTTPS GitHub API origin — the same centralized parsed-origin
+  rule that guards every direct request target. ``urllib`` copies request
+  headers into redirected requests, so the ``Authorization`` credential
+  travels with a followed redirect: that is safe exactly because the target
+  is the same trusted origin, and any target that is not (cross-origin, a
+  confusable hostname, embedded userinfo, non-HTTPS, a foreign port,
+  malformed) is refused — the 3xx answer surfaces and classifies as an
+  uncertain outcome, and no credential ever crosses the credential boundary.
+  Mutating requests never follow redirects: a redirect answer to a
+  consequential operation is an uncertain outcome, never an automatic
+  replay. The followed-redirect count and per-target repeats are bounded, so
+  loop and excess-redirect outcomes fail closed as uncertain too.
 - Every request carries a bounded timeout; the fetch seam receives it so a
   stalled connection cannot hang the calling process.
 - Failure classification uses the status code, rate-limit response headers,
@@ -38,11 +48,13 @@ listing operation.
 from __future__ import annotations
 
 import logging
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from datetime import UTC, datetime
+from urllib.parse import quote, urlparse
 
 from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
@@ -60,6 +72,7 @@ __all__ = [
     "SUPPORTED_GITHUB_API_VERSION",
     "GitHubFetcher",
     "GitHubHttpResponse",
+    "github_repository_api_address",
     "HttpGitHubRestClient",
     "http_fetch",
     "is_github_api_origin",
@@ -129,11 +142,43 @@ class GitHubHttpResponse:
     body: bytes
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse all redirects: never forward Authorization across hosts."""
+# The safe redirect policy (issue #122): followed redirects are bounded
+# below urllib's defaults, and per-target repeats are bounded so a redirect
+# loop fails closed quickly. urllib raises its HTTPError carrying the
+# original 3xx status when either bound trips, which classifies as an
+# uncertain outcome.
+_MAX_FOLLOWED_REDIRECTS = 3
+_MAX_REPEATS_PER_TARGET = 2
+
+# Redirects are followed for read-style requests only: a redirect answer to
+# a consequential (mutating) operation is an uncertain outcome, never an
+# automatic replay.
+_REDIRECTABLE_METHODS = frozenset({"GET", "HEAD"})
+
+
+class _GitHubApiRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow only bounded, same-trusted-origin redirects on read requests."""
+
+    max_repeats = _MAX_REPEATS_PER_TARGET
+    max_redirections = _MAX_FOLLOWED_REDIRECTS
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
-        return None
+        """Apply the safe redirect policy ahead of urllib's redirect mechanics.
+
+        A redirect is followed only for a read-style request whose resolved
+        target stays on the exact trusted HTTPS GitHub API origin. urllib
+        copies request headers into the redirected request, so following
+        carries the ``Authorization`` credential — safe exactly because the
+        target is the same trusted origin. Everything else refuses (``None``)
+        so the 3xx answer surfaces and classifies as an uncertain outcome:
+        cross-origin, confusable-hostname, userinfo, non-HTTPS, foreign-port,
+        and malformed targets never receive the credential.
+        """
+        if req.get_method() not in _REDIRECTABLE_METHODS:
+            return None
+        if not isinstance(newurl, str) or not is_github_api_origin(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _github_request_for(
@@ -168,13 +213,14 @@ def http_fetch(
     uncertain-outcome classification.
     """
     request = _github_request_for(url, method, headers, body)
-    opener = urllib.request.build_opener(_NoRedirectHandler)
+    opener = urllib.request.build_opener(_GitHubApiRedirectHandler)
     try:
         with opener.open(request, timeout=timeout_seconds) as response:
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
-        # A definitive HTTP answer, including 3xx (the handler refuses to
-        # follow redirects, surfacing them here): classify from the status.
+        # A definitive HTTP answer, including any 3xx the safe redirect
+        # policy refused to follow (surfacing them here): classify from the
+        # status.
         return exc.code, dict(exc.headers.items()), exc.read(_ERROR_BODY_CLASSIFICATION_LIMIT_BYTES)
 
 
@@ -189,6 +235,49 @@ def _body_reports_secondary_rate_limit(body: bytes) -> bool:
         return False
     text = body[:_ERROR_BODY_CLASSIFICATION_LIMIT_BYTES].decode("utf-8", "ignore").lower()
     return any(marker in text for marker in _SECONDARY_LIMIT_BODY_MARKERS)
+
+
+# Bounded safe scheduling facts (issue #122): when GitHub classifies a
+# rate-limit answer, the response's documented timing headers are normalized
+# onto the adapter error boundary so later orchestration can schedule retries
+# without provider headers leaking above the adapter. Retry-After is
+# documented as a delay-seconds value (GitHub rate-limit documentation); an
+# HTTP-date form is deliberately treated as absent rather than guessed
+# against a clock the transport does not own. X-RateLimit-Reset is documented
+# as epoch seconds (UTC). Parsing is total: absent, malformed, negative, or
+# absurd values normalize to None and never change the classification. The
+# adapter never sleeps, queues, or retries — scheduling policy belongs above
+# the adapter, and uncertain operations are never blindly replayed.
+_MAX_RETRY_AFTER_SECONDS = 86400.0
+_SECONDS_PATTERN = re.compile(r"[0-9]+")
+
+
+def _parse_retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+    """Normalize a well-formed ``Retry-After`` delay-seconds value, or None."""
+    raw = _header_value(headers, "Retry-After")
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not _SECONDS_PATTERN.fullmatch(text):
+        return None
+    seconds = float(text)
+    if seconds > _MAX_RETRY_AFTER_SECONDS:
+        return None
+    return seconds
+
+
+def _parse_rate_limit_reset_at(headers: Mapping[str, str]) -> datetime | None:
+    """Normalize a well-formed ``X-RateLimit-Reset`` epoch value, or None."""
+    raw = _header_value(headers, "X-RateLimit-Reset")
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not _SECONDS_PATTERN.fullmatch(text):
+        return None
+    try:
+        return datetime.fromtimestamp(int(text), tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -226,6 +315,21 @@ def is_github_api_origin(url: str) -> bool:
         and parsed.username is None
         and parsed.password is None
         and port in (None, 443)
+    )
+
+
+def github_repository_api_address(*, owner_login: str, repository_name: str) -> str:
+    """The documented canonical API address of one repository.
+
+    ``https://api.github.com/repos/{owner}/{repo}``, built from documented
+    fields with percent-encoded path segments. Adapter-internal provider
+    mechanics (issue #122): application services never construct, parse, or
+    provider-normalize GitHub API URLs — the GitHub-returned references they
+    hand to this adapter stay opaque.
+    """
+    return (
+        f"{GITHUB_API_BASE_URL}/repos/"
+        f"{quote(owner_login, safe='')}/{quote(repository_name, safe='')}"
     )
 
 
@@ -309,7 +413,10 @@ class HttpGitHubRestClient:
             or _body_reports_secondary_rate_limit(response_body)
         ):
             raise GitHubRateLimitedError(
-                f"the GitHub request was rate limited (status {status})", status_code=status
+                f"the GitHub request was rate limited (status {status})",
+                status_code=status,
+                retry_after_seconds=_parse_retry_after_seconds(response_headers),
+                rate_limit_reset_at=_parse_rate_limit_reset_at(response_headers),
             )
         if status == 401:
             raise GitHubAuthenticationRejectedError(
@@ -324,7 +431,8 @@ class HttpGitHubRestClient:
             raise GitHubRequestRejectedError(
                 f"GitHub rejected the request (status {status})", status_code=status
             )
-        # 3xx (redirects are never followed) and 5xx: the outcome is unknown.
+        # 3xx the safe redirect policy refused to follow and 5xx: the
+        # outcome is unknown.
         raise GitHubOutcomeUncertainError(
             f"the outcome of the GitHub request is unknown (status {status})"
         )
