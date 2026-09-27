@@ -393,7 +393,10 @@ def _persist_created_pull_request(
                 # persistence failure) already persisted the canonical
                 # record: never a second create and never a rewrite — the
                 # observed snapshot is reconciled in place, update-only.
-                reconcile_task_pull_request_observed(
+                # The POST-RECONCILIATION durable record is returned, so the
+                # caller's publication facts are exactly the canonical facts
+                # just persisted (never the stale pre-reconciliation image).
+                reconcile_result = reconcile_task_pull_request_observed(
                     tx_pool,
                     task_pull_request_id=existing.id,
                     workspace_id=workspace_id,
@@ -404,7 +407,17 @@ def _persist_created_pull_request(
                     state=observed_state,
                     merged_at=observation.merged_at,
                 )
-                return _WritePhaseResult(pull_request=existing, authority_stale=authority_stale)
+                if reconcile_result.pull_request is None:
+                    # The record's durable scope vanished inside the write
+                    # transaction: the uniform not-found, never a stale
+                    # pre-image returned as fact.
+                    raise NotFoundError(
+                        "the requested pull request record is not available for this task"
+                    )
+                return _WritePhaseResult(
+                    pull_request=reconcile_result.pull_request,
+                    authority_stale=authority_stale,
+                )
             created = create_task_pull_request(
                 tx_pool,
                 workspace_id=workspace_id,

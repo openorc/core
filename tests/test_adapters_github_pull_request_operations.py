@@ -827,7 +827,9 @@ def test_create_pull_request_already_exists_is_a_typed_classified_rejection() ->
     from openorc.adapters.github import GitHubPullRequestExistsError
 
     # The documented duplicate-PR 422 carries the validation-failed shape
-    # whose errors array names the base field.
+    # whose errors entry names the base field with the documented
+    # already_exists code — the structured form that itself proves
+    # duplication.
     fetch = FakeFetcher(
         [
             _mint_response(),
@@ -836,7 +838,13 @@ def test_create_pull_request_already_exists_is_a_typed_classified_rejection() ->
                 {},
                 {
                     "message": "Validation Failed",
-                    "errors": [{"resource": "PullRequest", "field": "base", "code": "invalid"}],
+                    "errors": [
+                        {
+                            "resource": "PullRequest",
+                            "field": "base",
+                            "code": "already_exists",
+                        }
+                    ],
                 },
             ),
         ]
@@ -940,6 +948,44 @@ def test_create_pull_request_unrelated_422_error_field_is_not_a_conflict() -> No
             repository_name="hello-world",
             head_ref="openorc/task-42",
             base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+    assert not isinstance(exc_info.value, GitHubPullRequestExistsError)
+
+
+def test_create_pull_request_base_field_with_invalid_code_is_not_a_conflict() -> None:
+    from openorc.adapters.github import (
+        GitHubPullRequestExistsError,
+        GitHubRequestRejectedError,
+    )
+
+    # An actually invalid/nonexistent base documents as field=base with the
+    # ordinary `invalid` code: the `code` vocabulary is what distinguishes
+    # meanings, so this stays an ordinary definitive rejection and must
+    # never become the workflow's non-adoption conflict.
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(
+                422,
+                {},
+                {
+                    "message": "Validation Failed",
+                    "errors": [{"resource": "PullRequest", "field": "base", "code": "invalid"}],
+                },
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubRequestRejectedError) as exc_info:
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="nonexistent-base",
             title="feat: task 42",
             body=None,
         )

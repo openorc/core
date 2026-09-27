@@ -51,16 +51,22 @@ __all__ = [
 
 _DOCUMENTED_PR_STATES = frozenset({"open", "closed"})
 
-# The stable documented 422 error members GitHub uses to report the specific
-# 'pull request already exists' validation failure of the create-pull-request
-# operation (GitHub REST create-pull-request documentation: a 422 carries a
-# message plus an errors array whose members identify the failing field).
-# Matched case-insensitively over a bounded body prefix; no provider content
-# is ever stored, echoed into errors, or exported (the same content-safe
-# bounded-classification discipline as the transport's secondary-limit
-# marker check).
+# The stable documented members GitHub's REST error model uses to report the
+# specific 'pull request already exists' validation failure (the general
+# REST error documentation defines the structured validation-error `code`
+# vocabulary, with `already_exists` distinct from `invalid`; the
+# create-pull-request endpoint's documented duplicate rejection names the
+# `base` field). Only the explicit documented message or a structured
+# error whose `code` itself proves duplication classifies as the duplicate
+# condition — a `field == base` entry with an ordinary `invalid` code is an
+# ordinary invalid-base validation failure and must never classify as the
+# duplicate. Matched case-insensitively over a bounded body prefix; no
+# provider content is ever stored, echoed into errors, or exported (the
+# same content-safe bounded-classification discipline as the transport's
+# secondary-limit marker check).
 _ALREADY_EXISTS_BODY_MARKERS = ("a pull request already exists",)
 _ALREADY_EXISTS_ERROR_FIELD = "base"
+_ALREADY_EXISTS_ERROR_CODE = "already_exists"
 _ALREADY_EXISTS_MESSAGE_MARKER = "validation failed"
 _ALREADY_EXISTS_BOUND_BYTES = 4096
 
@@ -70,13 +76,13 @@ def body_reports_pull_request_already_exists(body: bytes) -> bool:
 
     The create-pull-request endpoint documents 422 for ANY validation
     failure (invalid base/head, malformed title, endpoint abuse), so the
-    bare status alone must never classify as the duplicate condition. The
-    body is decoded over a bounded prefix and matched only against the
-    documented stable markers: GitHub's explicit 'a pull request already
-    exists' validation message, or the documented validation-failed shape
-    whose errors array names the ``base`` field (the duplicate-PR
-    rejection's documented failing field). Returns a boolean; no provider
-    content ever crosses this boundary.
+    bare status — or even a `base`-field error with an ordinary `invalid`
+    code — must never classify as the duplicate condition. The body is
+    decoded over a bounded prefix and matched only against the documented
+    stable members: GitHub's explicit 'a pull request already exists'
+    validation message, or a structured validation error that itself proves
+    duplication (`field == base` AND the documented `already_exists` code).
+    Returns a boolean; no provider content ever crosses this boundary.
     """
     if not body:
         return False
@@ -93,7 +99,9 @@ def body_reports_pull_request_already_exists(body: bytes) -> bool:
     if isinstance(message, str) and _ALREADY_EXISTS_MESSAGE_MARKER in message.lower():
         errors = payload.get("errors")
         if isinstance(errors, list) and any(
-            isinstance(entry, dict) and entry.get("field") == _ALREADY_EXISTS_ERROR_FIELD
+            isinstance(entry, dict)
+            and entry.get("field") == _ALREADY_EXISTS_ERROR_FIELD
+            and entry.get("code") == _ALREADY_EXISTS_ERROR_CODE
             for entry in errors
         ):
             return True

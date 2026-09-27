@@ -72,6 +72,7 @@ _GITHUB_PR_ID = 900_719_925_474_099
 _PR_NUMBER = 77
 _HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 _RACED_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+_OLD_SHA = "1111111111111111111111111111111111111111"
 _BRANCH = "openorc/task-42-implementation"
 _STATE_TOKEN = uuid.uuid4()
 _ROTATED_TOKEN = uuid.uuid4()
@@ -493,19 +494,28 @@ def _write_phase_scripts(
     *,
     task: tuple[Any, ...],
     created_row: tuple[Any, ...] | None,
+    existing_row: tuple[Any, ...] | None = None,
+    reconciled_row: tuple[Any, ...] | None = None,
 ) -> None:
     """Script Phase 5's short write transaction.
 
     The handler order mirrors the service's exact execute order: Workspace
-    read, Profile account-deletion barrier read, Task read (the currentness
-    recheck), Repository FOR UPDATE (route revalidation), the existing-
-    canonical-record read, and — only for a fresh creation — the insert.
+    read, Profile account-deletion barrier read, Task FOR UPDATE read (the
+    currentness recheck), Repository FOR UPDATE (route revalidation), the
+    existing-canonical-record read, and — depending on the concurrent state —
+    either the observed-snapshot reconciliation (with its returned
+    post-reconciliation record) or the fresh insert.
     """
     conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.profiles", (None, None, None))
     conn.on("from openorc.tasks", task)
     conn.on("from openorc.repositories where id", _repository_row())
-    conn.on("from openorc.task_pull_requests where task_id", None)
+    conn.on("from openorc.task_pull_requests where task_id", existing_row)
+    if existing_row is not None and reconciled_row is not None:
+        # The reconciliation's locked pre-image read, then its returning
+        # post-image row.
+        conn.on("for update", existing_row)
+        conn.on("update openorc.task_pull_requests", reconciled_row)
     if created_row is not None:
         conn.on("insert into openorc.task_pull_requests", created_row)
 
@@ -618,6 +628,42 @@ def test_a_rotated_state_token_after_creation_persists_the_pr_and_is_stale() -> 
     assert any(sql.startswith("insert into openorc.task_pull_requests") for sql, _ in conn.executed)
     assert result.pull_request.head_sha == _HEAD_SHA
     assert len(github.create_calls) == 1
+
+
+def test_a_concurrent_canonical_record_returns_the_post_reconciliation_facts() -> None:
+    conn = ScriptedConnection()
+    _preflight_scripts(conn)
+    # A concurrent write persisted the canonical record between Phase 1 and
+    # the write phase, carrying an OLDER observed head; the write-phase
+    # observed-snapshot reconciliation advances it to the GitHub-observed
+    # head, and the returned update row is the reconciled record.
+    _write_phase_scripts(
+        conn,
+        task=_task_row(),
+        created_row=None,
+        existing_row=_pull_request_row(head_sha=_OLD_SHA),
+        reconciled_row=_pull_request_row(head_sha=_HEAD_SHA),
+    )
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=GitHubBranchObservation(branch_name=_BRANCH, head_sha=_HEAD_SHA),
+        create_result=_created_facts(),
+        pull_request_observation=_pr_observation(),
+    )
+
+    result = publish_task_pull_request(_pool(conn), github, _command())
+
+    assert result.outcome is TaskPullRequestPublicationOutcome.PUBLISHED
+    assert result.pull_request is not None
+    # The returned publication carries the POST-RECONCILIATION canonical
+    # head — never the stale pre-reconciliation image.
+    assert result.pull_request.head_sha == _HEAD_SHA
+    assert result.pull_request.github_pr_id == _GITHUB_PR_ID
+    # The concurrent path never re-created: the insert never ran.
+    assert not any(
+        sql.startswith("insert into openorc.task_pull_requests") for sql, _ in conn.executed
+    )
 
 
 def test_the_write_phase_task_read_is_locked_for_the_authority_recheck() -> None:
