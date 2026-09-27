@@ -68,11 +68,12 @@ class GitHubRelatedIssueObservation:
 
     ``github_issue_id`` is the stable numeric issue identity;
     ``repository_url`` is GitHub's documented repository reference of the
-    related issue, carried verbatim as a RESOLUTION INPUT ONLY fact: the
-    application service uses it — within the same fresh observation unit —
-    to resolve the related repository's stable numeric ID. It is never
-    persisted as identity and never treated as authoritative identity by
-    itself.
+    related issue, carried verbatim as an OPAQUE NAVIGATION REFERENCE ONLY
+    fact (issue #122): the adapter validates it against the exact trusted
+    GitHub API origin and follows it exactly to resolve the related
+    repository's stable numeric ID — it is never decomposed into owner/name
+    parts, never persisted as identity, and never treated as authoritative
+    identity by itself.
     """
 
     github_issue_id: int

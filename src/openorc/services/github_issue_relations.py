@@ -7,14 +7,15 @@ leaf; they share no transaction and no fate:
 - ``synchronize_repository_issue_dependencies`` — the blocked-by dependency
   unit. This is AUTHORITATIVE INPUT TO ELIGIBILITY: the fresh observation is
   mirrored before any intake decision, and an unobservable blocking state
-  fails closed. Same-repository edges reuse the local Repository's known
-  stable GitHub repository ID with zero extra reads; distinct
-  cross-repository ``repository_url`` references are deduplicated and
-  resolved to stable numeric IDs through documented REST repository reads,
-  all with no database transaction open. If a required stable identity
-  cannot be established, the relationship observation classifies as
-  unobservable and the unit fails closed — mutable owner/name/URL data is
-  never treated as identity.
+  fails closed. Same-repository references reuse the local Repository's
+  known stable GitHub repository ID with zero extra reads; distinct
+  cross-repository references are resolved to stable numeric IDs inside the
+  GitHub adapter — which validates each documented opaque
+  ``repository_url`` against the exact trusted API origin and follows it
+  verbatim (issue #122) — all with no database transaction open. If a
+  required stable identity cannot be established, the relationship
+  observation classifies as unobservable and the unit fails closed —
+  mutable owner/name/URL data is never treated as identity.
 - ``synchronize_repository_issue_hierarchy`` — the parent + sub-issue unit.
   Hierarchy is deliberately NON-GATING: it is descriptive presentation
   state whose outcome never affects Task intake eligibility. The parent edge
@@ -40,7 +41,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from urllib.parse import urlparse
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -183,26 +183,6 @@ def _resolve_system_repository_installation_route(
     return repository, installation_id, installation.identity.github_installation_id
 
 
-def _repository_address_from_url(repository_url: str) -> tuple[str, str] | None:
-    """Extract the (owner, name) address from a documented repository_url.
-
-    GitHub REST issue objects document ``repository_url`` in the API form
-    ``https://api.github.com/repos/{owner}/{repo}`` (the same documented
-    member the #59 issue projection fact set carries). Returns ``None``
-    when the URL is not exactly that https API origin/path shape: the
-    caller then treats the relation as unresolvable rather than guessing.
-    The URL is a transient resolution input inside one fresh observation —
-    never identity, never persisted.
-    """
-    parsed = urlparse(repository_url)
-    if parsed.scheme != "https" or parsed.hostname != "api.github.com":
-        return None
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 3 or parts[0] != "repos":
-        return None
-    return parts[1], parts[2]
-
-
 def _resolve_related_endpoints(
     github: GitHubAppClient,
     *,
@@ -212,50 +192,27 @@ def _resolve_related_endpoints(
     fresh_repository_name: str,
     related: list[GitHubRelatedIssueObservation],
 ) -> list[RelatedIssueEndpoint]:
-    """Resolve related-issue observations into stable numeric endpoints.
+    """Resolve related-issue references into stable numeric endpoints.
 
-    Same-repository references (the documented ``repository_url`` naming the
-    local repository itself, case-insensitively — GitHub repository/owner
-    names are not case sensitive) reuse the known stable GitHub repository
-    ID with zero extra reads. Each distinct cross-repository reference is
-    resolved — deduplicated within the observation — through one documented
-    REST repository read. A non-API-origin or unparseable reference fails
-    the observation closed: mutable address data is never treated as
-    identity.
+    Resolution is adapter-owned provider mechanics (issue #122): the
+    adapter validates each documented opaque ``repository_url`` against the
+    exact trusted GitHub API origin, reuses the local stable repository
+    identity for same-repository references with zero extra reads, and
+    follows each distinct reference verbatim — obtaining the stable numeric
+    ID from the returned repository object's documented fields, deduplicated
+    within the observation unit. This service consumes only the stable
+    resolved identities; it never constructs, parses, or provider-normalizes
+    GitHub API URLs, and mutable address data is never treated as identity.
+    A reference that cannot establish a stable identity raises the
+    classified uncertain outcome and fails the observation closed.
     """
-    local_address = (fresh_owner_login.lower(), fresh_repository_name.lower())
-    resolved: list[RelatedIssueEndpoint] = []
-    resolution_cache: dict[tuple[str, str], int] = {}
-    for observation in related:
-        address = _repository_address_from_url(observation.repository_url)
-        if address is None:
-            # An unparseable/non-API-origin reference cannot establish the
-            # stable identity this mirror requires: fail the observation
-            # closed.
-            raise ExternalOperationUncertainError(
-                "the related issue's repository reference is not resolvable "
-                "to a stable GitHub repository identity"
-            )
-        if (address[0].lower(), address[1].lower()) == local_address:
-            github_repository_id = local_github_repository_id
-        else:
-            cached = resolution_cache.get(address)
-            if cached is not None:
-                github_repository_id = cached
-            else:
-                github_repository_id = github.get_repository_by_address(
-                    github_installation_id=github_installation_id,
-                    owner_login=address[0],
-                    repository_name=address[1],
-                )
-                resolution_cache[address] = github_repository_id
-        resolved.append(
-            RelatedIssueEndpoint(
-                github_repository_id=github_repository_id,
-                github_issue_id=observation.github_issue_id,
-            )
-        )
-    return resolved
+    return github.resolve_related_issue_endpoints(
+        github_installation_id=github_installation_id,
+        local_github_repository_id=local_github_repository_id,
+        fresh_owner_login=fresh_owner_login,
+        fresh_repository_name=fresh_repository_name,
+        related=related,
+    )
 
 
 def _revalidate_write_phase(

@@ -16,8 +16,9 @@ repository content, never comments:
   from; the concrete provider event names/actions never leak above this
   boundary.
 - ``ignored`` — valid but irrelevant or unsupported (anything outside the
-  settled v1 families, including ``issue_comment``: no v1 reconciliation
-  surface reads comments); safely acknowledged.
+  settled v1 families, including ``issue_comment``, which is deliberately
+  not a required subscription and has no v1 reconciliation surface); safely
+  acknowledged.
 - ``unusable`` — a settled-family payload that is structurally unusable for
   safe routing (uninterpretable JSON, missing/malformed stable identity
   members); safely classified without inventing authority.
@@ -225,7 +226,8 @@ def classify_github_webhook_delivery(
         return _facts(event_name, action, GitHubWebhookDeliveryClassification.IGNORED)
     classifier = _FAMILY_CLASSIFIERS.get(event_name)
     if classifier is None:
-        # A settled family with no v1 reconciliation surface (issue_comment:
-        # no v1 capability reads comments) is safely ignored.
+        # A settled family with no v1 reconciliation surface is safely
+        # ignored; outside-settled families (issue_comment included) take
+        # the ignored branch above.
         return _facts(event_name, action, GitHubWebhookDeliveryClassification.IGNORED)
     return classifier(payload, action, event_name)

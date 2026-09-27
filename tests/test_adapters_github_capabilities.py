@@ -113,7 +113,6 @@ _FULL_V1_PERMISSIONS = {
 }
 _FULL_V1_EVENTS = [
     "issues",
-    "issue_comment",
     "pull_request",
     "push",
     "status",
@@ -237,13 +236,30 @@ def test_statuses_write_grants_the_commit_status_read_capability() -> None:
 
 
 def test_required_webhook_events_are_a_single_explicit_set() -> None:
-    assert "issues" in REQUIRED_V1_WEBHOOK_EVENTS
-    assert "pull_request" in REQUIRED_V1_WEBHOOK_EVENTS
+    # issue #122: exactly the six settled v1 event families; comments are
+    # GitHub-owned presentation/discussion data with no v1 reconciliation
+    # surface.
+    assert sorted(REQUIRED_V1_WEBHOOK_EVENTS) == [
+        "check_run",
+        "check_suite",
+        "issues",
+        "pull_request",
+        "push",
+        "status",
+    ]
 
     assert missing_required_webhook_events(frozenset(_FULL_V1_EVENTS)) == frozenset()
     missing = missing_required_webhook_events(frozenset({"issues", "pull_request"}))
     assert "check_run" in missing
     assert "push" in missing
+
+
+def test_issue_comment_subscription_is_deliberately_not_required() -> None:
+    # An installation that does not subscribe to issue comments passes
+    # capability validation; publishing OpenOrc's own issue comments rides
+    # the issues write permission, not the webhook subscription.
+    assert "issue_comment" not in REQUIRED_V1_WEBHOOK_EVENTS
+    assert missing_required_webhook_events(frozenset(_FULL_V1_EVENTS)) == frozenset()
 
 
 def test_installation_payload_normalization_binds_to_the_exact_identity() -> None:

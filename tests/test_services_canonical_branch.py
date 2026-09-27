@@ -294,8 +294,8 @@ class FakeGitHubAppClient:
     def get_issue_parent(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not observe relationships")
 
-    def get_repository_by_address(self, **_kwargs: Any) -> Any:
-        raise AssertionError("this fake must not resolve addresses")
+    def resolve_related_issue_endpoints(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not resolve related endpoints")
 
     def get_repository_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not observe pull requests")

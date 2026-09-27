@@ -529,10 +529,8 @@ class _FakeGitHubClient:
     ) -> Any:
         raise AssertionError("this B3 reconciliation fake must not observe relationships")
 
-    def get_repository_by_address(
-        self, *, github_installation_id: int, owner_login: str, repository_name: str
-    ) -> int:
-        raise AssertionError("this B3 reconciliation fake must not resolve addresses")
+    def resolve_related_issue_endpoints(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this B3 reconciliation fake must not resolve related endpoints")
 
     def get_repository_branch(self, **_kwargs: Any) -> Any:
         raise AssertionError("this B3 reconciliation fake must not observe branches")
