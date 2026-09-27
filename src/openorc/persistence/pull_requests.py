@@ -65,8 +65,10 @@ __all__ = [
     "TaskPullRequestReconcileResult",
     "create_task_pull_request",
     "find_task_pull_request_by_github_identity",
+    "find_task_pull_request_by_number",
     "get_task_pull_request",
     "get_task_pull_request_for_task",
+    "list_task_pull_requests_for_repository",
     "reconcile_task_pull_request_observed",
     "update_task_pull_request_observed",
 ]
@@ -215,6 +217,52 @@ def find_task_pull_request_by_github_identity(
             (workspace_id, github_pr_id),
         ).fetchone()
     return None if row is None else _task_pull_request_from_row(row)
+
+
+def find_task_pull_request_by_number(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID, github_pr_number: int
+) -> TaskPullRequest | None:
+    """Find the Workspace Repository's canonical record for one PR number.
+
+    Webhook dispatch (#120) addresses canonical PRs by the repository-local
+    ``github_pr_number`` the delivery carried — mutable address metadata,
+    never identity: reconciliation (``reconcile_task_pull_request``) binds to
+    the record's stable ``github_pr_id`` and fails closed when the number
+    reports a different stable identity. The record carries its own
+    ``repository_id``, so no join is needed; the lookup is deterministic and
+    single-row by construction.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(repository_id, "repository_id")
+    _require_positive_int(github_pr_number, "github_pr_number")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_TASK_PULL_REQUEST_COLUMNS} from openorc.task_pull_requests "
+            "where workspace_id = %s and repository_id = %s and github_pr_number = %s "
+            "order by task_id limit 1",
+            (workspace_id, repository_id, github_pr_number),
+        ).fetchone()
+    return None if row is None else _task_pull_request_from_row(row)
+
+
+def list_task_pull_requests_for_repository(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID
+) -> list[TaskPullRequest]:
+    """List the canonical PR records of one Workspace Repository, deterministically ordered.
+
+    Repository-scoped webhook fan-out (#120): push/check notifications carry
+    no pull-request identity, so dispatch re-reads the fresh authoritative
+    state of every canonical record in the routed repository.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(repository_id, "repository_id")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_TASK_PULL_REQUEST_COLUMNS} from openorc.task_pull_requests "
+            "where workspace_id = %s and repository_id = %s order by task_id",
+            (workspace_id, repository_id),
+        ).fetchall()
+    return [_task_pull_request_from_row(row) for row in rows]
 
 
 def update_task_pull_request_observed(

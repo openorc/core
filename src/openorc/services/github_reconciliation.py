@@ -107,8 +107,10 @@ from openorc.services.workspace_authorization import require_workspace_repositor
 
 __all__ = [
     "RepositoryIssueReconciliation",
+    "RepositoryObservationReconciliation",
     "reconcile_repository_issue",
     "reconcile_repository_issue_for_owner",
+    "reconcile_repository_observation",
 ]
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,7 @@ logger = logging.getLogger(__name__)
 _SERVICE_TRACER_SCOPE = "openorc.services.github_reconciliation"
 _RECONCILE_SPAN_NAME = "github_reconciliation.reconcile_repository_issue"
 _OWNER_RECONCILE_SPAN_NAME = "github_reconciliation.reconcile_repository_issue_for_owner"
+_OBSERVATION_SPAN_NAME = "github_reconciliation.reconcile_repository_observation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,3 +484,116 @@ def reconcile_repository_issue_for_owner(
             repository_id=repository_id,
             issue_number=issue_number,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryObservationReconciliation:
+    """The durable before/current facts of one repository-observation reconciliation.
+
+    ``repository`` is the post-write durable record; ``metadata_changed``
+    says whether the authoritative observation actually advanced the mutable
+    metadata (an unchanged observation is a true durable no-op). Failed or
+    unobservable reads leave the prior mirror byte-identical — errors are
+    never reinterpreted as authoritative state.
+    """
+
+    repository: Repository
+    metadata_changed: bool
+
+
+def reconcile_repository_observation(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+) -> RepositoryObservationReconciliation:
+    """Reconcile one Workspace Repository's mutable metadata from fresh authority.
+
+    The trusted, system-capable repository-metadata unit for webhook dispatch
+    (#120) — the repository half of :func:`reconcile_repository_issue`
+    extracted as an invocable composition of the same existing primitives:
+    resolve the configured installation route fail-closed, perform the
+    authoritative repository observation with no database transaction open,
+    revalidate the exact route under a row lock before writing, and apply the
+    observed metadata only on actual difference.
+
+    Raises ``NotFoundError`` uniformly for an absent or foreign-Workspace
+    repository or an unconfigured route; ``AuthorizationError`` for the
+    normalized access-loss condition (the prior mirror stays byte-identical);
+    ``ExternalOperationFailedError`` for other known provider failures;
+    ``ExternalOperationUncertainError`` for unknown outcomes; and
+    ``StaleOperationError`` when the route moved during the read.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(repository_id, "repository_id")
+    with application_span(_SERVICE_TRACER_SCOPE, _OBSERVATION_SPAN_NAME) as span:
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
+        annotate_span(span, operation=_OBSERVATION_SPAN_NAME, workspace_id=str(workspace_id))
+        route = resolve_system_repository_installation_route(
+            pool, workspace_id=workspace_id, repository_id=repository_id
+        )
+        try:
+            repository_observation = github.get_installation_repository(
+                github_installation_id=route.github_installation_id,
+                github_repository_id=route.repository.identity.github_repository_id,
+            )
+        except (
+            GitHubAuthorizationRejectedError,
+            GitHubRateLimitedError,
+            GitHubAuthenticationRejectedError,
+            GitHubRequestRejectedError,
+            GitHubOutcomeUncertainError,
+        ) as error:
+            raise _translate_github_outcome(error) from error
+        return _apply_repository_observation(
+            pool,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            read_installation_id=route.installation_id,
+            repository_observation=repository_observation,
+        )
+
+
+def _apply_repository_observation(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    read_installation_id: UUID,
+    repository_observation: GitHubRepositoryObservation,
+) -> RepositoryObservationReconciliation:
+    """Apply the observed repository metadata inside one short transaction.
+
+    Same load-bearing order as the issue reconciliation's write phase: the
+    derived account-deletion barrier is the first lock acquisition; the
+    Repository row is then re-loaded under lock and the exact route
+    revalidated (a moved or superseded route is stale and applies nothing);
+    the mutable metadata is updated only on actual difference.
+    """
+    with composed_transaction(pool) as tx_pool:
+        workspace = get_workspace(tx_pool, workspace_id)
+        if workspace is None:
+            raise NotFoundError("the requested workspace is not available")
+        require_account_operational(tx_pool, profile_id=workspace.owner_profile_id)
+        reloaded = get_repository_for_update(tx_pool, repository_id)
+        if reloaded is None or reloaded.workspace_id != workspace_id:
+            raise NotFoundError("the requested repository is not available in this workspace")
+        if reloaded.github_installation_id != read_installation_id:
+            raise StaleOperationError(
+                "the repository's github installation route changed during reconciliation"
+            )
+        observed_metadata = RepositoryMetadata(
+            owner_login=repository_observation.owner_login,
+            name=repository_observation.name,
+            html_url=repository_observation.html_url,
+            is_private=repository_observation.is_private,
+            default_branch=repository_observation.default_branch,
+        )
+        if reloaded.metadata == observed_metadata:
+            return RepositoryObservationReconciliation(repository=reloaded, metadata_changed=False)
+        updated = update_repository_metadata(tx_pool, reloaded.id, metadata=observed_metadata)
+        if updated is None:  # pragma: no cover - the row lock excludes deletion
+            raise NotFoundError("the requested repository is not available in this workspace")
+        return RepositoryObservationReconciliation(repository=updated, metadata_changed=True)

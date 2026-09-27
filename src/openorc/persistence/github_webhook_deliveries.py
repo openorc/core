@@ -18,6 +18,12 @@ Deduplication semantics:
   facts of the accepted delivery in one set-based statement; the routes are
   the exact B1 route matches resolved within the same transaction.
 
+Processing/recovery state (issue #120): the delivery record also carries the
+smallest bounded processing/recovery metadata — a nullable ``processed_at``
+instant written only when every routed reconciliation completed, so recovery
+(#62) can identify accepted deliveries that still require processing. No
+payload, error body, or queue state is ever persisted here.
+
 Raw webhook request bodies, signature material, and customer content are
 never written or read here. Violated database invariants surface as driver
 exceptions (for example ``psycopg.errors.CheckViolation``); translating them
@@ -45,7 +51,9 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "get_github_webhook_delivery",
     "list_github_webhook_delivery_routes",
+    "mark_github_webhook_delivery_processed",
     "record_github_webhook_delivery",
     "record_webhook_delivery_routes",
 ]
@@ -53,7 +61,7 @@ __all__ = [
 _DELIVERY_COLUMNS = (
     "id, delivery_guid, event_name, action, classification, routing_target, "
     "routing_resolution, github_installation_id, github_repository_id, "
-    "github_issue_number, github_pull_request_number, received_at"
+    "github_issue_number, github_pull_request_number, received_at, processed_at"
 )
 
 
@@ -71,6 +79,7 @@ def _delivery_from_row(row: Sequence[Any]) -> GitHubWebhookDelivery:
         github_issue_number=row[9],
         github_pull_request_number=row[10],
         received_at=normalize_utc(row[11]),
+        processed_at=None if row[12] is None else normalize_utc(row[12]),
     )
 
 
@@ -157,3 +166,40 @@ def list_github_webhook_delivery_routes(
         )
         for row in rows
     ]
+
+
+def get_github_webhook_delivery(
+    pool: DatabasePool, *, delivery_guid: str
+) -> GitHubWebhookDelivery | None:
+    """Return the durable delivery record for one provider delivery GUID, or ``None``.
+
+    The GUID is the provider-owned deduplication identity; dispatch (#120)
+    reloads durable state through this read — never queue payload content,
+    never webhook payload content.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_DELIVERY_COLUMNS} from openorc.github_webhook_deliveries "
+            "where delivery_guid = %s",
+            (delivery_guid,),
+        ).fetchone()
+    return None if row is None else _delivery_from_row(row)
+
+
+def mark_github_webhook_delivery_processed(pool: DatabasePool, *, delivery_id: UUID) -> bool:
+    """Mark one delivery fully processed; ``False`` when already marked or absent.
+
+    The idempotent conditional update (the ``processed_at is null`` guard)
+    makes repeated dispatch/recovery convergences true no-ops: the delivery
+    record gains only this bounded recovery instant, and nothing else is
+    written.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.github_webhook_deliveries "
+            "set processed_at = now() "
+            "where id = %s and processed_at is null "
+            "returning id",
+            (delivery_id,),
+        ).fetchone()
+    return row is not None

@@ -414,8 +414,10 @@ def test_the_module_surface_carries_only_the_pr_repositories() -> None:
         "TaskPullRequestReconcileResult",
         "create_task_pull_request",
         "find_task_pull_request_by_github_identity",
+        "find_task_pull_request_by_number",
         "get_task_pull_request",
         "get_task_pull_request_for_task",
+        "list_task_pull_requests_for_repository",
         "reconcile_task_pull_request_observed",
         "update_task_pull_request_observed",
     }

@@ -1,11 +1,13 @@
-"""Tests for the thin GitHub webhook transport (issue #61).
+"""Tests for the thin GitHub webhook transport (issues #61 and #120).
 
 Route-level coverage of the HTTP mapping: exact raw-body fidelity through the
-seam, uniform detail-free 401 signature rejection, 400 header validation,
-204 acknowledgement of accepted/duplicate/ignored/unusable outcomes, and the
+seam, uniform detail-free 401 signature rejection, 400 header validation, 204
+acknowledgement of accepted/duplicate/ignored/unusable outcomes, and the
 fail-closed 503 when the webhook secret is unconfigured. The route is proven
-thin: it delegates to the (patched) intake service and contains no
-reconciliation logic of its own.
+thin: it delegates to the (patched) intake/dispatch facade — the single
+application-service boundary that owns every duplicate/relevance/processing
+decision and the enqueue — and contains no reconciliation, dispatch-decision,
+or workflow logic of its own.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from openorc.services.errors import (
     AuthenticationError,
     IntegrationNotConfiguredError,
 )
+from openorc.services.github_webhook_dispatch import GitHubWebhookIntakeAndDispatch
 from openorc.services.github_webhook_intake import GitHubWebhookIntake
 
 SECRET = "test-webhook-secret"
@@ -61,33 +64,41 @@ def _settings(*, with_secret: bool = True) -> Settings:
     )
 
 
-class _IntakeSeam:
-    """The patched intake seam: recorded invocations and pool acquisitions.
+class _FacadeSeam:
+    """The patched intake/dispatch seam: recorded invocations and wiring.
 
-    Both the intake service AND the process-local pool acquisition are
-    patched at the router-module boundary, so the route is proven to obtain
-    the pool through the seam inside the threadpool callable — never a real
-    pool, never an event-loop acquisition.
+    The facade, the dispatch-submission builder, AND the process-local pool
+    acquisition are patched at the router-module boundary, so the route is
+    proven to obtain the pool and build the queue seam inside the threadpool
+    callable — never a real pool, never an event-loop acquisition — and to
+    own no duplicate/relevance/processing or enqueue decision of its own.
     """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.pool_acquisitions: list[Settings] = []
+        self.built_submissions: list[object] = []
         self.pool: object = object()
 
 
 @pytest.fixture
-def intake_seam(monkeypatch: pytest.MonkeyPatch):
-    def _make(result: Any = None, error: Exception | None = None) -> _IntakeSeam:
-        seam = _IntakeSeam()
+def facade_seam(monkeypatch: pytest.MonkeyPatch):
+    def _make(result: Any = None, error: Exception | None = None) -> _FacadeSeam:
+        seam = _FacadeSeam()
 
         def _fake_get_database_pool(settings: Settings) -> object:
             seam.pool_acquisitions.append(settings)
             return seam.pool
 
-        def _intake(
+        def _fake_build_submission(settings: Settings) -> object:
+            built = object()
+            seam.built_submissions.append(built)
+            return built
+
+        def _facade(
             pool: Any,
             settings: Settings,
+            submission: Any,
             *,
             raw_body: bytes,
             signature_header: str | None,
@@ -97,6 +108,7 @@ def intake_seam(monkeypatch: pytest.MonkeyPatch):
             seam.calls.append(
                 {
                     "pool": pool,
+                    "submission": submission,
                     "raw_body": raw_body,
                     "signature_header": signature_header,
                     "event_name": event_name,
@@ -108,7 +120,10 @@ def intake_seam(monkeypatch: pytest.MonkeyPatch):
             return result
 
         monkeypatch.setattr(webhook_router, "get_database_pool", _fake_get_database_pool)
-        monkeypatch.setattr(webhook_router, "intake_github_webhook", _intake)
+        monkeypatch.setattr(
+            webhook_router, "build_github_webhook_dispatch_submission", _fake_build_submission
+        )
+        monkeypatch.setattr(webhook_router, "intake_and_dispatch_github_webhook", _facade)
         return seam
 
     return _make
@@ -125,9 +140,9 @@ def _headers(*, signature: str | None = _signature(BODY)) -> dict[str, str]:
     return headers
 
 
-def test_the_route_passes_the_exact_raw_body_and_headers_to_the_service(intake_seam) -> None:
+def test_the_route_passes_the_exact_raw_body_and_headers_to_the_service(facade_seam) -> None:
     settings = _settings()
-    seam = intake_seam()
+    seam = facade_seam()
     client = _client(settings)
 
     response = client.post(
@@ -142,14 +157,18 @@ def test_the_route_passes_the_exact_raw_body_and_headers_to_the_service(intake_s
     assert seam.calls[0]["event_name"] == "issues"
     assert seam.calls[0]["delivery_guid"] == "guid-1"
     # The pool was acquired through the (patched) seam inside the threadpool
-    # callable and is the pool the intake service received.
+    # callable and is the pool the facade received.
     assert seam.calls[0]["pool"] is seam.pool
     assert seam.pool_acquisitions == [settings]
+    # The queue seam was built through the (patched) transport wiring and is
+    # the seam the facade received: the route owns no enqueue decision.
+    assert seam.calls[0]["submission"] is seam.built_submissions[0]
+    assert len(seam.built_submissions) == 1
 
 
 @pytest.mark.parametrize("signature", [None, "sha256=" + "a" * 64, "bogus"])
-def test_signature_failures_map_to_a_uniform_401(intake_seam, signature: str | None) -> None:
-    intake_seam(error=AuthenticationError("rejected"))
+def test_signature_failures_map_to_a_uniform_401(facade_seam, signature: str | None) -> None:
+    facade_seam(error=AuthenticationError("rejected"))
     client = _client(_settings())
 
     response = client.post(
@@ -161,8 +180,8 @@ def test_signature_failures_map_to_a_uniform_401(intake_seam, signature: str | N
     assert response.content == b""
 
 
-def test_missing_delivery_or_event_headers_map_to_400(intake_seam) -> None:
-    intake_seam()
+def test_missing_delivery_or_event_headers_map_to_400(facade_seam) -> None:
+    facade_seam()
     client = _client(_settings())
     signature = _signature(BODY)
 
@@ -181,8 +200,8 @@ def test_missing_delivery_or_event_headers_map_to_400(intake_seam) -> None:
     assert missing_event.status_code == 400
 
 
-def test_an_unconfigured_webhook_secret_maps_to_503(intake_seam) -> None:
-    intake_seam(error=IntegrationNotConfiguredError("not configured"))
+def test_an_unconfigured_webhook_secret_maps_to_503(facade_seam) -> None:
+    facade_seam(error=IntegrationNotConfiguredError("not configured"))
     client = _client(_settings(with_secret=False))
 
     response = client.post("/api/github/webhooks", content=BODY, headers=_headers())
@@ -190,7 +209,7 @@ def test_an_unconfigured_webhook_secret_maps_to_503(intake_seam) -> None:
     assert response.status_code == 503
 
 
-def test_accepted_duplicate_ignored_and_unusable_all_acknowledge_204(intake_seam) -> None:
+def test_accepted_duplicate_ignored_and_unusable_all_acknowledge_204(facade_seam) -> None:
     delivery = GitHubWebhookDelivery(
         id=uuid.uuid4(),
         delivery_guid="guid-1",
@@ -204,26 +223,47 @@ def test_accepted_duplicate_ignored_and_unusable_all_acknowledge_204(intake_seam
         github_issue_number=3,
         github_pull_request_number=None,
         received_at=datetime.now(UTC),
+        processed_at=None,
     )
     client = _client(_settings())
     outcomes = (
-        ("accepted", GitHubWebhookIntake(delivery=delivery)),
-        ("duplicate", GitHubWebhookIntake(delivery=None, duplicate=True)),
-        ("ignored", GitHubWebhookIntake(delivery=delivery, ignored=True)),
-        ("unusable", GitHubWebhookIntake(delivery=delivery, unusable=True)),
+        (
+            "accepted",
+            GitHubWebhookIntakeAndDispatch(intake=GitHubWebhookIntake(delivery=delivery)),
+        ),
+        (
+            "duplicate",
+            GitHubWebhookIntakeAndDispatch(
+                intake=GitHubWebhookIntake(delivery=None, duplicate=True)
+            ),
+        ),
+        (
+            "ignored",
+            GitHubWebhookIntakeAndDispatch(
+                intake=GitHubWebhookIntake(delivery=delivery, ignored=True)
+            ),
+        ),
+        (
+            "unusable",
+            GitHubWebhookIntakeAndDispatch(
+                intake=GitHubWebhookIntake(delivery=delivery, unusable=True)
+            ),
+        ),
     )
 
     for name, outcome in outcomes:
-        seam = intake_seam(result=outcome)
+        seam = facade_seam(result=outcome)
 
         response = client.post("/api/github/webhooks", content=BODY, headers=_headers())
 
         assert response.status_code == 204, name
-        assert len(seam.calls) == 1
+        # The route branches on no intake semantics: every outcome maps to
+        # exactly one facade invocation and a detail-free acknowledgement.
+        assert len(seam.calls) == 1, name
 
 
-def test_the_route_registers_on_the_application(intake_seam) -> None:
-    intake_seam()
+def test_the_route_registers_on_the_application(facade_seam) -> None:
+    facade_seam()
     client = _client(_settings())
 
     response = client.post("/api/github/webhooks", content=b"")
@@ -232,8 +272,8 @@ def test_the_route_registers_on_the_application(intake_seam) -> None:
     assert response.status_code == 400
 
 
-def test_an_oversized_body_is_rejected_without_any_intake(intake_seam) -> None:
-    seam = intake_seam()
+def test_an_oversized_body_is_rejected_without_any_intake(facade_seam) -> None:
+    seam = facade_seam()
     client = _client(_settings())
 
     response = client.post(

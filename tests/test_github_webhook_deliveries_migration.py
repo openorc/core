@@ -139,3 +139,46 @@ def test_the_migration_grants_no_privileges() -> None:
 
     assert "grant " not in text
     assert "to anon" not in text
+
+
+def _processing_migration_text() -> str:
+    matches = sorted(
+        p.name for p in MIGRATIONS_DIR.glob("*_add_github_webhook_delivery_processing_state.sql")
+    )
+    assert len(matches) == 1, (
+        f"expected exactly one add_github_webhook_delivery_processing_state migration, "
+        f"found {matches}"
+    )
+    return (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8")
+
+
+def test_the_processing_state_migration_adds_the_bounded_recovery_instant() -> None:
+    text = _processing_migration_text()
+
+    assert "add column processed_at timestamptz" in text
+
+
+def test_the_processing_state_migration_relaxes_only_the_repository_metadata_identity() -> None:
+    text = _processing_migration_text()
+
+    # The old inline check is located by its exact normalized definition
+    # (exactly one match, else the migration fails hard) and replaced with an
+    # explicitly named constraint whose relaxation applies exactly to the
+    # repository-metadata target.
+    assert "github_repository_id IS NOT NULL" in text
+    assert "github_webhook_deliveries_relevant_repository_identity_check" in text
+    assert "routing_target = 'repository_metadata'" in text
+
+
+def test_the_processing_state_migration_adds_no_grants_or_foreign_keys() -> None:
+    text = _processing_migration_text()
+    # Assertions target executable SQL, not the migration's prose comments.
+    sql_only = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("--")
+    ).lower()
+
+    assert "grant " not in sql_only
+    # No foreign-key clause and no cross-table reference is introduced; the
+    # only new constraint is the bounded CHECK on the delivery table itself.
+    assert "foreign key (" not in sql_only
+    assert "references openorc." not in sql_only

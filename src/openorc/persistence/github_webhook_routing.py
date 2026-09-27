@@ -19,6 +19,12 @@ Resolution is exact-match and fails closed:
 - A known installation whose Workspaces hold no Repository record for the
   affected stable repository identity is the ``unconfigured_repository``
   observation.
+- Installation-scoped deliveries (issue #120: the ``installation`` and
+  ``installation_repositories`` families carry no singular repository
+  identity) resolve through ``resolve_github_webhook_installation_routes``:
+  routes are every Workspace repository explicitly routed to the delivery's
+  installation; a known installation with no routed repositories is the
+  ``unconfigured_repository`` observation.
 
 This is routing resolution only, never authorization: observed installation
 state (``suspended_at``) is deliberately not consulted, consistent with the
@@ -40,7 +46,10 @@ from openorc.domain.github_webhooks import (
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.transactions import transaction
 
-__all__ = ["resolve_github_webhook_routes"]
+__all__ = [
+    "resolve_github_webhook_installation_routes",
+    "resolve_github_webhook_routes",
+]
 
 
 def resolve_github_webhook_routes(
@@ -94,3 +103,50 @@ def resolve_github_webhook_routes(
             else GitHubWebhookRoutingResolution.UNCONFIGURED_REPOSITORY
         )
         return GitHubWebhookRouteResolution(resolution=resolution, routes=())
+
+
+def resolve_github_webhook_installation_routes(
+    pool: DatabasePool, *, github_installation_id: int
+) -> GitHubWebhookRouteResolution:
+    """Resolve one installation-scoped delivery's Workspace routing.
+
+    The installation-scoped complement for repository-metadata deliveries
+    that carry no singular repository identity (issue #120 — the
+    ``installation``/``installation_repositories`` families): routes are
+    every Workspace repository explicitly routed to this delivery's
+    installation. Same fail-closed discipline: an unknown installation
+    resolves nothing (the ``unmapped_installation`` observation); a known
+    installation with no routed repositories is the
+    ``unconfigured_repository`` observation. Exact-match only, never
+    authorization, never owner/login heuristics.
+    """
+    with transaction(pool) as conn:
+        candidates = conn.execute(
+            "select workspace_id from openorc.github_installations "
+            "where github_installation_id = %s order by workspace_id",
+            (github_installation_id,),
+        ).fetchall()
+        if not candidates:
+            return GitHubWebhookRouteResolution(
+                resolution=GitHubWebhookRoutingResolution.UNMAPPED_INSTALLATION, routes=()
+            )
+        routes = conn.execute(
+            "select r.id, r.workspace_id "
+            "from openorc.repositories r "
+            "join openorc.github_installations gi "
+            "on gi.id = r.github_installation_id and gi.workspace_id = r.workspace_id "
+            "where gi.github_installation_id = %s "
+            "order by r.workspace_id, r.id",
+            (github_installation_id,),
+        ).fetchall()
+        if routes:
+            return GitHubWebhookRouteResolution(
+                resolution=GitHubWebhookRoutingResolution.RESOLVED,
+                routes=tuple(
+                    GitHubWebhookResolvedRoute(workspace_id=row[1], repository_id=row[0])
+                    for row in routes
+                ),
+            )
+        return GitHubWebhookRouteResolution(
+            resolution=GitHubWebhookRoutingResolution.UNCONFIGURED_REPOSITORY, routes=()
+        )

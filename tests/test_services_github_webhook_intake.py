@@ -66,6 +66,7 @@ class FakeDeliveryRepo:
             github_issue_number=intake.github_issue_number,
             github_pull_request_number=intake.github_pull_request_number,
             received_at=datetime.now(UTC),
+            processed_at=None,
         )
 
     def record_webhook_delivery_routes(
@@ -83,6 +84,18 @@ class FakeRoutingRepo:
         self, pool: DatabasePool, *, github_installation_id: int, github_repository_id: int
     ) -> Any:
         self.calls.append((github_installation_id, github_repository_id))
+        return self.resolution
+
+
+class FakeInstallationRoutingRepo:
+    def __init__(self, resolution: Any) -> None:
+        self.resolution = resolution
+        self.calls: list[int] = []
+
+    def resolve_github_webhook_installation_routes(
+        self, pool: DatabasePool, *, github_installation_id: int
+    ) -> Any:
+        self.calls.append(github_installation_id)
         return self.resolution
 
 
@@ -120,6 +133,13 @@ def _issue_payload_bytes() -> bytes:
             "issue": {"number": 42, "title": "TITLE", "body": "BODY"},
         }
     ).encode("utf-8")
+
+
+def _installation_payload_bytes() -> bytes:
+    # The `installation` family carries no repository member at all (GitHub
+    # delivers it by default to every App); the classifier still extracts the
+    # stable installation identity for installation-scoped routing.
+    return json.dumps({"action": "created", "installation": {"id": 12345678}}).encode("utf-8")
 
 
 def _signature(body: bytes) -> str:
@@ -167,6 +187,11 @@ class Harness:
                 resolution=GitHubWebhookRoutingResolution.UNCONFIGURED_REPOSITORY, routes=()
             )
         )
+        self.installation_routing = FakeInstallationRoutingRepo(
+            GitHubWebhookRouteResolution(
+                resolution=GitHubWebhookRoutingResolution.RESOLVED, routes=()
+            )
+        )
 
     def intake(
         self,
@@ -209,6 +234,11 @@ def patched(monkeypatch: pytest.MonkeyPatch):
             github_webhook_intake,
             "resolve_github_webhook_routes",
             harness.routing.resolve_github_webhook_routes,
+        )
+        monkeypatch.setattr(
+            github_webhook_intake,
+            "resolve_github_webhook_installation_routes",
+            harness.installation_routing.resolve_github_webhook_installation_routes,
         )
         return harness
 
@@ -299,6 +329,51 @@ def test_unusable_payloads_are_safely_classified(patched) -> None:
     assert result.delivery is not None
     assert result.unusable
     assert harness.routing.calls == []
+
+
+def test_an_installation_scoped_delivery_resolves_through_the_installation_resolver(
+    patched,
+) -> None:
+    # issue #120: an installation-family delivery classifies relevant with
+    # installation-only identity (the payload carries no repository member);
+    # intake resolves through the installation-scoped resolver, which fans
+    # out over the installation's routed repositories — never through any
+    # owner/login heuristic.
+    from openorc.domain.github_webhooks import (
+        GitHubWebhookResolvedRoute,
+        GitHubWebhookRouteResolution,
+    )
+
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    harness = patched()
+    harness.installation_routing.resolution = GitHubWebhookRouteResolution(
+        resolution=GitHubWebhookRoutingResolution.RESOLVED,
+        routes=(
+            GitHubWebhookResolvedRoute(workspace_id=workspace_id, repository_id=repository_id),
+        ),
+    )
+
+    result = harness.intake(
+        event="installation",
+        body=_installation_payload_bytes(),
+        guid="guid-installation",
+    )
+
+    assert result.delivery is not None
+    recorded = harness.deliveries.recorded[0]
+    assert recorded.classification.value == "relevant"
+    assert recorded.routing_target.value == "repository_metadata"
+    assert recorded.github_installation_id == 12345678
+    assert recorded.github_repository_id is None
+    assert recorded.github_issue_number is None
+    assert harness.installation_routing.calls == [12345678]
+    assert harness.routing.calls == []
+    assert len(harness.deliveries.linked) == 1
+    _, routes = harness.deliveries.linked[0]
+    assert routes == [
+        GitHubWebhookResolvedRoute(workspace_id=workspace_id, repository_id=repository_id)
+    ]
 
 
 @pytest.mark.parametrize(

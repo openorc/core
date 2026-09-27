@@ -55,6 +55,7 @@ __all__ = [
     "GitHubIssueReconcileResult",
     "find_github_issue",
     "find_github_issue_by_number",
+    "list_repository_github_issues",
     "reconcile_github_issue",
 ]
 
@@ -437,3 +438,22 @@ def find_github_issue_by_number(
             (repository_id, issue_number),
         ).fetchone()
     return None if row is None else _github_issue_from_row(row)
+
+
+def list_repository_github_issues(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID
+) -> list[GitHubIssueProjection]:
+    """List one Workspace Repository's durable issue projections, deterministically ordered.
+
+    Repository-scoped webhook fan-out (#120): relation notifications
+    (``sub_issues``/``issue_dependencies``) carry no issue identity, so
+    dispatch re-synchronizes the tracked issues' authoritative relation state
+    from their durable stable identities.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
+            "where workspace_id = %s and repository_id = %s order by github_issue_id",
+            (workspace_id, repository_id),
+        ).fetchall()
+    return [_github_issue_from_row(row) for row in rows]

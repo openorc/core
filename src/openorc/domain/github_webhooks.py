@@ -175,9 +175,18 @@ def _validate_intake_shape(
     ):
         if value is not None:
             _require_positive_int(value, field_name)
-    if relevant and (github_installation_id is None or github_repository_id is None):
+    if relevant and github_installation_id is None:
         raise GitHubWebhookDeliveryDomainError(
-            "a relevant delivery requires both stable installation and repository identity"
+            "a relevant delivery requires the stable installation identity"
+        )
+    if (
+        relevant
+        and github_repository_id is None
+        and routing_target is not GitHubWebhookRoutingTarget.REPOSITORY_METADATA
+    ):
+        raise GitHubWebhookDeliveryDomainError(
+            "a repository-scoped relevant delivery requires the stable repository "
+            "identity; only repository-metadata deliveries may be installation-scoped"
         )
     if github_issue_number is not None and github_pull_request_number is not None:
         raise GitHubWebhookDeliveryDomainError(
@@ -226,7 +235,10 @@ class GitHubWebhookDelivery:
 
     Safe metadata only; the record is the durable intake/deduplication fact
     later dispatch/recovery reads. The record never carries workflow
-    authority: invoking reconciliation is dispatch work (#120).
+    authority: invoking reconciliation is dispatch work (#120), which leaves
+    ``processed_at`` — the smallest bounded processing/recovery metadata —
+    ``None`` until every routed reconciliation completed, at which point it
+    records that nothing remains outstanding for this delivery.
     """
 
     id: UUID
@@ -241,6 +253,7 @@ class GitHubWebhookDelivery:
     github_issue_number: int | None
     github_pull_request_number: int | None
     received_at: datetime
+    processed_at: datetime | None
 
     def __post_init__(self) -> None:
         _validate_intake_shape(

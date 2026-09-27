@@ -23,7 +23,10 @@ effect):
    provider event names/actions never leak above the GitHub boundary);
 3. durable recording — one short, database-only transaction records the
    GUID-keyed delivery, resolves relevant deliveries through the
-   webhook-direction B1 routing seam, and persists the resolved Workspace
+   webhook-direction B1 routing seam (repository-scoped resolution, or the
+   installation-scoped complement for the #120 installation families whose
+   notifications carry no singular repository identity), and persists the
+   resolved Workspace
    routing linkages; a duplicate GUID is acknowledged idempotently with no
    second accepted record (zero/mismatched routes are bounded,
    non-authoritative observations that never pierce Workspace isolation and
@@ -61,7 +64,10 @@ from openorc.persistence.github_webhook_deliveries import (
     record_github_webhook_delivery,
     record_webhook_delivery_routes,
 )
-from openorc.persistence.github_webhook_routing import resolve_github_webhook_routes
+from openorc.persistence.github_webhook_routing import (
+    resolve_github_webhook_installation_routes,
+    resolve_github_webhook_routes,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
     AuthenticationError,
@@ -167,12 +173,22 @@ def _record_delivery(
     relevant = facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
     with composed_transaction(pool) as tx_pool:
         resolution: GitHubWebhookRouteResolution | None = None
-        if relevant and facts.github_installation_id and facts.github_repository_id:
-            resolution = resolve_github_webhook_routes(
-                tx_pool,
-                github_installation_id=facts.github_installation_id,
-                github_repository_id=facts.github_repository_id,
-            )
+        if relevant and facts.github_installation_id is not None:
+            if facts.github_repository_id is not None:
+                resolution = resolve_github_webhook_routes(
+                    tx_pool,
+                    github_installation_id=facts.github_installation_id,
+                    github_repository_id=facts.github_repository_id,
+                )
+            else:
+                # Installation-scoped relevant deliveries (issue #120: the
+                # installation families carry no singular repository
+                # identity) resolve through the installation-scoped
+                # complement, which fans out over the installation's routed
+                # repositories.
+                resolution = resolve_github_webhook_installation_routes(
+                    tx_pool, github_installation_id=facts.github_installation_id
+                )
         delivery = record_github_webhook_delivery(
             tx_pool, _intake_facts(facts, delivery_guid, resolution)
         )

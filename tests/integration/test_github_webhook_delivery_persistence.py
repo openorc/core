@@ -16,11 +16,13 @@ from __future__ import annotations
 import threading
 import uuid
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from psycopg import Connection
 from psycopg.errors import CheckViolation, UniqueViolation
+
+from openorc.persistence.pool import DatabasePool
 
 pytestmark = pytest.mark.integration
 
@@ -352,3 +354,107 @@ def test_repository_deletion_cascades_its_linkages(conn: Connection) -> None:
         (delivery_id,),
     ).fetchone()
     assert linkages is not None and linkages[0] == 0
+
+
+def test_an_installation_scoped_relevant_delivery_is_accepted(conn: Connection) -> None:
+    # issue #120: the installation families carry no singular repository
+    # identity; the relevant delivery is installation-scoped and its resolved
+    # routing fan-out (one row per routed repository) persists normally.
+    workspace_id, project_id, _ = _create_workspace_graph(conn)
+    installation_pk = _create_installation(conn, workspace_id, 123)
+    repository_id = _create_routed_repository(conn, workspace_id, project_id, installation_pk, 456)
+    delivery_id = _insert_delivery(
+        conn,
+        "guid-installation-scoped",
+        event_name="installation",
+        routing_target="repository_metadata",
+        github_repository_id=None,
+        github_issue_number=None,
+    )
+
+    conn.execute(
+        "insert into openorc.github_webhook_delivery_routes "
+        "(delivery_id, workspace_id, repository_id) values (%s, %s, %s)",
+        (delivery_id, workspace_id, repository_id),
+    )
+    row = conn.execute(
+        "select routing_target, github_installation_id, github_repository_id, processed_at "
+        "from openorc.github_webhook_deliveries where id = %s",
+        (delivery_id,),
+    ).fetchone()
+
+    assert row is not None
+    assert row[0] == "repository_metadata"
+    assert row[1] == 123
+    assert row[2] is None
+    assert row[3] is None
+
+
+def test_a_repository_scoped_relevant_delivery_still_requires_the_repository_identity(
+    conn: Connection,
+) -> None:
+    with pytest.raises(CheckViolation), conn.transaction():
+        _insert_delivery(
+            conn,
+            "guid-repo-scoped",
+            routing_target="issue_state",
+            github_repository_id=None,
+        )
+
+
+def test_processed_marking_is_conditional_and_idempotent(conn: Connection) -> None:
+    delivery_id = _insert_delivery(conn, "guid-processing")
+
+    first = conn.execute(
+        "update openorc.github_webhook_deliveries set processed_at = now() "
+        "where id = %s and processed_at is null returning processed_at",
+        (delivery_id,),
+    ).fetchone()
+    second = conn.execute(
+        "update openorc.github_webhook_deliveries set processed_at = now() "
+        "where id = %s and processed_at is null returning processed_at",
+        (delivery_id,),
+    ).fetchone()
+
+    assert first is not None and first[0] is not None
+    assert second is None
+
+
+def test_the_processing_instant_round_trips_through_the_repository(conn: Connection) -> None:
+    from openorc.persistence.github_webhook_deliveries import (
+        get_github_webhook_delivery,
+        mark_github_webhook_delivery_processed,
+    )
+
+    class _Pool:
+        """Mirrors psycopg_pool connection-context commit/rollback semantics."""
+
+        def __init__(self, connection: Connection) -> None:
+            self._connection = connection
+
+        def connection(self) -> Any:
+            @contextmanager
+            def managed() -> Any:
+                with self._connection.transaction():
+                    yield self._connection
+
+            return managed()
+
+        def close(self) -> None:
+            raise AssertionError("the test fixture owns the connection lifetime")
+
+    delivery_id = cast(uuid.UUID, _insert_delivery(conn, "guid-roundtrip"))
+    pool = cast(DatabasePool, _Pool(conn))
+
+    delivery = get_github_webhook_delivery(pool, delivery_guid="guid-roundtrip")
+    assert delivery is not None
+    assert delivery.processed_at is None
+
+    assert mark_github_webhook_delivery_processed(pool, delivery_id=delivery_id) is True
+
+    delivery = get_github_webhook_delivery(pool, delivery_guid="guid-roundtrip")
+    assert delivery is not None
+    assert delivery.processed_at is not None
+
+    # Idempotent replay: an already-marked delivery answers False.
+    assert mark_github_webhook_delivery_processed(pool, delivery_id=delivery_id) is False

@@ -17,7 +17,10 @@ from contextlib import contextmanager
 from typing import Any, cast
 
 from openorc.domain.github_webhooks import GitHubWebhookRoutingResolution
-from openorc.persistence.github_webhook_routing import resolve_github_webhook_routes
+from openorc.persistence.github_webhook_routing import (
+    resolve_github_webhook_installation_routes,
+    resolve_github_webhook_routes,
+)
 from openorc.persistence.pool import DatabasePool
 
 
@@ -136,6 +139,51 @@ def test_no_exact_match_without_a_configured_repository_classifies_unconfigured(
     resolution = resolve_github_webhook_routes(
         _pool(conn), github_installation_id=123, github_repository_id=456
     )
+
+    assert resolution.resolution is GitHubWebhookRoutingResolution.UNCONFIGURED_REPOSITORY
+    assert resolution.routes == ()
+
+
+def test_installation_scoped_resolution_fans_out_over_routed_repositories() -> None:
+    workspace_a = uuid.uuid4()
+    workspace_b = uuid.uuid4()
+    repository_a = uuid.uuid4()
+    repository_b = uuid.uuid4()
+    conn = ScriptedConnection(
+        results=[
+            [(workspace_a,), (workspace_b,)],
+            [(repository_a, workspace_a), (repository_b, workspace_b)],
+        ]
+    )
+
+    resolution = resolve_github_webhook_installation_routes(_pool(conn), github_installation_id=123)
+
+    assert resolution.resolution is GitHubWebhookRoutingResolution.RESOLVED
+    assert [(route.workspace_id, route.repository_id) for route in resolution.routes] == [
+        (workspace_a, repository_a),
+        (workspace_b, repository_b),
+    ]
+    route_sql, route_params = conn.executed[1]
+    assert "join openorc.github_installations gi" in route_sql
+    assert "gi.github_installation_id = %s" in route_sql
+    assert "r.github_repository_id" not in route_sql
+    assert route_params == (123,)
+
+
+def test_installation_scoped_unknown_installation_fails_closed_without_route_statements() -> None:
+    conn = ScriptedConnection(results=[[]])
+
+    resolution = resolve_github_webhook_installation_routes(_pool(conn), github_installation_id=123)
+
+    assert resolution.resolution is GitHubWebhookRoutingResolution.UNMAPPED_INSTALLATION
+    assert resolution.routes == ()
+    assert len(conn.executed) == 1
+
+
+def test_installation_scoped_no_routed_repositories_classifies_unconfigured() -> None:
+    conn = ScriptedConnection(results=[[(uuid.uuid4(),)], []])
+
+    resolution = resolve_github_webhook_installation_routes(_pool(conn), github_installation_id=123)
 
     assert resolution.resolution is GitHubWebhookRoutingResolution.UNCONFIGURED_REPOSITORY
     assert resolution.routes == ()
