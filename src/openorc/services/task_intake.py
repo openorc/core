@@ -67,6 +67,7 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_repository
 
 __all__ = [
+    "IssueBlockedEligibilityError",
     "RepositoryTaskIntake",
     "intake_repository_task",
     "intake_repository_task_for_owner",
@@ -79,6 +80,20 @@ _INTAKE_SPAN_NAME = "task_intake.intake_repository_task"
 _OWNER_INTAKE_SPAN_NAME = "task_intake.intake_repository_task_for_owner"
 
 _OPENORC_ACTOR = WorkflowActorContext(WorkflowEventActor.OPENORC, None)
+
+
+class IssueBlockedEligibilityError(ConflictError):
+    """The blocked-issue eligibility outcome of authoritative Task intake.
+
+    Raised when the fresh authoritative GitHub observation — or the mirrored
+    dependency facts it produced, rechecked inside the creation transaction —
+    reports the addressed issue currently blocked by an issue dependency.
+    This is a typed, expected product outcome with nothing left to
+    reconcile, deliberately distinct from the base :class:`ConflictError`
+    raised for reconciliation/data-integrity conflicts (stable identity or
+    issue-number mismatches, an unserializable projection or creation write,
+    a pull-request-shaped addressed number), which remain recoverable.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +136,11 @@ def intake_repository_task(
     Workspace/Repository identity, no authenticated actor, fail closed
     uniformly. Raises ``NotFoundError`` uniformly for an absent or
     foreign-Workspace repository, an unconfigured/foreign route, or a fresh
-    authoritative check reporting the issue closed; ``ConflictError`` when
-    GitHub currently reports the issue blocked, when the addressed number is
-    a pull request, or for the classified duplicate-intake outcome;
+    authoritative check reporting the issue closed;
+    ``IssueBlockedEligibilityError`` (a ``ConflictError``) when GitHub
+    currently reports the addressed issue blocked by an issue dependency;
+    ``ConflictError`` when the addressed number is a pull request or an
+    intake write could not be serialized against current durable state; and
     ``AuthorizationError``/``ExternalOperationFailedError``/
     ``ExternalOperationUncertainError`` for the classified GitHub outcomes —
     in particular, an unobservable blocking state fails intake closed.
@@ -161,7 +178,7 @@ def intake_repository_task(
             github_issue_id=projection.identity.github_issue_id,
         )
         if dependency_sync.blocked:
-            raise ConflictError(
+            raise IssueBlockedEligibilityError(
                 "GitHub currently reports the addressed issue as blocked by an issue dependency"
             )
         # (4) The final short creation transaction: eligibility against the
@@ -213,7 +230,7 @@ def _apply_intake_creation(
             tx_pool, repository_id=repository_id, github_issue_id=github_issue_id
         )
         if blockers:
-            raise ConflictError(
+            raise IssueBlockedEligibilityError(
                 "GitHub currently reports the addressed issue as blocked by an issue dependency"
             )
         current = find_current_task_for_issue(

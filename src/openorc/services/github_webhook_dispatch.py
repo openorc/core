@@ -77,7 +77,6 @@ from openorc.services import (
 )
 from openorc.services.errors import (
     ApplicationError,
-    ConflictError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
@@ -465,9 +464,13 @@ def _dispatch_issue_state(
     for this layer: the fresh issue reconciliation, the fresh dependency
     observation, the eligibility check against those facts, the race-safe
     creation, and the non-gating hierarchy sync all read GitHub
-    authoritatively. A closed or blocked issue is a typed expected decline
-    (the fresh reconciliation and dependency mirror it performs were written
-    inside the composition); Task workflow consequences belong to Phase 2E.
+    authoritatively. A closed issue, the typed blocked-issue eligibility
+    outcome, or an absent Workspace subject is a typed expected decline (the
+    fresh reconciliation and dependency mirror it performs were written
+    inside the composition); a reconciliation/data-integrity conflict
+    (stable identity or issue-number mismatch, a PR-shaped number, an
+    unserializable write) is a known failure that stays recoverable; Task
+    workflow consequences belong to Phase 2E.
     """
     if delivery.github_issue_number is None:
         logger.warning(
@@ -486,9 +489,14 @@ def _dispatch_issue_state(
             repository_id=route.repository_id,
             issue_number=delivery.github_issue_number,
         )
-    except (NotFoundError, ConflictError):
-        # Typed expected product outcomes: a closed issue, a blocked issue,
-        # or an absent Workspace subject. Nothing remains outstanding.
+    except (NotFoundError, task_intake.IssueBlockedEligibilityError):
+        # Typed expected product outcomes: a closed issue, the blocked-issue
+        # eligibility outcome (the fresh reconciliation and dependency mirror
+        # it performs were written inside the composition), or an absent
+        # Workspace subject. Nothing remains outstanding. Generic
+        # reconciliation conflicts (stable identity/number mismatches,
+        # PR-shaped numbers, unserializable writes) do NOT decline here:
+        # they stay known failures below and remain recoverable.
         return GitHubWebhookDispatchRouteStatus.DECLINED
     except ApplicationError as error:
         return _classify_route_failure(route, error)

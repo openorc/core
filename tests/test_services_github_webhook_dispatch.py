@@ -422,10 +422,12 @@ def test_a_closed_issue_typedly_declines_and_marks_the_delivery_processed(harnes
 
 
 def test_a_blocked_issue_typedly_declines_and_marks_the_delivery_processed(harness_factory) -> None:
-    from openorc.services.errors import ConflictError
+    from openorc.services.task_intake import IssueBlockedEligibilityError
 
     harness = harness_factory()
-    harness.intake._error = ConflictError("GitHub currently reports the addressed issue as blocked")
+    harness.intake._error = IssueBlockedEligibilityError(
+        "GitHub currently reports the addressed issue as blocked"
+    )
     _script_delivery(harness.conn, _delivery_row())
     _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
     _script_processed(harness.conn, _DELIVERY_ID)
@@ -436,6 +438,35 @@ def test_a_blocked_issue_typedly_declines_and_marks_the_delivery_processed(harne
 
     assert result.processed is True
     assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.DECLINED
+
+
+def test_an_issue_reconciliation_conflict_fails_known_and_stays_recoverable(
+    harness_factory,
+) -> None:
+    # Regression (review fix): a generic reconciliation/data-integrity
+    # ConflictError from the intake composition (a stable identity or issue
+    # number mismatch, a PR-shaped addressed number, an unserializable write)
+    # is NOT the blocked-issue eligibility outcome — it must never be
+    # classified terminal, or the delivery leaves the #62 recovery set
+    # despite unresolved processing.
+    from openorc.services.errors import ConflictError
+
+    harness = harness_factory()
+    harness.intake._error = ConflictError(
+        "the GitHub issue number durably maps to a different stable issue identity"
+    )
+    _script_delivery(harness.conn, _delivery_row())
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+
+    result = github_webhook_dispatch.dispatch_github_webhook_delivery(
+        harness.pool, _github_client(), delivery_guid="guid-1"
+    )
+
+    assert result.processed is False
+    assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.FAILED_KNOWN
+    # No processed-marking was attempted: the unmatched scripted handler
+    # proves the bounded recovery metadata stayed untouched and the delivery
+    # remains in the #62 recovery set.
 
 
 def test_issue_state_known_provider_failure_leaves_the_delivery_recoverable(
