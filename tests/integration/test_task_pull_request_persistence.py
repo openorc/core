@@ -777,3 +777,137 @@ def test_owner_gate_pr_subjects_persist_and_reject_cross_task_binding(
             task_pull_request_id=record.id,
         )
         conn.execute("set constraints openorc.owner_gates_task_pull_request_fk immediate")
+
+
+def test_the_serialized_reconcile_updates_only_and_reports_the_pre_image(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    record = _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+
+    result = pull_request_repositories.reconcile_task_pull_request_observed(
+        pool,
+        task_pull_request_id=record.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        head_ref=record.head_ref,
+        base_ref=record.base_ref,
+        head_sha=_HEAD_B,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    # Update-only: the existing canonical record advanced in place, with the
+    # locked pre-image describing exactly what this invocation changed.
+    assert result.outcome is pull_request_repositories.TaskPullRequestReconcileOutcome.UPDATED
+    assert result.pull_request is not None
+    assert result.pull_request.id == record.id
+    assert result.pull_request.github_pr_id == record.github_pr_id
+    assert result.pull_request.head_sha == _HEAD_B
+    assert result.previous_head_sha == _HEAD_A
+    assert result.previous_head_ref == record.head_ref
+    assert result.previous_base_ref == record.base_ref
+    assert result.previous_state is TaskPullRequestState.OPEN
+    assert result.previous_merged_at is None
+    reread = pull_request_repositories.get_task_pull_request_for_task(pool, task_id=task_id)
+    assert reread is not None and reread.head_sha == _HEAD_B
+
+
+def test_the_serialized_reconcile_is_a_true_no_op_for_an_identical_observation(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    record = _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+    updated_before = record.updated_at
+
+    result = pull_request_repositories.reconcile_task_pull_request_observed(
+        pool,
+        task_pull_request_id=record.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        head_ref=record.head_ref,
+        base_ref=record.base_ref,
+        head_sha=record.head_sha,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    assert result.outcome is pull_request_repositories.TaskPullRequestReconcileOutcome.UNCHANGED
+    assert result.pull_request is not None
+    assert result.pull_request.updated_at == updated_before
+    assert result.previous_head_sha == record.head_sha
+
+
+def test_the_serialized_reconcile_never_inserts_an_absent_record(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    record = _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+
+    result = pull_request_repositories.reconcile_task_pull_request_observed(
+        pool,
+        task_pull_request_id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        task_id=task_id,
+        head_ref=record.head_ref,
+        base_ref=record.base_ref,
+        head_sha=_HEAD_B,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    # The strictly update-only contract: an absent record is the MISSING
+    # outcome and no row was created.
+    assert result.outcome is pull_request_repositories.TaskPullRequestReconcileOutcome.MISSING
+    assert result.pull_request is None
+    still_canonical = pull_request_repositories.get_task_pull_request_for_task(
+        pool, task_id=task_id
+    )
+    assert still_canonical is not None and still_canonical.id == record.id
+
+
+def test_the_serialized_reconcile_scope_mismatch_is_missing(conn: Connection[Any]) -> None:
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    record = _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+
+    mismatched_scope = pull_request_repositories.reconcile_task_pull_request_observed(
+        pool,
+        task_pull_request_id=record.id,
+        workspace_id=uuid.uuid4(),
+        task_id=task_id,
+        head_ref=record.head_ref,
+        base_ref=record.base_ref,
+        head_sha=_HEAD_B,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+    mismatched_task = pull_request_repositories.reconcile_task_pull_request_observed(
+        pool,
+        task_pull_request_id=record.id,
+        workspace_id=workspace_id,
+        task_id=uuid.uuid4(),
+        head_ref=record.head_ref,
+        base_ref=record.base_ref,
+        head_sha=_HEAD_B,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    assert (
+        mismatched_scope.outcome
+        is pull_request_repositories.TaskPullRequestReconcileOutcome.MISSING
+    )
+    assert (
+        mismatched_task.outcome is pull_request_repositories.TaskPullRequestReconcileOutcome.MISSING
+    )
+    # The real record was untouched.
+    reread = pull_request_repositories.get_task_pull_request_for_task(pool, task_id=task_id)
+    assert reread is not None and reread.head_sha == _HEAD_A

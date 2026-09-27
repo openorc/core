@@ -234,6 +234,21 @@ class FakeGitHubAppClient:
     def get_installation_capabilities(self, github_installation_id: int) -> Any:
         raise AssertionError("the service must not compose raw adapter operations")
 
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe branches")
+
+    def get_repository_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe pull requests")
+
+    def get_commit_check_runs(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project check runs")
+
+    def get_commit_combined_status(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project combined status")
+
+    def merge_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not request merges")
+
 
 def _ws_row() -> tuple[Any, ...]:
     return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, "")

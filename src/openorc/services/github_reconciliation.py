@@ -77,14 +77,12 @@ from openorc.domain.github_issues import (
 )
 from openorc.domain.ownership import Repository, RepositoryMetadata
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.github_installations import get_github_installation
 from openorc.persistence.github_issues import (
     GitHubIssueReconcileOutcome,
     GitHubIssueReconcileResult,
     reconcile_github_issue,
 )
 from openorc.persistence.ownership import (
-    get_repository,
     get_repository_for_update,
     get_workspace,
     update_repository_metadata,
@@ -99,6 +97,9 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
     StaleOperationError,
+)
+from openorc.services.github_installation_route import (
+    resolve_system_repository_installation_route,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
@@ -158,34 +159,6 @@ def _require_issue_number_command(value: object) -> None:
     """Reject a malformed issue-number command argument (the durable address)."""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise InvalidCommandError("issue_number must be a positive integer")
-
-
-def _resolve_system_repository_installation_route(
-    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID
-) -> tuple[Repository, UUID, int]:
-    """Resolve the durable Workspace Repository → installation route.
-
-    The trusted system resolution used by the reconciliation primitive: no
-    authenticated actor participates, and the boundary still fails closed
-    uniformly — an absent or foreign-Workspace repository, an unconfigured
-    route (valid historical state that is not usable for GitHub
-    operations), or a missing/foreign installation record is the uniform
-    not-found outcome. Returns the Repository, the OpenOrc installation
-    record UUID the reads must be authorized through, and the stable
-    external GitHub repository identity the adapter must address.
-    """
-    repository = get_repository(pool, repository_id)
-    if repository is None or repository.workspace_id != workspace_id:
-        raise NotFoundError("the requested repository is not available in this workspace")
-    if repository.github_installation_id is None:
-        raise NotFoundError("the requested repository has no configured github installation route")
-    installation_id = repository.github_installation_id
-    installation = get_github_installation(pool, installation_id)
-    if installation is None or installation.workspace_id != workspace_id:
-        raise NotFoundError(
-            "the requested repository installation route is not available in this workspace"
-        )
-    return repository, installation_id, installation.identity.github_installation_id
 
 
 def _observe_authoritative_state(
@@ -429,10 +402,13 @@ def reconcile_repository_issue(
         # Attach only after the caller-supplied identifiers proved valid: a
         # malformed command is classified without exporting its values.
         annotate_span(span, operation=_RECONCILE_SPAN_NAME, workspace_id=str(workspace_id))
+        route = resolve_system_repository_installation_route(
+            pool, workspace_id=workspace_id, repository_id=repository_id
+        )
         repository, installation_id, external_installation_id = (
-            _resolve_system_repository_installation_route(
-                pool, workspace_id=workspace_id, repository_id=repository_id
-            )
+            route.repository,
+            route.installation_id,
+            route.github_installation_id,
         )
         try:
             repository_observation, issue_observation = _observe_authoritative_state(

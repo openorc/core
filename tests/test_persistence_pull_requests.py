@@ -7,9 +7,13 @@ boundary, parameterization, the explicit-OPEN creation SQL (the migration
 declares no lifecycle default), the observed-snapshot UPDATE semantics
 (full replacement of head_ref/base_ref/head_sha/state/merged_at with
 ``updated_at`` advancing and ``github_pr_number`` deliberately excluded),
-and the identity-vs-address lookup shapes. Database constraint behavior —
-including ``unique (task_id)`` and ``unique (workspace_id, github_pr_id)``
-— is proven against a real database by the integration-marked suite in
+and the identity-vs-address lookup shapes, plus (issue #63) the strictly
+update-only serialized reconcile semantics — the ``FOR UPDATE`` locked
+pre-image, the true durable no-op for an identical observation, the
+``MISSING`` outcome with no insert path, and payload validation before any
+SQL. Database constraint behavior —
+including ``unique (task_id)`` and ``unique (workspace_id, github_pr_id)`` —
+is proven against a real database by the integration-marked suite in
 ``tests/integration/``.
 """
 
@@ -30,10 +34,12 @@ from openorc.domain.pull_requests import (
 from openorc.persistence import pull_requests as pull_requests_module
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import (
+    TaskPullRequestReconcileOutcome,
     create_task_pull_request,
     find_task_pull_request_by_github_identity,
     get_task_pull_request,
     get_task_pull_request_for_task,
+    reconcile_task_pull_request_observed,
     update_task_pull_request_observed,
 )
 
@@ -404,9 +410,142 @@ def test_an_open_observation_never_carries_a_merge_stamp() -> None:
 
 def test_the_module_surface_carries_only_the_pr_repositories() -> None:
     assert set(pull_requests_module.__all__) == {
+        "TaskPullRequestReconcileOutcome",
+        "TaskPullRequestReconcileResult",
         "create_task_pull_request",
         "find_task_pull_request_by_github_identity",
         "get_task_pull_request",
         "get_task_pull_request_for_task",
+        "reconcile_task_pull_request_observed",
         "update_task_pull_request_observed",
     }
+
+
+def test_reconcile_task_pull_request_observed_updates_the_locked_row_with_the_pre_image() -> None:
+    locked = _pull_request_row()
+    updated = _pull_request_row(
+        id=locked[0],
+        workspace_id=locked[1],
+        task_id=locked[2],
+        repository_id=locked[3],
+        head_ref="openorc/task-42-remediated",
+        head_sha="fedcba9876543210fedcba9876543210fedcba98",
+        updated_at=_observed_at() + timedelta(hours=1),
+    )
+    conn = FakeConnection(responses=[locked, updated])
+
+    result = reconcile_task_pull_request_observed(
+        cast(DatabasePool, FakePool(conn)),
+        task_pull_request_id=locked[0],
+        workspace_id=locked[1],
+        task_id=locked[2],
+        head_ref="openorc/task-42-remediated",
+        base_ref="main",
+        head_sha="fedcba9876543210fedcba9876543210fedcba98",
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    assert result.outcome is TaskPullRequestReconcileOutcome.UPDATED
+    assert result.pull_request is not None
+    assert result.pull_request.head_sha == "fedcba9876543210fedcba9876543210fedcba98"
+    # The serialized pre-image describes what this invocation changed.
+    assert result.previous_head_sha == "0123456789abcdef0123456789abcdef01234567"
+    assert result.previous_head_ref == "openorc/task-42"
+    assert result.previous_base_ref == "main"
+    assert result.previous_state is TaskPullRequestState.OPEN
+    assert result.previous_merged_at is None
+    # First statement: the scope-addressed locked read. Second: the full
+    # observed-snapshot update; github_pr_number is never part of it.
+    assert len(conn.executed) == 2
+    select_sql, select_params = conn.executed[0]
+    assert "for update" in " ".join(select_sql.split()).lower()
+    assert select_params == (locked[0], locked[1], locked[2])
+    update_sql, update_params = conn.executed[1]
+    assert update_sql.startswith("update openorc.task_pull_requests")
+    assert update_params == (
+        "openorc/task-42-remediated",
+        "main",
+        "fedcba9876543210fedcba9876543210fedcba98",
+        "open",
+        None,
+        locked[0],
+    )
+
+
+def test_reconcile_task_pull_request_observed_unchanged_is_a_true_no_op() -> None:
+    locked = _pull_request_row()
+    conn = FakeConnection(responses=[locked])
+
+    result = reconcile_task_pull_request_observed(
+        cast(DatabasePool, FakePool(conn)),
+        task_pull_request_id=locked[0],
+        workspace_id=locked[1],
+        task_id=locked[2],
+        head_ref="openorc/task-42",
+        base_ref="main",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    assert result.outcome is TaskPullRequestReconcileOutcome.UNCHANGED
+    assert result.pull_request is not None
+    assert result.pull_request.head_sha == "0123456789abcdef0123456789abcdef01234567"
+    assert result.previous_head_sha == "0123456789abcdef0123456789abcdef01234567"
+    # Only the locked read ran: no write, updated_at preserved.
+    assert len(conn.executed) == 1
+
+
+def test_reconcile_task_pull_request_observed_missing_row_has_no_insert_path() -> None:
+    conn = FakeConnection(responses=[None])
+
+    result = reconcile_task_pull_request_observed(
+        cast(DatabasePool, FakePool(conn)),
+        task_pull_request_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        head_ref="openorc/task-42",
+        base_ref="main",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+    )
+
+    assert result.outcome is TaskPullRequestReconcileOutcome.MISSING
+    assert result.pull_request is None
+    assert result.previous_head_sha is None
+    # Exactly the locked read ran: reconciliation never inserts or adopts.
+    assert len(conn.executed) == 1
+    assert "insert into openorc.task_pull_requests" not in conn.executed[0][0]
+
+
+def test_reconcile_task_pull_request_observed_validates_the_payload_before_any_sql() -> None:
+    conn = FakeConnection()
+
+    with pytest.raises(TaskPullRequestDomainError):
+        reconcile_task_pull_request_observed(
+            cast(DatabasePool, FakePool(conn)),
+            task_pull_request_id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            head_ref="   ",
+            base_ref="main",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            state=TaskPullRequestState.OPEN,
+            merged_at=None,
+        )
+    with pytest.raises(TaskPullRequestDomainError):
+        reconcile_task_pull_request_observed(
+            cast(DatabasePool, FakePool(conn)),
+            task_pull_request_id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            head_ref="openorc/task-42",
+            base_ref="main",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            state=TaskPullRequestState.OPEN,
+            merged_at=_observed_at(),
+        )
+    # Nothing reached SQL: the payload is validated at the boundary.
+    assert conn.executed == []

@@ -41,16 +41,22 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from typing import Protocol
+from urllib.parse import quote
 
 from openorc.adapters.github.authentication import GitHubAppAuthenticator
 from openorc.adapters.github.capabilities import (
+    GITHUB_COMMIT_CHECK_RUNS_PATH,
+    GITHUB_COMMIT_COMBINED_STATUS_PATH,
     GITHUB_GRAPHQL_PATH,
     GITHUB_INSTALLATION_PATH,
     GITHUB_INSTALLATION_REPOSITORIES_PATH,
     GITHUB_ISSUE_DEPENDENCIES_BLOCKED_BY_PATH,
     GITHUB_ISSUE_SUB_ISSUES_PATH,
+    GITHUB_PULL_REQUEST_MERGE_PATH,
+    GITHUB_REPOSITORY_BRANCH_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
     GITHUB_REPOSITORY_PATH,
+    GITHUB_REPOSITORY_PULL_REQUEST_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
     missing_required_capabilities,
@@ -63,12 +69,32 @@ from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+    GitHubRateLimitedError,
+    GitHubRequestRejectedError,
 )
 from openorc.adapters.github.observations import (
     GitHubIssueObservation,
     GitHubRepositoryObservation,
     parse_installation_repository_entry,
     parse_issue_payload,
+)
+from openorc.adapters.github.observations_branch import (
+    GitHubBranchObservation,
+    parse_branch_payload,
+)
+from openorc.adapters.github.observations_checks import (
+    GitHubCheckRunObservation,
+    GitHubCommitStatusesProjection,
+    GitHubStatusContextObservation,
+    parse_check_runs_page,
+    parse_combined_status_page,
+)
+from openorc.adapters.github.observations_pull_request import (
+    GitHubMergeRequestOutcome,
+    GitHubMergeRequestResult,
+    GitHubPullRequestObservation,
+    parse_merge_response_payload,
+    parse_pull_request_payload,
 )
 from openorc.adapters.github.observations_relations import (
     GitHubIssueParentObservation,
@@ -112,6 +138,11 @@ _BLOCKED_BY_SPAN_NAME = "github.get_issue_blocked_by"
 _SUB_ISSUES_SPAN_NAME = "github.get_issue_sub_issues"
 _PARENT_SPAN_NAME = "github.get_issue_parent"
 _REPOSITORY_RESOLVE_SPAN_NAME = "github.get_repository_by_address"
+_BRANCH_SPAN_NAME = "github.get_repository_branch"
+_PULL_REQUEST_SPAN_NAME = "github.get_repository_pull_request"
+_CHECK_RUNS_SPAN_NAME = "github.get_commit_check_runs"
+_COMBINED_STATUS_SPAN_NAME = "github.get_commit_combined_status"
+_MERGE_SPAN_NAME = "github.merge_pull_request"
 
 # The installation repository listing requests the maximum documented page
 # size (100) and is bounded so a broken pagination chain cannot loop.
@@ -183,6 +214,62 @@ class GitHubAppClient(Protocol):
         issue_number: int,
     ) -> GitHubIssueObservation:
         """Return the normalized current observation of one repository issue."""
+        ...
+
+    def get_repository_branch(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        branch_name: str,
+    ) -> GitHubBranchObservation:
+        """Return the normalized current observation of one repository branch."""
+        ...
+
+    def get_repository_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+    ) -> GitHubPullRequestObservation:
+        """Return the normalized current observation of one repository pull request."""
+        ...
+
+    def get_commit_check_runs(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_sha: str,
+    ) -> list[GitHubCheckRunObservation]:
+        """Return the exhaustively paginated check-run projection for one exact head."""
+        ...
+
+    def get_commit_combined_status(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_sha: str,
+    ) -> GitHubCommitStatusesProjection:
+        """Return the exhaustively paginated combined-status projection for one exact head."""
+        ...
+
+    def merge_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+        expected_head_sha: str,
+    ) -> GitHubMergeRequestResult:
+        """Request one exact-head merge of a pull request under GitHub's sha guard."""
         ...
 
     def get_installation_capabilities(
@@ -401,6 +488,283 @@ class HttpGitHubAppClient:
                 repository_name=repository_name,
                 issue_number=issue_number,
             )
+
+    def get_repository_branch(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        branch_name: str,
+    ) -> GitHubBranchObservation:
+        """Return the authoritative observation of one repository branch.
+
+        The documented ``GET /repos/{owner}/{repo}/branches/{branch}``
+        operation under the installation access token, addressed through the
+        freshly observed repository address. ``branch_name`` is the exact
+        branch the caller addresses (percent-encoded as one path segment);
+        the response binds to the addressed name, and the normalized
+        observation carries the exact GitHub-committed head SHA — the
+        committed-state fact runtime-local HEAD can never establish. A 404
+        answer (a missing/deleted branch or absent repository access) is the
+        transport's classified authorization absence: the normalized
+        integration condition, never permission to trust runtime-local state.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        _require_non_empty_command_str(branch_name, "branch_name")
+        with application_span(_TRACER_SCOPE, _BRANCH_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_BRANCH_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+            )
+            path = GITHUB_REPOSITORY_BRANCH_PATH.format(
+                owner=owner_login,
+                repo=repository_name,
+                branch=quote(branch_name, safe=""),
+            )
+            response = self._request_with_installation_token(github_installation_id, path)
+            return parse_branch_payload(_json_body(response), branch_name=branch_name)
+
+    def get_repository_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+    ) -> GitHubPullRequestObservation:
+        """Return the authoritative observation of one repository pull request.
+
+        The documented ``GET /repos/{owner}/{repo}/pulls/{pull_number}``
+        operation under the installation access token, addressed through the
+        freshly observed repository address — never stored mutable metadata.
+        The response binds to the addressed subject through its own
+        ``number``/``url`` members; the normalized observation carries the
+        stable PR identity and the mutable head/base/lifecycle facts the
+        canonical TaskPullRequest reconciliation updates in place.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(pull_number, "pull_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _PULL_REQUEST_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_PULL_REQUEST_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_pull_request_number=pull_number,
+            )
+            path = GITHUB_REPOSITORY_PULL_REQUEST_PATH.format(
+                owner=owner_login, repo=repository_name, pull_number=pull_number
+            )
+            response = self._request_with_installation_token(github_installation_id, path)
+            return parse_pull_request_payload(
+                _json_body(response),
+                owner_login=owner_login,
+                repository_name=repository_name,
+                pull_number=pull_number,
+            )
+
+    def get_commit_check_runs(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_sha: str,
+    ) -> list[GitHubCheckRunObservation]:
+        """Return the exhaustive check-run projection for one exact head.
+
+        The documented ``GET /repos/{owner}/{repo}/commits/{ref}/check-runs``
+        operation under the installation access token (``checks`` read),
+        addressed by the exact head SHA — never a branch name. The listing is
+        walked through GitHub's documented ``Link`` headers within the bounded
+        page count, and the collected check runs are proven complete against
+        the documented ``total_count``: any bound overrun, broken pagination
+        chain, count mismatch, or uninterpretable page is an uncertain
+        outcome — never a silently partial projection of GitHub-owned facts.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        _require_non_empty_command_str(head_sha, "head_sha")
+        with application_span(_TRACER_SCOPE, _CHECK_RUNS_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_CHECK_RUNS_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_head_sha=head_sha,
+            )
+            path = (
+                GITHUB_COMMIT_CHECK_RUNS_PATH.format(
+                    owner=owner_login, repo=repository_name, ref=head_sha
+                )
+                + f"?per_page={_LISTING_PAGE_SIZE}"
+            )
+            collected: list[GitHubCheckRunObservation] = []
+            total_count: int | None = None
+            page_count = 0
+            while path is not None:
+                if page_count >= _MAX_LISTING_PAGES:
+                    raise GitHubOutcomeUncertainError(
+                        "the check runs listing could not be completed within the "
+                        "bounded page count: the outcome is unknown"
+                    )
+                response = self._request_with_installation_token(github_installation_id, path)
+                page_total, page_runs = parse_check_runs_page(_json_body(response))
+                if total_count is None:
+                    total_count = page_total
+                elif page_total != total_count:
+                    raise GitHubOutcomeUncertainError(
+                        "the check runs listing is not interpretable: its pages report "
+                        "different totals"
+                    )
+                collected.extend(page_runs)
+                path = self._next_page_url(response)
+                page_count += 1
+            if total_count is None or len(collected) != total_count:
+                raise GitHubOutcomeUncertainError(
+                    "the check runs listing is incomplete: the documented total was "
+                    "not reached, so the projection cannot be proven complete"
+                )
+            return collected
+
+    def get_commit_combined_status(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_sha: str,
+    ) -> GitHubCommitStatusesProjection:
+        """Return the exhaustive combined-status projection for one exact head.
+
+        The documented ``GET /repos/{owner}/{repo}/commits/{ref}/status``
+        operation under the installation access token, addressed by the exact
+        head SHA. The combined-status listing is itself paginated: every page
+        binds its documented ``sha`` member to the addressed head and reports
+        the provider-owned aggregate ``state``/``total_count``, and the walk
+        collects every status context until the documented total is reached
+        within the bounded page count. Any incompleteness is an uncertain
+        outcome — the aggregate state is GitHub's own answer and is returned
+        only together with the proven-complete context listing.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        _require_non_empty_command_str(head_sha, "head_sha")
+        with application_span(_TRACER_SCOPE, _COMBINED_STATUS_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_COMBINED_STATUS_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_head_sha=head_sha,
+            )
+            path = (
+                GITHUB_COMMIT_COMBINED_STATUS_PATH.format(
+                    owner=owner_login, repo=repository_name, ref=head_sha
+                )
+                + f"?per_page={_LISTING_PAGE_SIZE}"
+            )
+            contexts: list[GitHubStatusContextObservation] = []
+            aggregate_state: str | None = None
+            total_count: int | None = None
+            page_count = 0
+            while path is not None:
+                if page_count >= _MAX_LISTING_PAGES:
+                    raise GitHubOutcomeUncertainError(
+                        "the combined status listing could not be completed within the "
+                        "bounded page count: the outcome is unknown"
+                    )
+                response = self._request_with_installation_token(github_installation_id, path)
+                page_state, page_total, page_contexts = parse_combined_status_page(
+                    _json_body(response), head_sha=head_sha
+                )
+                if aggregate_state is None:
+                    aggregate_state, total_count = page_state, page_total
+                elif page_state != aggregate_state or page_total != total_count:
+                    raise GitHubOutcomeUncertainError(
+                        "the combined status listing is not interpretable: its pages "
+                        "report different aggregates"
+                    )
+                contexts.extend(page_contexts)
+                path = self._next_page_url(response)
+                page_count += 1
+            if total_count is None or len(contexts) != total_count:
+                raise GitHubOutcomeUncertainError(
+                    "the combined status listing is incomplete: the documented total "
+                    "was not reached, so the projection cannot be proven complete"
+                )
+            assert aggregate_state is not None
+            return GitHubCommitStatusesProjection(state=aggregate_state, statuses=tuple(contexts))
+
+    def merge_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+        expected_head_sha: str,
+    ) -> GitHubMergeRequestResult:
+        """Request one exact-head merge under GitHub's documented sha guard.
+
+        The documented ``PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge``
+        operation under the installation access token (merge authority
+        derives from ``contents: write``, validated at route/access time —
+        never from a pull-request permission). The request carries the
+        documented ``sha`` parameter — the provider's expected-head facility
+        — so a concurrent head change can never satisfy this merge request:
+        GitHub answers the documented 409 head-mismatch rejection, normalized
+        here as ``HEAD_MISMATCH``. Any other definitive rejection is the
+        known ``REJECTED`` outcome (GitHub owns the merge policy: required
+        checks, conflicts, branch protection). Authentication/access absence,
+        rate limits, and uncertain outcomes (timeout, connection loss,
+        redirect, 5xx, uninterpretable answer) raise the adapter's classified
+        errors — an uncertain merge outcome is never silently replayed.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(pull_number, "pull_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        _require_non_empty_command_str(expected_head_sha, "expected_head_sha")
+        with application_span(_TRACER_SCOPE, _MERGE_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_MERGE_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_pull_request_number=pull_number,
+                github_head_sha=expected_head_sha,
+            )
+            path = GITHUB_PULL_REQUEST_MERGE_PATH.format(
+                owner=owner_login, repo=repository_name, pull_number=pull_number
+            )
+            body = json.dumps({"sha": expected_head_sha}).encode("utf-8")
+            try:
+                response = self._put_with_installation_token(github_installation_id, path, body)
+            except (
+                GitHubAuthenticationRejectedError,
+                GitHubAuthorizationRejectedError,
+                GitHubRateLimitedError,
+            ):
+                raise
+            except GitHubRequestRejectedError as error:
+                # The definitive rejections of this documented operation are
+                # classified from GitHub's own documented response semantics:
+                # 409 is the expected-head mismatch; every other definitive
+                # non-success is GitHub-owned policy/state refusal. The merge
+                # applied nothing in either case.
+                if error.status_code == 409:
+                    return GitHubMergeRequestResult(
+                        outcome=GitHubMergeRequestOutcome.HEAD_MISMATCH, merge_commit_sha=None
+                    )
+                return GitHubMergeRequestResult(
+                    outcome=GitHubMergeRequestOutcome.REJECTED, merge_commit_sha=None
+                )
+            return parse_merge_response_payload(_json_body(response))
 
     def get_issue_blocked_by(
         self,
@@ -661,6 +1025,34 @@ class HttpGitHubAppClient:
             return self._transport.request(
                 path,
                 method="POST",
+                authorization=f"Bearer {token.token_value()}",
+                body=body,
+            )
+
+    def _put_with_installation_token(
+        self, github_installation_id: int, path: str, body: bytes
+    ) -> GitHubHttpResponse:
+        """Perform one installation-token PUT with bounded 401 recovery.
+
+        The same bounded recovery contract as the GET/POST helpers: one token
+        eviction and re-mint on an authentication rejection; uncertain
+        outcomes are never replayed. The PUT verb is the documented exact-head
+        merge request's method.
+        """
+        token = self._authenticator.installation_token(github_installation_id)
+        try:
+            return self._transport.request(
+                path,
+                method="PUT",
+                authorization=f"Bearer {token.token_value()}",
+                body=body,
+            )
+        except GitHubAuthenticationRejectedError:
+            self._authenticator.invalidate_installation_token(github_installation_id)
+            token = self._authenticator.installation_token(github_installation_id)
+            return self._transport.request(
+                path,
+                method="PUT",
                 authorization=f"Bearer {token.token_value()}",
                 body=body,
             )

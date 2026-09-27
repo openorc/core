@@ -308,17 +308,22 @@ class HttpGitHubRestClient:
             or _header_value(response_headers, "Retry-After") is not None
             or _body_reports_secondary_rate_limit(response_body)
         ):
-            raise GitHubRateLimitedError(f"the GitHub request was rate limited (status {status})")
+            raise GitHubRateLimitedError(
+                f"the GitHub request was rate limited (status {status})", status_code=status
+            )
         if status == 401:
             raise GitHubAuthenticationRejectedError(
-                f"GitHub rejected the presented credential (status {status})"
+                f"GitHub rejected the presented credential (status {status})", status_code=status
             )
         if status in (403, 404):
             raise GitHubAuthorizationRejectedError(
-                f"GitHub denied access to the addressed resource (status {status})"
+                f"GitHub denied access to the addressed resource (status {status})",
+                status_code=status,
             )
         if 400 <= status < 500:
-            raise GitHubRequestRejectedError(f"GitHub rejected the request (status {status})")
+            raise GitHubRequestRejectedError(
+                f"GitHub rejected the request (status {status})", status_code=status
+            )
         # 3xx (redirects are never followed) and 5xx: the outcome is unknown.
         raise GitHubOutcomeUncertainError(
             f"the outcome of the GitHub request is unknown (status {status})"
