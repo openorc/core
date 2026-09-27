@@ -911,3 +911,79 @@ def test_the_serialized_reconcile_scope_mismatch_is_missing(conn: Connection[Any
     # The real record was untouched.
     reread = pull_request_repositories.get_task_pull_request_for_task(pool, task_id=task_id)
     assert reread is not None and reread.head_sha == _HEAD_A
+
+
+def test_the_canonical_record_is_findable_by_repository_local_number(
+    conn: Connection[Any],
+) -> None:
+    # issue #120: webhook dispatch addresses canonical records by the
+    # repository-local PR number; reconciliation still binds to the stable
+    # identity.
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    created = _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+
+    found = pull_request_repositories.find_task_pull_request_by_number(
+        pool, workspace_id=workspace_id, repository_id=repository_id, github_pr_number=42
+    )
+
+    assert found is not None
+    assert found.id == created.id
+    assert found.task_id == task_id
+    assert found.github_pr_id == created.github_pr_id
+    # A different repository's number namespace never resolves.
+    assert (
+        pull_request_repositories.find_task_pull_request_by_number(
+            pool,
+            workspace_id=workspace_id,
+            repository_id=uuid.uuid4(),
+            github_pr_number=42,
+        )
+        is None
+    )
+
+
+def test_the_repository_listing_is_deterministic_and_workspace_scoped(
+    conn: Connection[Any],
+) -> None:
+    workspace_id, repository_id, task_id, pool = _fresh_task(conn)
+    _canonical_pull_request(
+        pool, workspace_id=workspace_id, task_id=task_id, repository_id=repository_id
+    )
+    # A second Task in the same repository gets its own canonical record.
+    second_task = _insert_task(
+        conn, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=7502
+    )
+    second = pull_request_repositories.create_task_pull_request(
+        pool,
+        workspace_id=workspace_id,
+        task_id=second_task,
+        repository_id=repository_id,
+        github_pr_id=555_001,
+        github_pr_number=43,
+        head_ref="openorc/task-43",
+        base_ref="main",
+        head_sha=_HEAD_A,
+    )
+    assert second.github_pr_number == 43
+
+    listed = pull_request_repositories.list_task_pull_requests_for_repository(
+        pool, workspace_id=workspace_id, repository_id=repository_id
+    )
+    again = pull_request_repositories.list_task_pull_requests_for_repository(
+        pool, workspace_id=workspace_id, repository_id=repository_id
+    )
+
+    assert {record.task_id for record in listed} == {task_id, second_task}
+    assert {record.github_pr_number for record in listed} == {42, 43}
+    # Deterministic order across repeated reads.
+    assert [record.id for record in again] == [record.id for record in listed]
+    # Another Workspace Repository's records never leak into the listing.
+    other_workspace, other_repository = _ownership_chain(conn, github_repository_id=70_100_002)
+    assert (
+        pull_request_repositories.list_task_pull_requests_for_repository(
+            pool, workspace_id=other_workspace, repository_id=other_repository
+        )
+        == []
+    )

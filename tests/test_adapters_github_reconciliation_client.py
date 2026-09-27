@@ -110,6 +110,9 @@ _FULL_V1_EVENTS = [
     "status",
     "check_run",
     "check_suite",
+    "repository",
+    "sub_issues",
+    "issue_dependencies",
 ]
 
 

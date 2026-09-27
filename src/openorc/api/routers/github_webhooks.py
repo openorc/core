@@ -4,10 +4,11 @@ This router owns HTTP concerns only: it bounds the request body WHILE
 reading it (an oversized request is rejected without ever being fully
 buffered), obtains the exact raw request bytes and the required GitHub
 delivery headers, delegates the blocking, database-bound intake — pool
-acquisition included — to the shared application service off the event loop
-(the v1 persistence surface is synchronous), and maps the typed intake
-outcomes/errors onto HTTP responses. It contains no GitHub reconciliation,
-queue orchestration, or workflow logic — dispatch begins at #120.
+acquisition included — to the shared application service off the event loop (the v1 persistence
+surface is synchronous), and maps the typed intake outcomes/errors onto HTTP
+responses. It contains no GitHub reconciliation, no dispatch-decision or
+enqueue semantics, and no workflow logic — the intake/dispatch facade
+boundary owns those (issue #120).
 
 Response mapping:
 
@@ -39,7 +40,11 @@ from openorc.services.errors import (
     IntegrationNotConfiguredError,
     InvalidCommandError,
 )
-from openorc.services.github_webhook_intake import GitHubWebhookIntake, intake_github_webhook
+from openorc.services.github_webhook_dispatch import (
+    GitHubWebhookIntakeAndDispatch,
+    intake_and_dispatch_github_webhook,
+)
+from openorc.workers.jobs.github_webhook_dispatch import build_github_webhook_dispatch_submission
 
 router = APIRouter(tags=["github-webhooks"])
 
@@ -84,22 +89,24 @@ def _declared_length_exceeds_limit(declared_length: str | None) -> bool:
     return length > _MAX_WEBHOOK_BODY_BYTES
 
 
-def _intake_delivery(
+def _intake_and_dispatch(
     settings: Settings,
     raw_body: bytes,
     signature_header: str | None,
     event_name: str,
     delivery_guid: str,
-) -> GitHubWebhookIntake:
-    """Synchronous intake entry executed in the worker thread.
+) -> GitHubWebhookIntakeAndDispatch:
+    """Synchronous intake-and-dispatch entry executed in the worker thread.
 
     The process-local pool is acquired HERE, off the event loop: first-use
     pool construction can block on the database and must never run inside an
-    async request handler.
+    async request handler. The dispatch submission seam is transport wiring;
+    every duplicate/relevance/processing decision is the service's.
     """
-    return intake_github_webhook(
+    return intake_and_dispatch_github_webhook(
         get_database_pool(settings),
         settings,
+        build_github_webhook_dispatch_submission(settings),
         raw_body=raw_body,
         signature_header=signature_header,
         event_name=event_name,
@@ -126,10 +133,11 @@ async def receive_github_webhook(
     if raw_body is None:
         return Response(status_code=413)
     try:
-        # The blocking, database-bound intake — process-local pool
-        # acquisition included — runs off the event loop in one worker step.
+        # The blocking, database-and-queue-bound intake-and-dispatch facade —
+        # process-local pool acquisition included — runs off the event loop
+        # in one worker step; its typed result carries no HTTP contract.
         await run_in_threadpool(
-            _intake_delivery,
+            _intake_and_dispatch,
             settings,
             raw_body,
             x_hub_signature_256,

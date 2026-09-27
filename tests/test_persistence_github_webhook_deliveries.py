@@ -24,7 +24,9 @@ from openorc.domain.github_webhooks import (
     GitHubWebhookRoutingTarget,
 )
 from openorc.persistence.github_webhook_deliveries import (
+    get_github_webhook_delivery,
     list_github_webhook_delivery_routes,
+    mark_github_webhook_delivery_processed,
     record_github_webhook_delivery,
     record_webhook_delivery_routes,
 )
@@ -88,6 +90,7 @@ def _delivery_row() -> tuple[Any, ...]:
         42,
         None,
         _OBSERVED_AT,
+        None,
     )
 
 
@@ -196,3 +199,59 @@ def test_route_listing_maps_rows_deterministically() -> None:
     sql, params = conn.executed[0]
     assert "order by workspace_id, repository_id" in sql
     assert params == (delivery_id,)
+
+
+def test_get_maps_the_delivery_row_for_the_provider_guid() -> None:
+    delivery_id = uuid.uuid4()
+    conn = FakeConnection(
+        row=(
+            delivery_id,
+            "guid-1",
+            "issues",
+            "edited",
+            "relevant",
+            "issue_state",
+            "resolved",
+            123,
+            456,
+            42,
+            None,
+            _OBSERVED_AT,
+            _OBSERVED_AT,
+        )
+    )
+
+    delivery = get_github_webhook_delivery(_pool(conn), delivery_guid="guid-1")
+
+    assert delivery is not None
+    assert delivery.id == delivery_id
+    assert delivery.received_at == _UTC_OBSERVED
+    assert delivery.processed_at == _UTC_OBSERVED
+    sql, params = conn.executed[0]
+    assert "where delivery_guid = %s" in sql
+    assert params == ("guid-1",)
+
+
+def test_get_returns_none_for_an_unknown_guid() -> None:
+    conn = FakeConnection(row=None)
+
+    assert get_github_webhook_delivery(_pool(conn), delivery_guid="guid-x") is None
+
+
+def test_processed_marking_is_a_conditional_idempotent_update() -> None:
+    delivery_id = uuid.uuid4()
+    conn = FakeConnection(row=(delivery_id,))
+
+    marked = mark_github_webhook_delivery_processed(_pool(conn), delivery_id=delivery_id)
+
+    assert marked is True
+    sql, params = conn.executed[0]
+    assert "set processed_at = now()" in sql
+    assert "where id = %s and processed_at is null" in sql
+    assert params == (delivery_id,)
+
+
+def test_already_processed_or_absent_marking_returns_false() -> None:
+    conn = FakeConnection(row=None)
+
+    assert mark_github_webhook_delivery_processed(_pool(conn), delivery_id=uuid.uuid4()) is False

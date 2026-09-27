@@ -73,7 +73,7 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
 - Merge requests carry the exact reviewed/Owner-overridden head as expected SHA.
 - CI/check projection presents GitHub-owned facts and must not become a second merge-policy engine.
 
-## Webhook ingress boundary (issue #61)
+## Webhook ingress boundary (issues #61 and #120)
 
 - Inbound GitHub webhook deliveries verify GitHub's SHA-256 signature
   (`X-Hub-Signature-256`, a `sha256=`-prefixed hex HMAC-SHA256 digest) over
@@ -92,15 +92,26 @@ This adapter owns GitHub API/webhook transport, normalization, stable GitHub ide
   closed rather than accept unverified deliveries) and is never Workspace
   data, `openorc.*` state, Vault content, log/error text, or telemetry.
 - Payload semantics stay inside `webhook_classification`: a verified payload
-  is parsed only far enough to classify it — a relevant settled v1 event
-  family (`REQUIRED_V1_WEBHOOK_EVENTS`) with sufficient stable routing
-  identity maps onto the normalized `GitHubWebhookRoutingTarget` vocabulary;
-  valid-but-irrelevant deliveries (including `issue_comment` — no v1
-  capability reads comments) are safely ignored; structurally unusable
-  payloads are safely classified without inventing authority. Only stable
-  identity members (installation/repository IDs, issue/PR numbers) are ever
-  extracted; titles, bodies, and content members have no read path, and
-  provider event names/actions never leak above this boundary into
-  services/domain code.
+  is parsed only far enough to classify it — a relevant classified v1 event
+  family (`V1_CLASSIFIED_WEBHOOK_EVENTS`, a strict superset of the App's
+  subscription contract `REQUIRED_V1_WEBHOOK_EVENTS`, adding the
+  default-delivered, non-subscribable `installation` and
+  `installation_repositories` families, #120) with sufficient stable routing
+  identity maps onto the normalized `GitHubWebhookRoutingTarget` vocabulary.
+  Two identity shapes exist: repository-scoped deliveries carry the stable
+  installation ID, repository ID, and (where the family addresses a provider
+  object) the issue or PR number; installation-scoped deliveries (the two
+  installation families, whose notifications affect repository sets or the
+  whole installation rather than one singular repository) carry only the
+  stable installation ID, and dispatch fans out over the installation's
+  explicitly routed repositories. `sub_issues`/`issue_dependencies`
+  deliberately extract no issue number (their related issues may live in
+  other repositories); valid-but-irrelevant deliveries (including
+  `issue_comment` — no v1 capability reads comments) are safely ignored;
+  structurally unusable payloads are safely classified without inventing
+  authority. Only stable identity members (installation/repository IDs,
+  issue/PR numbers) are ever extracted; titles, bodies, and content members
+  have no read path, and provider event names/actions never leak above this
+  boundary into services/domain code.
 
 Do not let GitHub comments, labels, or webhook payloads become implicit Producer authority.

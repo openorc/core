@@ -69,6 +69,29 @@ def test_relevant_intake_requires_target_resolution_and_identity(
         _intake(**overrides)
 
 
+def test_an_installation_scoped_repository_metadata_intake_validates() -> None:
+    # issue #120: installation-level notifications (the `installation` and
+    # `installation_repositories` families) carry no singular repository
+    # identity; the REPOSITORY_METADATA target is the one target whose
+    # relevant deliveries may be installation-scoped.
+    intake = _intake(
+        event_name="installation",
+        routing_target=GitHubWebhookRoutingTarget.REPOSITORY_METADATA,
+        github_repository_id=None,
+        github_issue_number=None,
+    )
+
+    assert intake.github_repository_id is None
+    assert intake.routing_target is GitHubWebhookRoutingTarget.REPOSITORY_METADATA
+
+
+def test_a_repository_scoped_target_still_requires_the_repository_identity() -> None:
+    with pytest.raises(GitHubWebhookDeliveryDomainError):
+        _intake(
+            routing_target=GitHubWebhookRoutingTarget.ISSUE_RELATIONS, github_repository_id=None
+        )
+
+
 def test_a_non_relevant_intake_carries_no_target_or_resolution() -> None:
     intake = _intake(
         delivery_guid="guid-2",
@@ -127,9 +150,12 @@ def test_the_persisted_delivery_round_trips_the_intake_shape() -> None:
         github_issue_number=intake.github_issue_number,
         github_pull_request_number=intake.github_pull_request_number,
         received_at=_NOW,
+        processed_at=None,
     )
 
     assert delivery.received_at == _NOW
+    # The bounded processing/recovery metadata starts unresolved (issue #120).
+    assert delivery.processed_at is None
 
 
 def test_route_resolution_defaults_to_no_routes() -> None:

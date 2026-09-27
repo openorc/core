@@ -49,6 +49,9 @@ def _classify(event_name: str, payload: object) -> GitHubWebhookDeliveryFacts:
         ("status", GitHubWebhookRoutingTarget.CHECKS),
         ("check_run", GitHubWebhookRoutingTarget.CHECKS),
         ("check_suite", GitHubWebhookRoutingTarget.CHECKS),
+        ("sub_issues", GitHubWebhookRoutingTarget.ISSUE_RELATIONS),
+        ("issue_dependencies", GitHubWebhookRoutingTarget.ISSUE_RELATIONS),
+        ("repository", GitHubWebhookRoutingTarget.REPOSITORY_METADATA),
     ],
 )
 def test_settled_v1_event_families_classify(
@@ -92,6 +95,123 @@ def test_pull_request_identity_action_routes_to_the_task_branch_surface() -> Non
     assert facts.routing_target is GitHubWebhookRoutingTarget.TASK_BRANCH_OR_PULL_REQUEST
     assert facts.github_pull_request_number == 7
     assert facts.github_issue_number is None
+
+
+def test_sub_issue_delivery_classifies_relevant_without_any_issue_identity() -> None:
+    # issue #120: the parent or the sub-issue may live in another repository
+    # (`parent_issue_repo`), so no issue number is extracted and the delivery
+    # routes by the stable repository identity; customer content members are
+    # never read.
+    payload = {
+        "action": "parent_issue_added",
+        "installation": {"id": 12345678},
+        "repository": {"id": 987654321},
+        "sub_issue": {"number": 7, "title": "SECRET-SUB-TITLE"},
+        "parent_issue": {"number": 5, "title": "SECRET-PARENT-TITLE"},
+        "parent_issue_repo": {"id": 111, "name": "octo/other"},
+    }
+
+    facts = _classify("sub_issues", payload)
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
+    assert facts.routing_target is GitHubWebhookRoutingTarget.ISSUE_RELATIONS
+    assert facts.github_installation_id == 12345678
+    assert facts.github_repository_id == 987654321
+    assert facts.github_issue_number is None
+    assert facts.github_pull_request_number is None
+    extracted = {getattr(facts, field) for field in dir(facts) if not field.startswith("_")}
+    for forbidden in ("SECRET-SUB-TITLE", "SECRET-PARENT-TITLE", "octo/other"):
+        assert forbidden not in extracted
+
+
+def test_issue_dependency_delivery_classifies_relevant_without_any_issue_identity() -> None:
+    # issue #120: the blocked and blocking issues may live in different
+    # repositories (`blocking_issue_repo`), so no issue number is extracted
+    # and the delivery routes by the stable repository identity.
+    payload = {
+        "action": "blocked_by_added",
+        "installation": {"id": 12345678},
+        "repository": {"id": 987654321},
+        "blocked_issue_id": 7,
+        "blocked_issue": {"number": 7, "title": "SECRET-BLOCKED-TITLE"},
+        "blocking_issue": {"number": 5, "title": "SECRET-BLOCKING-TITLE"},
+        "blocking_issue_repo": {"id": 111, "name": "octo/other"},
+    }
+
+    facts = _classify("issue_dependencies", payload)
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
+    assert facts.routing_target is GitHubWebhookRoutingTarget.ISSUE_RELATIONS
+    assert facts.github_installation_id == 12345678
+    assert facts.github_repository_id == 987654321
+    assert facts.github_issue_number is None
+    assert facts.github_pull_request_number is None
+    extracted = {getattr(facts, field) for field in dir(facts) if not field.startswith("_")}
+    for forbidden in ("SECRET-BLOCKED-TITLE", "SECRET-BLOCKING-TITLE", "octo/other"):
+        assert forbidden not in extracted
+
+
+def test_repository_delivery_classifies_relevant_with_stable_repository_identity() -> None:
+    payload = {
+        "action": "renamed",
+        "installation": {"id": 12345678},
+        "repository": {"id": 987654321, "name": "new-name"},
+    }
+
+    facts = _classify("repository", payload)
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
+    assert facts.routing_target is GitHubWebhookRoutingTarget.REPOSITORY_METADATA
+    assert facts.github_installation_id == 12345678
+    assert facts.github_repository_id == 987654321
+
+
+@pytest.mark.parametrize("event_name", ["installation", "installation_repositories"])
+def test_installation_deliveries_classify_installation_scoped(event_name: str) -> None:
+    # issue #120: installation-level notifications affect repository sets or
+    # the whole installation, never one singular repository: the delivery is
+    # relevant with installation-only identity. The `repositories_added` /
+    # `repositories_removed` arrays are deliberately not extracted — they
+    # identify what may need reconciliation, never what canonical state
+    # becomes.
+    payload = {
+        "action": "created" if event_name == "installation" else "added",
+        "installation": {"id": 12345678},
+        "repositories_added": [{"id": 111, "name": "octo/added"}],
+        "repositories_removed": [{"id": 222, "name": "octo/removed"}],
+        "repository_selection": "selected",
+    }
+
+    facts = _classify(event_name, payload)
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.RELEVANT
+    assert facts.routing_target is GitHubWebhookRoutingTarget.REPOSITORY_METADATA
+    assert facts.github_installation_id == 12345678
+    assert facts.github_repository_id is None
+    assert facts.github_issue_number is None
+    assert facts.github_pull_request_number is None
+    extracted = {getattr(facts, field) for field in dir(facts) if not field.startswith("_")}
+    assert "octo/added" not in extracted
+    assert "octo/removed" not in extracted
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload"),
+    [
+        ("installation", {"action": "created"}),  # missing installation identity
+        ("installation_repositories", {"action": "added", "repositories_added": []}),
+        ("sub_issues", {"installation": {"id": 1}}),  # missing repository identity
+        ("issue_dependencies", {"repository": {"id": 2}}),  # missing installation identity
+        ("repository", {"installation": {"id": 1}}),  # missing repository identity
+    ],
+)
+def test_new_family_payloads_without_stable_identity_fail_closed(
+    event_name: str, payload: dict[str, object]
+) -> None:
+    facts = _classify(event_name, payload)
+
+    assert facts.classification is GitHubWebhookDeliveryClassification.UNUSABLE
+    assert facts.routing_target is None
 
 
 @pytest.mark.parametrize("action", ["closed", "labeled", "unlabeled", "edited"])

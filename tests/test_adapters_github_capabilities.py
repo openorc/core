@@ -27,6 +27,7 @@ from openorc.adapters.github.authentication import GitHubAppAuthenticator
 from openorc.adapters.github.capabilities import (
     REQUIRED_V1_WEBHOOK_EVENTS,
     REQUIRED_V1_WORKFLOW_CAPABILITIES,
+    V1_CLASSIFIED_WEBHOOK_EVENTS,
     GitHubAccessValidation,
     GitHubWorkflowCapability,
     map_installation_permissions,
@@ -118,6 +119,9 @@ _FULL_V1_EVENTS = [
     "status",
     "check_run",
     "check_suite",
+    "repository",
+    "sub_issues",
+    "issue_dependencies",
 ]
 
 
@@ -236,22 +240,47 @@ def test_statuses_write_grants_the_commit_status_read_capability() -> None:
 
 
 def test_required_webhook_events_are_a_single_explicit_set() -> None:
-    # issue #122: exactly the six settled v1 event families; comments are
+    # issue #120: the six settled v1 families plus the three subscribable
+    # notification families the dispatch pipeline reconciles; comments are
     # GitHub-owned presentation/discussion data with no v1 reconciliation
     # surface.
     assert sorted(REQUIRED_V1_WEBHOOK_EVENTS) == [
         "check_run",
         "check_suite",
+        "issue_dependencies",
         "issues",
         "pull_request",
         "push",
+        "repository",
         "status",
+        "sub_issues",
     ]
 
     assert missing_required_webhook_events(frozenset(_FULL_V1_EVENTS)) == frozenset()
     missing = missing_required_webhook_events(frozenset({"issues", "pull_request"}))
     assert "check_run" in missing
     assert "push" in missing
+    assert "sub_issues" in missing
+    assert "issue_dependencies" in missing
+    assert "repository" in missing
+
+
+def test_installation_families_are_classified_but_never_required() -> None:
+    # issue #120: `installation` and `installation_repositories` are
+    # default-delivered to every GitHub App and cannot be manually
+    # subscribed, so they must never enter the subscription contract; the
+    # classification superset covers their deliveries on arrival.
+    assert "installation" not in REQUIRED_V1_WEBHOOK_EVENTS
+    assert "installation_repositories" not in REQUIRED_V1_WEBHOOK_EVENTS
+    assert REQUIRED_V1_WEBHOOK_EVENTS < V1_CLASSIFIED_WEBHOOK_EVENTS
+    assert (
+        REQUIRED_V1_WEBHOOK_EVENTS
+        | {
+            "installation",
+            "installation_repositories",
+        }
+        == V1_CLASSIFIED_WEBHOOK_EVENTS
+    )
 
 
 def test_issue_comment_subscription_is_deliberately_not_required() -> None:

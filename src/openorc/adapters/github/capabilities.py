@@ -64,6 +64,7 @@ __all__ = [
     "GITHUB_COMMIT_CHECK_RUNS_PATH",
     "GITHUB_COMMIT_COMBINED_STATUS_PATH",
     "REQUIRED_V1_WEBHOOK_EVENTS",
+    "V1_CLASSIFIED_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",
     "GitHubAccessValidation",
     "GitHubInstallationCapabilities",
@@ -124,8 +125,34 @@ REQUIRED_V1_WORKFLOW_CAPABILITIES = frozenset(
 # future on-demand UI read would not need the subscription for either. This
 # does not touch the ``issues`` write permission OpenOrc needs to publish
 # its own issue comments.
+# ``repository``, ``sub_issues``, and ``issue_dependencies`` are the v1
+# notification families issue #120 dispatches that a deployed App CAN and
+# MUST configure. ``installation`` and ``installation_repositories`` are
+# deliberately NOT required: GitHub delivers both to every App by default and
+# they cannot be manually subscribed, so requiring them would make every
+# deployment fail validation on events its App cannot configure. They are
+# classified on arrival through ``V1_CLASSIFIED_WEBHOOK_EVENTS`` instead.
 REQUIRED_V1_WEBHOOK_EVENTS = frozenset(
-    {"issues", "pull_request", "push", "status", "check_run", "check_suite"}
+    {
+        "issues",
+        "pull_request",
+        "push",
+        "status",
+        "check_run",
+        "check_suite",
+        "repository",
+        "sub_issues",
+        "issue_dependencies",
+    }
+)
+
+# The webhook families the #120 dispatch pipeline classifies onto the
+# normalized semantic reconciliation-target vocabulary: a strict superset of
+# the subscription contract, adding the two default-delivered,
+# non-configurable installation families whose deliveries still trigger
+# authoritative repository-metadata reconciliation.
+V1_CLASSIFIED_WEBHOOK_EVENTS = REQUIRED_V1_WEBHOOK_EVENTS | frozenset(
+    {"installation", "installation_repositories"}
 )
 
 # Documented GitHub REST paths owned by this adapter (issues #58 and #59).
