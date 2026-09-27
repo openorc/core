@@ -779,7 +779,10 @@ def _sweep_checks_unit(
     The projection is the typed read model mirroring the #120 CHECKS
     dispatch; the sweep records the bounded projection summary for the later
     workflow layer (the detailed check/status surfaces are re-projectable on
-    demand). A not-found outcome is a typed decline.
+    demand). A not-found outcome is a typed decline. The sweep invokes this
+    unit only after the same Task's PR reconciliation completed: the exact
+    head it addresses is established by that reconciliation, never the stale
+    durable ``head_sha``.
     """
     try:
         projection = commit_checks_projection.project_commit_checks(
@@ -1040,9 +1043,15 @@ def run_github_reconciliation_sweep(
                 )
 
         # Family 3 — branch / pull-request / checks units (bucketed by Task
-        # identity), over each configured repository's current Tasks. The PR
-        # unit runs before its checks unit so the projection addresses the
-        # freshly reconciled head.
+        # identity), over each configured repository's current Tasks. The
+        # checks unit is strictly dependent on its PR unit: only a completed
+        # PR reconciliation establishes the current authoritative head in
+        # this sweep, so a failed, uncertain, unexpected, or declined PR unit
+        # is never followed by a checks projection — the durable
+        # ``head_sha`` it would address is the last reconciled head, and
+        # presenting it as current CI evidence would misrepresent stale
+        # state. The next rotation (or an operator re-run) re-derives the
+        # unit pair from durable state.
         for repository in repositories:
             for task in list_current_repository_tasks(
                 pool, workspace_id=repository.workspace_id, repository_id=repository.id
@@ -1060,15 +1069,19 @@ def run_github_reconciliation_sweep(
                     )
                 if get_task_pull_request_for_task(pool, task_id=task.id) is None:
                     continue
-                outcomes.append(
-                    _sweep_pull_request_unit(
-                        pool,
-                        github,
-                        workspace_id=repository.workspace_id,
-                        repository_id=repository.id,
-                        task_id=task.id,
-                    )
+                pull_request_outcome = _sweep_pull_request_unit(
+                    pool,
+                    github,
+                    workspace_id=repository.workspace_id,
+                    repository_id=repository.id,
+                    task_id=task.id,
                 )
+                outcomes.append(pull_request_outcome)
+                if (
+                    pull_request_outcome.status
+                    is not GitHubReconciliationSweepUnitStatus.RECONCILED
+                ):
+                    continue
                 outcomes.append(
                     _sweep_checks_unit(
                         pool,

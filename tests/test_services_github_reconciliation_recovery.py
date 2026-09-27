@@ -81,6 +81,7 @@ _INSTALLATION_A = uuid.uuid4()
 _GITHUB_REPOSITORY_ID = 456
 _EXTERNAL_INSTALLATION_ID = 123
 _TASK_A = uuid.uuid4()
+_TASK_B = uuid.uuid4()
 _TOKEN_A = uuid.uuid4()
 _FINGERPRINT_BASE = "a" * 64
 _FINGERPRINT_NEW = "b" * 64
@@ -987,6 +988,90 @@ def test_a_missed_closed_unmerged_pr_is_a_normalized_fact(harness_factory) -> No
     assert pr_outcome.pull_request_merged is False
     assert pr_outcome.pull_request_closed_unmerged is True
     _assert_no_durable_writes(harness)
+
+
+# --- the exact-head dependency: checks only follow an established head ----------
+
+
+def _script_two_task_pr_sweep(harness: Harness) -> None:
+    """Script one sweep over two current Tasks, each with a canonical PR."""
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on(
+        "from openorc.tasks",
+        [
+            _task_row(task_id=_TASK_A, github_issue_id=502, issue_number=52),
+            _task_row(task_id=_TASK_B, github_issue_id=503, issue_number=53),
+        ],
+    )
+    # One canonical PR read per Task (family 3 derives each pair fresh).
+    conn.on("where task_id = %s", _pull_request_row(task_id=_TASK_A))
+    conn.on("where task_id = %s", _pull_request_row(task_id=_TASK_B))
+    conn.on("order by received_at, id limit %s", [])
+
+
+def test_a_failed_pr_reconciliation_never_projects_checks(harness_factory) -> None:
+    harness = harness_factory()
+    _script_two_task_pr_sweep(harness)
+    harness.pull_request_reconcile.errors = {
+        0: ExternalOperationFailedError("known provider condition")
+    }
+    harness.pull_request_reconcile.results = [_pr_reconciliation()]
+    harness.checks_projection.results = [_checks_projection()]
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+
+    pr_outcomes = [
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.PULL_REQUEST
+    ]
+    # The first Task's PR reconciliation failed: no checks projection runs for
+    # it — the durable head_sha it would address was never established as the
+    # current authoritative head in this sweep.
+    assert [o.status for o in pr_outcomes] == [
+        GitHubReconciliationSweepUnitStatus.FAILED_KNOWN,
+        GitHubReconciliationSweepUnitStatus.RECONCILED,
+    ]
+    assert [o.task_id for o in pr_outcomes] == [_TASK_A, _TASK_B]
+    # Only the independent second Task's checks were projected, and the sweep
+    # continued normally.
+    assert [call["task_id"] for call in harness.checks_projection.calls] == [_TASK_B]
+
+
+def test_an_uncertain_pr_reconciliation_never_yields_current_head_checks_evidence(
+    harness_factory,
+) -> None:
+    harness = harness_factory()
+    _script_two_task_pr_sweep(harness)
+    harness.pull_request_reconcile.errors = {0: ExternalOperationUncertainError("unknown outcome")}
+    harness.pull_request_reconcile.results = [_pr_reconciliation()]
+    harness.checks_projection.results = [_checks_projection()]
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+
+    pr_outcomes = [
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.PULL_REQUEST
+    ]
+    checks_outcomes = [
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.CHECKS
+    ]
+    # An uncertain PR read must never be followed by a result that can be
+    # mistaken for current-head CI evidence.
+    assert [o.status for o in pr_outcomes] == [
+        GitHubReconciliationSweepUnitStatus.FAILED_UNCERTAIN,
+        GitHubReconciliationSweepUnitStatus.RECONCILED,
+    ]
+    # No stale-head projection for the uncertain Task; the independent second
+    # Task's checks unit completed against its own freshly reconciled head.
+    assert [o.task_id for o in checks_outcomes] == [_TASK_B]
+    assert [call["task_id"] for call in harness.checks_projection.calls] == [_TASK_B]
 
 
 def test_duplicate_and_out_of_order_deliveries_converge_oldest_first(harness_factory) -> None:
