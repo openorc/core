@@ -56,6 +56,7 @@ from openorc.adapters.github.capabilities import (
     GITHUB_REPOSITORY_BRANCH_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
     GITHUB_REPOSITORY_PULL_REQUEST_PATH,
+    GITHUB_REPOSITORY_PULL_REQUESTS_COLLECTION_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
     missing_required_capabilities,
@@ -68,6 +69,7 @@ from openorc.adapters.github.errors import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+    GitHubPullRequestExistsError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
 )
@@ -91,8 +93,10 @@ from openorc.adapters.github.observations_checks import (
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
+    GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     parse_merge_response_payload,
+    parse_pull_request_facts,
     parse_pull_request_payload,
 )
 from openorc.adapters.github.observations_relations import (
@@ -144,6 +148,7 @@ _PULL_REQUEST_SPAN_NAME = "github.get_repository_pull_request"
 _CHECK_RUNS_SPAN_NAME = "github.get_commit_check_runs"
 _COMBINED_STATUS_SPAN_NAME = "github.get_commit_combined_status"
 _MERGE_SPAN_NAME = "github.merge_pull_request"
+_CREATE_PULL_REQUEST_SPAN_NAME = "github.create_pull_request"
 
 # The installation repository listing requests the maximum documented page
 # size (100) and is bounded so a broken pagination chain cannot loop.
@@ -271,6 +276,20 @@ class GitHubAppClient(Protocol):
         expected_head_sha: str,
     ) -> GitHubMergeRequestResult:
         """Request one exact-head merge of a pull request under GitHub's sha guard."""
+        ...
+
+    def create_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_ref: str,
+        base_ref: str,
+        title: str,
+        body: str | None,
+    ) -> GitHubPullRequestFacts:
+        """Create one branch-addressed pull request and report its stable identity."""
         ...
 
     def get_installation_capabilities(
@@ -768,6 +787,86 @@ class HttpGitHubAppClient:
                     outcome=GitHubMergeRequestOutcome.REJECTED, merge_commit_sha=None
                 )
             return parse_merge_response_payload(_json_body(response))
+
+    def create_pull_request(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        head_ref: str,
+        base_ref: str,
+        title: str,
+        body: str | None,
+    ) -> GitHubPullRequestFacts:
+        """Create one branch-addressed pull request (the documented create).
+
+        The documented ``POST /repos/{owner}/{repo}/pulls`` operation under
+        the installation access token. GitHub's create operation is
+        branch-addressed and provides no atomic expected-head guard — the
+        exact-head race is closed above this adapter (preflight + immediate
+        post-create reconciliation), never here. The request carries only
+        the presentation title/body and the branch routing facts; the
+        response is normalized into the stable PR identity and facts.
+
+        The documented 'pull request already exists' definitive rejection
+        (a branch already having an open PR toward the base) raises the
+        typed :class:`GitHubPullRequestExistsError`; every other definitive
+        rejection raises the generic classified error. Authentication,
+        access, rate-limit, and uncertain outcomes (timeout, connection
+        loss, refused redirect on this mutating request, 5xx) raise the
+        adapter's classified errors — an uncertain create is never replayed
+        by this adapter and never reclassified as a success or a known
+        failure.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        _require_non_empty_command_str(head_ref, "head_ref")
+        _require_non_empty_command_str(base_ref, "base_ref")
+        _require_non_empty_command_str(title, "title")
+        if body is not None and not isinstance(body, str):
+            raise ValueError("body must be None or a string")
+        with application_span(_TRACER_SCOPE, _CREATE_PULL_REQUEST_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_CREATE_PULL_REQUEST_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+            )
+            path = GITHUB_REPOSITORY_PULL_REQUESTS_COLLECTION_PATH.format(
+                owner=owner_login, repo=repository_name
+            )
+            payload: dict[str, str] = {
+                "head": head_ref,
+                "base": base_ref,
+                "title": title,
+            }
+            if body is not None:
+                payload["body"] = body
+            request_body = json.dumps(payload).encode("utf-8")
+            try:
+                response = self._post_with_installation_token(
+                    github_installation_id, path, request_body
+                )
+            except (
+                GitHubAuthenticationRejectedError,
+                GitHubAuthorizationRejectedError,
+                GitHubPullRequestExistsError,
+                GitHubRateLimitedError,
+            ):
+                raise
+            except GitHubRequestRejectedError as error:
+                if error.status_code == 422:
+                    # The documented 'pull request already exists' answer:
+                    # a branch-addressed create that GitHub refused because
+                    # an open PR already exists for the head/base. Classified
+                    # here so services never branch on raw status codes.
+                    raise GitHubPullRequestExistsError(
+                        "a pull request already exists for the addressed branch and base",
+                        status_code=422,
+                    ) from error
+                raise
+            return parse_pull_request_facts(_json_body(response))
 
     def get_issue_blocked_by(
         self,

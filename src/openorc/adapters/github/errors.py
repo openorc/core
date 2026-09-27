@@ -44,6 +44,7 @@ __all__ = [
     "GitHubAuthenticationRejectedError",
     "GitHubAuthorizationRejectedError",
     "GitHubOutcomeUncertainError",
+    "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
 ]
@@ -68,6 +69,18 @@ class GitHubRequestRejectedError(Exception):
 
 class GitHubAuthenticationRejectedError(GitHubRequestRejectedError):
     """GitHub rejected the presented App JWT or installation token (401)."""
+
+
+class GitHubPullRequestExistsError(GitHubRequestRejectedError):
+    """GitHub answered the documented 'pull request already exists' rejection.
+
+    The PR-create operation's own documented finer classification of a
+    definitive rejection (a branch already has an open PR toward the base).
+    Carries only the bare HTTP status like every definitive rejection —
+    never provider content. Whether this means a silent adoption, a
+    conflict, or a replay condition is workflow meaning decided strictly
+    above the adapter.
+    """
 
 
 class GitHubAuthorizationRejectedError(GitHubRequestRejectedError):

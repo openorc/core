@@ -301,6 +301,9 @@ class FakeGitHubAppClient:
     def get_repository_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not observe pull requests")
 
+    def create_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not create pull requests")
+
     def get_commit_check_runs(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not project check runs")
 

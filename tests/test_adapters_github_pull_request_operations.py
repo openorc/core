@@ -45,6 +45,7 @@ from openorc.adapters.github.observations_checks import (
 )
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
+    GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     parse_merge_response_payload,
     parse_pull_request_payload,
@@ -775,3 +776,113 @@ def test_parser_surface_rejects_uninterpretable_shapes() -> None:
         parse_pull_request_payload({"id": 1}, owner_login="o", repository_name="r", pull_number=1)
     with pytest.raises(GitHubOutcomeUncertainError):
         parse_merge_response_payload({"merged": True})
+
+
+def test_create_pull_request_uses_the_documented_collection_operation() -> None:
+    fetch = FakeFetcher([_mint_response(), _json(201, {}, _pr_payload())])
+
+    facts = _client(fetch).create_pull_request(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        head_ref="openorc/task-42",
+        base_ref="main",
+        title="feat: task 42",
+        body="Closes #42",
+    )
+
+    assert isinstance(facts, GitHubPullRequestFacts)
+    assert facts.github_pr_id == 900_719_925_474_099
+    assert facts.pull_number == _PULL_NUMBER
+    assert facts.head_sha == _HEAD_SHA
+    assert fetch.calls[1][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls"
+    assert fetch.calls[1][1] == "POST"
+    sent = json.loads(fetch.calls[1][4] or b"{}")
+    assert sent == {
+        "head": "openorc/task-42",
+        "base": "main",
+        "title": "feat: task 42",
+        "body": "Closes #42",
+    }
+
+
+def test_create_pull_request_omits_an_absent_body() -> None:
+    fetch = FakeFetcher([_mint_response(), _json(201, {}, _pr_payload())])
+
+    _client(fetch).create_pull_request(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        head_ref="openorc/task-42",
+        base_ref="main",
+        title="feat: task 42",
+        body=None,
+    )
+
+    sent = json.loads(fetch.calls[1][4] or b"{}")
+    assert "body" not in sent
+
+
+def test_create_pull_request_already_exists_is_a_typed_classified_rejection() -> None:
+    from openorc.adapters.github import GitHubPullRequestExistsError
+
+    fetch = FakeFetcher([_mint_response(), _json(422, {}, {"message": "Validation Failed"})])
+
+    with pytest.raises(GitHubPullRequestExistsError) as exc_info:
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+    # Only the bare status is carried; provider content never leaks.
+    assert exc_info.value.status_code == 422
+
+
+def test_create_pull_request_other_definitive_rejections_stay_classified() -> None:
+    fetch = FakeFetcher([_mint_response(), _json(403, {}, {"message": "denied"})])
+
+    with pytest.raises(GitHubAuthorizationRejectedError):
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+
+def test_create_pull_request_connection_loss_is_uncertain() -> None:
+    fetch = FakeFetcher([_mint_response(), ConnectionResetError("lost")])
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+
+def test_create_pull_request_uninterpretable_success_is_uncertain() -> None:
+    fetch = FakeFetcher([_mint_response(), _json(201, {}, {"id": "not-an-int"})])
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
