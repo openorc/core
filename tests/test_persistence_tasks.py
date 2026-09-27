@@ -30,6 +30,7 @@ from openorc.persistence.tasks import (
     find_current_task_by_branch,
     find_current_task_for_issue,
     get_task,
+    list_current_repository_tasks,
     list_issue_attempts,
     list_workspace_tasks,
     set_current_owner_gate,
@@ -559,3 +560,33 @@ def test_set_current_owner_gate_requires_a_uuid_gate_identity() -> None:
             owner_gate_id="not-a-uuid",  # type: ignore[arg-type]
         )
     assert fake_conn.executed == []
+
+
+def test_current_repository_tasks_listing_maps_rows_deterministically() -> None:
+    rows = [_task_row(), _task_row()]
+    fake_conn = FakeConnection(None, rows)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_current_repository_tasks(pool, workspace_id=rows[0][1], repository_id=rows[0][2])
+
+    assert [task.id for task in listed] == [rows[0][0], rows[1][0]]
+    assert all(task.archived_at is None for task in listed)
+    sql, params = fake_conn.executed[0]
+    # One WHERE clause; the current-work filter narrows the repository scope.
+    assert sql.count(" where ") == 1
+    assert "where workspace_id = %s" in sql
+    assert "and repository_id = %s" in sql
+    assert "and archived_at is null" in sql
+    assert sql.index("where workspace_id") < sql.index("and archived_at is null")
+    assert "order by github_issue_id, id" in sql
+    assert params == (rows[0][1], rows[0][2])
+
+
+def test_current_repository_tasks_listing_with_no_rows_returns_an_empty_list() -> None:
+    fake_conn = FakeConnection(None, [])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        list_current_repository_tasks(pool, workspace_id=uuid.uuid4(), repository_id=uuid.uuid4())
+        == []
+    )

@@ -51,6 +51,7 @@ __all__ = [
     "get_repository",
     "get_workspace",
     "get_workspace_for_update",
+    "list_github_routed_repositories",
     "mark_account_deletion_attempt_uncertain",
     "read_account_deletion_state_for_key_share",
     "reclaim_expired_account_deletion_attempt",
@@ -387,6 +388,23 @@ def find_repository_by_github_identity(
             (workspace_id, identity.github_repository_id),
         ).fetchone()
     return None if row is None else _repository_from_row(row)
+
+
+def list_github_routed_repositories(pool: DatabasePool) -> list[Repository]:
+    """List every Repository with a configured GitHub installation route.
+
+    The bounded work-set enumeration for the #62 repeatable reconciliation
+    sweep: only repositories explicitly routed to an installation participate
+    in GitHub reconciliation, and the listing is database-only (no external
+    I/O), deterministic (ordered by Workspace then record id), and inherently
+    bounded by deployment configuration — never a GitHub-side crawl.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
+            "where github_installation_id is not null order by workspace_id, id",
+        ).fetchall()
+    return [_repository_from_row(row) for row in rows]
 
 
 def update_repository_metadata(

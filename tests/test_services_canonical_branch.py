@@ -43,6 +43,7 @@ from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
+    NotFoundError,
     StaleOperationError,
 )
 
@@ -627,3 +628,112 @@ def test_telemetry_uses_only_the_sanctioned_attribute_vocabulary() -> None:
     assert attributes[OPERATION] == "canonical_branch.verify_canonical_task_branch"
     assert attributes[WORKSPACE_ID] == str(_WORKSPACE_ID)
     assert attributes[TASK_ID] == str(_TASK_ID)
+
+
+# --- the system-capable bound-branch observation (issue #62) ---------------------
+
+
+def test_the_observation_reports_the_github_sourced_bound_branch_head() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.tasks", _task_row(canonical_feature_branch=_CLAIMED_BRANCH))
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=_branch_observation(sha=_HEAD_SHA),
+    )
+
+    observation = canonical_branch.observe_bound_canonical_task_branch(
+        _pool(conn), github, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert observation.task_id == _TASK_ID
+    assert observation.branch_name == _CLAIMED_BRANCH
+    assert observation.head_sha == _HEAD_SHA
+    assert github.branch_calls[0]["branch_name"] == _CLAIMED_BRANCH
+    # Database reads only: the task read plus the two durable route reads,
+    # and no durable write, no binding, no state-token rotation.
+    assert len(conn.executed) == 3
+
+
+def test_an_unbound_task_is_a_typed_not_found_without_any_github_call() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.tasks", _task_row(canonical_feature_branch=None))
+    github = FakeGitHubAppClient(pool=FakePool(conn))
+
+    with pytest.raises(NotFoundError):
+        canonical_branch.observe_bound_canonical_task_branch(
+            _pool(conn), github, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+
+    assert github.repository_calls == []
+    assert github.branch_calls == []
+    assert len(conn.executed) == 1
+
+
+def test_an_archived_or_foreign_task_is_a_uniform_not_found() -> None:
+    for row in (
+        _task_row(archived_at=_OBSERVED, status="completed"),
+        _task_row(workspace_id=uuid.uuid4()),
+    ):
+        conn = ScriptedConnection()
+        conn.on("from openorc.tasks", row)
+        github = FakeGitHubAppClient(pool=FakePool(conn))
+
+        with pytest.raises(NotFoundError):
+            canonical_branch.observe_bound_canonical_task_branch(
+                _pool(conn), github, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+            )
+
+        assert github.repository_calls == []
+        assert github.branch_calls == []
+
+
+def test_a_missing_branch_or_lost_access_is_the_normalized_access_condition() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.tasks", _task_row(canonical_feature_branch=_CLAIMED_BRANCH))
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        error=GitHubAuthorizationRejectedError("not accessible"),
+    )
+
+    with pytest.raises(AuthorizationError):
+        canonical_branch.observe_bound_canonical_task_branch(
+            _pool(conn), github, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+
+
+def test_an_uncertain_branch_read_stays_uncertain() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.tasks", _task_row(canonical_feature_branch=_CLAIMED_BRANCH))
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_error=GitHubOutcomeUncertainError("unknown outcome"),
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        canonical_branch.observe_bound_canonical_task_branch(
+            _pool(conn), github, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+
+
+def test_malformed_observation_commands_are_classified_before_any_work() -> None:
+    conn = ScriptedConnection()
+    github = FakeGitHubAppClient(pool=FakePool(conn))
+
+    with pytest.raises(InvalidCommandError):
+        canonical_branch.observe_bound_canonical_task_branch(
+            _pool(conn),
+            github,
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            task_id=_TASK_ID,
+        )
+
+    assert conn.executed == []
+    assert github.repository_calls == []

@@ -42,6 +42,7 @@ from openorc.persistence.github_issues import (
     GitHubIssueReconcileOutcome,
     find_github_issue,
     find_github_issue_by_number,
+    list_open_repository_github_issues,
     reconcile_github_issue,
 )
 from openorc.persistence.pool import DatabasePool
@@ -58,11 +59,19 @@ _FINGERPRINT = github_issue_requirements_fingerprint("Found a bug", "Steps to re
 
 
 class FakeCursor:
-    def __init__(self, row: tuple[Any, ...] | None) -> None:
+    def __init__(
+        self,
+        row: tuple[Any, ...] | None,
+        rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self._row = row
+        self._rows = rows if rows is not None else ([] if row is None else [row])
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self._row
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._rows)
 
 
 class ScriptedConnection:
@@ -70,9 +79,13 @@ class ScriptedConnection:
 
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
-        self._handlers: list[tuple[str, tuple[Any, ...] | None | Exception]] = []
+        self._handlers: list[
+            tuple[str, tuple[Any, ...] | list[tuple[Any, ...]] | None | Exception]
+        ] = []
 
-    def on(self, sql_marker: str, result: tuple[Any, ...] | None | Exception) -> None:
+    def on(
+        self, sql_marker: str, result: tuple[Any, ...] | list[tuple[Any, ...]] | None | Exception
+    ) -> None:
         self._handlers.append((sql_marker.lower(), result))
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
@@ -83,6 +96,8 @@ class ScriptedConnection:
                 del self._handlers[index]
                 if isinstance(result, Exception):
                     raise result
+                if isinstance(result, list):
+                    return FakeCursor(None, result)
                 return FakeCursor(result)
         raise AssertionError(f"no scripted handler matched: {sql}")
 
@@ -383,3 +398,38 @@ def test_malformed_command_arguments_are_rejected_before_any_sql() -> None:
         )
 
     assert conn.executed == []
+
+
+def test_open_issue_listing_maps_open_rows_deterministically() -> None:
+    conn = ScriptedConnection()
+    conn.on(
+        "from openorc.github_issues",
+        [
+            _issue_row(github_issue_id=501, issue_number=41),
+            _issue_row(github_issue_id=503, issue_number=43),
+        ],
+    )
+
+    listed = list_open_repository_github_issues(
+        _pool(conn), workspace_id=_WORKSPACE_ID, repository_id=_REPOSITORY_ID
+    )
+
+    assert [projection.identity.github_issue_id for projection in listed] == [501, 503]
+    assert all(projection.state is GitHubIssueState.OPEN for projection in listed)
+    sql, params = conn.executed[0]
+    # The bounded current-work predicate: only open tracked projections.
+    assert "state = %s" in sql
+    assert "order by github_issue_id" in sql
+    assert params == (_WORKSPACE_ID, _REPOSITORY_ID, GitHubIssueState.OPEN.value)
+
+
+def test_open_issue_listing_with_no_rows_returns_an_empty_list() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.github_issues", [])
+
+    assert (
+        list_open_repository_github_issues(
+            _pool(conn), workspace_id=_WORKSPACE_ID, repository_id=_REPOSITORY_ID
+        )
+        == []
+    )

@@ -32,6 +32,7 @@ from openorc.persistence.ownership import (
     get_project,
     get_repository,
     get_workspace,
+    list_github_routed_repositories,
     set_repository_installation_route,
     update_repository_metadata,
     update_workspace_guidance,
@@ -41,25 +42,38 @@ from openorc.persistence.pool import DatabasePool
 
 
 class FakeCursor:
-    """Returns one canned row, like a psycopg cursor."""
+    """Returns one canned row and/or canned rows, like a psycopg cursor."""
 
-    def __init__(self, row: tuple[Any, ...] | None) -> None:
+    def __init__(
+        self,
+        row: tuple[Any, ...] | None,
+        rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self._row = row
+        self._rows = rows if rows is not None else ([] if row is None else [row])
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self._row
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._rows)
 
 
 class FakeConnection:
     """Records executed SQL and returns canned rows."""
 
-    def __init__(self, row: tuple[Any, ...] | None = None) -> None:
+    def __init__(
+        self,
+        row: tuple[Any, ...] | None = None,
+        rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self.row = row
+        self.rows = rows
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
-        return FakeCursor(self.row)
+        return FakeCursor(self.row, self.rows)
 
 
 class FakePool:
@@ -511,3 +525,30 @@ def test_update_workspace_guidance_replaces_the_current_value() -> None:
     assert changed is False
     assert previous == prose
     assert len(noop_conn.executed) == 1
+
+
+def test_routed_repository_listing_maps_rows_deterministically() -> None:
+    first = list(_repository_row())
+    second = list(_repository_row())
+    first[-1] = uuid.uuid4()
+    second[-1] = uuid.uuid4()
+    fake_conn = FakeConnection(None, [tuple(first), tuple(second)])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_github_routed_repositories(pool)
+
+    assert [repository.id for repository in listed] == [first[0], second[0]]
+    assert all(repository.github_installation_id is not None for repository in listed)
+    sql, params = fake_conn.executed[0]
+    # The bounded work-set enumeration: only explicitly routed repositories.
+    assert "github_installation_id is not null" in sql
+    assert "order by workspace_id, id" in sql
+    # No parameters: the bounded enumeration is an unfiltered durable read.
+    assert params is None
+
+
+def test_routed_repository_listing_with_no_rows_returns_an_empty_list() -> None:
+    fake_conn = FakeConnection(None, [])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert list_github_routed_repositories(pool) == []

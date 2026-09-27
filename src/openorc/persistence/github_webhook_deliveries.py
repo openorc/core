@@ -52,6 +52,7 @@ from openorc.persistence.transactions import transaction
 
 __all__ = [
     "get_github_webhook_delivery",
+    "list_github_webhook_deliveries_requiring_recovery",
     "list_github_webhook_delivery_routes",
     "mark_github_webhook_delivery_processed",
     "record_github_webhook_delivery",
@@ -203,3 +204,27 @@ def mark_github_webhook_delivery_processed(pool: DatabasePool, *, delivery_id: U
             (delivery_id,),
         ).fetchone()
     return row is not None
+
+
+def list_github_webhook_deliveries_requiring_recovery(
+    pool: DatabasePool, *, limit: int
+) -> list[GitHubWebhookDelivery]:
+    """List accepted relevant deliveries whose processing is still unresolved.
+
+    The bounded recovery work set for the #62 repeatable reconciliation sweep:
+    durable delivery records only (never payloads, signatures, or queue
+    state), oldest first with a deterministic tiebreak, and explicitly limited
+    so one sweep invocation's recovery batch stays bounded — completed
+    deliveries leave the set through the bounded ``processed_at`` marking, so
+    repeated sweeps drain the backlog. The limit must be a positive integer.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_DELIVERY_COLUMNS} from openorc.github_webhook_deliveries "
+            "where classification = %s and processed_at is null "
+            "order by received_at, id limit %s",
+            (GitHubWebhookDeliveryClassification.RELEVANT.value, limit),
+        ).fetchall()
+    return [_delivery_from_row(row) for row in rows]

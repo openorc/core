@@ -55,6 +55,7 @@ __all__ = [
     "GitHubIssueReconcileResult",
     "find_github_issue",
     "find_github_issue_by_number",
+    "list_open_repository_github_issues",
     "list_repository_github_issues",
     "reconcile_github_issue",
 ]
@@ -455,5 +456,26 @@ def list_repository_github_issues(
             f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
             "where workspace_id = %s and repository_id = %s order by github_issue_id",
             (workspace_id, repository_id),
+        ).fetchall()
+    return [_github_issue_from_row(row) for row in rows]
+
+
+def list_open_repository_github_issues(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID
+) -> list[GitHubIssueProjection]:
+    """List one Workspace Repository's open tracked issue projections, deterministically ordered.
+
+    The bounded current-work issue set for the #62 repeatable reconciliation
+    sweep: only projections whose durable observed state is open participate
+    (closed historical issues have no current reconciliation subject unless a
+    current Task still backs them, which the sweep composes separately from
+    the durable Task set). Database-only; ordered by stable issue identity.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
+            "where workspace_id = %s and repository_id = %s and state = %s "
+            "order by github_issue_id",
+            (workspace_id, repository_id, GitHubIssueState.OPEN.value),
         ).fetchall()
     return [_github_issue_from_row(row) for row in rows]

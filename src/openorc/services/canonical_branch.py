@@ -48,6 +48,7 @@ from openorc.adapters.github import (
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import DatabasePool
+from openorc.persistence.tasks import get_task
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
@@ -55,6 +56,7 @@ from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
+    NotFoundError,
 )
 from openorc.services.github_installation_route import (
     resolve_system_repository_installation_route,
@@ -63,7 +65,9 @@ from openorc.services.task_mutations import bind_canonical_branch
 from openorc.services.task_subject_guards import require_current_task
 
 __all__ = [
+    "CanonicalBranchObservation",
     "CanonicalBranchVerification",
+    "observe_bound_canonical_task_branch",
     "verify_canonical_task_branch",
 ]
 
@@ -220,4 +224,94 @@ def verify_canonical_task_branch(
             branch=branch_observation.branch_name,
             verified_head_sha=branch_observation.head_sha,
             bound_now=bound_now,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalBranchObservation:
+    """The authoritative branch facts of one Task's bound canonical branch.
+
+    A typed read model (issue #62): the bound branch exists and its exact
+    committed head SHA was freshly observed from GitHub. No durable write, no
+    binding, no state-token rotation happens here — the later Task workflow
+    decides what the observed head authorizes.
+    """
+
+    task_id: UUID
+    workspace_id: UUID
+    branch_name: str
+    head_sha: str
+
+
+_OBSERVE_SPAN_NAME = "canonical_branch.observe_bound_canonical_task_branch"
+
+
+def observe_bound_canonical_task_branch(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+) -> CanonicalBranchObservation:
+    """Observe the Task's bound canonical branch from fresh GitHub authority.
+
+    The system-capable read-model complement of
+    :func:`verify_canonical_task_branch` for the #62 repeatable reconciliation
+    sweep: the Task must exist in the Workspace, be current, and carry its
+    one-time bound canonical branch (uniform ``NotFoundError`` otherwise —
+    the sweep typedly declines; this observation never binds a branch and
+    never rotates a state token). The durable route is resolved, then the two
+    documented reads — the fresh repository address, then the branch
+    addressed by its exact bound name — occur with no database transaction
+    open. A missing/deleted branch or an access failure is the normalized
+    GitHub integration condition (typed ``AuthorizationError``), never
+    permission to trust runtime-local state.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise InvalidCommandError("workspace_id must be a UUID")
+    if not isinstance(task_id, UUID):
+        raise InvalidCommandError("task_id must be a UUID")
+    with application_span(_SERVICE_TRACER_SCOPE, _OBSERVE_SPAN_NAME) as span:
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
+        annotate_span(
+            span,
+            operation=_OBSERVE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        task = get_task(pool, task_id)
+        if task is None or task.workspace_id != workspace_id or task.archived_at is not None:
+            raise NotFoundError("the requested task is not available in this workspace")
+        if task.canonical_feature_branch is None:
+            raise NotFoundError("the task has no bound canonical feature branch")
+        route = resolve_system_repository_installation_route(
+            pool, workspace_id=workspace_id, repository_id=task.repository_id
+        )
+        try:
+            repository_observation: GitHubRepositoryObservation = (
+                github.get_installation_repository(
+                    github_installation_id=route.github_installation_id,
+                    github_repository_id=route.repository.identity.github_repository_id,
+                )
+            )
+            branch_observation = github.get_repository_branch(
+                github_installation_id=route.github_installation_id,
+                owner_login=repository_observation.owner_login,
+                repository_name=repository_observation.name,
+                branch_name=task.canonical_feature_branch,
+            )
+        except (
+            GitHubAuthorizationRejectedError,
+            GitHubAuthenticationRejectedError,
+            GitHubRateLimitedError,
+            GitHubRequestRejectedError,
+            GitHubOutcomeUncertainError,
+        ) as error:
+            raise _translate_github_outcome(error) from error
+        return CanonicalBranchObservation(
+            task_id=task_id,
+            workspace_id=workspace_id,
+            branch_name=branch_observation.branch_name,
+            head_sha=branch_observation.head_sha,
         )

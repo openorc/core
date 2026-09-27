@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
+import pytest
+
 from openorc.domain.github_webhooks import (
     GitHubWebhookDeliveryClassification,
     GitHubWebhookDeliveryIntake,
@@ -25,6 +27,7 @@ from openorc.domain.github_webhooks import (
 )
 from openorc.persistence.github_webhook_deliveries import (
     get_github_webhook_delivery,
+    list_github_webhook_deliveries_requiring_recovery,
     list_github_webhook_delivery_routes,
     mark_github_webhook_delivery_processed,
     record_github_webhook_delivery,
@@ -37,24 +40,34 @@ _UTC_OBSERVED = datetime(2026, 9, 26, 12, 0, 0, tzinfo=UTC)
 
 
 class FakeCursor:
-    def __init__(self, row: tuple[Any, ...] | None) -> None:
+    def __init__(
+        self,
+        row: tuple[Any, ...] | None,
+        rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self._row = row
+        self._rows = rows if rows is not None else ([] if row is None else [row])
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self._row
 
     def fetchall(self) -> list[tuple[Any, ...]]:
-        return [] if self._row is None else [self._row]
+        return list(self._rows)
 
 
 class FakeConnection:
-    def __init__(self, row: tuple[Any, ...] | None = None) -> None:
+    def __init__(
+        self,
+        row: tuple[Any, ...] | None = None,
+        rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self.row = row
+        self.rows = rows
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
-        return FakeCursor(self.row)
+        return FakeCursor(self.row, self.rows)
 
 
 class FakePool:
@@ -255,3 +268,32 @@ def test_already_processed_or_absent_marking_returns_false() -> None:
     conn = FakeConnection(row=None)
 
     assert mark_github_webhook_delivery_processed(_pool(conn), delivery_id=uuid.uuid4()) is False
+
+
+def test_recovery_listing_maps_unresolved_relevant_deliveries_bounded() -> None:
+    unresolved = _delivery_row()
+    fake_conn = FakeConnection(None, [unresolved, _delivery_row()])
+
+    listed = list_github_webhook_deliveries_requiring_recovery(_pool(fake_conn), limit=25)
+
+    assert [delivery.delivery_guid for delivery in listed] == ["guid-1", "guid-1"]
+    assert all(delivery.processed_at is None for delivery in listed)
+    sql, params = fake_conn.executed[0]
+    # The bounded recovery work set: relevant and unresolved only, oldest
+    # first, explicitly limited.
+    assert "classification = %s" in sql
+    assert "processed_at is null" in sql
+    assert "order by received_at, id limit %s" in sql
+    assert params == ("relevant", 25)
+
+
+def test_the_recovery_listing_rejects_a_non_positive_limit() -> None:
+    conn = FakeConnection(row=None)
+
+    for bad_limit in (0, -1, True, 2.5, "5"):
+        with pytest.raises(ValueError):
+            list_github_webhook_deliveries_requiring_recovery(
+                _pool(conn),
+                limit=bad_limit,  # type: ignore[arg-type]
+            )
+    assert conn.executed == []

@@ -458,3 +458,58 @@ def test_the_processing_instant_round_trips_through_the_repository(conn: Connect
 
     # Idempotent replay: an already-marked delivery answers False.
     assert mark_github_webhook_delivery_processed(pool, delivery_id=delivery_id) is False
+
+
+def test_the_recovery_query_filters_unresolved_relevant_deliveries_bounded(
+    conn: Connection,
+) -> None:
+    # The #62 recovery work set: accepted relevant deliveries whose bounded
+    # processed_at recovery instant is still null, oldest first under an
+    # explicit limit. A processed delivery and an ignored delivery never
+    # enter it; ordering is received-at then durable id.
+    _insert_delivery(conn, "guid-newer")
+    _insert_delivery(conn, "guid-older")
+    conn.execute(
+        "update openorc.github_webhook_deliveries "
+        "set received_at = received_at - interval '1 hour' "
+        "where delivery_guid = 'guid-older'"
+    )
+    _insert_delivery(
+        conn,
+        "guid-ignored",
+        classification="ignored",
+        routing_target=None,
+        routing_resolution=None,
+    )
+    _insert_delivery(conn, "guid-processed")
+    conn.execute(
+        "update openorc.github_webhook_deliveries set processed_at = now() "
+        "where delivery_guid = 'guid-processed'"
+    )
+
+    rows = conn.execute(
+        "select delivery_guid from openorc.github_webhook_deliveries "
+        "where classification = 'relevant' and processed_at is null "
+        "order by received_at, id limit 1"
+    ).fetchall()
+
+    assert [row[0] for row in rows] == ["guid-older"]
+
+    bounded = conn.execute(
+        "select delivery_guid from openorc.github_webhook_deliveries "
+        "where classification = 'relevant' and processed_at is null "
+        "order by received_at, id limit 1 offset 1"
+    ).fetchall()
+    assert [row[0] for row in bounded] == ["guid-newer"]
+
+
+def test_the_recovery_pending_partial_index_exists(conn: Connection) -> None:
+    row = conn.execute(
+        "select indexdef from pg_indexes "
+        "where schemaname = 'openorc' "
+        "and indexname = 'github_webhook_deliveries_recovery_pending_idx'"
+    ).fetchone()
+
+    assert row is not None
+    assert "classification = 'relevant'" in row[0]
+    assert "processed_at IS NULL" in row[0]

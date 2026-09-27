@@ -182,3 +182,32 @@ def test_the_processing_state_migration_adds_no_grants_or_foreign_keys() -> None
     # only new constraint is the bounded CHECK on the delivery table itself.
     assert "foreign key (" not in sql_only
     assert "references openorc." not in sql_only
+
+
+def _recovery_index_migration_text() -> str:
+    matches = sorted(
+        p.name for p in MIGRATIONS_DIR.glob("*_add_github_webhook_delivery_recovery_index.sql")
+    )
+    assert len(matches) == 1, f"expected exactly one recovery-index migration, found {matches}"
+    return (MIGRATIONS_DIR / matches[0]).read_text(encoding="utf-8")
+
+
+def test_the_recovery_query_migration_adds_the_bounded_partial_index() -> None:
+    text = _recovery_index_migration_text()
+
+    assert "create index github_webhook_deliveries_recovery_pending_idx" in text
+    assert "where classification = 'relevant' and processed_at is null" in text
+    # The bounded recovery batch reads oldest first under an explicit limit.
+    assert "(received_at, id)" in text
+
+
+def test_the_recovery_query_migration_changes_no_grants_or_foreign_keys() -> None:
+    text = _recovery_index_migration_text().lower()
+
+    # The migration is exactly one index creation: no grants, no foreign keys,
+    # no constraint drops, no table alterations.
+    assert "grant " not in text
+    assert "add constraint" not in text
+    assert "references" not in text
+    assert "alter table" not in text
+    assert "drop constraint" not in text
