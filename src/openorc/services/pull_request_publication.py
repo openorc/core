@@ -81,7 +81,7 @@ from openorc.persistence.pull_requests import (
     get_task_pull_request_for_task,
     reconcile_task_pull_request_observed,
 )
-from openorc.persistence.tasks import get_task
+from openorc.persistence.tasks import get_task, get_task_for_update
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
@@ -99,6 +99,8 @@ from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
+    "ExternalOperationReconciliationRequiredError",
+    "ExternalOperationRecoveryRequiredError",
     "PublicationCommand",
     "TaskPullRequestPublication",
     "TaskPullRequestPublicationOutcome",
@@ -107,6 +109,31 @@ __all__ = [
 
 _SERVICE_TRACER_SCOPE = "openorc.services.pull_request_publication"
 _PUBLISH_SPAN_NAME = "pull_request_publication.publish_task_pull_request"
+
+
+class ExternalOperationRecoveryRequiredError(ExternalOperationFailedError):
+    """Known external success whose durable persistence afterwards failed.
+
+    The external side effect is no longer hypothetical — GitHub may already
+    contain the created pull request — so the outcome is neither a clean
+    success nor a known failure of the external operation: it is the typed
+    recovery-required condition. It forces authoritative
+    reconciliation/recovery through the canonical record (or its documented
+    absence) and prohibits any automatic second create; it never erases or
+    denies the known external creation.
+    """
+
+
+class ExternalOperationReconciliationRequiredError(ExternalOperationFailedError):
+    """Known external creation whose mandatory reconciliation afterwards failed.
+
+    Once the create request returned known success, a failure of the
+    mandatory immediate authoritative re-read (a known provider condition)
+    leaves the external PR un-reconciled: the same typed recovery-required
+    posture as a persistence failure, with the identical prohibition on
+    automatic second creates.
+    """
+
 
 _OBSERVED_STATES: dict[str, TaskPullRequestState] = {
     "open": TaskPullRequestState.OPEN,
@@ -313,11 +340,15 @@ def _persist_created_pull_request(
     happened and is never undone). Order is load-bearing:
 
     1. the derived account-deletion barrier is the first lock acquisition;
-    2. the Task row is reloaded under lock and the exact ``state_token``
-       revalidated — a moved token means the authority context went stale
-       in flight, and the created PR is STILL persisted with its
-       authoritative reconciled facts (the external fact is never erased)
-       while the caller receives the stale classification;
+    2. the Task row is reloaded under an EXCLUSIVE row lock
+       (``get_task_for_update``) and the exact ``state_token`` revalidated —
+       the lock is held through the canonical-record persistence, so a
+       concurrent token rotation/archival serializes on the row lock and can
+       never slip between this recheck and the durable write; a moved token
+       means the authority context went stale in flight, and the created PR
+       is STILL persisted with its authoritative reconciled facts (the
+       external fact is never erased) while the caller receives the stale
+       classification;
     3. the Repository route is revalidated under lock exactly as the #63
        reconciliation composes it (a moved route is likewise stale in
        flight, with the same preservation rule);
@@ -326,59 +357,78 @@ def _persist_created_pull_request(
        persisted the record, the observed snapshot is reconciled into it,
        update-only: never a second create and never a rewrite.
 
-    A persistence failure here (driver error, constraint violation) raises
-    through: the recovery-required condition, never an automatic second
-    create and never an erasure of the known external creation.
+    A persistence failure here (driver error, constraint violation) is
+    translated into the typed recovery-required classification — the
+    external creation is known and never denied; no automatic second create
+    exists and recovery reconciles through the canonical record.
     """
     observed_state = _OBSERVED_STATES[observation.state]
-    with composed_transaction(pool) as tx_pool:
-        workspace = get_workspace(tx_pool, workspace_id)
-        if workspace is None:
-            raise NotFoundError("the requested workspace is not available")
-        # Account-wide Owner-mutation barrier (#97), the FIRST lock
-        # acquisition of this write phase.
-        require_account_operational(tx_pool, profile_id=workspace.owner_profile_id)
-        reloaded_task = get_task(tx_pool, task_id)
-        if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        authority_stale = (
-            reloaded_task.archived_at is not None
-            or reloaded_task.state_token != expected_state_token
-        )
-        reloaded = get_repository_for_update(tx_pool, repository_id)
-        if reloaded is None or reloaded.workspace_id != workspace_id:
-            raise NotFoundError("the requested repository is not available in this workspace")
-        if reloaded.github_installation_id != read_installation_id:
-            authority_stale = True
-        existing = get_task_pull_request_for_task(tx_pool, task_id=task_id)
-        if existing is not None:
-            # A concurrent publication (or a recovery replay after a
-            # persistence failure) already persisted the canonical record:
-            # never a second create and never a rewrite — the observed
-            # snapshot is reconciled in place, update-only.
-            reconcile_task_pull_request_observed(
+    try:
+        with composed_transaction(pool) as tx_pool:
+            workspace = get_workspace(tx_pool, workspace_id)
+            if workspace is None:
+                raise NotFoundError("the requested workspace is not available")
+            # Account-wide Owner-mutation barrier (#97), the FIRST lock
+            # acquisition of this write phase.
+            require_account_operational(tx_pool, profile_id=workspace.owner_profile_id)
+            # The Task row under an EXCLUSIVE row lock, held through the
+            # canonical-record persistence: the state-token classification
+            # serializes against concurrent Task mutations instead of
+            # racing past them.
+            reloaded_task = get_task_for_update(tx_pool, task_id)
+            if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+                raise NotFoundError("the requested task is not available in this workspace")
+            authority_stale = (
+                reloaded_task.archived_at is not None
+                or reloaded_task.state_token != expected_state_token
+            )
+            reloaded = get_repository_for_update(tx_pool, repository_id)
+            if reloaded is None or reloaded.workspace_id != workspace_id:
+                raise NotFoundError("the requested repository is not available in this workspace")
+            if reloaded.github_installation_id != read_installation_id:
+                authority_stale = True
+            existing = get_task_pull_request_for_task(tx_pool, task_id=task_id)
+            if existing is not None:
+                # A concurrent publication (or a recovery replay after a
+                # persistence failure) already persisted the canonical
+                # record: never a second create and never a rewrite — the
+                # observed snapshot is reconciled in place, update-only.
+                reconcile_task_pull_request_observed(
+                    tx_pool,
+                    task_pull_request_id=existing.id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    head_ref=observation.head_ref,
+                    base_ref=observation.base_ref,
+                    head_sha=observation.head_sha,
+                    state=observed_state,
+                    merged_at=observation.merged_at,
+                )
+                return _WritePhaseResult(pull_request=existing, authority_stale=authority_stale)
+            created = create_task_pull_request(
                 tx_pool,
-                task_pull_request_id=existing.id,
                 workspace_id=workspace_id,
                 task_id=task_id,
+                repository_id=repository_id,
+                github_pr_id=observation.github_pr_id,
+                github_pr_number=observation.pull_number,
                 head_ref=observation.head_ref,
                 base_ref=observation.base_ref,
                 head_sha=observation.head_sha,
-                state=observed_state,
-                merged_at=observation.merged_at,
             )
-            return _WritePhaseResult(pull_request=existing, authority_stale=authority_stale)
-        created = create_task_pull_request(
-            tx_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            repository_id=repository_id,
-            github_pr_id=observation.github_pr_id,
-            github_pr_number=observation.pull_number,
-            head_ref=observation.head_ref,
-            base_ref=observation.base_ref,
-            head_sha=observation.head_sha,
-        )
+    except ApplicationError:
+        # Typed workflow classifications (not-found, stale, conflict)
+        # propagate unchanged: they are the boundary's own vocabulary.
+        raise
+    except Exception as error:
+        # A durable persistence failure AFTER GitHub known success is never
+        # an infrastructure leak through the service boundary: it is the
+        # typed recovery-required condition (the external creation is known,
+        # never denied, and never blindly retried).
+        raise ExternalOperationRecoveryRequiredError(
+            "the canonical pull request could not be durably persisted after its "
+            "known GitHub creation; authoritative reconciliation is required"
+        ) from error
     return _WritePhaseResult(pull_request=created, authority_stale=authority_stale)
 
 
@@ -502,7 +552,11 @@ def publish_task_pull_request(
             raise _translate_github_outcome(error) from error
         # --- Phase 4: immediate authoritative reconciliation of the created
         # PR (external, no transaction; compared to the same authorized
-        # head) ---
+        # head). Once the create returned known success, a KNOWN failure of
+        # this mandatory reconciliation is no longer an ordinary read
+        # failure: the external side effect exists, so it is the typed
+        # reconciliation-required condition — never an automatic second
+        # create and never a denial of the known creation. ---
         try:
             observation = _reobserve_created_pull_request(
                 github,
@@ -510,6 +564,17 @@ def publish_task_pull_request(
                 github_repository_id=route.repository.identity.github_repository_id,
                 pull_number=created_facts.pull_number,
             )
+        except (
+            GitHubAuthenticationRejectedError,
+            GitHubAuthorizationRejectedError,
+            GitHubRateLimitedError,
+            GitHubRequestRejectedError,
+        ) as error:
+            raise ExternalOperationReconciliationRequiredError(
+                "the authoritative reconciliation of the created pull request failed as a "
+                "known provider condition; the created PR is un-reconciled and "
+                "authoritative reconciliation is required"
+            ) from error
         except _GITHUB_READ_ERRORS as error:
             raise _translate_github_outcome(error) from error
         if observation.github_pr_id != created_facts.github_pr_id:

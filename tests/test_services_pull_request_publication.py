@@ -54,6 +54,8 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.pull_request_publication import (
+    ExternalOperationReconciliationRequiredError,
+    ExternalOperationRecoveryRequiredError,
     PublicationCommand,
     TaskPullRequestPublicationOutcome,
     publish_task_pull_request,
@@ -616,6 +618,80 @@ def test_a_rotated_state_token_after_creation_persists_the_pr_and_is_stale() -> 
     assert any(sql.startswith("insert into openorc.task_pull_requests") for sql, _ in conn.executed)
     assert result.pull_request.head_sha == _HEAD_SHA
     assert len(github.create_calls) == 1
+
+
+def test_the_write_phase_task_read_is_locked_for_the_authority_recheck() -> None:
+    conn = ScriptedConnection()
+    _preflight_scripts(conn)
+    _write_phase_scripts(conn, task=_task_row(), created_row=_pull_request_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=GitHubBranchObservation(branch_name=_BRANCH, head_sha=_HEAD_SHA),
+        create_result=_created_facts(),
+        pull_request_observation=_pr_observation(),
+    )
+
+    result = publish_task_pull_request(_pool(conn), github, _command())
+
+    assert result.outcome is TaskPullRequestPublicationOutcome.PUBLISHED
+    # The post-create authority recheck reads the Task row under an
+    # EXCLUSIVE row lock held through the canonical-record persistence: a
+    # concurrent token rotation serializes on the row lock instead of
+    # slipping between the recheck and the durable write.
+    task_reads = [sql for sql, _ in conn.executed if "from openorc.tasks" in sql]
+    assert len(task_reads) == 2  # preflight read + write-phase recheck
+    assert any("for update" in sql for sql in task_reads[1:])
+
+
+def test_persistence_failure_after_known_creation_is_the_typed_recovery_condition() -> None:
+    conn = ScriptedConnection()
+    _preflight_scripts(conn)
+    _write_phase_scripts(conn, task=_task_row(), created_row=None)
+    # The canonical-record insert fails durably (the driver-level constraint
+    # failure the persistence boundary surfaces untranslated).
+    conn.on("insert into openorc.task_pull_requests", UniqueViolationStub())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=GitHubBranchObservation(branch_name=_BRANCH, head_sha=_HEAD_SHA),
+        create_result=_created_facts(),
+        pull_request_observation=_pr_observation(),
+    )
+
+    with pytest.raises(ExternalOperationRecoveryRequiredError):
+        publish_task_pull_request(_pool(conn), github, _command())
+
+    # Exactly one create attempt: the known external creation is never
+    # denied and never blindly retried.
+    assert len(github.create_calls) == 1
+    assert len(github.pull_request_calls) == 1
+
+
+class UniqueViolationStub(Exception):
+    """A driver-level durability failure (constraint violation) at insert."""
+
+
+def test_known_reconciliation_failure_after_creation_is_the_recovery_condition() -> None:
+    conn = ScriptedConnection()
+    _preflight_scripts(conn)
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=GitHubBranchObservation(branch_name=_BRANCH, head_sha=_HEAD_SHA),
+        create_result=_created_facts(),
+        pull_request_error=GitHubRateLimitedError("rate limited", status_code=429),
+    )
+
+    with pytest.raises(ExternalOperationReconciliationRequiredError):
+        publish_task_pull_request(_pool(conn), github, _command())
+
+    # The create is known-success; the failed reconciliation never triggers
+    # a second create.
+    assert len(github.create_calls) == 1
+    assert not any(
+        sql.startswith("insert into openorc.task_pull_requests") for sql, _ in conn.executed
+    )
 
 
 def test_a_replayed_command_with_a_canonical_record_never_creates_a_second_pr() -> None:

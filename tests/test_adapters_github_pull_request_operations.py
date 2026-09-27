@@ -826,7 +826,21 @@ def test_create_pull_request_omits_an_absent_body() -> None:
 def test_create_pull_request_already_exists_is_a_typed_classified_rejection() -> None:
     from openorc.adapters.github import GitHubPullRequestExistsError
 
-    fetch = FakeFetcher([_mint_response(), _json(422, {}, {"message": "Validation Failed"})])
+    # The documented duplicate-PR 422 carries the validation-failed shape
+    # whose errors array names the base field.
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(
+                422,
+                {},
+                {
+                    "message": "Validation Failed",
+                    "errors": [{"resource": "PullRequest", "field": "base", "code": "invalid"}],
+                },
+            ),
+        ]
+    )
 
     with pytest.raises(GitHubPullRequestExistsError) as exc_info:
         _client(fetch).create_pull_request(
@@ -841,6 +855,96 @@ def test_create_pull_request_already_exists_is_a_typed_classified_rejection() ->
 
     # Only the bare status is carried; provider content never leaks.
     assert exc_info.value.status_code == 422
+
+
+def test_create_pull_request_already_exists_message_form_is_classified() -> None:
+    from openorc.adapters.github import GitHubPullRequestExistsError
+
+    # The documented explicit 'a pull request already exists' message form.
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(
+                422,
+                {},
+                {"message": "A pull request already exists for octocat/hello-world."},
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubPullRequestExistsError):
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+
+def test_create_pull_request_unrelated_422_is_not_an_already_exists_conflict() -> None:
+    from openorc.adapters.github import (
+        GitHubPullRequestExistsError,
+        GitHubRequestRejectedError,
+    )
+
+    # A generic validation failure (e.g. an invalid head) is the endpoint's
+    # general 422: an ordinary definitive rejection, NEVER the duplicate-PR
+    # classification — a non-duplicate validation refusal must never become
+    # the workflow's existing-PR conflict.
+    fetch = FakeFetcher([_mint_response(), _json(422, {}, {"message": "Validation Failed"})])
+
+    with pytest.raises(GitHubRequestRejectedError) as exc_info:
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+    assert not isinstance(exc_info.value, GitHubPullRequestExistsError)
+    assert exc_info.value.status_code == 422
+
+
+def test_create_pull_request_unrelated_422_error_field_is_not_a_conflict() -> None:
+    from openorc.adapters.github import (
+        GitHubPullRequestExistsError,
+        GitHubRequestRejectedError,
+    )
+
+    # A validation failure naming a different field (title) is not the
+    # duplicate-PR condition.
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(
+                422,
+                {},
+                {
+                    "message": "Validation Failed",
+                    "errors": [{"resource": "PullRequest", "field": "title", "code": "missing"}],
+                },
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubRequestRejectedError) as exc_info:
+        _client(fetch).create_pull_request(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+
+    assert not isinstance(exc_info.value, GitHubPullRequestExistsError)
 
 
 def test_create_pull_request_other_definitive_rejections_stay_classified() -> None:

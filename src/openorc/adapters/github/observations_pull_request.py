@@ -29,6 +29,7 @@ never contain provider URLs, response bodies, or credential material.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -40,14 +41,63 @@ from openorc.adapters.github.transport import github_repository_api_address, is_
 __all__ = [
     "GitHubMergeRequestOutcome",
     "GitHubMergeRequestResult",
-    "GitHubPullRequestObservation",
     "GitHubPullRequestFacts",
+    "GitHubPullRequestObservation",
+    "body_reports_pull_request_already_exists",
     "parse_merge_response_payload",
     "parse_pull_request_facts",
     "parse_pull_request_payload",
 ]
 
 _DOCUMENTED_PR_STATES = frozenset({"open", "closed"})
+
+# The stable documented 422 error members GitHub uses to report the specific
+# 'pull request already exists' validation failure of the create-pull-request
+# operation (GitHub REST create-pull-request documentation: a 422 carries a
+# message plus an errors array whose members identify the failing field).
+# Matched case-insensitively over a bounded body prefix; no provider content
+# is ever stored, echoed into errors, or exported (the same content-safe
+# bounded-classification discipline as the transport's secondary-limit
+# marker check).
+_ALREADY_EXISTS_BODY_MARKERS = ("a pull request already exists",)
+_ALREADY_EXISTS_ERROR_FIELD = "base"
+_ALREADY_EXISTS_MESSAGE_MARKER = "validation failed"
+_ALREADY_EXISTS_BOUND_BYTES = 4096
+
+
+def body_reports_pull_request_already_exists(body: bytes) -> bool:
+    """Whether a bounded 422 body carries the documented already-exists failure.
+
+    The create-pull-request endpoint documents 422 for ANY validation
+    failure (invalid base/head, malformed title, endpoint abuse), so the
+    bare status alone must never classify as the duplicate condition. The
+    body is decoded over a bounded prefix and matched only against the
+    documented stable markers: GitHub's explicit 'a pull request already
+    exists' validation message, or the documented validation-failed shape
+    whose errors array names the ``base`` field (the duplicate-PR
+    rejection's documented failing field). Returns a boolean; no provider
+    content ever crosses this boundary.
+    """
+    if not body:
+        return False
+    text = body[:_ALREADY_EXISTS_BOUND_BYTES].decode("utf-8", "ignore").lower()
+    if any(marker in text for marker in _ALREADY_EXISTS_BODY_MARKERS):
+        return True
+    try:
+        payload = json.loads(text) if text.lstrip().startswith("{") else None
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    message = payload.get("message")
+    if isinstance(message, str) and _ALREADY_EXISTS_MESSAGE_MARKER in message.lower():
+        errors = payload.get("errors")
+        if isinstance(errors, list) and any(
+            isinstance(entry, dict) and entry.get("field") == _ALREADY_EXISTS_ERROR_FIELD
+            for entry in errors
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)

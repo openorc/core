@@ -56,15 +56,24 @@ class GitHubRequestRejectedError(Exception):
     ``status_code`` carries the bare HTTP status of the definitive answer so
     a documented operation can apply its own finer documented response
     classification inside the adapter (for example the merge endpoint's
-    documented 409 expected-head-mismatch answer). It is adapter-internal
-    request mechanics: application services consume only the normalized
-    adapter outcomes and never branch on raw provider status codes, and the
-    attribute never carries provider content beyond the numeric status.
+    documented 409 expected-head-mismatch answer). ``response_body`` carries
+    the transport's already-bounded failure body for the same adapter-
+    internal finer classification only (the create-pull-request operation's
+    documented duplicate-PR 422 members) — it is never echoed into error
+    messages, logs, or telemetry, and application services never see it: the
+    attribute is adapter-internal request mechanics.
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_body: bytes | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.response_body = response_body
 
 
 class GitHubAuthenticationRejectedError(GitHubRequestRejectedError):

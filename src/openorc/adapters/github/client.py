@@ -95,6 +95,7 @@ from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestResult,
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
+    body_reports_pull_request_already_exists,
     parse_merge_response_payload,
     parse_pull_request_facts,
     parse_pull_request_payload,
@@ -856,11 +857,17 @@ class HttpGitHubAppClient:
             ):
                 raise
             except GitHubRequestRejectedError as error:
-                if error.status_code == 422:
+                if error.status_code == 422 and body_reports_pull_request_already_exists(
+                    error.response_body or b""
+                ):
                     # The documented 'pull request already exists' answer:
-                    # a branch-addressed create that GitHub refused because
-                    # an open PR already exists for the head/base. Classified
-                    # here so services never branch on raw status codes.
+                    # a branch-addressed create refused because an open PR
+                    # already exists for the head/base. Classified from the
+                    # documented response members only — a bare 422 is the
+                    # endpoint's general validation failure and stays the
+                    # ordinary definitive rejection, because a non-duplicate
+                    # validation refusal must never become the workflow's
+                    # duplicate-PR conflict.
                     raise GitHubPullRequestExistsError(
                         "a pull request already exists for the addressed branch and base",
                         status_code=422,
