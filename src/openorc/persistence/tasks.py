@@ -45,6 +45,7 @@ __all__ = [
     "get_task",
     "get_task_for_update",
     "list_issue_attempts",
+    "list_current_repository_tasks",
     "list_workspace_tasks",
     "set_current_plan_revision",
     "set_current_owner_gate",
@@ -186,6 +187,26 @@ def list_issue_attempts(
             "where repository_id = %s and github_issue_id = %s "
             "order by created_at, id",
             (repository_id, github_issue_id),
+        ).fetchall()
+    return [_task_from_row(row) for row in rows]
+
+
+def list_current_repository_tasks(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID
+) -> list[Task]:
+    """List one Workspace Repository's current (non-archived) Tasks.
+
+    The bounded current-work Task set for the #62 repeatable reconciliation
+    sweep: only nonterminal attempts participate, deterministically ordered by
+    stable issue identity then record id. Database-only; never attempt
+    history.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_TASK_COLUMNS} from openorc.tasks "
+            "where workspace_id = %s and repository_id = %s and archived_at is null "
+            "order by github_issue_id, id",
+            (workspace_id, repository_id),
         ).fetchall()
     return [_task_from_row(row) for row in rows]
 

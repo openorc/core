@@ -134,6 +134,7 @@ The worker connects to any Redis-compatible backend selected through `VALKEY_URL
 - For local OpenOrc development, `VALKEY_URL=redis://127.0.0.1:6379/2` is the recommended namespace (see `.env.example`), keeping the local stack out of a Redis namespace shared with other local development tooling.
 - No server binary or server version is pinned: the queue backend contract is Redis-compatibility through `VALKEY_URL`. The exact-pinned `rq` and `redis` Python packages are application dependencies under the repository dependency policy, not server-version indicators.
 - RQ is asynchronous execution machinery, not workflow truth; durable workflow state belongs in Postgres, not queue payloads.
+- The GitHub reconciliation/recovery sweep (repeatable missed-delivery recovery) rides the canonical default queue through `src/openorc/workers/jobs/github_reconciliation_sweep.py`. Periodic reconciliation is a deployment scheduling concern, not a core-internal scheduler: an external scheduler enqueues the job with successive tick values modulo the configured partition count (`OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS`, default 16), and operator/manual recovery enqueues the same job without a tick (the full sweep). The tick is a scheduling position only, never workflow truth — every sweep unit re-derives its bounded current-work set from Postgres and re-reads fresh authoritative GitHub state, so replayed, delayed, or reordered jobs are harmless.
 
 ### Postgres (persistence)
 

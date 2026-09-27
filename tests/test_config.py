@@ -21,6 +21,7 @@ from openorc.config import (
     DEFAULT_ENVIRONMENT,
     DEFAULT_VALKEY_URL,
     ENVIRONMENT_VAR,
+    GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
     GITHUB_WEBHOOK_SECRET_VAR,
     OTLP_ENDPOINT_VAR,
     VALKEY_URL_VAR,
@@ -443,3 +444,21 @@ def test_the_github_webhook_secret_never_appears_in_settings_representation() ->
     # The generated dataclass repr/str must never carry the raw secret.
     assert secret not in repr(settings)
     assert secret not in str(settings)
+
+
+def test_sweep_partitions_default_to_the_documented_rotation() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.github_reconciliation_sweep_partitions == 16
+
+
+def test_sweep_partitions_override_from_the_environment() -> None:
+    settings = Settings.from_env({GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR: "8"})
+
+    assert settings.github_reconciliation_sweep_partitions == 8
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "abc", "1.5"])
+def test_malformed_sweep_partitions_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"):
+        Settings.from_env({GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR: raw})

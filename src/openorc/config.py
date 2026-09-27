@@ -57,6 +57,12 @@ GITHUB_APP_PRIVATE_KEY_VAR = "OPENORC_GITHUB_APP_PRIVATE_KEY"
 # consumption — the requirement is enforced where the webhook verification
 # boundary is constructed, which fails fast when the value is absent.
 GITHUB_WEBHOOK_SECRET_VAR = "OPENORC_GITHUB_WEBHOOK_SECRET"
+# The repeatable GitHub reconciliation/recovery sweep partition count
+# (issue #62): the fixed number of stable-identity buckets each sweep family
+# rotates through so periodic sweeps stay bounded while every eligible unit
+# is serviced without starvation. Scheduling configuration only — correctness
+# never depends on it (every unit re-derives current durable state).
+GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR = "OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 
 DEFAULT_ENVIRONMENT = "development"
@@ -75,6 +81,12 @@ DEFAULT_DB_POOL_TIMEOUT = 30.0
 # Expected authenticated audience of Supabase Auth access tokens. Supabase
 # Auth mints user access tokens with audience/role "authenticated".
 DEFAULT_SUPABASE_JWT_AUDIENCE = "authenticated"
+# The #62 sweep partitions its bounded current-work families into this many
+# stable-identity buckets; one tick services one bucket per family, so every
+# eligible unit is covered once per this many ticks. 1 means a full sweep of
+# the whole eligible set per invocation. A scheduling knob only: sweep
+# correctness and convergence never depend on the value.
+DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS = 16
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -206,6 +218,12 @@ class Settings:
     github_app_id: int | None = None
     github_app_private_key: str | None = field(default=None, repr=False)
     github_webhook_secret: str | None = field(default=None, repr=False)
+    # Repeatable GitHub reconciliation sweep partitioning (issue #62). The
+    # partition count bounds each periodic sweep's provider-facing work to one
+    # stable-identity bucket per family; every eligible unit is serviced once
+    # per this many ticks. Scheduling configuration only — the sweep re-derives
+    # its work set and correctness state from Postgres/GitHub every run.
+    github_reconciliation_sweep_partitions: int = DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -327,6 +345,18 @@ class Settings:
         # per _read_secret).
         github_webhook_secret = _read_secret(source, GITHUB_WEBHOOK_SECRET_VAR)
 
+        # Repeatable GitHub reconciliation sweep partitioning (issue #62).
+        # Malformed supplied values fail in every environment so
+        # misconfiguration never surfaces at runtime; the default gives the
+        # documented 16-bucket rotation. A supplied value below the minimum is
+        # a configuration error, never silently clamped.
+        github_reconciliation_sweep_partitions = _read_int(
+            source,
+            GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
+            minimum=1,
+            default=DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS,
+        )
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -356,5 +386,6 @@ class Settings:
             github_app_id=github_app_id,
             github_app_private_key=github_app_private_key,
             github_webhook_secret=github_webhook_secret,
+            github_reconciliation_sweep_partitions=github_reconciliation_sweep_partitions,
             otlp_endpoint=otlp_endpoint,
         )
