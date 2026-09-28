@@ -65,6 +65,28 @@ _UNRESOLVED_PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{\{[A-Z]
 _GUIDANCE_DELIMITER: Final = "\n\n---\n\n## Workspace guidance (Owner-authored, subordinate)\n\n"
 
 
+def append_subordinate_guidance(base: str, guidance: str | None) -> str:
+    """Return ``base`` with optional Owner-authored subordinate Workspace
+    guidance appended mechanically.
+
+    This is the single controlled #66/#129 composition boundary for
+    Workspace guidance. When ``guidance`` is nonblank, a mechanical delimiter
+    heading identifying the following text as Owner-authored subordinate
+    Workspace guidance is appended, followed by the guidance verbatim. Blank
+    guidance (``None`` or whitespace-only) contributes nothing, and no other
+    prose is ever synthesized. Guidance is never interpreted, parsed, or
+    converted into configuration; Markdown and code fences inside it remain
+    ordinary prose. Callers must only ever pass already-authoritative
+    structured artifacts (exact subjects, formal results) through unchanged —
+    this helper composes prose surfaces only.
+    """
+    if guidance is not None and not isinstance(guidance, str):
+        raise TypeError("Workspace guidance must be a string or None")
+    if guidance is None or guidance.strip() == "":
+        return base
+    return base + _GUIDANCE_DELIMITER + guidance
+
+
 def _role_asset_name(role: str) -> str:
     if role not in INITIALIZATION_ROLES:
         raise ValueError(f"unknown OpenOrc initialization role: {role!r}")
@@ -130,9 +152,4 @@ def compose_initialization(role: str, guidance: str | None) -> str:
     converted into configuration; Markdown and code fences inside it remain
     ordinary prose.
     """
-    if guidance is not None and not isinstance(guidance, str):
-        raise TypeError("Workspace guidance must be a string or None")
-    rendered = render_initialization(role)
-    if guidance is None or guidance.strip() == "":
-        return rendered
-    return rendered + _GUIDANCE_DELIMITER + guidance
+    return append_subordinate_guidance(render_initialization(role), guidance)

@@ -27,6 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from openorc.protocol import controls_assets
 from openorc.protocol.models import (
     FORMAL_RESPONSE_FAMILIES,
     IMPLEMENTATION_RESULT_FAMILY,
@@ -55,7 +56,7 @@ import json
 from pathlib import Path
 
 from openorc import protocol
-from openorc.protocol import initialization_assets, schema_assets
+from openorc.protocol import controls_assets, initialization_assets, schema_assets
 
 package_dir = Path(protocol.__file__).resolve().parent
 assert "site-packages" in str(package_dir), "not the installed artifact: " + str(package_dir)
@@ -80,6 +81,18 @@ for role, role_families in expected_role_families.items():
     composed = initialization_assets.compose_initialization(role, guidance)
     delimiter = "\\n\\n---\\n\\n## Workspace guidance (Owner-authored, subordinate)\\n\\n"
     assert composed == rendered + delimiter + guidance, role
+
+control_assets = {control_assets!r}
+for asset in control_assets:
+    asset_path = package_dir / "controls" / (asset + ".md")
+    text = controls_assets.control_asset_text(asset)
+    assert text == asset_path.read_text(encoding="utf-8"), asset
+    rendered_control = controls_assets.render_control_asset(
+        asset, repository_full_name="openorc/core", issue_number=129
+    )
+    assert (chr(123) * 2) not in rendered_control, asset
+    assert "openorc/core" in rendered_control, asset
+    assert "#129" in rendered_control, asset
 
 print("PACKAGING_OK")
 """
@@ -120,6 +133,7 @@ def test_canonical_schema_assets_load_from_the_installed_wheel(tmp_path: Path) -
     script = _ARTIFACT_CHECK_SCRIPT.format(
         families=tuple(sorted(FORMAL_RESPONSE_FAMILIES)),
         expected_role_families=_ROLE_FAMILIES,
+        control_assets=tuple(sorted(controls_assets.CONTROL_ASSETS)),
     )
     artifact_check = subprocess.run(
         [str(venv_python), "-c", script],
