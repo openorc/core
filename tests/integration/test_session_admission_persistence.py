@@ -157,7 +157,12 @@ def _ownership_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID]:
 
 
 def _insert_task(
-    conn: Connection[Any], *, workspace_id: uuid.UUID, repository_id: uuid.UUID
+    conn: Connection[Any],
+    *,
+    workspace_id: uuid.UUID,
+    repository_id: uuid.UUID,
+    github_issue_id: int = 100,
+    github_issue_number: int = 100,
 ) -> uuid.UUID:
     task_id = uuid.uuid4()
     conn.execute(
@@ -165,7 +170,15 @@ def _insert_task(
         "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
         "state_token, source_requirements_fingerprint) "
         "values (%s, %s, %s, %s, %s, 'ready_to_plan', %s, %s)",
-        (task_id, workspace_id, repository_id, 100, 100, uuid.uuid4(), "a" * 64),
+        (
+            task_id,
+            workspace_id,
+            repository_id,
+            github_issue_id,
+            github_issue_number,
+            uuid.uuid4(),
+            "a" * 64,
+        ),
     )
     return task_id
 
@@ -312,8 +325,20 @@ def test_shared_connection_occupancy_counting_under_row_locks(
     conn: Connection[Any],
 ) -> None:
     workspace_id, repository_id = _ownership_chain(conn)
-    first_task = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
-    second_task = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
+    first_task = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=100,
+        github_issue_number=100,
+    )
+    second_task = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=101,
+        github_issue_number=101,
+    )
     connection_id = _insert_connection(conn, workspace_id=workspace_id, session_capacity=2)
     owner_row = conn.execute(
         "select owner_profile_id from openorc.workspaces where id = %s", (workspace_id,)
@@ -359,8 +384,20 @@ def test_two_concurrent_tasks_cannot_oversubscribe_the_final_slot(
     conn: Connection[Any], migrated_database: str
 ) -> None:
     workspace_id, repository_id = _ownership_chain(conn)
-    first_task = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
-    second_task = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
+    first_task = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=100,
+        github_issue_number=100,
+    )
+    second_task = _insert_task(
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=101,
+        github_issue_number=101,
+    )
     connection_id = _insert_connection(conn, workspace_id=workspace_id, session_capacity=1)
     owner_row = conn.execute(
         "select owner_profile_id from openorc.workspaces where id = %s", (workspace_id,)
@@ -698,14 +735,19 @@ def test_profile_root_lock_serializes_admission(
             with connect(migrated_database) as racer_conn:
                 start.wait()
                 try:
-                    admit_task_agent_sessions(
-                        cast(DatabasePool, _SingleConnectionPool(racer_conn)),
-                        profile_id=owner,
-                        workspace_id=workspace_id,
-                        task_id=task_id,
-                        roles=[WorkflowRole.PRODUCER],
-                    )
-                    outcomes.append("admitted")
+                    with racer_conn.transaction():
+                        # The deliberate probe timeouts turn a blocked barrier
+                        # read into LockNotAvailable/QueryCanceled instead of
+                        # deadlocking the test against the held Profile lock.
+                        _apply_probe_timeouts(racer_conn)
+                        outcome = admit_task_agent_sessions(
+                            cast(DatabasePool, _SingleConnectionPool(racer_conn)),
+                            profile_id=owner,
+                            workspace_id=workspace_id,
+                            task_id=task_id,
+                            roles=[WorkflowRole.PRODUCER],
+                        )
+                    outcomes.append(outcome.status.value)
                 except (LockNotAvailable, QueryCanceled):
                     # A deliberate probe timeout raising on the blocked
                     # barrier read is direct evidence the Profile-root lock
@@ -718,19 +760,31 @@ def test_profile_root_lock_serializes_admission(
             errors.append(exc)
 
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
-    locked = ownership_repositories.get_profile_for_account_deletion(
-        pool, profile_id=owner, lease_seconds=15.0
-    )
-    assert locked is not None
 
-    thread = threading.Thread(target=racer)
-    thread.start()
-    start.set()
-    thread.join()
+    # The explicit outer transaction makes the repository's own scope a
+    # nested SAVEPOINT on this connection, so the Profile-root FOR UPDATE
+    # stays held for the whole racer probe: the repository function alone
+    # opens and closes its own transaction block, which would release the
+    # lock before the racer even starts.
+    with conn.transaction():
+        locked = ownership_repositories.get_profile_for_account_deletion(
+            pool, profile_id=owner, lease_seconds=15.0
+        )
+        assert locked is not None
+
+        thread = threading.Thread(target=racer)
+        thread.start()
+        start.set()
+        thread.join(timeout=60)
+        assert not thread.is_alive(), "the admission probe deadlocked on the held lock"
 
     try:
         assert errors == []
-        assert outcomes in (["blocked"], ["rejected"])
+        # The Profile lock held for the whole probe: the admission's
+        # account-operational barrier is its FIRST lock acquisition, so the
+        # blocked read is the guard's FOR KEY SHARE — before any subject
+        # read, Connection lock, or reservation.
+        assert outcomes == ["blocked"]
         # No reservation was created past the claim.
         with connect(migrated_database) as verification:
             row = verification.execute(
