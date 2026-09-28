@@ -59,7 +59,18 @@ class AgentRuntimeAdapter(ABC):
     normalized results of :mod:`openorc.adapters.agent_runtime.results`; and
     normalized messages never echo credentials, Workspace guidance,
     prompt/initialization bodies, raw responses, transcripts, or
-    provider-native exception text.
+    provider-native exception text. The same discipline holds for the whole
+    exception chain: traceback/telemetry handling can traverse
+    ``__cause__``/``__context__``, so provider/runtime-native exceptions are
+    discarded at the boundary and never retained anywhere reachable by that
+    traversal. Because ``raise ... from None`` inside a failing handler
+    suppresses only the displayed chain and still populates ``__context__``,
+    concrete adapters raise the normalized error after the handler exits
+    (or otherwise convert the native failure to a separately sanitized
+    summary). The one deliberate exception is the shared #65
+    ``ProtocolError`` chained inside ``AgentRuntimeProtocolFailureError`` —
+    that error vocabulary is itself safe by authoring (it names only the
+    response family, the failing schema location, and the failing keyword).
     """
 
     @abstractmethod

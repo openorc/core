@@ -11,6 +11,7 @@ require no database, network, or live runtime.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -139,14 +140,26 @@ class _ScriptedAgentRuntime(AgentRuntimeAdapter):
             )
         return wrapped[len(_ENVELOPE_PREFIX) : -len(_ENVELOPE_SUFFIX)]
 
+    @staticmethod
+    def _provider_call() -> None:
+        """Simulate one provider/runtime-native call failing with an
+        exception whose text carries sensitive payload content."""
+
+        raise RuntimeError(f"hub rejected the configuration {_SECRET_PROVIDER_TEXT_MARKER}")
+
     def create_session(self, request: AgentSessionCreationRequest) -> AgentSessionCreated:
         if self.creation_outcome == "config_rejected":
-            provider_error = RuntimeError(
-                f"hub rejected the configuration {_SECRET_PROVIDER_TEXT_MARKER}"
-            )
+            # The provider call fails with a native exception whose text
+            # carries sensitive payload content; the failure is handled and
+            # the native exception discarded. The normalized error is raised
+            # after the handler exits, so neither __cause__ nor the implicit
+            # __context__ survives — raise-from-None inside a handler only
+            # suppresses the displayed chain, not __context__ itself.
+            with contextlib.suppress(RuntimeError):
+                self._provider_call()
             raise AgentRuntimeConfigurationRejectedError(
                 "the runtime rejected the presented configuration"
-            ) from provider_error
+            ) from None
         if self.creation_outcome == "unavailable":
             raise AgentRuntimeUnavailableError("the runtime was unreachable before any effect")
         if self.creation_outcome == "uncertain":
@@ -632,6 +645,53 @@ def test_normalized_diagnostics_never_echo_sensitive_payloads(
         _SECRET_PROVIDER_TEXT_MARKER,
     ):
         assert marker not in message
+    # The same discipline covers the complete exception chain: nothing
+    # planted in provider/credential/guidance/response surfaces is reachable
+    # through __cause__/__context__ either.
+    chain_text = " ".join(str(item) for item in _exception_chain(exc_info.value))
+    for marker in (
+        _SECRET_INITIALIZATION_MARKER,
+        _SECRET_RESPONSE_MARKER,
+        _SECRET_PROVIDER_TEXT_MARKER,
+    ):
+        assert marker not in chain_text
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Return the error plus everything reachable through ``__cause__`` and
+    the implicit ``__context__``, the surfaces traceback/telemetry handling
+    can expose.
+    """
+
+    chain: list[BaseException] = [error]
+    seen = {id(error)}
+    frontier = [error]
+    while frontier:
+        current = frontier.pop()
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None and id(linked) not in seen:
+                seen.add(id(linked))
+                chain.append(linked)
+                frontier.append(linked)
+    return chain
+
+
+def test_provider_native_exceptions_are_discarded_at_the_boundary() -> None:
+    runtime = _ScriptedAgentRuntime()
+    runtime.creation_outcome = "config_rejected"
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError) as exc_info:
+        runtime.create_session(_creation_request())
+
+    # The raw provider exception (with its planted secret marker) is fully
+    # discarded: neither a chained cause nor the implicit in-flight context
+    # survives, so no traceback/telemetry traversal can expose it.
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert _SECRET_PROVIDER_TEXT_MARKER not in "".join(
+        str(item) for item in _exception_chain(error)
+    )
 
 
 _ALLOWED_OPENORC_ROOTS = (

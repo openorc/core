@@ -51,7 +51,13 @@ domain vocabulary.
   never known non-delivery.
 - Normalized messages/results never expose credentials/tokens, Workspace
   guidance, prompt/initialization bodies, raw responses, transcripts, or
-  provider-native exception text.
+  provider-native exception text — and the discipline covers the whole
+  exception chain: provider/runtime-native exceptions are handled and
+  discarded at the boundary, with the normalized error raised after the
+  failing handler exits (``raise ... from None`` inside the handler only
+  suppresses the displayed chain and still populates ``__context__``); only
+  the deliberately-safe shared #65 ``ProtocolError`` stays chained (inside
+  ``AgentRuntimeProtocolFailureError``).
 
 Read the parent adapters guide, the protocol guide, and services/domain
 guides for cross-boundary changes.

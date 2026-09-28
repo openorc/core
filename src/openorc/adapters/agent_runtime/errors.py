@@ -41,7 +41,18 @@ Outcome classification (the discipline downstream code relies on):
 Error messages are safe by authoring: they never contain credentials/tokens,
 Workspace guidance, prompt/initialization bodies, raw model/runtime
 responses, transcripts, or provider-native exception text, because such
-payloads may carry sensitive content.
+payloads may carry sensitive content. The same discipline holds across the
+whole exception chain: traceback/telemetry handling can traverse
+``__cause__``/``__context__``, so provider/runtime-native exceptions are
+never retained anywhere that traversal can reach — concrete adapters handle
+and discard them, then raise the normalized error after the failing handler
+exits (``raise ... from None`` inside the handler only suppresses the
+displayed chain and still populates ``__context__``), or otherwise convert
+the native failure into a separately sanitized summary. The one deliberate
+exception is ``AgentRuntimeProtocolFailureError`` chaining the shared #65
+``ProtocolError``, whose error vocabulary is itself safe by authoring (it
+names only the response family, the failing schema location, and the
+failing keyword).
 """
 
 from __future__ import annotations
