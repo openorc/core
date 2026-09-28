@@ -12,6 +12,7 @@ Adapters do not own Task-state semantics, Owner authority, review policy, workfl
 - Harmless presentation normalization is allowed; semantic invention is not.
 - Never manufacture structured OpenOrc meaning from unstructured model prose.
 - Agent Runtime adapters (e.g. Cline) own runtime-native response extraction, normalization, and provider/runtime error classification locally, and consume shared `src/openorc/protocol/` validation for formal OpenOrc contracts rather than duplicating formal OpenOrc schemas here; non-runtime external-system adapters (e.g. GitHub) have no agent-protocol dependency.
+- The shared runtime-neutral Agent Runtime adapter contract lives in `agent_runtime/` (issue #67): concrete runtime adapters implement `openorc.adapters.agent_runtime.AgentRuntimeAdapter` and funnel formal candidates through its shared `_parse_formal_candidate` validation; application services consume its typed results and normalized error taxonomy. Runtime-specific capabilities stay behind local adapter boundaries and never expand the universal contract.
 - Preserve exact external identifiers needed for deterministic routing/reconciliation.
 - Treat uncertain delivery/outcome explicitly; do not pretend timeout means non-delivery.
 - Keep runtime/provider-specific capabilities behind local adapter boundaries rather than expanding the universal contract casually.
