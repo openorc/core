@@ -14,11 +14,11 @@ dependencies = [
     "psycopg[binary]==3.3.5",
     "psycopg-pool==3.3.1",
     "PyJWT[crypto]==2.14.0",
-    # Formal-response protocol validation (issue #65): canonical v1 JSON
+    # Formal-response protocol validation: canonical v1 JSON
     # Schema assets are draft 2020-12. Latest stable release verified on
     # PyPI (2026-09-28).
     "jsonschema==4.26.0",
-    # Application observability (issue #108): vendor-neutral OpenTelemetry
+    # Application observability: vendor-neutral OpenTelemetry
     # foundation with OTLP as the export boundary. Latest stable release at
     # implementation time, verified on PyPI (2026-09-22).
     "opentelemetry-api==1.44.0",
