@@ -25,6 +25,7 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskAgentSessionDomainError, TaskSessionLifecycleStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import (
+    count_active_task_agent_sessions_by_connection,
     ensure_task_agent_session,
     get_task_agent_session,
     initialize_task_agent_session,
@@ -462,4 +463,29 @@ def test_list_active_task_agent_sessions_maps_rows_and_filters_active() -> None:
             connection_id=rows[0][4],
         )
         == []
+    )
+
+
+def test_count_active_task_agent_sessions_groups_counts_by_connection() -> None:
+    rows = [(uuid.uuid4(), 2), (uuid.uuid4(), 1)]
+    fake_conn = FakeConnection(None, rows)
+    counts = count_active_task_agent_sessions_by_connection(
+        cast(DatabasePool, FakePool(fake_conn)),
+        connection_ids=[rows[0][0], rows[1][0]],
+    )
+    assert counts == {rows[0][0]: 2, rows[1][0]: 1}
+    sql, params = fake_conn.executed[0]
+    # One grouped occupancy query over exactly the active statuses (issue #68):
+    # the admission decision is not made here.
+    assert "where connection_id = any(%s)" in sql
+    assert "and lifecycle_status in ('connecting', 'ready')" in sql
+    assert "group by connection_id" in sql
+    assert params == ([rows[0][0], rows[1][0]],)
+    # Connections with no active sessions are absent from the mapping.
+    assert (
+        count_active_task_agent_sessions_by_connection(
+            cast(DatabasePool, FakePool(FakeConnection(None, []))),
+            connection_ids=[rows[0][0]],
+        )
+        == {}
     )

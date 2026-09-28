@@ -159,3 +159,20 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
   the `MISSING` outcome. The canonical record's only creator is the later
   race-safe PR publication operation (#64); no external-PR adoption path
   exists at any layer.
+
+## TaskAgentSession admission locking (issue #68)
+
+- Capacity admission serializes on Connection row locks, never process
+  memory: `list_connections_for_update` locks the exact requested distinct
+  Connection rows (`SELECT ... FOR UPDATE ORDER BY id`) and
+  `count_active_task_agent_sessions_by_connection` is the grouped
+  CONNECTING/READY occupancy count. The count is meaningful only after the
+  caller holds those same locks.
+- Every admission path that counts occupancy and reserves must take the same
+  locks in deterministic ascending UUID order before its decision, inside one
+  short composed transaction with no external I/O. Service-side classification
+  of missing/cross-Workspace/disabled rows is made from the locked rows.
+- Active occupancy is exactly CONNECTING + READY. Reservation establishes
+  bindings only through the idempotent `ensure_task_agent_session`
+  establishment primitive; admission never creates a second `(Task, role)`
+  row and never replaces a terminal (LOST/ENDED) historical binding.

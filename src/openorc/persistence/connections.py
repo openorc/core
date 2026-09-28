@@ -41,6 +41,7 @@ __all__ = [
     "get_connection_for_update",
     "get_role_binding",
     "list_connection_bindings",
+    "list_connections_for_update",
     "list_profile_connections_for_update",
     "list_workspace_connections",
     "list_workspace_connections_for_update",
@@ -257,6 +258,31 @@ def get_connection_for_update(pool: DatabasePool, connection_id: UUID) -> Connec
             (connection_id,),
         ).fetchone()
     return None if row is None else _connection_from_row(row)
+
+
+def list_connections_for_update(
+    pool: DatabasePool, *, connection_ids: Sequence[UUID]
+) -> list[Connection]:
+    """Row-locked read of the given Connections in deterministic UUID order.
+
+    Admission's serialization primitive (issue #68): the ``SELECT ... FOR
+    UPDATE`` in ascending ``id`` order locks every distinct target Connection
+    row before the caller counts active occupancy and reserves, so concurrent
+    admissions for the same Connection serialize on the same row locks, and
+    the ascending order is the deterministic lock order that avoids deadlock
+    across multi-Connection admission. Rows that do not exist are simply
+    absent from the result; classifying that absence (missing/cross-Workspace)
+    is the caller's concern. The lock is held only within the caller's short
+    transaction (inside ``composed_transaction``, the outer composition), and
+    no external call may occur while it is held.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_CONNECTION_COLUMNS} from openorc.connections "
+            "where id = any(%s) order by id for update",
+            (list(connection_ids),),
+        ).fetchall()
+    return [_connection_from_row(row) for row in rows]
 
 
 def set_connection_auth_reference(
