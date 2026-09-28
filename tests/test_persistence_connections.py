@@ -24,6 +24,7 @@ from openorc.persistence.connections import (
     get_connection,
     get_role_binding,
     list_connection_bindings,
+    list_connections_for_update,
     list_workspace_connections,
     set_role_binding,
     update_connection,
@@ -331,3 +332,33 @@ def test_transaction_boundary_is_used_for_every_repository_operation() -> None:
     pool = cast(DatabasePool, FakePool(fake_conn))
     with transaction(pool) as conn:
         assert isinstance(conn, FakeConnection)
+
+
+def test_list_connections_for_update_locks_rows_in_id_order() -> None:
+    rows = [_connection_row(), _connection_row()]
+    requested = [rows[1][0], rows[0][0], rows[1][0]]  # unsorted, with a duplicate
+    fake_conn = FakeConnection(None, rows)
+    listed = list_connections_for_update(
+        cast(DatabasePool, FakePool(fake_conn)), connection_ids=requested
+    )
+    assert [connection.id for connection in listed] == [rows[0][0], rows[1][0]]
+    assert [connection.session_capacity for connection in listed] == [
+        rows[0][5],
+        rows[1][5],
+    ]
+    sql, params = fake_conn.executed[0]
+    # The deliberate lock statement is the admission serialization boundary
+    # (issue #68): the ascending-id ORDER BY is the deterministic lock order
+    # that avoids deadlock across multi-Connection admission.
+    assert "from openorc.connections" in sql
+    assert "where id = any(%s) order by id for update" in sql
+    assert params == ([rows[1][0], rows[0][0], rows[1][0]],)
+    # Rows that do not exist are simply absent from the result; classifying
+    # that absence is the caller's concern.
+    assert (
+        list_connections_for_update(
+            cast(DatabasePool, FakePool(FakeConnection(None, []))),
+            connection_ids=[rows[0][0]],
+        )
+        == []
+    )

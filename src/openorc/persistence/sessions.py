@@ -33,6 +33,9 @@ Continuity invariants enforced here:
 - ``list_active_task_agent_sessions`` provides Connection-scoped active
   occupancy accounting (CONNECTING or READY) for later capacity admission
   services; admission decisions are not made here.
+- ``count_active_task_agent_sessions_by_connection`` is the grouped occupancy
+  count over several Connections for the capacity admission service (issue
+  #68): representation-level counting only, never an admission decision.
 
 Violated database invariants (uniqueness, foreign keys, CHECK constraints)
 surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``,
@@ -59,6 +62,7 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "count_active_task_agent_sessions_by_connection",
     "ensure_task_agent_session",
     "get_task_agent_session",
     "initialize_task_agent_session",
@@ -323,3 +327,28 @@ def list_active_task_agent_sessions(
             (connection_id,),
         ).fetchall()
     return [_session_from_row(row) for row in rows]
+
+
+def count_active_task_agent_sessions_by_connection(
+    pool: DatabasePool, *, connection_ids: Sequence[UUID]
+) -> dict[UUID, int]:
+    """Count the active (CONNECTING or READY) sessions per given Connection.
+
+    One grouped occupancy query for the capacity admission service (issue
+    #68): Connection-scoped counts of exactly the active statuses, mirroring
+    :func:`list_active_task_agent_sessions`. Connections with no active
+    sessions are absent from the returned mapping. The admission decision —
+    comparing counts against a Connection's Owner-configured
+    ``session_capacity`` and reserving — is not made here. Under admission
+    concurrency the counts are meaningful only after the caller has locked
+    the same Connection rows this query addresses.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select connection_id, count(*) from openorc.task_agent_sessions "
+            "where connection_id = any(%s) "
+            "and lifecycle_status in ('connecting', 'ready') "
+            "group by connection_id",
+            (list(connection_ids),),
+        ).fetchall()
+    return {row[0]: int(row[1]) for row in rows}
