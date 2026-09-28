@@ -22,9 +22,14 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskSessionLifecycleStatus
+from openorc.observability import OPERATION, TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
 from openorc.services import session_admission
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
@@ -840,3 +845,118 @@ def test_deterministic_lock_order_is_distinct_and_ascending() -> None:
 
     assert _connection_lock_order(shuffled) == (ordered[0], ordered[1], ordered[2])
     assert _connection_lock_order([]) == ()
+
+
+def _local_provider_with_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+@pytest.mark.parametrize("field_name", ["profile_id", "workspace_id", "task_id"])
+@pytest.mark.parametrize("malformed", ["not-a-uuid", 123, None])
+def test_malformed_identifiers_fail_inside_the_span_without_telemetry_or_database_access(
+    field_name: str, malformed: Any
+) -> None:
+    # Regression (issue #109 service-span contract): malformed caller-supplied
+    # identifiers are classified as InvalidCommandError INSIDE the use-case
+    # span, before telemetry annotation, and their raw values never enter
+    # exported span attributes — and no database access happens at all.
+    provider, exporter = _local_provider_with_exporter()
+    kwargs: dict[str, Any] = {
+        "profile_id": uuid.uuid4(),
+        "workspace_id": uuid.uuid4(),
+        "task_id": uuid.uuid4(),
+    }
+    kwargs[field_name] = malformed
+    conn = ScriptedConnection([])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(InvalidCommandError),
+    ):
+        admit_task_agent_sessions(
+            _pool(conn),
+            roles=[WorkflowRole.PRODUCER],
+            **kwargs,
+        )
+
+    assert conn.executed == []
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "session_admission.admit_task_agent_sessions"
+    assert exported.status is not None
+    assert exported.status.status_code is StatusCode.ERROR
+    assert exported.status.description == "InvalidCommandError"
+    # Validation ran before annotation: no identifier attributes were attached.
+    attributes = exported.attributes or {}
+    assert WORKSPACE_ID not in attributes
+    assert TASK_ID not in attributes
+    if malformed is not None:
+        assert str(malformed) not in str(attributes)
+
+
+def test_malformed_roles_fail_inside_the_span_without_database_access() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    conn = ScriptedConnection([])
+
+    with (
+        injected_tracer_source(lambda name: provider.get_tracer(name)),
+        pytest.raises(InvalidCommandError),
+    ):
+        admit_task_agent_sessions(
+            _pool(conn),
+            profile_id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            roles=cast(Any, ["producer"]),
+        )
+
+    assert conn.executed == []
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "session_admission.admit_task_agent_sessions"
+    assert exported.status is not None
+    assert exported.status.status_code is StatusCode.ERROR
+    assert exported.status.description == "InvalidCommandError"
+    # Validation ran before annotation: not even the safe identifiers were
+    # attached, and the malformed role value never entered telemetry.
+    assert not (exported.attributes or {})
+    assert "producer" not in str(exported.attributes or {})
+
+
+def test_admission_annotates_safe_identifiers_in_its_use_case_span() -> None:
+    provider, exporter = _local_provider_with_exporter()
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            (None, None, None),
+            _ws_row(workspace_id, profile_id),
+            _task_row(workspace_id),
+            *_binding_reads(workspace_id, profile_id, ("producer", connection_id)),
+            [_connection_row(workspace_id, connection_id)],
+            None,
+            [],
+            _session_row(workspace_id, task_id, "producer", connection_id),
+        ]
+    )
+
+    with injected_tracer_source(lambda name: provider.get_tracer(name)):
+        outcome = admit_task_agent_sessions(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            roles=[WorkflowRole.PRODUCER],
+        )
+    assert outcome.status is AdmissionStatus.ADMITTED
+
+    (exported,) = exporter.get_finished_spans()
+    assert exported.name == "session_admission.admit_task_agent_sessions"
+    attributes = exported.attributes
+    assert attributes is not None
+    assert attributes[OPERATION] == "session_admission.admit_task_agent_sessions"
+    assert attributes[WORKSPACE_ID] == str(workspace_id)
+    assert attributes[TASK_ID] == str(task_id)

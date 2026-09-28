@@ -139,6 +139,19 @@ class SessionAdmissionOutcome:
     blocked: tuple[BlockedCapacityFact, ...]
 
 
+def _require_uuid_command_field(value: object, field_name: str) -> UUID:
+    """Classify a malformed command identifier as an invalid command.
+
+    Command-shape validation happens inside the use-case span and before any
+    telemetry annotation: the error message names only the field — the raw
+    caller-supplied value is never echoed into the error message, telemetry,
+    or any later effect.
+    """
+    if not isinstance(value, UUID):
+        raise InvalidCommandError(f"session admission {field_name} must be a UUID")
+    return value
+
+
 def _normalize_requested_roles(roles: Sequence[WorkflowRole]) -> tuple[WorkflowRole, ...]:
     """Validate and normalize the requested roles: supported values, deduplicated.
 
@@ -209,10 +222,23 @@ def admit_task_agent_sessions(
     same locks before its capacity count and reservation — no process-local
     semaphore is authority. No external call occurs while the transaction is
     open, and no runtime adapter is invoked anywhere in this operation.
-    """
-    requested_roles = _normalize_requested_roles(roles)
 
+    All command-shape validation happens inside the use-case span and before
+    telemetry annotation (the #109 service-span contract): malformed
+    identifiers and roles raise :class:`InvalidCommandError` whose raw
+    caller-supplied values never enter telemetry, and the failure is
+    classified within the span without any database access.
+    """
     with application_span(_SERVICE_TRACER_SCOPE, _ADMIT_SPAN_NAME) as span:
+        # Command-shape validation runs INSIDE the use-case span and BEFORE
+        # telemetry annotation: malformed caller-supplied identifiers and
+        # roles are classified as InvalidCommandError with their raw values
+        # never entering telemetry, while the public use-case failure itself
+        # stays inside the span.
+        _require_uuid_command_field(profile_id, "profile_id")
+        _require_uuid_command_field(workspace_id, "workspace_id")
+        _require_uuid_command_field(task_id, "task_id")
+        requested_roles = _normalize_requested_roles(roles)
         annotate_span(
             span,
             operation=_ADMIT_SPAN_NAME,
