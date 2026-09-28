@@ -163,6 +163,7 @@ def test_planning_review_carries_the_exact_supplied_plan_subject_and_expects_rev
 def test_pr_review_carries_the_exact_canonical_pr_identity_head_and_expects_review_result():
     interaction = ReviewInteraction(subject=_PR_SUBJECT)
     assert interaction.subject is _PR_SUBJECT
+    assert isinstance(interaction.subject, PrReviewSubject)
     assert interaction.subject.head_sha == _HEAD_SHA
     assert interaction.subject.pull_request_number == _PR_NUMBER
     assert interaction.expected_response_family == REVIEW_RESULT_FAMILY
@@ -206,9 +207,11 @@ def test_revise_free_text_fields_pass_through_untouched():
     # Byte-identity of every field, including free text, proves no rewriting
     # or inspection without evaluating the wording of any of it.
     interaction = ReviseInteraction(subject=_PR_SUBJECT, review_result=_CHANGES_REQUESTED)
-    assert interaction.review_result.outcome == _CHANGES_REQUESTED.outcome
-    assert interaction.review_result.summary == _CHANGES_REQUESTED.summary
-    assert interaction.review_result.findings == _CHANGES_REQUESTED.findings
+    routed = interaction.review_result
+    assert routed is not None
+    assert routed.outcome == _CHANGES_REQUESTED.outcome
+    assert routed.summary == _CHANGES_REQUESTED.summary
+    assert routed.findings == _CHANGES_REQUESTED.findings
 
 
 def test_revise_rejects_non_changes_requested_results():
@@ -251,7 +254,13 @@ def test_pr_compose_expects_pr_result_and_has_no_publication_authorization_surfa
     assert interaction.kind is InteractionKind.PR_COMPOSE
     assert interaction.expected_response_family == PR_RESULT_FAMILY
     fields = {f.name for f in type(interaction).__dataclass_fields__.values()}
-    assert fields == {"kind", "repository_full_name", "issue_number", "expected_response_family"}
+    assert fields == {
+        "kind",
+        "repository_full_name",
+        "issue_number",
+        "guidance",
+        "expected_response_family",
+    }
 
 
 # --- Runtime neutrality of the interaction models ---
@@ -280,3 +289,113 @@ def test_interaction_models_carry_no_provider_or_runtime_specific_fields():
             assert "hub" not in lowered, f"{name}.{field} names a Hub identifier"
             assert "provider" not in lowered, f"{name}.{field} is provider-specific"
         assert "SDK" not in inspect.getsource(model)
+
+
+# --- Fail-closed interaction-kind and response-family coherence ---
+
+
+def test_contradictory_interaction_kinds_are_rejected():
+    with pytest.raises(ValueError):
+        PlanInteraction(
+            kind=InteractionKind.REVIEW, repository_full_name=_REPO, issue_number=_ISSUE
+        )
+    with pytest.raises(ValueError):
+        ReviewInteraction(kind=InteractionKind.PLAN, subject=_PLAN_SUBJECT)
+    with pytest.raises(ValueError):
+        ReviseInteraction(
+            kind=InteractionKind.IMPLEMENT, subject=_PR_SUBJECT, review_result=_CHANGES_REQUESTED
+        )
+    with pytest.raises(ValueError):
+        ImplementInteraction(kind=InteractionKind.PLAN)
+    with pytest.raises(ValueError):
+        PrComposeInteraction(
+            kind=InteractionKind.REVISE, repository_full_name=_REPO, issue_number=_ISSUE
+        )
+
+
+def test_review_wrong_expected_response_family_is_rejected():
+    with pytest.raises(ValueError):
+        ReviewInteraction(subject=_PLAN_SUBJECT, expected_response_family=PLAN_RESULT_FAMILY)
+
+
+def test_pr_compose_wrong_expected_response_family_is_rejected():
+    with pytest.raises(ValueError):
+        PrComposeInteraction(
+            repository_full_name=_REPO,
+            issue_number=_ISSUE,
+            expected_response_family=REVIEW_RESULT_FAMILY,
+        )
+
+
+def test_revise_wrong_expected_response_family_for_pr_subject_is_rejected():
+    with pytest.raises(ValueError):
+        ReviseInteraction(
+            subject=_PR_SUBJECT,
+            review_result=_CHANGES_REQUESTED,
+            expected_response_family=PLAN_RESULT_FAMILY,
+        )
+
+
+# --- Fail-closed REVIEW/REVISE subject typing ---
+
+
+def test_review_rejects_implementation_result_and_arbitrary_objects_as_subject():
+    from openorc.protocol.models import ImplementationResult
+
+    implementation = ImplementationResult(
+        status="COMPLETED",
+        branch="feat/some-branch",
+        summary="opaque",
+        changes=("opaque",),
+        validation=("opaque",),
+        notes=None,
+    )
+    with pytest.raises(ValueError):
+        ReviewInteraction(subject=implementation)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ReviewInteraction(subject="plan-rev-1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ReviseInteraction(subject=implementation, review_result=_CHANGES_REQUESTED)  # type: ignore[arg-type]
+
+
+# --- Workspace-guidance composition through the #66 boundary ---
+
+
+def test_plan_and_pr_compose_compose_guidance_through_the_shared_subordinate_boundary():
+    from openorc.protocol.initialization_assets import append_subordinate_guidance
+
+    guidance = "Owner-authored guidance prose."
+
+    with_guidance = PlanInteraction(
+        repository_full_name=_REPO, issue_number=_ISSUE, guidance=guidance
+    ).render()
+    base = PlanInteraction(repository_full_name=_REPO, issue_number=_ISSUE).render()
+    assert with_guidance == append_subordinate_guidance(base, guidance)
+    assert guidance in with_guidance
+    assert base in with_guidance
+
+    compose_base = PrComposeInteraction(repository_full_name=_REPO, issue_number=_ISSUE).render()
+    compose_with = PrComposeInteraction(
+        repository_full_name=_REPO, issue_number=_ISSUE, guidance=guidance
+    ).render()
+    assert compose_with == append_subordinate_guidance(compose_base, guidance)
+    assert guidance in compose_with
+
+
+def test_blank_guidance_contributes_nothing():
+    base = PlanInteraction(repository_full_name=_REPO, issue_number=_ISSUE).render()
+    assert (
+        PlanInteraction(repository_full_name=_REPO, issue_number=_ISSUE, guidance=None).render()
+        == base
+    )
+    assert (
+        PlanInteraction(repository_full_name=_REPO, issue_number=_ISSUE, guidance="   ").render()
+        == base
+    )
+    compose_base = PrComposeInteraction(repository_full_name=_REPO, issue_number=_ISSUE).render()
+    assert (
+        PrComposeInteraction(
+            repository_full_name=_REPO, issue_number=_ISSUE, guidance=None
+        ).render()
+        == compose_base
+    )
