@@ -1,6 +1,6 @@
 Compose the pull request for {{repository_full_name}} issue #{{issue_number}}.
 
-The pull request should clearly state:
+Write the pull request body as clear GitHub-flavored Markdown. It should clearly state:
 - what changed;
 - why;
 - tests/checks performed;
