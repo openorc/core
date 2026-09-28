@@ -1,19 +1,23 @@
-"""Installed-artifact packaging test for the canonical schema assets (issue #65).
+"""Installed-artifact packaging test for the canonical schema assets (issue #65)
+and the canonical role-initialization assets (issue #66).
 
 The acceptance criterion is that the five canonical v1 JSON Schema assets are
 loadable from an installed-package path through the schema-asset helpers — not
-merely present in the repository or a ZIP listing. This test builds the
-project wheel, installs it with ``--no-deps`` into an isolated throwaway venv
-(offline: the wheel is built locally), and runs a subprocess from a neutral
-working directory against the installed artifact that loads and renders every
-canonical family and asserts the resources resolve inside site-packages.
+merely present in the repository or a ZIP listing — and that the two canonical
+role-initialization assets load, render their controlled schema insertion
+points, and compose optional Workspace guidance from the installed artifact
+too. This test builds the project wheel, installs it with ``--no-deps`` into
+an isolated throwaway venv (offline: the wheel is built locally), and runs a
+subprocess from a neutral working directory against the installed artifact
+that loads and renders every canonical family and initialization asset and
+asserts the resources resolve inside site-packages.
 
 The exercised import chain is dependency-free by design:
 ``openorc/__init__.py`` carries only version metadata,
-``openorc/protocol/__init__.py`` is documentation only, and
-``openorc/protocol/schema_assets.py`` imports only the standard library. If
-that changes, this test fails and the artifact check must install the wheel's
-dependencies explicitly.
+``openorc/protocol/__init__.py`` is documentation only, and the exercised
+protocol modules (``models``, ``schema_assets``, ``initialization_assets``)
+import only the standard library. If that changes, this test fails and the
+artifact check must install the wheel's dependencies explicitly.
 """
 
 from __future__ import annotations
@@ -23,7 +27,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-from openorc.protocol.models import FORMAL_RESPONSE_FAMILIES
+from openorc.protocol.models import (
+    FORMAL_RESPONSE_FAMILIES,
+    IMPLEMENTATION_RESULT_FAMILY,
+    PLAN_RESULT_FAMILY,
+    PR_RESULT_FAMILY,
+    REVIEW_RESULT_FAMILY,
+    SESSION_READY_FAMILY,
+)
+
+# Role wiring for the controlled schema insertion points (issue #66), mirrored
+# as composition wiring only — never schema definitions.
+_ROLE_FAMILIES = {
+    "producer": (
+        PLAN_RESULT_FAMILY,
+        IMPLEMENTATION_RESULT_FAMILY,
+        PR_RESULT_FAMILY,
+        SESSION_READY_FAMILY,
+    ),
+    "reviewer": (REVIEW_RESULT_FAMILY, SESSION_READY_FAMILY),
+}
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +55,7 @@ import json
 from pathlib import Path
 
 from openorc import protocol
-from openorc.protocol import schema_assets
+from openorc.protocol import initialization_assets, schema_assets
 
 package_dir = Path(protocol.__file__).resolve().parent
 assert "site-packages" in str(package_dir), "not the installed artifact: " + str(package_dir)
@@ -42,6 +65,21 @@ for family in families:
     schema = schema_assets.load_schema(family)
     assert schema["properties"]["type"]["const"] == family, family
     assert json.loads(schema_assets.render_schema(family)) == schema, family
+
+expected_role_families = {expected_role_families!r}
+guidance = "Owner guidance for the artifact check."
+for role, role_families in expected_role_families.items():
+    asset_path = package_dir / "initialization" / (role + ".md")
+    asset = initialization_assets.initialization_asset_text(role)
+    assert asset == asset_path.read_text(encoding="utf-8"), role
+    rendered = initialization_assets.render_initialization(role)
+    assert (chr(123) * 2) not in rendered, role
+    for family in role_families:
+        assert schema_assets.render_schema(family) in rendered, (role, family)
+    assert rendered == initialization_assets.compose_initialization(role, None), role
+    composed = initialization_assets.compose_initialization(role, guidance)
+    delimiter = "\\n\\n---\\n\\n## Workspace guidance (Owner-authored, subordinate)\\n\\n"
+    assert composed == rendered + delimiter + guidance, role
 
 print("PACKAGING_OK")
 """
@@ -79,7 +117,10 @@ def test_canonical_schema_assets_load_from_the_installed_wheel(tmp_path: Path) -
 
     neutral_cwd = tmp_path / "neutral-cwd"
     neutral_cwd.mkdir()
-    script = _ARTIFACT_CHECK_SCRIPT.format(families=tuple(sorted(FORMAL_RESPONSE_FAMILIES)))
+    script = _ARTIFACT_CHECK_SCRIPT.format(
+        families=tuple(sorted(FORMAL_RESPONSE_FAMILIES)),
+        expected_role_families=_ROLE_FAMILIES,
+    )
     artifact_check = subprocess.run(
         [str(venv_python), "-c", script],
         cwd=neutral_cwd,
