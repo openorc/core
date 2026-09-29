@@ -3,18 +3,23 @@
 The ordinary suite cannot execute Postgres, and the shared session fixture
 applies every committed migration in one pass. This module instead proves the
 corrective migration's upgrade path against a PRE-correction schema: inside
-one rolled-back transaction it resets the ``openorc`` schema, applies every
-committed migration except the corrective removal migration, seeds a
-pre-correction state (a ``prompt_override_changed`` workflow event row, a
-prompt-template override row, and a four-fact-initialized TaskAgentSession
-row), executes the committed corrective migration file, and asserts the
-deliberate removal policy end to end:
+one rolled-back transaction it resets the ``openorc`` schema, applies the
+committed migrations chronologically up to — but not including — the
+corrective removal migration (the actual schema immediately before the
+correction; migrations dated after it are deliberately excluded so their
+schema/vocabulary can never retroactively define this historical upgrade
+contract), seeds a pre-correction state (a ``prompt_override_changed``
+workflow event row, a prompt-template override row, and a
+four-fact-initialized TaskAgentSession row), executes the committed
+corrective migration file, and asserts the deliberate removal policy end to
+end:
 
 - the obsolete ``openorc.prompt_template_overrides`` table is gone;
 - the legacy ``prompt_override_changed`` event row is deleted by the
   migration (the pre-v1 abstraction is removed, not preserved), the narrowed
   event-type CHECK rejects any further ``prompt_override_changed`` insert,
-  and every surviving Python enum value still inserts;
+  and the corrective migration's own narrowed event vocabulary (parsed from
+  the committed migration file, not the live enum) still inserts;
 - the ``initialization_protocol_version`` column is gone while the remaining
   row data is preserved, and the three-fact initialization-coherence CHECK
   rejects incoherent rows in both directions.
@@ -26,6 +31,7 @@ Owner-controlled target the other integration suites use).
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -35,8 +41,6 @@ import pytest
 from psycopg import Connection, connect
 from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
-
-from openorc.domain.events import WorkflowEventType
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
@@ -69,6 +73,41 @@ def _corrective_migration_path() -> Path:
     matches = sorted(MIGRATIONS_DIR.glob(f"*{REMOVAL_MIGRATION_SUFFIX}"))
     assert len(matches) == 1, f"expected exactly one corrective removal migration, found {matches}"
     return matches[0]
+
+
+def _pre_correction_migrations(corrective_path: Path) -> list[Path]:
+    """Committed migrations strictly before the corrective migration.
+
+    Migration filenames carry fixed-width UTC timestamps, so name order is
+    the committed apply order (the same order the shared session fixture
+    applies). Everything dated after the corrective migration is deliberately
+    excluded: its schema and vocabulary must not retroactively define what
+    this migration's predecessor looked like.
+    """
+    return sorted(path for path in MIGRATIONS_DIR.glob("*.sql") if path.name < corrective_path.name)
+
+
+def _installed_event_type_vocabulary(corrective_path: Path) -> tuple[str, ...]:
+    """The event vocabulary the corrective migration itself installed.
+
+    Parsed from the committed, append-only migration file — the same
+    extraction convention the deterministic ``tests/`` convention tests use —
+    so it is a frozen record of the vocabulary that exists immediately after
+    this migration. The live ``WorkflowEventType`` enum is deliberately not
+    consulted here: migrations dated after this one extend the vocabulary,
+    and a historical staged-upgrade test must not depend on them.
+    """
+    text = corrective_path.read_text(encoding="utf-8")
+    match = re.search(
+        r"add constraint workflow_events_event_type_check check \(event_type in \((.*?)\)\)",
+        text,
+        re.DOTALL,
+    )
+    assert match is not None, "expected the corrective migration's narrowed event_type CHECK"
+    values = tuple(dict.fromkeys(re.findall(r"'([a-z_]+)'", match.group(1))))
+    assert values
+    assert "prompt_override_changed" not in values
+    return values
 
 
 def _apply(conn: Connection[Any], path: Path) -> None:
@@ -159,12 +198,11 @@ def test_the_corrective_migration_upgrades_a_pre_correction_schema(
 ) -> None:
     corrective_path = _corrective_migration_path()
 
-    # Stage 1: reset the schema and apply every committed migration except
-    # the corrective removal migration — the pre-correction schema.
+    # Stage 1: reset the schema and apply the committed migrations
+    # chronologically up to, but not including, the corrective removal
+    # migration — the actual schema immediately before the correction.
     conn.execute("drop schema if exists openorc cascade")
-    for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if migration_path == corrective_path:
-            continue
+    for migration_path in _pre_correction_migrations(corrective_path):
         _apply(conn, migration_path)
 
     # Stage 2: seed the pre-correction state the corrective migration must
@@ -239,15 +277,20 @@ def test_the_corrective_migration_upgrades_a_pre_correction_schema(
             "values (%s, %s, %s)",
             (workspace_id, "prompt_override_changed", "owner"),
         )
-    # Every surviving Python enum value still inserts cleanly.
-    for member in WorkflowEventType:
+    # Every event type the corrective migration itself installed still
+    # inserts cleanly. The vocabulary is parsed from the committed,
+    # append-only migration file (the deterministic convention tests use the
+    # same extraction), so later migrations that legitimately extend the
+    # live enum/CHECK cannot retroactively change this historical contract.
+    surviving_event_types = _installed_event_type_vocabulary(corrective_path)
+    for event_type in surviving_event_types:
         conn.execute(
             "insert into openorc.workflow_events (workspace_id, event_type, actor_type) "
             "values (%s, %s, %s)",
-            (workspace_id, member.value, "owner"),
+            (workspace_id, event_type, "owner"),
         )
     assert _row_count(conn, "select count(*) from openorc.workflow_events", ()) == len(
-        WorkflowEventType
+        surviving_event_types
     )
 
     # Stage 4c: the initialization-protocol-version column is gone while the

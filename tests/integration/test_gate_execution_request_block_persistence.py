@@ -186,11 +186,15 @@ def _insert_task(
     github_issue_id: int,
 ) -> uuid.UUID:
     task_id = uuid.uuid4()
+    # The immutable Task source baseline is mandatory at the schema level
+    # (Phase 2B, issue #60): NOT NULL with the lowercase 64-hex SHA-256 CHECK.
+    # Every raw Task fixture must carry a valid fingerprint.
     conn.execute(
         "insert into openorc.tasks "
-        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status) "
-        "values (%s, %s, %s, %s, %s, 'ready_to_plan')",
-        (task_id, workspace_id, repository_id, github_issue_id, 200),
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, 'ready_to_plan', %s)",
+        (task_id, workspace_id, repository_id, github_issue_id, 200, "a" * 64),
     )
     return task_id
 

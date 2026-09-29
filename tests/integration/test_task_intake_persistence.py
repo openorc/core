@@ -96,12 +96,23 @@ def test_the_source_baseline_is_immutable_attempt_history(conn: Connection) -> N
         (repository_id,),
     )
     _intake_task(conn, workspace_id, repository_id, 503, _FINGERPRINT_B)
+    # The semantic contract, asserted directly rather than through insertion
+    # order: both attempts are created inside one outer transaction, so
+    # now() is transaction-stable and created_at may be identical — created_at
+    # ordering is not an insertion order. Exactly the two expected attempts
+    # exist; the archived/cancelled historical attempt still carries the
+    # exactly observed baseline (never rewritten), and the current
+    # non-archived attempt carries the fresh fingerprint.
     attempts = conn.execute(
-        "select source_requirements_fingerprint from openorc.tasks "
-        "where repository_id = %s order by created_at, id",
+        "select source_requirements_fingerprint, archived_at from openorc.tasks "
+        "where repository_id = %s",
         (repository_id,),
     ).fetchall()
-    assert [attempt[0] for attempt in attempts] == [_FINGERPRINT_A, _FINGERPRINT_B]
+    assert len(attempts) == 2
+    archived = [attempt for attempt in attempts if attempt[1] is not None]
+    current = [attempt for attempt in attempts if attempt[1] is None]
+    assert len(archived) == 1 and archived[0][0] == _FINGERPRINT_A
+    assert len(current) == 1 and current[0][0] == _FINGERPRINT_B
 
 
 def test_a_racing_duplicate_intake_keeps_exactly_one_current_task(
