@@ -9,8 +9,9 @@ create a GitHub-shaped workflow exception hierarchy.
 Outcome classification (the discipline the services rely on):
 
 - ``GitHubAuthenticationRejectedError`` — GitHub answered 401: the presented
-  App JWT or installation access token was rejected. A known failure that
-  never means the underlying operation's effect is known.
+  App JWT, installation access token, or Profile-scoped user access token
+  was rejected. A known failure that never means the underlying operation's
+  effect is known.
 - ``GitHubAuthorizationRejectedError`` — GitHub answered 403/404 where access
   to the addressed resource is the question, or the installation fails the
   capability/suspension validation: authorization absence. A known,

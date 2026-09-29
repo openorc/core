@@ -53,6 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from uuid import UUID
 
 from openorc.adapters.github.errors import (
     GitHubOutcomeUncertainError,
@@ -71,6 +72,7 @@ from openorc.observability import annotate_span, application_span
 __all__ = [
     "GITHUB_TOKEN_ENDPOINT_URL",
     "GitHubCurrentUser",
+    "GitHubProfileUserAccessToken",
     "GitHubUserAccessToken",
     "GitHubUserRefreshSecret",
     "GitHubUserTokenClient",
@@ -113,6 +115,50 @@ class GitHubUserAccessToken:
 
     def __str__(self) -> str:
         return "GitHubUserAccessToken(<redacted>)"
+
+
+class GitHubProfileUserAccessToken:
+    """Secret-bearing credential for one Owner-accountable GitHub write (issue #143).
+
+    Bundles the exact accountable Profile identity with that Profile's
+    resolved user access token: the write operation that accepts this
+    credential is externally attributed to exactly this Profile, and the
+    credential is never valid as another Profile's user authorization. The
+    identity must come from the trusted workflow/Owner authorization context
+    — it is never guessed from Workspace ownership, mutable GitHub metadata,
+    repository membership, or any current-user heuristic.
+
+    Ordinary representation is redacted; the token value is reachable only
+    through the carrier at the final request-construction boundary. The
+    credential lives only in the trusted write flow — never in domain
+    objects, persistence, events, logs, telemetry, or any other structure.
+    """
+
+    __slots__ = ("_access_token", "_profile_id")
+
+    def __init__(self, *, profile_id: UUID, access_token: GitHubUserAccessToken) -> None:
+        if not isinstance(profile_id, UUID):
+            raise ValueError("profile_id must be a UUID")
+        if not isinstance(access_token, GitHubUserAccessToken):
+            raise ValueError("access_token must be a GitHubUserAccessToken")
+        self._profile_id = profile_id
+        self._access_token = access_token
+
+    @property
+    def profile_id(self) -> UUID:
+        """The exact accountable Profile identity the write is attributed to."""
+        return self._profile_id
+
+    @property
+    def access_token(self) -> GitHubUserAccessToken:
+        """The secret-bearing user access token carrier for the trusted call."""
+        return self._access_token
+
+    def __repr__(self) -> str:
+        return "GitHubProfileUserAccessToken(<redacted>)"
+
+    def __str__(self) -> str:
+        return "GitHubProfileUserAccessToken(<redacted>)"
 
 
 class GitHubUserRefreshSecret:

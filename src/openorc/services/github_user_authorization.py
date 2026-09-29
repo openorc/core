@@ -644,6 +644,26 @@ class GitHubUserAccessTokenResolver:
                 "was not completed"
             )
 
+    def evict_cached_access_token(self, profile_id: UUID) -> None:
+        """Drop the Profile's cached access token (the bounded 401-recovery seam).
+
+        The only sanctioned trigger is a DEFINITIVE authentication rejection
+        (GitHub answered a 401-class failure) from a GitHub call made under
+        this Profile's resolved user token — the #142 lifecycle's allowed
+        bounded recovery: the next :meth:`resolve` re-reads durable state
+        and, finding no cache entry, performs exactly one refresh exchange
+        through the generation compare-and-swap. Never a replay mechanism:
+        uncertain outcomes, known policy rejections, and stale operations
+        must never trigger an eviction, and a recovered credential never
+        widens the authorization it had. Evicting an unknown Profile's
+        (absent) cache entry is a harmless no-op.
+        """
+        if not isinstance(profile_id, UUID):
+            raise InvalidCommandError("profile_id must be a UUID")
+        with self._cache_lock:
+            for key in [key for key in self._cache if key[0] == profile_id]:
+                del self._cache[key]
+
     def _resolve_refresh_secret(
         self, pool: DatabasePool, *, reference: object, refresh_expires_at: datetime
     ) -> GitHubUserRefreshSecret:

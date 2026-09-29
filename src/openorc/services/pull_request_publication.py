@@ -25,6 +25,15 @@ The central invariant: exact authorized head before creation, exact
 authoritative head after creation, the exact durable Task authority context
 both before and after, and no pretending the network is atomic.
 
+The accountable Profile (issue #143): the publication command carries the
+exact ``profile_id`` whose GitHub App user-to-server authorization will
+externally represent the created PR, and the service re-proves that
+Profile's account-operational state and Workspace/Task ownership BEFORE
+resolving the user credential or any external GitHub I/O. The preflight and
+post-create reads remain installation-authenticated infrastructure reads;
+only the create mutation carries the Profile-bound user credential — no
+installation-token fallback exists.
+
 Partial-success semantics are load-bearing:
 
 - Once GitHub creation is known-successful, the created PR is an external
@@ -62,6 +71,7 @@ from openorc.adapters.github import (
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
     GitHubOutcomeUncertainError,
+    GitHubProfileUserAccessToken,
     GitHubPullRequestExistsError,
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
@@ -81,7 +91,7 @@ from openorc.persistence.pull_requests import (
     get_task_pull_request_for_task,
     reconcile_task_pull_request_observed,
 )
-from openorc.persistence.tasks import get_task, get_task_for_update
+from openorc.persistence.tasks import get_task_for_update
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
@@ -93,8 +103,16 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.github_installation_route import (
+    ResolvedRepositoryInstallationRoute,
     resolve_system_repository_installation_route,
 )
+from openorc.services.github_owner_write_authorization import (
+    require_owner_write_authorization,
+    resolve_owner_write_credential,
+    resolve_owner_write_credential_after_rejection,
+    translate_owner_write_failure,
+)
+from openorc.services.github_user_authorization import GitHubUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 
@@ -199,6 +217,7 @@ class PublicationCommand:
 
     workspace_id: UUID
     task_id: UUID
+    profile_id: UUID
     authorized_head_sha: str
     canonical_branch: str
     base_ref: str
@@ -223,6 +242,10 @@ def _require_command_shape(command: PublicationCommand) -> None:
         raise InvalidCommandError("the publication command must be a PublicationCommand")
     _require_uuid(command.workspace_id, "workspace_id")
     _require_uuid(command.task_id, "task_id")
+    # The accountable Profile identity (issue #143): the exact Profile whose
+    # GitHub App user-to-server authorization will externally represent the
+    # created PR.
+    _require_uuid(command.profile_id, "profile_id")
     _require_uuid(command.state_token, "state_token")
     _require_nonblank(command.authorized_head_sha, "authorized_head_sha")
     _require_nonblank(command.canonical_branch, "canonical_branch")
@@ -268,6 +291,75 @@ _GITHUB_READ_ERRORS = (
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
 )
+
+
+def _translate_user_write_outcome(error: Exception) -> ApplicationError:
+    """Translate the user-authenticated create's classified outcomes.
+
+    Honest about the credential path (issue #143): the failure text never
+    describes the user-authenticated write as a routed-installation
+    credential failure; uncertain outcomes stay uncertain.
+    """
+    if isinstance(error, GitHubOutcomeUncertainError):
+        return ExternalOperationUncertainError(
+            "the outcome of the GitHub pull request publication operation is unknown"
+        )
+    assert isinstance(error, GitHubRequestRejectedError)
+    return translate_owner_write_failure(error, operation="pull request creation")
+
+
+def _create_pull_request_with_bounded_recovery(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    user_token_resolver: GitHubUserAccessTokenResolver,
+    *,
+    credential: GitHubProfileUserAccessToken,
+    profile_id: UUID,
+    route: ResolvedRepositoryInstallationRoute,
+    owner_login: str,
+    repository_name: str,
+    head_ref: str,
+    base_ref: str,
+    title: str,
+    body: str | None,
+) -> GitHubPullRequestFacts:
+    """Exactly one Owner-accountable create attempt with bounded 401 recovery.
+
+    The create mutation carries the accountable Profile's user credential
+    (issue #143). A DEFINITIVE 401-style authentication rejection — GitHub
+    did not perform the create — performs the single bounded recovery the
+    #142 lifecycle allows (evict the cached token, re-resolve through the
+    durable refresh lifecycle, re-prove the user × installation ×
+    repository intersection) and retries the create EXACTLY once; the
+    retry's classification propagates unchanged, so a second rejection is
+    the known failure. Uncertain outcomes are never refreshed, retried, or
+    replayed.
+    """
+    try:
+        return github.create_pull_request(
+            credential=credential,
+            github_installation_id=route.github_installation_id,
+            owner_login=owner_login,
+            repository_name=repository_name,
+            head_ref=head_ref,
+            base_ref=base_ref,
+            title=title,
+            body=body,
+        )
+    except GitHubAuthenticationRejectedError:
+        recovered = resolve_owner_write_credential_after_rejection(
+            pool, user_token_resolver, github, profile_id=profile_id, route=route
+        )
+        return github.create_pull_request(
+            credential=recovered,
+            github_installation_id=route.github_installation_id,
+            owner_login=owner_login,
+            repository_name=repository_name,
+            head_ref=head_ref,
+            base_ref=base_ref,
+            title=title,
+            body=body,
+        )
 
 
 def _observe_repository_and_branch(
@@ -448,30 +540,45 @@ def _persist_created_pull_request(
 def publish_task_pull_request(
     pool: DatabasePool,
     github: GitHubAppClient,
+    user_token_resolver: GitHubUserAccessTokenResolver,
     command: PublicationCommand,
 ) -> TaskPullRequestPublication:
     """Publish the Task's canonical pull request, race-safe.
 
-    Phase 1 (short database read): command-shape validation, then the
-    durable Task/authority/route facts — the Task must be current with
-    exactly the command's ``state_token`` and carry exactly the command's
-    canonical branch. A canonical record that already exists is the replay
-    conflict — never a second create.
+    Phase 1 (short database reads): command-shape validation, then the
+    accountable Profile's authorization re-established FIRST (issue #143:
+    the account-operational barrier composes first, then the exact
+    Profile's owner-gated Workspace/Task authorization), then the durable
+    Task/authority/route facts — the Task must be current with exactly the
+    command's ``state_token`` and carry exactly the command's canonical
+    branch. A canonical record that already exists is the replay conflict —
+    never a second create.
+
+    Credential resolution (no transaction across external calls): the exact
+    Profile's ``GitHubUserAuthorization`` is resolved only after the
+    authorization and subject validation proved current, and the
+    user × installation × repository intersection is proven for the exact
+    routed identities before any write — missing/revoked authorization and
+    intersection failures are typed conditions with no installation-token
+    fallback.
 
     Phase 2 (no database transaction open): the preflight authoritative
-    branch head through the exact routed installation. A head differing
-    from the authorized SHA is ``PREFLIGHT_STALE`` — no create call was
-    made and no PR exists because of this invocation.
+    branch head through the exact routed installation (installation
+    authentication). A head differing from the authorized SHA is
+    ``PREFLIGHT_STALE`` — no create call was made and no PR exists because
+    of this invocation.
 
     Phase 3 (external, no transaction): exactly one branch-addressed
-    create with the validated presentation title/body. GitHub's
-    'already exists' rejection is the explicit non-adoption conflict; an
-    uncertain create raises ``ExternalOperationUncertainError`` with zero
-    automatic resend.
+    create with the validated presentation title/body under the
+    Profile-bound user credential (issue #143), with the single bounded 401
+    recovery the #142 lifecycle allows. GitHub's 'already exists' rejection
+    is the explicit non-adoption conflict; an uncertain create raises
+    ``ExternalOperationUncertainError`` with zero automatic resend.
 
     Phase 4 (no transaction): the immediate authoritative re-read of the
-    created PR, bound to the created stable identity; its authoritative
-    head is compared to the SAME authorized SHA.
+    created PR (installation authentication), bound to the created stable
+    identity; its authoritative head is compared to the SAME authorized
+    SHA.
 
     Phase 5 (one short write transaction): the durable write — the
     canonical record with the GitHub-observed facts, the exact authority
@@ -488,9 +595,18 @@ def publish_task_pull_request(
         )
         # --- Phase 1: durable preflight state (short read; authoritative
         # locks are re-taken inside the later write transaction) ---
-        task = get_task(pool, command.task_id)
-        if task is None or task.workspace_id != command.workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
+        # The accountable Profile's Owner authorization is re-established
+        # FIRST (issue #143): the account-operational barrier composes
+        # first, then the exact Profile's owner-gated Workspace/Task
+        # authorization — before any credential resolution or external
+        # GitHub I/O. A caller-supplied or stale profile_id is never
+        # sufficient authority by itself.
+        task = require_owner_write_authorization(
+            pool,
+            profile_id=command.profile_id,
+            workspace_id=command.workspace_id,
+            task_id=command.task_id,
+        )
         if task.archived_at is not None or task.state_token != command.state_token:
             raise StaleOperationError(
                 "the task state has moved on since this publication was authorized"
@@ -510,6 +626,15 @@ def publish_task_pull_request(
             raise ConflictError(
                 "the task already has a canonical pull request; publication is already satisfied"
             )
+        # --- Credential resolution (external where it must refresh; no
+        # transaction open): the accountable Profile's GitHub user
+        # authorization, resolved ONLY after authorization and subject
+        # validation proved current (issue #143) — with the user ×
+        # installation × repository intersection proven for the exact
+        # routed identities. ---
+        credential = resolve_owner_write_credential(
+            pool, user_token_resolver, github, profile_id=command.profile_id, route=route
+        )
         # --- Phase 2: exact-head preflight (external, no transaction) ---
         try:
             preflight_repository, preflight_head_sha = _observe_repository_and_branch(
@@ -541,10 +666,15 @@ def publish_task_pull_request(
         )
 
         # --- Phase 3: exactly one create attempt (external, no transaction)
-        # ---
+        # under the accountable Profile's user credential (issue #143) ---
         try:
-            created_facts: GitHubPullRequestFacts = github.create_pull_request(
-                github_installation_id=route.github_installation_id,
+            created_facts: GitHubPullRequestFacts = _create_pull_request_with_bounded_recovery(
+                pool,
+                github,
+                user_token_resolver,
+                credential=credential,
+                profile_id=command.profile_id,
+                route=route,
                 owner_login=preflight_repository.owner_login,
                 repository_name=preflight_repository.name,
                 head_ref=canonical_branch,
@@ -562,7 +692,10 @@ def publish_task_pull_request(
                 "external pull requests are never adopted"
             ) from error
         except _GITHUB_READ_ERRORS as error:
-            raise _translate_github_outcome(error) from error
+            # The user-authenticated create's own classification (issue
+            # #143): honest about the accountable Profile's user credential,
+            # never dressed up as a routed-installation credential failure.
+            raise _translate_user_write_outcome(error) from error
         # --- Phase 4: immediate authoritative reconciliation of the created
         # PR (external, no transaction; compared to the same authorized
         # head). Once the create returned known success, a KNOWN failure of

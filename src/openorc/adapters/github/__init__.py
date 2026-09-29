@@ -5,8 +5,20 @@ installation access-token minting), the focused GitHub REST transport, and
 the documented capability/access validation operations for the routed
 installation (issue #58). Application services decide all workflow meaning;
 this boundary returns normalized typed facts and raises the adapter-local
-classified errors only. There is no PAT or human OAuth token fallback
-anywhere in this boundary: human GitHub sign-in is identity only.
+classified errors only.
+
+Authentication is two-mode by operation semantics (issues #141/#142/#143):
+installation authentication is the credential for App-level installation
+reads, #57 routing, discovery/validation, authoritative repository/issue/
+branch/PR/check/status reads, webhook reconciliation, and recovery —
+including the one read-only GraphQL POST surface. Profile-scoped GitHub App
+user-to-server authorization is the accountable Owner credential for
+engineering-record GitHub writes: the write operations require the exact
+Profile-bound user credential in their signatures (no installation-token
+mutation path is reachable from them). There is no PAT or human-OAuth-token
+fallback anywhere in this boundary, and the public surface accepts no raw
+credential value — the user credential travels as the redacted secret-
+bearing carrier the #142 lifecycle resolves.
 """
 
 from openorc.adapters.github.authentication import (
@@ -104,6 +116,7 @@ from openorc.adapters.github.transport import (
 from openorc.adapters.github.user_tokens import (
     GITHUB_TOKEN_ENDPOINT_URL,
     GitHubCurrentUser,
+    GitHubProfileUserAccessToken,
     GitHubUserAccessToken,
     GitHubUserRefreshSecret,
     GitHubUserTokenClient,
@@ -128,6 +141,8 @@ __all__ = [
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
     "GITHUB_TOKEN_ENDPOINT_URL",
+    "GITHUB_USER_INSTALLATIONS_PATH",
+    "GITHUB_USER_INSTALLATION_REPOSITORIES_PATH",
     "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
     "REQUIRED_V1_WEBHOOK_EVENTS",
@@ -149,6 +164,7 @@ __all__ = [
     "GitHubMergeRequestOutcome",
     "GitHubMergeRequestResult",
     "GitHubPullRequestFacts",
+    "GitHubProfileUserAccessToken",
     "GitHubPullRequestObservation",
     "body_reports_pull_request_already_exists",
     "GitHubRelatedIssueEndpoint",
@@ -156,6 +172,7 @@ __all__ = [
     "GitHubRepositoryObservation",
     "GitHubStatusContextObservation",
     "GitHubUserAccessToken",
+    "GitHubUserAccessValidation",
     "GitHubUserRefreshSecret",
     "GitHubUserTokenClient",
     "GitHubUserTokenGrant",
@@ -182,6 +199,7 @@ __all__ = [
     "parse_installation_payload",
     "parse_installation_repository_entry",
     "parse_installation_repositories_page",
+    "parse_user_installations_page",
     "parse_graphql_issue_parent",
     "parse_issue_payload",
     "parse_merge_response_payload",
