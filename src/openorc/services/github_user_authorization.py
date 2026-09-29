@@ -207,6 +207,20 @@ def _require_code(code: object) -> str:
     return code
 
 
+def _require_optional_verifier(code_verifier: object) -> None:
+    """Validate the optional PKCE verifier callback input before any external call.
+
+    The verifier is forwarded verbatim to the token exchange when the
+    correlated authorization request used PKCE; when present it must be a
+    non-empty string (challenge/verifier lifecycle itself is the callback
+    layer's responsibility).
+    """
+    if code_verifier is None:
+        return
+    if not isinstance(code_verifier, str) or code_verifier == "":
+        raise InvalidCommandError("a GitHub PKCE code verifier must be a non-empty string")
+
+
 def normalize_strict_github_user_id(provider_id: object) -> int:
     """Strictly normalize one trusted provider_id fact to the GitHub user ID.
 
@@ -271,11 +285,17 @@ def _resolve_trusted_github_identity(
 
 
 def _exchange_authorization_code(
-    token_client: GitHubUserTokenClient, *, code: str, redirect_uri: str | None
+    token_client: GitHubUserTokenClient,
+    *,
+    code: str,
+    redirect_uri: str | None,
+    code_verifier: str | None,
 ) -> GitHubUserTokenGrant:
     """Exchange the post-correlation code for the normalized token grant."""
     try:
-        grant = token_client.exchange_authorization_code(code, redirect_uri=redirect_uri)
+        grant = token_client.exchange_authorization_code(
+            code, redirect_uri=redirect_uri, code_verifier=code_verifier
+        )
     except GitHubUserTokenRejectedError as exc:
         raise ExternalOperationFailedError(
             "the GitHub user authorization request was rejected by the token endpoint"
@@ -305,6 +325,7 @@ def establish_github_user_authorization(
     admin_client: SupabaseAuthAdminClient,
     token_client: GitHubUserTokenClient,
     redirect_uri: str | None = None,
+    code_verifier: str | None = None,
 ) -> GitHubUserAuthorization:
     """Establish (or re-establish) the Profile's GitHub user authorization.
 
@@ -314,17 +335,22 @@ def establish_github_user_authorization(
        through the Auth Admin boundary (zero/multiple/malformed fail closed).
     2. Exchange the post-correlation authorization code and require the
        expiring-token capability (a capability-less answer fails closed —
-       never a silently persisted long-lived token).
+       never a silently persisted long-lived token). ``code_verifier`` is
+       forwarded when the correlated authorization request used PKCE.
     3. Resolve the authorized GitHub account authoritatively and compare the
        stable numeric GitHub user IDs; a mismatch fails closed storing
        nothing.
     4. In ONE short transaction: compose the account-operational barrier,
-       lock/read the authorization row, delete any superseded Vault secret
-       (fail closed on malformed/dangling references), install the new
-       refresh secret + reference, and update the row in place — inserting
-       it at generation 1 when absent, advancing its generation
-       monotonically otherwise. The row is never delete-and-reinserted, so
-       no earlier access-token cache key can resurface.
+       lock/read the authorization row, delete the superseded Vault secret
+       of an ACTIVE authorization (fail closed on malformed/dangling
+       references), install the new refresh secret + reference, and update
+       the row in place — inserting it at generation 1 when absent, or
+       reactivating a revoked row (which carries no superseded credential)
+       / replacing an active one with its generation advanced monotonically
+       otherwise. The row is never delete-and-reinserted, so no earlier
+       access-token cache key can resurface. Reauthorization is the
+       recovery path after revocation, including after an account-deletion
+       attempt whose external Auth deletion was definitively rejected.
 
     External calls run with no database transaction open. The caller
     validates OAuth ``state``/session correlation before invoking this
@@ -333,12 +359,15 @@ def establish_github_user_authorization(
     with application_span(_TRACER_SCOPE, _ESTABLISH_SPAN_NAME) as span:
         annotate_span(span, operation=_ESTABLISH_SPAN_NAME)
         _require_code(code)
+        _require_optional_verifier(code_verifier)
         # No database transaction is open across any of the three external
         # proof/exchange calls.
         proven_github_user_id = _resolve_trusted_github_identity(
             admin_client, profile_id=profile_id
         )
-        grant = _exchange_authorization_code(token_client, code=code, redirect_uri=redirect_uri)
+        grant = _exchange_authorization_code(
+            token_client, code=code, redirect_uri=redirect_uri, code_verifier=code_verifier
+        )
         current_user = _resolve_authorized_github_user(
             token_client, access_token=grant.access_token
         )
@@ -404,7 +433,12 @@ def _install_established_authorization(
                     "the durable GitHub authorization identity is inconsistent "
                     "with the proven sign-in identity"
                 )
-            _delete_superseded_refresh_secret(transaction_pool, existing=existing)
+            if existing.status is GitHubUserAuthorizationStatus.ACTIVE:
+                # Only an ACTIVE authorization carries a superseded secret to
+                # delete; a revoked row is CHECK-required to carry none, and
+                # reactivating it in place is the reauthorization recovery
+                # path (including after a failed account-deletion attempt).
+                _delete_superseded_refresh_secret(transaction_pool, existing=existing)
         secret_id = github_user_refresh_secrets.create_github_user_refresh_secret(
             transaction_pool, secret=refresh_secret.secret_value(), profile_id=profile_id
         )
@@ -578,13 +612,20 @@ class GitHubUserAccessTokenResolver:
                         condition=CONDITION_EXPIRED_UNREFRESHABLE,
                         message="the Profile's GitHub refresh credential is durably expired",
                     )
-                secret_value = self._resolve_refresh_secret(
-                    pool, reference=durable.refresh_secret_reference
+                durable_refresh_expires_at = durable.refresh_expires_at
+                if durable_refresh_expires_at is None:
+                    # Unreachable for an active row (CHECK-consistent); fail
+                    # closed rather than resolve without the expiry fact.
+                    raise ConflictError("the authorization carries no refresh expiry")
+                refresh_credential = self._resolve_refresh_secret(
+                    pool,
+                    reference=durable.refresh_secret_reference,
+                    refresh_expires_at=durable_refresh_expires_at,
                 )
                 grant = self._refresh_with_classification(
                     pool,
                     profile_id=profile_id,
-                    refresh_token=secret_value,
+                    refresh_token=refresh_credential,
                     observed_generation=durable.refresh_generation,
                 )
                 installed = self._install_refreshed_credential(
@@ -603,8 +644,18 @@ class GitHubUserAccessTokenResolver:
                 "was not completed"
             )
 
-    def _resolve_refresh_secret(self, pool: DatabasePool, *, reference: object) -> str:
-        """Resolve the exact Vault refresh secret behind the durable reference."""
+    def _resolve_refresh_secret(
+        self, pool: DatabasePool, *, reference: object, refresh_expires_at: datetime
+    ) -> GitHubUserRefreshSecret:
+        """Resolve the Vault refresh credential behind the durable reference.
+
+        The decrypted value crosses the persistence boundary only here, only
+        on explicit resolution, and is wrapped IMMEDIATELY in the redacted
+        secret-bearing carrier — it is never held as a plain string beyond
+        this wrapping, never copied into ordinary structures, and reaches a
+        raw representation only at the adapter's final request-construction
+        boundary.
+        """
         if not isinstance(reference, str) or not reference:
             # Unreachable for an active row (CHECK-consistent); fail closed anyway.
             logger.warning("github token resolution rejected a missing reference")
@@ -626,25 +677,40 @@ class GitHubUserAccessTokenResolver:
             raise ConflictError(
                 "the authorization's credential reference does not point at an existing secret"
             )
-        return secret_value
+        return GitHubUserRefreshSecret(value=secret_value, expires_at=refresh_expires_at)
 
     def _refresh_with_classification(
         self,
         pool: DatabasePool,
         *,
         profile_id: UUID,
-        refresh_token: str,
+        refresh_token: GitHubUserRefreshSecret,
         observed_generation: int,
     ) -> GitHubUserTokenGrant:
         """Perform exactly one refresh exchange, classified fail-closed.
 
-        No database transaction is open across the external call. A
-        definitive rejection never mutates durable authorization state: it
-        reloads durable state first, so an already-committed concurrent
-        rotation is reported as moved-on rather than as a dead credential.
+        The secret-bearing carrier is forwarded as-is; no database
+        transaction is open across the external call. A definitive
+        rejection never mutates durable authorization state: it reloads
+        durable state first, so an already-committed concurrent rotation is
+        reported as moved-on rather than as a dead credential.
         """
         try:
             return self._token_client.refresh_user_token(refresh_token)
+        except GitHubUserTokenRefreshCapabilityMissingError as exc:
+            # The deployment's GitHub App no longer provides the expiring
+            # user-token capability: a known misconfiguration condition,
+            # surfaced as the typed application condition with NO durable
+            # mutation (the durable credential is untouched).
+            logger.warning(
+                "github token refresh failed closed: the GitHub App does not "
+                "provide the required expiring user-token capability"
+            )
+            raise GitHubUserAuthorizationUnavailableError(
+                condition=CONDITION_REFRESH_CAPABILITY_UNAVAILABLE,
+                message="the GitHub App does not provide the expiring user-token "
+                "capability OpenOrc requires; fix the GitHub App configuration",
+            ) from exc
         except GitHubUserTokenRejectedError as exc:
             newer = github_user_authorizations.get_github_user_authorization(
                 pool, profile_id=profile_id

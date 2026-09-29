@@ -36,6 +36,7 @@ from psycopg.errors import CheckViolation, UniqueViolation
 from openorc.persistence import github_user_authorizations, github_user_refresh_secrets
 from openorc.persistence.pool import DatabasePool
 from openorc.services import account_lifecycle
+from openorc.services.errors import ExternalOperationFailedError
 
 pytestmark = pytest.mark.integration
 
@@ -292,7 +293,7 @@ def test_account_deletion_composes_the_github_cleanup_before_the_auth_delete(
     secret_id, _reference = _establish_real_authorization(conn, profile_id=profile_id)
 
     outcome = account_lifecycle.delete_account(
-        _pool(conn), _ImmediateDeleteAdminClient(), profile_id=profile_id
+        _pool(conn), _ImmediateDeleteAdminClient(conn), profile_id=profile_id
     )
 
     assert outcome.result == "deleted"
@@ -312,33 +313,65 @@ def test_account_deletion_composes_the_github_cleanup_before_the_auth_delete(
 def test_account_deletion_cleanup_is_idempotent_on_retry(conn: Connection[Any]) -> None:
     profile_id = uuid.uuid4()
     _seed_account(conn, profile_id)
-    _establish_real_authorization(conn, profile_id=profile_id)
+    secret_id, _reference = _establish_real_authorization(conn, profile_id=profile_id)
     # The first attempt's external Auth deletion is definitively rejected: the
-    # account stays present, its credentials stay revoked, retry is safe.
-    outcome = account_lifecycle.delete_account(
-        _pool(conn), _RejectedDeleteAdminClient(), profile_id=profile_id
-    )
-    _ = outcome
+    # established #97 contract translates that into the typed known-failure
+    # condition after clearing the attempt state, leaving the credentials
+    # revoked and the account present — and a later explicit retry safe.
+    with pytest.raises(ExternalOperationFailedError):
+        account_lifecycle.delete_account(
+            _pool(conn),
+            _RejectedDeleteAdminClient(),
+            profile_id=profile_id,
+        )
 
-    # The revoked row carries no dangling reference and the secret is gone.
+    # The GitHub authorization row still exists — revoked is durable
+    # currentness state, deliberately not removed by the rejection — and
+    # carries no dangling reference.
     durable = github_user_authorizations.get_github_user_authorization(
         _pool(conn), profile_id=profile_id
     )
     assert durable is not None
     assert durable.status.value == "revoked"
     assert durable.refresh_secret_reference is None
+    # The refresh secret was deleted in the committed pre-delete revocation.
+    assert not _vault_secret_exists(conn, secret_id)
+    # The attempt state was cleared: normal account use (and the explicit
+    # retry) can resume.
+    attempt_state = conn.execute(
+        "select account_deletion_state from openorc.profiles where id = %s",
+        (profile_id,),
+    ).fetchone()
+    assert attempt_state is not None and attempt_state[0] is None
 
-    # The retry succeeds end to end: no dangling-reference dead end.
+    # The retry succeeds end to end — no dangling-reference dead end — and the
+    # simulated successful Auth deletion removes the Profile-owned graph
+    # through the sanctioned cascade.
     retry = account_lifecycle.delete_account(
-        _pool(conn), _ImmediateDeleteAdminClient(), profile_id=profile_id
+        _pool(conn), _ImmediateDeleteAdminClient(conn), profile_id=profile_id
     )
     assert retry.result == "deleted"
+    row = conn.execute(
+        "select 1 from openorc.github_user_authorizations where profile_id = %s",
+        (profile_id,),
+    ).fetchone()
+    assert row is None
+    profile = conn.execute("select 1 from openorc.profiles where id = %s", (profile_id,)).fetchone()
+    assert profile is None
 
 
 class _ImmediateDeleteAdminClient:
-    """Scripted Auth Admin boundary: the permanent deletion succeeds."""
+    """Scripted Admin boundary whose permanent deletion actually applies.
 
-    def __init__(self) -> None:
+    The simulated external side effect runs against the fixture database:
+    deleting the exact Auth user row fires the sanctioned
+    ``auth.users -> profiles -> ...`` cascade exactly as the real Supabase
+    Auth deletion would, so the test proves the full cleanup-then-cascade
+    composition rather than a fake success that removes nothing.
+    """
+
+    def __init__(self, conn: Connection[Any]) -> None:
+        self._conn = conn
         self.delete_calls: list[UUID] = []
 
     @property
@@ -347,6 +380,7 @@ class _ImmediateDeleteAdminClient:
 
     def delete_user(self, user_id: UUID) -> None:
         self.delete_calls.append(user_id)
+        self._conn.execute("delete from auth.users where id = %s", (user_id,))
 
     def fetch_user(self, user_id: UUID) -> bool:
         return False

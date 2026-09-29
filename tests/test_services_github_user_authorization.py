@@ -200,20 +200,24 @@ class FakeTokenClient:
         self.exchange_results: list[object] = []
         self.refresh_results: list[object] = []
         self.user_results: list[object] = []
-        self.exchange_calls: list[tuple[str, int]] = []
-        self.refresh_calls: list[tuple[str, int]] = []
+        self.exchange_calls: list[tuple[str, str | None, int]] = []
+        self.refresh_calls: list[tuple[GitHubUserRefreshSecret, int]] = []
         self.user_calls: list[int] = []
 
     def exchange_authorization_code(
-        self, code: str, *, redirect_uri: str | None = None
+        self,
+        code: str,
+        *,
+        redirect_uri: str | None = None,
+        code_verifier: str | None = None,
     ) -> GitHubUserTokenGrant:
-        self.exchange_calls.append((code, self._conn.transaction_depth))
+        self.exchange_calls.append((code, code_verifier, self._conn.transaction_depth))
         outcome = self.exchange_results.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return cast(GitHubUserTokenGrant, outcome)
 
-    def refresh_user_token(self, refresh_token: str) -> GitHubUserTokenGrant:
+    def refresh_user_token(self, refresh_token: GitHubUserRefreshSecret) -> GitHubUserTokenGrant:
         self.refresh_calls.append((refresh_token, self._conn.transaction_depth))
         outcome = self.refresh_results.pop(0)
         if isinstance(outcome, Exception):
@@ -270,7 +274,7 @@ def test_establish_proves_the_same_human_identity_and_inserts_the_first_authoriz
     # Binding proof order: trusted Supabase identity, then the authoritative
     # /user comparison — all with NO database transaction open.
     assert admin.identity_calls == [(profile_id, 0)]
-    assert token_client.exchange_calls == [("the-code", 0)]
+    assert token_client.exchange_calls == [("the-code", None, 0)]
     assert token_client.user_calls == [0]
     (create_sql, create_params), (insert_sql, insert_params) = conn.executed[2], conn.executed[3]
     assert "vault.create_secret" in create_sql
@@ -516,7 +520,8 @@ def test_resolve_serves_the_generation_bound_cached_token() -> None:
     resolver = _resolver(conn, token_client)
 
     first = resolver.resolve(_pool(conn), profile_id=profile_id)
-    assert token_client.refresh_calls and token_client.refresh_calls[0][0] == _REFRESH_TOKEN
+    assert token_client.refresh_calls
+    assert token_client.refresh_calls[0][0].secret_value() == _REFRESH_TOKEN
 
     # Second resolution at the same durable generation hits the cache: no
     # additional external refresh and no additional Vault read.
@@ -540,7 +545,9 @@ def test_resolve_after_a_process_restart_exchanges_from_the_durable_vault_refere
     token = resolver.resolve(_pool(conn), profile_id=profile_id)
 
     assert token.token_value() == _ACCESS_TOKEN
-    assert token_client.refresh_calls == [(_REFRESH_TOKEN, 0)]  # NO transaction open
+    # NO transaction open across the exchange; the credential arrives wrapped.
+    assert [call[0].secret_value() for call in token_client.refresh_calls] == [_REFRESH_TOKEN]
+    assert all(depth == 0 for _credential, depth in token_client.refresh_calls)
     existence_sql = conn.executed[4][0]
     assert "vault.secrets" in existence_sql  # decrypt-free existence check
     update_sql, update_params = conn.executed[5]
@@ -610,10 +617,16 @@ def test_a_stale_refresher_discards_its_token_pair_and_reloads_newer_durable_sta
 
     # Two refresh exchanges happened (one per pass), but only the pass-2
     # rotation reached Vault: the stale grant's credential was never written.
-    assert [call[0] for call in token_client.refresh_calls] == [
+    assert [call[0].secret_value() for call in token_client.refresh_calls] == [
         _REFRESH_TOKEN,
         _REFRESH_TOKEN,
     ]
+    # The credential arrives as the redacted carrier, never a plain string.
+    assert all(isinstance(call[0], GitHubUserRefreshSecret) for call in token_client.refresh_calls)
+    assert all(
+        _REFRESH_TOKEN not in repr(call[0]) and _REFRESH_TOKEN not in str(call[0])
+        for call in token_client.refresh_calls
+    )
     update_statements = [
         (sql, params) for sql, params in conn.executed if "vault.update_secret" in sql
     ]
@@ -788,6 +801,97 @@ def test_revoke_fails_closed_on_malformed_or_dangling_references(dangling: bool)
     assert all("update openorc.github_user_authorizations" not in sql for sql, _ in conn.executed)
 
 
+def test_reauthorization_over_a_revoked_row_reactivates_it_in_place() -> None:
+    # A revoked row is CHECK-required to carry no refresh reference, so
+    # reactivation installs the new secret directly and advances the row's
+    # existing generation — never a delete-and-reinsert, never a reset, and
+    # no superseded-secret delete attempt (which would fail closed on the
+    # NULL reference).
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _row(profile_id, status="revoked", generation=4),  # locked read
+            (uuid.uuid4(),),  # new Vault secret create
+            _row(profile_id, generation=5),  # the reactivation update
+        ]
+    )
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+
+    established = github_user_authorization.establish_github_user_authorization(
+        _pool(conn),
+        profile_id=profile_id,
+        code="the-code",
+        admin_client=admin,
+        token_client=token_client,
+    )
+
+    assert established.refresh_generation == 5
+    assert established.status.value == "active"
+    # No Vault deletion and no DELETE from the authorization table: the revoked
+    # row carries no superseded credential and the row persists.
+    assert all("delete from vault.secrets" not in sql for sql, _ in conn.executed)
+    assert all(
+        "delete from openorc.github_user_authorizations" not in sql for sql, _ in conn.executed
+    )
+    reauth_sql = conn.executed[3][0]
+    assert "refresh_generation = refresh_generation + 1" in reauth_sql
+    assert "status = 'active'" in reauth_sql
+
+
+def test_reauthorization_recovers_after_a_failed_account_deletion_attempt() -> None:
+    # The post-failed-deletion state: the account-deletion revocation marked
+    # the authorization revoked (reference NULL, generation advanced) and the
+    # external Auth deletion was definitively rejected, so the account
+    # remains and normal use resumed. Reauthorization is the recovery path.
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,  # the deletion attempt was cleared: operational
+            _row(profile_id, status="revoked", generation=5),
+            (uuid.uuid4(),),
+            _row(profile_id, generation=6),
+        ]
+    )
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+
+    established = github_user_authorization.establish_github_user_authorization(
+        _pool(conn),
+        profile_id=profile_id,
+        code="the-code",
+        admin_client=admin,
+        token_client=token_client,
+    )
+
+    assert established.refresh_generation == 6
+    assert established.status.value == "active"
+
+
+def test_establish_forwards_the_pkce_verifier_to_the_exchange() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            None,
+            (uuid.uuid4(),),
+            _row(profile_id, generation=1),
+        ]
+    )
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+    verifier = "original-verifier-value-from-the-correlated-flow"
+
+    github_user_authorization.establish_github_user_authorization(
+        _pool(conn),
+        profile_id=profile_id,
+        code="the-code",
+        admin_client=admin,
+        token_client=token_client,
+        code_verifier=verifier,
+    )
+
+    assert token_client.exchange_calls == [("the-code", verifier, 0)]
+
+
 def test_every_external_call_runs_with_no_database_transaction_open() -> None:
     profile_id = uuid.uuid4()
     conn = ScriptedConnection(
@@ -809,5 +913,86 @@ def test_every_external_call_runs_with_no_database_transaction_open() -> None:
     )
 
     assert all(depth == 0 for _user_id, depth in admin.identity_calls)
-    assert all(depth == 0 for _code, depth in token_client.exchange_calls)
+    assert all(depth == 0 for _code, _verifier, depth in token_client.exchange_calls)
+    assert all(depth == 0 for _credential, depth in token_client.refresh_calls)
     assert all(depth == 0 for depth in token_client.user_calls)
+
+
+@pytest.mark.parametrize("bad_verifier", ["", 42, b"verifier"])
+def test_establish_rejects_a_malformed_pkce_verifier_before_any_external_call(
+    bad_verifier: object,
+) -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection([])
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+
+    with pytest.raises(InvalidCommandError):
+        github_user_authorization.establish_github_user_authorization(
+            _pool(conn),
+            profile_id=profile_id,
+            code="the-code",
+            admin_client=admin,
+            token_client=token_client,
+            code_verifier=bad_verifier,  # type: ignore[arg-type]
+        )
+
+    assert conn.executed == []
+    assert admin.identity_calls == []
+    assert token_client.exchange_calls == []
+
+
+def test_refresh_time_capability_loss_is_the_typed_unavailable_condition() -> None:
+    # GitHub definitively answers a refresh exchange without the expiring-token
+    # capability: a known misconfiguration condition surfaced through the typed
+    # application vocabulary — never a raw adapter exception — with NO durable
+    # mutation.
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _row(profile_id, generation=5),
+            (_REFRESH_TOKEN,),
+        ]
+    )
+    token_client = FakeTokenClient(conn)
+    token_client.refresh_results.append(GitHubUserTokenRefreshCapabilityMissingError("missing"))
+    resolver = _resolver(conn, token_client)
+
+    with pytest.raises(GitHubUserAuthorizationUnavailableError) as error:
+        resolver.resolve(_pool(conn), profile_id=profile_id)
+
+    assert error.value.condition == CONDITION_REFRESH_CAPABILITY_UNAVAILABLE
+    assert len(token_client.refresh_calls) == 1
+    assert all(
+        not sql.strip().startswith(("update", "delete", "insert")) for sql, _ in conn.executed
+    )
+
+
+def test_the_refresh_credential_is_carried_redacted_through_the_resolution_path() -> None:
+    # The decrypted Vault value is wrapped immediately in the redacted
+    # carrier and stays wrapped through the service-to-adapter refresh call;
+    # the raw value is reachable only at the final HTTP request-construction
+    # boundary (proven at the adapter level).
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _row(profile_id, generation=5),
+            (_REFRESH_TOKEN,),
+            _GUARD_OPERATIONAL_ROW,
+            _row(profile_id, generation=5),
+            (1,),
+            None,
+            _row(profile_id, generation=6),
+        ]
+    )
+    token_client = FakeTokenClient(conn)
+    token_client.refresh_results.append(_grant(refresh=_ROTATED_REFRESH))
+    resolver = _resolver(conn, token_client)
+
+    resolver.resolve(_pool(conn), profile_id=profile_id)
+
+    assert len(token_client.refresh_calls) == 1
+    credential, _depth = token_client.refresh_calls[0]
+    assert isinstance(credential, GitHubUserRefreshSecret)
+    assert credential.secret_value() == _REFRESH_TOKEN
+    assert _REFRESH_TOKEN not in repr(credential)
+    assert _REFRESH_TOKEN not in str(credential)

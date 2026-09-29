@@ -27,6 +27,7 @@ from openorc.adapters.github.transport import GITHUB_API_BASE_URL
 from openorc.adapters.github.user_tokens import (
     GITHUB_TOKEN_ENDPOINT_URL,
     GitHubUserAccessToken,
+    GitHubUserRefreshSecret,
     HttpGitHubUserTokenClient,
 )
 from openorc.config import ConfigurationError
@@ -112,8 +113,9 @@ def test_exchange_normalizes_the_expiring_token_grant_with_absolute_expiries() -
 
 def test_refresh_exchange_sends_the_documented_refresh_grant() -> None:
     transport = FakeGitHubTransport([(200, {}, _grant_body())])
+    credential = GitHubUserRefreshSecret(value=_REFRESH, expires_at=_FIXED_NOW)
 
-    _client(transport).refresh_user_token(_REFRESH)
+    _client(transport).refresh_user_token(credential)
 
     ((url, method, _headers, _timeout, body),) = transport.calls
     assert url == GITHUB_TOKEN_ENDPOINT_URL
@@ -124,6 +126,34 @@ def test_refresh_exchange_sends_the_documented_refresh_grant() -> None:
     assert form["client_id"] == _CLIENT_ID
     assert form["client_secret"] == _CLIENT_SECRET
     assert "code" not in form
+    # The credential value is read only at request construction: the carrier's
+    # ordinary representation never exposes it.
+    assert _REFRESH not in repr(credential)
+    assert _REFRESH not in str(credential)
+
+
+def test_exchange_forwards_the_pkce_verifier_when_the_flow_used_pkce() -> None:
+    transport = FakeGitHubTransport([(200, {}, _grant_body())])
+    verifier = "original-verifier-value-from-the-correlated-authorization-request"
+
+    _client(transport).exchange_authorization_code(_CODE, code_verifier=verifier)
+
+    ((url, method, _headers, _timeout, body),) = transport.calls
+    assert url == GITHUB_TOKEN_ENDPOINT_URL
+    assert method == "POST"
+    form = dict(urllib.parse.parse_qsl((body or b"").decode()))
+    assert form["code_verifier"] == verifier
+    assert form["code"] == _CODE
+
+
+def test_exchange_omits_the_verifier_when_no_pkce_was_used() -> None:
+    transport = FakeGitHubTransport([(200, {}, _grant_body())])
+
+    _client(transport).exchange_authorization_code(_CODE)
+
+    ((url, method, _headers, _timeout, body),) = transport.calls
+    form = dict(urllib.parse.parse_qsl((body or b"").decode()))
+    assert "code_verifier" not in form
 
 
 def test_documented_oauth_error_body_under_a_200_status_is_a_known_rejection() -> None:

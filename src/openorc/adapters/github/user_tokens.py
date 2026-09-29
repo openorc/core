@@ -10,11 +10,15 @@ the provider-native request mechanics and outcome classification only.
 Scope and safety:
 
 - The exchange API accepts only post-correlation callback inputs. OAuth
-  ``state`` correlation and session/PKCE verifier lifecycle against the
-  authenticated Profile are the browser/API callback layer's responsibility
-  (outside this leaf); an authorization code is never treated here as proof
-  of Profile identity. GitHub's GitHub-App web application flow carries no
-  PKCE, so no verifier parameter exists on this surface.
+  ``state`` correlation and session lifecycle against the authenticated
+  Profile are the browser/API callback layer's responsibility (outside this
+  leaf); an authorization code is never treated here as proof of Profile
+  identity. The GitHub App web application flow supports PKCE: where the
+  correlated authorization request carried ``code_challenge``/
+  ``code_challenge_method=S256``, the exchange forwards the original
+  ``code_verifier`` (GitHub's documented ``missing or incorrect
+  code_verifier`` rejection classifies as a known rejection); challenge
+  generation and verifier lifecycle remain callback-layer concerns.
 - The deployment's GitHub App user-flow client ID and client secret are
   deployment/bootstrap secret material: supplied at construction, validated
   once (fail fast on missing/blank values), held in private fields with
@@ -112,13 +116,15 @@ class GitHubUserAccessToken:
 
 
 class GitHubUserRefreshSecret:
-    """Secret-bearing carrier of one GitHub refresh credential in transit.
+    """Secret-bearing in-memory carrier of one GitHub refresh credential.
 
-    Exists only between the adapter's normalized answer and the trusted
-    Vault write. Ordinary representation is redacted; the value is reachable
-    only through :meth:`secret_value`, reserved for the Vault persistence
-    call. It is never copied into domain objects, DTOs, events, logs,
-    telemetry, or any other structure.
+    Exists only inside trusted flows: between the adapter's normalized
+    exchange answer and the trusted Vault write, and between the trusted
+    Vault read and the refresh-exchange request construction. Ordinary
+    representation is redacted; the value is reachable only through
+    :meth:`secret_value`, reserved for those trusted calls. It is never
+    copied into domain objects, DTOs, events, logs, telemetry, or any other
+    structure.
     """
 
     __slots__ = ("_value", "_expires_at")
@@ -173,13 +179,25 @@ class GitHubUserTokenClient(Protocol):
     """Structural contract of the GitHub user-token web-flow boundary."""
 
     def exchange_authorization_code(
-        self, code: str, *, redirect_uri: str | None = None
+        self,
+        code: str,
+        *,
+        redirect_uri: str | None = None,
+        code_verifier: str | None = None,
     ) -> GitHubUserTokenGrant:
-        """Exchange one post-correlation authorization code for a token grant."""
+        """Exchange one post-correlation authorization code for a token grant.
+
+        ``code_verifier`` is forwarded when the correlated authorization
+        request used PKCE.
+        """
         ...
 
-    def refresh_user_token(self, refresh_token: str) -> GitHubUserTokenGrant:
-        """Exchange one refresh credential for a fresh, rotated token grant."""
+    def refresh_user_token(self, refresh_token: GitHubUserRefreshSecret) -> GitHubUserTokenGrant:
+        """Exchange one refresh credential for a fresh, rotated token grant.
+
+        The secret-bearing carrier keeps the credential out of ordinary
+        representations; the raw value is read only at request construction.
+        """
         ...
 
     def fetch_authenticated_user(self, access_token: GitHubUserAccessToken) -> GitHubCurrentUser:
@@ -355,21 +373,36 @@ class HttpGitHubUserTokenClient:
         return self._timeout_seconds
 
     def exchange_authorization_code(
-        self, code: str, *, redirect_uri: str | None = None
+        self,
+        code: str,
+        *,
+        redirect_uri: str | None = None,
+        code_verifier: str | None = None,
     ) -> GitHubUserTokenGrant:
         """Exchange one post-correlation authorization code (see the module contract)."""
         with application_span(_TOKEN_TRACER_SCOPE, _EXCHANGE_SPAN_NAME) as span:
             annotate_span(span, operation=_EXCHANGE_SPAN_NAME)
-            body = self._token_request_body({"code": code, "redirect_uri": redirect_uri})
+            body = self._token_request_body(
+                {
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "code_verifier": code_verifier,
+                }
+            )
             status, response_body = self._post_token_request(body)
             return _classify_token_response(status, response_body, now=self._clock())
 
-    def refresh_user_token(self, refresh_token: str) -> GitHubUserTokenGrant:
+    def refresh_user_token(self, refresh_token: GitHubUserRefreshSecret) -> GitHubUserTokenGrant:
         """Exchange one refresh credential for a fresh, rotated token grant."""
         with application_span(_TOKEN_TRACER_SCOPE, _REFRESH_SPAN_NAME) as span:
             annotate_span(span, operation=_REFRESH_SPAN_NAME)
+            # The raw credential value is read only here, at the final HTTP
+            # request-construction boundary — never copied elsewhere.
             body = self._token_request_body(
-                {"grant_type": "refresh_token", "refresh_token": refresh_token}
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token.secret_value(),
+                }
             )
             status, response_body = self._post_token_request(body)
             return _classify_token_response(status, response_body, now=self._clock())
