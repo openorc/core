@@ -413,7 +413,9 @@ class FakeGitHubAppClient:
             }
         )
         if self._intersection_errors:
-            raise self._intersection_errors.pop(0)
+            outcome = self._intersection_errors.pop(0)
+            if outcome is not None:
+                raise outcome
         return None
 
     def create_pull_request(self, **_kwargs: Any) -> Any:
@@ -993,3 +995,48 @@ def test_another_profile_cannot_substitute_the_owner_even_with_repository_access
     assert resolver.resolve_calls == []
     assert github.repository_calls == []
     assert github.merge_calls == []
+
+
+def test_a_merge_401_whose_recovery_re_proof_is_rejected_fails_closed_without_a_write_retry() -> (
+    None
+):
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+        merge_errors=[GitHubAuthenticationRejectedError("rejected (status 401)")],
+        intersection_errors=[
+            None,
+            GitHubAuthenticationRejectedError("rejected again (status 401)"),
+        ],
+    )
+
+    with pytest.raises(ExternalOperationFailedError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The combined regression (issue #143): the merge's 401 spent the ONE
+    # bounded recovery pass — exactly one eviction/re-resolution — and the
+    # re-proof's own 401 failed closed: no second refresh and NO merge
+    # retry.
+    assert len(github.merge_calls) == 1
+    assert resolver.evict_calls == [_PROFILE_ID]
+    assert resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
+    assert len(github.validation_calls) == 2

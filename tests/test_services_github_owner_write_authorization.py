@@ -478,6 +478,26 @@ def test_recovery_after_a_write_rejection_evicts_then_re_resolves_and_re_proves(
     assert credential.profile_id == _PROFILE_ID
 
 
+def test_a_401_during_the_recovery_re_proof_fails_closed_without_another_refresh() -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(FakePool(conn))
+    github.validation_errors.append(GitHubAuthenticationRejectedError("rejected (status 401)"))
+
+    with pytest.raises(ExternalOperationFailedError):
+        resolve_owner_write_credential_after_rejection(
+            pool, resolver, github, profile_id=_PROFILE_ID, route=_route()
+        )
+
+    # The recovery pass is spent exactly once: one eviction, one
+    # re-resolution, one re-proof — the rejected re-proof never initiates
+    # another eviction/refresh cycle.
+    assert resolver.evict_calls == [_PROFILE_ID]
+    assert resolver.resolve_calls == [_PROFILE_ID]
+    assert len(github.validation_calls) == 1
+
+
 def test_the_write_failure_translation_is_honest_about_the_user_credential() -> None:
     error = translate_owner_write_failure(
         GitHubAuthenticationRejectedError("rejected (status 401)"),

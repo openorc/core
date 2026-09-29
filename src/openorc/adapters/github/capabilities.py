@@ -190,9 +190,7 @@ GITHUB_GRAPHQL_PATH = "/graphql"
 # Owner-accountable writes through these App-scoped listings under the user
 # access token before any mutation.
 GITHUB_USER_INSTALLATIONS_PATH = "/user/installations"
-GITHUB_USER_INSTALLATION_REPOSITORIES_PATH = (
-    "/user/installations/{installation_id}/repositories"
-)
+GITHUB_USER_INSTALLATION_REPOSITORIES_PATH = "/user/installations/{installation_id}/repositories"
 
 
 def require_positive_int(value: object, name: str) -> int:
@@ -433,8 +431,7 @@ def parse_user_installations_page(payload: Mapping[str, Any]) -> list[int]:
     installations = payload.get("installations")
     if not isinstance(installations, list):
         raise GitHubOutcomeUncertainError(
-            "the user installation listing is not interpretable: "
-            "the installations array is missing"
+            "the user installation listing is not interpretable: the installations array is missing"
         )
     installation_ids: list[int] = []
     for entry in installations:

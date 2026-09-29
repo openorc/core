@@ -486,7 +486,9 @@ class FakeGitHubAppClient:
         )
         self.call_order.append("validate")
         if self._intersection_errors:
-            raise self._intersection_errors.pop(0)
+            outcome = self._intersection_errors.pop(0)
+            if outcome is not None:
+                raise outcome
         return None
 
     def get_repository_pull_request(
@@ -1267,6 +1269,36 @@ def test_a_create_401_that_recovers_successfully_publishes_with_the_fresh_creden
     assert result.outcome is TaskPullRequestPublicationOutcome.PUBLISHED
     # Exactly one bounded recovery and one retry; the retry succeeded.
     assert len(github.create_calls) == 2
+    assert resolver.evict_calls == [_PROFILE_ID]
+    assert resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
+    assert len(github.validation_calls) == 2
+
+
+def test_a_create_401_whose_recovery_re_proof_is_rejected_fails_closed_without_a_write_retry() -> (
+    None
+):
+    conn = ScriptedConnection()
+    _preflight_scripts(conn)
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        branch_observation=GitHubBranchObservation(branch_name=_BRANCH, head_sha=_HEAD_SHA),
+        create_errors=[GitHubAuthenticationRejectedError("rejected (status 401)")],
+        intersection_errors=[
+            None,
+            GitHubAuthenticationRejectedError("rejected again (status 401)"),
+        ],
+    )
+
+    with pytest.raises(ExternalOperationFailedError):
+        publish_task_pull_request(_pool(conn), github, resolver, _command())
+
+    # The combined regression (issue #143): the write's 401 spent the ONE
+    # bounded recovery pass — exactly one eviction/re-resolution — and the
+    # re-proof's own 401 failed closed: no second refresh and NO write
+    # retry.
+    assert len(github.create_calls) == 1
     assert resolver.evict_calls == [_PROFILE_ID]
     assert resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
     assert len(github.validation_calls) == 2

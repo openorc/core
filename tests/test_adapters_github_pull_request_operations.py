@@ -143,9 +143,7 @@ def _user_credential() -> GitHubProfileUserAccessToken:
 
 def _assert_owner_write_auth(fetch: FakeFetcher, write_call_index: int = 0) -> None:
     """The write presented the Profile-bound user token and never minted one."""
-    assert (
-        fetch.calls[write_call_index][2]["Authorization"] == f"Bearer {_USER_TOKEN_VALUE}"
-    )
+    assert fetch.calls[write_call_index][2]["Authorization"] == f"Bearer {_USER_TOKEN_VALUE}"
     assert not any("access_tokens" in call[0] for call in fetch.calls)
 
 
@@ -689,9 +687,7 @@ def test_merge_request_success_reports_the_merge_commit_sha() -> None:
 
 
 def test_merge_request_expected_head_mismatch_is_the_documented_409_outcome() -> None:
-    fetch = FakeFetcher(
-        [_json(409, {}, {"message": "Head branch was modified or is invalid"})]
-    )
+    fetch = FakeFetcher([_json(409, {}, {"message": "Head branch was modified or is invalid"})])
 
     result = _client(fetch).merge_pull_request(
         credential=_user_credential(),

@@ -40,11 +40,14 @@ from openorc.adapters.github.capabilities import (
     GITHUB_REPOSITORY_BRANCH_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
     GITHUB_REPOSITORY_PULL_REQUEST_PATH,
+    GITHUB_USER_INSTALLATION_REPOSITORIES_PATH,
+    GITHUB_USER_INSTALLATIONS_PATH,
     REQUIRED_V1_WEBHOOK_EVENTS,
     REQUIRED_V1_WORKFLOW_CAPABILITIES,
     V1_CLASSIFIED_WEBHOOK_EVENTS,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
+    GitHubUserAccessValidation,
     GitHubWorkflowCapability,
     map_installation_permissions,
     missing_required_capabilities,
@@ -52,6 +55,7 @@ from openorc.adapters.github.capabilities import (
     parse_installation_payload,
     parse_installation_repositories_page,
     parse_instant,
+    parse_user_installations_page,
     require_positive_int,
 )
 from openorc.adapters.github.client import (

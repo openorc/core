@@ -215,13 +215,33 @@ def _validate_user_repository_intersection(
         raise
     except GitHubRequestRejectedError as error:
         raise ExternalOperationFailedError(
-            "the GitHub user installation access validation failed as a known "
-            "provider condition"
+            "the GitHub user installation access validation failed as a known provider condition"
         ) from error
     except GitHubOutcomeUncertainError as error:
         raise ExternalOperationUncertainError(
             "the outcome of the GitHub user installation access validation is unknown"
         ) from error
+
+
+def _resolve_and_validate_once(
+    pool: DatabasePool,
+    user_token_resolver: GitHubUserAccessTokenResolver,
+    github: GitHubAppClient,
+    *,
+    profile_id: UUID,
+    route: ResolvedRepositoryInstallationRoute,
+) -> GitHubProfileUserAccessToken:
+    """One credential resolution + one intersection proof (no recovery).
+
+    The typed unavailable-authorization conditions propagate unchanged; the
+    intersection proof's classified outcomes translate as usual EXCEPT a
+    definitive :class:`GitHubAuthenticationRejectedError`, which propagates
+    unchanged for the caller's bounded-recovery decision — never recovered
+    inside this helper.
+    """
+    credential = _resolve_profile_credential(user_token_resolver, pool, profile_id=profile_id)
+    _validate_user_repository_intersection(github, credential=credential, route=route)
+    return credential
 
 
 def resolve_owner_write_credential(
@@ -249,28 +269,25 @@ def resolve_owner_write_credential(
     _require_uuid_command(profile_id, "profile_id")
     with application_span(_SERVICE_TRACER_SCOPE, _RESOLVE_SPAN_NAME) as span:
         annotate_span(span, operation=_RESOLVE_SPAN_NAME)
-        credential = _resolve_profile_credential(user_token_resolver, pool, profile_id=profile_id)
         try:
-            _validate_user_repository_intersection(github, credential=credential, route=route)
-        except GitHubAuthenticationRejectedError:
-            # Definitive 401-style non-delivery under the user token: the
-            # single bounded recovery pass the #142 lifecycle allows. The
-            # fresh credential re-proves the intersection; a second
-            # rejection fails closed.
-            user_token_resolver.evict_cached_access_token(profile_id)
-            credential = _resolve_profile_credential(
-                user_token_resolver, pool, profile_id=profile_id
+            return _resolve_and_validate_once(
+                pool, user_token_resolver, github, profile_id=profile_id, route=route
             )
+        except GitHubAuthenticationRejectedError:
+            # Definitive 401-style non-delivery under the user token during
+            # the initial resolution: the single bounded recovery pass the
+            # #142 lifecycle allows. The fresh credential re-proves the
+            # intersection; a second rejection fails closed.
+            user_token_resolver.evict_cached_access_token(profile_id)
             try:
-                _validate_user_repository_intersection(
-                    github, credential=credential, route=route
+                return _resolve_and_validate_once(
+                    pool, user_token_resolver, github, profile_id=profile_id, route=route
                 )
             except GitHubAuthenticationRejectedError as error:
                 raise ExternalOperationFailedError(
                     "GitHub rejected the accountable Profile's user credential after "
                     "the bounded recovery; the resolution fails closed"
                 ) from error
-        return credential
 
 
 def resolve_owner_write_credential_after_rejection(
@@ -284,19 +301,32 @@ def resolve_owner_write_credential_after_rejection(
     """The bounded user-token recovery after a definitive write rejection.
 
     Called ONLY after a definitive 401-style authentication rejection from an
-    Owner-accountable write already attempted under a resolved credential:
-    evicts the cached token, re-resolves through the #142 durable refresh
-    lifecycle (exactly one refresh exchange), and re-proves the user ×
-    installation × repository intersection with the fresh credential before
-    the caller retries its write exactly once. Never triggered by uncertain
-    outcomes — those are never refreshed, retried, or replayed — and never
-    by known policy/state rejections or stale operations.
+    Owner-accountable write already attempted under a resolved credential.
+    Performs EXACTLY ONE bounded recovery pass: evict the cached token,
+    re-resolve through the #142 durable refresh lifecycle (exactly one
+    refresh exchange), and re-prove the user × installation × repository
+    intersection once with the fresh credential before the caller retries
+    its write exactly once. Any definitive 401-style rejection during that
+    re-proof fails closed — never another eviction, never another refresh,
+    and the caller's write retry never runs. Uncertain outcomes are never
+    refreshed, retried, or replayed, and known policy/state rejections or
+    stale operations never trigger this path at all.
     """
     _require_uuid_command(profile_id, "profile_id")
     user_token_resolver.evict_cached_access_token(profile_id)
-    return resolve_owner_write_credential(
-        pool, user_token_resolver, github, profile_id=profile_id, route=route
-    )
+    try:
+        return _resolve_and_validate_once(
+            pool, user_token_resolver, github, profile_id=profile_id, route=route
+        )
+    except GitHubAuthenticationRejectedError as error:
+        # The recovery pass is spent: the re-resolved credential was
+        # rejected while re-proving the intersection. Fail closed — no
+        # second eviction/refresh and no write retry.
+        raise ExternalOperationFailedError(
+            "GitHub rejected the re-resolved user credential while re-proving the "
+            "user installation access after the bounded recovery; the recovery "
+            "fails closed"
+        ) from error
 
 
 def translate_owner_write_failure(
