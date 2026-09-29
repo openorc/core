@@ -176,3 +176,26 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
   bindings only through the idempotent `ensure_task_agent_session`
   establishment primitive; admission never creates a second `(Task, role)`
   row and never replaces a terminal (LOST/ENDED) historical binding.
+
+## Profile-scoped GitHub user authorization (issue #142)
+
+- `github_user_refresh_secrets.py` is the GitHub-user-purpose Vault boundary
+  over the shared exact-ID primitive. Its opaque v1 reference
+  (`openorc:github-user-refresh:v1:vault:<uuid>`) is deliberately not
+  cross-parseable with the Connection-purpose `auth_reference`; parsing,
+  description composition, and resolution/rotation/deletion semantics live
+  here, never generic Vault browsing.
+- `github_user_authorizations.py` owns the durable lifecycle: the row is
+  keyed by `profile_id` (one current authorization per Profile) and updated
+  in place for its whole Profile lifetime — reauthorization advances
+  `refresh_generation` monotonically (never delete-and-reinsert, never a
+  reset), the refresh-install compare-and-swap (`try_install_rotated_refresh`)
+  installs only when the durable generation matches AND the row is still
+  active, and revocation removes the usable reference and advances the
+  generation in one statement so no `(Profile, generation)` cache key
+  outlives a lifecycle transition. Revoked is durable currentness state,
+  deliberately distinct from never-authorized; the only row removal is the
+  sanctioned `auth.users → profiles` cascade.
+- Raw access/refresh tokens have no column and no path through these
+  modules: ordinary `openorc.*` tables carry only the opaque reference
+  pointer.

@@ -47,6 +47,8 @@ __all__ = [
     "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
+    "GitHubUserTokenRefreshCapabilityMissingError",
+    "GitHubUserTokenRejectedError",
 ]
 
 
@@ -78,6 +80,33 @@ class GitHubRequestRejectedError(Exception):
 
 class GitHubAuthenticationRejectedError(GitHubRequestRejectedError):
     """GitHub rejected the presented App JWT or installation token (401)."""
+
+
+class GitHubUserTokenRejectedError(GitHubRequestRejectedError):
+    """The GitHub user-token endpoint definitively rejected the grant (issue #142).
+
+    A known failure of the web-flow authorization-code exchange or the
+    refresh exchange: GitHub answered with its documented OAuth error shape
+    (``error``/``error_description`` — which the token endpoint may deliver
+    even under a 200 status) or a definitive 4xx answer. The known rejection
+    is never reclassified as uncertainty, and the caller never blindly
+    replays it: an uncertain token answer (timeout, connection loss,
+    uninterpretable response) is a :class:`GitHubOutcomeUncertainError`
+    instead — deliberately distinct, because a refresh token GitHub may have
+    consumed is not safe to reuse after an unknown outcome.
+    """
+
+
+class GitHubUserTokenRefreshCapabilityMissingError(GitHubRequestRejectedError):
+    """The token answer cannot establish the required expiring-token lifecycle.
+
+    GitHub answered definitively but without the expiring user access token
+    capability OpenOrc requires (no refresh token/expiry in the response —
+    the documented shape when a GitHub App has opted out of expiring
+    user-to-server tokens). A known, safe-to-classify misconfiguration
+    condition: OpenOrc never persists a long-lived user access token as a
+    second credential model.
+    """
 
 
 class GitHubPullRequestExistsError(GitHubRequestRejectedError):

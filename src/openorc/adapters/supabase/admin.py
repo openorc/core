@@ -1,13 +1,16 @@
 """Transport-neutral Supabase Auth Admin boundary for account deletion.
 
 The server-side administrative boundary for permanent Supabase Auth user
-deletion (Phase 2A, issue #97): a focused client for the two supported Admin
-operations the account-deletion lifecycle needs — permanent user deletion and
-the read surface used to reconcile uncertain deletion outcomes. It owns the
-Supabase Auth Admin transport mechanics and nothing else: workflow meaning,
-reconciliation policy, and error translation belong to
-``openorc.services.account_lifecycle``, which composes this client and
-translates these adapter errors into the typed application vocabulary.
+deletion (Phase 2A, issue #97) and the trusted identity lookup the
+Profile-scoped GitHub user authorization binding proof needs (issue #142): a
+focused client for the supported Admin operations — permanent user deletion,
+the read surface used to reconcile uncertain deletion outcomes, and the
+multiplicity-preserving GitHub provider-identity read. It owns the Supabase
+Auth Admin transport mechanics and nothing else: workflow meaning,
+reconciliation policy, authorization binding, and error translation belong to
+``openorc.services.account_lifecycle`` and
+``openorc.services.github_user_authorization``, which compose this client and
+translate these adapter errors into the typed application vocabulary.
 
 Dependency direction: adapters never import ``openorc.services``. The
 adapter-local error types below are the normalized boundary; the service
@@ -56,6 +59,7 @@ contents.
 
 from __future__ import annotations
 
+import json
 import logging
 import urllib.error
 import urllib.request
@@ -64,7 +68,7 @@ from typing import Protocol
 from urllib.parse import urlparse
 from uuid import UUID
 
-from openorc.adapters.supabase.auth import _require_project_url
+from openorc.adapters.supabase.auth import GITHUB_PROVIDER, _require_project_url
 from openorc.config import ConfigurationError
 from openorc.observability import annotate_span, application_span
 
@@ -100,6 +104,7 @@ _ADMIN_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _ADMIN_TRACER_SCOPE = "openorc.adapters.supabase.admin"
 _DELETE_USER_SPAN_NAME = "supabase.auth_admin_delete_user"
 _FETCH_USER_SPAN_NAME = "supabase.auth_admin_fetch_user"
+_FETCH_GITHUB_PROVIDER_IDS_SPAN_NAME = "supabase.auth_admin_fetch_user_github_provider_ids"
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +222,29 @@ class SupabaseAuthAdminClient(Protocol):
         """
         ...
 
+    def fetch_user_github_provider_ids(self, user_id: UUID) -> tuple[str | None, ...]:
+        """Return the stable GitHub provider facts of the exact Auth user.
+
+        The narrowly normalized, multiplicity-preserving read surface for
+        the same-human authorization binding proof (issue #142): one entry
+        per identity in the user's trusted ``identities`` collection whose
+        ``provider`` is exactly ``"github"``, in collection order. Each
+        entry carries the raw ``identity_data.provider_id`` string — the
+        stable provider-side GitHub user fact — or ``None`` when that
+        entry's provider_id member is missing or malformed. The collection
+        shape is preserved exactly (zero, one, or many entries): collapsing
+        or normalizing it here would silently resolve ambiguity that only
+        the authorization service may classify. Mutable identity metadata
+        (login, email, ``user_metadata``) is never read into the result.
+
+        Raises :class:`SupabaseAuthAdminUserAbsentError` when the user is
+        confirmed absent, :class:`SupabaseAuthAdminRejectedError` on a
+        definitive rejection, and
+        :class:`SupabaseAuthAdminOutcomeUnknownError` when the outcome or
+        the trusted user-record shape cannot be determined.
+        """
+        ...
+
 
 # Injectable transport seam: one HTTP call returning (status, raw body).
 # Network-level failures (timeout, connection loss, DNS) raise; the HTTP
@@ -251,6 +279,49 @@ def _fetch_admin_response(
         # never needed for the outcome classification and is deliberately
         # discarded so no response content can leak into errors or logs.
         return exc.code, b""
+
+
+def _parse_github_provider_ids(body: bytes) -> tuple[str | None, ...]:
+    """Normalize the trusted user record into multiplicity-preserving facts.
+
+    One entry per ``identities`` member whose ``provider`` is exactly the
+    GitHub provider, in collection order; each entry carries the raw
+    ``identity_data.provider_id`` string, or ``None`` when that member is
+    missing or malformed. A non-dict identities entry is trusted durable
+    state that cannot be interpreted, so it contributes ``None`` — the
+    service fails closed on it. A response whose trusted shape cannot be
+    interpreted at all (not JSON, not an object, ``identities`` not a list)
+    is an unknown outcome, never a provable fact. No response content ever
+    enters the exception messages.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SupabaseAuthAdminOutcomeUnknownError(
+            "the Supabase Auth Admin GitHub identity lookup response is not interpretable"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SupabaseAuthAdminOutcomeUnknownError(
+            "the Supabase Auth Admin GitHub identity lookup response is not interpretable"
+        )
+    identities = payload.get("identities")
+    if not isinstance(identities, list):
+        raise SupabaseAuthAdminOutcomeUnknownError(
+            "the Supabase Auth Admin GitHub identity lookup response is not interpretable"
+        )
+    provider_ids: list[str | None] = []
+    for entry in identities:
+        if not isinstance(entry, dict) or entry.get("provider") != GITHUB_PROVIDER:
+            if not isinstance(entry, dict):
+                provider_ids.append(None)
+            continue
+        identity_data = entry.get("identity_data")
+        if not isinstance(identity_data, dict):
+            provider_ids.append(None)
+            continue
+        provider_id = identity_data.get("provider_id")
+        provider_ids.append(provider_id if isinstance(provider_id, str) else None)
+    return tuple(provider_ids)
 
 
 class HttpSupabaseAuthAdminClient:
@@ -354,9 +425,22 @@ class HttpSupabaseAuthAdminClient:
         apikey header carries credential material, so neither ever reaches a
         log record, span attribute, or exception message.
         """
+        status, _body = self._perform_read(method, user_id)
+        return status
+
+    def _perform_read(self, method: str, user_id: UUID) -> tuple[int, bytes]:
+        """Run one Admin request; return (status, raw body) for classification.
+
+        The body is retained only for 2xx reads whose documented operation
+        parses it (the GitHub identity lookup); failure classification
+        deliberately discards it. Transport-level failures (timeout,
+        connection loss, DNS) leave the outcome unknown — never reclassified
+        as a known failure or success. Fixed safe message only — never the
+        URL, the key, or any user-record content.
+        """
         url = self._base_url + AUTH_ADMIN_USERS_PATH + f"/{user_id}"
         try:
-            status, _body = _fetch_admin_response(
+            status, body = _fetch_admin_response(
                 self._fetch,
                 url,
                 method,
@@ -374,7 +458,34 @@ class HttpSupabaseAuthAdminClient:
             raise SupabaseAuthAdminOutcomeUnknownError(
                 "the Supabase Auth Admin endpoint could not be reached"
             ) from exc
-        return status
+        return status, body
+
+    def fetch_user_github_provider_ids(self, user_id: UUID) -> tuple[str | None, ...]:
+        """Return the user's GitHub provider facts (see the module contract)."""
+        with application_span(_ADMIN_TRACER_SCOPE, _FETCH_GITHUB_PROVIDER_IDS_SPAN_NAME) as span:
+            annotate_span(span, operation=_FETCH_GITHUB_PROVIDER_IDS_SPAN_NAME)
+            status, body = self._perform_read("GET", user_id)
+            if 200 <= status < 300:
+                return _parse_github_provider_ids(body)
+            if status == 404:
+                raise SupabaseAuthAdminUserAbsentError(
+                    "the Supabase Auth user addressed for the GitHub identity lookup is absent"
+                )
+            if 400 <= status < 500:
+                logger.warning(
+                    "Supabase Auth Admin GitHub identity lookup was definitively "
+                    "rejected by the administrative endpoint"
+                )
+                raise SupabaseAuthAdminRejectedError(
+                    "the Supabase Auth Admin boundary rejected the GitHub identity lookup"
+                )
+            logger.warning(
+                "Supabase Auth Admin request outcome is unknown: the administrative "
+                "endpoint reported an unclassified failure"
+            )
+            raise SupabaseAuthAdminOutcomeUnknownError(
+                "the Supabase Auth Admin GitHub identity lookup outcome is unknown"
+            )
 
     def __repr__(self) -> str:
         return "HttpSupabaseAuthAdminClient(<redacted>)"

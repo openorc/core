@@ -52,6 +52,27 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - `openorc.tasks.source_requirements_fingerprint` (NOT NULL, lowercase hex SHA-256 CHECK) is the immutable Task source baseline: the exact #59 requirements fingerprint of the issue as freshly reconciled at authoritative intake. It is historical authority for later source-drift detection and is never rewritten when GitHub requirements change; the issue body/title is deliberately not duplicated onto the Task.
 - Foreign-key classification follows the deletion-ownership vocabulary: each mirror's `(repository_id, workspace_id) → repositories` composite edge is true ownership (ON DELETE CASCADE, the #59 pattern). The classification is enforced by `tests/test_deletion_migration.py` and `tests/test_github_issue_relations_migration.py`.
 
+## Profile-scoped GitHub user authorization (issue #142)
+
+- `openorc.github_user_authorizations` is the durable, Profile-scoped GitHub
+  App user-to-server authorization boundary: one current authorization per
+  Profile, keyed by `profile_id` as the row identity, with the explicit
+  deletion-ownership CASCADE edge to `profiles` (classified in
+  `tests/test_deletion_migration.py`). The row is updated in place for its
+  whole Profile lifetime; only the sanctioned account-root cascade removes
+  it.
+- CHECK-consistent lifecycle: `status` is `'active'` or `'revoked'`; an
+  active row carries exactly its Vault refresh reference and expiry, a
+  revoked row carries neither and always `revoked_at`. Revocation is durable
+  currentness state, deliberately distinct from never-authorized.
+- `refresh_generation` is monotonic for the row's whole Profile lifetime and
+  is the cross-process stale-write guard for refresh rotation (issue #142):
+  every credential lifecycle transition advances it atomically with the
+  durable effect.
+- Raw access/refresh tokens have no column here; the refresh credential
+  lives only in Supabase Vault behind the opaque
+  `openorc:github-user-refresh:v1:vault:<uuid>` reference.
+
 ## Security / isolation
 
 - Workspace isolation is a security boundary.

@@ -200,6 +200,10 @@ class FakeAdminClient:
             raise outcome
         return cast(bool, outcome)
 
+    def fetch_user_github_provider_ids(self, user_id: UUID) -> tuple[str | None, ...]:
+        # The deletion lifecycle never performs the #142 identity lookup.
+        raise AssertionError("the account-deletion lifecycle never reads GitHub identities")
+
 
 def test_first_invocation_revokes_credentials_then_deletes_the_account() -> None:
     profile_id = uuid.uuid4()
@@ -212,6 +216,7 @@ def test_first_invocation_revokes_credentials_then_deletes_the_account() -> None
             [_connection_row(workspace_id, auth_reference=reference)],  # enumeration
             (1,),  # Vault secret delete
             _connection_row(workspace_id, auth_reference=None),  # disconnect
+            None,  # GitHub user authorization: none durably present
         ]
     )
     admin = FakeAdminClient()
@@ -233,7 +238,7 @@ def test_first_invocation_revokes_credentials_then_deletes_the_account() -> None
     assert depth_at_delete == [0]
     # Revocation-before-Auth-call ordering: the claim, Vault delete, and
     # disconnect all ran before the external delete was issued.
-    assert sql_count_at_delete == [5]
+    assert sql_count_at_delete == [6]
     sqls = [sql for sql, _ in conn.executed]
     assert "for update" in sqls[0] and "openorc.profiles" in sqls[0]
     claim_sql, claim_params = conn.executed[1]
@@ -253,6 +258,7 @@ def test_first_invocation_with_no_connections_still_claims_and_deletes() -> None
             _profile_attempt_row(profile_id),
             (1,),
             [],  # zero Connections across the Profile's Workspaces
+            None,  # GitHub user authorization: none durably present
         ]
     )
     admin = FakeAdminClient()
@@ -364,6 +370,7 @@ def test_expired_active_attempt_recovers_through_reconciliation_before_replay() 
             # active attempt, composed with the idempotent revocation re-run.
             (1,),
             [],  # revocation re-run enumeration: credentials already revoked
+            None,  # GitHub user authorization: none durably present
             # The replay delete_user resolves.
         ]
     )
@@ -435,6 +442,7 @@ def test_uncertain_state_reconciles_before_any_replay() -> None:
             _profile_attempt_row(profile_id, state="uncertain", attempt_id=uncertain_attempt),
             (1,),  # CAS: the exact reconciled 'uncertain' attempt -> fresh 'active'
             [],  # idempotent revocation re-run
+            None,  # GitHub user authorization: none durably present
         ]
     )
     admin = FakeAdminClient()
@@ -508,6 +516,7 @@ def test_stale_reconciliation_can_never_authorize_a_replay_two_retrier_race() ->
             ),
             (1,),  # A's CAS against the EXACT U2 applies
             [],  # idempotent revocation re-run
+            None,  # GitHub user authorization: none durably present
         ]
     )
     admin = FakeAdminClient()
@@ -539,6 +548,7 @@ def test_definitive_rejection_leaves_the_account_present_with_credentials_revoke
             [_connection_row(uuid.uuid4(), auth_reference=reference)],
             (1,),  # Vault secret delete
             _connection_row(uuid.uuid4(), auth_reference=None),  # disconnect
+            None,  # GitHub user authorization: none durably present
             (1,),  # attempt-scoped clear after the known failure
         ]
     )
@@ -550,7 +560,7 @@ def test_definitive_rejection_leaves_the_account_present_with_credentials_revoke
 
     # Account present (nothing cascade-deleted), credentials revoked, retry safe.
     assert admin.delete_calls == [profile_id]
-    clear_sql, clear_params = conn.executed[5]
+    clear_sql, clear_params = conn.executed[6]
     assert "account_deletion_state = null" in clear_sql
     assert clear_params is not None
     assert clear_params[0] == profile_id
@@ -563,6 +573,7 @@ def test_explicit_retry_after_a_known_failure_succeeds() -> None:
             _profile_attempt_row(profile_id),
             (1,),  # claim
             [],  # zero Connections
+            None,  # GitHub user authorization: none durably present
             (1,),  # attempt-scoped clear after the known failure
         ]
     )
@@ -579,6 +590,7 @@ def test_explicit_retry_after_a_known_failure_succeeds() -> None:
             _profile_attempt_row(profile_id),  # cleared state: normal operation
             (1,),  # fresh attempt claim
             [],
+            None,  # GitHub user authorization: none durably present
         ]
     )
     outcome = account_lifecycle.delete_account(_pool(second), admin, profile_id=profile_id)
@@ -594,6 +606,7 @@ def test_unknown_delete_outcome_reconciles_absent_completes_as_deleted() -> None
             _profile_attempt_row(profile_id),
             (1,),
             [],
+            None,  # GitHub user authorization: none durably present
         ]
     )
     admin = FakeAdminClient()
@@ -613,6 +626,7 @@ def test_unknown_delete_outcome_confirmed_present_is_a_known_not_applied_failure
             _profile_attempt_row(profile_id),
             (1,),
             [],
+            None,  # GitHub user authorization: none durably present
             (1,),  # attempt-scoped clear: normal use resumes
         ]
     )
@@ -624,7 +638,7 @@ def test_unknown_delete_outcome_confirmed_present_is_a_known_not_applied_failure
         account_lifecycle.delete_account(_pool(conn), admin, profile_id=profile_id)
 
     assert len(admin.fetch_calls) == 1 and len(admin.delete_calls) == 1
-    clear_sql, _clear_params = conn.executed[3]
+    clear_sql, _clear_params = conn.executed[4]
     assert "account_deletion_state = null" in clear_sql
 
 
@@ -635,6 +649,7 @@ def test_unknown_delete_outcome_that_cannot_be_reconciled_marks_the_attempt_unce
             _profile_attempt_row(profile_id),
             (1,),
             [],
+            None,  # GitHub user authorization: none durably present
             (1,),  # attempt-scoped 'active' -> 'uncertain'
         ]
     )
@@ -647,7 +662,7 @@ def test_unknown_delete_outcome_that_cannot_be_reconciled_marks_the_attempt_unce
 
     # No replay inside the attempt: exactly one delete, one reconcile.
     assert len(admin.delete_calls) == 1 and len(admin.fetch_calls) == 1
-    mark_sql, _mark_params = conn.executed[3]
+    mark_sql, _mark_params = conn.executed[4]
     assert "account_deletion_state = 'uncertain'" in mark_sql
 
 
@@ -668,6 +683,7 @@ def test_credentials_cannot_be_reinstalled_in_the_post_commit_window() -> None:
             [locked],  # enumeration
             (1,),  # Vault secret delete
             _connection_row(workspace_id, auth_reference=None, enabled=False),  # disconnect
+            None,  # GitHub user authorization: none durably present
             # --- the post-commit window: a concurrent configure attempt ---
             (None, None, None),  # the account barrier read of the configure flow
             (uuid.uuid4(), profile_id, "platform", _OBSERVED, _OBSERVED, 5, ""),  # ws read
@@ -705,7 +721,7 @@ def test_credentials_cannot_be_reinstalled_in_the_post_commit_window() -> None:
     # durable revocation barrier) and was denied.
     assert configure_denials == ["disabled"]
     # No fresh Vault secret was created in the window.
-    window_sqls = [sql for sql, _ in conn.executed[6:]]
+    window_sqls = [sql for sql, _ in conn.executed[7:]]
     assert all("vault.create_secret" not in sql for sql in window_sqls)
 
 
@@ -741,3 +757,120 @@ def test_the_barrier_read_uses_for_key_share_conflicting_with_the_deletion_lock(
     assert "for key share" in barrier_sql
     assert "openorc.profiles" in barrier_sql
     assert barrier_params == (profile_id,)
+
+
+# --- GitHub user authorization cleanup in the revocation transaction (#142) --
+
+
+def _github_auth_row(
+    profile_id: UUID, *, status: str = "active", reference: str | None = "ref", generation: int = 3
+) -> tuple[Any, ...]:
+    now = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
+    active = status == "active"
+    return (
+        profile_id,
+        5432,
+        "octocat",
+        status,
+        reference if active else None,
+        now if active else None,
+        generation,
+        now,
+        None if active else now,
+        now,
+        now,
+    )
+
+
+def test_deletion_revocation_deletes_the_github_refresh_secret_and_clears_the_row() -> None:
+    profile_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _profile_attempt_row(profile_id),
+            (1,),  # claim
+            [],  # zero Connections
+            _github_auth_row(
+                profile_id, reference=f"openorc:github-user-refresh:v1:vault:{secret_id}"
+            ),
+            (1,),  # GitHub refresh secret delete
+            _github_auth_row(profile_id, status="revoked", generation=4),  # row made non-dangling
+        ]
+    )
+    admin = FakeAdminClient()
+    admin.delete_results.append(None)
+
+    outcome = account_lifecycle.delete_account(_pool(conn), admin, profile_id=profile_id)
+
+    assert outcome == AccountDeletionOutcome(profile_id=profile_id, result="deleted")
+    delete_sql, delete_params = conn.executed[4]
+    assert "delete from vault.secrets" in delete_sql
+    assert delete_params == (secret_id,)
+    revoke_sql = conn.executed[5][0]
+    assert "status = 'revoked'" in revoke_sql
+    assert "refresh_secret_reference = null" in revoke_sql
+    assert "refresh_generation = refresh_generation + 1" in revoke_sql
+    # The row is made non-dangling BEFORE the external Auth delete.
+    assert admin.delete_calls == [profile_id]
+    assert len(conn.executed) == 6
+
+
+def test_deletion_retry_is_idempotent_when_the_authorization_is_already_revoked() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _profile_attempt_row(profile_id),  # entry after a definitive rejection
+            (1,),  # reclaim/claim
+            [],  # zero Connections
+            _github_auth_row(profile_id, status="revoked", reference=None, generation=4),
+        ]
+    )
+    admin = FakeAdminClient()
+    admin.delete_results.append(None)
+
+    outcome = account_lifecycle.delete_account(_pool(conn), admin, profile_id=profile_id)
+
+    assert outcome == AccountDeletionOutcome(profile_id=profile_id, result="deleted")
+    # The revoked row with no reference has nothing to revoke: no Vault call,
+    # no further durable write, and the retry is never stranded.
+    assert len(conn.executed) == 4
+    assert all("vault" not in sql for sql, _ in conn.executed)
+
+
+@pytest.mark.parametrize(
+    ("reference", "dangling"),
+    [
+        ("not-a-v1-github-reference", False),  # malformed: fails closed at parse
+        (f"openorc:github-user-refresh:v1:vault:{uuid.uuid4()}", True),  # dangling delete
+    ],
+)
+def test_deletion_fails_closed_on_a_bad_github_reference_before_the_auth_delete(
+    reference: str, dangling: bool
+) -> None:
+    profile_id = uuid.uuid4()
+    results: list[tuple[Any, ...] | list[Any] | Exception | None] = [
+        _profile_attempt_row(profile_id),
+        (1,),  # claim
+        [],  # zero Connections
+        _github_auth_row(profile_id, reference=reference),
+    ]
+    if dangling:
+        results.append(None)  # the Vault delete reports a dangling pointer
+    conn = ScriptedConnection(results)
+    admin = FakeAdminClient()
+
+    with pytest.raises(ConflictError):
+        account_lifecycle.delete_account(_pool(conn), admin, profile_id=profile_id)
+
+    # Fail closed before any destructive external call.
+    assert admin.delete_calls == []
+    assert admin.fetch_calls == []
+    if dangling:
+        assert "delete from vault.secrets" in conn.executed[4][0]
+        # The revocation row update never ran: nothing was revoked.
+        assert all(
+            "github_user_authorizations" not in sql or "select" in sql.lower()
+            for sql, _ in conn.executed[5:]
+        )
+    else:
+        assert all("vault" not in sql for sql, _ in conn.executed)

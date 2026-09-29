@@ -53,6 +53,8 @@ from openorc.adapters.github.errors import (
     GitHubPullRequestExistsError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+    GitHubUserTokenRefreshCapabilityMissingError,
+    GitHubUserTokenRejectedError,
 )
 from openorc.adapters.github.observations import (
     GitHubIssueObservation,
@@ -99,6 +101,15 @@ from openorc.adapters.github.transport import (
     HttpGitHubRestClient,
     http_fetch,
 )
+from openorc.adapters.github.user_tokens import (
+    GITHUB_TOKEN_ENDPOINT_URL,
+    GitHubCurrentUser,
+    GitHubUserAccessToken,
+    GitHubUserRefreshSecret,
+    GitHubUserTokenClient,
+    GitHubUserTokenGrant,
+    HttpGitHubUserTokenClient,
+)
 
 __all__ = [
     "DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS",
@@ -116,6 +127,7 @@ __all__ = [
     "GITHUB_REPOSITORY_BRANCH_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
+    "GITHUB_TOKEN_ENDPOINT_URL",
     "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
     "INSTALLATION_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
     "REQUIRED_V1_WEBHOOK_EVENTS",
@@ -128,6 +140,7 @@ __all__ = [
     "GitHubBranchObservation",
     "GitHubCheckRunObservation",
     "GitHubCommitStatusesProjection",
+    "GitHubCurrentUser",
     "GitHubFetcher",
     "GitHubHttpResponse",
     "GitHubInstallationCapabilities",
@@ -142,9 +155,14 @@ __all__ = [
     "GitHubRelatedIssueObservation",
     "GitHubRepositoryObservation",
     "GitHubStatusContextObservation",
+    "GitHubUserAccessToken",
+    "GitHubUserRefreshSecret",
+    "GitHubUserTokenClient",
+    "GitHubUserTokenGrant",
     "GitHubWorkflowCapability",
     "HttpGitHubAppClient",
     "HttpGitHubRestClient",
+    "HttpGitHubUserTokenClient",
     "InstallationAccessToken",
     "GitHubAuthenticationRejectedError",
     "GitHubAuthorizationRejectedError",
@@ -152,6 +170,8 @@ __all__ = [
     "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
+    "GitHubUserTokenRefreshCapabilityMissingError",
+    "GitHubUserTokenRejectedError",
     "map_installation_permissions",
     "missing_required_capabilities",
     "missing_required_webhook_events",
