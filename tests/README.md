@@ -18,6 +18,7 @@ The test suite grows alongside implementation. Ordinary tests are deterministic 
 
 - Ordinary tests are deterministic and require no live Supabase, Valkey, GitHub, or Cline infrastructure.
 - Fake clients/adapters (hand-rolled fakes or `unittest.mock` doubles) stand in for external systems at bootstrap boundaries.
+- The reusable deterministic fake Agent Runtime (issue #69) lives in `tests/fakes/` and is imported from ordinary test modules as `from tests.fakes.agent_runtime import ...`. It drives the real #67 adapter contract and the shared #67 → #65 formal-validation funnel; construct a fresh adapter per test — there is no cross-test global session registry.
 - The `integration` marker is reserved for explicitly configured real-infrastructure suites. It is not used by the ordinary baseline, and the default pytest configuration (`pyproject.toml` `addopts`) deselects integration-marked tests, so ordinary local and CI runs never require live infrastructure. `pytest -m integration` overrides the default explicitly, and `--strict-markers` rejects unknown markers.
 
 Planned coverage layers include:

@@ -29,6 +29,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
@@ -428,6 +429,79 @@ def test_successful_establishment_finalizes_ready_exactly_once() -> None:
     # No database transaction was held across the runtime call: the
     # create_session invocation sits strictly between the closed Phase-1
     # reads and the finalize transaction's connection checkout.
+    assert conn.lifecycle == _PHASE1_LIFECYCLE + ["create_session"] + _FINALIZE_LIFECYCLE
+
+
+def test_establishment_through_the_reusable_fake_agent_runtime() -> None:
+    """The #69 fake runtime drives the genuine establish seam: the real #67
+    create-session readiness contract finalizes a seeded CONNECTING binding
+    READY with the external identity the fake itself returned."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    guidance = "Owner-authored guidance composed upstream into the initialization."
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="fake-session-1",
+        initialized_at=_OBSERVED,
+        snapshot={"adapter": "cline", "configuration": {}},
+        reported_provider="fake-provider",
+        reported_model="fake-model",
+        reported_runtime_version="fake-1.2.3",
+    )
+    conn = _establish_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        connection_id,
+        binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
+        route_row=_binding_row(workspace_id, "producer", connection_id),
+        connection_row=_connection_row(workspace_id, connection_id, safe_config={}),
+        guidance=guidance,
+        finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
+    )
+    adapter = FakeAgentRuntimeAdapter(
+        reported_provider="fake-provider",
+        reported_model="fake-model",
+        reported_runtime_version="fake-1.2.3",
+        lifecycle=conn.lifecycle,
+    )
+    adapter.queue_creation(session_ready_candidate())
+
+    session = establish_task_agent_session(
+        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+    )
+
+    # The genuine CONNECTING binding finalized READY with the exact external
+    # identity the fake runtime established and returned; the identity was
+    # never installed manually.
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert session.external_session_id == "fake-session-1"
+    assert adapter.created_session_ids() == ("fake-session-1",)
+    update_params = _initialize_updates(conn)[0][1]
+    assert update_params is not None
+    assert update_params[0] == "fake-session-1"
+    assert update_params[2] == "fake-provider"
+    assert update_params[3] == "fake-model"
+    assert update_params[4] == "fake-1.2.3"
+
+    # The fake received the exact #67 creation request: the same Task/role
+    # identity and the canonical #66 initialization composed with the
+    # Workspace guidance, delivered verbatim and never re-authored.
+    assert len(adapter.creation_requests()) == 1
+    request = adapter.creation_requests()[0]
+    assert request.workspace_id == workspace_id
+    assert request.task_id == task_id
+    assert request.role is WorkflowRole.PRODUCER
+    assert request.initialization == compose_initialization("producer", guidance)
+
+    # Same seam shape as the ordinary establishment: no database transaction
+    # is held across the runtime call.
     assert conn.lifecycle == _PHASE1_LIFECYCLE + ["create_session"] + _FINALIZE_LIFECYCLE
 
 
