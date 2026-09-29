@@ -4,10 +4,11 @@
 
 This adapter owns GitHub API/webhook transport, normalization, stable GitHub identifiers, and authoritative-state reconciliation mechanics. Application services decide workflow consequences.
 
-## Authentication boundary (issue #58)
+## Authentication boundary (issues #58, #141)
 
-- Durable repository automation authenticates only as the deployed OpenOrc GitHub App: App JWTs for app-level reads and short-lived installation access tokens for the exact installation the #57 route resolved. Human GitHub sign-in is identity only; no PAT or human OAuth token fallback exists anywhere in this boundary, and the public surface accepts no credential parameter.
-- The GitHub App ID and private key are deployment/bootstrap secret material, optional on the shared Settings surface and required at the point the client/authenticator is constructed (fail fast; never Workspace data, never `openorc.*` tables, never Vault, never logged or returned).
+- GitHub authorization is two-mode. Installation authentication remains the credential for App-level installation reads, #57 routing, installation/repository discovery and capability validation, authoritative repository/issue/branch/PR/check/status reads, webhook-driven reconciliation, and periodic/missed-delivery recovery. Profile-scoped GitHub App user-to-server authorization is the accountable Owner credential for engineering-record GitHub writes; the write operations adopt it in the #142/#143 remediation leaves, and nothing changes before then.
+- Supabase GitHub sign-in establishes the OpenOrc Profile identity only — it is never a GitHub credential for repository operations. Internal agent provenance stays in OpenOrc: Producer/Reviewer/specialist agents never act as GitHub actors and never receive GitHub identities. No PAT or human-OAuth-token fallback exists anywhere in this boundary, and the public surface accepts no credential parameter.
+- The GitHub App ID, private key, webhook secret, and user-flow client ID/client secret are deployment/bootstrap secret material, optional on the shared Settings surface and required at the point the consuming component is constructed (fail fast; never Workspace data, never `openorc.*` tables, never Vault, never logged or returned).
 - Installation access tokens live in memory only: a cache keyed by the stable external installation ID honors GitHub expiry semantics with a safety margin, is pruned opportunistically of expired entries, and is LRU-bounded at a documented entry count, so expired secrets are never retained indefinitely and cardinality cannot grow without limit. Eviction on an authentication rejection is a single bounded re-mint, and uncertain outcomes are never replayed. Tokens and key material never enter domain objects, persistence, events, logs, error messages, or telemetry attributes; `repr`/`str` of the secret-bearing types are redacted.
 
 ## Documented-operation discipline (issue #58)

@@ -58,8 +58,8 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - Connection.auth_reference is opaque and nullable. Raw credential material never appears in openorc.* tables.
 - Connection.safe_config is non-secret canonical JSON only.
 - enabled is Owner eligibility, not runtime health. session_capacity is Owner-configured admission control, not runtime-discovered state.
-- Supabase Vault is the sole persistence boundary for OpenOrc-owned Agent Runtime control-endpoint credentials.
-- persistence/runtime_control_secrets.py is the only module that queries vault.*. Other code must use its strict reference encode/parse and exact-ID operations rather than browsing or parsing Vault state itself.
+- Supabase Vault is the sole encrypted store for OpenOrc-owned secret purposes. Raw secret values never live in ordinary openorc.* tables.
+- The shared exact-ID Vault storage primitive, persistence/vault_exact_id.py (issue #141), is the only module that queries vault.*: create, decrypt-on-read, decrypt-free existence, in-place update, and targeted delete by exact secret UUID, with no browsing or search surface. Purpose-specific modules call the primitive and own their own reference codecs and service semantics — persistence/runtime_control_secrets.py owns the v1 Connection auth_reference today, and a later Profile-scoped GitHub user-refresh credential module will define its own distinct opaque reference format over the same primitive. Purpose references are never cross-parseable.
 - Existence checks do not decrypt. Decrypted values cross this boundary only for immediate wrapping by the trusted secret-bearing service/adapter boundary.
 - Browser-facing roles have no Vault access. vault must remain outside exposed Data API schemas.
 

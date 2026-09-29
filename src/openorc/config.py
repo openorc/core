@@ -57,6 +57,23 @@ GITHUB_APP_PRIVATE_KEY_VAR = "OPENORC_GITHUB_APP_PRIVATE_KEY"
 # consumption — the requirement is enforced where the webhook verification
 # boundary is constructed, which fails fast when the value is absent.
 GITHUB_WEBHOOK_SECRET_VAR = "OPENORC_GITHUB_WEBHOOK_SECRET"
+# The GitHub App user-flow credentials (issue #141): the App's OAuth
+# user-to-server client ID and client secret — the deployment/bootstrap
+# credentials for the Profile-scoped GitHub App user authorization that will
+# represent the accountable human Owner for engineering-record GitHub writes
+# in the #142/#143 remediation leaves. Deliberately OPTIONAL on this shared
+# surface: both the API and worker process surfaces boot through
+# Settings.from_env, and authentication ownership follows direct consumption —
+# the requirement is enforced by the later component that consumes these
+# credentials, which fails fast when a required value is absent. The client
+# secret is secret material with the same discipline as the App private key
+# and webhook secret: never Workspace data, never stored in ordinary
+# openorc.* tables, never stored in Supabase Vault, never returned through
+# ordinary APIs, never logged or attached to telemetry. A supplied-but-blank
+# value of either setting is a configuration error raised without echoing
+# the value.
+GITHUB_APP_USER_FLOW_CLIENT_ID_VAR = "OPENORC_GITHUB_APP_USER_FLOW_CLIENT_ID"
+GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR = "OPENORC_GITHUB_APP_USER_FLOW_CLIENT_SECRET"
 # The repeatable GitHub reconciliation/recovery sweep partition count
 # (issue #62): the fixed number of stable-identity buckets each sweep family
 # rotates through so periodic sweeps stay bounded while every eligible unit
@@ -144,6 +161,27 @@ def _read_secret(env: Mapping[str, str], name: str) -> str | None:
     return value
 
 
+def _read_identifier(env: Mapping[str, str], name: str) -> str | None:
+    """Read one optional non-secret identifier setting; blank fails closed.
+
+    Identity material (never excluded from repr/str) under the same
+    supplied-blank discipline as secrets: a supplied-but-whitespace-only
+    value is a configuration error raised WITHOUT echoing the value — a
+    half-configured deployment is never a valid state, and misconfiguration
+    must surface at startup rather than later at the point of consumption. A
+    supplied non-empty value is preserved verbatim: identifier bytes are
+    meaningful and are never stripped or normalized.
+    """
+    value = env.get(name)
+    if value is None:
+        return None
+    if not value.strip():
+        raise ConfigurationError(
+            f"{name} was supplied blank: provide the value or leave the variable unset"
+        )
+    return value
+
+
 def _read_int(env: Mapping[str, str], name: str, *, minimum: int, default: int) -> int:
     """Read an integer setting enforcing a minimum; blank/unset uses default."""
     raw = _read(env, name)
@@ -218,6 +256,16 @@ class Settings:
     github_app_id: int | None = None
     github_app_private_key: str | None = field(default=None, repr=False)
     github_webhook_secret: str | None = field(default=None, repr=False)
+    # GitHub App user-flow credentials (issue #141). The client ID is
+    # identity material (validated non-empty when supplied, repr-visible).
+    # The client secret is deployment/bootstrap secret material:
+    # representation-safe (excluded from the dataclass repr/str), never
+    # persisted in openorc.* tables or Vault, never logged or returned.
+    # Both are consumed only by the later user-to-server authorization
+    # component, which fails fast at construction when a required value is
+    # absent.
+    github_app_user_flow_client_id: str | None = None
+    github_app_user_flow_client_secret: str | None = field(default=None, repr=False)
     # Repeatable GitHub reconciliation sweep partitioning (issue #62). The
     # partition count bounds each periodic sweep's provider-facing work to one
     # stable-identity bucket per family; every eligible unit is serviced once
@@ -345,6 +393,21 @@ class Settings:
         # per _read_secret).
         github_webhook_secret = _read_secret(source, GITHUB_WEBHOOK_SECRET_VAR)
 
+        # GitHub App user-flow credentials (issue #141). Optional on this
+        # shared surface in every environment — including production: the
+        # user-to-server authorization component that consumes them enforces
+        # its own requirement at construction. The client ID is identity
+        # material: a supplied-but-blank value is a configuration error (fail
+        # closed without echoing it, per _read_identifier). The client secret
+        # is secret material read through _read_secret: supplied-but-blank
+        # fails closed without echoing, and the value is preserved verbatim.
+        github_app_user_flow_client_id = _read_identifier(
+            source, GITHUB_APP_USER_FLOW_CLIENT_ID_VAR
+        )
+        github_app_user_flow_client_secret = _read_secret(
+            source, GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR
+        )
+
         # Repeatable GitHub reconciliation sweep partitioning (issue #62).
         # Malformed supplied values fail in every environment so
         # misconfiguration never surfaces at runtime; the default gives the
@@ -386,6 +449,8 @@ class Settings:
             github_app_id=github_app_id,
             github_app_private_key=github_app_private_key,
             github_webhook_secret=github_webhook_secret,
+            github_app_user_flow_client_id=github_app_user_flow_client_id,
+            github_app_user_flow_client_secret=github_app_user_flow_client_secret,
             github_reconciliation_sweep_partitions=github_reconciliation_sweep_partitions,
             otlp_endpoint=otlp_endpoint,
         )

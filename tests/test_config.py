@@ -21,6 +21,8 @@ from openorc.config import (
     DEFAULT_ENVIRONMENT,
     DEFAULT_VALKEY_URL,
     ENVIRONMENT_VAR,
+    GITHUB_APP_USER_FLOW_CLIENT_ID_VAR,
+    GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR,
     GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
     GITHUB_WEBHOOK_SECRET_VAR,
     OTLP_ENDPOINT_VAR,
@@ -444,6 +446,85 @@ def test_the_github_webhook_secret_never_appears_in_settings_representation() ->
     # The generated dataclass repr/str must never carry the raw secret.
     assert secret not in repr(settings)
     assert secret not in str(settings)
+
+
+# --- GitHub App user-flow credentials (issue #141) ----------------------------
+
+
+def test_github_app_user_flow_credentials_default_to_unconfigured() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.github_app_user_flow_client_id is None
+    assert settings.github_app_user_flow_client_secret is None
+
+
+def test_github_app_user_flow_credentials_are_read_from_the_environment() -> None:
+    settings = Settings.from_env(
+        {
+            GITHUB_APP_USER_FLOW_CLIENT_ID_VAR: "Iv1.8a61f9b3a7bbb3fc",
+            GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR: "user-flow-secret-value",
+        }
+    )
+
+    assert settings.github_app_user_flow_client_id == "Iv1.8a61f9b3a7bbb3fc"
+    assert settings.github_app_user_flow_client_secret == "user-flow-secret-value"
+
+
+def test_github_app_user_flow_values_are_preserved_verbatim() -> None:
+    # Identity and credential bytes are meaningful: supplied values are
+    # never stripped or normalized.
+    settings = Settings.from_env(
+        {
+            GITHUB_APP_USER_FLOW_CLIENT_ID_VAR: " Iv1.test ",
+            GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR: " secret ",
+        }
+    )
+
+    assert settings.github_app_user_flow_client_id == " Iv1.test "
+    assert settings.github_app_user_flow_client_secret == " secret "
+
+
+def test_blank_github_app_user_flow_client_id_fails_closed_without_echo() -> None:
+    with pytest.raises(ConfigurationError, match="was supplied blank"):
+        Settings.from_env({GITHUB_APP_USER_FLOW_CLIENT_ID_VAR: "   "})
+
+
+def test_blank_github_app_user_flow_client_secret_fails_closed_without_echo() -> None:
+    with pytest.raises(ConfigurationError, match="was supplied blank"):
+        Settings.from_env({GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR: "   "})
+
+
+def test_the_user_flow_client_secret_never_appears_in_settings_representation() -> None:
+    secret = "user-flow-repr-leak-probe"
+    settings = Settings.from_env(
+        {
+            GITHUB_APP_USER_FLOW_CLIENT_ID_VAR: "Iv1.repr-probe",
+            GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR: secret,
+        }
+    )
+
+    # The generated dataclass repr/str must never carry the raw secret.
+    assert secret not in repr(settings)
+    assert secret not in str(settings)
+    # The client ID is identity material, not secret: the representation
+    # stays useful for it.
+    assert "Iv1.repr-probe" in repr(settings)
+
+
+def test_github_app_user_flow_credentials_are_optional_in_production() -> None:
+    # Authentication ownership follows direct consumption: the shared
+    # Settings surface boots both API and worker processes, so the
+    # user-flow credentials are never globally required — the later
+    # user-to-server authorization component enforces its own requirement.
+    settings = Settings.from_env(
+        {
+            "OPENORC_ENV": "production",
+            "SUPABASE_URL": "https://prod.supabase.co",
+        }
+    )
+
+    assert settings.github_app_user_flow_client_id is None
+    assert settings.github_app_user_flow_client_secret is None
 
 
 def test_sweep_partitions_default_to_the_documented_rotation() -> None:
