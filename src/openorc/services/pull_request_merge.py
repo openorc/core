@@ -78,7 +78,7 @@ from openorc.services.github_owner_write_authorization import (
     resolve_owner_write_credential_after_rejection,
     translate_owner_write_failure,
 )
-from openorc.services.github_user_authorization import GitHubUserAccessTokenResolver
+from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.task_pull_request_reconciliation import (
     TaskPullRequestReconciliation,
     reconcile_task_pull_request,
@@ -142,7 +142,7 @@ def _translate_github_outcome(error: Exception) -> ApplicationError:
 def _merge_request_with_bounded_recovery(
     pool: DatabasePool,
     github: GitHubAppClient,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     *,
     credential: GitHubProfileUserAccessToken,
     profile_id: UUID,
@@ -190,7 +190,7 @@ def _merge_request_with_bounded_recovery(
 def request_pull_request_merge(
     pool: DatabasePool,
     github: GitHubAppClient,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     *,
     profile_id: UUID,
     workspace_id: UUID,

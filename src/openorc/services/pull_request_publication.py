@@ -112,7 +112,7 @@ from openorc.services.github_owner_write_authorization import (
     resolve_owner_write_credential_after_rejection,
     translate_owner_write_failure,
 )
-from openorc.services.github_user_authorization import GitHubUserAccessTokenResolver
+from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 
@@ -311,7 +311,7 @@ def _translate_user_write_outcome(error: Exception) -> ApplicationError:
 def _create_pull_request_with_bounded_recovery(
     pool: DatabasePool,
     github: GitHubAppClient,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     *,
     credential: GitHubProfileUserAccessToken,
     profile_id: UUID,
@@ -540,7 +540,7 @@ def _persist_created_pull_request(
 def publish_task_pull_request(
     pool: DatabasePool,
     github: GitHubAppClient,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     command: PublicationCommand,
 ) -> TaskPullRequestPublication:
     """Publish the Task's canonical pull request, race-safe.

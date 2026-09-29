@@ -54,6 +54,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
+from typing import Protocol
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -106,6 +107,7 @@ __all__ = [
     "GitHubUserAccessTokenResolver",
     "GitHubUserAuthorizationUnavailableError",
     "GitHubUserIdentityMismatchError",
+    "ProfileUserAccessTokenResolver",
     "SupabaseGitHubIdentityStateError",
     "establish_github_user_authorization",
     "normalize_strict_github_user_id",
@@ -159,6 +161,26 @@ _ACCESS_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60.0
 _ACCESS_TOKEN_CACHE_MAX_ENTRIES = 32
 
 logger = logging.getLogger(__name__)
+
+
+class ProfileUserAccessTokenResolver(Protocol):
+    """The resolver seam Owner-accountable GitHub writes depend on (issue #143).
+
+    Structural contract so the shared Owner-write boundary and the write
+    services never depend on the concrete resolver: the exact Profile's
+    fail-closed user-token resolution (the typed unavailable-authorization
+    conditions) and the single bounded-recovery eviction seam. The concrete
+    :class:`GitHubUserAccessTokenResolver` satisfies it structurally; tests
+    substitute structural fakes.
+    """
+
+    def resolve(self, pool: DatabasePool, *, profile_id: UUID) -> GitHubUserAccessToken:
+        """Return a usable user access token for the Profile's authorization."""
+        ...
+
+    def evict_cached_access_token(self, profile_id: UUID) -> None:
+        """Drop the Profile's cached access token (the bounded 401-recovery seam)."""
+        ...
 
 
 class GitHubUserAuthorizationUnavailableError(ApplicationError):

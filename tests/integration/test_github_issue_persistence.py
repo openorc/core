@@ -550,6 +550,9 @@ class _FakeGitHubClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this B3 reconciliation fake must not request merges")
 
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this B3 reconciliation fake must not compose user-write validation")
+
 
 def _workspace_with_routed_repository(
     conn: Connection[Any],

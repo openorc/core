@@ -69,7 +69,7 @@ from openorc.services.errors import (
 from openorc.services.github_installation_route import (
     ResolvedRepositoryInstallationRoute,
 )
-from openorc.services.github_user_authorization import GitHubUserAccessTokenResolver
+from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -160,7 +160,7 @@ def require_owner_write_authorization(
 
 
 def _resolve_profile_credential(
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     pool: DatabasePool,
     *,
     profile_id: UUID,
@@ -225,7 +225,7 @@ def _validate_user_repository_intersection(
 
 def _resolve_and_validate_once(
     pool: DatabasePool,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     github: GitHubAppClient,
     *,
     profile_id: UUID,
@@ -246,7 +246,7 @@ def _resolve_and_validate_once(
 
 def resolve_owner_write_credential(
     pool: DatabasePool,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     github: GitHubAppClient,
     *,
     profile_id: UUID,
@@ -292,7 +292,7 @@ def resolve_owner_write_credential(
 
 def resolve_owner_write_credential_after_rejection(
     pool: DatabasePool,
-    user_token_resolver: GitHubUserAccessTokenResolver,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     github: GitHubAppClient,
     *,
     profile_id: UUID,

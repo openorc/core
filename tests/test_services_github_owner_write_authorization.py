@@ -244,6 +244,42 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("the boundary never merges pull requests")
 
+    def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never composes raw #58 validation operations")
+
+    def get_installation_repository(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes repositories")
+
+    def get_repository_issue(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes issues")
+
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes branches")
+
+    def get_repository_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes pull requests")
+
+    def get_commit_check_runs(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never projects check runs")
+
+    def get_commit_combined_status(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never projects combined status")
+
+    def get_installation_capabilities(self, github_installation_id: int) -> Any:
+        raise AssertionError("the boundary never reads capabilities")
+
+    def get_issue_blocked_by(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes relationships")
+
+    def get_issue_sub_issues(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes relationships")
+
+    def get_issue_parent(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never observes relationships")
+
+    def resolve_related_issue_endpoints(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the boundary never resolves related endpoints")
+
 
 def test_owner_write_authorization_composes_the_barrier_then_the_owner_boundary() -> None:
     conn = ScriptedConnection()

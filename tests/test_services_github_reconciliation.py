@@ -273,6 +273,9 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not request merges")
 
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not compose user-write validation")
+
 
 def _ws_row(workspace_id: Any, profile_id: Any) -> tuple[Any, ...]:
     return (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")

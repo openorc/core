@@ -368,7 +368,7 @@ class FakeGitHubAppClient:
         branch_error: Exception | None = None,
         pull_request_error: Exception | None = None,
         create_errors: list[Exception] | None = None,
-        intersection_errors: list[Exception] | None = None,
+        intersection_errors: list[Exception | None] | None = None,
     ) -> None:
         self._pool = pool
         self._repository_observation = repository_observation

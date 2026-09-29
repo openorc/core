@@ -241,6 +241,9 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not request merges")
 
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not compose user-write validation")
+
 
 def _pool(conn: ScriptedConnection) -> DatabasePool:
     return cast(DatabasePool, FakePool(conn))

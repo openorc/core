@@ -230,7 +230,7 @@ def test_a_pagination_walk_beyond_the_bounded_page_count_is_uncertain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("openorc.adapters.github.client._MAX_LISTING_PAGES", 2)
-    pages = [
+    pages: list[tuple[int, Mapping[str, str], bytes] | Exception] = [
         _json(
             200,
             {
