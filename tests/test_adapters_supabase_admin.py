@@ -391,3 +391,109 @@ def test_the_adapter_imports_no_service_modules() -> None:
     source = inspect.getsource(admin_module)
     assert "from openorc.services" not in source
     assert "import openorc.services" not in source
+
+
+# --- GitHub provider-identity read (issue #142) -----------------------------
+
+_GITHUB_IDENTITIES_BODY = (
+    b'{"id": "u1", "identities": ['
+    b'{"provider": "github", "identity_data": {"provider_id": "5432", "email": "e"}},'
+    b'{"provider": "github", "identity_data": {"provider_id": "5433"}}'
+    b"]}"
+)
+
+
+def test_github_identity_read_preserves_multiplicity_of_github_entries() -> None:
+    # Two GitHub identity entries are returned as two facts, in collection
+    # order: collapsing them here would silently resolve ambiguity that only
+    # the authorization service may classify.
+    transport = FakeAdminTransport([(200, _GITHUB_IDENTITIES_BODY)])
+    user_id = uuid4()
+
+    provider_ids = _client(transport).fetch_user_github_provider_ids(user_id)
+
+    assert provider_ids == ("5432", "5433")
+    url, method, headers, _timeout = transport.calls[0]
+    assert url == _admin_url(user_id)
+    assert method == "GET"
+    assert headers["apikey"] == _SECRET_KEY
+    assert "Authorization" not in headers
+
+
+def test_github_identity_read_returns_only_github_provider_entries() -> None:
+    body = (
+        b'{"identities": ['
+        b'{"provider": "google", "identity_data": {"provider_id": "999"}},'
+        b'{"provider": "github", "identity_data": {"provider_id": "7"}}'
+        b"]}"
+    )
+    transport = FakeAdminTransport([(200, body)])
+
+    provider_ids = _client(transport).fetch_user_github_provider_ids(uuid4())
+
+    assert provider_ids == ("7",)
+
+
+def test_github_identity_read_reports_a_malformed_entry_as_none_without_guessing() -> None:
+    body = (
+        b'{"identities": ['
+        b'{"provider": "github", "identity_data": {"user_name": "octocat"}},'
+        b"1234567"
+        b"]}"
+    )
+    transport = FakeAdminTransport([(200, body)])
+
+    provider_ids = _client(transport).fetch_user_github_provider_ids(uuid4())
+
+    # The malformed GitHub entry contributes None (its provider_id member is
+    # missing) and the non-dict entry is malformed trusted state too: the
+    # service fails closed on either.
+    assert provider_ids == (None, None)
+
+
+def test_github_identity_read_zero_entries_is_an_empty_collection() -> None:
+    transport = FakeAdminTransport([(200, b'{"identities": []}')])
+
+    assert _client(transport).fetch_user_github_provider_ids(uuid4()) == ()
+
+
+def test_github_identity_read_confirmed_absent_user_is_a_classified_outcome() -> None:
+    transport = FakeAdminTransport([(404, b"")])
+
+    with pytest.raises(SupabaseAuthAdminUserAbsentError):
+        _client(transport).fetch_user_github_provider_ids(uuid4())
+
+
+def test_github_identity_read_definitive_rejection_is_a_known_failure() -> None:
+    transport = FakeAdminTransport([(403, b"")])
+
+    with pytest.raises(SupabaseAuthAdminRejectedError):
+        _client(transport).fetch_user_github_provider_ids(uuid4())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [urllib.error.URLError("refused"), TimeoutError("timed out")],
+)
+def test_github_identity_read_transport_failure_is_unknown(failure: Exception) -> None:
+    transport = FakeAdminTransport([failure])
+
+    with pytest.raises(SupabaseAuthAdminOutcomeUnknownError):
+        _client(transport).fetch_user_github_provider_ids(uuid4())
+
+
+@pytest.mark.parametrize("body", [b"", b"not json", b"[]", b'{"identities": 1}'])
+def test_github_identity_read_uninterpretable_trusted_shape_is_unknown(body: bytes) -> None:
+    transport = FakeAdminTransport([(200, body)])
+
+    with pytest.raises(SupabaseAuthAdminOutcomeUnknownError):
+        _client(transport).fetch_user_github_provider_ids(uuid4())
+
+
+def test_github_identity_read_error_never_carries_user_record_content() -> None:
+    transport = FakeAdminTransport([(200, b'{"identities": 1, "email": "s3cret@x"}')])
+
+    with pytest.raises(SupabaseAuthAdminOutcomeUnknownError) as error:
+        _client(transport).fetch_user_github_provider_ids(uuid4())
+
+    assert "s3cret" not in str(error.value)

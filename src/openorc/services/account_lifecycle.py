@@ -92,10 +92,18 @@ from openorc.adapters.supabase import (
     SupabaseAuthAdminRejectedError,
     SupabaseAuthAdminUserAbsentError,
 )
+from openorc.domain.github_user_authorization import GitHubUserAuthorizationStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import runtime_control_secrets
+from openorc.persistence import (
+    github_user_authorizations,
+    github_user_refresh_secrets,
+    runtime_control_secrets,
+)
 from openorc.persistence.connections import list_profile_connections_for_update
 from openorc.persistence.deletion import disconnect_connection
+from openorc.persistence.github_user_refresh_secrets import (
+    GitHubUserRefreshSecretReferenceError,
+)
 from openorc.persistence.ownership import (
     claim_account_deletion_attempt,
     clear_account_deletion_attempt,
@@ -170,16 +178,18 @@ def _active_attempt_lease_seconds(admin_client: SupabaseAuthAdminClient) -> floa
 
 
 def _revoke_profile_runtime_credentials(transaction_pool, *, profile_id: UUID) -> None:
-    """Revoke every OpenOrc-owned runtime-control credential of one Profile.
+    """Revoke every OpenOrc-owned credential of one Profile.
 
     Composed inside the caller's one short transaction: every Connection
     across the Profile's Workspaces is enumerated under deterministic row
     locks (the same locks configure/rotate take), every referenced Vault
-    secret is deleted, and every Connection is disconnected
-    (``enabled = false``, ``auth_reference = null``) — the revocation barrier
-    that outlives the transaction even when the external Auth deletion later
-    fails. A malformed or dangling reference fails closed: nothing is
-    claimed, nothing is revoked, and no external call is issued.
+    secret is deleted, every Connection is disconnected
+    (``enabled = false``, ``auth_reference = null``), and the Profile's
+    GitHub user authorization is revoked with its refresh secret deleted
+    (issue #142) — the revocation barrier that outlives the transaction even
+    when the external Auth deletion later fails. A malformed or dangling
+    reference fails closed: nothing is claimed, nothing is revoked, and no
+    external call is issued.
     """
     connections = list_profile_connections_for_update(transaction_pool, owner_profile_id=profile_id)
     for connection in connections:
@@ -205,6 +215,61 @@ def _revoke_profile_runtime_credentials(transaction_pool, *, profile_id: UUID) -
                     "nothing was revoked"
                 )
         disconnect_connection(transaction_pool, connection.id)
+    _revoke_profile_github_user_authorization(transaction_pool, profile_id=profile_id)
+
+
+def _revoke_profile_github_user_authorization(transaction_pool, *, profile_id: UUID) -> None:
+    """Revoke the Profile's GitHub user authorization in the same transaction.
+
+    The Vault refresh secret is deleted and the authorization row is made
+    non-dangling (status revoked, reference NULL, generation advanced) in
+    the same short credential-revocation transaction that establishes the
+    deletion-attempt barrier — before the external Supabase Auth delete — so
+    a definitively-rejected Auth deletion never strands a later deletion
+    retry on a dangling secret reference. Idempotent on retry: an absent
+    authorization and an already-revoked one (with no reference) have
+    nothing to revoke. A malformed or dangling reference fails closed
+    before any destructive external Auth call. Account deletion never
+    uninstalls the GitHub App or mutates GitHub engineering artifacts.
+    """
+    authorization = github_user_authorizations.get_github_user_authorization_for_update(
+        transaction_pool, profile_id=profile_id
+    )
+    if authorization is None or authorization.status is GitHubUserAuthorizationStatus.REVOKED:
+        return
+    if authorization.refresh_secret_reference is None:
+        # Unreachable for an active row (CHECK-consistent), but fail closed
+        # rather than parse a None reference.
+        raise ConflictError(
+            "the account's credential references could not be reconciled; nothing was revoked"
+        )
+    try:
+        secret_id = github_user_refresh_secrets.parse_github_user_refresh_reference(
+            authorization.refresh_secret_reference
+        )
+    except GitHubUserRefreshSecretReferenceError as exc:
+        logger.warning(
+            "account deletion revocation rejected an unrecognized github authorization reference"
+        )
+        raise ConflictError(
+            "the account's credential references could not be reconciled; nothing was revoked"
+        ) from exc
+    if not github_user_refresh_secrets.delete_github_user_refresh_secret(
+        transaction_pool, secret_id=secret_id
+    ):
+        logger.warning(
+            "account deletion revocation rejected a dangling github authorization reference"
+        )
+        raise ConflictError(
+            "the account's credential references could not be reconciled; nothing was revoked"
+        )
+    revoked = github_user_authorizations.revoke_github_user_authorization_row(
+        transaction_pool, profile_id=profile_id
+    )
+    if revoked is None:  # pragma: no cover - unreachable under the row lock
+        raise ConflictError(
+            "the durable GitHub authorization vanished during account deletion revocation"
+        )
 
 
 def _clear_own_attempt(pool: DatabasePool, *, profile_id: UUID, attempt_id: UUID) -> None:

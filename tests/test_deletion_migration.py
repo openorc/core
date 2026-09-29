@@ -57,6 +57,7 @@ OWNERSHIP_CASCADE_CONSTRAINTS = (
     "workflow_role_bindings_workspace_id_fkey",
     "prompt_template_overrides_workspace_id_fkey",
     "workflow_events_workspace_id_fkey",
+    "github_user_authorizations_profile_id_fkey",
 )
 
 # Restrictive edges: direct Workspace scope-consistency facts of Task-owned
