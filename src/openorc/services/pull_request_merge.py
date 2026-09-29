@@ -10,6 +10,15 @@ expected head SHA the later workflow service supplies:
   (``require_task_pull_request_head``): the caller's expected SHA must equal
   the durable reconciled head exactly. The transaction closes before any
   GitHub call — no database transaction ever spans a GitHub call.
+- The accountable Profile is explicit and re-proven (issue #143): the merge
+  command carries the exact ``profile_id`` whose GitHub App user-to-server
+  authorization will externally represent the merge, and the service
+  re-establishes the account-operational barrier and the exact Profile's
+  Workspace/Task ownership BEFORE resolving the user credential or any
+  external GitHub I/O. The merge request itself carries that Profile-bound
+  user credential — the repository-access observation and the post-merge
+  reconciliation remain installation-authenticated infrastructure reads,
+  and there is no installation-token fallback for the merge.
 - The GitHub request carries the documented ``sha`` expected-head parameter
   (the provider's own expected-head facility, merge authority deriving from
   ``contents: write`` validated at route/access time). A concurrent head
@@ -23,7 +32,10 @@ expected head SHA the later workflow service supplies:
   policy). Authentication/access failure is the normalized integration
   condition; timeout/connection loss/ambiguous response is uncertain and is
   **never automatically replayed** — reconciliation and recovery for an
-  uncertain mutating call belong to the later recovery layer.
+  uncertain mutating call belong to the later recovery layer. A definitive
+  401-style non-delivery under the user credential performs only the single
+  bounded recovery the #142 token lifecycle allows, then retries the merge
+  exactly once.
 - The later workflow service decides the Task ``COMPLETED`` transition and
   the Owner merge-decision policy; nothing of either lives here.
 """
@@ -40,6 +52,7 @@ from openorc.adapters.github import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
     GitHubOutcomeUncertainError,
+    GitHubProfileUserAccessToken,
     GitHubRateLimitedError,
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
@@ -47,19 +60,25 @@ from openorc.adapters.github import (
 from openorc.domain.pull_requests import TaskPullRequest
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import DatabasePool
-from openorc.persistence.tasks import get_task
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
-    NotFoundError,
     StaleOperationError,
 )
 from openorc.services.github_installation_route import (
+    ResolvedRepositoryInstallationRoute,
     resolve_system_repository_installation_route,
 )
+from openorc.services.github_owner_write_authorization import (
+    require_owner_write_authorization,
+    resolve_owner_write_credential,
+    resolve_owner_write_credential_after_rejection,
+    translate_owner_write_failure,
+)
+from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.task_pull_request_reconciliation import (
     TaskPullRequestReconciliation,
     reconcile_task_pull_request,
@@ -120,33 +139,97 @@ def _translate_github_outcome(error: Exception) -> ApplicationError:
     )
 
 
+def _merge_request_with_bounded_recovery(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    user_token_resolver: ProfileUserAccessTokenResolver,
+    *,
+    credential: GitHubProfileUserAccessToken,
+    profile_id: UUID,
+    route: ResolvedRepositoryInstallationRoute,
+    owner_login: str,
+    repository_name: str,
+    pull_number: int,
+    expected_head_sha: str,
+) -> GitHubMergeRequestResult:
+    """Exactly one Owner-accountable merge request with bounded 401 recovery.
+
+    The merge mutation carries the accountable Profile's user credential
+    (issue #143). A DEFINITIVE 401-style authentication rejection — GitHub
+    did not perform the merge — performs the single bounded recovery the
+    #142 lifecycle allows (evict the cached token, re-resolve through the
+    durable refresh lifecycle, re-prove the user × installation ×
+    repository intersection) and retries the merge EXACTLY once with the
+    same expected head; the retry's classification propagates unchanged, so
+    a second rejection is the known failure. Uncertain outcomes are never
+    refreshed, retried, or replayed.
+    """
+    try:
+        return github.merge_pull_request(
+            credential=credential,
+            github_installation_id=route.github_installation_id,
+            owner_login=owner_login,
+            repository_name=repository_name,
+            pull_number=pull_number,
+            expected_head_sha=expected_head_sha,
+        )
+    except GitHubAuthenticationRejectedError:
+        recovered = resolve_owner_write_credential_after_rejection(
+            pool, user_token_resolver, github, profile_id=profile_id, route=route
+        )
+        return github.merge_pull_request(
+            credential=recovered,
+            github_installation_id=route.github_installation_id,
+            owner_login=owner_login,
+            repository_name=repository_name,
+            pull_number=pull_number,
+            expected_head_sha=expected_head_sha,
+        )
+
+
 def request_pull_request_merge(
     pool: DatabasePool,
     github: GitHubAppClient,
+    user_token_resolver: ProfileUserAccessTokenResolver,
     *,
+    profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
     expected_head_sha: str,
 ) -> PullRequestMergeResult:
     """Request the canonical PR's merge bound to the exact expected head.
 
-    Phase 1 (one short transaction): the Task must exist in the Workspace;
-    the canonical TaskPullRequest is resolved and the merge's authority is
-    bound to its exact current reconciled head through the Phase 2A guard —
-    a caller whose expected SHA does not match is stale before anything
-    external happens.
+    Phase 1 (short database reads): the accountable Profile's authorization
+    re-established FIRST (issue #143: the account-operational barrier
+    composes first, then the exact Profile's owner-gated Workspace/Task
+    authorization); the canonical TaskPullRequest is resolved and the
+    merge's authority is bound to its exact current reconciled head through
+    the Phase 2A guard — a caller whose expected SHA does not match is
+    stale before anything external happens.
+
+    Credential resolution (no transaction across external calls): the exact
+    Profile's ``GitHubUserAuthorization`` is resolved only after the
+    authorization and subject/route validation proved current, and the
+    user × installation × repository intersection is proven for the exact
+    routed identities before the merge — missing/revoked authorization and
+    intersection failures are typed conditions with no installation-token
+    fallback.
 
     Phase 2 (no database transaction open): the repository access
-    observation through the exact routed installation, then the documented
-    exact-head merge request.
+    observation through the exact routed installation (installation
+    authentication), then the documented exact-head merge request under the
+    Profile-bound user credential (issue #143) with the single bounded 401
+    recovery the #142 lifecycle allows.
 
     Phase 3 (known-outcome classification): the documented head-mismatch
     answer is a stale operation; any other definitive rejection is a known
     GitHub-owned policy/state failure; on the known success the same
     authoritative reconciliation primitive immediately persists and returns
-    the durable merged facts — the merge request itself never mutates Task
-    workflow state.
+    the durable merged facts (installation authentication) — the merge
+    request itself never mutates Task workflow state.
     """
+    if not isinstance(profile_id, UUID):
+        raise InvalidCommandError("profile_id must be a UUID")
     if not isinstance(workspace_id, UUID):
         raise InvalidCommandError("workspace_id must be a UUID")
     if not isinstance(task_id, UUID):
@@ -163,9 +246,11 @@ def request_pull_request_merge(
             task_id=str(task_id),
             github_head_sha=expected_head_sha,
         )
-        task = get_task(pool, task_id)
-        if task is None or task.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
+        # --- Phase 1: the accountable Profile's authorization re-established
+        # FIRST (issue #143), then the exact-head authority guard + route ---
+        task = require_owner_write_authorization(
+            pool, profile_id=profile_id, workspace_id=workspace_id, task_id=task_id
+        )
         pull_request = require_task_pull_request_head(
             pool, task=task, expected_head_sha=expected_head_sha
         )
@@ -180,19 +265,19 @@ def request_pull_request_merge(
             github_head_sha=expected_head_sha,
             github_pull_request_number=pull_request.github_pr_number,
         )
+        # --- Credential resolution (external where it must refresh; no
+        # transaction open): the accountable Profile's GitHub user
+        # authorization, resolved ONLY after authorization and subject/route
+        # validation proved current (issue #143) ---
+        credential = resolve_owner_write_credential(
+            pool, user_token_resolver, github, profile_id=profile_id, route=route
+        )
         try:
             repository_observation: GitHubRepositoryObservation = (
                 github.get_installation_repository(
                     github_installation_id=route.github_installation_id,
                     github_repository_id=route.repository.identity.github_repository_id,
                 )
-            )
-            merge_result: GitHubMergeRequestResult = github.merge_pull_request(
-                github_installation_id=route.github_installation_id,
-                owner_login=repository_observation.owner_login,
-                repository_name=repository_observation.name,
-                pull_number=pull_request.github_pr_number,
-                expected_head_sha=expected_head_sha,
             )
         except (
             GitHubAuthorizationRejectedError,
@@ -201,7 +286,31 @@ def request_pull_request_merge(
             GitHubRequestRejectedError,
             GitHubOutcomeUncertainError,
         ) as error:
+            # The installation-authenticated access observation keeps its
+            # installation-flavored classification.
             raise _translate_github_outcome(error) from error
+        try:
+            merge_result: GitHubMergeRequestResult = _merge_request_with_bounded_recovery(
+                pool,
+                github,
+                user_token_resolver,
+                credential=credential,
+                profile_id=profile_id,
+                route=route,
+                owner_login=repository_observation.owner_login,
+                repository_name=repository_observation.name,
+                pull_number=pull_request.github_pr_number,
+                expected_head_sha=expected_head_sha,
+            )
+        except GitHubOutcomeUncertainError as error:
+            raise ExternalOperationUncertainError(
+                "the outcome of the exact-head GitHub merge request is unknown"
+            ) from error
+        except GitHubRequestRejectedError as error:
+            # The user-authenticated merge's own classification (issue
+            # #143): honest about the accountable Profile's user credential,
+            # never dressed up as a routed-installation credential failure.
+            raise translate_owner_write_failure(error, operation="merge request") from error
         if merge_result.outcome is GitHubMergeRequestOutcome.HEAD_MISMATCH:
             # GitHub's documented expected-head guard refused: the head moved
             # concurrently and this merge request is stale. The operation is

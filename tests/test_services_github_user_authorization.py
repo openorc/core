@@ -996,3 +996,66 @@ def test_the_refresh_credential_is_carried_redacted_through_the_resolution_path(
     assert credential.secret_value() == _REFRESH_TOKEN
     assert _REFRESH_TOKEN not in repr(credential)
     assert _REFRESH_TOKEN not in str(credential)
+
+
+def test_evicting_the_cached_token_forces_exactly_one_refresh_rotation() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        _resolve_fresh_flow_script(profile_id, observed_generation=3, installed_generation=4)
+    )
+    token_client = FakeTokenClient(conn)
+    token_client.refresh_results.append(_grant(refresh=_ROTATED_REFRESH))
+    token_client.refresh_results.append(_grant(refresh="ghr_second-rotation"))
+    resolver = _resolver(conn, token_client)
+
+    first = resolver.resolve(_pool(conn), profile_id=profile_id)
+    assert len(token_client.refresh_calls) == 1
+
+    # Eviction (the bounded 401-recovery seam, issue #143) drops the cached
+    # entry: the next resolution restarts from durable state and performs
+    # exactly ONE further refresh exchange through the rotation CAS.
+    resolver.evict_cached_access_token(profile_id)
+    conn.results.extend(
+        _resolve_fresh_flow_script(profile_id, observed_generation=4, installed_generation=5)
+    )
+    second = resolver.resolve(_pool(conn), profile_id=profile_id)
+
+    assert first is not second
+    assert second.token_value() == _ACCESS_TOKEN
+    assert len(token_client.refresh_calls) == 2
+    # The rotation consumed the durable refresh credential behind the exact
+    # generation the durable row reported.
+    assert token_client.refresh_calls[1][0].secret_value() == _REFRESH_TOKEN
+
+
+def test_evicting_an_absent_cache_entry_is_a_noop_never_a_refresh_trigger() -> None:
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        _resolve_fresh_flow_script(profile_id, observed_generation=3, installed_generation=4)
+    )
+    token_client = FakeTokenClient(conn)
+    token_client.refresh_results.append(_grant(refresh=_ROTATED_REFRESH))
+    resolver = _resolver(conn, token_client)
+
+    token = resolver.resolve(_pool(conn), profile_id=profile_id)
+    assert len(token_client.refresh_calls) == 1
+
+    # An eviction for a Profile with no cache entry (or an unknown Profile)
+    # is a harmless no-op: the next resolution still serves the cached
+    # credential and performs no further external exchange.
+    resolver.evict_cached_access_token(uuid.uuid4())
+    conn.results.append(_row(profile_id, generation=4))  # the durable read
+    again = resolver.resolve(_pool(conn), profile_id=profile_id)
+
+    assert again is token
+    assert len(token_client.refresh_calls) == 1
+
+
+def test_eviction_rejects_a_malformed_profile_identity_before_anything_else() -> None:
+    conn = ScriptedConnection([])
+    resolver = _resolver(conn, FakeTokenClient(conn))
+
+    with pytest.raises(InvalidCommandError):
+        resolver.evict_cached_access_token("not-a-uuid")  # type: ignore[arg-type]
+
+    assert conn.executed == []

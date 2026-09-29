@@ -31,9 +31,11 @@ from openorc.adapters.github import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
     GitHubOutcomeUncertainError,
+    GitHubProfileUserAccessToken,
     GitHubPullRequestObservation,
     GitHubRateLimitedError,
     GitHubRepositoryObservation,
+    GitHubUserAccessToken,
 )
 from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.observability import (
@@ -48,16 +50,27 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services import pull_request_merge
 from openorc.services.errors import (
     AuthorizationError,
+    ConflictError,
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.github_owner_write_authorization import (
+    CONDITION_USER_INSTALLATION_REPOSITORY_ACCESS_MISSING,
+    GitHubUserRepositoryAccessError,
+)
+from openorc.services.github_user_authorization import (
+    CONDITION_MISSING,
+    CONDITION_REVOKED,
+    GitHubUserAuthorizationUnavailableError,
+)
 
 _OBSERVED = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _MERGED_AT = datetime(2026, 9, 27, 14, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
+_PROFILE_ID = uuid.uuid4()
 _REPOSITORY_ID = uuid.uuid4()
 _TASK_ID = uuid.uuid4()
 _INSTALLATION_RECORD = uuid.uuid4()
@@ -218,8 +231,39 @@ def _installation_row() -> tuple[Any, ...]:
     )
 
 
-def _workspace_row() -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, uuid.uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "")
+def _workspace_row(*, owner_profile_id: uuid.UUID = _PROFILE_ID) -> tuple[Any, ...]:
+    return (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+
+
+def _guard_row() -> tuple[Any, ...]:
+    return (None, None, None)
+
+
+def _guard_active_attempt_row() -> tuple[Any, ...]:
+    return ("active", uuid.uuid4(), _OBSERVED)
+
+
+class FakeUserTokenResolver:
+    """Scripted #142 resolver recording the exact Profile it resolves for."""
+
+    def __init__(self) -> None:
+        self.resolve_calls: list[uuid.UUID] = []
+        self.evict_calls: list[uuid.UUID] = []
+        self.resolve_error: Exception | None = None
+        self._token = GitHubUserAccessToken(value="ghu_owner_user_token", expires_at=_OBSERVED)
+
+    def resolve(self, pool: DatabasePool, *, profile_id: uuid.UUID) -> GitHubUserAccessToken:
+        self.resolve_calls.append(profile_id)
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        return self._token
+
+    def evict_cached_access_token(self, profile_id: uuid.UUID) -> None:
+        self.evict_calls.append(profile_id)
+
+
+def _resolver(conn: ScriptedConnection) -> FakeUserTokenResolver:
+    return FakeUserTokenResolver()
 
 
 def _repository_observation() -> GitHubRepositoryObservation:
@@ -260,6 +304,8 @@ class FakeGitHubAppClient:
         pull_request_observation: GitHubPullRequestObservation | None = None,
         error: Exception | None = None,
         merge_error: Exception | None = None,
+        merge_errors: list[Exception] | None = None,
+        intersection_errors: list[Exception | None] | None = None,
     ) -> None:
         self._pool = pool
         self._repository_observation = repository_observation
@@ -267,9 +313,12 @@ class FakeGitHubAppClient:
         self._pull_request_observation = pull_request_observation
         self._error = error
         self._merge_error = merge_error
+        self._merge_errors = list(merge_errors or [])
+        self._intersection_errors = list(intersection_errors or [])
         self.repository_calls: list[dict[str, int]] = []
         self.merge_calls: list[dict[str, Any]] = []
         self.pull_request_calls: list[dict[str, Any]] = []
+        self.validation_calls: list[dict[str, Any]] = []
 
     def get_installation_repository(
         self, *, github_installation_id: int, github_repository_id: int
@@ -315,6 +364,7 @@ class FakeGitHubAppClient:
     def merge_pull_request(
         self,
         *,
+        credential: GitHubProfileUserAccessToken,
         github_installation_id: int,
         owner_login: str,
         repository_name: str,
@@ -327,6 +377,7 @@ class FakeGitHubAppClient:
         )
         self.merge_calls.append(
             {
+                "profile_id": str(credential.profile_id),
                 "github_installation_id": github_installation_id,
                 "owner_login": owner_login,
                 "repository_name": repository_name,
@@ -334,6 +385,8 @@ class FakeGitHubAppClient:
                 "expected_head_sha": expected_head_sha,
             }
         )
+        if self._merge_errors:
+            raise self._merge_errors.pop(0)
         if self._merge_error is not None:
             raise self._merge_error
         if self._error is not None:
@@ -341,11 +394,35 @@ class FakeGitHubAppClient:
         assert self._merge_result is not None
         return self._merge_result
 
-    def get_repository_branch(self, **_kwargs: Any) -> Any:
-        raise AssertionError("this fake must not observe branches")
+    def validate_user_installation_repository_access(
+        self,
+        *,
+        credential: GitHubProfileUserAccessToken,
+        github_installation_id: int,
+        github_repository_id: int,
+    ) -> Any:
+        assert self._pool.active_connections == 0, (
+            "the service must never hold a database transaction open across "
+            "the external GitHub call"
+        )
+        self.validation_calls.append(
+            {
+                "profile_id": str(credential.profile_id),
+                "github_installation_id": github_installation_id,
+                "github_repository_id": github_repository_id,
+            }
+        )
+        if self._intersection_errors:
+            outcome = self._intersection_errors.pop(0)
+            if outcome is not None:
+                raise outcome
+        return None
 
     def create_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not create pull requests")
+
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe branches")
 
     def get_commit_check_runs(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not project check runs")
@@ -387,6 +464,10 @@ def _merge_success_scripts(conn: ScriptedConnection) -> None:
     """
     merged_row = _pull_request_row(state="closed", merged_at=_MERGED_AT)
     for _ in range(2):
+        conn.on("from openorc.profiles", _guard_row())
+
+        conn.on("from openorc.workspaces", _workspace_row())
+
         conn.on("from openorc.tasks", _task_row())
         conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
         conn.on("from openorc.repositories where id", _repository_row())
@@ -415,14 +496,18 @@ def test_the_known_success_reconciles_the_durable_merged_facts() -> None:
     result = pull_request_merge.request_pull_request_merge(
         _pool(conn),
         github,
+        _resolver(conn),
+        profile_id=_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_head_sha=_HEAD_SHA,
     )
 
-    # The merge request was bound to the exact expected head.
+    # The merge request was bound to the exact expected head, carried by the
+    # accountable Profile's user credential.
     assert github.merge_calls == [
         {
+            "profile_id": str(_PROFILE_ID),
             "github_installation_id": _EXTERNAL_INSTALLATION_ID,
             "owner_login": "octocat",
             "repository_name": "hello-world",
@@ -438,11 +523,15 @@ def test_the_known_success_reconciles_the_durable_merged_facts() -> None:
     assert result.reconciliation.state_changed is True
     assert result.reconciliation.head_changed is False
     assert result.reconciliation.updated is True
-    assert len(conn.executed) == 13
+    # Phase 1 now composes the account barrier + Workspace Owner
+    # authorization reads before the guard reads (issue #143).
+    assert len(conn.executed) == 15
 
 
 def test_a_stale_caller_head_is_rejected_before_anything_external() -> None:
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on(
         "from openorc.task_pull_requests where task_id",
@@ -460,6 +549,8 @@ def test_a_stale_caller_head_is_rejected_before_anything_external() -> None:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -472,6 +563,8 @@ def test_a_stale_caller_head_is_rejected_before_anything_external() -> None:
 
 def test_the_documented_head_mismatch_is_a_stale_operation_never_replayed() -> None:
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -488,6 +581,8 @@ def test_the_documented_head_mismatch_is_a_stale_operation_never_replayed() -> N
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -500,6 +595,8 @@ def test_the_documented_head_mismatch_is_a_stale_operation_never_replayed() -> N
 
 def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -516,6 +613,8 @@ def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -528,6 +627,8 @@ def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
 
 def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None:
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -541,6 +642,8 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             access_lost,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -548,6 +651,8 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
     assert access_lost.merge_calls == []
 
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -561,12 +666,16 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             rate_limited,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
         )
 
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -576,17 +685,29 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         repository_observation=_repository_observation(),
         merge_error=GitHubAuthenticationRejectedError("rejected (status 401)"),
     )
+    auth_resolver = FakeUserTokenResolver()
     with pytest.raises(ExternalOperationFailedError):
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             auth_rejected,
+            auth_resolver,
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
         )
-    assert len(auth_rejected.merge_calls) == 1
+    # A definitive 401-style non-delivery under the user credential performs
+    # ONLY the bounded #142 recovery (one evict + one re-resolve + the
+    # intersection re-proof) and then the merge retried EXACTLY once; the
+    # second rejection is the known failure — never a further recovery.
+    assert len(auth_rejected.merge_calls) == 2
+    assert auth_resolver.evict_calls == [_PROFILE_ID]
+    assert auth_resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
+    assert len(auth_rejected.validation_calls) == 2
 
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
     conn.on("from openorc.repositories where id", _repository_row())
@@ -600,6 +721,8 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             uncertain,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -611,6 +734,8 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
 
 def test_a_missing_canonical_record_is_the_uniform_not_found_with_no_github_call() -> None:
     conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
     conn.on("from openorc.tasks", _task_row())
     conn.on("from openorc.task_pull_requests where task_id", None)
     github = FakeGitHubAppClient(
@@ -625,6 +750,8 @@ def test_a_missing_canonical_record_is_the_uniform_not_found_with_no_github_call
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -642,6 +769,8 @@ def test_malformed_commands_are_classified_before_any_state_is_touched() -> None
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha="   ",
@@ -650,6 +779,8 @@ def test_malformed_commands_are_classified_before_any_state_is_touched() -> None
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id="not-a-uuid",  # type: ignore[arg-type]
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -676,6 +807,8 @@ def test_telemetry_uses_only_the_sanctioned_attribute_vocabulary() -> None:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
@@ -694,3 +827,216 @@ def test_telemetry_uses_only_the_sanctioned_attribute_vocabulary() -> None:
     assert attributes[TASK_ID] == str(_TASK_ID)
     assert attributes[GITHUB_HEAD_SHA] == _HEAD_SHA
     assert attributes[GITHUB_PULL_REQUEST_NUMBER] == _PR_NUMBER
+
+
+def test_an_unowned_workspace_is_the_uniform_not_found_before_any_github_call() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row(owner_profile_id=uuid.uuid4()))
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+
+    with pytest.raises(NotFoundError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The exact-Profile ownership gate failed first: no credential
+    # resolution and no GitHub call — another Profile is never substituted,
+    # even if it could access the same repository.
+    assert resolver.resolve_calls == []
+    assert github.repository_calls == []
+    assert github.merge_calls == []
+
+
+def test_an_active_account_deletion_attempt_blocks_the_merge_before_any_github_call() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_active_attempt_row())
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+
+    with pytest.raises(ConflictError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    assert resolver.resolve_calls == []
+    assert github.repository_calls == []
+    assert github.merge_calls == []
+    assert len(conn.executed) == 1  # only the barrier read ran
+
+
+def test_a_missing_or_revoked_user_authorization_blocks_the_merge_with_no_fallback() -> None:
+    for condition in (CONDITION_MISSING, CONDITION_REVOKED):
+        conn = ScriptedConnection()
+        conn.on("from openorc.profiles", _guard_row())
+        conn.on("from openorc.workspaces", _workspace_row())
+        conn.on("from openorc.tasks", _task_row())
+        conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+        conn.on("from openorc.repositories where id", _repository_row())
+        conn.on("from openorc.github_installations", _installation_row())
+        resolver = FakeUserTokenResolver()
+        resolver.resolve_error = GitHubUserAuthorizationUnavailableError(
+            condition=condition, message="unusable"
+        )
+        github = FakeGitHubAppClient(
+            pool=FakePool(conn),
+            repository_observation=_repository_observation(),
+            merge_result=GitHubMergeRequestResult(
+                outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+            ),
+        )
+
+        with pytest.raises(GitHubUserAuthorizationUnavailableError) as error:
+            pull_request_merge.request_pull_request_merge(
+                _pool(conn),
+                github,
+                resolver,
+                profile_id=_PROFILE_ID,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                expected_head_sha=_HEAD_SHA,
+            )
+
+        assert error.value.condition == condition
+        # No installation-token fallback: no GitHub call happened at all.
+        assert github.repository_calls == []
+        assert github.merge_calls == []
+        assert github.pull_request_calls == []
+        assert resolver.evict_calls == []
+
+
+def test_the_user_installation_repository_intersection_failure_blocks_the_merge() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+        intersection_errors=[GitHubAuthorizationRejectedError("denied (status 403)")],
+    )
+
+    with pytest.raises(GitHubUserRepositoryAccessError) as error:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    assert error.value.condition == CONDITION_USER_INSTALLATION_REPOSITORY_ACCESS_MISSING
+    # The merge was never attempted on another route or credential.
+    assert github.repository_calls == []
+    assert github.merge_calls == []
+    assert resolver.evict_calls == []
+
+
+def test_another_profile_cannot_substitute_the_owner_even_with_repository_access() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row(owner_profile_id=uuid.uuid4()))
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+
+    with pytest.raises(NotFoundError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=uuid.uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The caller-supplied profile_id was never trusted as authority: the
+    # Workspace Owner gate failed first and nothing was resolved or called.
+    assert resolver.resolve_calls == []
+    assert github.repository_calls == []
+    assert github.merge_calls == []
+
+
+def test_a_merge_401_whose_recovery_re_proof_is_rejected_fails_closed_without_a_write_retry() -> (
+    None
+):
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    resolver = FakeUserTokenResolver()
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+        merge_errors=[GitHubAuthenticationRejectedError("rejected (status 401)")],
+        intersection_errors=[
+            None,
+            GitHubAuthenticationRejectedError("rejected again (status 401)"),
+        ],
+    )
+
+    with pytest.raises(ExternalOperationFailedError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            resolver,
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The combined regression (issue #143): the merge's 401 spent the ONE
+    # bounded recovery pass — exactly one eviction/re-resolution — and the
+    # re-proof's own 401 failed closed: no second refresh and NO merge
+    # retry.
+    assert len(github.merge_calls) == 1
+    assert resolver.evict_calls == [_PROFILE_ID]
+    assert resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
+    assert len(github.validation_calls) == 2

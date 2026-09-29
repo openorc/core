@@ -26,13 +26,26 @@ so a broken pagination chain can never loop silently — exceeding the bound
 classifies as an uncertain outcome because the access question cannot be
 answered from an incomplete listing.
 
-Credential discipline: installation tokens are minted by the authenticator
-for the exact installation, presented as ``Authorization: Bearer`` headers
-on the immediate transport call, and evicted with a single bounded re-mint
-when GitHub rejects the presented token with 401. Uncertain outcomes are
-never replayed. No credential material ever crosses this facade into
-service code: the public surface returns typed facts and raises typed
-adapter errors only.
+Credential discipline (two-mode, issues #141/#142/#143): the credential
+mode follows the operation's semantics, never its HTTP verb. Installation
+authentication remains the credential for every infrastructure/read
+operation — the installation repository/branch/PR/check/status reads, the
+read-only GraphQL observations (a POST to the GraphQL endpoint is a read
+there), webhook reconciliation, and recovery mechanics — with installation
+tokens minted by the authenticator for the exact installation, presented as
+``Authorization: Bearer`` headers on the immediate transport call, and
+evicted with a single bounded re-mint when GitHub rejects the presented
+token with 401. Owner-accountable engineering-record writes (canonical PR
+creation, exact-head merge) require the exact Profile-bound GitHub App
+user-to-server credential (:class:`GitHubProfileUserAccessToken`) in their
+signatures: there is no installation-token mutation path reachable from
+them, no installation-token fallback, and no PAT or human-OAuth fallback
+anywhere. The user-credential lifecycle (resolution, refresh, eviction, and
+the bounded 401 recovery) is owned by the application-service resolver;
+this adapter never resolves, stores, or refreshes a user token. Uncertain
+outcomes are never replayed. No credential material ever crosses this
+facade into service code: the public surface returns typed facts and
+raises typed adapter errors only.
 """
 
 from __future__ import annotations
@@ -57,12 +70,16 @@ from openorc.adapters.github.capabilities import (
     GITHUB_REPOSITORY_ISSUE_PATH,
     GITHUB_REPOSITORY_PULL_REQUEST_PATH,
     GITHUB_REPOSITORY_PULL_REQUESTS_COLLECTION_PATH,
+    GITHUB_USER_INSTALLATION_REPOSITORIES_PATH,
+    GITHUB_USER_INSTALLATIONS_PATH,
     GitHubAccessValidation,
     GitHubInstallationCapabilities,
+    GitHubUserAccessValidation,
     missing_required_capabilities,
     missing_required_webhook_events,
     parse_installation_payload,
     parse_installation_repositories_page,
+    parse_user_installations_page,
     require_positive_int,
 )
 from openorc.adapters.github.errors import (
@@ -114,6 +131,7 @@ from openorc.adapters.github.transport import (
     github_repository_api_address,
     is_github_api_origin,
 )
+from openorc.adapters.github.user_tokens import GitHubProfileUserAccessToken
 from openorc.config import (
     GITHUB_APP_ID_VAR,
     GITHUB_APP_PRIVATE_KEY_VAR,
@@ -150,6 +168,7 @@ _CHECK_RUNS_SPAN_NAME = "github.get_commit_check_runs"
 _COMBINED_STATUS_SPAN_NAME = "github.get_commit_combined_status"
 _MERGE_SPAN_NAME = "github.merge_pull_request"
 _CREATE_PULL_REQUEST_SPAN_NAME = "github.create_pull_request"
+_USER_ACCESS_SPAN_NAME = "github.validate_user_installation_repository_access"
 
 # The installation repository listing requests the maximum documented page
 # size (100) and is bounded so a broken pagination chain cannot loop.
@@ -194,16 +213,29 @@ class GitHubAppClient(Protocol):
     """The GitHub adapter boundary application services depend on.
 
     Typed seam so services never import the concrete HTTP client. The
-    surface carries no credential parameter of any kind: there is no PAT,
-    human OAuth token, or other human-credential fallback anywhere in this
-    boundary — authentication always derives from the deployment-held GitHub
-    App identity and the exact routed installation.
+    credential mode follows the operation's semantics (issue #143): every
+    infrastructure/read operation authenticates through the exact routed
+    installation, while the Owner-accountable engineering-record writes
+    (``create_pull_request``/``merge_pull_request``) require the exact
+    Profile-bound GitHub App user-to-server credential in their signatures —
+    never a raw token, never an installation token, and no PAT or human-OAuth
+    fallback anywhere in this boundary.
     """
 
     def validate_installation_repository_access(
         self, *, github_installation_id: int, github_repository_id: int
     ) -> GitHubAccessValidation:
         """Validate current repository access and the required v1 capabilities."""
+        ...
+
+    def validate_user_installation_repository_access(
+        self,
+        *,
+        credential: GitHubProfileUserAccessToken,
+        github_installation_id: int,
+        github_repository_id: int,
+    ) -> GitHubUserAccessValidation:
+        """Prove the user × installation × repository intersection for one Owner write."""
         ...
 
     def get_installation_repository(
@@ -270,6 +302,7 @@ class GitHubAppClient(Protocol):
     def merge_pull_request(
         self,
         *,
+        credential: GitHubProfileUserAccessToken,
         github_installation_id: int,
         owner_login: str,
         repository_name: str,
@@ -282,6 +315,7 @@ class GitHubAppClient(Protocol):
     def create_pull_request(
         self,
         *,
+        credential: GitHubProfileUserAccessToken,
         github_installation_id: int,
         owner_login: str,
         repository_name: str,
@@ -467,6 +501,85 @@ class HttpGitHubAppClient:
             github_installation_id, github_repository_id
         )
         return parse_installation_repository_entry(entry, github_repository_id=github_repository_id)
+
+    def validate_user_installation_repository_access(
+        self,
+        *,
+        credential: GitHubProfileUserAccessToken,
+        github_installation_id: int,
+        github_repository_id: int,
+    ) -> GitHubUserAccessValidation:
+        """Prove the effective user/App/installation/repository intersection.
+
+        The two documented App-scoped user-to-server listings under the
+        exact Profile-bound user access token (issue #143): the paginated
+        ``GET /user/installations`` walk proves the authorized user can act
+        through the exact routed installation of this GitHub App, and the
+        paginated ``GET /user/installations/{id}/repositories`` walk proves
+        that installation currently grants the user access to the exact
+        stable repository identity. Absence of either stable identity after
+        the complete listing raises the classified authorization rejection;
+        a bounded-page exhaustion or any uninterpretable answer raises the
+        uncertain outcome. This proof never falls back to another
+        installation, another Profile, or an installation-token write, and
+        a later definitive permission/policy rejection from GitHub on the
+        write itself remains a normal known provider outcome.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(github_repository_id, "github_repository_id")
+        with application_span(_TRACER_SCOPE, _USER_ACCESS_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_USER_ACCESS_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+            )
+            path = f"{GITHUB_USER_INSTALLATIONS_PATH}?per_page={_LISTING_PAGE_SIZE}"
+            page_count = 0
+            installation_proven = False
+            while page_count < _MAX_LISTING_PAGES:
+                response = self._request_with_user_access_token(credential, path)
+                if github_installation_id in parse_user_installations_page(_json_body(response)):
+                    installation_proven = True
+                    break
+                next_url = self._next_page_url(response)
+                if next_url is None:
+                    raise GitHubAuthorizationRejectedError(
+                        "the accountable Profile's GitHub user authorization cannot act "
+                        "through the routed installation"
+                    )
+                path = next_url
+                page_count += 1
+            if not installation_proven:
+                raise GitHubOutcomeUncertainError(
+                    "the user installation listing could not be completed within the "
+                    "bounded page count: the access outcome is unknown"
+                )
+            repositories_path = GITHUB_USER_INSTALLATION_REPOSITORIES_PATH.format(
+                installation_id=github_installation_id
+            )
+            path = f"{repositories_path}?per_page={_LISTING_PAGE_SIZE}"
+            page_count = 0
+            while page_count < _MAX_LISTING_PAGES:
+                response = self._request_with_user_access_token(credential, path)
+                if github_repository_id in parse_installation_repositories_page(
+                    _json_body(response)
+                ):
+                    return GitHubUserAccessValidation(
+                        github_installation_id=github_installation_id,
+                        github_repository_id=github_repository_id,
+                    )
+                next_url = self._next_page_url(response)
+                if next_url is None:
+                    raise GitHubAuthorizationRejectedError(
+                        "the accountable Profile's GitHub user authorization cannot reach "
+                        "the routed repository through the routed installation"
+                    )
+                path = next_url
+                page_count += 1
+            raise GitHubOutcomeUncertainError(
+                "the user installation repository listing could not be completed within "
+                "the bounded page count: the access outcome is unknown"
+            )
 
     def get_repository_issue(
         self,
@@ -727,6 +840,7 @@ class HttpGitHubAppClient:
     def merge_pull_request(
         self,
         *,
+        credential: GitHubProfileUserAccessToken,
         github_installation_id: int,
         owner_login: str,
         repository_name: str,
@@ -736,18 +850,26 @@ class HttpGitHubAppClient:
         """Request one exact-head merge under GitHub's documented sha guard.
 
         The documented ``PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge``
-        operation under the installation access token (merge authority
-        derives from ``contents: write``, validated at route/access time —
-        never from a pull-request permission). The request carries the
-        documented ``sha`` parameter — the provider's expected-head facility
-        — so a concurrent head change can never satisfy this merge request:
-        GitHub answers the documented 409 head-mismatch rejection, normalized
-        here as ``HEAD_MISMATCH``. Any other definitive rejection is the
-        known ``REJECTED`` outcome (GitHub owns the merge policy: required
-        checks, conflicts, branch protection). Authentication/access absence,
-        rate limits, and uncertain outcomes (timeout, connection loss,
-        redirect, 5xx, uninterpretable answer) raise the adapter's classified
-        errors — an uncertain merge outcome is never silently replayed.
+        operation under the exact Profile-bound user-to-server credential
+        (issue #143): this Owner-accountable engineering-record mutation
+        carries the accountable Profile's user authorization — an
+        installation token can never reach it and there is no
+        installation-token fallback. Merge authority still derives from the
+        App's ``contents: write`` validated at route/access time — never
+        from a pull-request permission — and the routed installation
+        identity remains part of the operation's address. The request
+        carries the documented ``sha`` parameter — the provider's
+        expected-head facility — so a concurrent head change can never
+        satisfy this merge request: GitHub answers the documented 409
+        head-mismatch rejection, normalized here as ``HEAD_MISMATCH``. Any
+        other definitive rejection is the known ``REJECTED`` outcome (GitHub
+        owns the merge policy: required checks, conflicts, branch
+        protection). Authentication/access absence, rate limits, and
+        uncertain outcomes (timeout, connection loss, redirect, 5xx,
+        uninterpretable answer) raise the adapter's classified errors — an
+        uncertain merge outcome is never silently replayed, and a definitive
+        401-style rejection propagates for the service's single bounded
+        user-token recovery pass (issue #142 lifecycle).
         """
         require_positive_int(github_installation_id, "github_installation_id")
         require_positive_int(pull_number, "pull_number")
@@ -767,7 +889,7 @@ class HttpGitHubAppClient:
             )
             body = json.dumps({"sha": expected_head_sha}).encode("utf-8")
             try:
-                response = self._put_with_installation_token(github_installation_id, path, body)
+                response = self._put_with_user_access_token(credential, path, body)
             except (
                 GitHubAuthenticationRejectedError,
                 GitHubAuthorizationRejectedError,
@@ -792,6 +914,7 @@ class HttpGitHubAppClient:
     def create_pull_request(
         self,
         *,
+        credential: GitHubProfileUserAccessToken,
         github_installation_id: int,
         owner_login: str,
         repository_name: str,
@@ -803,12 +926,18 @@ class HttpGitHubAppClient:
         """Create one branch-addressed pull request (the documented create).
 
         The documented ``POST /repos/{owner}/{repo}/pulls`` operation under
-        the installation access token. GitHub's create operation is
+        the exact Profile-bound user-to-server credential (issue #143): the
+        canonical PR creation is an Owner-accountable engineering-record
+        write, externally attributed to the accountable Profile's authorized
+        GitHub account — an installation token can never reach it and there
+        is no installation-token fallback. GitHub's create operation is
         branch-addressed and provides no atomic expected-head guard — the
         exact-head race is closed above this adapter (preflight + immediate
-        post-create reconciliation), never here. The request carries only
-        the presentation title/body and the branch routing facts; the
-        response is normalized into the stable PR identity and facts.
+        post-create reconciliation), never here. The routed installation
+        identity remains part of the operation's address; the request
+        carries only the presentation title/body and the branch routing
+        facts; the response is normalized into the stable PR identity and
+        facts.
 
         The documented 'pull request already exists' definitive rejection
         (a branch already having an open PR toward the base) raises the
@@ -818,7 +947,9 @@ class HttpGitHubAppClient:
         loss, refused redirect on this mutating request, 5xx) raise the
         adapter's classified errors — an uncertain create is never replayed
         by this adapter and never reclassified as a success or a known
-        failure.
+        failure, and a definitive 401-style rejection propagates for the
+        service's single bounded user-token recovery pass (issue #142
+        lifecycle).
         """
         require_positive_int(github_installation_id, "github_installation_id")
         _require_non_empty_command_str(owner_login, "owner_login")
@@ -846,9 +977,7 @@ class HttpGitHubAppClient:
                 payload["body"] = body
             request_body = json.dumps(payload).encode("utf-8")
             try:
-                response = self._post_with_installation_token(
-                    github_installation_id, path, request_body
-                )
+                response = self._post_with_user_access_token(credential, path, request_body)
             except (
                 GitHubAuthenticationRejectedError,
                 GitHubAuthorizationRejectedError,
@@ -988,8 +1117,8 @@ class HttpGitHubAppClient:
                 issue_number=issue_number,
             )
             body = json.dumps({"query": query}).encode("utf-8")
-            response = self._post_with_installation_token(
-                github_installation_id, GITHUB_GRAPHQL_PATH, body
+            response = self._post_graphql_query_with_installation_token(
+                github_installation_id, body
             )
             return parse_graphql_issue_parent(_json_body(response))
 
@@ -1158,19 +1287,24 @@ class HttpGitHubAppClient:
                 path, method="GET", authorization=f"Bearer {token.token_value()}"
             )
 
-    def _post_with_installation_token(
-        self, github_installation_id: int, path: str, body: bytes
+    def _post_graphql_query_with_installation_token(
+        self, github_installation_id: int, body: bytes
     ) -> GitHubHttpResponse:
-        """Perform one installation-token POST with bounded 401 recovery.
+        """Perform the installation-authenticated read-only GraphQL query POST.
 
-        The same bounded recovery contract as the GET helper: one token
-        eviction and re-mint on an authentication rejection; uncertain
-        outcomes are never replayed.
+        The one installation-token POST surface this adapter owns, and it is
+        a READ: the documented GraphQL endpoint answering the issue-parent
+        observation query (issue #60). Credential mode follows the
+        operation's semantics, never the HTTP verb (issue #143): this POST
+        reads, so installation authentication remains authoritative for it;
+        no mutating operation may use this helper. The same bounded recovery
+        contract as the GET helper: one token eviction and re-mint on an
+        authentication rejection; uncertain outcomes are never replayed.
         """
         token = self._authenticator.installation_token(github_installation_id)
         try:
             return self._transport.request(
-                path,
+                GITHUB_GRAPHQL_PATH,
                 method="POST",
                 authorization=f"Bearer {token.token_value()}",
                 body=body,
@@ -1179,39 +1313,63 @@ class HttpGitHubAppClient:
             self._authenticator.invalidate_installation_token(github_installation_id)
             token = self._authenticator.installation_token(github_installation_id)
             return self._transport.request(
-                path,
+                GITHUB_GRAPHQL_PATH,
                 method="POST",
                 authorization=f"Bearer {token.token_value()}",
                 body=body,
             )
 
-    def _put_with_installation_token(
-        self, github_installation_id: int, path: str, body: bytes
+    def _request_with_user_access_token(
+        self, credential: GitHubProfileUserAccessToken, path: str
     ) -> GitHubHttpResponse:
-        """Perform one installation-token PUT with bounded 401 recovery.
+        """Perform one user-token GET under the exact Profile-bound credential.
 
-        The same bounded recovery contract as the GET/POST helpers: one token
-        eviction and re-mint on an authentication rejection; uncertain
-        outcomes are never replayed. The PUT verb is the documented exact-head
-        merge request's method.
+        The read surface of the Owner-accountable credential path (issue
+        #143): the App-scoped user-to-server listing walks that prove the
+        user × installation × repository intersection. The adapter never
+        resolves, stores, or refreshes a user token — the application-service
+        resolver owns that lifecycle, and the service owns the bounded 401
+        recovery: a definitive authentication rejection propagates unchanged.
+        Uncertain outcomes are never replayed.
         """
-        token = self._authenticator.installation_token(github_installation_id)
-        try:
-            return self._transport.request(
-                path,
-                method="PUT",
-                authorization=f"Bearer {token.token_value()}",
-                body=body,
-            )
-        except GitHubAuthenticationRejectedError:
-            self._authenticator.invalidate_installation_token(github_installation_id)
-            token = self._authenticator.installation_token(github_installation_id)
-            return self._transport.request(
-                path,
-                method="PUT",
-                authorization=f"Bearer {token.token_value()}",
-                body=body,
-            )
+        return self._transport.request(
+            path, method="GET", authorization=f"Bearer {credential.access_token.token_value()}"
+        )
+
+    def _post_with_user_access_token(
+        self, credential: GitHubProfileUserAccessToken, path: str, body: bytes
+    ) -> GitHubHttpResponse:
+        """Perform one Owner-accountable user-token POST (canonical PR creation).
+
+        The raw token value is read only here, at the final
+        request-construction boundary. A definitive 401-style rejection
+        propagates to the service, which owns the single bounded recovery
+        pass allowed by the #142 token lifecycle; uncertain outcomes are
+        never replayed.
+        """
+        return self._transport.request(
+            path,
+            method="POST",
+            authorization=f"Bearer {credential.access_token.token_value()}",
+            body=body,
+        )
+
+    def _put_with_user_access_token(
+        self, credential: GitHubProfileUserAccessToken, path: str, body: bytes
+    ) -> GitHubHttpResponse:
+        """Perform one Owner-accountable user-token PUT (exact-head merge request).
+
+        The same contract as :meth:`_post_with_user_access_token`: the raw
+        value is read only at this final request-construction boundary, a
+        definitive 401-style rejection propagates for the service's bounded
+        recovery, and uncertain outcomes are never replayed.
+        """
+        return self._transport.request(
+            path,
+            method="PUT",
+            authorization=f"Bearer {credential.access_token.token_value()}",
+            body=body,
+        )
 
     def _collect_paginated_entries(
         self, github_installation_id: int, initial_path: str, entries: list[object]

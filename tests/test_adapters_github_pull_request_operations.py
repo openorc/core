@@ -16,11 +16,18 @@ bounded pagination with ``total_count`` completeness proofs for both
 projection surfaces, the documented merge response classes (success, 409
 head mismatch, other definitive rejection), and auth/access/rate-limit/5xx
 classifications — an uncertain merge outcome is never a result.
+
+Credential mode (issue #143): the Owner-accountable write operations
+(``create_pull_request``, ``merge_pull_request``) authenticate with the
+exact Profile-bound user-to-server credential — no installation token is
+ever minted for them — and a definitive 401 under the user token propagates
+for the service-side bounded recovery instead of any adapter-side retry.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -51,6 +58,10 @@ from openorc.adapters.github.observations_pull_request import (
     parse_pull_request_payload,
 )
 from openorc.adapters.github.transport import GITHUB_API_BASE_URL, HttpGitHubRestClient
+from openorc.adapters.github.user_tokens import (
+    GitHubProfileUserAccessToken,
+    GitHubUserAccessToken,
+)
 
 _NOW = 1_790_000_000.0
 _REPOSITORY_ID = 987654321
@@ -115,6 +126,25 @@ def _client(fetch: FakeFetcher) -> HttpGitHubAppClient:
     )
     transport = HttpGitHubRestClient(fetch=fetch)
     return HttpGitHubAppClient(authenticator=authenticator, transport=transport)
+
+
+_USER_TOKEN_VALUE = "ghu_owner_user_token"
+
+
+def _user_credential() -> GitHubProfileUserAccessToken:
+    """One accountable Profile's resolved user credential for the write operations."""
+    return GitHubProfileUserAccessToken(
+        profile_id=uuid.UUID(int=42),
+        access_token=GitHubUserAccessToken(
+            value=_USER_TOKEN_VALUE, expires_at=datetime.fromtimestamp(_NOW + 3600, tz=UTC)
+        ),
+    )
+
+
+def _assert_owner_write_auth(fetch: FakeFetcher, write_call_index: int = 0) -> None:
+    """The write presented the Profile-bound user token and never minted one."""
+    assert fetch.calls[write_call_index][2]["Authorization"] == f"Bearer {_USER_TOKEN_VALUE}"
+    assert not any("access_tokens" in call[0] for call in fetch.calls)
 
 
 def _branch_payload(name: str = "openorc/task-42", sha: str = _HEAD_SHA) -> dict[str, Any]:
@@ -630,7 +660,6 @@ def test_a_pagination_walk_beyond_the_bounded_page_count_is_uncertain(
 def test_merge_request_success_reports_the_merge_commit_sha() -> None:
     fetch = FakeFetcher(
         [
-            _mint_response(),
             _json(
                 200,
                 {},
@@ -640,6 +669,7 @@ def test_merge_request_success_reports_the_merge_commit_sha() -> None:
     )
 
     result = _client(fetch).merge_pull_request(
+        credential=_user_credential(),
         github_installation_id=4242,
         owner_login="octocat",
         repository_name="hello-world",
@@ -650,17 +680,17 @@ def test_merge_request_success_reports_the_merge_commit_sha() -> None:
     assert result.outcome is GitHubMergeRequestOutcome.MERGED
     assert result.merge_commit_sha == _OTHER_SHA
     # The documented merge operation: PUT with the sha expected-head guard.
-    assert fetch.calls[1][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls/77/merge"
-    assert fetch.calls[1][1] == "PUT"
-    assert json.loads(fetch.calls[1][4] or b"{}") == {"sha": _HEAD_SHA}
+    assert fetch.calls[0][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls/77/merge"
+    assert fetch.calls[0][1] == "PUT"
+    assert json.loads(fetch.calls[0][4] or b"{}") == {"sha": _HEAD_SHA}
+    _assert_owner_write_auth(fetch)
 
 
 def test_merge_request_expected_head_mismatch_is_the_documented_409_outcome() -> None:
-    fetch = FakeFetcher(
-        [_mint_response(), _json(409, {}, {"message": "Head branch was modified or is invalid"})]
-    )
+    fetch = FakeFetcher([_json(409, {}, {"message": "Head branch was modified or is invalid"})])
 
     result = _client(fetch).merge_pull_request(
+        credential=_user_credential(),
         github_installation_id=4242,
         owner_login="octocat",
         repository_name="hello-world",
@@ -676,9 +706,10 @@ def test_merge_request_other_definitive_rejections_are_github_owned_policy() -> 
     # 405 (not mergeable) and 422 (validation) are documented definitive
     # rejections GitHub owns; the merge applied nothing in either case.
     for status in (405, 422):
-        fetch = FakeFetcher([_mint_response(), _json(status, {}, {"message": "rejected"})])
+        fetch = FakeFetcher([_json(status, {}, {"message": "rejected"})])
 
         result = _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -690,49 +721,67 @@ def test_merge_request_other_definitive_rejections_are_github_owned_policy() -> 
         assert result.merge_commit_sha is None
 
 
-def test_merge_request_access_and_authentication_rejections_are_classified() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(403, {}, {"message": "Forbidden"})])
+def test_merge_request_access_rejections_are_classified() -> None:
+    fetch = FakeFetcher([_json(403, {}, {"message": "Forbidden"})])
     with pytest.raises(GitHubAuthorizationRejectedError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
             pull_number=_PULL_NUMBER,
             expected_head_sha=_HEAD_SHA,
         )
-    # An authentication rejection is recovered once (evict + re-mint); a
-    # second rejection is the known failure.
-    fetch = FakeFetcher(
-        [
-            _mint_response(),
-            _json(401, {}, {"message": "Bad credentials"}),
-            _mint_response(),
-            _json(401, {}, {"message": "Bad credentials"}),
-        ]
-    )
+
+
+def test_a_definitive_user_token_401_propagates_without_any_adapter_retry() -> None:
+    # The adapter never resolves, stores, or refreshes a user token: a
+    # definitive 401-style rejection under the Profile-bound credential
+    # propagates for the service's single bounded recovery pass (issue
+    # #142/#143). Exactly one transport call — no adapter-side eviction or
+    # replay — for both Owner-accountable write operations.
+    fetch = FakeFetcher([_json(401, {}, {"message": "Bad credentials"})])
     with pytest.raises(GitHubAuthenticationRejectedError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
             pull_number=_PULL_NUMBER,
             expected_head_sha=_HEAD_SHA,
         )
+    assert len(fetch.calls) == 1
+
+    fetch = FakeFetcher([_json(401, {}, {"message": "Bad credentials"})])
+    with pytest.raises(GitHubAuthenticationRejectedError):
+        _client(fetch).create_pull_request(
+            credential=_user_credential(),
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            head_ref="openorc/task-42",
+            base_ref="main",
+            title="feat: task 42",
+            body=None,
+        )
+    assert len(fetch.calls) == 1
 
 
 def test_merge_request_rate_limits_and_uncertain_outcomes_are_classified() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(429, {"Retry-After": "60"}, {"message": "abuse"})])
+    fetch = FakeFetcher([_json(429, {"Retry-After": "60"}, {"message": "abuse"})])
     with pytest.raises(GitHubRateLimitedError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
             pull_number=_PULL_NUMBER,
             expected_head_sha=_HEAD_SHA,
         )
-    fetch = FakeFetcher([_mint_response(), _json(500, {}, {"message": "boom"})])
+    fetch = FakeFetcher([_json(500, {}, {"message": "boom"})])
     with pytest.raises(GitHubOutcomeUncertainError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -740,9 +789,10 @@ def test_merge_request_rate_limits_and_uncertain_outcomes_are_classified() -> No
             expected_head_sha=_HEAD_SHA,
         )
     # A connection loss is an uncertain outcome, never a non-delivery.
-    fetch = FakeFetcher([_mint_response(), TimeoutError("connection lost")])
+    fetch = FakeFetcher([TimeoutError("connection lost")])
     with pytest.raises(GitHubOutcomeUncertainError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -752,10 +802,11 @@ def test_merge_request_rate_limits_and_uncertain_outcomes_are_classified() -> No
 
 
 def test_a_merge_response_that_does_not_report_a_successful_merge_is_uncertain() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(200, {}, {"merged": False, "sha": None})])
+    fetch = FakeFetcher([_json(200, {}, {"merged": False, "sha": None})])
 
     with pytest.raises(GitHubOutcomeUncertainError):
         _client(fetch).merge_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -779,9 +830,10 @@ def test_parser_surface_rejects_uninterpretable_shapes() -> None:
 
 
 def test_create_pull_request_uses_the_documented_collection_operation() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(201, {}, _pr_payload())])
+    fetch = FakeFetcher([_json(201, {}, _pr_payload())])
 
     facts = _client(fetch).create_pull_request(
+        credential=_user_credential(),
         github_installation_id=4242,
         owner_login="octocat",
         repository_name="hello-world",
@@ -795,9 +847,10 @@ def test_create_pull_request_uses_the_documented_collection_operation() -> None:
     assert facts.github_pr_id == 900_719_925_474_099
     assert facts.pull_number == _PULL_NUMBER
     assert facts.head_sha == _HEAD_SHA
-    assert fetch.calls[1][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls"
-    assert fetch.calls[1][1] == "POST"
-    sent = json.loads(fetch.calls[1][4] or b"{}")
+    assert fetch.calls[0][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls"
+    assert fetch.calls[0][1] == "POST"
+    _assert_owner_write_auth(fetch)
+    sent = json.loads(fetch.calls[0][4] or b"{}")
     assert sent == {
         "head": "openorc/task-42",
         "base": "main",
@@ -807,9 +860,10 @@ def test_create_pull_request_uses_the_documented_collection_operation() -> None:
 
 
 def test_create_pull_request_omits_an_absent_body() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(201, {}, _pr_payload())])
+    fetch = FakeFetcher([_json(201, {}, _pr_payload())])
 
     _client(fetch).create_pull_request(
+        credential=_user_credential(),
         github_installation_id=4242,
         owner_login="octocat",
         repository_name="hello-world",
@@ -819,8 +873,9 @@ def test_create_pull_request_omits_an_absent_body() -> None:
         body=None,
     )
 
-    sent = json.loads(fetch.calls[1][4] or b"{}")
+    sent = json.loads(fetch.calls[0][4] or b"{}")
     assert "body" not in sent
+    _assert_owner_write_auth(fetch)
 
 
 def test_create_pull_request_already_exists_is_a_typed_classified_rejection() -> None:
@@ -832,7 +887,6 @@ def test_create_pull_request_already_exists_is_a_typed_classified_rejection() ->
     # duplication.
     fetch = FakeFetcher(
         [
-            _mint_response(),
             _json(
                 422,
                 {},
@@ -852,6 +906,7 @@ def test_create_pull_request_already_exists_is_a_typed_classified_rejection() ->
 
     with pytest.raises(GitHubPullRequestExistsError) as exc_info:
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -871,7 +926,6 @@ def test_create_pull_request_already_exists_message_form_is_classified() -> None
     # The documented explicit 'a pull request already exists' message form.
     fetch = FakeFetcher(
         [
-            _mint_response(),
             _json(
                 422,
                 {},
@@ -882,6 +936,7 @@ def test_create_pull_request_already_exists_message_form_is_classified() -> None
 
     with pytest.raises(GitHubPullRequestExistsError):
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -902,10 +957,11 @@ def test_create_pull_request_unrelated_422_is_not_an_already_exists_conflict() -
     # general 422: an ordinary definitive rejection, NEVER the duplicate-PR
     # classification — a non-duplicate validation refusal must never become
     # the workflow's existing-PR conflict.
-    fetch = FakeFetcher([_mint_response(), _json(422, {}, {"message": "Validation Failed"})])
+    fetch = FakeFetcher([_json(422, {}, {"message": "Validation Failed"})])
 
     with pytest.raises(GitHubRequestRejectedError) as exc_info:
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -929,7 +985,6 @@ def test_create_pull_request_unrelated_422_error_field_is_not_a_conflict() -> No
     # duplicate-PR condition.
     fetch = FakeFetcher(
         [
-            _mint_response(),
             _json(
                 422,
                 {},
@@ -943,6 +998,7 @@ def test_create_pull_request_unrelated_422_error_field_is_not_a_conflict() -> No
 
     with pytest.raises(GitHubRequestRejectedError) as exc_info:
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -967,7 +1023,6 @@ def test_create_pull_request_base_field_with_invalid_code_is_not_a_conflict() ->
     # never become the workflow's non-adoption conflict.
     fetch = FakeFetcher(
         [
-            _mint_response(),
             _json(
                 422,
                 {},
@@ -981,6 +1036,7 @@ def test_create_pull_request_base_field_with_invalid_code_is_not_a_conflict() ->
 
     with pytest.raises(GitHubRequestRejectedError) as exc_info:
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -994,10 +1050,11 @@ def test_create_pull_request_base_field_with_invalid_code_is_not_a_conflict() ->
 
 
 def test_create_pull_request_other_definitive_rejections_stay_classified() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(403, {}, {"message": "denied"})])
+    fetch = FakeFetcher([_json(403, {}, {"message": "denied"})])
 
     with pytest.raises(GitHubAuthorizationRejectedError):
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -1009,10 +1066,11 @@ def test_create_pull_request_other_definitive_rejections_stay_classified() -> No
 
 
 def test_create_pull_request_connection_loss_is_uncertain() -> None:
-    fetch = FakeFetcher([_mint_response(), ConnectionResetError("lost")])
+    fetch = FakeFetcher([ConnectionResetError("lost")])
 
     with pytest.raises(GitHubOutcomeUncertainError):
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",
@@ -1024,10 +1082,11 @@ def test_create_pull_request_connection_loss_is_uncertain() -> None:
 
 
 def test_create_pull_request_uninterpretable_success_is_uncertain() -> None:
-    fetch = FakeFetcher([_mint_response(), _json(201, {}, {"id": "not-an-int"})])
+    fetch = FakeFetcher([_json(201, {}, {"id": "not-an-int"})])
 
     with pytest.raises(GitHubOutcomeUncertainError):
         _client(fetch).create_pull_request(
+            credential=_user_credential(),
             github_installation_id=4242,
             owner_login="octocat",
             repository_name="hello-world",

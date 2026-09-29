@@ -313,6 +313,9 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not request merges")
 
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not compose user-write validation")
+
 
 def _verify_scripts_unbound(conn: ScriptedConnection) -> None:
     """Script the unbound-claim flow: guard read, route reads, bind, update."""

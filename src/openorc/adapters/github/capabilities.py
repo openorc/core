@@ -64,10 +64,13 @@ __all__ = [
     "GITHUB_REPOSITORY_PULL_REQUESTS_COLLECTION_PATH",
     "GITHUB_COMMIT_CHECK_RUNS_PATH",
     "GITHUB_COMMIT_COMBINED_STATUS_PATH",
+    "GITHUB_USER_INSTALLATIONS_PATH",
+    "GITHUB_USER_INSTALLATION_REPOSITORIES_PATH",
     "REQUIRED_V1_WEBHOOK_EVENTS",
     "V1_CLASSIFIED_WEBHOOK_EVENTS",
     "REQUIRED_V1_WORKFLOW_CAPABILITIES",
     "GitHubAccessValidation",
+    "GitHubUserAccessValidation",
     "GitHubInstallationCapabilities",
     "GitHubWorkflowCapability",
     "map_installation_permissions",
@@ -76,6 +79,7 @@ __all__ = [
     "parse_instant",
     "parse_installation_payload",
     "parse_installation_repositories_page",
+    "parse_user_installations_page",
     "require_positive_int",
 ]
 
@@ -180,6 +184,14 @@ GITHUB_ISSUE_SUB_ISSUES_PATH = "/repos/{owner}/{repo}/issues/{issue_number}/sub_
 # the REST parent endpoint documents no distinct successful no-parent answer.
 GITHUB_GRAPHQL_PATH = "/graphql"
 
+# Documented user-to-server installation/repository access surfaces (issue
+# #143): the Profile-scoped GitHub App user authorization proves the
+# effective user × App installation × repository intersection for
+# Owner-accountable writes through these App-scoped listings under the user
+# access token before any mutation.
+GITHUB_USER_INSTALLATIONS_PATH = "/user/installations"
+GITHUB_USER_INSTALLATION_REPOSITORIES_PATH = "/user/installations/{installation_id}/repositories"
+
 
 def require_positive_int(value: object, name: str) -> int:
     """Validate a caller-supplied stable external identifier (fail closed).
@@ -224,6 +236,21 @@ class GitHubAccessValidation:
     github_repository_id: int
     capabilities: frozenset[GitHubWorkflowCapability]
     subscribed_events: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubUserAccessValidation:
+    """The normalized result of one successful user×installation×repository proof.
+
+    Produced only when the exact Profile-bound GitHub App user authorization
+    can reach the exact routed installation and its stable repository
+    identity through the documented App-scoped user-to-server listings
+    (issue #143): any absence is raised by the adapter as the classified
+    authorization rejection instead. Carries no credential material.
+    """
+
+    github_installation_id: int
+    github_repository_id: int
 
 
 # GitHub installation permission dictionary -> semantic capabilities.
@@ -390,3 +417,38 @@ def parse_installation_repositories_page(payload: Mapping[str, Any]) -> list[int
             )
         repository_ids.append(repository_id)
     return repository_ids
+
+
+def parse_user_installations_page(payload: Mapping[str, Any]) -> list[int]:
+    """Normalize one page of the user's App-scoped installation listing to stable IDs.
+
+    The documented ``GET /user/installations`` answer under the user access
+    token lists the installations of the token's GitHub App the authorized
+    user can act through. Only the numeric stable ``id`` values are
+    consumed: the listing proves installation membership by stable identity,
+    never by login/name presentation data.
+    """
+    installations = payload.get("installations")
+    if not isinstance(installations, list):
+        raise GitHubOutcomeUncertainError(
+            "the user installation listing is not interpretable: the installations array is missing"
+        )
+    installation_ids: list[int] = []
+    for entry in installations:
+        if not isinstance(entry, dict):
+            raise GitHubOutcomeUncertainError(
+                "the user installation listing is not interpretable: "
+                "an installation entry is malformed"
+            )
+        installation_id = entry.get("id")
+        if (
+            isinstance(installation_id, bool)
+            or not isinstance(installation_id, int)
+            or installation_id <= 0
+        ):
+            raise GitHubOutcomeUncertainError(
+                "the user installation listing is not interpretable: "
+                "an installation identity is malformed"
+            )
+        installation_ids.append(installation_id)
+    return installation_ids

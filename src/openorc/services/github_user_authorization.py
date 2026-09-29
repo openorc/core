@@ -54,6 +54,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
+from typing import Protocol
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -106,6 +107,7 @@ __all__ = [
     "GitHubUserAccessTokenResolver",
     "GitHubUserAuthorizationUnavailableError",
     "GitHubUserIdentityMismatchError",
+    "ProfileUserAccessTokenResolver",
     "SupabaseGitHubIdentityStateError",
     "establish_github_user_authorization",
     "normalize_strict_github_user_id",
@@ -159,6 +161,26 @@ _ACCESS_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60.0
 _ACCESS_TOKEN_CACHE_MAX_ENTRIES = 32
 
 logger = logging.getLogger(__name__)
+
+
+class ProfileUserAccessTokenResolver(Protocol):
+    """The resolver seam Owner-accountable GitHub writes depend on (issue #143).
+
+    Structural contract so the shared Owner-write boundary and the write
+    services never depend on the concrete resolver: the exact Profile's
+    fail-closed user-token resolution (the typed unavailable-authorization
+    conditions) and the single bounded-recovery eviction seam. The concrete
+    :class:`GitHubUserAccessTokenResolver` satisfies it structurally; tests
+    substitute structural fakes.
+    """
+
+    def resolve(self, pool: DatabasePool, *, profile_id: UUID) -> GitHubUserAccessToken:
+        """Return a usable user access token for the Profile's authorization."""
+        ...
+
+    def evict_cached_access_token(self, profile_id: UUID) -> None:
+        """Drop the Profile's cached access token (the bounded 401-recovery seam)."""
+        ...
 
 
 class GitHubUserAuthorizationUnavailableError(ApplicationError):
@@ -643,6 +665,26 @@ class GitHubUserAccessTokenResolver:
                 "the GitHub authorization refresh state kept moving; the resolution "
                 "was not completed"
             )
+
+    def evict_cached_access_token(self, profile_id: UUID) -> None:
+        """Drop the Profile's cached access token (the bounded 401-recovery seam).
+
+        The only sanctioned trigger is a DEFINITIVE authentication rejection
+        (GitHub answered a 401-class failure) from a GitHub call made under
+        this Profile's resolved user token — the #142 lifecycle's allowed
+        bounded recovery: the next :meth:`resolve` re-reads durable state
+        and, finding no cache entry, performs exactly one refresh exchange
+        through the generation compare-and-swap. Never a replay mechanism:
+        uncertain outcomes, known policy rejections, and stale operations
+        must never trigger an eviction, and a recovered credential never
+        widens the authorization it had. Evicting an unknown Profile's
+        (absent) cache entry is a harmless no-op.
+        """
+        if not isinstance(profile_id, UUID):
+            raise InvalidCommandError("profile_id must be a UUID")
+        with self._cache_lock:
+            for key in [key for key in self._cache if key[0] == profile_id]:
+                del self._cache[key]
 
     def _resolve_refresh_secret(
         self, pool: DatabasePool, *, reference: object, refresh_expires_at: datetime
