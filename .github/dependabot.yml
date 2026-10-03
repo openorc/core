@@ -1,0 +1,62 @@
+# Dependabot version updates for openorc/core.
+#
+# Policy (see .github/AGENTS.md "Dependabot"):
+# - Security: Dependabot alerts and Dependabot security updates are repository
+#   settings. Security remediation PRs open immediately, stay individual (no
+#   security-update groups), and are never auto-merged. The cooldown option
+#   does not apply to security updates.
+# - Version updates: ordinary dependencies are checked weekly (Monday) and
+#   compatible patch/minor updates are grouped per ecosystem; major updates
+#   always arrive as individual PRs for separate review.
+#
+# GitHub Actions note: this repository pins actions to full commit SHAs with a
+# same-line "# vX.Y" version comment. Dependabot version updates DO update
+# owner/action@<commit> references, including that adjacent same-line comment.
+# Dependabot vulnerability alerts and alert-driven security updates are NOT
+# generated for actions pinned to SHA values (alerting requires semantic
+# version references), so this weekly version-update entry is the automated
+# refresh channel for the pinned actions.
+
+version: 2
+updates:
+  # Python (uv-managed): pyproject.toml + uv.lock at the repository root.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      uv-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  # Frontend SPA (npm): apps/app/package.json + package-lock.json.
+  - package-ecosystem: npm
+    directory: "/apps/app"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the repository workflows (SHA-pinned; see note above).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
