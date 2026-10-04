@@ -12,7 +12,7 @@ Do not implement independent workflow authority, direct Agent Runtime calls, dir
 
 - Vue 3 Composition API with `<script setup lang="ts">`.
 - TypeScript strictness.
-- PrimeVue for the component system.
+- The UI/component library is intentionally TBD. It must not be selected implicitly through ordinary feature or dependency work; selection happens as an explicit decision when substantive frontend implementation begins.
 - TanStack Vue Query owns server-derived state.
 - Pinia is for genuine client/application state, not a duplicate server truth store.
 

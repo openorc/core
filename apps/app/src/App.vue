@@ -24,7 +24,7 @@
 
 .app-shell-header {
   padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--p-content-border-color, #e2e8f0);
+  border-bottom: 1px solid #e2e8f0;
 }
 
 .app-shell-brand {

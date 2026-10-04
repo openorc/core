@@ -21,8 +21,8 @@ body {
     'Helvetica Neue',
     Arial,
     sans-serif;
-  color: var(--p-text-color, #1b1b1f);
-  background-color: var(--p-surface-ground, #ffffff);
+  color: #1b1b1f;
+  background-color: #ffffff;
   -webkit-font-smoothing: antialiased;
 }
 
