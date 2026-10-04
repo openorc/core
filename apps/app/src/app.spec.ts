@@ -1,5 +1,5 @@
 // Bootstrap composition test: exercises the real application composition
-// root (Pinia + Router + PrimeVue + Vue Query) against the real route table,
+// root (Pinia + Router + Vue Query) against the real route table,
 // not a bare App.vue mount.
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -19,7 +19,7 @@ describe('OpenOrc app composition', () => {
     mountedApp = undefined
   })
 
-  it('installs Pinia, Router, PrimeVue, and Vue Query and renders the root route', async () => {
+  it('installs Pinia, Router, and Vue Query and renders the root route', async () => {
     container = document.createElement('div')
     container.id = 'app'
     document.body.appendChild(container)

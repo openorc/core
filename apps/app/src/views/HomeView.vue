@@ -23,6 +23,6 @@
 }
 
 .home-view-status {
-  color: var(--p-text-muted-color, #64748b);
+  color: #64748b;
 }
 </style>
