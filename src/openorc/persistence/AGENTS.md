@@ -54,7 +54,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 ## Connections and runtime-control credentials
 
 - connections and workflow_role_bindings carry direct Workspace scope.
-- Exactly one role binding exists per (Workspace, role) in v1.
+- Exactly one role binding exists per (Workspace, role) in v1. Its concrete role-session configuration uses typed columns: opaque provider/model identifiers as a both-present-or-both-absent pair plus a nullable role-prompt override; do not introduce a generic runtime-configuration JSON bag or provider catalog tables.
 - Connection.auth_reference is opaque and nullable. Raw credential material never appears in openorc.* tables.
 - Connection.safe_config is non-secret canonical JSON only.
 - enabled is Owner eligibility, not runtime health. session_capacity is Owner-configured admission control, not runtime-discovered state.
@@ -71,7 +71,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - The canonical feature branch is nullable initially, bound once, and unique among current Tasks in a Repository.
 - current_plan_revision_id and current_owner_gate_id are pointers only. Never duplicate target content/outcomes on Task and never add a singular current Execution pointer.
 - Exactly one TaskAgentSession exists per (Task, role). Establishment never silently repoints an existing binding.
-- Session initialization facts external_session_id, initialized_at, effective_config_snapshot move coherently. LOST/ENDED never create a successor binding.
+- Session initialization facts external_session_id, initialized_at, effective_config_snapshot move coherently. The snapshot does not freeze live role provider/model/prompt values solely for reconstruction. LOST/ENDED never create a successor binding.
 - A non-null external_session_id is unique within its Connection.
 - Active Connection occupancy is CONNECTING or READY; services own admission decisions.
 

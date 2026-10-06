@@ -34,7 +34,7 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 
 - `@cline/sdk` / `ClineCore` is the primary OpenOrc runtime-session integration surface.
 - Lower-level `Agent` / `AgentRuntime` APIs are not the OpenOrc integration layer.
-- The documented `@cline/llms` catalog surface may be consumed for provider/model selection.
+- Do not depend on `@cline/llms`, a configured-provider catalog, or effective provider/model readback. Provider/model identifiers arrive as opaque OpenOrc role configuration.
 - Do not mirror ClineCore wholesale into Python. Expose only the session/configuration/control/event operations OpenOrc actually needs.
 
 ## Session invariants
@@ -42,7 +42,7 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 - Preserve one exact Producer and one exact Reviewer external session per Task for the Task lifetime.
 - Session creation is idempotent for `(Task, role)` and usable only after the OpenOrc readiness handshake succeeds.
 - Producer and Reviewer have isolated working contexts even on one Hub.
-- Reviewer remains review-only/PLAN mode in v1; Producer begins PLAN and switches to ACT only after implementation authorization. Use only the supported public same-session mode-control contract qualified for the pinned Cline baseline.
+- Reviewer remains review-only/PLAN mode in v1; Producer begins PLAN and switches to ACT only after implementation authorization. On the pinned baseline, mode changes use the qualified same-external-session-ID reconstruction path rather than per-send mode tags as current-mode authority.
 - Runtime-internal rebuild under the same external session identity is not an OpenOrc session replacement.
 - Unexpected loss of the bound context blocks; never silently create a new one.
 
@@ -50,7 +50,7 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 
 OpenOrc owns Task/role binding, exact external-session routing, workflow semantics, and the role/session configuration it deliberately selects.
 
-For Cline v1, OpenOrc selects provider/model identifiers per role/session from the documented public catalog and records effective runtime-reported identity where available.
+For Cline v1, OpenOrc stores opaque provider/model identifiers plus an optional role-prompt override on the role binding. Each fresh construction or legitimate same-ID reconstruction resolves the then-current values; runtime-reported provider/model metadata is optional observation, never configuration authority.
 
 Cline owns provider authentication and native runtime configuration, including tools, MCP, plugins, skills, sub-agents/teams, permission/auto-approval configuration, filesystem/tool execution, runtime persistence, private conversational state, and other native behavior inside the session. A managed Cline Box does not transfer those concerns into OpenOrc merely because Cloud owns the host lifecycle.
 
@@ -60,10 +60,10 @@ OpenOrc Connection rows never model Cline-owned provider/MCP/tool credentials. O
 
 ## Delivery / telemetry
 
-Use supported ClineCore session events/state for delivery reconciliation, cancellation/control, usage/cost, effective model identity, and optional runtime telemetry. Do not consume lower-level AgentRuntime events when the ClineCore session surface supplies the needed fact.
+Use public ClineCore reads/history plus supported events/state for delivery reconciliation, controls, usage, and optional runtime telemetry. A fresh client is not assumed to replay an already-running turn's event stream; uncertain accepted sends reconcile through public persisted state before any retry.
 
-Cline-native tool approval remains a runtime concern unless the qualified remote-session contract demonstrably requires a minimal OpenOrc-side callback/pass-through. Do not make OpenOrc the Cline permission UI by assumption.
+Cline v1 registers no interactive approval/question executors or capabilities, and native tool approvals do not become OpenOrc `RuntimeRequest`s. Disable `ask_question` through the supported session policy. Owner activity interruption uses the public abort semantics; `stop(sessionId)` belongs to same-ID runtime reconstruction, not to the user-facing activity-control surface.
 
-Do not blindly replay uncertain sends. Runtime telemetry is not workflow authority.
+Do not blindly replay uncertain sends. Runtime telemetry and Cline record status are not workflow authority.
 
 Read `packages/cline-sdk-bridge/AGENTS.md` for bridge changes and services/domain guidance for semantic changes.

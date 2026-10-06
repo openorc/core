@@ -37,13 +37,13 @@ Documentation defines the candidate public contract. Source inspection/live prob
 ## Package policy
 
 - Prefer `@cline/sdk` / `ClineCore` for session lifecycle, persistence, messages, events, usage, and controls.
-- `@cline/llms` may be consumed directly for the documented provider/model catalog used by OpenOrc role configuration.
+- Do not add an `@cline/llms` or other provider/model catalog dependency. OpenOrc passes opaque configured provider/model identifiers through the SDK surface and does not enumerate Cline-native provider state.
 - Do not drop to `@cline/agents` / `AgentRuntime` merely because a lower-level method exists.
 - Do not import private Cline packages, private Hub protocol, or private on-disk configuration as product contracts.
 
 ## It may own
 
-Official SDK invocation, request/reply correlation, plain-JSON translation, SDK connection lifecycle, asynchronous ClineCore session-event forwarding, usage/effective-runtime-state forwarding, provider/model catalog translation, and any minimal approval/question callback forwarding only where the validated public remote contract requires OpenOrc participation.
+Official SDK invocation, request/reply correlation, plain-JSON translation, SDK connection lifecycle, public session/message/history reads, asynchronous ClineCore event forwarding, usage/runtime-state forwarding, and the SDK control/reconstruction calls required by the backend contract.
 
 ## It must never own
 
@@ -54,5 +54,5 @@ Tasks, PlanRevisions, ReviewLoops, OwnerGates, Executions, OpenOrc retry/idempot
 - Python starts/lifecycle-manages the bridge locally; it is not a separately deployed service.
 - Bridge failure/restart never implies replacement of the external Task session.
 - Keep the bridge replaceable by a future native Python SDK implementation without changes above the backend boundary.
-- Pin released Cline package versions and validate them as one supported CLI/core/SDK/catalog baseline.
-- Contract tests cover only OpenOrc-owned bridge behavior such as request/reply correlation, async event forwarding, translation, and restart behavior; do not recreate Cline's SDK test suite.
+- Pin the supported `@cline/sdk` version selected by the Phase 2D baseline; compatibility is qualified against the corresponding supported CLI/core/SDK baseline.
+- Do not register interactive approval/question executors or turn Cline-native tool approvals into an OpenOrc bridge protocol. Contract tests cover only OpenOrc-owned bridge behavior such as request/reply correlation, translation/event forwarding, and restart behavior; do not recreate Cline's SDK test suite.

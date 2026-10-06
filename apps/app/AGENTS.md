@@ -27,7 +27,7 @@ Do not implement independent workflow authority, direct Agent Runtime calls, dir
 
 - The dashboard is the primary happy path.
 - Each active Task wizard occupies its own tab; never introduce a singleton global current Task.
-- Owner Requests surface durable gates and scoped runtime approvals.
+- Owner Requests surface durable gates and any adapter-mediated RuntimeRequests that actually exist. Cline v1 native tool approvals remain Cline-owned and are not an OpenOrc Owner Request source.
 - Reviewer discussion is Owner ↔ Reviewer only; never create free-form Owner ↔ Producer chat.
 - Implementation authorization and merge are explicit actions tied to the exact current subject.
 - Durable blocked/recovery conditions remain visible; they are not toast-only errors.
