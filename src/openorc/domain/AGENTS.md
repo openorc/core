@@ -29,7 +29,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - Raw credentials never appear in domain objects. Runtime-owned provider/MCP/tool credentials remain runtime-owned. OpenOrc-owned control-endpoint authentication is represented only by auth_reference.
 - reported_provider, reported_model, and reported runtime metadata are nullable opaque observations, never configuration authority or enums.
 - safe_config contains canonical non-secret JSON only.
-- Exactly one WorkflowRoleBinding exists per (Workspace, role) in v1. Producer and Reviewer bindings may reference the same Connection or separate Connections. Runtime pools/failover are not v1 concepts.
+- Exactly one WorkflowRoleBinding exists per (Workspace, role) in v1. Producer and Reviewer bindings may reference the same Connection or separate Connections. The settled concrete role configuration is an opaque provider/model pair plus a nullable Owner role-prompt override; no provider catalog or generic runtime-config bag is implied. Runtime pools/failover are not v1 concepts.
 
 ## GitHub App installations and Repository routing (Phase 2B)
 
@@ -57,7 +57,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - Lifecycle is CONNECTING → READY | ENDED and READY → LOST | ENDED. LOST and ENDED are absorbing.
 - Recoverable runtime/Hub unavailability is not session loss. Genuine loss of the exact bound conversational context is LOST on the same binding and becomes a recovery/blocking concern.
 - external_session_id, initialized_at, and effective_config_snapshot form one coherent initialization fact set. Before successful initialization they are all absent; afterward they are all present.
-- effective_config_snapshot is caller-assembled, non-secret, immutable historical runtime/session configuration for that Task session. It is never a credential, prompt, schema, transcript, or Workspace-guidance snapshot.
+- effective_config_snapshot is caller-assembled, non-secret, immutable historical runtime/session configuration for facts deliberately captured there. It is never a credential, prompt, schema, transcript, Workspace-guidance snapshot, or requirement to freeze live role provider/model/prompt configuration for later reconstruction.
 - Producer and Reviewer sessions sharing one Connection each consume its capacity.
 
 ## Planning and review
@@ -78,7 +78,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - Gates bind exact subjects: implementation authorization → PlanRevision; PR authorization → exact committed Producer head; merge decision → TaskPullRequest + exact head; review resolution → exhausted PlanRevision or TaskPullRequest + exact head.
 - Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed.
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.
-- RuntimeRequest is a scoped Producer/runtime-originated ACTION_APPROVAL correlation. It is not free-form Owner ↔ Producer conversation.
+- RuntimeRequest remains a scoped Producer/runtime-originated ACTION_APPROVAL correlation only for adapter contracts that actually require OpenOrc participation. Cline v1 native tool approvals do not create RuntimeRequests. It is never free-form Owner ↔ Producer conversation.
 - TaskBlock stores one durable block reason and recovery context. Resolving a block does not erase why it existed and does not imply one universal resume transition.
 - WorkflowEvent is append-oriented audit history for consequential OpenOrc facts. It is not event sourcing, current workflow state, operational logging, or runtime telemetry.
 - Logical WorkflowEvent actors are owner, openorc, producer, reviewer, runtime, github. Event context stays small and safe; never store raw credentials, request bodies, prompt/guidance prose, transcripts, or duplicated canonical records.
