@@ -31,6 +31,7 @@ Supabase persistence/auth integration and the official v1 Cline adapter belong i
 ## Dependency policy
 
 - Do not choose dependency or tool versions from model memory.
+- Cline is a qualification-gated exception to ordinary latest-stable selection: preserve the R5-supported CLI 3.0.68 / Core and SDK 0.0.90 baseline until deliberate affected compatibility checks authorize an upgrade. Release notifications do not authorize adoption.
 - When adding or upgrading a dependency or development tool, determine the latest stable release from its authoritative package registry or upstream release source at implementation time.
 - Verify compatibility with OpenOrc's pinned runtime/toolchain versions and all supported target environments.
 - Pin the selected direct dependency/tool version using the repository's established dependency and lockfile conventions.

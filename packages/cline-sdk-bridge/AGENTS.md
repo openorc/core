@@ -37,13 +37,13 @@ Documentation defines the candidate public contract. Source inspection/live prob
 ## Package policy
 
 - Prefer `@cline/sdk` / `ClineCore` for session lifecycle, persistence, messages, events, usage, and controls.
-- `@cline/llms` may be consumed directly for the documented provider/model catalog used by OpenOrc role configuration.
+- Provider/model identifiers are opaque construction inputs; no catalog dependency/API or effective-model readback requirement.
 - Do not drop to `@cline/agents` / `AgentRuntime` merely because a lower-level method exists.
 - Do not import private Cline packages, private Hub protocol, or private on-disk configuration as product contracts.
 
 ## It may own
 
-Official SDK invocation, request/reply correlation, plain-JSON translation, SDK connection lifecycle, asynchronous ClineCore session-event forwarding, usage/effective-runtime-state forwarding, provider/model catalog translation, and any minimal approval/question callback forwarding only where the validated public remote contract requires OpenOrc participation.
+Official SDK invocation, request/reply correlation, lossless full construction/transcript JSON translation, SDK connection lifecycle, required ClineCore session-event and observable state/usage forwarding. The supported v1 path registers no interactive executor or approval/question callback. Remote start does not execute initialization; the Python adapter owns first-send readiness and same-ID rebuild orchestration.
 
 ## It must never own
 
@@ -54,5 +54,6 @@ Tasks, PlanRevisions, ReviewLoops, OwnerGates, Executions, OpenOrc retry/idempot
 - Python starts/lifecycle-manages the bridge locally; it is not a separately deployed service.
 - Bridge failure/restart never implies replacement of the external Task session.
 - Keep the bridge replaceable by a future native Python SDK implementation without changes above the backend boundary.
-- Pin released Cline package versions and validate them as one supported CLI/core/SDK/catalog baseline.
+- Supported baseline: CLI 3.0.68, Hub/Core 0.0.90, public SDK 0.0.90. D3 creates the actual exact SDK manifest/lockfile and verifies resolved Core; no synthetic catalog/helper dependency. Future upgrades require deliberate qualification, not an automatic latest-version choice.
+- Fresh-client events are not replay; process restart preserves external identity and reconciles through public reads. Usage resets across Hub lifetime changes. The bridge reports uncertainty and leaves retry/rebuild decisions above it.
 - Contract tests cover only OpenOrc-owned bridge behavior such as request/reply correlation, async event forwarding, translation, and restart behavior; do not recreate Cline's SDK test suite.

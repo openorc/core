@@ -1,0 +1,295 @@
+--- grounding-before.md
++++ grounding-after.md
+@@ -210,16 +210,19 @@
+ 
+ ## 3.6 OpenOrc owns protocol and workflow controls; users configure optional guidance
+ 
+-OpenOrc separates four interaction concerns that must not be conflated:
++OpenOrc separates the following interaction concerns:
+ 
+ 1. **Formal JSON schemas** are canonical OpenOrc-owned `.json` machine contracts. They are non-overridable and carry explicit `schema_version` because structural compatibility matters.
+-2. **Role initialization prompts** are canonical OpenOrc-owned Producer/Reviewer `.md` artifacts. They are non-overridable and may render the canonical schemas into controlled insertion points rather than duplicating schema definitions.
+-3. **Workflow controls** are OpenOrc-owned semantic instructions such as plan, review, implement, remediate, or compose PR content. They are non-overridable. A runtime adapter may realize a control through a terse prose message, a runtime-native action, or both.
+-4. **Workspace guidance** is optional Owner-authored prose, blank by default. OpenOrc may inject it into controlled initialization or interaction locations where useful. Guidance may influence emphasis or working conventions but cannot redefine protocol, authority, communication topology, session boundaries, exact review-subject identity, or workflow transitions.
++2. **Role prompts** are runtime-neutral Producer/Reviewer Markdown: OpenOrc ships defaults and the Owner may configure an optional per-role override. They configure role behavior without redefining protocol or authority.
++3. **Role initialization prompts** are canonical OpenOrc-owned Producer/Reviewer `.md` artifacts. They are non-overridable and may render the canonical schemas into controlled insertion points rather than duplicating schema definitions.
++4. **Workflow controls** are OpenOrc-owned semantic instructions such as plan, review, implement, remediate, or compose PR content. They are non-overridable. A runtime adapter may realize a control through a terse prose message, a runtime-native action, or both.
++5. **Workspace guidance** is optional Owner-authored prose, blank by default, separate from role prompts. OpenOrc may inject it into controlled initialization or interaction locations where useful. Guidance may influence emphasis or working conventions but cannot redefine protocol, authority, communication topology, session boundaries, exact review-subject identity, or workflow transitions.
+ 
+ OpenOrc audits resulting workflow facts and authority decisions, not the exact historical prose sent to an agent. It does not persist prompt/template versions, hashes, snapshots, or per-interaction prompt-use records. Formal machine contracts retain `schema_version` because incompatible schema changes can break parsing/validation.
+ 
+-> OpenOrc owns the protocol and workflow controls. Users may provide optional guidance. Agents provide semantic results.
++Repository-owned context, including root `AGENTS.md`, and the runtime-native system/mode/tool harness are independent layers. OpenOrc does not hydrate native rule files.
++
++> OpenOrc owns protocol, workflow controls, and default role prompts. Owners may customize role prompts and provide optional Workspace guidance within those authority boundaries. Agents provide semantic results.
+ 
+ ## 3.7 Persistent Workspace development environments
+ 
+@@ -330,7 +333,7 @@
+ - dashboard-centered Task wizard UX with one active wizard per tab;
+ - operator workflow/configuration UI;
+ - `ClineAdapter` as the sole v1 Agent Runtime adapter, usable independently by both Producer and Reviewer roles;
+-- role-specific runtime session configuration; for Cline v1 OpenOrc selects provider/model per role/session through the documented public SDK/catalog surface while the Cline Box remains canonical owner of provider authentication and native runtime configuration; exact pinned-release/remote-Box semantics are qualified by the managed-runtime research gate before Core D1;
++- role-specific runtime session configuration; Cline v1 uses opaque Owner-entered provider/model identifiers and runtime-neutral role Markdown, realized through the qualified public SDK while native authentication/configuration remains Cline-owned;
+ - OpenOrc Cloud-managed persistent Workspace development environment (ClineBox) lifecycle as a hosted/reference capability, with Workspace-scoped hydration reused across Tasks, guarded hibernation/snapshot restore, and reproducible clean rebuild, without making runtime provisioning or hibernation a universal Core Agent Runtime requirement;
+ - fake/test Agent Runtime adapters and role behaviors for deterministic workflow testing;
+ - GitHub-only user sign-in through Supabase Auth;
+@@ -430,7 +433,7 @@
+ - execution attempt/history metadata;
+ - deterministic retry/block/recovery policy;
+ - Connection definitions and workflow role bindings;
+-- OpenOrc-owned formal JSON schemas and role initialization prompts;
++- OpenOrc-owned formal JSON schemas, role prompts and role initialization prompts;
+ - OpenOrc-owned workflow controls and optional Workspace guidance;
+ - non-editable protocol envelopes and structured result contracts;
+ - Owner ↔ Reviewer discussion routing;
+@@ -623,7 +626,7 @@
+ 
+ OpenOrc supports two runtime-ownership modes without changing the workflow model. **Externally managed/BYO runtimes** are Owner-controlled execution environments whose filesystem, provider/MCP/tool/repository credentials, local configuration, upgrades, and operations remain governed by that runtime's own isolation/security model. **OpenOrc Cloud-managed runtimes** remain separate execution environments outside the shared control-plane process boundary. Cloud may initially provision and hydrate their compute, hibernate eligible Workspace runtimes by snapshotting the hydrated environment and destroying compute, restore them later, and retain Workspace-scoped configuration and secret material required for operation and clean rebuild. Managed-runtime infrastructure/Cline-native secret material remains isolated by Workspace and behind the secure secret boundary. The one explicit v1 exception is the Profile-scoped Owner GitHub authorization described above: Cloud may make that same human authorization usable for Git on multiple managed Boxes belonging to that Profile. Secret material is never surfaced in agent prompts, logs/telemetry, or ordinary application responses.
+ 
+-For the OpenOrc Cloud reference topology, each Workspace that uses the managed option receives its own persistent managed development environment/ClineBox. One such environment may contain multiple repositories from that Workspace and may host multiple concurrent isolated Task role sessions when configured capacity permits. This one-environment-per-Workspace topology is a Cloud product/deployment choice, not a universal Core Agent Runtime requirement.
++For the OpenOrc Cloud reference topology, each managed Workspace receives one persistent development environment/ClineBox that may contain several repositories and concurrent Task role sessions subject to configured capacity. Normal hibernation is blocked while nonterminal Tasks depend on live sessions. One qualified snapshot cycle preserved native authentication/configuration, repository/filesystem state and stopped records/transcripts without Owner reauthentication; this does not promise active-session portability or clean-rebuild survival. Host/SSH readiness is separate from managed Cline READY: Cloud starts Hub/dashboard as applicable, re-resolves current control credentials and verifies public remote attachment. Credentials rotated in two observations but every-start rotation is unproven. One completed stopped record re-projected failed and accumulated usage reset across the new Hub lifetime. Orderly poweroff succeeded without explicit Hub drain/stop; further quiesce policy is a Cloud design choice. Restored instances regenerate SSH host keys: Cloud adopts by guarded restore provenance and re-pins, never source-key equality. Clean rebuild may require Owner native reconfiguration. The pinned dashboard has a known headless Cline-account OAuth/browser-launch limitation without an OpenOrc workaround. These are Cloud deployment facts, not universal Core operations.
+ 
+ Runtime environments commonly contain repository clones/worktrees, filesystem access, Git/CLI authentication, MCP/tool credentials, local environment configuration, development dependencies/toolchains, runtime rules/history, and provider/model configuration. Cross-Workspace runtime sharing is never assumed safe: it is valid only when the runtime provides a demonstrably sufficient isolation domain for filesystem, credentials, configuration, tools, and working contexts. Otherwise each Workspace requires separate runtime isolation.
+ 
+@@ -682,7 +685,7 @@
+ External runtime
+ ```
+ 
+-A `WorkflowRoleBinding` references an Agent Runtime `Connection` plus role-specific runtime session configuration. Multiple role bindings may reference the same Connection; sharing a runtime endpoint does not imply sharing Task sessions, conversational context, working context, provider/model selection, or role instructions. Role-session configuration includes Owner-selectable runtime choices where the runtime exposes them, plus the runtime mode required by the OpenOrc workflow role.
++A `WorkflowRoleBinding` references an Agent Runtime `Connection` plus per-role configuration. Producer and Reviewer may share a Connection while retaining separate Task sessions and working contexts. The binding stores opaque configured provider/model identifiers and an optional Owner-authored role-prompt Markdown override. A NULL override uses the current shipped OpenOrc default for that role; defaults are not copied into Workspace configuration. Runtime mode is workflow-derived, not an Owner setting. No generic runtime-configuration bag or catalog is required.
+ 
+ GitHub is intentionally **not** represented as an Agent Runtime Connection. Repository routing uses a separate Workspace-scoped GitHub App installation concept, represented durably by a `GitHubInstallation` or equivalent repository-integration record. That record stores stable installation/account identity and observed/configuration state needed for reconciliation, but no human user token or PAT. Repositories are routed through an installation that currently grants the OpenOrc GitHub App access to them. The exact foreign-key shape between Workspace, installation, and Repository is an implementation decision, but selection must be explicit and deterministic; OpenOrc must never guess among multiple installations at execution time.
+ 
+@@ -743,7 +746,7 @@
+ 
+ Producer and Reviewer are independently bound workflow roles even when both bindings point to the same physical Cline Hub. Each role creates its own isolated Task sessions and may use different runtime session configuration.
+ 
+-The current official Cline SDK architecture separates session orchestration from provider/model catalog and authentication concerns. OpenOrc uses `@cline/sdk` / `ClineCore` as the runtime-session integration surface and may use the documented `@cline/llms` catalog surface to present provider/model choices. OpenOrc stores the selected provider/model identifiers as role/session configuration; the Cline Box owns provider authentication, endpoints/account state, and other native provider configuration. OpenOrc does not need a supported "list configured providers" API: it may offer the documented catalog, request the selected provider/model when creating the session, and surface the runtime's supported failure if that selection is not usable on the Box. Exact method/type/error behavior is qualified against the pinned release by `openorc/cloud#2`.
++The supported Cline baseline is CLI `3.0.68`, Hub/runtime `@cline/core 0.0.90`, and public client `@cline/sdk 0.0.90`. OpenOrc uses `ClineCore` remote mode with opaque per-role `providerId`/`modelId` strings. Native Cline UI supplies the model ID; provider ID is a separate identifier and is not assumed discoverable there. OpenOrc does not maintain a model catalog, configured-provider registry, or required effective provider/model readback. Cline owns provider authentication and native account/configuration. Selection usability is validated lazily on the first turn; a failure before valid `session_ready` is a construction/configuration failure, not ordinary workflow completion.
+ 
+ This ownership boundary applies equally to externally managed and OpenOrc Cloud-managed Cline Boxes. Making the host managed does not make OpenOrc canonical owner of Cline-native provider credentials or configuration. OpenOrc must not parse private Cline files or duplicate native dashboard state to infer configuration readiness.
+ 
+@@ -760,9 +763,9 @@
+ → does not return to PLAN within the same Task after planning is cleared
+ ```
+ 
+-Cline PLAN mode is the restricted planning/review mode documented by Cline; it does not permit file modification or command execution, while ACT is execution-capable. OpenOrc relies on the supported native mode boundary rather than recreating Cline's tool-permission machinery. The exact public `ClineCore` control used to preserve the same session while realizing PLAN→ACT is qualified against the pinned remote-Box baseline by `openorc/cloud#2`. Cline-native tool policies/approvals remain runtime concerns unless the validated remote session contract necessarily requires OpenOrc to pass through a specific approval request. The Reviewer therefore performs repository/code review in PLAN mode; authoritative CI/check execution remains GitHub-owned.
+-
+-The effective runtime/session configuration is captured when a Task role session is created. Later Workspace role-configuration changes affect future Task sessions and must not silently mutate an existing Task's bound Producer or Reviewer session. OpenOrc retains enough effective runtime-session configuration identity, including provider/model identity where the runtime reports it, to reconstruct which runtime/model acted in consequential workflow events.
++On the qualified baseline, Cline PLAN permits read-only commands and guards mutating commands; ACT is execution-capable. OpenOrc uses this native mode/tool boundary without a second permission system. Mode is fixed at construction: per-turn `send(mode)` tags input only. Producer PLAN→ACT uses the same-ID rebuild: reconcile settled work, `readMessages(sessionId)`, await `stop(sessionId)`, then `start` with the existing ID, raw transcript as `initialMessages`, target mode and full construction bundle. It preserves the Task session and one-time initialization; no continuation/mode-notice prompt is required. Original record `metadata.mode` is not current-mode truth. Native tool approvals do not cross the qualified OpenOrc seam: register no interactive executors or approval callbacks, and suppress `ask_question`. Reviewer stays PLAN; GitHub owns CI/check execution.
++
++Selected non-secret provider/model identity is captured when the Task role session is established. Later Workspace configuration changes affect future sessions and do not rewrite initialized session configuration. Requested provider/model values are not verified effective identity; runtime-reported provenance is optional and may be NULL. Role prompts cannot change during dependent nonterminal Tasks; §9.4 defines that guard. This keeps rebuild inputs stable without storing historical prompt snapshots.
+ 
+ The architecture must permit additional Agent Runtime adapters later without requiring a generic capability marketplace or universal adapter SDK in v1. A future runtime or bridge backed by a nominally stateless completion/response provider is usable only if it can deterministically establish isolated Task context, preserve continuity, and expose an opaque stable routing identifier to OpenOrc.
+ 
+@@ -782,7 +785,7 @@
+ 
+ Each Agent Runtime Connection has an Owner-configured OpenOrc session-capacity value. The default is `1`, so concurrency is a conscious Owner choice rather than an implicit deployment assumption. This is an OpenOrc admission/backpressure setting for the Owner's deployment infrastructure, not a capacity value discovered from or enforced by Cline. OpenOrc may progress multiple executable Tasks concurrently when the underlying runtime Connection(s) have enough configured aggregate capacity for all role sessions the Task requires. If Producer and Reviewer share one Cline Hub Connection, starting one Task consumes two slots from that Connection's OpenOrc capacity pool; if they use separate Connections, each role consumes one slot from its own Connection. Effective Task concurrency is therefore bounded by Owner-configured Connection capacity rather than by a global single-Task OpenOrc limit.
+ 
+-The accepted managed-Cline direction is one persistent managed Cline Hub/Box that may host both Producer and Reviewer sessions. Producer and Reviewer always retain distinct Task sessions, working contexts, and role semantics, and may select different provider/model combinations. `openorc/cloud#2` R3 qualifies the documented per-session `cwd`/`workspaceRoot` and provider/model configuration against the pinned remote-Box topology. Separate runtime deployments remain a valid hardened deployment choice, but they are not required merely to obtain independent role sessions or provider/model selections.
++The qualified managed topology is one persistent CLI-owned Hub/Box that hosts distinct Producer/Reviewer sessions with separate ordinary repository checkouts. Per-session `cwd` and `workspaceRoot` both point to that role checkout. Root repository `AGENTS.md` is naturally consumed without OpenOrc rule-file hydration. Directory separation is working-context isolation, not a Workspace security boundary. Separate runtime deployments remain a valid hardened choice.
+ 
+ OpenOrc must not encode a global `current_task`, singleton role session, or other assumption that prevents parallel Task execution.
+ 
+@@ -1064,7 +1067,7 @@
+ Reviewer → ClineAdapter → Cline Hub → Reviewer Task session
+ ```
+ 
+-The two roles are independently bound and initialized whether they use the same Hub or separate Hubs. For Cline v1, OpenOrc selects provider/model identifiers as role/session configuration while Cline remains owner of provider authentication and native provider configuration. The documented `@cline/llms` catalog is the candidate source for OpenOrc's provider/model selection UX; the pinned release is qualified by Cloud #2 rather than replaced with private Cline configuration inspection.
++The two roles are independently bound and initialized whether they share a Hub or use separate Hubs. OpenOrc supplies per-role opaque provider/model identifiers and runtime-neutral role prompts; Cline owns native authentication/configuration. The qualified construction bundle uses role Markdown in `config.rules`, blank `systemPrompt` so Cline builds its native harness, the role checkout as both `cwd` and `workspaceRoot`, workflow-derived mode, tools enabled, spawn-agent/agent-teams disabled, `interactive: true`, and `toolPolicies.ask_question.enabled = false`, without interactive client capabilities.
+ 
+ ## 9.1 Task-scoped session lifecycle
+ 
+@@ -1105,7 +1108,7 @@
+ 
+ Workflow state changes, ReviewLoop iterations, Executions, retries, RuntimeRequests, owner gates, and PR remediation do not create new sessions.
+ 
+-For Cline, runtime mode is deterministic from the workflow role/state but remains a runtime concern rather than a new OpenOrc domain state. Reviewer sessions remain in PLAN mode for their Task lifetime. Producer sessions begin in PLAN mode, switch to ACT after `IMPLEMENTATION_AUTHORIZATION`, and remain ACT for later implementation/PR remediation within that Task. Once planning is cleared, the Task never returns to `PLANNING`; a fundamental plan change requires cancellation/archive and a fresh Task. The exact supported `ClineCore` remote control for mode transition and its same-session continuity semantics are qualification items for Cloud #2; OpenOrc must not simulate the transition by replacing the bound session.
++For Cline, runtime mode follows the authorized workflow without becoming a domain state. Reviewer stays PLAN. Producer begins PLAN, moves to ACT only on an already-authorized implementation control and remains ACT for remediation. The qualified public same-ID runtime rebuild preserves the exact external session identity and transcript; it does not replace the bound OpenOrc session. Re-supply the complete construction bundle on every rebuild, preserve raw public transcript messages verbatim and never resend initialization.
+ 
+ A Task reaching `COMPLETED` or `CANCELLED` ends OpenOrc's active use of the role-session bindings. v1 does not require a universal external `close_session` operation.
+ 
+@@ -1123,8 +1126,14 @@
+ 
+ ```text
+ provider/runtime system harness
++→ role Markdown composes additively through the adapter; Cline uses config.rules
++→ repository-owned root AGENTS.md is naturally consumed where present
+ → general agent behavior, tools, runtime semantics
+ → may independently include repository/runtime-local instruction layers
++
++OpenOrc role prompt
++→ shipped role-behavior default or optional Owner override, separate from Workspace guidance
++→ additive runtime configuration, subordinate to protocol/authority
+ 
+ OpenOrc initialization protocol
+ → canonical Producer or Reviewer Markdown asset
+@@ -1148,7 +1157,7 @@
+ 
+ The canonical v1 initialization deliberately does **not** add broader role, authority, Git, review-methodology, repository-discovery, or runtime-operation prose merely because such guidance might be useful in some environments. It must work in a vanilla supported Agent Runtime against an arbitrary repository without assuming `AGENTS.md`, `.cline/rules`, `CLAUDE.md`, `activeTask.md`, or any equivalent instruction layer exists. If such runtime/repository instructions do exist, they operate independently of the OpenOrc initialization contract.
+ 
+-For Cline, OpenOrc initialization is delivered through a supported additive session interaction and never replaces Cline's native system/agent harness.
++For Cline, remote `start({prompt})` allocates without executing that prompt. Canonical initialization is the first `send()` and must return valid `session_ready` before READY. It never replaces the native harness or substitutes for the separate role prompt.
+ 
+ ## 9.3 Owner ↔ Reviewer discussion
+ 
+@@ -1168,15 +1177,20 @@
+ 
+ OpenOrc may persist discussion messages or metadata for UI/audit purposes, but such persistence is not the Reviewer's conversational-memory source of truth.
+ 
+-## 9.4 Formal schemas, initialization prompts, workflow controls, and Workspace guidance
+-
+-OpenOrc distinguishes four interaction categories:
++## 9.4 Formal schemas, role prompts, initialization, workflow controls, and Workspace guidance
++
++OpenOrc distinguishes the following owned interaction categories:
+ 
+ ```text
+ formal JSON schemas
+ → canonical `.json` files shipped with OpenOrc
+ → OpenOrc-controlled and non-overridable
+ → carry explicit `schema_version` because structural compatibility matters
++
++role prompts
++→ runtime-neutral Producer/Reviewer Markdown defaults shipped with OpenOrc
++→ optional freely configurable Owner override per role binding; NULL uses current default
++→ subordinate to protocol, authority and workflow contracts
+ 
+ role initialization prompts
+ → canonical Producer/Reviewer `.md` files shipped with OpenOrc
+@@ -1200,7 +1214,9 @@
+ 
+ Formal schemas are the sole machine-contract source of truth. Initialization Markdown must not maintain handwritten copies of schema definitions.
+ 
+-The canonical v1 prose inventory is deliberately small:
++Role-prompt edits, including override reset or routing changes that would change the resolved prompt, are rejected while already-started nonterminal Tasks depend on that Workspace role. Same-value writes are no-ops. Admission and edits serialize through the role-binding boundary, covering CONNECTING and recovery gaps as well as active turns. Shipped default prompt changes must not be activated for affected Tasks until those Tasks finish or cancel. OpenOrc stores only the current optional override, with no prompt copies, versions, hashes or history. Provider/model edits may affect future sessions while existing selected IDs remain captured in the initialized non-secret session configuration.
++
++The canonical v1 initialization/control prose inventory is deliberately small; separate role-behavior defaults are not protocol assets:
+ 
+ ```text
+ initialization/producer.md
+@@ -2433,7 +2449,7 @@
+ 
+ A known successful dispatch/completion does not imply semantic idempotency inside the LLM. Conversely, timeout or connection loss must not be interpreted automatically as non-delivery. The adapter must reconcile if the runtime exposes enough persisted session/history/event state; if uncertainty remains, OpenOrc blocks rather than guessing whether resending would duplicate the request.
+ 
+-This rule governs duplicate **logical dispatch from OpenOrc to the runtime**. It does not disable runtime-internal resilience after a turn has already been accepted. The September 2026 Cline feasibility baseline suggested that provider/auth/network-initiation/context-recovery retries remain inside the same accepted turn and that remote-client whole-command reconnect resend is not a safe OpenOrc assumption. Cloud #2 must revalidate the current official remote/SSH behavior before Core D1 freezes the concrete adapter policy. Regardless of Cline's current transport, OpenOrc itself must reconcile before retrying any submission whose delivery is uncertain.
++This rule governs duplicate **logical dispatch from OpenOrc to the runtime**. Qualified bridge/transport loss does not cancel Hub-accepted work. Reconcile before retrying; fresh-client plain subscriptions do not replay an existing mid-flight stream on `0.0.90`, while the original surviving client auto-resumed. Read public record/transcript/usage/history together with durable OpenOrc dispatch state. Persisted transcript and usage may lag to turn boundaries. If acceptance/completion or rebuild construction remains uncertain, block rather than replay.
+ 
+ This delivery rule is separate from session-creation idempotency. Session creation is idempotent for `(Task, role)`; message dispatch is protected by OpenOrc/adapter dispatch state and runtime reconciliation rather than by expecting the LLM to recognize duplicates or by requiring one universal acknowledgement API.
+ 
+@@ -2532,13 +2548,13 @@
+ - invoking the official Cline SDK;
+ - translating SDK-native requests/results/events to and from plain JSON;
+ - maintaining the SDK client's connection lifecycle to the supported Cline remote-runtime surface;
+-- forwarding SDK session events, usage, effective runtime/session state, and any approval callback only where the validated public remote contract requires OpenOrc participation.
++- forwarding required SDK session events, usage and observable state; the qualified v1 contract registers no native approval/question callbacks.
+ 
+ The bridge must not own Tasks, PlanRevisions, ReviewLoops, OwnerGates, OpenOrc retry/idempotency policy, formal OpenOrc response validation, GitHub operations, workflow transitions, authorization, or durable workflow state. Those remain in Python application/domain code and `ClineAdapter`.
+ 
+ `ClineAdapter` depends on an internal `ClineSdkBackend`-style contract rather than on Node-specific process details. The v1 implementation of that contract uses the local SDK bridge. If Cline later publishes a suitable native Python SDK, OpenOrc should replace the bridge-backed implementation with an in-process Python implementation behind the same internal boundary; this migration must not require changes to the workflow/domain model, Task-session contracts, persistence, API, or higher-level adapter semantics.
+ 
+-OpenOrc must use the highest stable official SDK/runtime abstractions that satisfy the validated contracts. `@cline/sdk` / `ClineCore` is the primary v1 runtime-session surface; lower-level `Agent` / `AgentRuntime` APIs are not OpenOrc's integration layer. The documented `@cline/llms` catalog surface may be consumed specifically for provider/model selection. OpenOrc avoids:
++OpenOrc must use the highest stable official SDK/runtime abstractions that satisfy the validated contracts. `@cline/sdk` / `ClineCore` is the primary v1 runtime-session surface; lower-level `Agent` / `AgentRuntime` APIs are not OpenOrc's integration layer. Provider/model selection is opaque role configuration; no catalog package or API is required. OpenOrc avoids:
+ 
+ - reimplementing Cline Hub's wire protocol;
+ - forking Cline internals;
+@@ -2551,21 +2567,13 @@
+ 
+ For each Task, `ClineAdapter` must preserve the exact Producer and Reviewer contexts independently across the Task lifetime. Producer sessions preserve context across planning, implementation, retries, and PR remediation; Reviewer sessions preserve context across planning review, Owner discussion, and PR review. Each Task/role receives an isolated runtime working context even when both roles share one Hub. The Producer context is mutable and owns the Task feature branch. The Reviewer context is non-authoritative, remains in Cline PLAN mode, and must be prepared to the exact committed review subject before formal review. Concrete clone/worktree/sandbox/checkout mechanics for presenting that exact committed subject remain runtime-specific. OpenOrc does not add a parallel Reviewer tool-permission layer on top of PLAN mode. The Producer creates and semantically names one feature branch for the Task as part of the authorized implementation workflow. On implementation completion and Producer push, the adapter/application path treats the branch reported in `implementation_result` as a routing/discovery claim and reconciles it through GitHub before OpenOrc binds the GitHub-confirmed branch as the Task's canonical branch. Runtime-local Git state, including sandbox/worktree HEAD SHAs, may support adapter mechanics or diagnostics but does not establish canonical committed repository truth. Later remediation continues on the canonical branch.
+ 
+-The September 2026 feasibility study is historical. The accepted managed-runtime direction is now the managed Cline Box qualified by `openorc/cloud#16`: one persistent managed Cline Hub/dashboard, with OpenOrc attaching through public `ClineCore` remote mode to that same Hub. Current official SDK documentation establishes the candidate public architecture: `ClineCore` is the full persistent harness, `@cline/sdk` re-exports the Core surface, and `@cline/llms` exposes the provider/model catalog layer. Cloud #2 now qualifies only the remaining remote-boundary semantics against the pinned release rather than rediscovering documented Cline architecture.
+-
+-The official Cline CLI/distribution may be used to install, bootstrap, ensure, administer, or inspect the managed Box, but the CLI is another Hub client and is not part of the OpenOrc Task execution path. OpenOrc Task execution uses the public remote-session path from `ClineCore` to the Hub and Hub-assigned spoke/runtime execution.
+-
+-The source feasibility study was performed against Cline repository commit `e4f1df2c5aa647b99b60e565a97f71164b3bf087` (2026-09-10). That commit remains historical feasibility evidence only. Before Core D1 is refined, the `openorc/cloud#2` research/validation epic must exercise current stable official releases on real OpenOrc-managed Workspace runtime hosts and establish the supported Cline baseline and lifecycle, including:
+-
+-- exact public `ClineCore` remote methods/types/events on the pinned release and their behavior against the already-running managed Cline Hub;
+-- PLAN→ACT control, abort/stop/continuation, completion reasons, connection-loss signals, and whether native Cline approvals/questions ever require OpenOrc-side pass-through;
+-- `@cline/llms` provider/model catalog use, per-session provider/model selection, effective model identity, and runtime failure when the selected configuration is unusable while authentication remains Cline-owned;
+-- same-Hub Producer/Reviewer working-context isolation using supported per-session configuration;
+-- repository/Git authentication requirements;
+-- interruption/reconciliation semantics for in-flight work and the terminal boundary where the exact bound session/context is genuinely lost;
+-- the actual version/pinning relationship among the official CLI, `@cline/core`, `@cline/sdk`, and any other public package OpenOrc directly consumes.
+-
+-The resulting Cline baseline must be explicit and versioned, but Pass 1 does not assume that today's correct pinning unit is exactly the older CLI + SDK pair. Cloud #2 records exact tested releases/components; its R5 synthesis triggers a grounding-document reconciliation before Core D1 selects/pins the supported baseline and D2–D7 implement against it. Future Cline upgrades remain deliberate dependency upgrades that rerun the same affected compatibility qualification before supported pins change.
++The completed R-series establishes CLI `3.0.68` / Core and SDK `0.0.90` as the supported baseline. Core pins the actual SDK dependency/lockfile in the bridge implementation; Cloud pins its CLI distribution and disables native auto-update on managed launches. The CLI owns managed Hub lifecycle/admin operation and is not a Task execution intermediary. No helper/second-Hub topology, private protocol, native credential file, or lower-level AgentRuntime API belongs in the Core contract.
++
++Qualified `abort` interrupts an in-flight turn (finish reason `aborted`) and allows later turns on the same session. `stop` releases runtime incarnation and finalizes bookkeeping while retaining the public transcript; it does not prove session loss. Continuation is a subsequent authorized ordinary interaction after reconciliation, not automatic replay. Public finish reasons are `completed`, `max_iterations`, `aborted`, `mistake_limit`, and `error`; only valid formal OpenOrc results establish semantic success.
++
++Public record status is Hub bookkeeping, not workflow authority or TaskAgentSession lifecycle. A settled-session Hub restart preserves records/history/transcripts but resets accumulated usage and makes the session non-addressable until same-ID reconstruction. Usage continuity holds only within one Hub lifetime. A fresh client recovers using public reads, not event-replay assumptions. After Hub lifecycle events, the runtime owner supplies current endpoint/control credentials through the existing Connection/auth seam; private Cloud credential discovery is not a Core API. `hub_connect_failed` does not distinguish invalid credentials from unreachability. `hub_connection_closed` with close code `1006` is a call-level loss signal, without a session-event equivalent. Deleted-session reads and missing records demonstrate genuine loss; deletion is not claimed to be the only possible loss condition. Unknown send/start acceptance or incomplete transcript remains uncertain and blocks automatic replay. Mid-turn Hub restart was not qualified and is not promised transparent recovery.
++
++Future upgrades read current official SDK documentation first and run only affected representative remote compatibility checks, then update supported pins and the R5 decision ledger deliberately. Package-release notifications do not authorize upgrades. D7 validates the completed Core stack against the fixed baseline, without redoing the research archive or adding a generic certification framework.
+ 
+ ## 15.5 GitHub adapter reconciliation boundary
+ 
+@@ -3031,7 +3039,7 @@
+         └── retained hibernation snapshot while compute is absent
+ ```
+ 
+-Current official Cline documentation establishes the candidate provider/model catalog, `ClineCore` session, events, tools, plugins, and persistent-service architecture. `openorc/cloud#2` now validates only the pinned-release facts that remain material to Core: remote session controls/events, same-Hub working-context isolation, effective provider/model identity and missing-auth failure, repository working-context behavior, interruption/reconciliation, and terminal session loss. R3 records the managed-Box Git authorization boundary above but does not require production OAuth/token delivery before Core exists in a deployable form. Pass 1 does not introduce generic credential/domain entities or depend on private Cline files as public APIs.
++Completed R2a.2–R4b research establishes the supported remote construction, working-context, interruption/reconciliation and loss contract summarized in §7.5 and §15.4. Role prompts are Core configuration, not Cloud hydration. Production managed Git token delivery remains downstream Cloud work using existing Core Profile authorization, not a prerequisite to implementing ClineAdapter. No generic credential entity or private Cline file becomes a public Core API.
+ 
+ The managed runtime must remain cleanly rebuildable from repository-owned Cloud desired state plus documented secure prerequisites even though normal daily resume uses the retained Workspace snapshot. Changes to Cloud-owned runtime definitions/configuration are tracked rather than depending on undocumented pet-VM mutation. Workspace development hydration may evolve inside the runtime and be preserved by hibernation, but loss or deliberate invalidation of the snapshot must fall back to a clean provision/bootstrap/hydration path rather than making that snapshot an irreplaceable source of truth.
+ 
+@@ -3043,7 +3051,7 @@
+ 
+ `openorc/cloud` depends on core and owns hosted/reference concerns: the concrete DigitalOcean control-plane deployment, production Supabase/Valkey configuration and operations, managed/reference Cline runtime research/provisioning/lifecycle, OpenOrc-owned infrastructure/control credentials for that lifecycle, hosted-only Polar billing/entitlement behavior, Cloud runbooks, and Cloud deployment automation. Cline-native provider/MCP/plugin/tool credentials remain runtime-owned. For managed-Box Git, Cloud consumes Core's existing Profile-scoped Owner GitHub authorization and owns the hosted token-delivery/refresh/revocation/rebuild mechanics; Core exposes no Cline-Box-specific Git credential abstraction and must never depend on Cloud.
+ 
+-The reference Cloud control plane is one DigitalOcean App Platform application containing the Vue static-site component, FastAPI service component, and RQ worker component. Managed Cline Workspace environments remain separate from that persistent control-plane application and may provision, hibernate, restore, or rebuild their compute independently, subject to the nonterminal-Task hibernation guard. The accepted managed baseline uses one persistent managed Cline Hub/Box for both roles; Cloud #2 R3 qualifies the documented per-session working-context isolation needed for Producer and Reviewer. Separate role runtimes remain an optional hardened deployment choice, not the default contract.
++The reference Cloud control plane is one DigitalOcean App Platform application containing the Vue static-site component, FastAPI service component, and RQ worker component. Managed Cline Workspace environments remain separate from that persistent control-plane application and may provision, hibernate, restore, or rebuild their compute independently, subject to the nonterminal-Task hibernation guard. The accepted managed baseline uses one persistent managed Cline Hub/Box for both roles; R3 qualified separate per-role checkout working contexts with per-session cwd/workspaceRoot; this is not cross-Workspace security isolation. Separate role runtimes remain an optional hardened deployment choice, not the default contract.
+ 
+ Self-hosted users may supply and operate any conforming supported runtime deployment themselves. OpenOrc Cloud may additionally operate persistent managed Workspace development environments/ClineBoxes for hosted customers. This hosted capability does not move runtime execution into the shared control-plane process or make Cloud a dependency of self-hosted Core.
+ 
+@@ -3223,7 +3231,7 @@
+ 
+ The Configuration surface may expose Workspace-owned Connections, role assignments, supported runtime configuration/status, Workspace guidance, and Workspace policy. For an OpenOrc Cloud-managed runtime, this surface may also expose hosted lifecycle status and actions such as `PROVISIONING`, `READY`, `HIBERNATING`, `HIBERNATED`, `RESTORING`, and `FAILED`. These are Cloud-managed runtime lifecycle/UX states, not Core Task states, `TaskAgentSession` states, or additions to the universal Agent Runtime contract. **Hibernate** is unavailable while any nonterminal Task depends on the runtime; **Resume** restores the retained Workspace snapshot and must complete readiness/reconciliation before the runtime is presented as `READY`. A deliberate clean rebuild remains the recovery path when the snapshot is unavailable or invalid.
+ 
+-For an Agent Runtime role binding, OpenOrc may present runtime-exposed configuration choices needed to create Task sessions. In the v1 Cline integration, OpenOrc presents provider/model choices from the documented public Cline catalog (`@cline/llms`) and persists the selected identifiers as role/session configuration. Provider authentication and provider-native account/configuration remain Cline Box concerns configured through native Cline surfaces. OpenOrc does not attempt to pre-enumerate which catalog entries are authenticated; an unusable selection is surfaced as a runtime configuration/error outcome. Runtime mode follows the workflow role: Reviewer remains PLAN; Producer uses PLAN for planning and ACT for implementation/remediation, with the exact pinned-release remote control qualified by Cloud #2.
++For Cline role bindings, OpenOrc accepts opaque provider/model IDs and an optional Owner role-prompt Markdown override; NULL selects the shipped role default. Model ID is available from native Cline UI; provider ID is distinct and not assumed discoverable there. No catalog, configured-provider enumeration or effective readback is required. Native authentication stays Cline-owned; unusable selection fails during the first-send initialization before READY. Reviewer stays PLAN; Producer uses PLAN for planning and authorized ACT for implementation/remediation through the same-ID rebuild.
+ 
+ The Workspace Guidance experience is a simple optional Owner-authored prose setting, blank by default. OpenOrc controls where that guidance is inserted. Formal schemas, initialization prompts, workflow controls, protocol envelopes, session semantics, authority rules, and state transitions are not editable.
+ 
+@@ -3280,7 +3288,7 @@
+ - Python `ClineAdapter` contract tests can run against a fake `ClineSdkBackend` without starting Node or a real Cline Hub;
+ - the Node/TypeScript SDK bridge preserves request/reply correlation and asynchronous event forwarding over its stdio protocol, owns no durable OpenOrc state, and can be restarted without implying replacement of an external Task session;
+ - the supported Cline CLI + `@cline/sdk` semantic-version pair passes the real adapter/integration contract suite before either pin is adopted or upgraded;
+-- Cline v1 persists OpenOrc's per-role provider/model selection from the documented public catalog and records the effective provider/model reported by the runtime where available; provider credentials remain Cline-owned;
++- Cline v1 persists opaque per-role provider/model selections and optional Owner role-prompt overrides; runtime-reported provenance remains optional and requested identity is not mislabeled effective readback; provider credentials stay Cline-owned;
+ - shared-Hub capacity accounting counts all Producer and Reviewer sessions against the underlying runtime Connection rather than treating role bindings as separate pools;
+ - initial implementation completion reports a Producer-created branch as a routing/discovery claim; after push, GitHub reconciliation confirms the canonical Task branch and committed head, and runtime-local/sandbox Git state cannot substitute for that authority;
+ - missing/lost sessions do not trigger silent replacement;
+@@ -4033,13 +4041,13 @@
+ 
+ > The universal v1 session contract is `create_session(Task, role)` plus `send(session_id, message)`. Provider/runtime transport mechanics and runtime-specific controls stay inside adapters.
+ 
+-> For Cline v1, OpenOrc consumes the official Cline SDK rather than implementing Cline's private runtime wire protocol directly. Python `ClineAdapter` depends on an internal language-neutral SDK backend; v1 implements that backend with a thin long-lived local Node/TypeScript subprocess using JSON-RPC over stdin/stdout and pinned `@cline/sdk` / `ClineCore`, attaching in remote mode to the persistent managed Cline Hub; the Cline Box dashboard and Cline CLI are separate Hub clients rather than intermediaries in OpenOrc Task execution. The bridge owns no OpenOrc workflow semantics or durable state. `@cline/llms` is the documented provider/model catalog surface used for role selection; lower-level `Agent` / `AgentRuntime` APIs are not the OpenOrc integration layer. Future Cline work reads the official SDK docs before source archaeology or live probing, then uses targeted qualification only for pinned-version/remote-boundary behavior. A future native Python Cline SDK must be able to replace the subprocess backend without changes above the adapter boundary.
+-
+-> Producer and Reviewer are independently bound Agent Runtime roles backed by persistent Cline sessions. v1 supports Cline as the sole Agent Runtime type for both roles. OpenOrc selects provider/model identifiers per role/session from the documented public Cline catalog, while Cline owns provider authentication and native provider/runtime configuration. Cloud #2 qualifies the exact pinned-release remote behavior, same-Hub working-context isolation, and failure semantics before Core D1 freezes the implementation contract.
++> Cline v1 uses the official `@cline/sdk` / `ClineCore` remote surface through a replaceable internal backend and thin local Node JSON-RPC subprocess. Supported baseline: CLI `3.0.68`, Core/SDK `0.0.90`. No provider/model catalog, helper Hub, lower-level AgentRuntime integration, private protocol or credential discovery belongs in Core. The bridge owns no workflow semantics or durable state.
++
++> Producer and Reviewer are independently bound persistent Cline sessions. Per-role opaque provider/model IDs and runtime-neutral role Markdown are OpenOrc configuration; Cline owns native authentication/settings. Blank systemPrompt preserves the native harness and config.rules carries role Markdown. The role checkout is both cwd/workspaceRoot; root AGENTS.md remains repository-owned. Reviewer stays PLAN, Producer enters ACT only on authorized control via full-bundle same-ID rebuild. Requested identity is not verified effective readback.
+ 
+ > Self-hosted OpenOrc supports externally managed/BYO Agent Runtimes and does not require OpenOrc to provision them. OpenOrc Cloud may additionally provide Workspace-scoped managed Cline Boxes outside the persistent control-plane process. Managed runtimes are initially provisioned/hydrated, reused across Tasks, may be hibernated by snapshotting and destroying compute only when no nonterminal Task depends on them, and may later be restored; clean reproducible bootstrap remains the fallback rebuild path. Cloud owns host lifecycle and OpenOrc control connectivity, while Cline-native provider/MCP/plugin/tool/sub-agent configuration and credentials remain Cline-owned even on a managed Box. Cross-Workspace runtime sharing is valid only where the runtime itself provides sufficient isolation; OpenOrc never assumes that a project/workspace directory alone supplies that security boundary.
+ 
+-> v1 configures one runtime binding per role, not one session per role. Each binding references an Agent Runtime Connection plus role-specific session configuration, and Producer/Reviewer bindings may share the same Connection or use separate Connections. Whether the OpenOrc Cloud managed topology uses one runtime instance for both roles or separate role instances is determined by the validated current Cline configuration/isolation surface, not by the older feasibility workaround; separate role runtimes remain a valid hardened topology. Each Runtime Connection has an Owner-configured OpenOrc session-capacity value, default `1`; concurrency is enabled deliberately by the Owner, and the limit models the Owner's deployment-resource budget rather than a Cline-discovered capacity. Shared role bindings consume the same capacity pool. A started Task waiting for required role-session capacity enters `QUEUED`; queued Tasks advance FIFO by queue-entry time when capacity becomes available. Capacity waiting is not failure.
++> v1 configures one runtime binding per role, with a Connection plus opaque provider/model selections and optional role-prompt override; NULL uses the shipped default. Roles may share one qualified Hub while retaining separate sessions/working contexts. Owner-configured Connection capacity defaults to 1 and is not Cline-discovered; shared bindings consume the same pool, each required role occupies one slot. Capacity waiting enters QUEUED and advances FIFO; it is not failure. Separate runtime deployments remain valid isolation choices.
+ 
+ > Multiple configured runtimes per role and generic runtime-pool scheduling/failover are post-v1 capabilities. The concrete provision/hibernate/restore/rebuild lifecycle of one configured OpenOrc Cloud-managed Cline Workspace runtime is a hosted capability, not a generic runtime pool. The Task/session domain model must not require redesign when true pools are introduced.
+ 
+@@ -4097,13 +4105,13 @@
+ 
+ > The canonical PR must close its Task's GitHub issue when merged. Producer-authored closing keywords are valid PR content; OpenOrc deterministically ensures the closing reference exists without relying on LLM memory.
+ 
+-> `RuntimeRequest` is reserved for a scoped runtime-originated interaction that the validated adapter contract requires OpenOrc to service. Native Cline tool approvals/questions remain Cline-owned when the Cline Box/dashboard handles them without OpenOrc participation. Any adapter-mediated request is tied to the exact Task/session/request and answered through typed correlated control, never a free-form Owner ↔ Producer chat channel.
++> `RuntimeRequest` remains a runtime-neutral scoped interaction model for a demonstrably required adapter contract. No Cline approvals/questions cross the supported v1 seam, so Cline creates no approval RuntimeRequests or callbacks and suppresses ask_question. Any future supported request must remain exact Task/session/request-correlated and typed, never a free-form Owner ↔ Producer channel.
+ 
+ > Where an Agent Runtime exposes supported runtime activity cancel/resume controls, OpenOrc exposes them to the Owner as typed operational controls on the exact bound Task session. Runtime cancel/resume preserves the OpenOrc Task, TaskAgentSession, external session identity, and conversational context and must not be interpreted as Task cancellation, session loss, session reset/replacement, or free-form Owner ↔ agent communication. Exact Execution status/history mapping follows the concrete adapter's supported semantics.
+ 
+ > Cancellation ends OpenOrc orchestration, requests runtime abort for active Producer work, and archives/releases that Task as the current mapping for its GitHub issue. Abort failure/uncertainty is surfaced but does not resurrect the Task or keep the issue locked. Cancellation never implicitly mutates GitHub issues, branches, commits, PRs, or CI/check state.
+ 
+-> Formal JSON schemas, role initialization prompts, and workflow controls are OpenOrc-owned and non-overridable. Workspace guidance is optional Owner-authored prose, blank by default, and may be injected only into OpenOrc-controlled locations. OpenOrc does not persist prompt/guidance versions, hashes, historical snapshots, or per-interaction prompt-use records; formal JSON contracts retain explicit `schema_version` for machine compatibility. Guidance may influence emphasis or conventions but never protocol, authority, session semantics, exact review-subject identity, or state transitions.
++> Formal JSON schemas, role initialization prompts, and workflow controls are OpenOrc-owned and non-overridable. Role prompts have OpenOrc defaults and optional Owner overrides; their resolved values cannot change during dependent nonterminal Tasks. Workspace guidance is optional Owner-authored prose, blank by default, and may be injected only into OpenOrc-controlled locations. OpenOrc does not persist prompt/guidance versions, hashes, historical snapshots, or per-interaction prompt-use records; formal JSON contracts retain explicit `schema_version` for machine compatibility. Guidance may influence emphasis or conventions but never protocol, authority, session semantics, exact review-subject identity, or state transitions.
+ 
+ > GitHub owns CI and merge policy. OpenOrc displays state, presents the human decision, invokes GitHub, and surfaces the authoritative result.
+ 
