@@ -15,11 +15,14 @@ observations and results whose exact nested contents D5/D6 must interpret
 without loss stay opaque as :class:`JsonObject` values: forwarded verbatim,
 never interpreted, projected, summarized, or re-shaped here.
 
-Sensitive handling: the remote attachment auth token and SDK-native event
-payloads are excluded from ``repr`` and never allowed into errors, logging,
-events, or call diagnostics. The token is supplied by the caller — Cloud
-resolves/reissues managed-Hub attach credentials and owns host/tunnel
-lifecycle; this boundary only transports the current inputs.
+Sensitive handling: the remote attachment auth token, the prompt/role-Markdown
+and transcript-carrying start-request fields, the SDK-native start result,
+and SDK-native event payloads are excluded from ``repr`` and never allowed
+into errors, logging, events, or call diagnostics. Representations carry
+only safe configuration identity while full values stay intact for lossless
+transport. The token is supplied by the caller — Cloud resolves/reissues
+managed-Hub attach credentials and owns host/tunnel lifecycle; this
+boundary only transports the current inputs.
 """
 
 from __future__ import annotations
@@ -137,6 +140,11 @@ class ClineStartRequest:
     ``enableAgentTeams``, provider catalog, provider credentials, native
     tools/executors, approval callbacks, session prompt overrides, session
     history snapshots, or generic SDK configuration bags.
+
+    The representation withholds ``rules``, ``system_prompt``, and
+    ``initial_messages``: prompt and transcript content never enters
+    ``repr``, assertion-failure text, or telemetry, while the values
+    themselves stay intact for lossless transport.
     """
 
     provider_id: str
@@ -180,6 +188,17 @@ class ClineStartRequest:
                 "JSON objects carrying the raw persisted message array"
             )
 
+    def __repr__(self) -> str:
+        return (
+            f"ClineStartRequest(provider_id={self.provider_id!r}, "
+            f"model_id={self.model_id!r}, mode={self.mode!r}, "
+            f"rules=<withheld>, system_prompt=<withheld>, "
+            f"cwd={self.cwd!r}, workspace_root={self.workspace_root!r}, "
+            f"enable_tools={self.enable_tools!r}, interactive={self.interactive!r}, "
+            f"tool_policies={self.tool_policies!r}, "
+            f"session_id={self.session_id!r}, initial_messages=<withheld>)"
+        )
+
 
 @dataclass(frozen=True)
 class ClineStartResult:
@@ -191,7 +210,9 @@ class ClineStartResult:
     is not validated, the optional SDK ``result`` is not assumed to have
     executed an initial turn, and no ``AgentSessionCreated`` is produced.
     ``result`` is the optional SDK-native plain-JSON result object — or None
-    for the SDK's legitimate undefined response — kept opaque.
+    for the SDK's legitimate undefined response — kept opaque. The
+    representation withholds ``result``: SDK-native response content never
+    enters ``repr``, assertion-failure text, or telemetry.
     """
 
     session_id: str
@@ -201,6 +222,12 @@ class ClineStartResult:
         _require_non_empty_string("ClineStartResult", "session_id", self.session_id)
         if self.result is not None:
             _require_json_object("ClineStartResult", "result", self.result)
+
+    def __repr__(self) -> str:
+        return (
+            f"ClineStartResult(session_id={self.session_id!r}, "
+            f"result=<{'present' if self.result is not None else 'absent'}>)"
+        )
 
 
 @dataclass(frozen=True)

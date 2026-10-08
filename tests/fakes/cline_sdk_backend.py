@@ -47,6 +47,9 @@ Faithfulness and determinism guarantees:
   (exact target IDs, verbatim prompts/requests/reasons/config) for test
   assertions. Recording is in memory only; the fake never logs and never
   persists anything, and separate instances share no mutable state.
+  Representations withhold prompt/request content, so recorded values stay
+  verbatim for assertions without entering reprs, assertion-failure text,
+  or telemetry.
 
 The fake does not enforce attachment state, call ordering, or transport
 policy — scripts own outcomes. Its ``stop``/``abort``/``dispose`` are
@@ -99,7 +102,9 @@ class FakeBackendCall:
     with no session target), and the remaining fields hold the operation's
     raw inputs verbatim for test assertions: ``prompt``/``reason`` for
     sends and aborts, ``request`` for starts, and ``remote`` for connects.
-    Recording is in memory only; recorded payloads are never logged.
+    Recording is in memory only; recorded payloads are never logged, and
+    the representation withholds prompt and request content — recorded
+    values stay verbatim for assertions.
     """
 
     operation: str
@@ -108,6 +113,20 @@ class FakeBackendCall:
     reason: str | None = None
     request: ClineStartRequest | None = None
     remote: ClineRemoteConfig | None = None
+
+    def __repr__(self) -> str:
+        parts = [f"operation={self.operation!r}"]
+        if self.session_id is not None:
+            parts.append(f"session_id={self.session_id!r}")
+        if self.reason is not None:
+            parts.append(f"reason={self.reason!r}")
+        if self.prompt is not None:
+            parts.append("prompt=<withheld>")
+        if self.request is not None:
+            parts.append("request=<withheld>")
+        if self.remote is not None:
+            parts.append(f"remote={self.remote!r}")
+        return f"FakeBackendCall({', '.join(parts)})"
 
 
 @dataclass

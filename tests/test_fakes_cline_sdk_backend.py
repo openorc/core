@@ -389,7 +389,7 @@ def test_backend_errors_never_leak_a_sensitive_sentinel_through_text_or_chains()
     )
     missing = raise_after_handler_exit(ClineSessionNotFoundError("session not found"))
     rejected_code = raise_after_handler_exit(
-        ClineSdkOperationRejectedError("hub_connect_failed", details={"note": sentinel})
+        ClineSdkOperationRejectedError("hub_connection_closed", details={"close_code": 1006})
     )
 
     for error in (known, uncertain, missing, rejected_code):
@@ -401,12 +401,84 @@ def test_backend_errors_never_leak_a_sensitive_sentinel_through_text_or_chains()
     # The machine code stays available for downstream classification while
     # the bounded details never enter text or representation:
     assert isinstance(rejected_code, ClineSdkOperationRejectedError)
-    assert rejected_code.code == "hub_connect_failed"
-    assert rejected_code.details == {"note": sentinel}
+    assert rejected_code.code == "hub_connection_closed"
+    assert rejected_code.details == {"close_code": 1006}
     assert str(rejected_code) == (
-        "cline sdk operation rejected with machine code 'hub_connect_failed'"
+        "cline sdk operation rejected with machine code 'hub_connection_closed'"
     )
-    assert repr(rejected_code) == ("ClineSdkOperationRejectedError(code='hub_connect_failed')")
+    assert repr(rejected_code) == ("ClineSdkOperationRejectedError(code='hub_connection_closed')")
+
+
+def test_operation_rejection_diagnostics_reject_arbitrary_sensitive_values() -> None:
+    sentinel = "SENSITIVE-NATIVE-SENTINEL"
+
+    bad_constructions = (
+        lambda: ClineSdkOperationRejectedError(sentinel),
+        lambda: ClineSdkOperationRejectedError("hub_connect_failed", details={"note": sentinel}),
+        lambda: ClineSdkOperationRejectedError(
+            "hub_connect_failed", details={"close_code": sentinel}
+        ),
+        lambda: ClineSdkOperationRejectedError("hub_connect_failed", details={"close_code": True}),
+        lambda: ClineSdkOperationRejectedError("hub_connect_failed", details={"unknown_field": 1}),
+    )
+
+    # Arbitrary text codes, unknown/unbounded detail fields, and mistyped
+    # values are rejected — never retained in any exported diagnostic — and
+    # the rejection diagnostics themselves leak nothing:
+    for construct in bad_constructions:
+        with pytest.raises(ValueError) as exc_info:
+            construct()
+        assert sentinel not in str(exc_info.value)
+        assert sentinel not in repr(exc_info.value)
+
+    # The permitted bounded diagnostic field works and stays out of text:
+    bounded = ClineSdkOperationRejectedError("hub_connection_closed", details={"close_code": 1006})
+    assert bounded.code == "hub_connection_closed"
+    assert bounded.details == {"close_code": 1006}
+    assert "close_code" not in str(bounded)
+    assert "1006" not in str(bounded)
+    assert "close_code" not in repr(bounded)
+    assert "1006" not in repr(bounded)
+
+
+def test_representations_never_leak_prompt_transcript_or_result_content() -> None:
+    request = _start_request(
+        rules="# Rules with SENSITIVE-RULES-SENTINEL",
+        system_prompt="system prompt with SENSITIVE-SYSTEM-PROMPT-SENTINEL",
+        session_id="reconstruction-target",
+        initial_messages=_raw_messages(),
+    )
+    request_repr = repr(request)
+    assert "SENSITIVE-RULES-SENTINEL" not in request_repr
+    assert "SENSITIVE-SYSTEM-PROMPT-SENTINEL" not in request_repr
+    # Transcript content never enters representation either:
+    assert "composed turn text" not in request_repr
+    assert "raw-session-id" not in request_repr
+
+    result = ClineStartResult(
+        session_id="raw-session-id",
+        result={"agentResult": {"text": "SENSITIVE-RESULT-SENTINEL"}},
+    )
+    assert "SENSITIVE-RESULT-SENTINEL" not in repr(result)
+
+    call = FakeBackendCall(
+        OP_SEND,
+        session_id="reconstruction-target",
+        prompt="composed prompt with SENSITIVE-PROMPT-SENTINEL",
+        request=request,
+    )
+    call_repr = repr(call)
+    assert "SENSITIVE-PROMPT-SENTINEL" not in call_repr
+    assert "SENSITIVE-RULES-SENTINEL" not in call_repr
+    assert "SENSITIVE-RESULT-SENTINEL" not in call_repr
+    assert "composed turn text" not in call_repr
+
+    # Representations withhold content; the values themselves stay intact
+    # for lossless transport and verbatim test assertions:
+    assert call.prompt == "composed prompt with SENSITIVE-PROMPT-SENTINEL"
+    assert call.request is not None
+    assert call.request.initial_messages == _raw_messages()
+    assert result.result == {"agentResult": {"text": "SENSITIVE-RESULT-SENTINEL"}}
 
 
 def test_fake_instances_and_scripted_outcomes_are_isolated_and_deterministic() -> None:

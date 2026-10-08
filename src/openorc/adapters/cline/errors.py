@@ -30,29 +30,37 @@ Outcome classification (the discipline downstream code relies on):
 - ``ClineSdkOperationRejectedError`` — the SDK rejected the operation with
   an available safe machine code (for example the qualified
   ``hub_connection_closed`` / ``hub_connect_failed``) and bounded safe
-  structured details (for example a numeric close code). A bare
-  empty-message ``hub_connect_failed`` must not be interpreted as
-  identifying bad credentials versus a down Hub: the code is preserved for
-  downstream classification, never interpreted here.
+  structured details (for example a numeric close code). The safe boundary
+  is enforced, not advisory: codes are validated machine identifiers and
+  details are constrained to the explicitly permitted bounded diagnostic
+  fields, so arbitrary provider text or unbounded dictionaries are rejected
+  instead of being embedded in exported diagnostics. A bare empty-message
+  ``hub_connect_failed`` must not be interpreted as identifying bad
+  credentials versus a down Hub: the code is preserved for downstream
+  classification, never interpreted here.
 
 Non-inferences: terminal session loss is never inferred from ``stop``,
 ``abort``, bridge death, WebSocket 1006, or a session record's ``status``.
 Public-evidence classification and reconciliation belong to D6; no recovery
 algorithm lives in this module.
 
-Safety by authoring: error messages, reprs, and the ``details`` carrier
-never contain raw SDK/provider exception text, stack traces, URLs with
-credentials, tokens, prompts, responses, session transcripts, or arbitrary
-JS errors. Native exceptions are discarded at the boundary — constructors
-and raisers never chain them (traceback/telemetry handling can traverse
-``__cause__``/``__context__``), so concrete implementations convert native
-failures into these sanitized errors after the failing handler exits.
-``ClineSdkOperationRejectedError.details`` additionally never appears in
-the exception's string or representation.
+Safety by authoring and by enforcement: error messages, reprs, and the
+``details`` carrier never contain raw SDK/provider exception text, stack
+traces, URLs with credentials, tokens, prompts, responses, session
+transcripts, or arbitrary JS errors. Native exceptions are discarded at the
+boundary — constructors and raisers never chain them (traceback/telemetry
+handling can traverse ``__cause__``/``__context__``), so concrete
+implementations convert native failures into these sanitized errors after
+the failing handler exits. ``ClineSdkOperationRejectedError`` additionally
+enforces its own boundary by construction: codes are validated machine
+identifiers and details are constrained to the permitted bounded diagnostic
+fields, with both excluded from the exception's string and representation.
 """
 
 from __future__ import annotations
 
+import re
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -104,25 +112,62 @@ class ClineSessionNotFoundError(ClineSdkBackendError):
     """
 
 
+# Safe machine-code shape of ``ClineSdkOperationRejectedError.code``:
+# lowercase snake_case identifiers of bounded length. Arbitrary provider
+# text (which could carry sensitive content) cannot satisfy the shape, so
+# it is rejected instead of being embedded in exported exception text or
+# representations. The vocabulary extends through later qualification by
+# remaining within this shape.
+_MACHINE_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
+_MAX_MACHINE_CODE_LENGTH = 64
+
+# The explicitly permitted bounded diagnostic fields of
+# ``ClineSdkOperationRejectedError.details``, declared here and extended
+# only as later SDK requirements demonstrate safe machine evidence (for
+# example the numeric close code of the pinned baseline).
+_PERMITTED_DETAIL_FIELDS = MappingProxyType({"close_code": int})
+
+
 class ClineSdkOperationRejectedError(ClineSdkBackendError):
     """The SDK rejected the operation with a safe machine code.
 
     ``code`` is a safe machine identifier from the qualified baseline (for
     example ``hub_connection_closed`` / ``hub_connect_failed``), preserved
-    for downstream classification. ``details`` carries optional bounded
-    safe structured details (for example a numeric close code) and is
-    excluded from the exception's string and representation. Neither value
-    is interpreted here: a bare empty-message ``hub_connect_failed`` does
-    not identify bad credentials versus a down Hub.
+    for downstream classification and enforced by construction to a
+    lowercase snake_case machine identifier of bounded length: arbitrary
+    provider text is rejected, never embedded in the exception text or
+    representation. ``details`` carries only the explicitly permitted
+    bounded diagnostic fields (``_PERMITTED_DETAIL_FIELDS``, for example a
+    numeric close code); unknown fields or mistyped values are rejected,
+    and details never appear in the exception's string or representation.
+    Neither value is interpreted here: a bare empty-message
+    ``hub_connect_failed`` does not identify bad credentials versus a down
+    Hub.
     """
 
     def __init__(self, code: str, details: JsonObject | None = None) -> None:
-        if not isinstance(code, str) or not code.strip():
-            raise ValueError("ClineSdkOperationRejectedError.code must be a non-empty string")
-        if details is not None and (
-            not isinstance(details, dict) or any(not isinstance(key, str) for key in details)
+        if (
+            not isinstance(code, str)
+            or len(code) > _MAX_MACHINE_CODE_LENGTH
+            or _MACHINE_CODE_PATTERN.fullmatch(code) is None
         ):
-            raise ValueError("ClineSdkOperationRejectedError.details must be None or a JSON object")
+            raise ValueError(
+                "ClineSdkOperationRejectedError.code must be a lowercase "
+                "snake_case machine identifier of at most 64 characters"
+            )
+        if details is not None:
+            if not isinstance(details, dict):
+                raise ValueError(
+                    "ClineSdkOperationRejectedError.details must be None or a "
+                    "JSON object of permitted bounded diagnostic fields"
+                )
+            for key, value in details.items():
+                if type(value) is not _PERMITTED_DETAIL_FIELDS.get(key):
+                    raise ValueError(
+                        "ClineSdkOperationRejectedError.details may only carry "
+                        "the permitted bounded diagnostic fields with their "
+                        "declared types"
+                    )
         self.code = code
         self.details = details
         super().__init__(f"cline sdk operation rejected with machine code {code!r}")
