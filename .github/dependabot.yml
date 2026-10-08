@@ -47,6 +47,21 @@ updates:
           - minor
           - patch
 
+  # Cline SDK bridge (npm): packages/cline-sdk-bridge/package.json +
+  # package-lock.json. Dedicated, UNGROUPED entry per the Cline compatibility
+  # policy (.github/AGENTS.md; openorc/cloud#45): every newer stable
+  # @cline/sdk release — including 0.0.x increments — must arrive as an
+  # individual compatibility-signal PR. These PRs never auto-merge and never
+  # silently change OpenOrc's supported Cline baseline; the bridge stays
+  # pinned at the D1-qualified version until a deliberate
+  # requalification adopts a newer one.
+  - package-ecosystem: npm
+    directory: "/packages/cline-sdk-bridge"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+
   # GitHub Actions used by the repository workflows (SHA-pinned; see note above).
   - package-ecosystem: github-actions
     directory: "/"
