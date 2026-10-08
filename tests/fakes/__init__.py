@@ -19,11 +19,17 @@ from .agent_runtime import (
     pr_result_candidate,
     session_ready_candidate,
 )
+from .cline_sdk_backend import (
+    FakeBackendCall,
+    FakeClineSdkBackend,
+)
 
 __all__ = [
     "ControlRealization",
     "ControlRecord",
     "FakeAgentRuntimeAdapter",
+    "FakeBackendCall",
+    "FakeClineSdkBackend",
     "FakeSessionContext",
     "ScriptedOutcome",
     "SendRecord",
