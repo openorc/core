@@ -55,6 +55,10 @@ the failing handler exits. ``ClineSdkOperationRejectedError`` additionally
 enforces its own boundary by construction: codes are validated machine
 identifiers and details are constrained to the permitted bounded diagnostic
 fields, with both excluded from the exception's string and representation.
+``ClineBridgeProtocolError`` (the D4 bridge-process transport addition,
+#73) carries D3's explicit ``wire_protocol`` rejections — a bounded safe
+machine ``reason`` such as ``not_attached`` — and is kept deliberately
+distinct from SDK rejection and from positive session absence.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ClineBackendUncertainOutcomeError",
+    "ClineBridgeProtocolError",
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineSdkBackendError",
@@ -174,3 +179,35 @@ class ClineSdkOperationRejectedError(ClineSdkBackendError):
 
     def __repr__(self) -> str:
         return f"ClineSdkOperationRejectedError(code={self.code!r})"
+
+
+class ClineBridgeProtocolError(ClineSdkBackendError):
+    """The bridge wire protocol positively rejected an operation or frame.
+
+    D4 transport addition for the concrete bridge-process backend (#73):
+    carries D3's explicit ``wire_protocol`` rejections (bounded safe
+    ``reason``: ``parse_error`` / ``invalid_request`` / ``method_not_found``
+    / ``invalid_params`` / ``not_attached``) and the backend's local
+    not-attached rejection, which mirrors them. Deliberately distinct from
+    ``ClineSdkOperationRejectedError`` (the SDK answered with a machine
+    code) and ``ClineSessionNotFoundError`` (positive exact-session
+    absence). ``reason`` is a validated safe machine identifier preserved
+    for downstream classification, never interpreted here, and never
+    carrying payload content.
+    """
+
+    def __init__(self, reason: str) -> None:
+        if (
+            not isinstance(reason, str)
+            or len(reason) > _MAX_MACHINE_CODE_LENGTH
+            or _MACHINE_CODE_PATTERN.fullmatch(reason) is None
+        ):
+            raise ValueError(
+                "ClineBridgeProtocolError.reason must be a lowercase "
+                "snake_case machine identifier of at most 64 characters"
+            )
+        self.reason = reason
+        super().__init__(f"cline bridge wire protocol rejected with reason {reason!r}")
+
+    def __repr__(self) -> str:
+        return f"ClineBridgeProtocolError(reason={self.reason!r})"
