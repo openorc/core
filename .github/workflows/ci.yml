@@ -81,3 +81,40 @@ jobs:
 
       - name: Production build (vue-tsc + vite)
         run: npm run build
+
+  bridge-checks:
+    name: Cline SDK bridge checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/cline-sdk-bridge
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: packages/cline-sdk-bridge/.node-version
+          cache: npm
+          cache-dependency-path: packages/cline-sdk-bridge/package-lock.json
+
+      - name: Bootstrap pinned npm
+        # devEngines in packages/cline-sdk-bridge/package.json requires the
+        # exact npm version declared there before install/ci/run commands;
+        # read it from the file rather than duplicating the pin in this
+        # workflow.
+        run: |
+          npm install -g npm@"$(node -p "require('./package.json').devEngines.packageManager.version")"
+
+      - name: Install locked bridge dependencies
+        run: npm ci
+
+      - name: Type check (tsc)
+        run: npm run typecheck
+
+      - name: Test (Vitest, deterministic — no live Cline service)
+        run: npm test
+
+      - name: Production build (tsc)
+        run: npm run build
