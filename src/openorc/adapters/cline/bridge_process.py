@@ -542,7 +542,12 @@ class _BridgeAttachment:
         has_result = "result" in frame
         has_error = "error" in frame
         if has_result == has_error:
+            # A matched response must carry exactly one of result or error;
+            # anything else is malformed wire output after the operation may
+            # have taken effect: the call stays an uncertain outcome and the
+            # transport is invalidated.
             self.resolve(pending, (False, _UNCERTAIN_FAILURE))
+            self.invalidate()
             return True
         if has_error:
             self.resolve(pending, (False, _classify_error(frame["error"])))

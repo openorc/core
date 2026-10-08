@@ -56,8 +56,8 @@ _FAKE_RECORD_ENV = "OPENORC_BRIDGE_FAKE_RECORD"
 # notifications) so the backend's transport, correlation, event dispatch,
 # and failure classification are exercised deterministically without Node.
 # Scenario script keys: `outcomes` (per-method FIFO of {ok|error|delay_ms|
-# crash|garbage}), `events` (after_subscribe-keyed notifications), `sentinel`
-# (sensitive-text marker inside the harmless error message).
+# crash|garbage|malformed}), `events` (after_subscribe-keyed notifications),
+# `sentinel` (sensitive-text marker inside the harmless error message).
 _FAKE_BRIDGE_CHILD_SOURCE = '''
 """Scripted JSON-RPC child used only by the bridge-process backend tests."""
 import json
@@ -159,6 +159,19 @@ def apply(method, request_id, fallback):
             os._exit(101)
         if outcome.get("garbage"):
             write_raw(outcome["garbage"])
+        if outcome.get("malformed"):
+            # A well-delimited but malformed matched response carrying the
+            # exact request id: both result and error, or neither field.
+            frame = {"jsonrpc": "2.0", "id": request_id}
+            if outcome["malformed"] == "both":
+                frame["result"] = {"claimed": "result"}
+                frame["error"] = {
+                    "code": -32000,
+                    "message": "cline sdk backend operation failed",
+                    "data": {"kind": "uncertain_outcome"},
+                }
+            write_frame(frame)
+            return
         if "error" in outcome:
             respond(request_id, error=outcome["error"])
             return
@@ -684,7 +697,7 @@ def test_queued_events_cannot_reach_an_unsubscribed_listener(tmp_path: Path) -> 
             },
             {
                 "after_subscribe": 1,
-                "delay_ms": 30,
+                "delay_ms": 60,
                 "session_id": "s1",
                 "kind": "message",
                 "payload": {"n": 2},
@@ -853,6 +866,28 @@ def test_invalid_result_shape_invalidates_attachment_conservatively(tmp_path: Pa
     backend.dispose()
 
 
+@pytest.mark.parametrize("shape", ["both", "neither"])
+def test_malformed_matched_response_invalidates_attachment(tmp_path: Path, shape: str) -> None:
+    script = {
+        "outcomes": {
+            "get": [{"malformed": shape}],
+            "read_messages": [{"ok": [{"role": "user", "parts": []}]}],
+        }
+    }
+    command, child_env, _ = _scripted_child(tmp_path, "malformed", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    backend.start(_start_request())
+    with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.get("cline-session-1")  # not evidence the effect never happened
+    with pytest.raises(ClineBridgeProtocolError) as raised:
+        backend.send("cline-session-1", "probe prompt")
+    assert raised.value.reason == "not_attached"
+    backend.connect(_remote_config())  # explicit reattachment restores service
+    assert backend.read_messages("cline-session-1") == [{"role": "user", "parts": []}]
+    backend.dispose()
+
+
 def test_invalid_envelope_invalidates_attachment_conservatively(tmp_path: Path) -> None:
     script = {
         "outcomes": {
@@ -927,6 +962,13 @@ def test_dispose_unblocks_waiters_repeatable_and_leaves_no_workers(tmp_path: Pat
     script = {"outcomes": {"send": [{"delay_ms": 30000}]}}
     command, child_env, record_path = _scripted_child(tmp_path, "dispose", script)
     backend = _make_backend(command, child_env, request_timeout=30.0)
+    # Snapshot bridge-worker threads so the final assertion proves this test
+    # left no NEW workers behind, independent of any earlier test's leakage.
+    bridge_threads_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("openorc-cline-bridge-")
+    }
     backend.connect(_remote_config())
     backend.start(_start_request())
     outcomes: list[BaseException | None] = []
@@ -948,11 +990,13 @@ def test_dispose_unblocks_waiters_repeatable_and_leaves_no_workers(tmp_path: Pat
     assert time.monotonic() - disposed_at < 5.0  # bounded, not the scripted 30s
     assert outcomes and isinstance(outcomes[0], ClineBackendUncertainOutcomeError)
     backend.dispose()  # idempotent repeat
-    assert [
-        thread
+    lingering = [
+        thread.name
         for thread in threading.enumerate()
         if thread.name.startswith("openorc-cline-bridge-")
-    ] == []
+        and thread.ident not in bridge_threads_before
+    ]
+    assert lingering == []
     assert not any(
         call["method"] in ("dispose", "stop", "abort") for call in _recorded_calls(record_path)
     )
