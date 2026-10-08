@@ -36,6 +36,7 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 - Lower-level `Agent` / `AgentRuntime` APIs are not the OpenOrc integration layer.
 - Do not depend on `@cline/llms`, a configured-provider catalog, or effective provider/model readback. Provider/model identifiers arrive as opaque OpenOrc role configuration.
 - Do not mirror ClineCore wholesale into Python. Expose only the session/configuration/control/event operations OpenOrc actually needs.
+- The supported CLI, Hub/core, and SDK versions are one qualified compatibility baseline. A newer upstream release is not authorization to update any component independently; changed public seams require documentation-first, targeted remote-runtime requalification and deliberate pin/contract updates.
 
 ## Session invariants
 
@@ -52,7 +53,7 @@ OpenOrc owns Task/role binding, exact external-session routing, workflow semanti
 
 For Cline v1, OpenOrc stores opaque provider/model identifiers plus an optional role-prompt override on the role binding. Each fresh construction or legitimate same-ID reconstruction resolves the then-current values; runtime-reported provider/model metadata is optional observation, never configuration authority.
 
-Cline owns provider authentication and native runtime configuration, including tools, MCP, plugins, skills, sub-agents/teams, permission/auto-approval configuration, filesystem/tool execution, runtime persistence, private conversational state, and other native behavior inside the session. A managed Cline Box does not transfer those concerns into OpenOrc merely because Cloud owns the host lifecycle.
+Cline owns provider authentication and native runtime configuration, including tools, MCP, plugins, skills, sub-agents/teams, filesystem/tool execution, runtime persistence, private conversational state, and other native behavior inside the session. OpenOrc's deliberate v1 session tool policy is the narrow exception to Cline-native approval configuration. A managed Cline Box does not transfer those concerns into OpenOrc merely because Cloud owns the host lifecycle.
 
 Do not parse private Cline files or invent a shadow configured-provider registry. If a selected provider/model is unusable because native Cline configuration/authentication is missing, surface the supported runtime failure.
 
@@ -62,7 +63,7 @@ OpenOrc Connection rows never model Cline-owned provider/MCP/tool credentials. O
 
 Use public ClineCore reads/history plus supported events/state for delivery reconciliation, controls, usage, and optional runtime telemetry. A fresh client is not assumed to replay an already-running turn's event stream; uncertain accepted sends reconcile through public persisted state before any retry.
 
-Cline v1 registers no interactive approval/question executors or capabilities, and native tool approvals do not become OpenOrc `RuntimeRequest`s. Disable `ask_question` through the supported session policy. Owner activity interruption uses the public abort semantics; `stop(sessionId)` belongs to same-ID runtime reconstruction, not to the user-facing activity-control surface.
+Cline v1 registers no interactive approval/question executors or capabilities, and native tool approvals do not become OpenOrc `RuntimeRequest`s. The deliberate v1 session policy auto-approves enabled tools and disables `ask_question`; do not set `enableSpawnAgent` or `enableAgentTeams`, which remain Cline-owned. Owner activity interruption uses the public abort semantics; `stop(sessionId)` belongs to same-ID runtime reconstruction, not to the user-facing activity-control surface.
 
 Do not blindly replay uncertain sends. Runtime telemetry and Cline record status are not workflow authority.
 
