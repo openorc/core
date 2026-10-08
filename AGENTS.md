@@ -78,6 +78,7 @@ Read the nearest relevant guide before editing, and read all relevant guides for
 - `src/openorc/api/AGENTS.md`
 - `src/openorc/workers/AGENTS.md`
 - `src/openorc/adapters/AGENTS.md`
+- `src/openorc/adapters/agent_runtime/AGENTS.md`
 - `src/openorc/adapters/github/AGENTS.md`
 - `src/openorc/adapters/cline/AGENTS.md`
 - `src/openorc/adapters/supabase/AGENTS.md`
