@@ -30,9 +30,10 @@ Failure discipline (conservative outcome classification):
 - A timeout, process crash/exit, broken pipe, or malformed wire output
   after a request may have been dispatched resolves that call as
   :class:`ClineBackendUncertainOutcomeError` — never as known
-  non-delivery — and invalidates the affected attachment. A demonstrable
-  failure before dispatch (missing Node runtime, missing built entrypoint,
-  unserializable caller inputs) remains a known failure.
+  non-delivery — and invalidates the affected attachment: further use
+  requires an explicit reconnect. A demonstrable failure before dispatch
+  (missing Node runtime, missing built entrypoint, unserializable caller
+  inputs) remains a known failure.
 - Native transport exceptions are discarded, never chained: the sanitized
   backend error is raised after the failing handler exits, so ``__cause__``
   and ``__context__`` stay empty and no raw error text, prompt, transcript,
@@ -405,9 +406,11 @@ class _BridgeAttachment:
     def await_reply(self, pending: _PendingCall) -> Any:
         """Wait bounded for the exact reply; convert the outcome safely.
 
-        A timeout resolves the call conservatively as an uncertain outcome;
-        its late reply can never satisfy any other call (IDs are unique per
-        process generation and the timed-out entry is removed).
+        A timeout resolves the call conservatively as an uncertain outcome
+        and invalidates the attachment — an in-flight operation may still
+        have taken effect, so further use requires an explicit reconnect.
+        The timed-out entry is removed, so its late reply can never satisfy
+        any other call (IDs are unique per process generation).
         """
         if not pending.event.wait(self._request_timeout):
             with self._lock:
@@ -415,6 +418,7 @@ class _BridgeAttachment:
                     pending.outcome = (False, _UNCERTAIN_FAILURE)
                     self._pending.pop(pending.request_id, None)
                     pending.event.set()
+            self.invalidate()
         settled = pending.outcome
         assert settled is not None  # set by the resolver or the timeout path above
         ok, outcome = settled
@@ -466,6 +470,22 @@ class _BridgeAttachment:
         with suppress(queue.Full):
             self._dispatch_queue.put_nowait((entry, event))
 
+    def invalidate(self) -> None:
+        """Conservative invalidation after the transport lost trust.
+
+        Used after a request timeout or malformed wire output following
+        dispatch: outstanding calls resolve conservatively as uncertain
+        outcomes (never as known non-delivery), subscriptions are
+        deactivated, and the child is torn down. This never implies any
+        external session decision; further use requires an explicit
+        ``connect`` on the backend.
+        """
+        self._backend._attachment_died(self)
+        self.fail_pending()
+        self.deactivate_subscriptions()
+        self._closing.set()
+        self.shutdown_child()
+
     def _reader_loop(self) -> None:
         """Consume stdout continuously so replies match out of order while
         notifications interleave. This is the sole stdout-reading path."""
@@ -509,7 +529,7 @@ class _BridgeAttachment:
         except ValueError:
             return False
         if not isinstance(frame, dict) or frame.get("jsonrpc") != "2.0":
-            return True
+            return False  # corrupt wire output: the attachment cannot be trusted
         if "id" not in frame:
             self._handle_notification(frame)
             return True
@@ -529,7 +549,11 @@ class _BridgeAttachment:
             return True
         decoded = _decode_result(pending.method, frame["result"])
         if decoded is _INVALID_RESULT:
+            # The reply violated the declared shape after the operation may
+            # have taken effect: the call stays an uncertain outcome and the
+            # transport is invalidated; further use requires a reconnect.
             self.resolve(pending, (False, _UNCERTAIN_FAILURE))
+            self.invalidate()
             return True
         self.resolve(pending, (True, decoded))
         return True
@@ -586,11 +610,15 @@ class _BridgeAttachment:
                 continue
 
     def unsubscribe(self, subscription_id: str) -> None:
-        """Best-effort wire-only unsubscribe; failures are contained.
+        """Deactivate the local registration, then best-effort wire-only
+        unsubscribe; failures are contained.
 
-        The wire unsubscribe is idempotent on the bridge side and stops only
-        its own handle; a dead or replaced attachment is simply gone.
+        The local registration is removed synchronously first, so events
+        already queued for dispatch can no longer reach the listener even if
+        the wire unsubscribe is slow or fails; the wire unsubscribe is
+        idempotent on the bridge side and stops only its own handle.
         """
+        self.remove_subscription(subscription_id)
         if self._finalized or self.process.poll() is not None:
             return
         with application_span(_TRACER_SCOPE, _UNSUBSCRIBE_SPAN_NAME) as span:

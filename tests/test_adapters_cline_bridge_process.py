@@ -672,6 +672,51 @@ def test_unsubscribe_is_idempotent_and_isolated(tmp_path: Path) -> None:
     )
 
 
+def test_queued_events_cannot_reach_an_unsubscribed_listener(tmp_path: Path) -> None:
+    script = {
+        "events": [
+            {
+                "after_subscribe": 1,
+                "delay_ms": 30,
+                "session_id": "s1",
+                "kind": "message",
+                "payload": {"n": 1},
+            },
+            {
+                "after_subscribe": 1,
+                "delay_ms": 30,
+                "session_id": "s1",
+                "kind": "message",
+                "payload": {"n": 2},
+            },
+        ]
+    }
+    command, child_env, record_path = _scripted_child(tmp_path, "queued", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    seen: list[Any] = []
+    started = threading.Event()
+    gate = threading.Event()
+
+    def blocking_listener(event: ClineSessionEvent) -> None:
+        seen.append(event.payload["n"])
+        started.set()
+        assert gate.wait(5.0)  # hold the single dispatcher busy; event 2 stays queued
+
+    subscription = backend.subscribe("s1", blocking_listener)
+    assert started.wait(5.0)  # event 1 is executing; event 2 is queued behind it
+    subscription.unsubscribe()  # removes the local registration synchronously
+    assert subscription.active is False
+    gate.set()  # release the in-execution callback
+    time.sleep(0.3)  # the dispatcher drains: the queued event must be dropped
+    assert seen == [1]  # the queued event never reached the unsubscribed listener
+    subscription.unsubscribe()  # idempotent
+    backend.dispose()
+    assert (
+        len([call for call in _recorded_calls(record_path) if call["method"] == "unsubscribe"]) == 1
+    )
+
+
 @pytest.mark.parametrize(
     ("method", "error", "expected_type", "expected"),
     [
@@ -755,24 +800,74 @@ def test_operations_before_connect_fail_not_attached_without_spawning(tmp_path: 
     assert not marker.exists()  # no child was ever launched
 
 
-def test_timeout_after_dispatch_is_uncertain_and_late_replies_bind_nothing(tmp_path: Path) -> None:
+def test_timeout_invalidates_attachment_until_explicit_reconnect(tmp_path: Path) -> None:
     script = {
         "outcomes": {
-            "send": [{"delay_ms": 800}],
-            "get": [{"ok": {"status": "fine"}}, {"ok": {"status": "fine"}}],
+            "send": [{"delay_ms": 30000}],
+            "read_messages": [{"ok": [{"role": "user", "parts": []}]}],
         }
     }
-    command, child_env, _ = _scripted_child(tmp_path, "timeout", script)
+    command, child_env, record_path = _scripted_child(tmp_path, "timeout", script)
     backend = _make_backend(command, child_env, request_timeout=0.3)
     backend.connect(_remote_config())
     backend.start(_start_request())
     started_at = time.monotonic()
     with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.send("cline-session-1", "probe prompt")  # bounded wait, not the scripted delay
+    assert time.monotonic() - started_at < 3.0
+    with pytest.raises(ClineBridgeProtocolError) as raised:
+        backend.get("cline-session-1")
+    assert raised.value.reason == "not_attached"  # further use requires an explicit reconnect
+    with pytest.raises(ClineBridgeProtocolError):
+        backend.start(_start_request())
+
+    backend.connect(_remote_config())  # explicit reattachment: a fresh child
+    messages = backend.read_messages("cline-session-1")  # same explicitly supplied session ID
+    assert messages == [{"role": "user", "parts": []}]
+    backend.dispose()
+
+    calls = _recorded_calls(record_path)
+    assert len([call for call in calls if call["method"] == "connect"]) == 2
+    assert len([call for call in calls if call["method"] == "start"]) == 1  # no implicit start
+    assert len([call for call in calls if call["method"] == "send"]) == 1  # no replay
+
+
+def test_invalid_result_shape_invalidates_attachment_conservatively(tmp_path: Path) -> None:
+    script = {
+        "outcomes": {
+            "get": [{"ok": "not-a-json-object"}],
+            "read_messages": [{"ok": [{"role": "user", "parts": []}]}],
+        }
+    }
+    command, child_env, _ = _scripted_child(tmp_path, "shape", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    backend.start(_start_request())
+    with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.get("cline-session-1")  # not evidence the effect never happened
+    with pytest.raises(ClineBridgeProtocolError) as raised:
         backend.send("cline-session-1", "probe prompt")
-    assert time.monotonic() - started_at < 1.0  # the bounded wait, not the scripted delay
-    assert backend.get("cline-session-1") == {"status": "fine"}  # bound to its own reply
-    time.sleep(0.8)  # the late send reply arrives while idle and is discarded
-    assert backend.get("cline-session-1") == {"status": "fine"}
+    assert raised.value.reason == "not_attached"
+    backend.connect(_remote_config())  # explicit reattachment serves the same supplied ID
+    assert backend.read_messages("cline-session-1") == [{"role": "user", "parts": []}]
+    backend.dispose()
+
+
+def test_invalid_envelope_invalidates_attachment_conservatively(tmp_path: Path) -> None:
+    script = {
+        "outcomes": {
+            "get": [{"garbage": '{"id": "1.2", "result": 1}', "ok": {"status": "running"}}],
+        }
+    }
+    command, child_env, _ = _scripted_child(tmp_path, "envelope", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    backend.start(_start_request())
+    with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.get("cline-session-1")  # the corrupt frame invalidated the attachment
+    with pytest.raises(ClineBridgeProtocolError) as raised:
+        backend.send("cline-session-1", "probe prompt")
+    assert raised.value.reason == "not_attached"
     backend.dispose()
 
 
