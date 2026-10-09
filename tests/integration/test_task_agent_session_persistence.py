@@ -769,8 +769,8 @@ def test_later_configuration_changes_do_not_rewrite_historical_configuration(
         effective_config_snapshot={"stage": "plan", "runtime": "cline"},
     )
 
-    # Later Workspace role-binding and Connection configuration changes affect
-    # only future sessions.
+    # Later Workspace role-binding configuration (routing and per-role runtime
+    # configuration alike) and Connection changes affect only future sessions.
     connection_repositories.update_connection(
         pool,
         first_connection,
@@ -785,6 +785,9 @@ def test_later_configuration_changes_do_not_rewrite_historical_configuration(
         workspace_id=workspace_id,
         role=WorkflowRole.PRODUCER,
         connection_id=second_connection,
+        configured_provider="provider-id-later",
+        configured_model="model-id-later",
+        role_prompt_override="/# Later override",
     )
 
     reloaded = session_repositories.get_task_agent_session(

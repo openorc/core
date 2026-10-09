@@ -69,7 +69,10 @@ _CONNECTION_COLUMNS = (
     "enabled, auth_reference, reported_provider, reported_model, created_at, updated_at"
 )
 
-_BINDING_COLUMNS = "id, workspace_id, role, connection_id, created_at, updated_at"
+_BINDING_COLUMNS = (
+    "id, workspace_id, role, connection_id, configured_provider, configured_model, "
+    "role_prompt_override, created_at, updated_at"
+)
 
 
 def _connection_from_row(row: Sequence[Any]) -> Connection:
@@ -307,28 +310,78 @@ def set_connection_auth_reference(
 
 
 def set_role_binding(
-    pool: DatabasePool, *, workspace_id: UUID, role: WorkflowRole, connection_id: UUID
-) -> WorkflowRoleBinding:
-    """Point one workflow role at one Connection (mutable configuration upsert).
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    role: WorkflowRole,
+    connection_id: UUID,
+    configured_provider: str | None,
+    configured_model: str | None,
+    role_prompt_override: str | None,
+) -> tuple[WorkflowRoleBinding, bool]:
+    """Write one role binding's complete runtime configuration (issue #162).
 
-    Exactly one binding exists per ``(workspace_id, role)``. Re-calling this
-    for the same ``(workspace_id, role)`` repoints the existing binding: the
-    binding row identity (``id`` and ``created_at``) is preserved — a
-    configuration change, not historical replacement. The upsert cannot point
-    a binding at another Workspace's Connection: the composite foreign key
-    makes that a ForeignKeyViolation.
+    Exactly one binding exists per ``(workspace_id, role)``. This one
+    conditional upsert is the whole-record, atomic compare-and-set: an
+    absent ``(workspace, role)`` creates the binding (``changed=True``); an
+    existing binding is updated in place only when its configuration
+    actually differs — when the stored configuration is identical, the row
+    is locked but not updated (no RETURNING row is produced),
+    ``updated_at`` is preserved, and the identical write reports
+    ``changed=False``. Binding row identity (``id`` and ``created_at``) is
+    always preserved — a configuration change, never historical replacement.
+    The upsert cannot point a binding at another Workspace's Connection: the
+    composite foreign key makes that a ForeignKeyViolation.
+
+    The ``changed`` fact comes from the statement outcome (whether a
+    RETURNING row was produced), never from a prior read, so a concurrent
+    identical creation that loses the upsert race reports ``changed=False``
+    instead of emitting a phantom change. Row-wise ``IS DISTINCT FROM``
+    treats NULLs correctly, so the unconfigured state is a first-class
+    no-op value.
     """
     with transaction(pool) as conn:
         row = conn.execute(
-            "insert into openorc.workflow_role_bindings (workspace_id, role, connection_id) "
-            "values (%s, %s, %s) "
+            "insert into openorc.workflow_role_bindings "
+            "(workspace_id, role, connection_id, configured_provider, "
+            "configured_model, role_prompt_override) "
+            "values (%s, %s, %s, %s, %s, %s) "
             "on conflict (workspace_id, role) do update "
-            "set connection_id = excluded.connection_id, updated_at = now() "
+            "set connection_id = excluded.connection_id, "
+            "configured_provider = excluded.configured_provider, "
+            "configured_model = excluded.configured_model, "
+            "role_prompt_override = excluded.role_prompt_override, "
+            "updated_at = now() "
+            "where (openorc.workflow_role_bindings.connection_id, "
+            "openorc.workflow_role_bindings.configured_provider, "
+            "openorc.workflow_role_bindings.configured_model, "
+            "openorc.workflow_role_bindings.role_prompt_override) "
+            "is distinct from (excluded.connection_id, excluded.configured_provider, "
+            "excluded.configured_model, excluded.role_prompt_override) "
             f"returning {_BINDING_COLUMNS}",
-            (workspace_id, role.value, connection_id),
+            (
+                workspace_id,
+                role.value,
+                connection_id,
+                configured_provider,
+                configured_model,
+                role_prompt_override,
+            ),
         ).fetchone()
+        if row is None:
+            # Identical stored configuration: the row was locked but not
+            # updated, so no RETURNING row was produced. The current row is
+            # the honest result of this no-op write.
+            row = conn.execute(
+                f"select {_BINDING_COLUMNS} from openorc.workflow_role_bindings "
+                "where workspace_id = %s and role = %s",
+                (workspace_id, role.value),
+            ).fetchone()
+            changed = False
+        else:
+            changed = True
     assert row is not None
-    return _binding_from_row(row)
+    return _binding_from_row(row), changed
 
 
 def get_role_binding(
@@ -363,6 +416,9 @@ def _binding_from_row(row: Sequence[Any]) -> WorkflowRoleBinding:
         workspace_id=row[1],
         role=WorkflowRole(row[2]),
         connection_id=row[3],
-        created_at=normalize_utc(row[4]),
-        updated_at=normalize_utc(row[5]),
+        configured_provider=row[4],
+        configured_model=row[5],
+        role_prompt_override=row[6],
+        created_at=normalize_utc(row[7]),
+        updated_at=normalize_utc(row[8]),
     )

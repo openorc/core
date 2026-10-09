@@ -211,7 +211,19 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
 
 
 def _binding_row(workspace_id: Any, role: str, connection_id: Any) -> tuple[Any, ...]:
-    return (uuid.uuid4(), workspace_id, role, connection_id, _OBSERVED, _OBSERVED)
+    # Canned row matching the #162 binding columns: the scripted flows use
+    # the unconfigured configuration state.
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        role,
+        connection_id,
+        None,
+        None,
+        None,
+        _OBSERVED,
+        _OBSERVED,
+    )
 
 
 def _connection_row(

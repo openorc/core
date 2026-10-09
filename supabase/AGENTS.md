@@ -112,4 +112,27 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   authority and not an event-sourced copy of GitHub; dispatch (#120)
   re-validates current routing before any effect.
 
+## WorkflowRoleBinding runtime session configuration (issue #162)
+
+- `openorc.workflow_role_bindings` carries the settled concrete per-role
+  runtime-session configuration: the routed `connection_id`, the Owner-supplied
+  opaque `configured_provider`/`configured_model` pair, and the nullable
+  `role_prompt_override`. The pair is configuration authority supplied by the
+  Owner — never an enum, never validated through a catalog or readback, and
+  deliberately distinct from the Connection's nullable runtime-reported
+  observations.
+- The pair is complete only when both values are present
+  (`(configured_provider is null) = (configured_model is null)` CHECK) and
+  present values are nonblank; existing/legacy bindings remain entirely
+  unconfigured (both NULL, no invented defaults) after the additive migration.
+- `role_prompt_override` is NULL (use the current shipped default for the role)
+  or any verbatim non-NULL string — including empty — with no blankness rule:
+  Core never parses or classifies the prose, and shipped default prompt bodies
+  stay OpenOrc-owned code assets, never materialized into rows. No prompt
+  hash/version/history/snapshot rows exist.
+- These are live Workspace configuration values. Editing them is an ordinary
+  configuration mutation that never rewrites an existing `TaskAgentSession`,
+  its admitted Connection, or its historical effective configuration snapshot;
+  later runtime construction/reconstruction resolves the then-current values.
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

@@ -95,9 +95,12 @@ def test_reported_provider_model_are_nullable_opaque_strings() -> None:
 
 
 def test_binding_models_only_role_and_identity() -> None:
-    # The v1 binding is honest: no per-role session configuration exists
-    # (provider/model selection is intentionally unavailable; PLAN/ACT mode is
-    # workflow-derived; initialization prompts are OpenOrc protocol behavior).
+    # The Phase 1 create-table statement is honest about its baseline shape:
+    # identity columns only. The concrete per-role runtime configuration
+    # (issue #162) arrives through the later append-only
+    # add_role_binding_runtime_configuration migration, never by mutating
+    # this settled baseline (PLAN/ACT mode is workflow-derived; initialization
+    # prompts are OpenOrc protocol behavior).
     block = _table_block(_migration_text(), BINDINGS_TABLE)
     for column in ("id", "workspace_id", "role", "connection_id", "created_at", "updated_at"):
         assert column in block

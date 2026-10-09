@@ -296,7 +296,18 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             _OBSERVED,
             _OBSERVED,
         ),
-        "binding": (uuid.uuid4(), workspace_id, "producer", connection_id, _OBSERVED, _OBSERVED),
+        # Canned row matching the #162 binding columns (unconfigured state).
+        "binding": (
+            uuid.uuid4(),
+            workspace_id,
+            "producer",
+            connection_id,
+            None,
+            None,
+            None,
+            _OBSERVED,
+            _OBSERVED,
+        ),
         "task": (
             task_id,
             workspace_id,
@@ -665,6 +676,9 @@ def test_session_and_role_binding_resolution_scopes_fail_closed() -> None:
         foreign_workspace_id,
         "producer",
         uuid.uuid4(),
+        None,
+        None,
+        None,
         _OBSERVED,
         _OBSERVED,
     )

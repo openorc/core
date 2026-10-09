@@ -199,3 +199,20 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
 - Raw access/refresh tokens have no column and no path through these
   modules: ordinary `openorc.*` tables carry only the opaque reference
   pointer.
+
+## Role-binding runtime configuration writes (issue #162)
+
+- `set_role_binding` is the one whole-record configuration write for
+  `(workspace_id, role)`: a single conditional upsert whose
+  `ON CONFLICT DO UPDATE ... WHERE (row) IS DISTINCT FROM (excluded)` guard
+  makes the statement itself the atomic compare-and-set. An absent binding
+  is created; an identical stored configuration is locked-but-not-updated
+  (no RETURNING row), preserving `updated_at`; and the returned `changed`
+  fact comes from the statement outcome, never from a prior read, so a
+  concurrent identical creation that loses the upsert race reports no
+  change. Binding row identity (`id`/`created_at`) is always preserved.
+- Every write states the complete configuration record (routed
+  `connection_id`, opaque configured provider/model pair, nullable
+  role-prompt override) — no caller can silently erase configuration by
+  omitting fields; the composite foreign key keeps cross-Workspace
+  Connection targets a ForeignKeyViolation for service classification.

@@ -123,4 +123,28 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
 - The user × installation × repository intersection failure is the typed `GitHubUserRepositoryAccessError` (condition constant) — never another installation, another Profile, an installation-token write, or a PAT; GitHub's later definitive permission/policy rejection on the write itself remains a normal known provider outcome. Write-failure translation (`translate_owner_write_failure`) is honest about the accountable Profile's user credential and never describes a user-authenticated write failure as a routed-installation credential failure; installation-flavored error text belongs only to installation-authenticated reads/reconciliation.
 - Account deletion composes the GitHub-user cleanup in the same revocation transaction as the deletion-attempt barrier: the refresh secret is deleted and the row is made non-dangling (revoked, reference NULL, generation advanced) BEFORE the external Auth delete, idempotent on retry, and failing closed on malformed/dangling references before any destructive external call.
 
+## Role-binding configuration and the authenticated API dependency (issue #162)
+
+- `role_binding_configuration.py` owns the Owner-authorized read/update of
+  the per-role runtime-session configuration. Reads and mutations establish
+  Workspace ownership through the shared resolvers (`require_workspace_role_binding`
+  / `require_profile_workspace`) — authentication alone never grants Workspace
+  access, and missing/foreign subjects are uniformly `NotFoundError`.
+- The mutation composes the account-operational barrier first, validates the
+  command shape before authorization/persistence (pair completeness; the
+  override is `None` or any verbatim string, including empty), writes the
+  whole record through the conditional upsert, and records
+  `WORKSPACE_CONFIGURATION_CHANGED` only for actual changes (including
+  initial creation) inside the same transaction. The event helper accepts no
+  provider/model/prompt parameter, so those values have no path into event
+  context. Configuration edits compose no `task_agent_sessions` work: an
+  initialized session, its Connection boundary, and its historical snapshot
+  are never rewritten.
+- `api/dependencies/authentication.py` is the first authenticated transport
+  dependency: bearer-token extraction plus the #52 `authenticate` service,
+  run off the event loop (sync dependency), with a process-level verifier so
+  the adapter's JWKS cache works across requests. `api/dependencies/application_errors.py`
+  is the one ApplicationError → HTTP mapping (401/403/404/409/422/503);
+  routers stay thin and raise/propagate the typed vocabulary.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
