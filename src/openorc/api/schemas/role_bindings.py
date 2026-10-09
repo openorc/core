@@ -25,17 +25,20 @@ __all__ = [
 class RoleBindingConfigurationUpdate(BaseModel):
     """The full desired role-binding configuration record.
 
-    Full-record semantics: every field is the desired current value, so a
-    ``null`` role-prompt override is the explicit reset to the shipped
-    default. The configured provider/model values are opaque Owner-supplied
-    configuration; the pair-completeness rule is the service's, never a
-    wire-level duplicate.
+    Full-record replacement semantics: EVERY field is required in the
+    request and carries the desired current value — omitting a field is a
+    wire-validation error, never a silent clear, so existing configuration
+    can never be erased through omitted write arguments. Explicit ``null``
+    is the only reset value (for the override: back to the shipped
+    default). The configured provider/model values are opaque
+    Owner-supplied configuration; the pair-completeness rule is the
+    service's, never a wire-level duplicate.
     """
 
     connection_id: UUID
-    configured_provider: str | None = None
-    configured_model: str | None = None
-    role_prompt_override: str | None = None
+    configured_provider: str | None
+    configured_model: str | None
+    role_prompt_override: str | None
 
 
 class RoleBindingConfigurationRead(BaseModel):

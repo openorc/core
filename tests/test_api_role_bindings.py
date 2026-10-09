@@ -445,3 +445,46 @@ def test_a_verified_identity_reaches_the_authorized_route(
     # The resolved Profile — not the raw token — is the service's authority
     # input.
     assert seam.reads[0]["profile_id"] == owner_profile.id
+
+
+def test_omitted_configuration_fields_cannot_silently_clear(
+    service_seam, settings_factory, owner_profile
+) -> None:
+    # Full-record replacement regression (review of #172): the PUT schema
+    # requires every configuration field to be present. Omitting a field is
+    # a wire-validation error — never a silent supply of the null reset — so
+    # a caller submitting only connection_id can never erase an existing
+    # provider/model pair or override without explicitly requesting it.
+    seam = service_seam()
+    client = _client(settings_factory(), owner_profile)
+
+    response = client.put(
+        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        json={"connection_id": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 422
+    # The mutation service was never invoked: nothing was cleared.
+    assert seam.updates == []
+
+    # Explicitly supplied nulls remain the valid reset form (full record).
+    binding = _binding(role=WorkflowRole.PRODUCER)
+    seam2 = service_seam(
+        update_result=role_binding_configuration.RoleBindingConfigurationUpdate(
+            binding=binding, changed=True
+        )
+    )
+    response = client.put(
+        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        json={
+            "connection_id": str(uuid.uuid4()),
+            "configured_provider": None,
+            "configured_model": None,
+            "role_prompt_override": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert seam2.updates[0]["role_prompt_override"] is None
+    assert seam2.updates[0]["configured_provider"] is None
+    assert seam2.updates[0]["configured_model"] is None
