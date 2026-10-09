@@ -50,6 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
+from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGateStatus
 from openorc.domain.tasks import TaskStatus
@@ -63,6 +64,7 @@ __all__ = [
     "record_guidance_changed_event",
     "record_owner_gate_resolved_event",
     "record_review_iteration_limit_changed_event",
+    "record_role_binding_configuration_changed_event",
     "record_task_terminal_event",
 ]
 
@@ -178,6 +180,36 @@ def record_guidance_changed_event(
         subject_type=_SUBJECT_TYPE_WORKSPACE,
         subject_id=workspace_id,
         context={"setting": "guidance"},
+    )
+
+
+def record_role_binding_configuration_changed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    actor: WorkflowActorContext,
+    role: WorkflowRole,
+) -> None:
+    """Record one workflow role-binding configuration change (issue #162).
+
+    Workspace-scoped (no Task), subject the Workspace, context identifies
+    only the ``workflow_role_binding`` setting and the affected role. The
+    Owner's provider/model identifiers and role-prompt Markdown have no
+    parameter in this helper at all, so they can never be copied into the
+    event.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    if not isinstance(role, WorkflowRole):
+        raise InvalidCommandError("role-binding configuration events require a WorkflowRole")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_WORKSPACE,
+        subject_id=workspace_id,
+        context={"setting": "workflow_role_binding", "role": role.value},
     )
 
 

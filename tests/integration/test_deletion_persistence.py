@@ -486,6 +486,9 @@ def test_account_deletion_from_the_auth_users_root_removes_the_complete_openorc_
         workspace_id=primary_workspace,
         role=WorkflowRole.PRODUCER,
         connection_id=primary_connection.id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     event_repositories.record_workflow_event(
         pool,
@@ -620,6 +623,9 @@ def test_scoped_workspace_project_and_repository_deletion_preserves_siblings_and
         workspace_id=main_workspace,
         role=WorkflowRole.PRODUCER,
         connection_id=connection.id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     event_repositories.record_workflow_event(
         pool,
@@ -796,7 +802,13 @@ def test_connection_deletion_is_restricted_and_disconnect_is_explicit(
         auth_reference="auth-ref-referenced",
     )
     connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.PRODUCER, connection_id=connection.id
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection.id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     task = task_repositories.create_task(
         pool,

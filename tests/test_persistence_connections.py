@@ -67,12 +67,12 @@ class FakeConnection:
 class FakePool:
     """Emulates psycopg_pool ConnectionPool.connection() semantics."""
 
-    def __init__(self, conn: FakeConnection) -> None:
+    def __init__(self, conn: FakeConnection | _ScriptedConnection) -> None:
         self._conn = conn
 
     def connection(self) -> Any:
         @contextmanager
-        def managed() -> Iterator[FakeConnection]:
+        def managed() -> Iterator[FakeConnection | _ScriptedConnection]:
             yield self._conn
 
         return managed()
@@ -128,6 +128,9 @@ def _binding_row(**overrides: Any) -> tuple[Any, ...]:
         "workspace_id": uuid.uuid4(),
         "role": "producer",
         "connection_id": uuid.uuid4(),
+        "configured_provider": None,
+        "configured_model": None,
+        "role_prompt_override": None,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
     }
@@ -137,6 +140,9 @@ def _binding_row(**overrides: Any) -> tuple[Any, ...]:
         values["workspace_id"],
         values["role"],
         values["connection_id"],
+        values["configured_provider"],
+        values["configured_model"],
+        values["role_prompt_override"],
         values["created_at"],
         values["updated_at"],
     )
@@ -271,13 +277,17 @@ def test_set_role_binding_upsert_repoints_and_preserves_identity() -> None:
     fake_conn = FakeConnection(repointed_row)
     pool = cast(DatabasePool, FakePool(fake_conn))
 
-    binding = set_role_binding(
+    binding, changed = set_role_binding(
         pool,
         workspace_id=workspace_id,
         role=WorkflowRole.PRODUCER,
         connection_id=repointed_row[3],
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
 
+    assert changed is True
     assert binding.id == original_id
     assert binding.role == WorkflowRole.PRODUCER
     assert binding.connection_id == repointed_row[3]
@@ -286,7 +296,7 @@ def test_set_role_binding_upsert_repoints_and_preserves_identity() -> None:
     assert "openorc.workflow_role_bindings" in sql
     assert "on conflict (workspace_id, role) do update" in sql
     assert "set connection_id = excluded.connection_id" in sql
-    assert params == (workspace_id, "producer", repointed_row[3])
+    assert params == (workspace_id, "producer", repointed_row[3], None, None, None)
 
 
 def test_get_role_binding_maps_row_or_none() -> None:
@@ -362,3 +372,110 @@ def test_list_connections_for_update_locks_rows_in_id_order() -> None:
         )
         == []
     )
+
+
+class _ScriptedConnection:
+    """Plays back one canned result per executed statement, in order."""
+
+    def __init__(self, results: list[tuple[Any, ...] | None]) -> None:
+        self.results = list(results)
+        self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
+        self.executed.append((sql, params))
+        return FakeCursor(self.results.pop(0), None)
+
+
+def test_set_role_binding_writes_the_full_configuration() -> None:
+    row = _binding_row(
+        configured_provider="provider-id-⚡",
+        configured_model="model-id-ünicode",
+        role_prompt_override="",
+    )
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    binding, changed = set_role_binding(
+        pool,
+        workspace_id=row[1],
+        role=WorkflowRole.PRODUCER,
+        connection_id=row[3],
+        configured_provider="provider-id-⚡",
+        configured_model="model-id-ünicode",
+        role_prompt_override="",
+    )
+
+    assert changed is True
+    assert binding.configured_provider == "provider-id-⚡"
+    assert binding.configured_model == "model-id-ünicode"
+    # An empty string is a verbatim explicit override, preserved exactly.
+    assert binding.role_prompt_override == ""
+
+    sql, params = fake_conn.executed[0]
+    # The whole record is written: the conflict update sets the configuration
+    # columns from excluded and guards the write with the row-wise change
+    # condition, so an identical stored configuration can never advance
+    # updated_at or fabricate a change.
+    assert "configured_provider = excluded.configured_provider" in sql
+    assert "configured_model = excluded.configured_model" in sql
+    assert "role_prompt_override = excluded.role_prompt_override" in sql
+    assert "is distinct from" in sql
+    assert params == (
+        row[1],
+        "producer",
+        row[3],
+        "provider-id-⚡",
+        "model-id-ünicode",
+        "",
+    )
+
+
+def test_set_role_binding_identical_write_reports_no_change() -> None:
+    # The statement-level no-op path: the DO UPDATE WHERE suppresses the
+    # write for an identical stored configuration (no RETURNING row), so the
+    # repository re-selects the current row and reports changed=False. This
+    # is the exact path a concurrent identical creation takes when it loses
+    # the upsert race.
+    row = _binding_row(
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override=None,
+    )
+    scripted = _ScriptedConnection([None, row])
+    pool = cast(DatabasePool, FakePool(scripted))
+
+    binding, changed = set_role_binding(
+        pool,
+        workspace_id=row[1],
+        role=WorkflowRole.PRODUCER,
+        connection_id=row[3],
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override=None,
+    )
+
+    assert changed is False
+    assert binding.id == row[0]
+    assert binding.created_at == _utc_observed_at()
+    reselect_sql, reselect_params = scripted.executed[1]
+    assert "select" in reselect_sql
+    assert "openorc.workflow_role_bindings" in reselect_sql
+    assert reselect_params == (row[1], "producer")
+
+
+def test_get_role_binding_maps_configured_values() -> None:
+    row = _binding_row(
+        role="reviewer",
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override="# Override",
+    )
+    found = get_role_binding(
+        cast(DatabasePool, FakePool(FakeConnection(row))),
+        workspace_id=row[1],
+        role=WorkflowRole.REVIEWER,
+    )
+    assert found is not None
+    assert found.configured_provider == "provider-id-1"
+    assert found.configured_model == "model-id-x"
+    assert found.role_prompt_override == "# Override"

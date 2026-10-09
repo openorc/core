@@ -28,9 +28,20 @@ a workflow role (Producer or Reviewer) at a Connection.
   once those configurations exist. Secret material never belongs here.
 - Exactly one binding exists per ``(Workspace, role)`` in v1 (no runtime
   pools, no failover). Producer and Reviewer bindings are independent and may
-  reference the same Connection or separate Connections. The binding carries
-  only workspace/role/connection identity and timestamps; per-role session
-  configuration is added later only when a real configurable property exists.
+  reference the same Connection or separate Connections. The settled concrete
+  role configuration (issue #162) is the Owner-supplied opaque configured
+  provider/model pair plus the nullable Owner-authored role-prompt Markdown
+  override — configuration authority, deliberately distinct from the
+  Connection's nullable runtime-reported observations. A partial one-value
+  pair is not representable, and a blank pair member is not a valid opaque
+  identifier. ``role_prompt_override`` is ``None`` (use OpenOrc's current
+  shipped default for the role) or stored and passed verbatim: Core never
+  parses, classifies, or reasons about its prose, and the shipped default
+  prompt bodies remain OpenOrc-owned code assets never materialized into
+  persistence. No provider catalog, generic runtime-config bag, prompt
+  hash/version/history, or effective-config-snapshot interaction exists:
+  editing these values is live Workspace configuration that never rewrites
+  an already-resident runtime incarnation.
 """
 
 from __future__ import annotations
@@ -127,15 +138,20 @@ class Connection:
 class WorkflowRoleBinding:
     """Mutable per-role runtime configuration within one Workspace.
 
-    Exactly one binding per ``(workspace_id, role)`` in v1. The binding is
-    honest about its shape: workspace/role/connection identity and timestamps
-    only.
+    Exactly one binding per ``(workspace_id, role)`` in v1. The routed
+    Connection plus the Owner-supplied opaque configured provider/model pair
+    and the nullable Owner-authored role-prompt Markdown override are the
+    binding's whole shape: live, typed Workspace configuration — no runtime
+    pools, no provider/model catalog, and no generic configuration bag.
     """
 
     id: UUID
     workspace_id: UUID
     role: WorkflowRole
     connection_id: UUID
+    configured_provider: str | None
+    configured_model: str | None
+    role_prompt_override: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -143,6 +159,37 @@ class WorkflowRoleBinding:
         if not isinstance(self.role, WorkflowRole):
             raise ConnectionDomainError(
                 "WorkflowRoleBinding.role must be a WorkflowRole (producer or reviewer)"
+            )
+        # The configured provider/model pair is complete only when both values
+        # are present: a partial one-value configuration is an impossible pair
+        # and is rejected before it can be represented or persisted. Existing
+        # bindings may remain entirely unconfigured (both None).
+        if (self.configured_provider is None) != (self.configured_model is None):
+            raise ConnectionDomainError(
+                "WorkflowRoleBinding provider/model configuration is complete only "
+                "when both values are present; a partial configuration cannot be "
+                "represented"
+            )
+        if self.configured_provider is not None:
+            # Opaque Owner-supplied runtime identity: plain nonblank strings.
+            # No vocabulary, no enum, no catalog validation, no normalization.
+            provider = self.configured_provider
+            model = self.configured_model
+            if not isinstance(provider, str) or not provider.strip():
+                raise ConnectionDomainError(
+                    "WorkflowRoleBinding.configured_provider must be a nonblank "
+                    "opaque string when the pair is configured"
+                )
+            if not isinstance(model, str) or not model.strip():
+                raise ConnectionDomainError(
+                    "WorkflowRoleBinding.configured_model must be a nonblank "
+                    "opaque string when the pair is configured"
+                )
+        if self.role_prompt_override is not None and not isinstance(self.role_prompt_override, str):
+            raise ConnectionDomainError(
+                "WorkflowRoleBinding.role_prompt_override must be None (use the "
+                "current shipped default for this role) or the Owner's verbatim "
+                "Markdown override"
             )
 
 

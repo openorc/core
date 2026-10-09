@@ -106,12 +106,24 @@ def _insert_binding(
     workspace_id: uuid.UUID,
     role: str,
     connection_id: uuid.UUID,
+    configured_provider: str | None = None,
+    configured_model: str | None = None,
+    role_prompt_override: str | None = None,
 ) -> uuid.UUID:
     binding_id = uuid.uuid4()
     conn.execute(
-        "insert into openorc.workflow_role_bindings (id, workspace_id, role, connection_id) "
-        "values (%s, %s, %s, %s)",
-        (binding_id, workspace_id, role, connection_id),
+        "insert into openorc.workflow_role_bindings "
+        "(id, workspace_id, role, connection_id, configured_provider, configured_model, "
+        "role_prompt_override) values (%s, %s, %s, %s, %s, %s, %s)",
+        (
+            binding_id,
+            workspace_id,
+            role,
+            connection_id,
+            configured_provider,
+            configured_model,
+            role_prompt_override,
+        ),
     )
     return binding_id
 
@@ -391,11 +403,23 @@ def test_repository_upsert_repoints_binding_and_preserves_identity(
     connection_two = _insert_connection(conn, workspace_id=workspace_id)
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    original = connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.PRODUCER, connection_id=connection_one
+    original, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_one,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
-    repointed = connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.PRODUCER, connection_id=connection_two
+    repointed, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_two,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
 
     # A workflow role binding is mutable configuration: the same
@@ -421,7 +445,13 @@ def test_direct_duplicate_insert_still_raises_unique_violation(
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
     connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.REVIEWER, connection_id=connection_id
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.REVIEWER,
+        connection_id=connection_id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
 
     # The database invariant is proven separately from repository upsert
@@ -469,11 +499,23 @@ def test_connection_round_trip_through_persistence_layer(conn: Connection[Any]) 
     assert updated.enabled is False
     assert updated.auth_reference is None
 
-    producer = connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.PRODUCER, connection_id=created.id
+    producer, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=created.id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
-    reviewer = connection_repositories.set_role_binding(
-        pool, workspace_id=workspace_id, role=WorkflowRole.REVIEWER, connection_id=created.id
+    reviewer, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.REVIEWER,
+        connection_id=created.id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     assert (
         connection_repositories.get_role_binding(
@@ -490,3 +532,205 @@ def test_connection_round_trip_through_persistence_layer(conn: Connection[Any]) 
     assert isinstance(created_at, datetime)
     assert created_at.tzinfo is not None
     assert created_at.utcoffset() == timedelta(0)
+
+
+# --- concrete per-role runtime session configuration (issue #162) -------------
+
+
+def test_binding_configuration_defaults_to_unconfigured(conn: Connection[Any]) -> None:
+    # Existing/legacy bindings migrate as entirely unconfigured: the additive
+    # columns carry no invented default provider/model and no prompt prose.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+    binding_id = _insert_binding(
+        conn, workspace_id=workspace_id, role="producer", connection_id=connection_id
+    )
+
+    row = conn.execute(
+        "select configured_provider, configured_model, role_prompt_override "
+        "from openorc.workflow_role_bindings where id = %s",
+        (binding_id,),
+    ).fetchone()
+
+    assert row is not None
+    assert row == (None, None, None)
+
+
+def test_binding_configuration_round_trip_through_the_repository(
+    conn: Connection[Any],
+) -> None:
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    binding, changed = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+        configured_provider="provider-id-⚡",
+        configured_model="model-id-ünicode",
+        role_prompt_override="# Override 第二段落",
+    )
+    assert changed is True
+    loaded = connection_repositories.get_role_binding(
+        pool, workspace_id=workspace_id, role=WorkflowRole.PRODUCER
+    )
+    assert loaded is not None
+    assert loaded.id == binding.id
+    # Opaque Owner-supplied values round-trip verbatim: no vocabulary, no
+    # normalization, no catalog validation.
+    assert loaded.configured_provider == "provider-id-⚡"
+    assert loaded.configured_model == "model-id-ünicode"
+    assert loaded.role_prompt_override == "# Override 第二段落"
+
+    # An empty string is a verbatim explicit override, not the NULL default.
+    empty, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.REVIEWER,
+        connection_id=connection_id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override="",
+    )
+    assert empty.role_prompt_override == ""
+
+    # Resetting to the entirely unconfigured state is a legitimate change.
+    cleared, changed = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
+    )
+    assert changed is True
+    assert cleared.id == binding.id
+    assert cleared.created_at == binding.created_at
+    assert cleared.configured_provider is None
+    assert cleared.configured_model is None
+    assert cleared.role_prompt_override is None
+
+
+def test_binding_identity_preserved_across_configuration_update(
+    conn: Connection[Any],
+) -> None:
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    original, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
+    )
+    reconfigured, changed = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override="/# Override",
+    )
+
+    assert changed is True
+    # A configuration change, never historical replacement: one binding row
+    # whose identity and creation instant are preserved; updated_at advances.
+    assert reconfigured.id == original.id
+    assert reconfigured.created_at == original.created_at
+    assert reconfigured.updated_at >= original.updated_at
+    count = conn.execute(
+        "select count(*) from openorc.workflow_role_bindings where workspace_id = %s and role = %s",
+        (workspace_id, "producer"),
+    ).fetchone()
+    assert count is not None
+    assert count[0] == 1
+
+
+def test_identical_configuration_rewrite_is_a_no_op(conn: Connection[Any]) -> None:
+    # The statement-level change detection: an identical whole-record write
+    # is locked-but-not-updated — updated_at is preserved, changed is False,
+    # and exactly one row remains. This is the durable path a concurrent
+    # identical creation takes when it loses the upsert race: it can never
+    # fabricate a second change or duplicate the audit handoff.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    first, changed = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.REVIEWER,
+        connection_id=connection_id,
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override="/# Override",
+    )
+    assert changed is True
+
+    second, changed = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.REVIEWER,
+        connection_id=connection_id,
+        configured_provider="provider-id-1",
+        configured_model="model-id-x",
+        role_prompt_override="/# Override",
+    )
+
+    assert changed is False
+    assert second.id == first.id
+    assert second.created_at == first.created_at
+    assert second.updated_at == first.updated_at
+    assert second.configured_provider == "provider-id-1"
+    count = conn.execute(
+        "select count(*) from openorc.workflow_role_bindings where workspace_id = %s and role = %s",
+        (workspace_id, "reviewer"),
+    ).fetchone()
+    assert count is not None
+    assert count[0] == 1
+
+
+def test_partial_provider_model_pair_cannot_be_committed(conn: Connection[Any]) -> None:
+    # The durable backstop for the pair invariant: a one-value configuration
+    # state cannot be committed even bypassing the domain/repository layers.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+
+    with pytest.raises(CheckViolation):
+        conn.execute(
+            "insert into openorc.workflow_role_bindings "
+            "(id, workspace_id, role, connection_id, configured_provider) "
+            "values (%s, %s, 'producer', %s, 'provider-only')",
+            (uuid.uuid4(), workspace_id, connection_id),
+        )
+
+
+def test_blank_configured_identifiers_cannot_be_committed(conn: Connection[Any]) -> None:
+    # Opaque configured identifiers are NULL-or-nonblank, mirroring the
+    # Connection's auth_reference durable rule.
+    profile_id = _insert_profile(conn)
+    workspace_id = _insert_workspace(conn, profile_id)
+    connection_id = _insert_connection(conn, workspace_id=workspace_id)
+
+    with pytest.raises(CheckViolation):
+        _insert_binding(
+            conn,
+            workspace_id=workspace_id,
+            role="reviewer",
+            connection_id=connection_id,
+            configured_provider="   ",
+            configured_model="model-id-x",
+        )

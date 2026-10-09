@@ -8,14 +8,17 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from fastapi import FastAPI
 
 from openorc import __version__
+from openorc.api.dependencies.application_errors import application_error_response
 from openorc.api.request_correlation import (
     RequestCorrelationMiddleware,
     server_error_response,
 )
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
+from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.config import Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
+from openorc.services.errors import ApplicationError
 
 API_TITLE = "OpenOrc API"
 
@@ -62,11 +65,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # handler so the framework's outermost server-error layer keeps its
         # semantics while the final response carries the request ID (issue
         # #108).
-        exception_handlers={Exception: server_error_response},
+        exception_handlers={
+            Exception: server_error_response,
+            ApplicationError: application_error_response,
+        },
     )
     app.add_middleware(RequestCorrelationMiddleware)
     app.include_router(health_router)
     app.include_router(github_webhooks_router)
+    app.include_router(role_bindings_router)
     app.state.settings = resolved
     return app
 

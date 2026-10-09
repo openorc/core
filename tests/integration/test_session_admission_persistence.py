@@ -544,6 +544,9 @@ def test_role_binding_change_after_existing_binding_conflicts(conn: Connection[A
         workspace_id=workspace_id,
         role=WorkflowRole.PRODUCER,
         connection_id=repointed_connection,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     with pytest.raises(SessionRouteConflictError):
         admit_task_agent_sessions(

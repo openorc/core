@@ -374,6 +374,9 @@ def test_service_authorization_enforces_workspace_isolation_on_real_data(
         workspace_id=owner_workspace.id,
         role=WorkflowRole.PRODUCER,
         connection_id=connection_id,
+        configured_provider=None,
+        configured_model=None,
+        role_prompt_override=None,
     )
     assert (
         require_profile_workspace(
