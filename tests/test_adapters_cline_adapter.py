@@ -15,6 +15,8 @@ instead of re-testing it and require no database, network, or live runtime.
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
@@ -819,6 +821,13 @@ def test_normalized_error_chains_stay_clean() -> None:
         ("unknown_code_send", "send", AgentRuntimeUncertainOutcomeError),
         ("not_attached_start", "start", AgentRuntimeUnavailableError),
         ("invalid_params_start", "start", AgentRuntimeConfigurationRejectedError),
+        ("attachment_rejected_abort", "abort", AgentRuntimeConfigurationRejectedError),
+        ("attachment_unavailable_abort", "abort", AgentRuntimeUnavailableError),
+        ("hub_connect_failed_abort", "abort", AgentRuntimeUnavailableError),
+        ("hub_closed_abort", "abort", AgentRuntimeUncertainOutcomeError),
+        ("not_attached_abort", "abort", AgentRuntimeUnavailableError),
+        ("unknown_code_abort", "abort", AgentRuntimeUncertainOutcomeError),
+        ("session_not_found_abort", "abort", AgentSessionNotFoundError),
     ],
 )
 def test_backend_failures_classify_into_the_normalized_taxonomy(
@@ -847,13 +856,27 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
         backend.queue_start(ClineBridgeProtocolError("invalid_params"))
     elif script == "unknown_code_send":
         backend.queue_send(session_id, ClineSdkOperationRejectedError("mystery_failure"))
+    elif script == "attachment_rejected_abort":
+        backend.queue_abort(session_id, ClineRemoteAttachmentRejectedError())
+    elif script == "attachment_unavailable_abort":
+        backend.queue_abort(session_id, ClineRemoteAttachmentUnavailableError())
+    elif script == "hub_connect_failed_abort":
+        backend.queue_abort(session_id, ClineSdkOperationRejectedError("hub_connect_failed"))
+    elif script == "hub_closed_abort":
+        backend.queue_abort(session_id, ClineSdkOperationRejectedError("hub_connection_closed"))
+    elif script == "not_attached_abort":
+        backend.queue_abort(session_id, ClineBridgeProtocolError("not_attached"))
+    elif script == "unknown_code_abort":
+        backend.queue_abort(session_id, ClineSdkOperationRejectedError("mystery_failure"))
+    elif script == "session_not_found_abort":
+        backend.queue_abort(session_id, ClineSessionNotFoundError("gone"))
 
     if operation == "send":
         with pytest.raises(expected):
             adapter.send(session_id, "Hello?")
-    elif operation == "start":
+    elif operation == "abort":
         with pytest.raises(expected):
-            adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+            adapter.abort_activity(session_id)
     else:
         with pytest.raises(expected):
             adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -1636,3 +1659,410 @@ def test_string_encoded_mcp_results_verify_like_structured_ones() -> None:
     )
 
     assert isinstance(result, ReviewResult)
+
+
+# --- D6a: activity abort (issue #75) ---
+
+_EVENT_TIMEOUT_SECONDS = 10.0
+
+
+def _call_in_thread(target: Callable[[], object]) -> tuple[threading.Thread, list[Exception]]:
+    """Run target on a daemon worker, capturing a raised exception."""
+    captured: list[Exception] = []
+
+    def wrapper() -> None:
+        try:
+            target()
+        except Exception as error:
+            captured.append(error)
+
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    return thread, captured
+
+
+class _PairedRoleResolver(ClineConstructionContextResolver):
+    """Resolver double serving one Producer and one Reviewer context."""
+
+    def __init__(
+        self, producer: ClineConstructionContext, reviewer: ClineConstructionContext
+    ) -> None:
+        self._contexts = {
+            (producer.identity.task_id, producer.identity.role): producer,
+            (reviewer.identity.task_id, reviewer.identity.role): reviewer,
+        }
+        self._bound: dict[str, ClineConstructionContext] = {}
+
+    def resolve_construction_context(
+        self, workspace_id: UUID, task_id: UUID, role: WorkflowRole
+    ) -> ClineConstructionContext:
+        return self._contexts[(task_id, role)]
+
+    def resolve_bound_session_context(self, session_id: str) -> ClineConstructionContext | None:
+        return self._bound.get(session_id)
+
+    def bind(self, session_id: str, context: ClineConstructionContext) -> None:
+        self._bound[session_id] = context
+
+
+def test_abort_activity_dispatches_one_native_abort_for_a_bound_producer_session() -> None:
+    """The exact bound ID dispatches one public abort: no stop/start/send,
+    no replacement, no new prompt, and no invented abort reason."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+
+    adapter.abort_activity(session_id)
+
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send", "abort"]
+    abort_calls = [call for call in backend.calls() if call.operation == "abort"]
+    assert len(abort_calls) == 1
+    assert abort_calls[0].session_id == session_id
+    assert abort_calls[0].reason is None
+
+
+def test_abort_activity_serves_a_fresh_instance_bound_reviewer_session() -> None:
+    """A fresh adapter instance with only the resolver-established binding
+    aborts the exact bound Reviewer session: _known_identity is never the
+    authority and both roles are eligible at this seam."""
+    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
+    fresh = ClineAdapter(backend, resolver)
+
+    fresh.abort_activity(session_id)
+
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send", "abort"]
+    abort_calls = [call for call in backend.calls() if call.operation == "abort"]
+    assert abort_calls[0].session_id == session_id
+
+
+def test_abort_activity_rejects_a_blank_session_id_before_any_effect() -> None:
+    adapter, backend, _, _ = _ready_adapter()
+
+    with pytest.raises(ValueError):
+        adapter.abort_activity("")
+    with pytest.raises(ValueError):
+        adapter.abort_activity("   ")
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_abort_activity_fails_closed_without_an_establishable_binding() -> None:
+    """A missing durable binding fails closed before any runtime dispatch."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.abort_activity(session_id)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+    assert resolver.bound_queries == [session_id]
+
+
+def test_abort_reaches_the_backend_while_an_ordinary_send_is_in_flight() -> None:
+    """The abort dispatches without the send/reconstruction lock: it reaches
+    the backend while the send is still held open, and the send completes
+    afterwards."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _completed("slow reply"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    send_thread, send_errors = _call_in_thread(
+        lambda: adapter.send(session_id, "long running turn")
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    adapter.abort_activity(session_id)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+    assert send_thread.is_alive()
+
+    release.set()
+    send_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not send_thread.is_alive()
+    assert send_errors == []
+
+
+def test_an_abort_on_one_session_leaves_another_sessions_send_independent() -> None:
+    """Abort coordination is per session: an abort dispatched for a held-open
+    session A does not serialize or disturb a concurrent send on session B."""
+    backend = FakeClineSdkBackend()
+    producer_context = _context()
+    reviewer_context = _context(
+        _identity(role=WorkflowRole.REVIEWER),
+        cwd=_NEUTRAL_DIRECTORY,
+        workspace_root=_NEUTRAL_DIRECTORY,
+    )
+    resolver = _PairedRoleResolver(producer_context, reviewer_context)
+    adapter = ClineAdapter(backend, resolver)
+    _script_ready_session(backend)
+    producer_id = adapter.create_session(_creation_request()).external_session_id
+    _script_ready_session(backend, session_id="cline-session-2")
+    reviewer_id = adapter.create_session(
+        _creation_request(role=WorkflowRole.REVIEWER, initialization="Reviewer init.")
+    ).external_session_id
+    assert (producer_id, reviewer_id) == ("cline-session-1", "cline-session-2")
+    resolver.bind(producer_id, producer_context)
+    resolver.bind(reviewer_id, reviewer_context)
+
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", producer_id, entered=entered, release=release)
+    backend.queue_send(producer_id, _completed("slow producer reply"))
+    backend.queue_send(reviewer_id, _completed("fast reviewer reply"))
+
+    producer_thread, producer_errors = _call_in_thread(
+        lambda: adapter.send(producer_id, "long running producer turn")
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    adapter.abort_activity(producer_id)
+
+    reviewer_thread, reviewer_errors = _call_in_thread(
+        lambda: adapter.send(reviewer_id, "reviewer question")
+    )
+    reviewer_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert reviewer_errors == []
+    assert producer_thread.is_alive()
+
+    release.set()
+    producer_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not producer_thread.is_alive()
+    assert producer_errors == []
+
+
+def test_abort_reaches_the_backend_during_a_verified_pr_review_send() -> None:
+    """The D5b verified-review path holds the per-session lock across its
+    pre-send read, send, and post-send evidence read; the abort still
+    reaches the backend while the review send is in flight."""
+    from openorc.protocol.models import ReviewResult
+
+    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
+    suffix = _turn_messages(
+        _pr_read_pair("call-1", _ASSIGNED_HEAD),
+        _file_read_pair("call-2", _ASSIGNED_HEAD),
+    )
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_send(session_id, _completed(_review_result_payload()))
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + suffix)
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    outcomes: list[object] = []
+    review_thread, review_errors = _call_in_thread(
+        lambda: outcomes.append(
+            adapter.realize_control(
+                session_id,
+                _pr_review_interaction(),
+                message=_review_message(),
+                expected_family=REVIEW_RESULT_FAMILY,
+            )
+        )
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    adapter.abort_activity(session_id)
+
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send", "read_messages", "send", "abort"]
+    assert review_thread.is_alive()
+
+    release.set()
+    review_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not review_thread.is_alive()
+    assert review_errors == []
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], ReviewResult)
+
+
+def test_abort_declines_while_reconstruction_holds_the_incarnation_section() -> None:
+    """A reconstruction that already entered its read_messages -> stop ->
+    start section makes the abort decline locally before any dispatch —
+    never a queued interruption of the possibly new incarnation."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+
+    reconstruct_thread, reconstruct_errors = _call_in_thread(
+        lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    with pytest.raises(AgentRuntimeUnavailableError):
+        adapter.abort_activity(session_id)
+
+    assert "abort" not in [call.operation for call in backend.calls()]
+
+    release.set()
+    reconstruct_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not reconstruct_thread.is_alive()
+    assert reconstruct_errors == []
+    assert [call.operation for call in backend.calls()] == [
+        "start",
+        "send",
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+    # With the reconstruction complete, a later abort dispatches normally.
+    adapter.abort_activity(session_id)
+    assert [call.operation for call in backend.calls()][-1] == "abort"
+
+
+def test_a_pending_abort_makes_a_waiting_reconstruction_fail_closed() -> None:
+    """A reconstruction queued behind a running send must not starve the
+    abort: the abort dispatches while the send is in flight, and after the
+    send completes the reconstruction refuses before any read/stop effect."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _completed("slow reply"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    send_thread, send_errors = _call_in_thread(
+        lambda: adapter.send(session_id, "long running turn")
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    # Started while the gate holds the send open: the reconstruction cannot
+    # acquire the send lock yet, so the abort below is registered first.
+    reconstruct_thread, reconstruct_errors = _call_in_thread(
+        lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    )
+
+    adapter.abort_activity(session_id)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+
+    release.set()
+    send_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not send_thread.is_alive()
+    assert send_errors == []
+    reconstruct_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not reconstruct_thread.is_alive()
+    assert len(reconstruct_errors) == 1
+    assert isinstance(reconstruct_errors[0], AgentRuntimeUncertainOutcomeError)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+
+
+def test_an_acknowledged_abort_does_not_clear_the_reconstruction_guard() -> None:
+    """An acknowledged abort is unresolved interruption evidence, not
+    quiescence: same-ID reconstruction stays refused for #148."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+
+    adapter.abort_activity(session_id)
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort"]
+
+
+def test_overlapping_aborts_keep_the_reconstruction_guard_until_all_settle() -> None:
+    """Regression: one abort's known pre-effect failure must not release the
+    reconstruction guard while another abort for the same session is still
+    outstanding. Only when the last outstanding abort settles with a known
+    no-effect outcome does the baseline reconstruction safety return."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    first_entered, first_release = threading.Event(), threading.Event()
+    second_entered, second_release = threading.Event(), threading.Event()
+    backend.gate_operation("abort", session_id, entered=first_entered, release=first_release)
+    backend.gate_operation("abort", session_id, entered=second_entered, release=second_release)
+    backend.queue_abort(session_id, ClineRemoteAttachmentUnavailableError("down"))
+    backend.queue_abort(session_id, ClineRemoteAttachmentUnavailableError("down"))
+
+    first_thread, first_errors = _call_in_thread(lambda: adapter.abort_activity(session_id))
+    assert first_entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+    second_thread, second_errors = _call_in_thread(lambda: adapter.abort_activity(session_id))
+    assert second_entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    # The second abort settles first with a known pre-effect failure while
+    # the first abort is still outstanding:
+    second_release.set()
+    second_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not second_thread.is_alive()
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], AgentRuntimeUnavailableError)
+    assert second_errors[0].__cause__ is None
+    assert second_errors[0].__context__ is None
+
+    # The guard still holds with one abort outstanding: reconstruction is
+    # refused even though one abort already settled without any effect.
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert "read_messages" not in [call.operation for call in backend.calls()]
+
+    first_release.set()
+    first_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not first_thread.is_alive()
+    assert len(first_errors) == 1
+    assert isinstance(first_errors[0], AgentRuntimeUnavailableError)
+
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    operations = [call.operation for call in backend.calls()]
+    assert operations.count("abort") == 2
+    assert operations[-3:] == ["read_messages", "stop", "start"]
+
+
+def test_an_uncertain_abort_latches_the_session_against_reconstruction() -> None:
+    """An abort whose effect could not be classified keeps the D5a uncertain
+    classification and latch: same-ID reconstruction is refused."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_abort(session_id, ClineBackendUncertainOutcomeError("dropped"))
+
+    with pytest.raises(AgentRuntimeDeliveryUncertainError) as excinfo:
+        adapter.abort_activity(session_id)
+
+    error = excinfo.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort"]
+
+
+def test_a_known_pre_effect_abort_failure_releases_the_guard_when_settled() -> None:
+    """A verifiably pre-effect abort never reached the runtime: with no abort
+    left outstanding, the D5a baseline reconstruction safety applies again
+    and the normalized taxonomy surfaces unchanged."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_abort(session_id, ClineRemoteAttachmentUnavailableError("down"))
+
+    with pytest.raises(AgentRuntimeUnavailableError) as excinfo:
+        adapter.abort_activity(session_id)
+
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()] == [
+        "start",
+        "send",
+        "abort",
+        "read_messages",
+        "stop",
+        "start",
+    ]
