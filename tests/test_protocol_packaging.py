@@ -28,6 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from openorc import protocol
 from openorc.protocol import controls_assets
 from openorc.protocol.models import (
     FORMAL_RESPONSE_FAMILIES,
@@ -116,6 +117,23 @@ for asset in workspace_control_assets:
     assert str(task_uuid) in rendered_control, asset
     assert "/tmp/openorc-task-checkout-181" in rendered_control, asset
 
+# The Cline adapter (issue #74) consumes the canonical role-prompt Markdown
+# assets through a package-resource loader: prove they load from the
+# installed artifact too, byte-identical to the repository content.
+role_prompts = {role_prompts!r}
+from importlib import resources as _resources
+
+for role, expected in role_prompts.items():
+    loaded = (
+        _resources.files("openorc.protocol")
+        .joinpath("role_prompts")
+        .joinpath(role + ".md")
+        .read_text(encoding="utf-8")
+    )
+    assert loaded == expected, role
+    asset_path = package_dir / "role_prompts" / (role + ".md")
+    assert asset_path.read_text(encoding="utf-8") == expected, role
+
 print("PACKAGING_OK")
 """
 
@@ -152,10 +170,16 @@ def test_canonical_schema_assets_load_from_the_installed_wheel(tmp_path: Path) -
 
     neutral_cwd = tmp_path / "neutral-cwd"
     neutral_cwd.mkdir()
+    protocol_package_dir = Path(protocol.__file__).resolve().parent
+    role_prompts = {
+        role: (protocol_package_dir / "role_prompts" / (role + ".md")).read_text(encoding="utf-8")
+        for role in ("producer", "reviewer")
+    }
     script = _ARTIFACT_CHECK_SCRIPT.format(
         families=tuple(sorted(FORMAL_RESPONSE_FAMILIES)),
         expected_role_families=_ROLE_FAMILIES,
         control_assets=tuple(sorted(controls_assets.CONTROL_ASSETS)),
+        role_prompts=role_prompts,
     )
     artifact_check = subprocess.run(
         [str(venv_python), "-c", script],

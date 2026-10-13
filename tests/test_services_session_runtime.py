@@ -30,6 +30,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
+from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
@@ -45,6 +46,13 @@ from openorc.adapters.agent_runtime.results import (
     AgentSessionCreated,
     AgentSessionCreationRequest,
 )
+from openorc.adapters.cline import (
+    ClineAdapter,
+    ClineConstructionContext,
+    ClineConstructionContextResolver,
+    ClineSessionIdentity,
+)
+from openorc.adapters.cline.values import ClineStartResult
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import (
@@ -1590,3 +1598,100 @@ def test_end_malformed_command_fails_inside_the_span_without_database_access(
     assert exported.name == "session_runtime.end_task_agent_session"
     assert exported.status is not None
     assert exported.status.status_code is StatusCode.ERROR
+
+
+def test_establishment_through_the_real_cline_adapter_and_scripted_backend() -> None:
+    """A real ``ClineAdapter`` over a scripted D2 backend fake participates in
+    the existing CONNECTING→READY handshake: the #130 service composes the
+    canonical initialization, the adapter performs exactly one readiness
+    handshake over the backend (allocation + the single verbatim
+    initialization send), and the durable finalize installs the exact
+    external identity — with no second service-level send."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    guidance = "Owner-authored guidance composed upstream into the initialization."
+    repository_base = "/srv/openorc/repositories"
+    safe_config = {"repository_base": repository_base}
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="cline-session-1",
+        initialized_at=_OBSERVED,
+        snapshot={"adapter": "cline", "configuration": safe_config},
+    )
+    conn = _establish_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        connection_id,
+        binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
+        route_row=_binding_row(workspace_id, "producer", connection_id),
+        connection_row=_connection_row(workspace_id, connection_id, safe_config=safe_config),
+        guidance=guidance,
+        finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
+    )
+    backend = FakeClineSdkBackend()
+    backend.queue_start(ClineStartResult(session_id="cline-session-1"))
+    backend.queue_send(
+        "cline-session-1",
+        {
+            "finishReason": "completed",
+            "text": json.dumps({"type": "session_ready", "schema_version": 1, "status": "READY"}),
+        },
+    )
+    identity = ClineSessionIdentity(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+    )
+    context = ClineConstructionContext(
+        identity=identity,
+        configured_provider="configured-provider",
+        configured_model="configured-model",
+        role_prompt_override=None,
+        cwd=repository_base,
+        workspace_root=repository_base,
+    )
+
+    class _WiredResolver(ClineConstructionContextResolver):
+        def resolve_construction_context(
+            self, workspace_id: Any, task_id: Any, role: WorkflowRole
+        ) -> ClineConstructionContext:
+            assert (workspace_id, task_id, role) == (
+                workspace_id,
+                task_id,
+                WorkflowRole.PRODUCER,
+            )
+            return context
+
+        def resolve_bound_session_context(self, session_id: str) -> None:
+            return None
+
+    adapter = ClineAdapter(backend, _WiredResolver())
+
+    session = establish_task_agent_session(
+        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+    )
+
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert session.external_session_id == "cline-session-1"
+
+    # The adapter performed exactly one readiness handshake over the backend:
+    # allocation in native ACT at the authorized repository base plus the
+    # single verbatim canonical initialization send. No second send exists.
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send"]
+    start_request = backend.calls()[0].request
+    assert start_request is not None
+    assert start_request.mode.value == "act"
+    assert start_request.cwd == repository_base
+    assert backend.calls()[1].prompt == compose_initialization("producer", guidance)
+
+    # No database transaction was held across the runtime call.
+    assert conn.lifecycle == _PHASE1_LIFECYCLE + _FINALIZE_LIFECYCLE
