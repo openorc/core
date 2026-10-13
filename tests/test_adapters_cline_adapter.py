@@ -504,9 +504,20 @@ def test_cleanup_workspace_failed_result_is_a_typed_result_not_an_error() -> Non
 
 def test_workspace_control_on_a_reviewer_session_is_rejected_before_effects() -> None:
     adapter, backend, resolver, session_id = _ready_adapter(
-        context=_context(_identity(role=WorkflowRole.REVIEWER), cwd=_NEUTRAL_DIRECTORY)
+        context=_context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        )
     )
-    resolver.set_bound(session_id, _context(_identity(role=WorkflowRole.REVIEWER)))
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
 
     with pytest.raises(ValueError, match="Producer-only"):
         adapter.realize_control(
@@ -569,9 +580,20 @@ def test_implement_realizes_authorized_plan_to_act_at_the_task_checkout() -> Non
 
 def test_implement_on_a_reviewer_session_is_rejected_before_effects() -> None:
     adapter, backend, resolver, session_id = _ready_adapter(
-        context=_context(_identity(role=WorkflowRole.REVIEWER), cwd=_NEUTRAL_DIRECTORY)
+        context=_context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        )
     )
-    resolver.set_bound(session_id, _context(_identity(role=WorkflowRole.REVIEWER)))
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
 
     with pytest.raises(ValueError, match="Producer-only"):
         adapter.realize_control(session_id, ImplementInteraction())
@@ -785,7 +807,8 @@ def test_normalized_error_chains_stay_clean() -> None:
         ("hub_connect_failed_start", "start", AgentRuntimeUnavailableError),
         ("hub_closed_send", "send", AgentRuntimeUncertainOutcomeError),
         ("hub_closed_read", "read_messages", AgentRuntimeUnavailableError),
-        ("other_code_start", "start", AgentRuntimeConfigurationRejectedError),
+        ("other_code_start", "start", AgentRuntimeUncertainOutcomeError),
+        ("unknown_code_send", "send", AgentRuntimeUncertainOutcomeError),
         ("not_attached_start", "start", AgentRuntimeUnavailableError),
         ("invalid_params_start", "start", AgentRuntimeConfigurationRejectedError),
     ],
@@ -814,6 +837,8 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
         backend.queue_start(ClineBridgeProtocolError("not_attached"))
     elif script == "invalid_params_start":
         backend.queue_start(ClineBridgeProtocolError("invalid_params"))
+    elif script == "unknown_code_send":
+        backend.queue_send(session_id, ClineSdkOperationRejectedError("mystery_failure"))
 
     if operation == "send":
         with pytest.raises(expected):
@@ -850,3 +875,84 @@ def test_secret_material_never_enters_normalized_errors_or_chains() -> None:
     for surface in surfaces:
         assert _SECRET_INITIALIZATION_MARKER not in surface
         assert _SECRET_RESPONSE_MARKER not in surface
+
+
+# --- review remediations: authority, native construction invariants, and
+# --- conservative unknown-code classification ---
+
+
+def test_established_session_losing_its_resolver_binding_fails_closed() -> None:
+    """The in-memory record of a session this instance established is never a
+    substitute for the authoritative durable binding: when the resolver can
+    no longer establish the binding, a Producer-only control fails closed
+    before any runtime effect without claiming session loss."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    resolver.set_bound(session_id, None)
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.realize_control(
+            session_id,
+            _workspace_interaction("prepare"),
+            message="caller prose",
+            expected_family=WORKSPACE_RESULT_FAMILY,
+        )
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_reconstruction_into_reviewer_act_is_refused_before_any_effect() -> None:
+    """The Reviewer remains native PLAN for the Task lifetime: a forbidden
+    ACT reconstruction is refused before any backend effect."""
+    reviewer_context = _context(
+        _identity(role=WorkflowRole.REVIEWER),
+        cwd=_NEUTRAL_DIRECTORY,
+        workspace_root=_NEUTRAL_DIRECTORY,
+    )
+    adapter, backend, resolver, session_id = _ready_adapter(context=reviewer_context)
+    resolver.set_bound(session_id, reviewer_context)
+
+    with pytest.raises(ValueError, match="native PLAN"):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_mismatched_working_roots_fail_closed_before_start_and_reconstruction() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(
+        creation=_context(cwd=_REPOSITORY_BASE, workspace_root="/srv/openorc/other")
+    )
+    adapter = ClineAdapter(backend, resolver)
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.create_session(_creation_request())
+    assert backend.calls() == ()
+
+    ready_adapter, ready_backend, ready_resolver, session_id = _ready_adapter()
+    ready_resolver.set_bound(
+        session_id, _context(cwd=_TASK_CHECKOUT, workspace_root="/srv/openorc/other")
+    )
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        ready_adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
+
+    assert [call.operation for call in ready_backend.calls()] == ["start", "send"]
+
+
+def test_unknown_code_send_failure_remains_uncertain_and_blocks_reconstruction() -> None:
+    """An SDK code the pinned bridge forwards without establishing effect
+    gives no positive evidence of non-effect for a send: the outcome stays
+    conservatively uncertain and same-ID reconstruction cannot follow."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineSdkOperationRejectedError("mystery_failure"))
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.send(session_id, "Hello?")
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
+
+    operations = [call.operation for call in backend.calls()]
+    assert "read_messages" not in operations
+    assert "stop" not in operations

@@ -30,7 +30,11 @@ is claimed only from positively established backend evidence.
 
 Failure discipline: every backend failure translates into exactly one
 normalized #67 error with a documented safe classification grounded in the
-pinned result shape; native backend exceptions are handled and discarded so
+pinned result shape and positive code/phase evidence — a machine code the
+pinned bridge merely forwards without establishing effect never becomes a
+known pre-effect failure for an effectful operation; unproven effectful
+outcomes stay conservatively uncertain and latch reconstruction. Native
+backend exceptions are handled and discarded so
 ``__cause__``/``__context__`` stay clean; the one deliberate chain is the
 shared safe #65 ``ProtocolError`` inside ``AgentRuntimeProtocolFailureError``.
 Uncertain outcomes are never retried, never downgraded to known failures,
@@ -113,7 +117,14 @@ def _classify_backend_failure(error: ClineSdkBackendError, *, operation: str) ->
     Documented safe classification grounded in the D2 taxonomy and the
     qualified baseline (R2b/R3/R4). The backend error object itself is
     discarded by the caller after this classification; only these safe
-    machine-identifier messages survive. Deliberate non-inferences: bad
+    machine-identifier messages survive. Known pre-effect classifications
+    are preserved only where positive code/phase evidence supports them:
+    the two qualified hub transport codes classify attachment state, and a
+    pure read can never take an external effect. Any other SDK machine code
+    is forwarded by the pinned bridge without establishing whether the
+    operation took effect, so an unproven effectful ``start``/``send``/
+    ``stop`` outcome is conservatively uncertain — never a known
+    pre-effect failure, never a safe retry. Deliberate non-inferences: bad
     credentials are never inferred from ``hub_connect_failed`` alone,
     exact-session loss is never inferred from connection loss, and an
     uncertain ``start``/``send``/``stop`` is never downgraded to a safe
@@ -157,8 +168,18 @@ def _classify_backend_failure(error: ClineSdkBackendError, *, operation: str) ->
             return AgentRuntimeUnavailableError(
                 f"the connection closed before the {operation} could be served ({error.code!r})"
             )
-        return AgentRuntimeConfigurationRejectedError(
-            f"the runtime rejected the {operation} ({error.code!r})"
+        # Any other code is forwarded by the pinned bridge without
+        # establishing whether the operation took effect. For effectful
+        # operations there is no positive evidence of non-effect, so the
+        # outcome stays conservatively uncertain (and latches same-ID
+        # reconstruction); a pure read can never take an external effect,
+        # so its answered-but-unusable response is a transport-class failure.
+        if operation in _EFFECTFUL_OPERATIONS:
+            return AgentRuntimeUncertainOutcomeError(
+                f"the {operation} was rejected with an unproven effect ({error.code!r})"
+            )
+        return AgentRuntimeTransportError(
+            f"the {operation} read was answered without a usable response ({error.code!r})"
         )
     raise AssertionError(  # pragma: no cover - the D2 taxonomy is closed
         f"unclassified cline backend failure: {type(error).__name__}"
@@ -224,6 +245,12 @@ def _require_construction_inputs(context: ClineConstructionContext) -> None:
         raise AgentRuntimeConfigurationRejectedError(
             "no workflow-selected existing runtime-side working directory was "
             "supplied for this authorized construction phase"
+        )
+    if context.cwd != context.workspace_root:
+        raise AgentRuntimeConfigurationRejectedError(
+            "the workflow-selected working directory for this authorized "
+            "construction phase must identify the same runtime-side path as "
+            "both the cwd and the workspace root"
         )
 
 
@@ -317,38 +344,15 @@ class ClineAdapter(AgentRuntimeAdapter):
         assert failure is not None
         raise failure from None
 
-    def _resolve_bound_identity(self, session_id: str) -> ClineSessionIdentity:
-        """Establish the authoritative Task/role/Connection identity of a
-        bound session for role-sensitive enforcement.
-
-        The wiring-resolved durable binding is the authority; this instance's
-        memory of sessions it established is only a fast path that must agree
-        with the resolver. An establishment miss (and an empty fast path)
-        fails closed before any runtime effect without claiming session loss.
-        """
-        known = self._known_identity.get(session_id)
-        resolved = self._construction_contexts.resolve_bound_session_context(session_id)
-        if resolved is not None:
-            if known is not None and known != resolved.identity:
-                raise ValueError(
-                    "the resolved binding context disagrees with the session "
-                    "identity this adapter instance established"
-                )
-            return resolved.identity
-        if known is not None:
-            return known
-        raise AgentRuntimeConfigurationRejectedError(
-            "the bound Task/role context for the addressed external session "
-            "could not be established"
-        )
-
     def _resolve_bound_context(self, session_id: str) -> ClineConstructionContext:
         """Resolve the full construction context of an existing bound session.
 
-        Reconstruction needs the complete construction inputs (provider/model
-        pair, role Markdown override, phase-selected working directory), so
-        the resolver is the only source; the known fast-path identity cannot
-        supply them. Identity disagreement with the resolver fails closed.
+        Reconstruction and role-sensitive enforcement both resolve through
+        this method: the wiring-resolved durable binding is the sole
+        authority, and this instance's memory of sessions it established is
+        only a consistency check that must agree with the resolver — never a
+        substitute for it. An establishment miss fails closed before any
+        runtime effect without claiming session loss.
         """
         known = self._known_identity.get(session_id)
         resolved = self._construction_contexts.resolve_bound_session_context(session_id)
@@ -371,7 +375,7 @@ class ClineAdapter(AgentRuntimeAdapter):
         an unrelated Reviewer session or from a session whose bound context
         cannot be established; both fail closed before any runtime effect.
         """
-        identity = self._resolve_bound_identity(session_id)
+        identity = self._resolve_bound_context(session_id).identity
         if identity.role is not WorkflowRole.PRODUCER:
             raise ValueError(
                 f"the {control} control is Producer-only; the addressed session "
@@ -548,6 +552,15 @@ class ClineAdapter(AgentRuntimeAdapter):
                 raise ValueError("target_mode must be a ClineConstructionMode")
             context = self._resolve_bound_context(session_id)
             identity = context.identity
+            reviewer_forbidden = (
+                identity.role is WorkflowRole.REVIEWER
+                and target_mode is not ClineConstructionMode.PLAN
+            )
+            if reviewer_forbidden:
+                raise ValueError(
+                    "the reviewer session remains native PLAN for the Task "
+                    "lifetime; reconstruction into ACT is refused"
+                )
             _require_construction_inputs(context)
             with self._lock_for(session_id):
                 if session_id in self._uncertain_sessions:
