@@ -12,7 +12,7 @@ PR composition response → `pr_result`:
 
 {{PR_RESULT_SCHEMA}}
 
-Workspace lifecycle response → `workspace_result` (only when OpenOrc explicitly requests Task workspace preparation or cleanup, as a distinct authorized interaction after readiness; the `session_ready` confirmation below remains only the initial protocol-readiness handshake and never means preparation is complete):
+Workspace lifecycle response → `workspace_result` (only when explicitly requested Task workspace preparation or cleanup, as a distinct authorized interaction after readiness; the `session_ready` confirmation below remains only the initial protocol-readiness handshake and never means preparation is complete):
 
 {{WORKSPACE_RESULT_SCHEMA}}
 

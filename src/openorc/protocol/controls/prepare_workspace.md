@@ -1,6 +1,6 @@
 Prepare the Task workspace for {{repository_full_name}} issue #{{issue_number}}.
 
-OpenOrc has authorized preparation of your isolated Task checkout:
+You have been authorized preparation of your isolated Task checkout:
 
 - Task: {{task_uuid}}
 - Repository: {{repository_full_name}}
