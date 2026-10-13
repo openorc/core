@@ -34,12 +34,16 @@ from openorc.protocol.models import (
     REVIEW_OUTCOME_CHANGES_REQUESTED,
     REVIEW_RESULT_FAMILY,
     SESSION_READY_FAMILY,
+    WORKSPACE_OPERATION_CLEANUP,
+    WORKSPACE_OPERATION_PREPARE,
+    WORKSPACE_RESULT_FAMILY,
     ImplementationResult,
     PlanResult,
     PrResult,
     ReviewFinding,
     ReviewResult,
     SessionReady,
+    WorkspaceResult,
 )
 
 _RAW_PAYLOAD_MARKER = "UNTRUSTED-AGENT-PAYLOAD-MARKER-42"
@@ -72,6 +76,14 @@ def _valid_payload(family: str) -> dict[str, Any]:
             "changes": ["Added the thing.", "Added tests for the thing."],
             "validation": [".venv/bin/python -m pytest", ".venv/bin/python -m ruff check ."],
             "notes": None,
+        }
+    if family == WORKSPACE_RESULT_FAMILY:
+        return {
+            "type": "workspace_result",
+            "schema_version": 1,
+            "operation": "PREPARE",
+            "status": "COMPLETED",
+            "summary": "Task checkout prepared.",
         }
     assert family == PR_RESULT_FAMILY
     return {
@@ -143,6 +155,28 @@ def test_pr_result_parses_into_a_typed_result():
     assert isinstance(result, PrResult)
     assert result.title == "Implement the thing"
     assert result.body == "Closes #1\n\nAdds the thing with tests."
+
+
+def test_workspace_result_prepare_parses_into_a_typed_result():
+    result = parsing.parse_formal_response(_json(_valid_payload(WORKSPACE_RESULT_FAMILY)))
+    assert isinstance(result, WorkspaceResult)
+    assert result.operation == WORKSPACE_OPERATION_PREPARE
+    assert result.status == "COMPLETED"
+    assert result.summary == "Task checkout prepared."
+
+
+def test_workspace_result_cleanup_failure_is_a_valid_protocol_result():
+    payload = {
+        "type": "workspace_result",
+        "schema_version": 1,
+        "operation": "CLEANUP",
+        "status": "FAILED",
+        "summary": "Could not establish safe cleanup.",
+    }
+    result = parsing.parse_formal_response(_json(payload), expected_family=WORKSPACE_RESULT_FAMILY)
+    assert isinstance(result, WorkspaceResult)
+    assert result.operation == WORKSPACE_OPERATION_CLEANUP
+    assert result.status == "FAILED"
 
 
 def test_changes_requested_is_a_valid_protocol_result_not_a_failure():
@@ -304,6 +338,13 @@ def test_expected_family_mismatch_fails():
         )
 
 
+def test_workspace_result_expected_family_mismatch_fails():
+    with pytest.raises(UnexpectedResponseTypeError):
+        parsing.parse_formal_response(
+            _json(_valid_payload(WORKSPACE_RESULT_FAMILY)), expected_family=REVIEW_RESULT_FAMILY
+        )
+
+
 @pytest.mark.parametrize(
     ("family", "payload"),
     [
@@ -367,6 +408,36 @@ def test_expected_family_mismatch_fails():
                 "findings": [{"summary": "S"}],
             },
             id="finding-missing-details",
+        ),
+        pytest.param(
+            WORKSPACE_RESULT_FAMILY,
+            {**_valid_payload(WORKSPACE_RESULT_FAMILY), "operation": "START"},
+            id="unknown-operation",
+        ),
+        pytest.param(
+            WORKSPACE_RESULT_FAMILY,
+            {**_valid_payload(WORKSPACE_RESULT_FAMILY), "status": "READY"},
+            id="unknown-status",
+        ),
+        pytest.param(
+            WORKSPACE_RESULT_FAMILY,
+            {
+                "type": "workspace_result",
+                "schema_version": 1,
+                "status": "COMPLETED",
+                "summary": "Task checkout prepared.",
+            },
+            id="missing-operation",
+        ),
+        pytest.param(
+            WORKSPACE_RESULT_FAMILY,
+            {**_valid_payload(WORKSPACE_RESULT_FAMILY), "summary": ""},
+            id="empty-summary",
+        ),
+        pytest.param(
+            WORKSPACE_RESULT_FAMILY,
+            {**_valid_payload(WORKSPACE_RESULT_FAMILY), "checkout_path": "/agent/invented"},
+            id="extra-agent-supplied-path",
         ),
     ],
 )

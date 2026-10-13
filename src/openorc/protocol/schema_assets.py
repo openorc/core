@@ -1,6 +1,6 @@
 """Loading and rendering of the canonical v1 formal-response JSON Schema assets.
 
-The five JSON Schema files shipped under ``src/openorc/protocol/schemas/`` are
+The six JSON Schema files shipped under ``src/openorc/protocol/schemas/`` are
 the sole machine-contract source of truth for OpenOrc formal responses
 (issue #65). This module is the single access path for those assets so no
 handwritten schema copies appear in Markdown or Python constants, and so

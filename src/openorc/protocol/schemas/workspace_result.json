@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "schema_version",
+    "operation",
+    "status",
+    "summary"
+  ],
+  "properties": {
+    "type": {
+      "const": "workspace_result"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "operation": {
+      "enum": [
+        "PREPARE",
+        "CLEANUP"
+      ]
+    },
+    "status": {
+      "enum": [
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

@@ -56,6 +56,7 @@ from openorc.protocol.models import (
     REVIEW_RESULT_FAMILY,
     SCHEMA_VERSION,
     SESSION_READY_FAMILY,
+    WORKSPACE_RESULT_FAMILY,
     FormalResponse,
     ImplementationResult,
     PlanResult,
@@ -63,6 +64,7 @@ from openorc.protocol.models import (
     ReviewFinding,
     ReviewResult,
     SessionReady,
+    WorkspaceResult,
 )
 
 _MAX_REPORTED_SCHEMA_ERRORS = 5
@@ -219,6 +221,10 @@ def _build_result(family: str, payload: dict[str, Any]) -> FormalResponse:
             changes=tuple(payload["changes"]),
             validation=tuple(payload["validation"]),
             notes=payload.get("notes"),
+        )
+    if family == WORKSPACE_RESULT_FAMILY:
+        return WorkspaceResult(
+            operation=payload["operation"], status=payload["status"], summary=payload["summary"]
         )
     # PR_RESULT_FAMILY is the only remaining canonical family.
     return PrResult(title=payload["title"], body=payload["body"])
