@@ -30,7 +30,9 @@ baseline):
   snapshot and post-send read: the post-send transcript must be an exact
   value extension of the snapshot, and only the appended suffix may
   satisfy a new assignment. Evidence from earlier review revisions on the
-  persistent session can never verify a new one.
+  persistent session can never verify a new one. A failed post-send
+  transcript read likewise withholds the review result: a completed send
+  is never reclassified as a pre-effect outcome.
 - The PR-head check uses final-relevant-observation semantics: among the
   successfully parsed assigned-PR reads of the turn, the last one must
   report ``head.sha`` equal to the assigned SHA. An earlier stale read is
@@ -42,11 +44,13 @@ baseline):
 - The file-read check requires at least one successful commit-addressed
   read: ``Github__get_file_contents`` for the assigned repository with
   ``ref == assigned SHA`` whose result binds the same commit through its
-  ``repo://<owner>/<repo>/sha/<sha>/contents/<path>`` resource URI (or an
-  equivalently explicit pinned-result commit binding; the qualified
-  baseline exposes exactly this URI shape). The blob-SHA text binding is
-  deliberately unused here: verifying it requires a per-file expected
-  blob-hash registry, which this seam excludes.
+  structured ``resource.uri`` field — ``repo://<owner>/<repo>/sha/<sha>/
+  contents/<path>`` (the qualified baseline exposes exactly this shape).
+  Returned text — including repository-controlled file content — is
+  untrusted and is never scanned for bindings: only the structured
+  resource URI counts. The blob-SHA text binding is deliberately unused
+  here: verifying it requires a per-file expected blob-hash registry,
+  which this seam excludes.
 - Model prose is never evidence. A syntactically valid ``review_result``
   with failing subject evidence is not released: the adapter raises
   :class:`ClineReviewSubjectUnverifiedError`, a safe non-content-bearing
@@ -75,6 +79,7 @@ from openorc.protocol.interaction import PrReviewSubject
 
 __all__ = [
     "ClineReviewSubjectUnverifiedError",
+    "UNREADABLE_EVIDENCE",
     "verify_pr_review_turn",
 ]
 
@@ -110,6 +115,13 @@ _MISSING_FILE_READ: Final = (
     "no successful commit-addressed read at the assigned head was observed in the review turn"
 )
 _UNSAFE_BOUNDARY: Final = "the current-turn transcript boundary could not be safely established"
+
+# The one safe reason the adapter itself raises: a completed review send's
+# verification transcript could not be read, so the result is withheld
+# without any pre-effect classification of the completed send.
+UNREADABLE_EVIDENCE: Final = (
+    "the review turn completed but its verification transcript could not be read"
+)
 
 
 class ClineReviewSubjectUnverifiedError(AgentRuntimeError):
@@ -222,16 +234,60 @@ def _extract_head_sha(result_content: object) -> str | None:
     return None
 
 
-def _result_binds_commit(result_content: object, owner: str, repo: str, sha: str) -> bool:
-    """Whether one file-read result explicitly binds the assigned commit.
+def _collect_resource_uris(content: object) -> list[str]:
+    """The structured ``resource.uri`` values of one tool-result content payload.
 
-    The qualified binding is the result's ``repo://<owner>/<repo>/sha/<sha>/
-    contents/<path>`` resource URI: the URI's repository and commit must
-    equal the assignment. Content text alone is never a binding.
+    Only structured MCP resource items count: the ``resource.uri`` field of a
+    resource item, reached through ``content`` wrapper lists/objects. Returned
+    text — including repository-controlled file content — is untrusted and is
+    never scanned for bindings, and a ``text`` item is never parsed. A
+    JSON-encoded MCP wrapper string is unwrapped to its structured fields,
+    since the pinned baseline encodes the result wrapper that way.
     """
-    text = _flatten_result_content(result_content)
-    for match in _COMMIT_URI.finditer(text):
-        if match.group(1) == owner and match.group(2) == repo and match.group(3) == sha:
+    if isinstance(content, str):
+        stripped = content.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return []
+        if isinstance(parsed, dict | list):
+            return _collect_resource_uris(parsed)
+        return []
+    if isinstance(content, list):
+        uris: list[str] = []
+        for item in content:
+            uris.extend(_collect_resource_uris(item))
+        return uris
+    if isinstance(content, dict):
+        inner = content.get("content")
+        if inner is not None:
+            return _collect_resource_uris(inner)
+        resource = content.get("resource")
+        if isinstance(resource, dict) and isinstance(resource.get("uri"), str):
+            return [resource["uri"]]
+    return []
+
+
+def _result_binds_commit(result_content: object, owner: str, repo: str, sha: str) -> bool:
+    """Whether one file-read result's structured resource URI binds the commit.
+
+    The qualified binding is the result's structured ``resource.uri`` field —
+    ``repo://<owner>/<repo>/sha/<sha>/contents/<path>`` — with the URI's
+    repository and commit equal to the assignment. Returned text is never
+    scanned: a matching URI appearing as ordinary tool-returned text (for
+    example inside repository-controlled file content) is not tool evidence
+    of the binding.
+    """
+    for uri in _collect_resource_uris(result_content):
+        match = _COMMIT_URI.match(uri)
+        if (
+            match is not None
+            and match.group(1) == owner
+            and match.group(2) == repo
+            and match.group(3) == sha
+        ):
             return True
     return False
 

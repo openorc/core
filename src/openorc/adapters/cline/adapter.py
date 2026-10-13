@@ -80,7 +80,11 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
-from openorc.adapters.cline.review_subject import verify_pr_review_turn
+from openorc.adapters.cline.review_subject import (
+    UNREADABLE_EVIDENCE,
+    ClineReviewSubjectUnverifiedError,
+    verify_pr_review_turn,
+)
 from openorc.adapters.cline.values import ClineConstructionMode, ClineStartRequest, JsonObject
 from openorc.domain.connections import WorkflowRole
 from openorc.observability import annotate_span, application_span
@@ -571,8 +575,12 @@ class ClineAdapter(AgentRuntimeAdapter):
         :class:`openorc.adapters.cline.review_subject.ClineReviewSubjectUnverifiedError`
         without retry. A failed pre-send read means the boundary cannot even
         be attempted: the normalized backend error surfaces before any send,
-        so no unverifiable review is ever delivered. No new session, no
-        reconstruction, no GitHub/workflow authority is introduced here; the
+        so no unverifiable review is ever delivered. A failed post-send
+        evidence read also withholds the result — as the same safe unverified
+        failure, never as a pre-effect classification of the already-completed
+        send, so no caller can blind-replay the interaction. No new session,
+        no reconstruction, no GitHub/workflow authority is introduced here;
+        the
         assigned SHA stays OpenOrc/GitHub-owned and the workflow owns every
         subsequent current-head check.
         """
@@ -601,11 +609,26 @@ class ClineAdapter(AgentRuntimeAdapter):
             )
             candidate = _extract_reply_candidate(raw, phase="send")
             result = self._parse_formal_candidate(candidate, expected_family=REVIEW_RESULT_FAMILY)
-            post_turn = self._backend_operation(
-                "read_messages",
-                lambda: self._backend.read_messages(session_id),
-                session_id=session_id,
-            )
+            evidence_read_failed = False
+            try:
+                post_turn = self._backend_operation(
+                    "read_messages",
+                    lambda: self._backend.read_messages(session_id),
+                    session_id=session_id,
+                )
+            except AgentRuntimeError:
+                # The review send already completed: failing to retrieve the
+                # verification transcript withholds the review result without
+                # implying the send never occurred — no pre-effect
+                # unavailability/non-delivery classification may escape and
+                # invite a blind replay of the completed interaction. The
+                # normalized error is discarded here and the safe unverified
+                # failure is raised after this handler exits so the exception
+                # chain stays clean.
+                evidence_read_failed = True
+                post_turn = None
+        if evidence_read_failed or post_turn is None:
+            raise ClineReviewSubjectUnverifiedError(UNREADABLE_EVIDENCE)
         verify_pr_review_turn(subject, pre_turn, post_turn)
         return result
 

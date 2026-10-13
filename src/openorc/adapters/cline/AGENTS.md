@@ -57,14 +57,18 @@ PR number, and exact head SHA, and the parsed `review_result` is released only
 after current-turn `read_messages` tool evidence — paired `tool_use`/
 `tool_result` blocks for `Github__pull_request_read(method="get")` on the
 assigned PR and at least one commit-addressed
-`Github__get_file_contents(ref=<assigned SHA>)` read whose result carries the
-`repo://…/sha/<sha>/contents/…` binding — establishes access to the exact
-assigned subject (`adapters/cline/review_subject.py`). Otherwise the
-interaction fails closed with the safe, non-content-bearing
-`ClineReviewSubjectUnverifiedError`. Only the appended current-turn suffix may
-satisfy an assignment (pre-send snapshot under the per-session serialization);
-corrected stale observations are tolerated, unresolved mismatches and
-prior-turn evidence are not. Model prose is never evidence; planning reviews
+`Github__get_file_contents(ref=<assigned SHA>)` read whose structured
+`resource.uri` carries the `repo://…/sha/<sha>/contents/…` binding (returned
+text, including repository-controlled file content, is never scanned) —
+establishes access to the exact assigned subject
+(`adapters/cline/review_subject.py`). Otherwise the interaction fails closed
+with the safe, non-content-bearing `ClineReviewSubjectUnverifiedError`; a
+failed post-send evidence read likewise withholds the result without any
+pre-effect classification of the completed send. Only the appended
+current-turn suffix may satisfy an assignment (pre-send snapshot under the
+per-session serialization); corrected stale observations are tolerated,
+unresolved mismatches and prior-turn evidence are not. Model prose is never
+evidence; planning reviews
 and ordinary sends are unchanged; this seam adds no GitHub authority,
 persistence, retries, or workflow logic.
 
