@@ -49,6 +49,25 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 - Runtime-internal rebuild under the same external session identity is not an OpenOrc session replacement.
 - Unexpected loss of the bound context blocks; never silently create a new one.
 
+## PR-review subject verification (D5b, issue #163)
+
+Realizing a REVIEW control whose subject is a `PrReviewSubject` is a verified
+interaction: the caller-composed message must name the assigned repository,
+PR number, and exact head SHA, and the parsed `review_result` is released only
+after current-turn `read_messages` tool evidence — paired `tool_use`/
+`tool_result` blocks for `Github__pull_request_read(method="get")` on the
+assigned PR and at least one commit-addressed
+`Github__get_file_contents(ref=<assigned SHA>)` read whose result carries the
+`repo://…/sha/<sha>/contents/…` binding — establishes access to the exact
+assigned subject (`adapters/cline/review_subject.py`). Otherwise the
+interaction fails closed with the safe, non-content-bearing
+`ClineReviewSubjectUnverifiedError`. Only the appended current-turn suffix may
+satisfy an assignment (pre-send snapshot under the per-session serialization);
+corrected stale observations are tolerated, unresolved mismatches and
+prior-turn evidence are not. Model prose is never evidence; planning reviews
+and ordinary sends are unchanged; this seam adds no GitHub authority,
+persistence, retries, or workflow logic.
+
 ## Runtime ownership
 
 OpenOrc owns Task/role binding, exact external-session routing, workflow semantics, and the role/session configuration it deliberately selects.

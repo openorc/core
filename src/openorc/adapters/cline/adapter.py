@@ -80,11 +80,22 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
+from openorc.adapters.cline.review_subject import verify_pr_review_turn
 from openorc.adapters.cline.values import ClineConstructionMode, ClineStartRequest, JsonObject
 from openorc.domain.connections import WorkflowRole
 from openorc.observability import annotate_span, application_span
-from openorc.protocol.interaction import Interaction, InteractionKind
-from openorc.protocol.models import SESSION_READY_FAMILY, FormalResponse, SessionReady
+from openorc.protocol.interaction import (
+    Interaction,
+    InteractionKind,
+    PrReviewSubject,
+    ReviewInteraction,
+)
+from openorc.protocol.models import (
+    REVIEW_RESULT_FAMILY,
+    SESSION_READY_FAMILY,
+    FormalResponse,
+    SessionReady,
+)
 
 __all__ = ["ClineAdapter"]
 
@@ -484,12 +495,18 @@ class ClineAdapter(AgentRuntimeAdapter):
         ``ImplementInteraction`` is realized natively: the authorized same-ID
         PLAN→ACT reconstruction at the Task checkout, returning ``None`` and
         issuing no implementation prompt — the actual implementation
-        interaction is separately composed and sent by workflow code. All
-        other controls, including the #181 workspace preparation and cleanup
-        controls, take the shared prose-only path with the caller-composed
-        message and expected family; the adapter never renders control prose,
-        never decides authorization, and never changes construction context
-        from a received ``WorkspaceResult``.
+        interaction is separately composed and sent by workflow code. A
+        ``ReviewInteraction`` carrying a ``PrReviewSubject`` takes the D5b
+        verified PR-review path (:meth:`_send_verified_pr_review`): the
+        caller-composed review message is sent and the parsed
+        ``review_result`` is released only after the current-turn
+        ``read_messages`` tool evidence establishes access to the exact
+        assigned PR subject. All other controls, including planning reviews
+        and the #181 workspace preparation and cleanup controls, take the
+        shared prose-only path with the caller-composed message and expected
+        family; the adapter never renders control prose, never decides
+        authorization, and never changes construction context from a
+        received ``WorkspaceResult``.
         """
         with application_span(_TRACER_SCOPE, "cline_adapter.realize_control") as span:
             annotate_span(span, operation="cline_adapter.realize_control")
@@ -504,12 +521,93 @@ class ClineAdapter(AgentRuntimeAdapter):
                 InteractionKind.CLEANUP_WORKSPACE,
             ):
                 self._require_producer_identity(session_id, control=interaction.kind.value)
+            if isinstance(interaction, ReviewInteraction) and isinstance(
+                interaction.subject, PrReviewSubject
+            ):
+                return self._send_verified_pr_review(
+                    session_id,
+                    interaction.subject,
+                    message=message,
+                    expected_family=expected_family,
+                )
             return super().realize_control(
                 session_id,
                 interaction,
                 message=message,
                 expected_family=expected_family,
             )
+
+    def _send_verified_pr_review(
+        self,
+        session_id: str,
+        subject: PrReviewSubject,
+        *,
+        message: str | None,
+        expected_family: str | None,
+    ) -> FormalResponse:
+        """Send the composed PR-review message and verify its subject (D5b).
+
+        The caller-composed message is forwarded verbatim to the existing
+        persistent PLAN-mode Reviewer session at its neutral non-repository
+        working directory — the adapter renders no review prose and changes
+        no construction context. The caller's message must name the assigned
+        repository, PR number, and exact head SHA and direct the Reviewer to
+        inspect that PR through its native GitHub MCP, reading code at the
+        assigned SHA with commit-addressed ``get_file_contents`` reads; the
+        adapter cannot render, repair, or infer that message, and it never
+        derives the authoritative subject from message text.
+
+        Verification: under this adapter's per-session serialization, one
+        pre-send transcript snapshot is read through the public
+        ``read_messages`` surface, the formal send completes, and one
+        post-send read establishes the appended current-turn suffix. The
+        shared #65 funnel parses the reply exactly as an ordinary formal
+        send would. The typed ``review_result`` is released only when the
+        suffix's tool evidence — paired ``tool_use``/``tool_result`` blocks
+        for the two qualified native GitHub MCP shapes — establishes access
+        to the assigned PR and at least one commit-addressed code read at
+        the assigned SHA; otherwise the parsed result is discarded and the
+        interaction fails with the safe
+        :class:`openorc.adapters.cline.review_subject.ClineReviewSubjectUnverifiedError`
+        without retry. A failed pre-send read means the boundary cannot even
+        be attempted: the normalized backend error surfaces before any send,
+        so no unverifiable review is ever delivered. No new session, no
+        reconstruction, no GitHub/workflow authority is introduced here; the
+        assigned SHA stays OpenOrc/GitHub-owned and the workflow owns every
+        subsequent current-head check.
+        """
+        if message is None:
+            raise ValueError(
+                "the verified PR-review realization requires the composed "
+                "interaction message; composing it is the application layer's "
+                "obligation, never adapter prose"
+            )
+        if not message.strip():
+            raise ValueError("the composed control message must be a non-empty string")
+        if expected_family != REVIEW_RESULT_FAMILY:
+            raise ValueError(
+                "the verified PR-review realization expects the review_result response family"
+            )
+        with self._lock_for(session_id):
+            pre_turn = self._backend_operation(
+                "read_messages",
+                lambda: self._backend.read_messages(session_id),
+                session_id=session_id,
+            )
+            raw = self._backend_operation(
+                "send",
+                lambda: self._backend.send(session_id, message),
+                session_id=session_id,
+            )
+            candidate = _extract_reply_candidate(raw, phase="send")
+            result = self._parse_formal_candidate(candidate, expected_family=REVIEW_RESULT_FAMILY)
+            post_turn = self._backend_operation(
+                "read_messages",
+                lambda: self._backend.read_messages(session_id),
+                session_id=session_id,
+            )
+        verify_pr_review_turn(subject, pre_turn, post_turn)
+        return result
 
     def reconstruct_session(
         self,

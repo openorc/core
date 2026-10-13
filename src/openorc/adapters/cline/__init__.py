@@ -25,6 +25,7 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
+from openorc.adapters.cline.review_subject import ClineReviewSubjectUnverifiedError
 from openorc.adapters.cline.values import (
     ClineConstructionMode,
     ClineRemoteConfig,
@@ -46,6 +47,7 @@ __all__ = [
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineRemoteConfig",
+    "ClineReviewSubjectUnverifiedError",
     "ClineSdkBackend",
     "ClineSdkBackendError",
     "ClineSdkOperationRejectedError",
