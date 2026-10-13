@@ -13,25 +13,31 @@ authoritative-value substitution only.
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import openorc.protocol
 from openorc.protocol.controls_assets import (
+    CLEANUP_WORKSPACE_CONTROL_ASSET,
     CONTROL_ASSETS,
     PLAN_CONTROL_ASSET,
     PR_COMPOSE_CONTROL_ASSET,
+    PREPARE_WORKSPACE_CONTROL_ASSET,
     control_asset_text,
     render_control_asset,
 )
 from openorc.protocol.interaction import (
     INTERACTION_KINDS,
+    CleanupWorkspaceInteraction,
     ImplementInteraction,
     InteractionKind,
     PlanInteraction,
     PlanReviewSubject,
     PrComposeInteraction,
+    PrepareWorkspaceInteraction,
     PrReviewSubject,
     ReviewInteraction,
     ReviseInteraction,
@@ -41,6 +47,7 @@ from openorc.protocol.models import (
     PLAN_RESULT_FAMILY,
     PR_RESULT_FAMILY,
     REVIEW_RESULT_FAMILY,
+    WORKSPACE_RESULT_FAMILY,
     ReviewFinding,
     ReviewResult,
 )
@@ -49,6 +56,8 @@ _REPO = "openorc/core"
 _ISSUE = 129
 _PR_NUMBER = 42
 _HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
+_TASK_UUID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+_TARGET_DIRECTORY = "/tmp/openorc-task-checkout"
 
 _PLAN_SUBJECT = PlanReviewSubject(
     plan_revision_id="plan-rev-1",
@@ -81,8 +90,21 @@ def _repository_asset(asset: str) -> str:
 # --- Closed v1 interaction vocabulary ---
 
 
-def test_closed_interaction_vocabulary_exactly_the_five_kinds():
-    assert frozenset({"PLAN", "REVIEW", "REVISE", "IMPLEMENT", "PR_COMPOSE"}) == INTERACTION_KINDS
+def test_closed_interaction_vocabulary_exactly_the_seven_kinds():
+    assert (
+        frozenset(
+            {
+                "PLAN",
+                "REVIEW",
+                "REVISE",
+                "IMPLEMENT",
+                "PR_COMPOSE",
+                "PREPARE_WORKSPACE",
+                "CLEANUP_WORKSPACE",
+            }
+        )
+        == INTERACTION_KINDS
+    )
     assert {kind.value for kind in InteractionKind} == set(INTERACTION_KINDS)
 
 
@@ -93,8 +115,11 @@ def test_owner_reviewer_advisory_discussion_is_not_a_workflow_control():
 # --- Canonical control assets: closed set and deterministic rendering ---
 
 
-def test_only_plan_and_pr_compose_are_renderable_control_assets():
-    assert frozenset({"plan", "pr_compose"}) == CONTROL_ASSETS
+def test_only_the_four_canonical_control_assets_are_renderable():
+    assert (
+        frozenset({"plan", "pr_compose", "prepare_workspace", "cleanup_workspace"})
+        == CONTROL_ASSETS
+    )
 
 
 def test_control_assets_load_exactly_the_repository_markdown_files():
@@ -263,6 +288,145 @@ def test_pr_compose_expects_pr_result_and_has_no_publication_authorization_surfa
     }
 
 
+# --- PREPARE_WORKSPACE / CLEANUP_WORKSPACE: caller-authorized lifecycle ---
+
+
+def test_prepare_workspace_carries_the_exact_supplied_context_and_expects_workspace_result():
+    interaction = PrepareWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    assert interaction.kind is InteractionKind.PREPARE_WORKSPACE
+    assert interaction.repository_full_name == _REPO
+    assert interaction.issue_number == _ISSUE
+    assert interaction.task_uuid == _TASK_UUID
+    assert interaction.target_directory == _TARGET_DIRECTORY
+    assert interaction.expected_response_family == WORKSPACE_RESULT_FAMILY
+
+
+def test_cleanup_workspace_carries_the_exact_supplied_context_and_expects_workspace_result():
+    interaction = CleanupWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    assert interaction.kind is InteractionKind.CLEANUP_WORKSPACE
+    assert interaction.repository_full_name == _REPO
+    assert interaction.issue_number == _ISSUE
+    assert interaction.task_uuid == _TASK_UUID
+    assert interaction.target_directory == _TARGET_DIRECTORY
+    assert interaction.expected_response_family == WORKSPACE_RESULT_FAMILY
+
+
+def test_workspace_interactions_render_the_exact_canonical_assets_with_authoritative_values():
+    prepare = PrepareWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    ).render()
+    assert prepare == render_control_asset(
+        PREPARE_WORKSPACE_CONTROL_ASSET,
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    assert _REPO in prepare
+    assert f"#{_ISSUE}" in prepare
+    assert str(_TASK_UUID) in prepare
+    assert _TARGET_DIRECTORY in prepare
+
+    cleanup = CleanupWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    ).render()
+    assert cleanup == render_control_asset(
+        CLEANUP_WORKSPACE_CONTROL_ASSET,
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    assert _REPO in cleanup
+    assert f"#{_ISSUE}" in cleanup
+    assert str(_TASK_UUID) in cleanup
+    assert _TARGET_DIRECTORY in cleanup
+
+
+def test_workspace_rendering_is_deterministic_and_never_leaves_unresolved_placeholders():
+    prepare = PrepareWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    cleanup = CleanupWorkspaceInteraction(
+        repository_full_name=_REPO,
+        issue_number=_ISSUE,
+        task_uuid=_TASK_UUID,
+        target_directory=_TARGET_DIRECTORY,
+    )
+    for rendered in (prepare.render(), cleanup.render()):
+        assert "{{" not in rendered
+        assert "}}" not in rendered
+    assert prepare.render() == prepare.render()
+    assert cleanup.render() == cleanup.render()
+
+
+def test_workspace_interactions_carry_only_the_lifecycle_context_fields():
+    for model in (PrepareWorkspaceInteraction, CleanupWorkspaceInteraction):
+        fields = {f.name for f in model.__dataclass_fields__.values()}
+        assert fields == {
+            "kind",
+            "repository_full_name",
+            "issue_number",
+            "task_uuid",
+            "target_directory",
+            "expected_response_family",
+        }
+
+
+def test_workspace_interactions_reject_invalid_or_missing_context():
+    valid: dict[str, Any] = {
+        "repository_full_name": _REPO,
+        "issue_number": _ISSUE,
+        "task_uuid": _TASK_UUID,
+        "target_directory": _TARGET_DIRECTORY,
+    }
+    invalid_overrides: list[dict[str, Any]] = [
+        {"repository_full_name": ""},
+        {"repository_full_name": "   "},
+        {"issue_number": 0},
+        {"issue_number": -3},
+        {"issue_number": True},
+        {"target_directory": ""},
+        {"target_directory": "   "},
+        {"expected_response_family": PLAN_RESULT_FAMILY},
+    ]
+    for model in (PrepareWorkspaceInteraction, CleanupWorkspaceInteraction):
+        for overrides in invalid_overrides:
+            with pytest.raises(ValueError):
+                model(**{**valid, **overrides})
+        with pytest.raises(ValueError):
+            model(**{**valid, "task_uuid": "not-a-uuid"})
+
+
+def test_workspace_only_values_fail_closed_on_assets_that_do_not_use_them():
+    with pytest.raises(ValueError):
+        render_control_asset(
+            PLAN_CONTROL_ASSET,
+            repository_full_name=_REPO,
+            issue_number=_ISSUE,
+            task_uuid=_TASK_UUID,
+        )
+
+
 # --- Runtime neutrality of the interaction models ---
 
 
@@ -277,6 +441,8 @@ def test_interaction_models_carry_no_provider_or_runtime_specific_fields():
         "ReviseInteraction",
         "ImplementInteraction",
         "PrComposeInteraction",
+        "PrepareWorkspaceInteraction",
+        "CleanupWorkspaceInteraction",
         "PlanReviewSubject",
         "PrReviewSubject",
     )
@@ -310,6 +476,22 @@ def test_contradictory_interaction_kinds_are_rejected():
     with pytest.raises(ValueError):
         PrComposeInteraction(
             kind=InteractionKind.REVISE, repository_full_name=_REPO, issue_number=_ISSUE
+        )
+    with pytest.raises(ValueError):
+        PrepareWorkspaceInteraction(
+            kind=InteractionKind.CLEANUP_WORKSPACE,
+            repository_full_name=_REPO,
+            issue_number=_ISSUE,
+            task_uuid=_TASK_UUID,
+            target_directory=_TARGET_DIRECTORY,
+        )
+    with pytest.raises(ValueError):
+        CleanupWorkspaceInteraction(
+            kind=InteractionKind.PREPARE_WORKSPACE,
+            repository_full_name=_REPO,
+            issue_number=_ISSUE,
+            task_uuid=_TASK_UUID,
+            target_directory=_TARGET_DIRECTORY,
         )
 
 

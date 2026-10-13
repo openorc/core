@@ -1,7 +1,7 @@
 """Installed-artifact packaging test for the canonical schema assets (issue #65)
 and the canonical role-initialization assets (issue #66).
 
-The acceptance criterion is that the five canonical v1 JSON Schema assets are
+The acceptance criterion is that the six canonical v1 JSON Schema assets are
 loadable from an installed-package path through the schema-asset helpers — not
 merely present in the repository or a ZIP listing — and that the two canonical
 role-initialization assets load, render their controlled schema insertion
@@ -15,9 +15,10 @@ asserts the resources resolve inside site-packages.
 The exercised import chain is dependency-free by design:
 ``openorc/__init__.py`` carries only version metadata,
 ``openorc/protocol/__init__.py`` is documentation only, and the exercised
-protocol modules (``models``, ``schema_assets``, ``initialization_assets``)
-import only the standard library. If that changes, this test fails and the
-artifact check must install the wheel's dependencies explicitly.
+protocol modules (``models``, ``schema_assets``, ``initialization_assets``,
+``controls_assets``) import only the standard library. If that changes, this
+test fails and the artifact check must install the wheel's dependencies
+explicitly.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from openorc.protocol.models import (
     PR_RESULT_FAMILY,
     REVIEW_RESULT_FAMILY,
     SESSION_READY_FAMILY,
+    WORKSPACE_RESULT_FAMILY,
 )
 
 # Role wiring for the controlled schema insertion points (issue #66), mirrored
@@ -44,6 +46,7 @@ _ROLE_FAMILIES = {
         PLAN_RESULT_FAMILY,
         IMPLEMENTATION_RESULT_FAMILY,
         PR_RESULT_FAMILY,
+        WORKSPACE_RESULT_FAMILY,
         SESSION_READY_FAMILY,
     ),
     "reviewer": (REVIEW_RESULT_FAMILY, SESSION_READY_FAMILY),
@@ -53,6 +56,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _ARTIFACT_CHECK_SCRIPT = """
 import json
+import uuid
 from pathlib import Path
 
 from openorc import protocol
@@ -83,16 +87,34 @@ for role, role_families in expected_role_families.items():
     assert composed == rendered + delimiter + guidance, role
 
 control_assets = {control_assets!r}
+plain_control_assets = ("plan", "pr_compose")
+workspace_control_assets = ("prepare_workspace", "cleanup_workspace")
 for asset in control_assets:
     asset_path = package_dir / "controls" / (asset + ".md")
-    text = controls_assets.control_asset_text(asset)
-    assert text == asset_path.read_text(encoding="utf-8"), asset
+    assert controls_assets.control_asset_text(asset) == asset_path.read_text(
+        encoding="utf-8"
+    ), asset
+for asset in plain_control_assets:
     rendered_control = controls_assets.render_control_asset(
         asset, repository_full_name="openorc/core", issue_number=129
     )
     assert (chr(123) * 2) not in rendered_control, asset
     assert "openorc/core" in rendered_control, asset
     assert "#129" in rendered_control, asset
+task_uuid = uuid.UUID("00000000-0000-0000-0000-000000000181")
+for asset in workspace_control_assets:
+    rendered_control = controls_assets.render_control_asset(
+        asset,
+        repository_full_name="openorc/core",
+        issue_number=181,
+        task_uuid=task_uuid,
+        target_directory="/tmp/openorc-task-checkout-181",
+    )
+    assert (chr(123) * 2) not in rendered_control, asset
+    assert "openorc/core" in rendered_control, asset
+    assert "#181" in rendered_control, asset
+    assert str(task_uuid) in rendered_control, asset
+    assert "/tmp/openorc-task-checkout-181" in rendered_control, asset
 
 print("PACKAGING_OK")
 """

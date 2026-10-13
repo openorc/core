@@ -1,14 +1,27 @@
-"""The closed runtime-neutral v1 semantic interaction/control model (issue #129).
+"""The closed runtime-neutral v1 semantic interaction/control model (issues
+#129 and #181).
 
-OpenOrc drives the proven v1 Producer/Reviewer flow through exactly five
-semantic interactions: ``PLAN``, ``REVIEW``, ``REVISE``, ``IMPLEMENT``, and
-``PR_COMPOSE``. The vocabulary is closed — every other name is rejected —
-because workflow semantics do not imply prompt prose:
+OpenOrc drives the proven v1 Producer/Reviewer flow through exactly seven
+semantic interactions: ``PLAN``, ``REVIEW``, ``REVISE``, ``IMPLEMENT``,
+``PR_COMPOSE``, ``PREPARE_WORKSPACE``, and ``CLEANUP_WORKSPACE``. The
+vocabulary is closed — every other name is rejected — because workflow
+semantics do not imply prompt prose:
 
 - PLAN renders the canonical ``controls/plan.md`` asset deterministically.
 - PR_COMPOSE renders the canonical ``controls/pr_compose.md`` asset
   deterministically; it is presentation-only and never authorizes or performs
   GitHub PR creation.
+- PREPARE_WORKSPACE and CLEANUP_WORKSPACE (issue #181) render the canonical
+  ``controls/prepare_workspace.md`` and ``controls/cleanup_workspace.md``
+  assets deterministically: they ask the Producer to prepare its own isolated
+  Task checkout at the exact OpenOrc-supplied destination by cloning the
+  authoritative repository there, or to remove only that Task checkout after
+  the calling workflow has separately authorized cleanup. They carry the exact
+  caller-supplied authoritative context (repository, issue, Task UUID, target
+  checkout directory) and expect a ``workspace_result``, whose agent-reported
+  operational status is never authority for Task identity, checkout location,
+  merge state, or session binding; operation matching and workflow
+  consequences belong to calling services.
 - REVIEW is exact-subject: the OpenOrc-supplied planning or canonical PR/head
   subject is the artifact the returned ``review_result`` is bound to, kept
   structurally distinct from agent-authored output. There is no implementation
@@ -37,6 +50,7 @@ Standard library imports only, like the rest of the protocol package.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final
@@ -48,6 +62,7 @@ from openorc.protocol.models import (
     PLAN_RESULT_FAMILY,
     PR_RESULT_FAMILY,
     REVIEW_RESULT_FAMILY,
+    WORKSPACE_RESULT_FAMILY,
     ReviewResult,
 )
 
@@ -62,6 +77,8 @@ class InteractionKind(StrEnum):
     REVISE = "REVISE"
     IMPLEMENT = "IMPLEMENT"
     PR_COMPOSE = "PR_COMPOSE"
+    PREPARE_WORKSPACE = "PREPARE_WORKSPACE"
+    CLEANUP_WORKSPACE = "CLEANUP_WORKSPACE"
 
 
 INTERACTION_KINDS: Final[frozenset[str]] = frozenset(kind.value for kind in InteractionKind)
@@ -258,11 +275,130 @@ class PrComposeInteraction:
         return append_subordinate_guidance(rendered, self.guidance)
 
 
+def _validate_workspace_context(
+    *,
+    repository_full_name: str,
+    issue_number: int,
+    task_uuid: uuid.UUID,
+    target_directory: str,
+) -> None:
+    """Validate only the input shapes of the caller-supplied authoritative
+    workspace context. The protocol never checks filesystem existence, never
+    invents a default base, never computes a Task path, and never infers
+    authorization from a field."""
+    if not isinstance(repository_full_name, str) or not repository_full_name.strip():
+        raise ValueError("workspace lifecycle interactions require a nonblank repository full name")
+    if type(issue_number) is not int or issue_number <= 0:
+        raise ValueError("workspace lifecycle interactions require a positive issue number")
+    if not isinstance(task_uuid, uuid.UUID):
+        raise ValueError("workspace lifecycle interactions require a typed Task UUID")
+    if not isinstance(target_directory, str) or not target_directory.strip():
+        raise ValueError(
+            "workspace lifecycle interactions require a nonblank target checkout directory"
+        )
+
+
+@dataclass(frozen=True)
+class PrepareWorkspaceInteraction:
+    """PREPARE_WORKSPACE: ask the Producer to prepare its own isolated Task
+    checkout at the exact OpenOrc-supplied destination, cloning the
+    authoritative repository into that directory (issue #181).
+
+    The caller supplies and owns the authoritative context; the target
+    checkout directory is an input authorized by the caller, never an
+    agent-generated path. The returned ``workspace_result`` is agent-reported
+    operational status, never authority.
+    """
+
+    repository_full_name: str
+    issue_number: int
+    task_uuid: uuid.UUID
+    target_directory: str
+    kind: InteractionKind = field(default=InteractionKind.PREPARE_WORKSPACE)
+    expected_response_family: str = WORKSPACE_RESULT_FAMILY
+
+    def __post_init__(self) -> None:
+        if self.kind is not InteractionKind.PREPARE_WORKSPACE:
+            raise ValueError(
+                "PrepareWorkspaceInteraction is the PREPARE_WORKSPACE interaction; "
+                f"received kind {self.kind!r}"
+            )
+        _validate_workspace_context(
+            repository_full_name=self.repository_full_name,
+            issue_number=self.issue_number,
+            task_uuid=self.task_uuid,
+            target_directory=self.target_directory,
+        )
+        if self.expected_response_family != WORKSPACE_RESULT_FAMILY:
+            raise ValueError(
+                "PREPARE_WORKSPACE expects the workspace_result response family; "
+                f"received {self.expected_response_family!r}"
+            )
+
+    def render(self) -> str:
+        return controls_assets.render_control_asset(
+            controls_assets.PREPARE_WORKSPACE_CONTROL_ASSET,
+            repository_full_name=self.repository_full_name,
+            issue_number=self.issue_number,
+            task_uuid=self.task_uuid,
+            target_directory=self.target_directory,
+        )
+
+
+@dataclass(frozen=True)
+class CleanupWorkspaceInteraction:
+    """CLEANUP_WORKSPACE: ask the Producer to remove only the designated
+    Task checkout after the calling workflow has separately authorized
+    cleanup (issue #181).
+
+    The caller supplies and owns the authoritative context and establishes
+    cleanup authorization; the protocol neither infers authorization from a
+    field nor performs any deletion. The returned ``workspace_result`` is
+    agent-reported operational status, never authority.
+    """
+
+    repository_full_name: str
+    issue_number: int
+    task_uuid: uuid.UUID
+    target_directory: str
+    kind: InteractionKind = field(default=InteractionKind.CLEANUP_WORKSPACE)
+    expected_response_family: str = WORKSPACE_RESULT_FAMILY
+
+    def __post_init__(self) -> None:
+        if self.kind is not InteractionKind.CLEANUP_WORKSPACE:
+            raise ValueError(
+                "CleanupWorkspaceInteraction is the CLEANUP_WORKSPACE interaction; "
+                f"received kind {self.kind!r}"
+            )
+        _validate_workspace_context(
+            repository_full_name=self.repository_full_name,
+            issue_number=self.issue_number,
+            task_uuid=self.task_uuid,
+            target_directory=self.target_directory,
+        )
+        if self.expected_response_family != WORKSPACE_RESULT_FAMILY:
+            raise ValueError(
+                "CLEANUP_WORKSPACE expects the workspace_result response family; "
+                f"received {self.expected_response_family!r}"
+            )
+
+    def render(self) -> str:
+        return controls_assets.render_control_asset(
+            controls_assets.CLEANUP_WORKSPACE_CONTROL_ASSET,
+            repository_full_name=self.repository_full_name,
+            issue_number=self.issue_number,
+            task_uuid=self.task_uuid,
+            target_directory=self.target_directory,
+        )
+
+
 Interaction = (
     PlanInteraction
     | ReviewInteraction
     | ReviseInteraction
     | ImplementInteraction
     | PrComposeInteraction
+    | PrepareWorkspaceInteraction
+    | CleanupWorkspaceInteraction
 )
 ReviewSubject = PlanReviewSubject | PrReviewSubject

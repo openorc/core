@@ -26,6 +26,7 @@ PLAN_RESULT_FAMILY: Final = "plan_result"
 REVIEW_RESULT_FAMILY: Final = "review_result"
 IMPLEMENTATION_RESULT_FAMILY: Final = "implementation_result"
 PR_RESULT_FAMILY: Final = "pr_result"
+WORKSPACE_RESULT_FAMILY: Final = "workspace_result"
 
 FORMAL_RESPONSE_FAMILIES: Final[frozenset[str]] = frozenset(
     {
@@ -34,6 +35,7 @@ FORMAL_RESPONSE_FAMILIES: Final[frozenset[str]] = frozenset(
         REVIEW_RESULT_FAMILY,
         IMPLEMENTATION_RESULT_FAMILY,
         PR_RESULT_FAMILY,
+        WORKSPACE_RESULT_FAMILY,
     }
 )
 
@@ -41,6 +43,9 @@ SCHEMA_VERSION: Final = 1
 
 REVIEW_OUTCOME_ACCEPTED: Final = "ACCEPTED"
 REVIEW_OUTCOME_CHANGES_REQUESTED: Final = "CHANGES_REQUESTED"
+
+WORKSPACE_OPERATION_PREPARE: Final = "PREPARE"
+WORKSPACE_OPERATION_CLEANUP: Final = "CLEANUP"
 
 
 @dataclass(frozen=True)
@@ -111,4 +116,24 @@ class PrResult:
     body: str
 
 
-FormalResponse = SessionReady | PlanResult | ReviewResult | ImplementationResult | PrResult
+@dataclass(frozen=True)
+class WorkspaceResult:
+    """Validated ``workspace_result`` formal response (issue #181).
+
+    Agent-reported operational status for the runtime-neutral workspace
+    lifecycle interactions (``PREPARE_WORKSPACE``/``CLEANUP_WORKSPACE``). It
+    is never a source of authority for Task identity, checkout location,
+    GitHub repository, merge state, or session binding. ``FAILED`` is a valid
+    operational result, not automatically a protocol failure; the caller
+    validates that the reported ``operation`` matches the operation it
+    requested, and application services decide the workflow consequences.
+    """
+
+    operation: str
+    status: str
+    summary: str
+
+
+FormalResponse = (
+    SessionReady | PlanResult | ReviewResult | ImplementationResult | PrResult | WorkspaceResult
+)

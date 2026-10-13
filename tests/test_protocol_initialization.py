@@ -33,7 +33,13 @@ from openorc.protocol.initialization_assets import (
 # Role wiring under test, mirrored from the module contract (composition
 # wiring only — never schema definitions).
 _ROLE_FAMILIES: dict[str, tuple[str, ...]] = {
-    PRODUCER_ROLE: ("plan_result", "implementation_result", "pr_result", "session_ready"),
+    PRODUCER_ROLE: (
+        "plan_result",
+        "implementation_result",
+        "pr_result",
+        "workspace_result",
+        "session_ready",
+    ),
     REVIEWER_ROLE: ("review_result", "session_ready"),
 }
 
@@ -78,7 +84,7 @@ def test_unknown_role_is_rejected():
         compose_initialization("spectator", None)
 
 
-def test_producer_initialization_renders_its_four_canonical_schemas():
+def test_producer_initialization_renders_its_five_canonical_schemas():
     rendered = render_initialization(PRODUCER_ROLE)
     for family in _ROLE_FAMILIES[PRODUCER_ROLE]:
         assert schema_assets.render_schema(family) in rendered
@@ -89,7 +95,7 @@ def test_reviewer_initialization_renders_its_two_canonical_schemas():
     rendered = render_initialization(REVIEWER_ROLE)
     for family in _ROLE_FAMILIES[REVIEWER_ROLE]:
         assert schema_assets.render_schema(family) in rendered
-    for family in ("plan_result", "implementation_result", "pr_result"):
+    for family in ("plan_result", "implementation_result", "pr_result", "workspace_result"):
         assert schema_assets.render_schema(family) not in rendered
 
 

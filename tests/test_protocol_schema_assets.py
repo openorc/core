@@ -1,6 +1,6 @@
 """Canonical schema asset loading/rendering tests (issue #65).
 
-Ordinary deterministic tests: no database, no network. The five shipped JSON
+Ordinary deterministic tests: no database, no network. The six shipped JSON
 Schema files are the sole machine-contract source of truth; these tests prove
 the schema-asset helpers load and render exactly those assets (light shape
 assertions only — the schema definitions themselves are never duplicated in
