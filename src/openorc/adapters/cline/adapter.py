@@ -40,12 +40,30 @@ shared safe #65 ``ProtocolError`` inside ``AgentRuntimeProtocolFailureError``.
 Uncertain outcomes are never retried, never downgraded to known failures,
 and latch the session against same-ID reconstruction until the caller's
 reconciliation work re-establishes safety.
+
+The D6a activity-control operation (``abort_activity``) is the narrow
+Cline-specific interrupt behind the authorized Owner-facing interrupt
+command and terminal Task cancellation: one public ``ClineCore.abort``
+dispatch for the exact bound Producer or Reviewer session ID, dispatched
+without the per-session send/reconstruction lock so it reaches the runtime
+while a send is still in flight. A short-lived per-session coordination
+gate orders abort against the serialized same-ID reconstruction section:
+a reconstruction that already entered its incarnation-change section makes
+the abort decline locally before any dispatch, and a reconstruction
+refuses — before its first ``read_messages``/``stop`` effect — while any
+abort of that session is outstanding, acknowledged-but-unreconciled, or
+outcome-uncertain. Outstanding aborts are counted per session, so one
+abort's known pre-effect failure can never release a concurrent abort's
+unresolved intent, and an acknowledged abort never clears the guard by
+itself: that reconciliation belongs to D6b, not to this adapter.
 """
 
 from __future__ import annotations
 
+import enum
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Final, TypeVar
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
@@ -121,9 +139,10 @@ _HUB_CONNECTION_CLOSED: Final = "hub_connection_closed"
 # successful attachment: positively pre-effect unavailability.
 _NOT_ATTACHED: Final = "not_attached"
 
-# Operations whose effect is an external session allocation or incarnation
-# change: a connection-level breakage during them leaves the effect unknown.
-_EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset({"start", "send", "stop"})
+# Operations whose effect is an external session allocation, an incarnation
+# change, or an activity interruption: a connection-level breakage during
+# them leaves the effect unknown.
+_EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset({"start", "send", "stop", "abort"})
 
 
 def _classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> AgentRuntimeError:
@@ -300,6 +319,39 @@ def _build_start_request(
     )
 
 
+class _AbortState(enum.Enum):
+    """Local coordination state of one session's activity-abort intent (D6a).
+
+    ``PENDING`` marks a registered abort whose backend outcome has not
+    settled; ``ACKNOWLEDGED`` an acknowledged dispatch whose interruption is
+    deliberately left locally unresolved for #148's reconciliation;
+    ``UNCERTAIN`` an abort whose effect could not be classified. Guard
+    states only strengthen: ``ACKNOWLEDGED`` and ``UNCERTAIN`` never
+    downgrade, and only a ``PENDING`` intent with no other outstanding
+    abort for the session may return to ``NONE`` after a known pre-effect
+    failure or positive session-not-found outcome.
+    """
+
+    NONE = "none"
+    PENDING = "pending"
+    ACKNOWLEDGED = "acknowledged"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass
+class _AbortGuard:
+    """One session's outstanding-abort accounting and guard state (D6a).
+
+    ``outstanding`` counts registered-but-unsettled ``abort_activity``
+    invocations for the session, so one abort's known pre-effect failure
+    can never release the reconstruction guard while a concurrent abort
+    for the same session is still in flight.
+    """
+
+    outstanding: int = 0
+    state: _AbortState = _AbortState.NONE
+
+
 class ClineAdapter(AgentRuntimeAdapter):
     """The official Cline Agent Runtime adapter over the #71 SDK backend seam.
 
@@ -329,6 +381,14 @@ class ClineAdapter(AgentRuntimeAdapter):
         # same-ID reconstruction is refused until the caller's reconciliation
         # work re-establishes safety. No automatic clearing exists.
         self._uncertain_sessions: set[str] = set()
+        # D6a activity-abort coordination: per-session outstanding-abort
+        # accounting plus the reconstruction-active set, ordered against the
+        # send/reconstruction locks through one short-lived coordination lock
+        # (send lock -> coordination lock; the abort path takes only the
+        # coordination lock and never waits on the send lock).
+        self._abort_coordination = threading.Lock()
+        self._abort_guards: dict[str, _AbortGuard] = {}
+        self._reconstruction_active: set[str] = set()
 
     def _lock_for(self, session_id: str) -> threading.Lock:
         return self._session_locks.setdefault(session_id, threading.Lock())
@@ -632,6 +692,102 @@ class ClineAdapter(AgentRuntimeAdapter):
         verify_pr_review_turn(subject, pre_turn, post_turn)
         return result
 
+    def abort_activity(self, session_id: str) -> None:
+        """Interrupt the active Cline activity of the exact bound session (D6a).
+
+        The narrow Cline-specific activity control behind the authorized
+        Owner-facing interrupt command and, separately, terminal Task
+        cancellation: dispatch exactly one public ``ClineCore.abort`` for the
+        exact external session ID of a bound Task/role session — Producer or
+        Reviewer alike. It is not OpenOrc Task cancellation, session
+        deletion, a resume command, or ``stop(sessionId)``: the same
+        ``TaskAgentSession``, external session ID, and retained conversation
+        are preserved, no replacement session or new conversational prompt is
+        created, and no required abort reason exists (the backend's optional
+        default is used; Owner prose or Task content is never passed to the
+        runtime or exported as telemetry).
+
+        Concurrency: the dispatch deliberately does not take this adapter's
+        per-session send/reconstruction lock — an abort must reach the
+        backend while an ordinary or verified-PR-review ``send`` is still in
+        flight, with other sessions unaffected. A short-lived per-session
+        coordination gate orders the abort against the serialized
+        ``read_messages`` → ``stop`` → ``start`` reconstruction section: a
+        reconstruction that already entered its incarnation-change section
+        makes the abort decline locally with a safe known pre-dispatch
+        unavailability (never a queued interruption of a possibly new
+        incarnation), and a reconstruction refuses — before its first
+        ``read_messages``/``stop`` effect — while any abort of the session
+        is outstanding, acknowledged-but-unreconciled, or outcome-uncertain.
+        Outstanding aborts are counted per session, so one abort's known
+        pre-effect failure can never release another concurrent abort's
+        unresolved intent.
+
+        A normal return means the abort request was acknowledged — not that
+        the active turn is fully quiescent, that an in-flight ``send``
+        definitively failed, or that a later workflow result cannot arrive.
+        An acknowledged or uncertain interruption stays locally unresolved
+        for #148's reconciliation through public runtime state; no
+        ``resume()`` operation exists here, and any subsequent authorized
+        interaction uses the existing exact-session send path. Caller
+        authorization and Task/Execution consequences stay entirely with the
+        application layer.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.abort_activity") as span:
+            annotate_span(span, operation="cline_adapter.abort_activity")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            self._resolve_bound_context(session_id)
+            with self._abort_coordination:
+                if session_id in self._reconstruction_active:
+                    raise AgentRuntimeUnavailableError(
+                        "the session's runtime incarnation is changing; the "
+                        "activity abort is declined before dispatch"
+                    )
+                guard = self._abort_guards.get(session_id)
+                if guard is None:
+                    guard = _AbortGuard()
+                    self._abort_guards[session_id] = guard
+                guard.outstanding += 1
+                if guard.state is _AbortState.NONE:
+                    guard.state = _AbortState.PENDING
+            try:
+                self._backend_operation(
+                    "abort",
+                    lambda: self._backend.abort(session_id),
+                    session_id=session_id,
+                )
+            except AgentRuntimeError as failure:
+                self._settle_abort(session_id, failure)
+                raise
+            self._settle_abort(session_id, None)
+
+    def _settle_abort(self, session_id: str, failure: AgentRuntimeError | None) -> None:
+        """Settle one outstanding abort against the per-session guard (D6a).
+
+        Acknowledgement and uncertainty are sticky: an acknowledged abort
+        stays locally unresolved until #148's reconciliation, and an
+        uncertain abort keeps both its guard state and the D5a uncertain
+        latch already applied by ``_backend_operation``. Only a ``PENDING``
+        intent with no other outstanding abort may return to ``NONE`` after
+        a known pre-effect failure or positive session-not-found outcome —
+        the operation verifiably never reached the runtime, so the D5a
+        baseline reconstruction safety applies again. No clearing or retry
+        procedure exists beyond this.
+        """
+        with self._abort_coordination:
+            guard = self._abort_guards.get(session_id)
+            if guard is None:  # pragma: no cover - registration precedes settlement
+                return
+            guard.outstanding -= 1
+            if failure is None:
+                if guard.state is not _AbortState.UNCERTAIN:
+                    guard.state = _AbortState.ACKNOWLEDGED
+            elif isinstance(failure, AgentRuntimeUncertainOutcomeError):
+                guard.state = _AbortState.UNCERTAIN
+            elif guard.outstanding == 0 and guard.state is _AbortState.PENDING:
+                guard.state = _AbortState.NONE
+
     def reconstruct_session(
         self,
         session_id: str,
@@ -659,7 +815,12 @@ class ClineAdapter(AgentRuntimeAdapter):
         against this adapter's own same-session sends/controls; a session
         whose last interaction ended with an uncertain outcome is refused
         (fail closed) — a concurrent in-flight send is awaited by the
-        serialization, an uncertain one is never silently displaced. The
+        serialization, an uncertain one is never silently displaced, and an
+        unresolved D6a activity interruption (an outstanding,
+        acknowledged-but-unreconciled, or outcome-uncertain abort) is
+        likewise refused before the first ``read_messages``/``stop`` effect,
+        so reconstruction never displaces the possibly active work an abort
+        was requested to interrupt. The
         bound Task/role/Connection context and the construction inputs come
         from the injected resolver's durable binding resolution; identity
         disagreement with this instance's memory fails closed. The caller
@@ -690,30 +851,43 @@ class ClineAdapter(AgentRuntimeAdapter):
                         "uncertain outcome; same-ID reconstruction safety cannot "
                         "be established"
                     )
-                messages = self._backend_operation(
-                    "read_messages",
-                    lambda: self._backend.read_messages(session_id),
-                    session_id=session_id,
-                )
-                self._backend_operation(
-                    "stop",
-                    lambda: self._backend.stop(session_id),
-                    session_id=session_id,
-                )
-                start_request = _build_start_request(
-                    context,
-                    mode=target_mode,
-                    session_id=session_id,
-                    initial_messages=messages,
-                )
-                result = self._backend_operation(
-                    "start",
-                    lambda: self._backend.start(start_request),
-                    session_id=session_id,
-                )
-            if result.session_id != session_id:
-                raise AgentRuntimeConfigurationRejectedError(
-                    "the same-ID reconstruction did not rebind the requested "
-                    "exact external session identity"
-                )
-            self._known_identity[session_id] = identity
+                try:
+                    with self._abort_coordination:
+                        self._reconstruction_active.add(session_id)
+                        guard = self._abort_guards.get(session_id)
+                        if guard is not None and guard.state is not _AbortState.NONE:
+                            raise AgentRuntimeUncertainOutcomeError(
+                                "an activity interruption of this session is "
+                                "unresolved; same-ID reconstruction safety cannot "
+                                "be established"
+                            )
+                    messages = self._backend_operation(
+                        "read_messages",
+                        lambda: self._backend.read_messages(session_id),
+                        session_id=session_id,
+                    )
+                    self._backend_operation(
+                        "stop",
+                        lambda: self._backend.stop(session_id),
+                        session_id=session_id,
+                    )
+                    start_request = _build_start_request(
+                        context,
+                        mode=target_mode,
+                        session_id=session_id,
+                        initial_messages=messages,
+                    )
+                    result = self._backend_operation(
+                        "start",
+                        lambda: self._backend.start(start_request),
+                        session_id=session_id,
+                    )
+                    if result.session_id != session_id:
+                        raise AgentRuntimeConfigurationRejectedError(
+                            "the same-ID reconstruction did not rebind the "
+                            "requested exact external session identity"
+                        )
+                finally:
+                    with self._abort_coordination:
+                        self._reconstruction_active.discard(session_id)
+                self._known_identity[session_id] = identity

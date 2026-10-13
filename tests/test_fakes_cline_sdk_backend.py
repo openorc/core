@@ -17,6 +17,7 @@ deliberately not repeated here.
 from __future__ import annotations
 
 import copy
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -516,3 +517,42 @@ def test_fake_instances_and_scripted_outcomes_are_isolated_and_deterministic() -
     assert third.get("scripted-opaque-id") is None
     third.queue_read_messages("scripted-opaque-id", [])
     assert third.read_messages("scripted-opaque-id") == []
+
+
+def test_operation_gates_hold_a_call_open_until_released() -> None:
+    """A registered gate holds the next matching call open after its
+    recording: the caller blocks on the release event, the recorded order
+    already shows the held call, and the scripted outcome follows release."""
+    backend = FakeClineSdkBackend()
+    session_id = backend.start(_start_request()).session_id
+    backend.queue_send(session_id, {"echo": "held"})
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation(OP_SEND, session_id, entered=entered, release=release)
+
+    outcomes: list[object] = []
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            outcomes.append(backend.send(session_id, "held prompt"))
+        except Exception as error:  # captured for assertion, never swallowed
+            errors.append(error)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    assert entered.wait(timeout=10.0)
+
+    assert [call.operation for call in backend.calls()] == [OP_START, OP_SEND]
+    assert outcomes == []
+    assert thread.is_alive()
+
+    release.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+    assert errors == []
+    assert outcomes == [{"echo": "held"}]
+
+    # Gates are consumed FIFO like scripts: a later unregistered send
+    # runs freely.
+    backend.send(session_id, "free prompt")
+    assert [call.operation for call in backend.calls()] == [OP_START, OP_SEND, OP_SEND]

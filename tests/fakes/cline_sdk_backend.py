@@ -50,6 +50,12 @@ Faithfulness and determinism guarantees:
   Representations withhold prompt/request content, so recorded values stay
   verbatim for assertions without entering reprs, assertion-failure text,
   or telemetry.
+- Optional deterministic operation gates: ``gate_operation`` registers a
+  FIFO ``(operation, session_id)`` gate whose next matching call — after
+  its recording — signals ``entered`` and blocks on ``release`` before
+  producing its scripted outcome. Gates exist for concurrency tests: the
+  bounded release wait is a deadlock guard, never a timing assertion, and
+  no sleeps or timers are introduced for synchronization.
 
 The fake does not enforce attachment state, call ordering, or transport
 policy — scripts own outcomes. Its ``stop``/``abort``/``dispose`` are
@@ -62,6 +68,7 @@ local attachment resource) while leaving session state untouched.
 from __future__ import annotations
 
 import copy
+import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -92,6 +99,11 @@ OP_SEND = "send"
 OP_START = "start"
 OP_STOP = "stop"
 OP_SUBSCRIBE = "subscribe"
+
+# Bounded release wait of one registered operation gate. It exists purely as
+# a deadlock guard so a misbehaving test fails on its own assertions instead
+# of hanging the suite; it is never a timing assertion.
+_GATE_RELEASE_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,16 @@ class _SubscriptionEntry:
         self.active = False
 
 
+@dataclass
+class _GateEntry:
+    """One registered operation gate, consumed by the next matching call."""
+
+    operation: str
+    session_id: str | None
+    entered: threading.Event
+    release: threading.Event
+
+
 class FakeClineSdkBackend:
     """In-memory deterministic fake of the exact #71 backend contract."""
 
@@ -158,6 +180,7 @@ class FakeClineSdkBackend:
         self._read_scripts: dict[str, deque[list[JsonObject] | ClineSdkBackendError]] = {}
         self._list_history_scripts: deque[list[JsonObject] | ClineSdkBackendError] = deque()
         self._usage_scripts: dict[str, deque[JsonObject | None | ClineSdkBackendError]] = {}
+        self._gates: deque[_GateEntry] = deque()
 
     # -- scripting surface (test-only, FIFO per operation) -----------------
 
@@ -202,6 +225,46 @@ class FakeClineSdkBackend:
     ) -> None:
         """Script one FIFO usage outcome for the exact session ID."""
         self._usage_scripts.setdefault(session_id, deque()).append(outcome)
+
+    # -- deterministic operation gates (test-only, FIFO) --------------------
+
+    def gate_operation(
+        self,
+        operation: str,
+        session_id: str | None,
+        *,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        """Register one FIFO gate for the next matching operation call.
+
+        The next call to ``operation`` targeting ``session_id`` — after its
+        recording — signals ``entered`` and blocks on ``release`` before
+        producing its scripted outcome. Entries are consumed FIFO like
+        scripts. The synchronization surface is events only: the bounded
+        release wait is a deadlock guard, never a timing assertion.
+        """
+        self._gates.append(
+            _GateEntry(
+                operation=operation,
+                session_id=session_id,
+                entered=entered,
+                release=release,
+            )
+        )
+
+    def _apply_gate(self, operation: str, session_id: str | None) -> None:
+        """Hold the caller on the next matching registered gate, if any."""
+        for index, entry in enumerate(self._gates):
+            if entry.operation == operation and entry.session_id == session_id:
+                del self._gates[index]
+                entry.entered.set()
+                if not entry.release.wait(timeout=_GATE_RELEASE_TIMEOUT_SECONDS):
+                    # Deadlock-guard expiry: proceed so a misbehaving test
+                    # fails on its own recorded-order assertions instead of
+                    # hanging the suite.
+                    return
+                return
 
     # -- deterministic event input -----------------------------------------
 
@@ -259,6 +322,7 @@ class FakeClineSdkBackend:
 
     def send(self, session_id: str, prompt: str) -> JsonObject | None:
         self._calls.append(FakeBackendCall(OP_SEND, session_id=session_id, prompt=prompt))
+        self._apply_gate(OP_SEND, session_id)
         scripted = self._send_scripts.get(session_id)
         if scripted:
             outcome = scripted.popleft()
@@ -283,6 +347,7 @@ class FakeClineSdkBackend:
 
     def abort(self, session_id: str, reason: str | None = None) -> None:
         self._calls.append(FakeBackendCall(OP_ABORT, session_id=session_id, reason=reason))
+        self._apply_gate(OP_ABORT, session_id)
         scripted = self._abort_scripts.get(session_id)
         if scripted:
             raise scripted.popleft()
@@ -307,6 +372,7 @@ class FakeClineSdkBackend:
 
     def read_messages(self, session_id: str) -> list[JsonObject]:
         self._calls.append(FakeBackendCall(OP_READ_MESSAGES, session_id=session_id))
+        self._apply_gate(OP_READ_MESSAGES, session_id)
         scripted = self._read_scripts.get(session_id)
         if scripted:
             outcome = scripted.popleft()
