@@ -61,6 +61,12 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    # The bridge targets Node 24; do not use API types from newer Node majors.
+    # Continue receiving Node 24.x type updates and security fixes.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
 
   # GitHub Actions used by the repository workflows (SHA-pinned; see note above).
   - package-ecosystem: github-actions
