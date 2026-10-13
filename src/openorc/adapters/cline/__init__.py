@@ -8,7 +8,13 @@ the same interface for deterministic tests. Runtime-specific capabilities
 stay behind this local boundary and never expand the universal contract.
 """
 
+from openorc.adapters.cline.adapter import ClineAdapter
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
+from openorc.adapters.cline.construction import (
+    ClineConstructionContext,
+    ClineConstructionContextResolver,
+    ClineSessionIdentity,
+)
 from openorc.adapters.cline.contract import ClineSdkBackend
 from openorc.adapters.cline.errors import (
     ClineBackendUncertainOutcomeError,
@@ -30,9 +36,12 @@ from openorc.adapters.cline.values import (
 )
 
 __all__ = [
+    "ClineAdapter",
     "ClineBackendUncertainOutcomeError",
     "ClineBridgeProcessBackend",
     "ClineBridgeProtocolError",
+    "ClineConstructionContext",
+    "ClineConstructionContextResolver",
     "ClineConstructionMode",
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
@@ -41,6 +50,7 @@ __all__ = [
     "ClineSdkBackendError",
     "ClineSdkOperationRejectedError",
     "ClineSessionEvent",
+    "ClineSessionIdentity",
     "ClineSessionNotFoundError",
     "ClineStartRequest",
     "ClineStartResult",
