@@ -8,6 +8,27 @@ the same interface for deterministic tests. Runtime-specific capabilities
 stay behind this local boundary and never expand the universal contract.
 """
 
+from openorc.adapters.cline.activity import (
+    ClineAccumulatedUsage,
+    ClineActivityDetail,
+    ClineActivityKind,
+    ClineActivityObservation,
+    ClineActivitySnapshot,
+    ClineCommentaryActivity,
+    ClineFinishActivity,
+    ClineIterationActivity,
+    ClineNoticeActivity,
+    ClineNoticeCategory,
+    ClineRuntimeEndedActivity,
+    ClineRuntimeErrorActivity,
+    ClineRuntimeStatusActivity,
+    ClineToolActivity,
+    ClineToolCategory,
+    ClineTurnFinishReason,
+    ClineUsageActivity,
+    project_session_event,
+    project_usage_summary,
+)
 from openorc.adapters.cline.adapter import ClineAdapter
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
 from openorc.adapters.cline.construction import (
@@ -44,19 +65,32 @@ from openorc.adapters.cline.values import (
 )
 
 __all__ = [
+    "ClineAccumulatedUsage",
     "ClineAdapter",
+    "ClineActivityDetail",
+    "ClineActivityKind",
+    "ClineActivityObservation",
+    "ClineActivitySnapshot",
     "ClineBackendUncertainOutcomeError",
     "ClineBridgeProcessBackend",
     "ClineBridgeProtocolError",
+    "ClineCommentaryActivity",
     "ClineConstructionContext",
     "ClineConstructionContextResolver",
     "ClineConstructionMode",
     "ClineDispatchCheckpoint",
+    "ClineFinishActivity",
+    "ClineIterationActivity",
+    "ClineNoticeActivity",
+    "ClineNoticeCategory",
     "ClineReconciliationResult",
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineRemoteConfig",
     "ClineReviewSubjectUnverifiedError",
+    "ClineRuntimeEndedActivity",
+    "ClineRuntimeErrorActivity",
+    "ClineRuntimeStatusActivity",
     "ClineSdkBackend",
     "ClineSdkBackendError",
     "ClineSdkOperationRejectedError",
@@ -68,6 +102,12 @@ __all__ = [
     "ClineSettlementRefusal",
     "ClineStartRequest",
     "ClineStartResult",
+    "ClineToolActivity",
+    "ClineToolCategory",
+    "ClineTurnFinishReason",
+    "ClineUsageActivity",
     "JsonObject",
     "Subscription",
+    "project_session_event",
+    "project_usage_summary",
 ]
