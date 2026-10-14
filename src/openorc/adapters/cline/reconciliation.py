@@ -21,7 +21,9 @@ Semantic distinctions (never collapsed into one another):
   existing D5a same-ID reconstruction seam can restore it.
 - ``LOST`` — the exact persisted context is positively and coherently
   established absent across independent public reads on a demonstrably
-  healthy attachment.
+  healthy attachment, gated on a demonstrated exhaustive public-history
+  contract (the pinned #71 backend contract makes no such guarantee, so
+  the adapter never asserts it today).
 - ``UNKNOWN`` — the evidence is inadequate or contradictory; continuity is
   unknown. This is the conservative default and never destroys the durable
   binding.
@@ -44,7 +46,7 @@ never enter these results, errors, logs, spans, or telemetry.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from openorc.adapters.cline.values import JsonObject
@@ -111,13 +113,27 @@ class ClineSessionEvidence:
     - ``history_presence`` — True when a successful history enumeration
       positively identifies the exact session ID, False when it
       demonstrably carries session identity and the exact ID is absent,
-      None when not consulted or inconclusive.
+      None when not consulted or inconclusive. A False answer observes
+      that the enumeration is readable, never that it exhaustively
+      enumerated every persisted session, so it is never terminal-loss
+      proof on its own.
+    - ``history_exhaustive`` — True only when the backend contract
+      demonstrates that a successful history enumeration exhaustively
+      covers every persisted session. The pinned #71 contract makes no
+      such guarantee, so the adapter never asserts it today; the flag
+      exists so a future documented contract can enable terminal-loss
+      classification without changing this seam's shape.
+
+    The raw ``transcript`` is excluded from the representation: it is
+    transient conversation content and never enters reprs, errors, logs,
+    or telemetry.
     """
 
     record_present: bool | None
-    transcript: list[JsonObject] | None
+    transcript: list[JsonObject] | None = field(repr=False)
     transcript_absent: bool
     history_presence: bool | None
+    history_exhaustive: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,7 +218,11 @@ def classify_session_evidence(
     conversation survives and the D5a same-ID reconstruction seam applies);
     terminal ``LOST`` requires the transcript to be positively absent AND
     the record positively absent AND a healthy, identity-carrying history
-    enumeration to coherently lack the exact ID; everything else — an empty
+    enumeration to coherently lack the exact ID AND a demonstrated
+    exhaustive public-history contract (``history_exhaustive``): a
+    non-exhaustive enumeration proves readability, never exhaustive
+    coverage, so an omitted older session stays ``UNKNOWN``; everything
+    else — an empty
     transcript on an established session, contradictory reads, inadequate
     evidence — stays ``UNKNOWN``. A transcript that shrank below the
     caller's checkpoint is contradictory and forces ``UNKNOWN``.
@@ -225,7 +245,15 @@ def classify_session_evidence(
         # transcript; an empty read is inadequate evidence, never loss.
         continuity = ClineSessionContinuity.UNKNOWN
     elif evidence.transcript_absent:
-        if evidence.record_present is False and evidence.history_presence is False:
+        if (
+            evidence.record_present is False
+            and evidence.history_presence is False
+            and evidence.history_exhaustive
+        ):
+            # Terminal loss additionally requires a demonstrated exhaustive
+            # public-history contract: a non-exhaustive enumeration proves
+            # readability, never that every persisted session was covered,
+            # so an omitted older session must stay unknown, not lost.
             continuity = ClineSessionContinuity.LOST
         else:
             continuity = ClineSessionContinuity.UNKNOWN

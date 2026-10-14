@@ -350,6 +350,12 @@ def _history_presence(history: list[JsonObject], session_id: str) -> bool | None
     field) and no entry matches, and None when identity cannot be
     established from the entries (inconclusive — never evidence of
     absence). Record semantics are never interpreted here.
+
+    A False answer observes that this enumeration is readable, never that
+    it exhaustively covers every persisted session: the #71 backend
+    contract guarantees no such exhaustiveness, so enumeration absence is
+    never terminal-loss proof (see
+    :func:`openorc.adapters.cline.reconciliation.classify_session_evidence`).
     """
     identifiable = False
     for entry in history:
@@ -1033,6 +1039,11 @@ class ClineAdapter(AgentRuntimeAdapter):
                     transcript=transcript,
                     transcript_absent=transcript_absent,
                     history_presence=history_presence,
+                    # The pinned #71 backend contract makes no exhaustive
+                    # public-history guarantee, so enumeration absence is
+                    # never terminal-loss proof today; a future documented
+                    # contract would assert this deliberately.
+                    history_exhaustive=False,
                 ),
                 checkpoint=checkpoint,
             )

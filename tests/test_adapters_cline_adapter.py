@@ -2146,10 +2146,13 @@ def test_reconciliation_surviving_transcript_with_non_addressable_record_is_reco
     assert "list_history" not in [call.operation for call in backend.calls()]
 
 
-def test_reconciliation_coherent_absence_on_a_healthy_attachment_is_lost() -> None:
-    """Terminal loss requires positive, coherent absence across independent
-    public reads on a demonstrably healthy attachment — never a single
-    absent read."""
+def test_reconciliation_enumeration_absence_is_unknown_without_an_exhaustive_history_contract() -> (
+    None
+):
+    """Coherent absence across reads stays unknown without a demonstrated
+    exhaustive public-history contract: a readable enumeration proves
+    readability, never that every persisted session was covered, so an
+    omitted older session is never classified terminally lost."""
     backend = FakeClineSdkBackend()
     session_id = _script_ready_session(backend)
     adapter, _ = _reconcile_instance(backend, session_id)
@@ -2159,7 +2162,7 @@ def test_reconciliation_coherent_absence_on_a_healthy_attachment_is_lost() -> No
 
     result = adapter.reconcile_session(session_id)
 
-    assert result.continuity is ClineSessionContinuity.LOST
+    assert result.continuity is ClineSessionContinuity.UNKNOWN
     assert result.transcript_message_count is None
 
 
@@ -2724,11 +2727,15 @@ def test_reconciliation_and_recovery_preserve_the_shared_attachment() -> None:
     assert operations.count("send") == 3
 
 
-def test_classification_requires_coherent_absence_for_terminal_loss() -> None:
+def test_classification_requires_a_demonstrated_exhaustive_history_contract_for_terminal_loss() -> (
+    None
+):
     """The pure classification policy: terminal loss requires positive
     transcript absence AND positive record absence AND a coherent
-    identity-carrying history absence — every weaker combination stays
-    unknown."""
+    identity-carrying history absence AND a demonstrated exhaustive
+    public-history contract. Without that contract — the pinned #71
+    baseline — even the fully coherent absence combination stays unknown,
+    and every weaker combination does too."""
     absent = ClineSessionEvidence(
         record_present=False,
         transcript=None,
@@ -2736,23 +2743,30 @@ def test_classification_requires_coherent_absence_for_terminal_loss() -> None:
         history_presence=False,
     )
     assert (
-        classify_session_evidence(absent, checkpoint=None).continuity is ClineSessionContinuity.LOST
+        classify_session_evidence(absent, checkpoint=None).continuity
+        is ClineSessionContinuity.UNKNOWN
+    )
+
+    demonstrated = replace(absent, history_exhaustive=True)
+    assert (
+        classify_session_evidence(demonstrated, checkpoint=None).continuity
+        is ClineSessionContinuity.LOST
     )
 
     for history_presence in (None, True):
-        weakened = replace(absent, history_presence=history_presence)
+        weakened = replace(demonstrated, history_presence=history_presence)
         assert (
             classify_session_evidence(weakened, checkpoint=None).continuity
             is ClineSessionContinuity.UNKNOWN
         )
 
-    contradictory_record = replace(absent, record_present=True)
+    contradictory_record = replace(demonstrated, record_present=True)
     assert (
         classify_session_evidence(contradictory_record, checkpoint=None).continuity
         is ClineSessionContinuity.UNKNOWN
     )
 
-    record_only_absence = replace(absent, transcript_absent=False, transcript=None)
+    record_only_absence = replace(demonstrated, transcript_absent=False, transcript=None)
     assert (
         classify_session_evidence(record_only_absence, checkpoint=None).continuity
         is ClineSessionContinuity.UNKNOWN
@@ -2779,6 +2793,25 @@ def test_classification_marks_a_shrunk_transcript_contradictory() -> None:
     )
     assert consistent.continuity is ClineSessionContinuity.ACCESSIBLE
     assert consistent.messages_beyond_checkpoint == 1
+
+
+def test_session_evidence_representation_withholds_the_transcript() -> None:
+    """The evidence carrier is representation-safe: the raw transcript it
+    holds transiently never enters its str or repr."""
+    evidence = ClineSessionEvidence(
+        record_present=True,
+        transcript=[
+            {
+                "id": "m1",
+                "content": [{"type": "text", "text": "SECRET-EVIDENCE-MARKER"}],
+            }
+        ],
+        transcript_absent=False,
+        history_presence=None,
+    )
+
+    assert "SECRET-EVIDENCE-MARKER" not in repr(evidence)
+    assert "SECRET-EVIDENCE-MARKER" not in str(evidence)
 
 
 def test_reconciliation_failures_stay_secret_safe() -> None:
