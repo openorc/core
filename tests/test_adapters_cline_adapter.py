@@ -7,9 +7,13 @@ with the canonical readiness handshake, verbatim exact-session interactions
 through the shared #65 funnel, the #181 workspace controls and the native
 IMPLEMENT realization, the serialized same-ID reconstruction seam (including
 cross-instance continuity over the resolver-established durable binding),
-and the normalized backend-failure classification with whole-chain secret
-safety. They reuse the already-covered #65/#66/#181 protocol behavior
-instead of re-testing it and require no database, network, or live runtime.
+the normalized backend-failure classification with whole-chain secret
+safety, and the #148 D6b interruption-reconciliation and recovery seam —
+public-state reconciliation with conservative continuity classification,
+caller-attested per-kind guard settlement, and authorized same-ID recovery
+over an already-established attachment. They reuse the already-covered
+#65/#66/#181 protocol behavior instead of re-testing it and require no
+database, network, or live runtime.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -40,8 +45,12 @@ from openorc.adapters.cline import (
     ClineConstructionContext,
     ClineConstructionContextResolver,
     ClineConstructionMode,
+    ClineDispatchCheckpoint,
     ClineReviewSubjectUnverifiedError,
+    ClineSessionContinuity,
     ClineSessionIdentity,
+    ClineSettlementOutcome,
+    ClineSettlementRefusal,
 )
 from openorc.adapters.cline.errors import (
     ClineBackendUncertainOutcomeError,
@@ -50,6 +59,10 @@ from openorc.adapters.cline.errors import (
     ClineRemoteAttachmentUnavailableError,
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
+)
+from openorc.adapters.cline.reconciliation import (
+    ClineSessionEvidence,
+    classify_session_evidence,
 )
 from openorc.adapters.cline.values import ClineStartResult
 from openorc.domain.connections import WorkflowRole
@@ -2066,3 +2079,738 @@ def test_a_known_pre_effect_abort_failure_releases_the_guard_when_settled() -> N
         "stop",
         "start",
     ]
+
+
+# --- D6b: interruption reconciliation and recovery (issue #148) ---
+
+
+def _reconcile_instance(
+    backend: FakeClineSdkBackend, session_id: str
+) -> tuple[ClineAdapter, ScriptedResolver]:
+    """A fresh adapter instance over an established binding: process-local
+    caches are empty and the resolver's durable binding is the authority."""
+    resolver = ScriptedResolver()
+    resolver.set_bound(
+        session_id,
+        _context(cwd=_TASK_CHECKOUT, workspace_root=_TASK_CHECKOUT),
+    )
+    return ClineAdapter(backend, resolver), resolver
+
+
+def test_reconciliation_reads_the_exact_bound_transcript_without_runtime_effects() -> None:
+    """A newly instantiated adapter with a resolver-proven binding inspects
+    the exact persisted transcript through public reads only: no start, no
+    initialization or send, no stop, no subscription, and no connect."""
+    backend = FakeClineSdkBackend()
+    session_id = _script_ready_session(backend)
+    adapter, _ = _reconcile_instance(backend, session_id)
+    backend.queue_get(session_id, {"sessionId": session_id, "status": "running"})
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_get_accumulated_usage(session_id, {"totalTokens": 5})
+
+    result = adapter.reconcile_session(session_id)
+
+    assert result.continuity is ClineSessionContinuity.ACCESSIBLE
+    assert result.transcript_message_count == len(_RAW_MESSAGES)
+    assert result.messages_beyond_checkpoint is None
+    assert result.record_observed is True
+    assert result.usage_observed is True
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["get", "read_messages", "get_accumulated_usage"]
+    assert "connect" not in operations
+
+
+def test_reconciliation_fails_closed_without_a_durable_binding() -> None:
+    adapter, backend, _, session_id = _ready_adapter()
+    fresh = ClineAdapter(backend, ScriptedResolver())
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        fresh.reconcile_session(session_id)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_reconciliation_surviving_transcript_with_non_addressable_record_is_recoverable() -> None:
+    """A readable persisted transcript without an addressable record is the
+    recoverable-incarnation distinction, never a terminal-loss claim."""
+    backend = FakeClineSdkBackend()
+    session_id = _script_ready_session(backend)
+    adapter, _ = _reconcile_instance(backend, session_id)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+
+    result = adapter.reconcile_session(session_id)
+
+    assert result.continuity is ClineSessionContinuity.RECOVERABLE
+    assert result.transcript_message_count == len(_RAW_MESSAGES)
+    assert result.record_observed is False
+    assert "list_history" not in [call.operation for call in backend.calls()]
+
+
+def test_reconciliation_coherent_absence_on_a_healthy_attachment_is_lost() -> None:
+    """Terminal loss requires positive, coherent absence across independent
+    public reads on a demonstrably healthy attachment — never a single
+    absent read."""
+    backend = FakeClineSdkBackend()
+    session_id = _script_ready_session(backend)
+    adapter, _ = _reconcile_instance(backend, session_id)
+    backend.queue_get(session_id, ClineSessionNotFoundError("gone"))
+    backend.queue_read_messages(session_id, ClineSessionNotFoundError("gone"))
+    backend.queue_list_history([{"sessionId": "cline-session-other"}])
+
+    result = adapter.reconcile_session(session_id)
+
+    assert result.continuity is ClineSessionContinuity.LOST
+    assert result.transcript_message_count is None
+
+
+def test_reconciliation_absence_without_coherent_history_is_unknown_not_lost() -> None:
+    """Absence without coherent corroboration stays unknown: an empty or
+    non-identifying history enumeration cannot establish terminal loss, and
+    a history that still lists the session is contradictory."""
+    backend = FakeClineSdkBackend()
+    session_id = _script_ready_session(backend)
+    adapter, _ = _reconcile_instance(backend, session_id)
+    backend.queue_get(session_id, ClineSessionNotFoundError("gone"))
+    backend.queue_read_messages(session_id, ClineSessionNotFoundError("gone"))
+    backend.queue_list_history([])
+
+    result = adapter.reconcile_session(session_id)
+    assert result.continuity is ClineSessionContinuity.UNKNOWN
+
+    backend.queue_list_history([{"sessionId": session_id}])
+    result = adapter.reconcile_session(session_id)
+    assert result.continuity is ClineSessionContinuity.UNKNOWN
+
+
+def test_reconciliation_attachment_failures_are_never_terminal_claims() -> None:
+    """An unavailable attachment or a mid-read connection loss fails closed
+    through the normalized taxonomy without any session-loss or replay
+    claim, and without latching the otherwise safe session."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_get(session_id, ClineRemoteAttachmentUnavailableError("down"))
+
+    with pytest.raises(AgentRuntimeUnavailableError):
+        adapter.reconcile_session(session_id)
+
+    backend.queue_get(
+        session_id,
+        ClineSdkOperationRejectedError("hub_connection_closed", {"close_code": 1006}),
+    )
+    with pytest.raises(AgentRuntimeUnavailableError):
+        adapter.reconcile_session(session_id)
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_reconciliation_checkpoint_observations_stay_bounded_and_claim_nothing() -> None:
+    """A caller-supplied pre-dispatch checkpoint yields only a bounded
+    new-turn observation count: it never claims delivery, never triggers a
+    duplicate send, never reconstitutes a formal result, and never clears
+    the uncertain-send latch — even with a completed record status."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    backend.queue_get(session_id, {"sessionId": session_id, "status": "completed"})
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + [{"id": "m3"}])
+    result = adapter.reconcile_session(
+        session_id,
+        checkpoint=ClineDispatchCheckpoint(transcript_message_count=len(_RAW_MESSAGES)),
+    )
+
+    assert result.continuity is ClineSessionContinuity.ACCESSIBLE
+    assert result.messages_beyond_checkpoint == 1
+    # The interrupted send plus the readiness send: reconciliation added
+    # no duplicate send and no synthetic formal result.
+    assert [call.operation for call in backend.calls()].count("send") == 2
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+
+def test_reconciliation_shrunk_transcript_is_contradictory() -> None:
+    """A transcript that shrank below the caller's pre-dispatch observation
+    is contradictory evidence: unknown continuity, no delta observation."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+
+    result = adapter.reconcile_session(
+        session_id,
+        checkpoint=ClineDispatchCheckpoint(transcript_message_count=len(_RAW_MESSAGES) + 3),
+    )
+
+    assert result.continuity is ClineSessionContinuity.UNKNOWN
+    assert result.messages_beyond_checkpoint is None
+
+
+def test_settlement_requires_positive_caller_evidence() -> None:
+    """Settlement is caller-attested: an unsatisfied attestation raises
+    before any effect and leaves every guard latched."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    with pytest.raises(ValueError, match="positive caller evidence"):
+        adapter.settle_uncertain_send(
+            session_id,
+            runtime_work_settled=False,
+            operation_accounted_for=True,
+        )
+    with pytest.raises(ValueError, match="positive caller evidence"):
+        adapter.settle_uncertain_send(
+            session_id,
+            runtime_work_settled=True,
+            operation_accounted_for=False,
+        )
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send"]
+
+
+def test_settling_an_accounted_uncertain_send_releases_only_the_send_kind() -> None:
+    """A provably accounted-for settled send releases the send-kind latch
+    and reconstruction becomes possible again — without equating record
+    status with completion and without clearing unrelated kinds."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+    assert outcome.refusal is None
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_settlement_never_clears_an_unrelated_uncertain_stop() -> None:
+    """Settling the send kind leaves an uncertain stop latched: reconstruction
+    stays refused until every applicable uncertain effect is accounted for,
+    and a later send settlement never clears the stop kind either."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    # With the send settled, an authorized reconstruction may run — and an
+    # uncertain stop inside it latches the stop kind.
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_stop(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    # A new interrupted send latches the send kind again; settling it must
+    # not clear the unrelated stop-kind uncertainty.
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted again")
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()].count("read_messages") == 1
+
+
+def test_settlement_vetoes_while_an_abort_is_outstanding_or_unresolved() -> None:
+    """An outstanding or acknowledged-but-unsettled abort is always a veto:
+    settlement returns a typed refusal and keeps every guard latched."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("abort", session_id, entered=entered, release=release)
+    abort_thread, abort_errors = _call_in_thread(lambda: adapter.abort_activity(session_id))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is False
+    assert outcome.refusal is ClineSettlementRefusal.OUTSTANDING_ABORT
+
+    release.set()
+    abort_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not abort_thread.is_alive()
+    assert abort_errors == []
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is False
+    assert outcome.refusal is ClineSettlementRefusal.UNRESOLVED_ABORT
+
+    outcome = adapter.settle_abort(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_settlement_cannot_slip_past_an_active_reconstruction() -> None:
+    """Guard settlement serializes behind the same reconstruction section:
+    it cannot clear anything while a reconstruction holds the incarnation
+    section, and only proceeds after the section ends."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+    reconstruction_thread, reconstruction_errors = _call_in_thread(
+        lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    outcomes: list[object] = []
+    settle_thread, settle_errors = _call_in_thread(
+        lambda: outcomes.append(
+            adapter.settle_abort(
+                session_id,
+                runtime_work_settled=True,
+                operation_accounted_for=True,
+            )
+        )
+    )
+    assert settle_thread.is_alive()
+
+    release.set()
+    reconstruction_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not reconstruction_thread.is_alive()
+    assert reconstruction_errors == []
+    settle_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not settle_thread.is_alive()
+    assert settle_errors == []
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert isinstance(outcome, ClineSettlementOutcome)
+    assert outcome.settled is False
+    assert outcome.refusal is ClineSettlementRefusal.NOTHING_TO_SETTLE
+
+
+def test_settling_an_uncertain_abort_releases_guard_and_latch_atomically() -> None:
+    """An uncertain abort keeps both its D6a guard and its abort-kind
+    uncertain effect; one caller-attested settlement clears both, and the
+    authorized reconstruction then succeeds — no residual generic latch."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_abort(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.abort_activity(session_id)
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    outcome = adapter.settle_abort(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+    assert outcome.refusal is None
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_abort_settlement_never_clears_an_uncertain_send() -> None:
+    """Settling the abort guard leaves an uncertain send latched: both
+    interruptions must be accounted for before reconstruction."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_abort(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.abort_activity(session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    outcome = adapter.settle_abort(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_failed_reconciliation_reads_never_latch_an_otherwise_safe_session() -> None:
+    """A pure observational read can never take an external effect: even an
+    uncertain-classified transport failure on a reconciliation read leaves
+    no unresolved runtime-effect guard behind."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_get(session_id, ClineBackendUncertainOutcomeError("timeout"))
+
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.reconcile_session(session_id)
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_recovery_reconstructs_the_same_id_after_a_qualified_restart() -> None:
+    """Surviving transcript with a non-addressable incarnation: the
+    authorized recovery runs the single same-ID seam — read_messages, a
+    positively-absent stop, and a same-ID start carrying the raw transcript
+    verbatim in the workflow-selected mode at the resolver-bound original
+    checkout, with no connect and no initialization resend."""
+    backend = FakeClineSdkBackend()
+    session_id = _script_ready_session(backend)
+    resolver = ScriptedResolver(
+        creation=_context(cwd="/elsewhere/edited", workspace_root="/elsewhere/edited")
+    )
+    resolver.set_bound(
+        session_id,
+        _context(cwd=_TASK_CHECKOUT, workspace_root=_TASK_CHECKOUT),
+    )
+    adapter = ClineAdapter(backend, resolver)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_stop(session_id, ClineSessionNotFoundError("no live incarnation"))
+
+    adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    operations = [call.operation for call in backend.calls()]
+    assert operations[-3:] == ["read_messages", "stop", "start"]
+    assert "connect" not in operations
+    rebuild = backend.calls()[-1].request
+    assert rebuild is not None
+    assert rebuild.session_id == session_id
+    assert rebuild.mode is ClineConstructionMode.ACT
+    assert rebuild.cwd == _TASK_CHECKOUT
+    assert rebuild.workspace_root == _TASK_CHECKOUT
+    assert rebuild.initial_messages == _RAW_MESSAGES
+
+
+def test_recovery_refuses_an_ambiguous_stop_failure() -> None:
+    """An uncertain stop never permits a same-ID start: the recovery fails
+    closed and the stop-kind uncertainty keeps the session guarded."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_stop(session_id, ClineBackendUncertainOutcomeError("dropped"))
+
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    operations = [call.operation for call in backend.calls()]
+    assert "start" not in operations[2:]
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()].count("read_messages") == 1
+
+
+def test_recovery_refuses_without_surviving_transcript_evidence() -> None:
+    """Recovery requires positively established surviving transcript
+    evidence: a positively absent read and an empty read on an established
+    bound session both refuse before any stop/start effect."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_read_messages(session_id, ClineSessionNotFoundError("gone"))
+
+    with pytest.raises(AgentSessionNotFoundError):
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+    operations = [call.operation for call in backend.calls()]
+    assert "stop" not in operations[2:]
+    assert "start" not in operations[2:]
+
+    empty = FakeClineSdkBackend()
+    empty_session = _script_ready_session(empty)
+    empty_resolver = ScriptedResolver()
+    empty_resolver.set_bound(
+        empty_session,
+        _context(cwd=_TASK_CHECKOUT, workspace_root=_TASK_CHECKOUT),
+    )
+    fresh = ClineAdapter(empty, empty_resolver)
+    empty.queue_read_messages(empty_session, [])
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        fresh.recover_session(empty_session, target_mode=ClineConstructionMode.ACT)
+    empty_operations = [call.operation for call in empty.calls()]
+    assert "stop" not in empty_operations
+    assert "start" not in empty_operations
+
+
+def test_recovery_refuses_while_uncertainty_or_abort_guards_remain() -> None:
+    """Recovery never displaces possibly active or unresolved work: an
+    unresolved uncertain effect or an acknowledged abort refuses the
+    recovery before the first effect until the caller settles them."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert "read_messages" not in [call.operation for call in backend.calls()]
+
+    adapter.abort_activity(session_id)
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert "read_messages" not in [call.operation for call in backend.calls()]
+
+    outcome = adapter.settle_abort(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+    outcome = adapter.settle_uncertain_send(
+        session_id,
+        runtime_work_settled=True,
+        operation_accounted_for=True,
+    )
+    assert outcome.settled is True
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+    assert [call.operation for call in backend.calls()][-3:] == [
+        "read_messages",
+        "stop",
+        "start",
+    ]
+
+
+def test_recovery_into_reviewer_act_is_refused_before_any_effect() -> None:
+    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="native PLAN"):
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_reconciliation_and_recovery_preserve_the_shared_attachment() -> None:
+    """Reconciliation and recovery consume the existing attachment: no
+    connect is ever recorded and an in-flight send on another session is
+    not disturbed or invalidated."""
+    backend = FakeClineSdkBackend()
+    producer_context = _context()
+    reviewer_context = _context(
+        _identity(role=WorkflowRole.REVIEWER),
+        cwd=_NEUTRAL_DIRECTORY,
+        workspace_root=_NEUTRAL_DIRECTORY,
+    )
+    resolver = _PairedRoleResolver(producer_context, reviewer_context)
+    producer_id = _script_ready_session(backend)
+    backend.queue_start(ClineStartResult(session_id="cline-session-2"))
+    backend.queue_send("cline-session-2", _completed(_READY_PAYLOAD))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.create_session(_creation_request())
+    adapter.create_session(_creation_request(role=WorkflowRole.REVIEWER))
+    reviewer_id = "cline-session-2"
+    resolver.bind(producer_id, _context(cwd=_TASK_CHECKOUT, workspace_root=_TASK_CHECKOUT))
+    resolver.bind(reviewer_id, reviewer_context)
+
+    backend.queue_send(reviewer_id, _completed("slow reply"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", reviewer_id, entered=entered, release=release)
+    send_thread, send_errors = _call_in_thread(lambda: adapter.send(reviewer_id, "long turn"))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    backend.queue_get(producer_id, {"sessionId": producer_id, "status": "running"})
+    backend.queue_read_messages(producer_id, list(_RAW_MESSAGES))
+    result = adapter.reconcile_session(producer_id)
+    assert result.continuity is ClineSessionContinuity.ACCESSIBLE
+    assert send_thread.is_alive()
+
+    backend.queue_read_messages(producer_id, list(_RAW_MESSAGES))
+    backend.queue_stop(producer_id, ClineSessionNotFoundError("no live incarnation"))
+    adapter.recover_session(producer_id, target_mode=ClineConstructionMode.ACT)
+    assert send_thread.is_alive()
+
+    release.set()
+    send_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not send_thread.is_alive()
+    assert send_errors == []
+
+    operations = [call.operation for call in backend.calls()]
+    assert "connect" not in operations
+    assert operations.count("send") == 3
+
+
+def test_classification_requires_coherent_absence_for_terminal_loss() -> None:
+    """The pure classification policy: terminal loss requires positive
+    transcript absence AND positive record absence AND a coherent
+    identity-carrying history absence — every weaker combination stays
+    unknown."""
+    absent = ClineSessionEvidence(
+        record_present=False,
+        transcript=None,
+        transcript_absent=True,
+        history_presence=False,
+    )
+    assert (
+        classify_session_evidence(absent, checkpoint=None).continuity is ClineSessionContinuity.LOST
+    )
+
+    for history_presence in (None, True):
+        weakened = replace(absent, history_presence=history_presence)
+        assert (
+            classify_session_evidence(weakened, checkpoint=None).continuity
+            is ClineSessionContinuity.UNKNOWN
+        )
+
+    contradictory_record = replace(absent, record_present=True)
+    assert (
+        classify_session_evidence(contradictory_record, checkpoint=None).continuity
+        is ClineSessionContinuity.UNKNOWN
+    )
+
+    record_only_absence = replace(absent, transcript_absent=False, transcript=None)
+    assert (
+        classify_session_evidence(record_only_absence, checkpoint=None).continuity
+        is ClineSessionContinuity.UNKNOWN
+    )
+
+
+def test_classification_marks_a_shrunk_transcript_contradictory() -> None:
+    evidence = ClineSessionEvidence(
+        record_present=True,
+        transcript=[{"id": "m1"}, {"id": "m2"}, {"id": "m3"}],
+        transcript_absent=False,
+        history_presence=None,
+    )
+    result = classify_session_evidence(
+        evidence,
+        checkpoint=ClineDispatchCheckpoint(transcript_message_count=5),
+    )
+    assert result.continuity is ClineSessionContinuity.UNKNOWN
+    assert result.messages_beyond_checkpoint is None
+
+    consistent = classify_session_evidence(
+        evidence,
+        checkpoint=ClineDispatchCheckpoint(transcript_message_count=2),
+    )
+    assert consistent.continuity is ClineSessionContinuity.ACCESSIBLE
+    assert consistent.messages_beyond_checkpoint == 1
+
+
+def test_reconciliation_failures_stay_secret_safe() -> None:
+    """Reconciliation and recovery failures surface only the normalized
+    safe classifications: no scripted backend text, prompt, transcript, or
+    token material enters the error string, repr, or exception chain."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_get(
+        session_id,
+        ClineBackendUncertainOutcomeError("SECRET-RECON-MARKER prompt transcript token"),
+    )
+
+    with pytest.raises(AgentRuntimeDeliveryUncertainError) as excinfo:
+        adapter.reconcile_session(session_id)
+
+    error = excinfo.value
+    assert "SECRET-RECON-MARKER" not in str(error)
+    assert "SECRET-RECON-MARKER" not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    backend.queue_stop(
+        session_id,
+        ClineBackendUncertainOutcomeError("SECRET-RECON-MARKER transcript"),
+    )
+    with pytest.raises(AgentRuntimeDeliveryUncertainError) as excinfo:
+        adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
+
+    error = excinfo.value
+    assert "SECRET-RECON-MARKER" not in str(error)
+    assert "SECRET-RECON-MARKER" not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None

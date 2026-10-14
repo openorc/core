@@ -25,6 +25,13 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
+from openorc.adapters.cline.reconciliation import (
+    ClineDispatchCheckpoint,
+    ClineReconciliationResult,
+    ClineSessionContinuity,
+    ClineSettlementOutcome,
+    ClineSettlementRefusal,
+)
 from openorc.adapters.cline.review_subject import ClineReviewSubjectUnverifiedError
 from openorc.adapters.cline.values import (
     ClineConstructionMode,
@@ -44,6 +51,8 @@ __all__ = [
     "ClineConstructionContext",
     "ClineConstructionContextResolver",
     "ClineConstructionMode",
+    "ClineDispatchCheckpoint",
+    "ClineReconciliationResult",
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineRemoteConfig",
@@ -51,9 +60,12 @@ __all__ = [
     "ClineSdkBackend",
     "ClineSdkBackendError",
     "ClineSdkOperationRejectedError",
+    "ClineSessionContinuity",
     "ClineSessionEvent",
     "ClineSessionIdentity",
     "ClineSessionNotFoundError",
+    "ClineSettlementOutcome",
+    "ClineSettlementRefusal",
     "ClineStartRequest",
     "ClineStartResult",
     "JsonObject",
