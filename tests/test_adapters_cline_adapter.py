@@ -11,9 +11,11 @@ the normalized backend-failure classification with whole-chain secret
 safety, and the #148 D6b interruption-reconciliation and recovery seam —
 public-state reconciliation with conservative continuity classification,
 caller-attested per-kind guard settlement, and authorized same-ID recovery
-over an already-established attachment. They reuse the already-covered
-#65/#66/#181 protocol behavior instead of re-testing it and require no
-database, network, or live runtime.
+over an already-established attachment — and the #164 D6c activity/usage
+observation seam: safe typed event projection, exact-binding observation
+subscriptions, and the aggregated-usage snapshot read. They reuse the
+already-covered #65/#66/#181 protocol behavior instead of re-testing it
+and require no database, network, or live runtime.
 """
 
 from __future__ import annotations
@@ -52,6 +54,25 @@ from openorc.adapters.cline import (
     ClineSettlementOutcome,
     ClineSettlementRefusal,
 )
+from openorc.adapters.cline.activity import (
+    ClineAccumulatedUsage,
+    ClineActivityKind,
+    ClineActivityObservation,
+    ClineCommentaryActivity,
+    ClineFinishActivity,
+    ClineIterationActivity,
+    ClineNoticeActivity,
+    ClineNoticeCategory,
+    ClineRuntimeEndedActivity,
+    ClineRuntimeErrorActivity,
+    ClineRuntimeStatusActivity,
+    ClineToolActivity,
+    ClineToolCategory,
+    ClineTurnFinishReason,
+    ClineUsageActivity,
+    project_session_event,
+    project_usage_summary,
+)
 from openorc.adapters.cline.errors import (
     ClineBackendUncertainOutcomeError,
     ClineBridgeProtocolError,
@@ -64,7 +85,7 @@ from openorc.adapters.cline.reconciliation import (
     ClineSessionEvidence,
     classify_session_evidence,
 )
-from openorc.adapters.cline.values import ClineStartResult
+from openorc.adapters.cline.values import ClineSessionEvent, ClineStartResult
 from openorc.domain.connections import WorkflowRole
 from openorc.protocol.interaction import (
     CleanupWorkspaceInteraction,
@@ -2847,3 +2868,1152 @@ def test_reconciliation_failures_stay_secret_safe() -> None:
     assert "SECRET-RECON-MARKER" not in repr(error)
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+# --- D6c: activity and usage observation (issue #164) ---
+
+_REASONING_SENTINEL = "SECRET-REASONING-MARKER"
+_PROMPT_SENTINEL = "SECRET-PROMPT-MARKER"
+_COMMENTARY_TEXT = "Implemented the parser and updated the failing tests."
+_TOOL_INPUT_SENTINEL = "SECRET-TOOL-INPUT-MARKER"
+_TOOL_OUTPUT_SENTINEL = "SECRET-TOOL-OUTPUT-MARKER"
+_TOOL_ERROR_SENTINEL = "SECRET-TOOL-ERROR-MARKER"
+_NOTICE_SENTINEL = "SECRET-NOTICE-MARKER"
+_DONE_TEXT_SENTINEL = "SECRET-DONE-TEXT-MARKER"
+_ERROR_TEXT_SENTINEL = "SECRET-ERROR-TEXT-MARKER"
+_SNAPSHOT_SENTINEL = "SECRET-SNAPSHOT-MARKER"
+
+_EXCLUDED_SENTINELS = (
+    _REASONING_SENTINEL,
+    _PROMPT_SENTINEL,
+    _TOOL_INPUT_SENTINEL,
+    _TOOL_OUTPUT_SENTINEL,
+    _TOOL_ERROR_SENTINEL,
+    _NOTICE_SENTINEL,
+    _DONE_TEXT_SENTINEL,
+    _ERROR_TEXT_SENTINEL,
+    _SNAPSHOT_SENTINEL,
+)
+
+
+def _agent_event(session_id: str, event: dict[str, object]) -> ClineSessionEvent:
+    return ClineSessionEvent(
+        session_id=session_id,
+        kind="agent_event",
+        payload={"sessionId": session_id, "event": event},
+    )
+
+
+def _status_event(session_id: str, status: object) -> ClineSessionEvent:
+    return ClineSessionEvent(
+        session_id=session_id,
+        kind="status",
+        payload={"sessionId": session_id, "status": status},
+    )
+
+
+def _ended_event(session_id: str, reason: object) -> ClineSessionEvent:
+    return ClineSessionEvent(
+        session_id=session_id,
+        kind="ended",
+        payload={"sessionId": session_id, "reason": reason, "ts": 1},
+    )
+
+
+def _snapshot_event(session_id: str, snapshot: dict[str, object]) -> ClineSessionEvent:
+    return ClineSessionEvent(
+        session_id=session_id,
+        kind="session_snapshot",
+        payload={"sessionId": session_id, "snapshot": snapshot},
+    )
+
+
+def _chunk_event(session_id: str, chunk: object) -> ClineSessionEvent:
+    return ClineSessionEvent(
+        session_id=session_id,
+        kind="chunk",
+        payload={"sessionId": session_id, "stream": "agent", "chunk": chunk, "ts": 1},
+    )
+
+
+def _collector() -> tuple[
+    list[ClineActivityObservation], Callable[[ClineActivityObservation], None]
+]:
+    """A recording listener and its observation list for one subscription."""
+    observations: list[ClineActivityObservation] = []
+    return observations, observations.append
+
+
+def _bound_adapter(
+    *,
+    session_id: str = "cline-session-1",
+    context: ClineConstructionContext | None = None,
+) -> tuple[ClineAdapter, FakeClineSdkBackend, ScriptedResolver, str]:
+    """A fresh adapter over a durably bound session with no construction.
+
+    The resolver carries the bound Task/role context; the backend knows no
+    session, so any construction or session-addressed effectful call would
+    fail loudly — observation seams must work without them.
+    """
+    context = context if context is not None else _context()
+    resolver = ScriptedResolver(bound={session_id: context})
+    backend = FakeClineSdkBackend()
+    return ClineAdapter(backend, resolver), backend, resolver, session_id
+
+
+def _kinds(observations: list[ClineActivityObservation]) -> list[ClineActivityKind]:
+    return [observation.kind for observation in observations]
+
+
+def _assert_sentinels_absent(observations: list[ClineActivityObservation]) -> None:
+    """No excluded sentinel appears in any observation representation."""
+    rendered = repr(observations)
+    for sentinel in _EXCLUDED_SENTINELS:
+        assert sentinel not in rendered
+        for observation in observations:
+            assert sentinel not in repr(observation)
+            assert sentinel not in str(observation)
+
+
+def test_subscribe_activity_resolves_the_durable_binding_without_construction_effects() -> None:
+    adapter, backend, resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+
+    subscription = adapter.subscribe_activity(session_id, listener)
+    backend.emit(
+        _agent_event(session_id, {"type": "iteration_start", "iteration": 1}),
+    )
+
+    assert subscription.active is True
+    assert resolver.bound_queries == [session_id]
+    assert [call.operation for call in backend.calls()] == ["subscribe"]
+    assert backend.calls()[0].session_id == session_id
+    assert _kinds(observations) == [ClineActivityKind.ITERATION_STARTED]
+    assert observations[0].session_id == session_id
+    assert isinstance(observations[0].detail, ClineIterationActivity)
+    assert observations[0].detail.iteration == 1
+
+
+def test_read_activity_snapshot_reads_public_usage_without_construction_effects() -> None:
+    adapter, backend, resolver, session_id = _bound_adapter()
+    resolver.bound_queries.clear()
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {
+            "usage": {"inputTokens": 10, "outputTokens": 20, "totalCost": 0.1},
+            "aggregateUsage": {"inputTokens": 15, "outputTokens": 25, "totalCost": 0.2},
+        },
+    )
+    snapshot = adapter.read_activity_snapshot(session_id)
+
+    assert resolver.bound_queries == [session_id]
+    assert [call.operation for call in backend.calls()] == ["get_accumulated_usage"]
+    assert backend.calls()[0].session_id == session_id
+    assert snapshot.session_id == session_id
+    assert snapshot.usage is not None
+    assert snapshot.usage.input_tokens == 10
+    assert snapshot.aggregate_usage is not None
+    assert snapshot.aggregate_usage.input_tokens == 15
+
+
+def test_subscribe_activity_refuses_an_unbound_session_before_backend_effects() -> None:
+    adapter, backend, _resolver, _session_id = _bound_adapter()
+    observations, listener = _collector()
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.subscribe_activity("unbound-session", listener)
+
+    assert backend.calls() == ()
+    assert observations == []
+
+
+def test_read_activity_snapshot_refuses_an_unbound_session_before_backend_effects() -> None:
+    adapter, backend, _resolver, _session_id = _bound_adapter()
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.read_activity_snapshot("unbound-session")
+
+    assert backend.calls() == ()
+
+
+def test_activity_subscriptions_do_not_cross_feed_between_bound_sessions() -> None:
+    adapter, backend, resolver, session_id = _bound_adapter()
+    other_session = "cline-session-2"
+    resolver.set_bound(other_session, _context(_identity(task_id=_OTHER_TASK_ID)))
+    producer_observations, producer_listener = _collector()
+    reviewer_observations, reviewer_listener = _collector()
+    adapter.subscribe_activity(session_id, producer_listener)
+    adapter.subscribe_activity(other_session, reviewer_listener)
+
+    backend.emit(_agent_event(session_id, {"type": "iteration_start", "iteration": 1}))
+    backend.emit(_agent_event(other_session, {"type": "iteration_start", "iteration": 2}))
+
+    assert _kinds(producer_observations) == [ClineActivityKind.ITERATION_STARTED]
+    assert producer_observations[0].session_id == session_id
+    assert _kinds(reviewer_observations) == [ClineActivityKind.ITERATION_STARTED]
+    assert reviewer_observations[0].session_id == other_session
+
+
+def test_project_session_event_drops_events_addressed_to_another_session() -> None:
+    event = _agent_event("cline-session-1", {"type": "iteration_start", "iteration": 1})
+
+    assert project_session_event(event, expected_session_id="cline-session-2") == []
+
+
+def test_reasoning_content_projects_indicators_without_content() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "reasoning",
+                "text": _REASONING_SENTINEL,
+                "reasoning": _REASONING_SENTINEL,
+                "accumulated": _REASONING_SENTINEL,
+                "redacted": False,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_end",
+                "contentType": "reasoning",
+                "reasoning": _REASONING_SENTINEL,
+                "text": _REASONING_SENTINEL,
+            },
+        )
+    )
+
+    assert _kinds(observations) == [
+        ClineActivityKind.THINKING_STARTED,
+        ClineActivityKind.THINKING_ENDED,
+    ]
+    assert all(observation.detail is None for observation in observations)
+    _assert_sentinels_absent(observations)
+
+
+def test_completed_assistant_text_reaches_only_its_typed_commentary_field() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_start", "contentType": "text", "text": _COMMENTARY_TEXT},
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": _COMMENTARY_TEXT},
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.COMMENTARY]
+    detail = observations[0].detail
+    assert isinstance(detail, ClineCommentaryActivity)
+    assert detail.text == _COMMENTARY_TEXT
+    assert detail.truncated is False
+
+
+def test_formal_response_envelopes_are_not_relabelled_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    for family in (
+        "session_ready",
+        "plan_result",
+        "review_result",
+        "implementation_result",
+        "workspace_result",
+        "pr_result",
+    ):
+        payload = json.dumps({"type": family, "schema_version": 1, "status": "READY"})
+        backend.emit(
+            _agent_event(
+                session_id,
+                {"type": "content_end", "contentType": "text", "text": payload},
+            )
+        )
+
+    assert observations == []
+
+
+def test_fenced_formal_responses_are_not_relabelled_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    for family in ("plan_result", "review_result", "implementation_result"):
+        payload = json.dumps({"type": family, "schema_version": 1})
+        backend.emit(
+            _agent_event(
+                session_id,
+                {
+                    "type": "content_end",
+                    "contentType": "text",
+                    "text": f"```json\n{payload}\n```",
+                },
+            )
+        )
+
+    assert observations == []
+
+
+def test_fenced_ordinary_json_still_projects_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    fenced = f"```json\n{json.dumps({'type': 'unrelated_note', 'count': 2})}\n```"
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": fenced},
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.COMMENTARY]
+    detail = observations[0].detail
+    assert isinstance(detail, ClineCommentaryActivity)
+    assert detail.text == fenced
+    assert detail.truncated is False
+
+
+def test_non_formal_json_and_prose_still_project_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_end",
+                "contentType": "text",
+                "text": json.dumps({"type": "unrelated_note", "count": 2}),
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": _COMMENTARY_TEXT},
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.COMMENTARY, ClineActivityKind.COMMENTARY]
+    details = [observation.detail for observation in observations]
+    assert all(isinstance(detail, ClineCommentaryActivity) for detail in details)
+
+
+def test_commentary_is_bounded_with_explicit_truncation() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": "x" * 2500},
+        )
+    )
+
+    detail = observations[0].detail
+    assert isinstance(detail, ClineCommentaryActivity)
+    assert detail.truncated is True
+    assert len(detail.text) == 2000
+    assert detail.text == "x" * 2000
+
+
+def test_unknown_and_malformed_events_project_nothing() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    events = [
+        ClineSessionEvent(session_id, "agent_event", {"sessionId": session_id}),
+        ClineSessionEvent(
+            session_id,
+            "agent_event",
+            {"sessionId": session_id, "event": "not-a-dict"},
+        ),
+        ClineSessionEvent(
+            session_id,
+            "agent_event",
+            {"sessionId": session_id, "event": {"type": "mystery_event"}},
+        ),
+        ClineSessionEvent(
+            session_id,
+            "agent_event",
+            {"sessionId": session_id, "event": {"type": "content_start"}},
+        ),
+        ClineSessionEvent(
+            session_id,
+            "agent_event",
+            {"sessionId": session_id, "event": {"type": "iteration_start", "iteration": 0}},
+        ),
+        ClineSessionEvent(
+            session_id,
+            "agent_event",
+            {
+                "sessionId": session_id,
+                "event": {
+                    "type": "content_update",
+                    "contentType": "text",
+                    "text": _PROMPT_SENTINEL,
+                },
+            },
+        ),
+        _agent_event(session_id, {"type": "content_start", "contentType": "media"}),
+        _chunk_event(session_id, _PROMPT_SENTINEL),
+        ClineSessionEvent(
+            session_id, "hook", {"sessionId": session_id, "hookEventName": "tool_call"}
+        ),
+        ClineSessionEvent(
+            session_id,
+            "team_progress",
+            {"sessionId": session_id, "teamName": "t", "lifecycle": {}, "summary": {}},
+        ),
+        ClineSessionEvent(
+            session_id,
+            "pending_prompts",
+            {"sessionId": session_id, "prompts": []},
+        ),
+        ClineSessionEvent(session_id, "made_up_kind", {"sessionId": session_id}),
+    ]
+    for event in events:
+        backend.emit(event)
+
+    assert observations == []
+
+
+def test_runtime_status_and_ended_events_project_bounded_bookkeeping() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(_status_event(session_id, "running"))
+    backend.emit(_status_event(session_id, "not a machine identifier"))
+    backend.emit(_ended_event(session_id, "completed"))
+    backend.emit(_ended_event(session_id, "arbitrary runtime prose"))
+    backend.emit(
+        _snapshot_event(
+            session_id,
+            {
+                "status": "running",
+                "prompt": _PROMPT_SENTINEL,
+                "messages": [_PROMPT_SENTINEL],
+                "workspace": {"cwd": _SNAPSHOT_SENTINEL},
+                "metadata": {"nested": _SNAPSHOT_SENTINEL},
+            },
+        )
+    )
+    backend.emit(_snapshot_event(session_id, {"prompt": _PROMPT_SENTINEL}))
+
+    assert _kinds(observations) == [
+        ClineActivityKind.RUNTIME_STATUS,
+        ClineActivityKind.RUNTIME_ENDED,
+        ClineActivityKind.RUNTIME_ENDED,
+        ClineActivityKind.RUNTIME_STATUS,
+    ]
+    assert isinstance(observations[0].detail, ClineRuntimeStatusActivity)
+    assert observations[0].detail.status == "running"
+    assert isinstance(observations[1].detail, ClineRuntimeEndedActivity)
+    assert observations[1].detail.reason == "completed"
+    assert isinstance(observations[2].detail, ClineRuntimeEndedActivity)
+    assert observations[2].detail.reason is None
+    assert isinstance(observations[3].detail, ClineRuntimeStatusActivity)
+    _assert_sentinels_absent(observations)
+
+
+def test_command_tool_lifecycle_projects_safe_details_without_content() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "input": {"command": _TOOL_INPUT_SENTINEL},
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_update",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "update": _TOOL_OUTPUT_SENTINEL,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_end",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "durationMs": 120,
+                "output": _TOOL_OUTPUT_SENTINEL,
+            },
+        )
+    )
+
+    assert _kinds(observations) == [
+        ClineActivityKind.TOOL_STARTED,
+        ClineActivityKind.TOOL_PROGRESS,
+        ClineActivityKind.TOOL_COMPLETED,
+    ]
+    started = observations[0].detail
+    assert isinstance(started, ClineToolActivity)
+    assert started.category is ClineToolCategory.COMMAND
+    assert started.tool_name == "run_commands"
+    assert started.tool_call_id == "call-1"
+    assert started.duration_ms is None
+    completed = observations[2].detail
+    assert isinstance(completed, ClineToolActivity)
+    assert completed.duration_ms == 120
+    _assert_sentinels_absent(observations)
+
+
+def test_file_and_mcp_tool_names_classify_conservatively() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "apply_patch",
+                "toolCallId": "call-2",
+                "input": {"path": "src/app.py"},
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "Github__pull_request_read",
+                "toolCallId": "call-3",
+                "input": {"method": "get", "extras": _TOOL_INPUT_SENTINEL},
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_start", "contentType": "tool", "toolName": "some_custom_tool"},
+        )
+    )
+    backend.emit(_agent_event(session_id, {"type": "content_start", "contentType": "tool"}))
+
+    assert _kinds(observations) == [ClineActivityKind.TOOL_STARTED] * 4
+    first, second, third, fourth = (observation.detail for observation in observations)
+    assert isinstance(first, ClineToolActivity)
+    assert isinstance(second, ClineToolActivity)
+    assert isinstance(third, ClineToolActivity)
+    assert isinstance(fourth, ClineToolActivity)
+    assert first.category is ClineToolCategory.FILE
+    assert first.tool_name == "apply_patch"
+    assert second.category is ClineToolCategory.MCP
+    assert second.tool_name == "Github__pull_request_read"
+    assert third.category is ClineToolCategory.OTHER
+    assert third.tool_name == "some_custom_tool"
+    assert fourth.category is ClineToolCategory.OTHER
+    assert fourth.tool_name is None
+    _assert_sentinels_absent(observations)
+
+
+def test_failed_tool_end_projects_failure_without_error_text() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_end",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "durationMs": 30,
+                "error": _TOOL_ERROR_SENTINEL,
+                "output": _TOOL_OUTPUT_SENTINEL,
+            },
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.TOOL_STARTED, ClineActivityKind.TOOL_FAILED]
+    _assert_sentinels_absent(observations)
+
+
+def test_missing_tool_end_never_fabricates_a_completion() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+            },
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.TOOL_STARTED]
+
+
+def test_notice_done_and_error_events_project_safe_classifications_only() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "notice",
+                "noticeType": "recovery",
+                "reason": "api_error",
+                "message": _NOTICE_SENTINEL,
+                "metadata": {"nested": _NOTICE_SENTINEL},
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "notice", "noticeType": "mystery", "message": _NOTICE_SENTINEL},
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "done",
+                "reason": "completed",
+                "text": _DONE_TEXT_SENTINEL,
+                "iterations": 3,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "done",
+                "reason": "something_unrecognized",
+                "text": _DONE_TEXT_SENTINEL,
+                "iterations": 1,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "error",
+                "error": {"message": _ERROR_TEXT_SENTINEL},
+                "errorClass": "provider_overloaded",
+                "recoverable": True,
+                "iteration": 2,
+            },
+        )
+    )
+
+    assert _kinds(observations) == [
+        ClineActivityKind.NOTICE,
+        ClineActivityKind.TURN_FINISHED,
+        ClineActivityKind.TURN_FINISHED,
+        ClineActivityKind.RUNTIME_ERROR,
+    ]
+    notice = observations[0].detail
+    assert isinstance(notice, ClineNoticeActivity)
+    assert notice.category is ClineNoticeCategory.RECOVERY
+    assert notice.reason == "api_error"
+    finished = observations[1].detail
+    assert isinstance(finished, ClineFinishActivity)
+    assert finished.reason is ClineTurnFinishReason.COMPLETED
+    assert finished.iterations == 3
+    unknown_finish = observations[2].detail
+    assert isinstance(unknown_finish, ClineFinishActivity)
+    assert unknown_finish.reason is ClineTurnFinishReason.UNKNOWN
+    runtime_error = observations[3].detail
+    assert isinstance(runtime_error, ClineRuntimeErrorActivity)
+    assert runtime_error.error_class == "provider_overloaded"
+    assert runtime_error.recoverable is True
+    assert runtime_error.iteration == 2
+    _assert_sentinels_absent(observations)
+
+
+def test_live_usage_event_projects_per_turn_figures_and_totals() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "usage",
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "cacheReadTokens": 5,
+                "cacheWriteTokens": 6,
+                "cost": 0.01,
+                "totalInputTokens": 100,
+                "totalOutputTokens": 200,
+                "totalCacheReadTokens": 50,
+                "totalCacheWriteTokens": 60,
+                "totalCost": 0.5,
+            },
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.USAGE_OBSERVED]
+    detail = observations[0].detail
+    assert isinstance(detail, ClineUsageActivity)
+    assert detail.input_tokens == 10
+    assert detail.output_tokens == 20
+    assert detail.cache_read_tokens == 5
+    assert detail.cache_write_tokens == 6
+    assert detail.cost == 0.01
+    assert detail.total_input_tokens == 100
+    assert detail.total_output_tokens == 200
+    assert detail.total_cache_read_tokens == 50
+    assert detail.total_cache_write_tokens == 60
+    assert detail.total_cost == 0.5
+
+
+def test_live_usage_event_leaves_unusable_fields_unreported() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "usage",
+                "inputTokens": "many",
+                "outputTokens": float("nan"),
+                "cacheWriteTokens": -1,
+                "cost": -0.5,
+                "totalInputTokens": True,
+                "totalOutputTokens": 30,
+            },
+        )
+    )
+
+    detail = observations[0].detail
+    assert isinstance(detail, ClineUsageActivity)
+    assert detail.input_tokens is None
+    assert detail.output_tokens is None
+    assert detail.cache_write_tokens is None
+    assert detail.cost is None
+    assert detail.total_input_tokens is None
+    assert detail.total_output_tokens == 30
+
+
+def test_snapshot_usage_parses_both_aggregation_scopes() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 20,
+                "cacheReadTokens": 5,
+                "cacheWriteTokens": 6,
+                "totalCost": 0.1,
+            },
+            "aggregateUsage": {
+                "inputTokens": 15,
+                "outputTokens": 25,
+                "cacheReadTokens": 7,
+                "cacheWriteTokens": 8,
+                "totalCost": 0.2,
+            },
+        },
+    )
+    snapshot = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(snapshot.usage, ClineAccumulatedUsage)
+    assert isinstance(snapshot.aggregate_usage, ClineAccumulatedUsage)
+    assert snapshot.usage is not snapshot.aggregate_usage
+    assert snapshot.usage.input_tokens == 10
+    assert snapshot.usage.output_tokens == 20
+    assert snapshot.usage.total_cost == 0.1
+    assert snapshot.aggregate_usage.input_tokens == 15
+    assert snapshot.aggregate_usage.output_tokens == 25
+    assert snapshot.aggregate_usage.total_cost == 0.2
+
+
+def test_snapshot_usage_preserves_scope_absence_without_substitution() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    usage_scope = {"inputTokens": 10, "outputTokens": 20, "totalCost": 0.1}
+    aggregate_scope = {"inputTokens": 15, "outputTokens": 25, "totalCost": 0.2}
+
+    backend.queue_get_accumulated_usage(session_id, {"usage": usage_scope})
+    root_only = adapter.read_activity_snapshot(session_id)
+    backend.queue_get_accumulated_usage(session_id, {"aggregateUsage": aggregate_scope})
+    aggregate_only = adapter.read_activity_snapshot(session_id)
+    backend.queue_get_accumulated_usage(session_id, None)
+    undefined = adapter.read_activity_snapshot(session_id)
+    backend.queue_get_accumulated_usage(session_id, {})
+    empty = adapter.read_activity_snapshot(session_id)
+    backend.queue_get_accumulated_usage(session_id, {"usage": "not-an-object"})
+    unusable = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(root_only.usage, ClineAccumulatedUsage)
+    assert root_only.usage.input_tokens == 10
+    assert root_only.aggregate_usage is None
+    assert aggregate_only.usage is None
+    assert isinstance(aggregate_only.aggregate_usage, ClineAccumulatedUsage)
+    assert aggregate_only.aggregate_usage.input_tokens == 15
+    assert undefined.usage is None
+    assert undefined.aggregate_usage is None
+    assert empty.usage is None
+    assert empty.aggregate_usage is None
+    assert unusable.usage is None
+    assert unusable.aggregate_usage is None
+
+
+def test_snapshot_usage_leaves_unusable_fields_unreported() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {
+            "aggregateUsage": {
+                "inputTokens": float("nan"),
+                "outputTokens": "many",
+                "cacheReadTokens": True,
+                "cacheWriteTokens": -2,
+                "totalCost": 0.3,
+            }
+        },
+    )
+    snapshot = adapter.read_activity_snapshot(session_id)
+
+    assert snapshot.usage is None
+    assert snapshot.aggregate_usage is not None
+    assert snapshot.aggregate_usage.input_tokens is None
+    assert snapshot.aggregate_usage.output_tokens is None
+    assert snapshot.aggregate_usage.cache_read_tokens is None
+    assert snapshot.aggregate_usage.cache_write_tokens is None
+    assert snapshot.aggregate_usage.total_cost == 0.3
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {"usage": {"inputTokens": -100, "outputTokens": 20}},
+    )
+    negative_tokens = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(negative_tokens.usage, ClineAccumulatedUsage)
+    assert negative_tokens.usage.input_tokens is None
+    assert negative_tokens.usage.output_tokens == 20
+
+
+def test_snapshot_usage_after_a_hub_restart_is_a_new_observation() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {"aggregateUsage": {"inputTokens": 1000, "outputTokens": 2000, "totalCost": 5.0}},
+    )
+    before = adapter.read_activity_snapshot(session_id)
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {"aggregateUsage": {"inputTokens": 40, "outputTokens": 80, "totalCost": 0.2}},
+    )
+    after = adapter.read_activity_snapshot(session_id)
+
+    assert before.aggregate_usage is not None
+    assert after.aggregate_usage is not None
+    assert before.aggregate_usage.total_cost == 5.0
+    assert before.aggregate_usage.input_tokens == 1000
+    assert after.aggregate_usage.total_cost == 0.2
+    assert after.aggregate_usage.input_tokens == 40
+
+
+def test_snapshot_read_failures_use_normalized_classifications() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        ClineSessionNotFoundError("session 'x' is not known to this backend instance"),
+    )
+    with pytest.raises(AgentSessionNotFoundError):
+        adapter.read_activity_snapshot(session_id)
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        ClineBackendUncertainOutcomeError("SECRET-USAGE-MARKER"),
+    )
+    with pytest.raises(AgentRuntimeDeliveryUncertainError) as excinfo:
+        adapter.read_activity_snapshot(session_id)
+
+    assert "SECRET-USAGE-MARKER" not in str(excinfo.value)
+    assert "SECRET-USAGE-MARKER" not in repr(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+
+
+def test_project_usage_summary_parses_the_pinned_wrapper_conservatively() -> None:
+    usage_scope = {"inputTokens": 10, "outputTokens": 20, "totalCost": 0.1}
+    aggregate_scope = {"inputTokens": 15, "outputTokens": 25, "totalCost": 0.2}
+
+    usage, aggregate = project_usage_summary(
+        {"usage": usage_scope, "aggregateUsage": aggregate_scope}
+    )
+    assert usage is not None and aggregate is not None
+    assert usage.input_tokens == 10 and aggregate.input_tokens == 15
+
+    usage, aggregate = project_usage_summary({"usage": usage_scope})
+    assert usage is not None and usage.output_tokens == 20
+    assert aggregate is None
+
+    usage, aggregate = project_usage_summary({"aggregateUsage": aggregate_scope})
+    assert usage is None
+    assert aggregate is not None and aggregate.total_cost == 0.2
+
+    assert project_usage_summary(None) == (None, None)
+    assert project_usage_summary("not-an-object") == (None, None)  # type: ignore[arg-type]
+    assert project_usage_summary({}) == (None, None)
+    assert project_usage_summary({"usage": 5}) == (None, None)
+    nan_scope = {"inputTokens": float("nan"), "outputTokens": True}
+    assert project_usage_summary({"usage": nan_scope}) == (None, None)
+
+
+def test_unsubscribe_is_explicit_idempotent_and_stops_only_its_delivery() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    subscription = adapter.subscribe_activity(session_id, listener)
+
+    subscription.unsubscribe()
+    subscription.unsubscribe()
+    backend.emit(_agent_event(session_id, {"type": "iteration_start", "iteration": 1}))
+
+    assert subscription.active is False
+    assert observations == []
+    assert [call.operation for call in backend.calls()].count("subscribe") == 1
+
+
+def test_a_disposed_attachment_invalidates_subscriptions_without_replacement() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.dispose()
+    backend.emit(_agent_event(session_id, {"type": "iteration_start", "iteration": 1}))
+
+    assert observations == []
+    assert [call.operation for call in backend.calls()].count("subscribe") == 1
+
+
+def test_observations_flow_during_a_parked_send() -> None:
+    adapter, backend, resolver, session_id = _ready_adapter()
+    resolver.set_bound(session_id, _context())
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+    backend.queue_send(session_id, _completed("Continued the authorized work."))
+    send_errors: list[BaseException] = []
+
+    def _parked_send() -> None:
+        try:
+            adapter.send(session_id, "Continue the work.")
+        except BaseException as error:  # noqa: BLE001 - captured for assertion
+            send_errors.append(error)
+
+    sender = threading.Thread(target=_parked_send)
+    sender.start()
+    assert entered.wait(timeout=5)
+
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+    backend.emit(_agent_event(session_id, {"type": "iteration_start", "iteration": 1}))
+    backend.queue_get_accumulated_usage(session_id, {"usage": {"inputTokens": 1}})
+    snapshot = adapter.read_activity_snapshot(session_id)
+
+    assert _kinds(observations) == [ClineActivityKind.ITERATION_STARTED]
+    assert snapshot.usage is not None
+    assert snapshot.usage.input_tokens == 1
+
+    release.set()
+    sender.join(timeout=5)
+
+    assert not sender.is_alive()
+    assert send_errors == []
+
+
+def test_projected_activity_carries_only_the_permitted_content() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "reasoning",
+                "text": _REASONING_SENTINEL,
+                "reasoning": _REASONING_SENTINEL,
+                "accumulated": _REASONING_SENTINEL,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": _COMMENTARY_TEXT},
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_start",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "input": {"command": _TOOL_INPUT_SENTINEL},
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_update",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "update": _TOOL_OUTPUT_SENTINEL,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "content_end",
+                "contentType": "tool",
+                "toolName": "run_commands",
+                "toolCallId": "call-1",
+                "durationMs": 5,
+                "output": _TOOL_OUTPUT_SENTINEL,
+                "error": _TOOL_ERROR_SENTINEL,
+            },
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "notice", "noticeType": "status", "message": _NOTICE_SENTINEL},
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "done", "reason": "completed", "text": _DONE_TEXT_SENTINEL, "iterations": 3},
+        )
+    )
+    backend.emit(
+        _agent_event(
+            session_id,
+            {
+                "type": "error",
+                "error": {"message": _ERROR_TEXT_SENTINEL},
+                "recoverable": False,
+                "iteration": 2,
+            },
+        )
+    )
+    backend.emit(
+        _snapshot_event(
+            session_id,
+            {
+                "status": "running",
+                "prompt": _PROMPT_SENTINEL,
+                "messages": [_PROMPT_SENTINEL],
+                "workspace": {"cwd": _SNAPSHOT_SENTINEL},
+            },
+        )
+    )
+
+    assert _kinds(observations) == [
+        ClineActivityKind.THINKING_STARTED,
+        ClineActivityKind.COMMENTARY,
+        ClineActivityKind.TOOL_STARTED,
+        ClineActivityKind.TOOL_PROGRESS,
+        ClineActivityKind.TOOL_FAILED,
+        ClineActivityKind.NOTICE,
+        ClineActivityKind.TURN_FINISHED,
+        ClineActivityKind.RUNTIME_ERROR,
+        ClineActivityKind.RUNTIME_STATUS,
+    ]
+    commentary = observations[1].detail
+    assert isinstance(commentary, ClineCommentaryActivity)
+    assert commentary.text == _COMMENTARY_TEXT
+    _assert_sentinels_absent(observations)
+
+
+def test_activity_surface_validates_its_inputs() -> None:
+    adapter, _backend, _resolver, session_id = _bound_adapter()
+    _observations, listener = _collector()
+
+    with pytest.raises(ValueError):
+        adapter.subscribe_activity("", listener)
+    with pytest.raises(ValueError):
+        adapter.subscribe_activity("   ", listener)
+    with pytest.raises(ValueError):
+        adapter.subscribe_activity(session_id, "not-callable")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        adapter.read_activity_snapshot("")
+    with pytest.raises(ValueError):
+        adapter.read_activity_snapshot("   ")

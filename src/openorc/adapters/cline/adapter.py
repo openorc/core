@@ -68,6 +68,18 @@ positive caller-attested evidence under the existing lock ordering; and
 the same single same-ID reconstruction seam. All three consume the
 backend's already-established attachment — the adapter never reconnects,
 replaces, or manages transport state — and never decide workflow meaning.
+
+The D6c activity/usage observation seam (issue #164) is the Cline-local
+observational surface beside these operations: ``subscribe_activity``
+delivers a safe typed projection of the attached backend's session events
+for the exact bound session, and ``read_activity_snapshot`` reports the
+usage the runtime currently accounts for it. Both resolve the durable
+Task/role binding first and fail closed before any backend effect, take no
+send/reconstruction lock, and never reconnect, replace, or manage transport
+state. Consumers receive only
+:mod:`openorc.adapters.cline.activity` observations — never the opaque SDK
+event payload — and every observation stays advisory runtime bookkeeping
+that never decides workflow meaning.
 """
 
 from __future__ import annotations
@@ -93,6 +105,12 @@ from openorc.adapters.agent_runtime.results import (
     AgentSessionCreated,
     AgentSessionCreationRequest,
     AgentTextResponse,
+)
+from openorc.adapters.cline.activity import (
+    ClineActivityObservation,
+    ClineActivitySnapshot,
+    project_session_event,
+    project_usage_summary,
 )
 from openorc.adapters.cline.construction import (
     ClineConstructionContext,
@@ -123,7 +141,13 @@ from openorc.adapters.cline.review_subject import (
     ClineReviewSubjectUnverifiedError,
     verify_pr_review_turn,
 )
-from openorc.adapters.cline.values import ClineConstructionMode, ClineStartRequest, JsonObject
+from openorc.adapters.cline.values import (
+    ClineConstructionMode,
+    ClineSessionEvent,
+    ClineStartRequest,
+    JsonObject,
+    Subscription,
+)
 from openorc.domain.connections import WorkflowRole
 from openorc.observability import annotate_span, application_span
 from openorc.protocol.interaction import (
@@ -1283,6 +1307,131 @@ class ClineAdapter(AgentRuntimeAdapter):
                 context,
                 target_mode,
                 tolerate_positive_stop_absence=True,
+            )
+
+    # --- D6c: activity and usage observation (issue #164) ---
+
+    def subscribe_activity(
+        self,
+        session_id: str,
+        listener: Callable[[ClineActivityObservation], None],
+    ) -> Subscription:
+        """Subscribe to safe typed activity observations of the exact bound session (D6c).
+
+        The narrow Cline-local observational subscription behind later
+        authorized product projections: the attached backend's session
+        events for the exact external session ID of a bound Task/role
+        session — Producer or Reviewer alike — are projected into the
+        immutable observations of :mod:`openorc.adapters.cline.activity`
+        and delivered to the consumer listener. The consumer never receives
+        the opaque SDK event payload.
+
+        Preconditions and discipline:
+
+        - The exact Task/role/Connection binding is resolved through the
+          injected resolver before any backend effect; a missing or
+          mismatched binding fails closed as a configuration rejection,
+          and a fresh adapter instance can observe a durably bound session.
+          This instance's ``_known_identity`` memory is never authority.
+        - The already-attached D4 backend is consumed as-is: no
+          ``connect``, no credential handling, no session allocation or
+          reconstruction, no prompts, tools, aborts, or mode changes.
+        - The subscription and its delivery take no per-session
+          send/reconstruction lock: observations flow while a send is in
+          flight or an activity abort is outstanding.
+        - The subscription is addressed to the exact session, and every
+          event's own ``session_id`` is verified again before projection,
+          so different Producer/Reviewer sessions, Tasks, and Connections
+          cannot cross-feed.
+        - Delivery rides the backend's existing bounded event dispatch —
+          no additional queue, thread, buffer, or replay. The projection is
+          best-effort live observation: no historical replay, no
+          exactly-once guarantee, and no recovery of a turn's lost
+          mid-flight events. A disposed or replaced backend attachment
+          invalidates its subscriptions; a later caller may explicitly
+          subscribe again on an independently restored attachment.
+        - Unsubscribe is explicit and idempotent through the returned
+          handle; disposal never implies a workflow decision.
+
+        Every observation is advisory runtime bookkeeping: no event,
+        completion, or usage reading completes an OpenOrc Execution/Task,
+        validates a review, grants Owner authority, settles an uncertain
+        dispatch/abort, or classifies session loss. Missing telemetry
+        proves nothing about session health; unknown stays a valid
+        downstream representation.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.subscribe_activity") as span:
+            annotate_span(span, operation="cline_adapter.subscribe_activity")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not callable(listener):
+                raise ValueError("listener must be callable")
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+
+            def _deliver(event: ClineSessionEvent) -> None:
+                for observation in project_session_event(event, expected_session_id=session_id):
+                    listener(observation)
+
+            return self._backend_operation(
+                "subscribe",
+                lambda: self._backend.subscribe(session_id, _deliver),
+                session_id=session_id,
+            )
+
+    def read_activity_snapshot(self, session_id: str) -> ClineActivitySnapshot:
+        """Read the usage the runtime currently reports for the exact bound session (D6c).
+
+        One public ``get_accumulated_usage`` read for the exact external
+        session ID of a bound Task/role session, projected into the typed
+        snapshot of :mod:`openorc.adapters.cline.activity`: the pinned
+        ``SessionUsageSummary`` wrapper's ``usage`` (root/lead-agent
+        totals) and ``aggregateUsage`` (totals including teammates and
+        subagents) scopes, preserved distinctly and never substituted for
+        one another. An absent or unusable scope is unknown (``None``),
+        never an invented number, and a root-only total is never presented
+        as the Task-session aggregate.
+
+        The read is a pure observation on the already-attached backend: it
+        resolves the durable binding first and fails closed before any
+        backend effect, takes no per-session send/reconstruction lock,
+        never latches an uncertain-effect guard, and never reconnects,
+        replaces, or manages transport state. Attachment and transport
+        failures raise the existing normalized errors; positive
+        exact-session absence raises ``AgentSessionNotFoundError``.
+
+        The result is runtime-observed bookkeeping within the current
+        Cline Hub lifetime: a Hub restart may reset it even when the
+        conversation survives, successive reads are independent
+        observations rather than a lifetime ledger, and usage is never
+        evidence of delivery, continuity, success, or Task progress.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.read_activity_snapshot") as span:
+            annotate_span(span, operation="cline_adapter.read_activity_snapshot")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            raw = self._backend_operation(
+                "get_accumulated_usage",
+                lambda: self._backend.get_accumulated_usage(session_id),
+                session_id=session_id,
+            )
+            usage, aggregate_usage = project_usage_summary(raw)
+            return ClineActivitySnapshot(
+                session_id=session_id,
+                usage=usage,
+                aggregate_usage=aggregate_usage,
             )
 
     def _check_reconstruction_mode(
