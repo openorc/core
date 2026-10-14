@@ -23,6 +23,11 @@ may reach the authorized Task-facing product projection only; it never
 enters OpenTelemetry spans/logs/attributes, PostHog, ordinary application
 error strings, exception chains, persistence, audit ``WorkflowEvent``, or
 broadly visible diagnostics, and the representations here withhold it.
+Recognized formal OpenOrc response envelopes are suppressed from
+commentary — as bare JSON or inside one complete surrounding Markdown code
+fence, the same presentation tolerance the shared protocol funnel applies
+to formal responses — so formal protocol output is never relabelled as
+progress.
 
 All observation is advisory. A completed turn, tool, or SDK ``done`` event
 never completes an OpenOrc Execution/Task, validates a review, grants Owner
@@ -37,7 +42,9 @@ the scopes are preserved distinctly, never substituted for one another, and
 authoritative only as runtime bookkeeping within the current Cline Hub
 lifetime (a Hub restart may reset them even when the conversation survives,
 nothing is summed across observations, and usage is never evidence of
-delivery, continuity, success, or Task progress).
+delivery, continuity, success, or Task progress). Reported usage values are
+finite and non-negative: missing, mistyped, or negative readings stay
+unreported rather than becoming invented numbers.
 
 Pinned-SDK mapping limits (0.0.90): only demonstrated supported
 ``CoreSessionEvent``/``AgentEvent`` shapes are projected. ``chunk`` is not
@@ -422,9 +429,10 @@ class ClineUsageActivity:
 
     Per-turn figures and the runtime's accumulated totals are preserved as
     the pinned event reports them — ``None`` means not reported, never
-    zero, and nothing is summed or invented here. Usage is runtime
-    bookkeeping within the current Cline Hub lifetime, never evidence of
-    delivery, continuity, success, or Task progress.
+    zero, and nothing is summed or invented here. Values are finite and
+    non-negative: a negative or mistyped reading stays unreported. Usage is
+    runtime bookkeeping within the current Cline Hub lifetime, never
+    evidence of delivery, continuity, success, or Task progress.
     """
 
     input_tokens: int | float | None = None
@@ -454,8 +462,10 @@ class ClineUsageActivity:
             "total_cost",
         ):
             value = getattr(self, name)
-            if value is not None and _finite_number(value) != value:
-                raise ValueError(f"ClineUsageActivity.{name} must be None or a finite number")
+            if value is not None and _non_negative_number(value) != value:
+                raise ValueError(
+                    f"ClineUsageActivity.{name} must be None or a non-negative finite number"
+                )
 
 
 @dataclass(frozen=True)
@@ -464,8 +474,9 @@ class ClineAccumulatedUsage:
 
     Maps the pinned ``SessionAccumulatedUsage`` shape: ``None`` fields are
     not reported values, never zeros, and nothing is summed or invented
-    here. The scope a value belongs to is carried by the surrounding
-    snapshot, never implied.
+    here. Values are finite and non-negative: a negative or mistyped
+    reading stays unreported. The scope a value belongs to is carried by
+    the surrounding snapshot, never implied.
     """
 
     input_tokens: int | float | None = None
@@ -483,8 +494,10 @@ class ClineAccumulatedUsage:
             "total_cost",
         ):
             value = getattr(self, name)
-            if value is not None and _finite_number(value) != value:
-                raise ValueError(f"ClineAccumulatedUsage.{name} must be None or a finite number")
+            if value is not None and _non_negative_number(value) != value:
+                raise ValueError(
+                    f"ClineAccumulatedUsage.{name} must be None or a non-negative finite number"
+                )
 
 
 @dataclass(frozen=True)
@@ -794,20 +807,56 @@ def _commentary(text: object) -> ClineCommentaryActivity | None:
 
     Recognized formal OpenOrc response envelopes are suppressed — they have
     separate canonical protocol/authority paths and are never relabelled as
-    progress. Longer text is truncated explicitly, never summarized, and
-    the projection never infers workflow transitions from it.
+    progress. Suppression covers the pinned presentation tolerance for
+    formal responses: the whole text as bare JSON, or one complete Markdown
+    code fence around it — the same tolerance the shared protocol funnel
+    applies when it parses a formal response. Prose around a fence,
+    partial fences, and multiple fenced blocks stay ordinary commentary.
+    Longer text is truncated explicitly, never summarized, and the
+    projection never infers workflow transitions from it.
     """
     if not isinstance(text, str) or not text.strip():
         return None
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        parsed = None
-    if isinstance(parsed, dict) and parsed.get("type") in FORMAL_RESPONSE_FAMILIES:
+    if _is_formal_response_text(text):
         return None
     if len(text) <= _MAX_COMMENTARY_CHARS:
         return ClineCommentaryActivity(text=text, truncated=False)
     return ClineCommentaryActivity(text=text[:_MAX_COMMENTARY_CHARS], truncated=True)
+
+
+def _is_formal_response_text(text: str) -> bool:
+    """Whether the whole text is one recognized formal OpenOrc response.
+
+    The text is a formal envelope when it parses — bare, or after
+    unwrapping one complete surrounding Markdown code fence — into a JSON
+    object whose ``type`` names a canonical formal response family. The
+    family check is deliberately recognition-only: a malformed formal body
+    is still formal protocol output and never becomes progress commentary.
+    """
+    fenced = _unfenced_text(text)
+    try:
+        parsed = json.loads(fenced if fenced is not None else text)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("type") in FORMAL_RESPONSE_FAMILIES
+
+
+def _unfenced_text(text: str) -> str | None:
+    """Return the content of one complete surrounding Markdown code fence.
+
+    Recognizes the whole text as a single fenced block: an opening fence
+    line (optionally carrying a backtick-free info string such as
+    ``json``) and a closing fence alone on the last line. Prose around a
+    fence, multiple fences, unterminated fences, and nested fences are not
+    recognized — the caller then treats the text as ordinary content.
+    """
+    lines = text.strip().splitlines()
+    if len(lines) < 3 or lines[-1].strip() != "```":
+        return None
+    opener = lines[0]
+    if not opener.startswith("```") or "`" in opener[3:]:
+        return None
+    return "\n".join(lines[1:-1])
 
 
 def _project_notice(agent: JsonObject, session_id: str) -> list[ClineActivityObservation]:
@@ -837,17 +886,17 @@ def _project_usage_event(agent: JsonObject, session_id: str) -> list[ClineActivi
             session_id,
             ClineActivityKind.USAGE_OBSERVED,
             ClineUsageActivity(
-                input_tokens=_finite_number(agent.get("inputTokens")),
-                output_tokens=_finite_number(agent.get("outputTokens")),
-                cache_read_tokens=_finite_number(agent.get("cacheReadTokens")),
-                cache_write_tokens=_finite_number(agent.get("cacheWriteTokens")),
-                cost=_finite_number(agent.get("cost")),
-                reasoning_token_count=_finite_number(agent.get("reasoningTokenCount")),
-                total_input_tokens=_finite_number(agent.get("totalInputTokens")),
-                total_output_tokens=_finite_number(agent.get("totalOutputTokens")),
-                total_cache_read_tokens=_finite_number(agent.get("totalCacheReadTokens")),
-                total_cache_write_tokens=_finite_number(agent.get("totalCacheWriteTokens")),
-                total_cost=_finite_number(agent.get("totalCost")),
+                input_tokens=_non_negative_number(agent.get("inputTokens")),
+                output_tokens=_non_negative_number(agent.get("outputTokens")),
+                cache_read_tokens=_non_negative_number(agent.get("cacheReadTokens")),
+                cache_write_tokens=_non_negative_number(agent.get("cacheWriteTokens")),
+                cost=_non_negative_number(agent.get("cost")),
+                reasoning_token_count=_non_negative_number(agent.get("reasoningTokenCount")),
+                total_input_tokens=_non_negative_number(agent.get("totalInputTokens")),
+                total_output_tokens=_non_negative_number(agent.get("totalOutputTokens")),
+                total_cache_read_tokens=_non_negative_number(agent.get("totalCacheReadTokens")),
+                total_cache_write_tokens=_non_negative_number(agent.get("totalCacheWriteTokens")),
+                total_cost=_non_negative_number(agent.get("totalCost")),
             ),
         )
     ]
@@ -908,8 +957,8 @@ def project_usage_summary(
     additionally includes teammates and subagents — preserved distinctly
     and never substituted for one another. ``None`` input, a non-object
     wrapper, or a non-object scope means that scope is unknown, and a
-    scope without any reported finite number is likewise unknown rather
-    than an all-unreported placeholder.
+    scope without any reported finite non-negative number is likewise
+    unknown rather than an all-unreported placeholder.
     """
     if not isinstance(raw, dict):
         return (None, None)
@@ -920,11 +969,11 @@ def _accumulated_usage(scope: object) -> ClineAccumulatedUsage | None:
     if not isinstance(scope, dict):
         return None
     usage = ClineAccumulatedUsage(
-        input_tokens=_finite_number(scope.get("inputTokens")),
-        output_tokens=_finite_number(scope.get("outputTokens")),
-        cache_read_tokens=_finite_number(scope.get("cacheReadTokens")),
-        cache_write_tokens=_finite_number(scope.get("cacheWriteTokens")),
-        total_cost=_finite_number(scope.get("totalCost")),
+        input_tokens=_non_negative_number(scope.get("inputTokens")),
+        output_tokens=_non_negative_number(scope.get("outputTokens")),
+        cache_read_tokens=_non_negative_number(scope.get("cacheReadTokens")),
+        cache_write_tokens=_non_negative_number(scope.get("cacheWriteTokens")),
+        total_cost=_non_negative_number(scope.get("totalCost")),
     )
     if all(
         getattr(usage, name) is None

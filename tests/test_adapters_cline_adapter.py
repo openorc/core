@@ -3148,6 +3148,47 @@ def test_formal_response_envelopes_are_not_relabelled_as_commentary() -> None:
     assert observations == []
 
 
+def test_fenced_formal_responses_are_not_relabelled_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    for family in ("plan_result", "review_result", "implementation_result"):
+        payload = json.dumps({"type": family, "schema_version": 1})
+        backend.emit(
+            _agent_event(
+                session_id,
+                {
+                    "type": "content_end",
+                    "contentType": "text",
+                    "text": f"```json\n{payload}\n```",
+                },
+            )
+        )
+
+    assert observations == []
+
+
+def test_fenced_ordinary_json_still_projects_as_commentary() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+    observations, listener = _collector()
+    adapter.subscribe_activity(session_id, listener)
+
+    fenced = f"```json\n{json.dumps({'type': 'unrelated_note', 'count': 2})}\n```"
+    backend.emit(
+        _agent_event(
+            session_id,
+            {"type": "content_end", "contentType": "text", "text": fenced},
+        )
+    )
+
+    assert _kinds(observations) == [ClineActivityKind.COMMENTARY]
+    detail = observations[0].detail
+    assert isinstance(detail, ClineCommentaryActivity)
+    assert detail.text == fenced
+    assert detail.truncated is False
+
+
 def test_non_formal_json_and_prose_still_project_as_commentary() -> None:
     adapter, backend, _resolver, session_id = _bound_adapter()
     observations, listener = _collector()
@@ -3586,7 +3627,7 @@ def test_live_usage_event_projects_per_turn_figures_and_totals() -> None:
     assert detail.total_cost == 0.5
 
 
-def test_live_usage_event_leaves_missing_and_non_finite_fields_unreported() -> None:
+def test_live_usage_event_leaves_unusable_fields_unreported() -> None:
     adapter, backend, _resolver, session_id = _bound_adapter()
     observations, listener = _collector()
     adapter.subscribe_activity(session_id, listener)
@@ -3598,6 +3639,8 @@ def test_live_usage_event_leaves_missing_and_non_finite_fields_unreported() -> N
                 "type": "usage",
                 "inputTokens": "many",
                 "outputTokens": float("nan"),
+                "cacheWriteTokens": -1,
+                "cost": -0.5,
                 "totalInputTokens": True,
                 "totalOutputTokens": 30,
             },
@@ -3608,6 +3651,8 @@ def test_live_usage_event_leaves_missing_and_non_finite_fields_unreported() -> N
     assert isinstance(detail, ClineUsageActivity)
     assert detail.input_tokens is None
     assert detail.output_tokens is None
+    assert detail.cache_write_tokens is None
+    assert detail.cost is None
     assert detail.total_input_tokens is None
     assert detail.total_output_tokens == 30
 
@@ -3677,7 +3722,7 @@ def test_snapshot_usage_preserves_scope_absence_without_substitution() -> None:
     assert unusable.aggregate_usage is None
 
 
-def test_snapshot_usage_leaves_mistyped_and_non_finite_fields_unreported() -> None:
+def test_snapshot_usage_leaves_unusable_fields_unreported() -> None:
     adapter, backend, _resolver, session_id = _bound_adapter()
 
     backend.queue_get_accumulated_usage(
@@ -3687,6 +3732,7 @@ def test_snapshot_usage_leaves_mistyped_and_non_finite_fields_unreported() -> No
                 "inputTokens": float("nan"),
                 "outputTokens": "many",
                 "cacheReadTokens": True,
+                "cacheWriteTokens": -2,
                 "totalCost": 0.3,
             }
         },
@@ -3698,7 +3744,18 @@ def test_snapshot_usage_leaves_mistyped_and_non_finite_fields_unreported() -> No
     assert snapshot.aggregate_usage.input_tokens is None
     assert snapshot.aggregate_usage.output_tokens is None
     assert snapshot.aggregate_usage.cache_read_tokens is None
+    assert snapshot.aggregate_usage.cache_write_tokens is None
     assert snapshot.aggregate_usage.total_cost == 0.3
+
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {"usage": {"inputTokens": -100, "outputTokens": 20}},
+    )
+    negative_tokens = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(negative_tokens.usage, ClineAccumulatedUsage)
+    assert negative_tokens.usage.input_tokens is None
+    assert negative_tokens.usage.output_tokens == 20
 
 
 def test_snapshot_usage_after_a_hub_restart_is_a_new_observation() -> None:
