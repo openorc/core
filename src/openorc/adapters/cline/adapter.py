@@ -56,6 +56,18 @@ outcome-uncertain. Outstanding aborts are counted per session, so one
 abort's known pre-effect failure can never release a concurrent abort's
 unresolved intent, and an acknowledged abort never clears the guard by
 itself: that reconciliation belongs to D6b, not to this adapter.
+
+The D6b interruption-reconciliation and recovery seam (issue #148) is the
+small Cline-local, caller-invoked surface beside these operations:
+``reconcile_session`` inspects the exact bound session through qualified
+public reads and returns a typed, conservative continuity classification
+plus bounded checkpoint-derived observations; ``settle_uncertain_send`` and
+``settle_abort`` release exactly one accounted-for uncertainty kind with
+positive caller-attested evidence under the existing lock ordering; and
+``recover_session`` performs the authorized Hub-restart recovery through
+the same single same-ID reconstruction seam. All three consume the
+backend's already-established attachment — the adapter never reconnects,
+replaces, or manages transport state — and never decide workflow meaning.
 """
 
 from __future__ import annotations
@@ -63,7 +75,7 @@ from __future__ import annotations
 import enum
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, TypeVar
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
@@ -97,6 +109,14 @@ from openorc.adapters.cline.errors import (
     ClineSdkBackendError,
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
+)
+from openorc.adapters.cline.reconciliation import (
+    ClineDispatchCheckpoint,
+    ClineReconciliationResult,
+    ClineSessionEvidence,
+    ClineSettlementOutcome,
+    ClineSettlementRefusal,
+    classify_session_evidence,
 )
 from openorc.adapters.cline.review_subject import (
     UNREADABLE_EVIDENCE,
@@ -319,6 +339,43 @@ def _build_start_request(
     )
 
 
+def _history_presence(history: list[JsonObject], session_id: str) -> bool | None:
+    """Disambiguate exact-session presence from one history enumeration.
+
+    D6b uses the public ``list_history`` observation only to disambiguate
+    whether a history enumeration that answered successfully positively
+    identifies the exact session ID. Returns True when an entry positively
+    matches the exact ID, False when the enumeration demonstrably carries
+    session identity (at least one entry with a recognizable session-ID
+    field) and no entry matches, and None when identity cannot be
+    established from the entries (inconclusive — never evidence of
+    absence). Record semantics are never interpreted here.
+
+    A False answer observes that this enumeration is readable, never that
+    it exhaustively covers every persisted session: the #71 backend
+    contract guarantees no such exhaustiveness, so enumeration absence is
+    never terminal-loss proof (see
+    :func:`openorc.adapters.cline.reconciliation.classify_session_evidence`).
+    """
+    identifiable = False
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        matched = False
+        has_identity = False
+        for field in ("sessionId", "session_id", "id"):
+            value = entry.get(field)
+            if isinstance(value, str) and value.strip():
+                has_identity = True
+                if value == session_id:
+                    matched = True
+        if matched:
+            return True
+        if has_identity:
+            identifiable = True
+    return False if identifiable else None
+
+
 class _AbortState(enum.Enum):
     """Local coordination state of one session's activity-abort intent (D6a).
 
@@ -377,10 +434,15 @@ class ClineAdapter(AgentRuntimeAdapter):
         # resolver's durable binding resolution is. A registry miss is an
         # optimization miss, never exact-session-loss evidence.
         self._known_identity: dict[str, ClineSessionIdentity] = {}
-        # Sessions whose last interaction ended with an uncertain outcome:
-        # same-ID reconstruction is refused until the caller's reconciliation
-        # work re-establishes safety. No automatic clearing exists.
-        self._uncertain_sessions: set[str] = set()
+        # Unresolved uncertain runtime effects, per session and per effect
+        # kind (the _EFFECTFUL_OPERATIONS vocabulary; D6b): a pure
+        # observational read can never take an external effect, so only an
+        # effectful operation's unproven outcome is recorded here.
+        # Same-ID reconstruction is refused while any kind remains
+        # unresolved; the D6b settlement seam releases exactly one
+        # accounted-for kind with positive caller-attested evidence. No
+        # automatic clearing exists.
+        self._uncertain_effects: dict[str, set[str]] = {}
         # D6a activity-abort coordination: per-session outstanding-abort
         # accounting plus the reconstruction-active set, ordered against the
         # send/reconstruction locks through one short-lived coordination lock
@@ -406,16 +468,25 @@ class ClineAdapter(AgentRuntimeAdapter):
         ``ClineSdkBackendError`` is translated; the backend error object is
         discarded and the normalized error is raised after the failing
         handler exits, keeping ``__cause__`` and ``__context__`` empty. An
-        uncertain outcome on a session-addressed operation latches that
-        session against reconstruction.
+        uncertain outcome on a session-addressed *effectful* operation
+        (``_EFFECTFUL_OPERATIONS``) records that operation kind as an
+        unresolved uncertain effect for the session (D6b): same-ID
+        reconstruction is refused while any kind remains. A pure
+        observational read can never take an external effect, so even an
+        uncertain-classified transport failure on a read never latches an
+        otherwise safe session.
         """
         failure: AgentRuntimeError | None = None
         try:
             return invoke()
         except ClineSdkBackendError as error:
             failure = _classify_backend_failure(error, operation=operation)
-            if session_id is not None and isinstance(failure, AgentRuntimeUncertainOutcomeError):
-                self._uncertain_sessions.add(session_id)
+            if (
+                session_id is not None
+                and operation in _EFFECTFUL_OPERATIONS
+                and isinstance(failure, AgentRuntimeUncertainOutcomeError)
+            ):
+                self._uncertain_effects.setdefault(session_id, set()).add(operation)
         assert failure is not None
         raise failure from None
 
@@ -766,9 +837,11 @@ class ClineAdapter(AgentRuntimeAdapter):
         """Settle one outstanding abort against the per-session guard (D6a).
 
         Acknowledgement and uncertainty are sticky: an acknowledged abort
-        stays locally unresolved until #148's reconciliation, and an
-        uncertain abort keeps both its guard state and the D5a uncertain
-        latch already applied by ``_backend_operation``. Only a ``PENDING``
+        stays locally unresolved until D6b's settlement, and an uncertain
+        abort keeps both its guard state and the abort-kind uncertain-effect
+        entry recorded by ``_backend_operation``. D6b's ``settle_abort``
+        clears both atomically with positive caller-attested evidence. Only
+        a ``PENDING``
         intent with no other outstanding abort may return to ``NONE`` after
         a known pre-effect failure or positive session-not-found outcome —
         the operation verifiably never reached the runtime, so the D5a
@@ -844,50 +917,496 @@ class ClineAdapter(AgentRuntimeAdapter):
                     "lifetime; reconstruction into ACT is refused"
                 )
             _require_construction_inputs(context)
-            with self._lock_for(session_id):
-                if session_id in self._uncertain_sessions:
-                    raise AgentRuntimeUncertainOutcomeError(
-                        "an earlier interaction on this session ended with an "
-                        "uncertain outcome; same-ID reconstruction safety cannot "
-                        "be established"
-                    )
+            self._run_same_id_reconstruction(
+                session_id,
+                context,
+                target_mode,
+                tolerate_positive_stop_absence=False,
+            )
+
+    # --- D6b: interruption reconciliation and recovery (issue #148) ---
+
+    def reconcile_session(
+        self,
+        session_id: str,
+        *,
+        checkpoint: ClineDispatchCheckpoint | None = None,
+    ) -> ClineReconciliationResult:
+        """Reconcile the exact bound session through public state (D6b).
+
+        The caller-invoked Cline-local interruption-reconciliation
+        operation: after a local bridge/client/transport interruption, a
+        Cline activity abort, or a managed Hub restart — once the
+        caller/wiring layer has independently restored the D4 backend
+        attachment — this operation inspects the addressed exact external
+        session through the qualified public reads (``get``,
+        ``read_messages``, and, when the transcript read positively
+        reports absence, one ``list_history`` enumeration to disambiguate
+        presence) and returns a typed, conservative continuity
+        classification with bounded, content-free observations
+        (:mod:`openorc.adapters.cline.reconciliation`).
+
+        Preconditions and discipline:
+
+        - The injected backend is consumed as-is: this operation performs
+          no ``connect`` and never replaces, restarts, or manages transport
+          state. An absent or not-ready attachment fails closed through
+          the existing normalized unavailability classification — never a
+          session-loss or replay claim.
+        - The exact Task/role/Connection binding is resolved through the
+          injected resolver before any read; a missing, mismatched, or
+          otherwise unestablishable binding fails closed as a
+          configuration rejection and is never evidence that the Cline
+          transcript is gone. This instance's ``_known_identity`` memory
+          is never authority.
+        - The reads are pure observations: they take no per-session
+          send/reconstruction lock (they may observe in-flight work) and
+          can never latch an uncertain-effect guard — a read cannot take
+          an external effect. Attachment/transport failures raise the
+          existing normalized errors; evidence-shaped answers (including
+          positive session-not-found) classify into the typed result.
+        - A caller-supplied :class:`ClineDispatchCheckpoint` derives only
+          bounded, clearly identified new-turn observations. Message
+          presence beyond it never proves that an interrupted logical
+          send completed; no formal output is ever reconstituted from
+          record status or agent prose, and the delivery/currentness
+          decision stays with the caller's durable dispatch identity.
+        - Raw transcripts stay transient inside this call and never enter
+          the typed result, errors, logs, spans, or telemetry. The span
+          carries only the safe fixed vocabulary (operation plus the
+          resolved binding's stable IDs).
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.reconcile_session") as span:
+            annotate_span(span, operation="cline_adapter.reconcile_session")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if checkpoint is not None and not isinstance(checkpoint, ClineDispatchCheckpoint):
+                raise ValueError("checkpoint must be a ClineDispatchCheckpoint when supplied")
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            record_present: bool | None
+            try:
+                record = self._backend_operation(
+                    "get",
+                    lambda: self._backend.get(session_id),
+                    session_id=session_id,
+                )
+            except AgentSessionNotFoundError:
+                record_present = False
+            else:
+                record_present = record is not None
+            transcript: list[JsonObject] | None
+            transcript_absent = False
+            try:
+                transcript = self._backend_operation(
+                    "read_messages",
+                    lambda: self._backend.read_messages(session_id),
+                    session_id=session_id,
+                )
+            except AgentSessionNotFoundError:
+                transcript = None
+                transcript_absent = True
+            history_presence: bool | None = None
+            if transcript_absent:
+                history = self._backend_operation(
+                    "list_history",
+                    lambda: self._backend.list_history(),
+                )
+                history_presence = _history_presence(history, session_id)
+            usage_observed: bool | None = None
+            if transcript is not None:
                 try:
-                    with self._abort_coordination:
-                        self._reconstruction_active.add(session_id)
-                        guard = self._abort_guards.get(session_id)
-                        if guard is not None and guard.state is not _AbortState.NONE:
-                            raise AgentRuntimeUncertainOutcomeError(
-                                "an activity interruption of this session is "
-                                "unresolved; same-ID reconstruction safety cannot "
-                                "be established"
-                            )
-                    messages = self._backend_operation(
-                        "read_messages",
-                        lambda: self._backend.read_messages(session_id),
+                    usage = self._backend_operation(
+                        "get_accumulated_usage",
+                        lambda: self._backend.get_accumulated_usage(session_id),
                         session_id=session_id,
                     )
+                except AgentRuntimeError:
+                    # Optional supporting observation only: a failed usage
+                    # read never fails the reconciliation and never
+                    # establishes or denies anything.
+                    usage_observed = None
+                else:
+                    usage_observed = usage is not None
+            result = classify_session_evidence(
+                ClineSessionEvidence(
+                    record_present=record_present,
+                    transcript=transcript,
+                    transcript_absent=transcript_absent,
+                    history_presence=history_presence,
+                    # The pinned #71 backend contract makes no exhaustive
+                    # public-history guarantee, so enumeration absence is
+                    # never terminal-loss proof today; a future documented
+                    # contract would assert this deliberately.
+                    history_exhaustive=False,
+                ),
+                checkpoint=checkpoint,
+            )
+            return replace(result, usage_observed=usage_observed)
+
+    def settle_uncertain_send(
+        self,
+        session_id: str,
+        *,
+        runtime_work_settled: bool,
+        operation_accounted_for: bool,
+    ) -> ClineSettlementOutcome:
+        """Release the session's send-kind uncertainty latch (D6b).
+
+        The explicit, caller-driven settlement of D5a's uncertain-send
+        protection: the only way this adapter clears a session's
+        ``send``-kind unresolved uncertain effect. Nothing else does — not
+        a reconnect, not a succeeding read, not an acknowledged abort, and
+        never the absence of a process-local latch after a worker or
+        bridge restart, which is not settlement evidence.
+
+        Caller preconditions (documented, fail closed): the caller must
+        hold positive, durable evidence that the interrupted runtime work
+        has settled or cannot still execute (``runtime_work_settled``) and
+        that the applicable logical dispatch has been accounted for by its
+        owning caller (``operation_accounted_for``) — the durable
+        pending-operation/currentness facts belong to the later dispatch
+        reconciliation layer, never to this adapter. An unsatisfied
+        attestation raises before any effect. The attestation covers every
+        outstanding interrupted send of this session's ``send`` kind: the
+        per-kind latch does not distinguish individual sends, so settling
+        with a still-unaccounted interrupted send outstanding is a caller
+        authority error this seam cannot detect.
+
+        Concurrency: settlement serializes against this adapter's own
+        same-session sends/reconstructions (send/reconstruction lock
+        first), then takes the short coordination lock for the final
+        recheck — any outstanding abort, unresolved acknowledged or
+        uncertain abort, or active reconstruction is a veto that keeps
+        every guard latched (typed refusal). Only the ``send`` kind is
+        released; unrelated unresolved kinds stay latched. Independent
+        sessions are unaffected.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.settle_uncertain_send") as span:
+            annotate_span(span, operation="cline_adapter.settle_uncertain_send")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not runtime_work_settled or not operation_accounted_for:
+                raise ValueError(
+                    "settlement requires positive caller evidence that the "
+                    "interrupted runtime work has settled or cannot still "
+                    "execute and that the logical dispatch is accounted for"
+                )
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            with self._lock_for(session_id), self._abort_coordination:
+                guard = self._abort_guards.get(session_id)
+                if guard is not None and guard.outstanding > 0:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.OUTSTANDING_ABORT,
+                    )
+                if guard is not None and guard.state is not _AbortState.NONE:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.UNRESOLVED_ABORT,
+                    )
+                if session_id in self._reconstruction_active:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.RECONSTRUCTION_ACTIVE,
+                    )
+                effects = self._uncertain_effects.get(session_id)
+                if effects is None or "send" not in effects:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE,
+                    )
+                effects.discard("send")
+                if not effects:
+                    self._uncertain_effects.pop(session_id, None)
+            return ClineSettlementOutcome(settled=True)
+
+    def settle_abort(
+        self,
+        session_id: str,
+        *,
+        runtime_work_settled: bool,
+        operation_accounted_for: bool,
+    ) -> ClineSettlementOutcome:
+        """Settle the session's activity-interruption guard (D6b).
+
+        The explicit, caller-driven settlement of D6a's sticky
+        ``ACKNOWLEDGED``/``UNCERTAIN`` abort guards and of the abort-kind
+        uncertain effect an uncertain abort records: the only way this
+        adapter clears a session's activity-interruption protection, and
+        both are cleared atomically in one settlement. Nothing else does —
+        not a reconnect, not the abort acknowledgement itself, not a
+        succeeding read, and never the absence of a process-local latch
+        after a worker or bridge restart, which is not settlement
+        evidence.
+
+        Caller preconditions (documented, fail closed): the caller must
+        hold positive, durable evidence that the interrupted runtime work
+        has settled or cannot still execute (``runtime_work_settled``)
+        and that the applicable logical control has been accounted for by
+        its owning caller (``operation_accounted_for``) — the durable
+        pending-operation/currentness facts belong to the later dispatch
+        reconciliation layer, never to this adapter. An unsatisfied
+        attestation raises before any effect.
+
+        Concurrency: settlement serializes against this adapter's own
+        same-session sends/reconstructions (send/reconstruction lock
+        first), then takes the short coordination lock for the final
+        recheck — any outstanding abort or active reconstruction is a veto
+        that keeps every guard latched (typed refusal); an unresolved
+        concurrent abort can never be settled away. Only the
+        abort-kind protection is released; unrelated unresolved kinds
+        (for example an uncertain send) stay latched. Independent
+        sessions are unaffected.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.settle_abort") as span:
+            annotate_span(span, operation="cline_adapter.settle_abort")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not runtime_work_settled or not operation_accounted_for:
+                raise ValueError(
+                    "settlement requires positive caller evidence that the "
+                    "interrupted runtime work has settled or cannot still "
+                    "execute and that the logical control is accounted for"
+                )
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            with self._lock_for(session_id), self._abort_coordination:
+                guard = self._abort_guards.get(session_id)
+                if guard is not None and guard.outstanding > 0:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.OUTSTANDING_ABORT,
+                    )
+                if session_id in self._reconstruction_active:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.RECONSTRUCTION_ACTIVE,
+                    )
+                effects = self._uncertain_effects.get(session_id)
+                guard_unresolved = guard is not None and guard.state is not _AbortState.NONE
+                if (effects is None or "abort" not in effects) and not guard_unresolved:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE,
+                    )
+                if effects is not None and "abort" in effects:
+                    effects.discard("abort")
+                    if not effects:
+                        self._uncertain_effects.pop(session_id, None)
+                if guard_unresolved and guard is not None:
+                    guard.state = _AbortState.NONE
+            return ClineSettlementOutcome(settled=True)
+
+    def recover_session(
+        self,
+        session_id: str,
+        *,
+        target_mode: ClineConstructionMode,
+    ) -> None:
+        """Recover the exact bound session after a qualified restart (D6b).
+
+        The authorized Hub-restart recovery: rebuild the addressed exact
+        external session into the caller-selected effective mode through
+        D5a's single same-ID reconstruction seam, preserving the exact
+        external session identity and the full raw transcript. The
+        workflow selects the authorized effective mode (the Reviewer is
+        always PLAN; the Producer's ACT/PLAN phase selection is the
+        caller's authority) and the resolver's durable binding supplies
+        the current construction context — including the original
+        repository base and Task checkout for Producer recovery, never a
+        newly edited live Connection default. No initialization resend,
+        no ``session_ready`` re-dispatch, no synthesized continuation
+        notice, no replacement session, and no second reconstruction
+        mechanism exists.
+
+        Preconditions (documented, fail closed):
+
+        - The caller/wiring layer has already restored the D4 backend
+          attachment with current attach credentials; this operation
+          performs no ``connect`` and no transport management.
+        - Any latched uncertainty has been settled by the caller with its
+          durable facts (``settle_uncertain_send``/``settle_abort``): an
+          unresolved uncertain effect or activity-interruption guard
+          refuses the recovery before the first effect, so recovery never
+          displaces possibly active work.
+        - The exact persisted transcript must be positively established
+          inside the serialized section before any ``stop``/``start``: an
+          empty or absent read on an established bound session refuses
+          the recovery (inadequate evidence, never permission to
+          reinitialize).
+
+        The narrow qualified-restart adjustment stays inside the same
+        reconstruction seam: when the serialized ``stop`` fails with a
+        positively identified session absence after the transcript was
+        just read, the recovery proceeds directly to the same-ID
+        ``start`` — an ambiguous, uncertain, or unavailable ``stop``
+        failure never permits a start. A wrong returned start ID always
+        fails closed. Genuine exact-context loss is surfaced to the
+        existing session-lifecycle/blocking authority through the
+        normalized taxonomy; this adapter never mutates Task or
+        ``TaskAgentSession`` state.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.recover_session") as span:
+            annotate_span(span, operation="cline_adapter.recover_session")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not isinstance(target_mode, ClineConstructionMode):
+                raise ValueError("target_mode must be a ClineConstructionMode")
+            context = self._resolve_bound_context(session_id)
+            identity = context.identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            self._check_reconstruction_mode(context, target_mode)
+            self._run_same_id_reconstruction(
+                session_id,
+                context,
+                target_mode,
+                tolerate_positive_stop_absence=True,
+            )
+
+    def _check_reconstruction_mode(
+        self,
+        context: ClineConstructionContext,
+        target_mode: ClineConstructionMode,
+    ) -> None:
+        """Fail closed on a role-forbidden mode or absent construction inputs.
+
+        Shared by ``reconstruct_session`` and D6b's ``recover_session``:
+        the Reviewer session remains native PLAN for the Task lifetime,
+        and the resolver-resolved construction inputs must be complete
+        before any runtime effect.
+        """
+        identity = context.identity
+        reviewer_forbidden = (
+            identity.role is WorkflowRole.REVIEWER and target_mode is not ClineConstructionMode.PLAN
+        )
+        if reviewer_forbidden:
+            raise ValueError(
+                "the reviewer session remains native PLAN for the Task "
+                "lifetime; reconstruction into ACT is refused"
+            )
+        _require_construction_inputs(context)
+
+    def _run_same_id_reconstruction(
+        self,
+        session_id: str,
+        context: ClineConstructionContext,
+        target_mode: ClineConstructionMode,
+        *,
+        tolerate_positive_stop_absence: bool,
+    ) -> None:
+        """Run the serialized same-ID reconstruction section (D5a seam).
+
+        The single same-external-ID reconstruction mechanism, shared by
+        ``reconstruct_session`` and D6b's ``recover_session``: under the
+        per-session send/reconstruction lock, refuse while any unresolved
+        uncertain effect kind or activity-interruption guard remains,
+        register the reconstruction against concurrent aborts, then
+        execute the qualified ``read_messages`` → ``stop`` (incarnation
+        release, not abort) → ``start`` sequence with the identical
+        session ID and the raw persisted message array verbatim. The
+        start must return the identical session ID or the reconstruction
+        fails closed; no initialization resend, no synthesized
+        continuation or mode prose, and no session substitution.
+
+        ``tolerate_positive_stop_absence`` is D6b's narrow qualified-
+        restart adjustment, staying inside this one seam: only the
+        recovery entrypoint sets it, and it changes exactly one thing —
+        a ``stop`` that fails with a positively identified session
+        absence (``AgentSessionNotFoundError``, a known pre-effect
+        outcome proving the session is not live on this runtime) is
+        accepted as the absent-incarnation evidence after the surviving
+        transcript was just read in this same section, so the authorized
+        recovery proceeds directly to the same-ID ``start``. Any
+        ambiguous, uncertain, or unavailable ``stop`` failure never
+        permits a start, with or without the flag.
+        """
+        with self._lock_for(session_id):
+            if self._uncertain_effects.get(session_id):
+                raise AgentRuntimeUncertainOutcomeError(
+                    "an earlier interaction on this session ended with an "
+                    "uncertain outcome; same-ID reconstruction safety cannot "
+                    "be established"
+                )
+            try:
+                with self._abort_coordination:
+                    self._reconstruction_active.add(session_id)
+                    guard = self._abort_guards.get(session_id)
+                    if guard is not None and guard.state is not _AbortState.NONE:
+                        raise AgentRuntimeUncertainOutcomeError(
+                            "an activity interruption of this session is "
+                            "unresolved; same-ID reconstruction safety cannot "
+                            "be established"
+                        )
+                messages = self._backend_operation(
+                    "read_messages",
+                    lambda: self._backend.read_messages(session_id),
+                    session_id=session_id,
+                )
+                if tolerate_positive_stop_absence and not messages:
+                    # Recovery precondition: the exact persisted transcript
+                    # must be positively established before a same-ID start.
+                    # An empty read on an established bound session is
+                    # inadequate evidence, never permission to reinitialize.
+                    raise AgentRuntimeUncertainOutcomeError(
+                        "the persisted transcript of the addressed session "
+                        "could not be positively established; same-ID "
+                        "recovery is refused"
+                    )
+                try:
                     self._backend_operation(
                         "stop",
                         lambda: self._backend.stop(session_id),
                         session_id=session_id,
                     )
-                    start_request = _build_start_request(
-                        context,
-                        mode=target_mode,
-                        session_id=session_id,
-                        initial_messages=messages,
+                except AgentSessionNotFoundError:
+                    if not tolerate_positive_stop_absence:
+                        raise
+                    # Positive absence: no live incarnation addresses this
+                    # session on the attached runtime. The surviving
+                    # transcript was just read in this section and no
+                    # unresolved work remains (checked under the locks
+                    # above), so the authorized recovery proceeds directly
+                    # to the same-ID start. An ambiguous failed stop never
+                    # reaches this path.
+                start_request = _build_start_request(
+                    context,
+                    mode=target_mode,
+                    session_id=session_id,
+                    initial_messages=messages,
+                )
+                result = self._backend_operation(
+                    "start",
+                    lambda: self._backend.start(start_request),
+                    session_id=session_id,
+                )
+                if result.session_id != session_id:
+                    raise AgentRuntimeConfigurationRejectedError(
+                        "the same-ID reconstruction did not rebind the "
+                        "requested exact external session identity"
                     )
-                    result = self._backend_operation(
-                        "start",
-                        lambda: self._backend.start(start_request),
-                        session_id=session_id,
-                    )
-                    if result.session_id != session_id:
-                        raise AgentRuntimeConfigurationRejectedError(
-                            "the same-ID reconstruction did not rebind the "
-                            "requested exact external session identity"
-                        )
-                finally:
-                    with self._abort_coordination:
-                        self._reconstruction_active.discard(session_id)
-                self._known_identity[session_id] = identity
+            finally:
+                with self._abort_coordination:
+                    self._reconstruction_active.discard(session_id)
+            self._known_identity[session_id] = context.identity
