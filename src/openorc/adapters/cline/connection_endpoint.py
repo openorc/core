@@ -31,10 +31,12 @@ Contract:
   syntax, so dedicated checks reject malformed host characters and
   non-ASCII/IDN forms (IDNA is not a v1 endpoint capability).
 - Parsing is **never a safety property**. A syntactically valid endpoint says
-  nothing about where it actually leads; reaching it must be bounded by
-  dial-time egress/SSRF policy at the later attachment leaf (issue #188).
-  This module validates shape only and performs no network action of any
-  kind.
+  nothing about where it actually leads. This module validates shape only and
+  performs no network action of any kind; the SDK attachment (D8b, issue
+  #190) performs no application-level egress/SSRF screening — protecting
+  internal services and other tenants from Owner-configured endpoints is a
+  deployment-operator obligation (infrastructure isolation and network
+  controls).
 - Errors carry only safe content: they name the failing aspect (scheme, host,
   path, component) and never echo the raw configured value, so a malformed
   URL cannot leak secret-bearing material through an error message.
