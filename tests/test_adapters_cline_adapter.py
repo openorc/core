@@ -28,7 +28,6 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
 import openorc.protocol
 from openorc.adapters.agent_runtime.errors import (
@@ -100,6 +99,7 @@ from openorc.protocol.models import (
     REVIEW_RESULT_FAMILY,
     WORKSPACE_RESULT_FAMILY,
 )
+from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
 # --- shared test constants and helpers ---
 

@@ -18,16 +18,6 @@ import uuid
 from typing import Any
 
 import pytest
-from tests.fakes.agent_runtime import (
-    ControlRealization,
-    FakeAgentRuntimeAdapter,
-    accepted_review_result_candidate,
-    changes_requested_review_result_candidate,
-    implementation_result_candidate,
-    plan_result_candidate,
-    pr_result_candidate,
-    session_ready_candidate,
-)
 
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
@@ -61,6 +51,16 @@ from openorc.protocol.models import (
     ReviewFinding,
     ReviewResult,
     SessionReady,
+)
+from tests.fakes.agent_runtime import (
+    ControlRealization,
+    FakeAgentRuntimeAdapter,
+    accepted_review_result_candidate,
+    changes_requested_review_result_candidate,
+    implementation_result_candidate,
+    plan_result_candidate,
+    pr_result_candidate,
+    session_ready_candidate,
 )
 
 

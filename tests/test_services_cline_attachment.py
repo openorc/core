@@ -31,7 +31,6 @@ import pytest
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
@@ -75,6 +74,7 @@ from openorc.services.errors import (
     NotFoundError,
 )
 from openorc.services.session_runtime import establish_task_agent_session
+from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
 _OBSERVED = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 _BARRIER_ROW = (None, None, None)  # account-operational barrier: no attempt state
