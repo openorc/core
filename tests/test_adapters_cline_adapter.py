@@ -47,7 +47,6 @@ from openorc.adapters.cline import (
     ClineConstructionContextResolver,
     ClineConstructionMode,
     ClineDispatchCheckpoint,
-    ClineReviewSubjectUnverifiedError,
     ClineSessionContinuity,
     ClineSessionIdentity,
     ClineSettlementOutcome,
@@ -1023,47 +1022,40 @@ def test_unknown_code_send_failure_remains_uncertain_and_blocks_reconstruction()
     assert "stop" not in operations
 
 
-# --- D5b: PR-review subject verification (issue #163) ---
+# --- REVIEW realization: exact-subject formal path (issue #198) ---
 #
-# Representative sanitized tool-block fixtures shaped on the Owner
-# qualification of 2026-10-13 (openorc/core#163 prerequisite): the qualified
-# native GitHub MCP shapes with synthetic repository/PR/SHA values. Tool
-# inputs and results mirror the qualified read_messages message shapes.
+# A typed REVIEW interaction (planning or canonical-PR subject) is realized
+# through the ordinary shared formal path on the exact existing session. The
+# dispatched ``PrReviewSubject`` carries the GitHub-authoritative repository,
+# PR number, and exact reconciled head SHA as interaction context; how the
+# Reviewer inspects the assigned subject is the Reviewer's own method and is
+# never asserted here. The former D5b tool-attestation seam (issue #163) is
+# retired: acceptance depends only on the canonical ``review_result``.
 
-_REVIEW_OWNER = "openorc"
-_REVIEW_REPO_NAME = "review-fixture"
-_REVIEW_REPO = f"{_REVIEW_OWNER}/{_REVIEW_REPO_NAME}"
+_REVIEW_REPO = "openorc/review-fixture"
 _REVIEW_PR_NUMBER = 7
 _REVIEW_ISSUE_NUMBER = 163
-_REVIEW_FILE = "src/feature.py"
-
-_ASSIGNED_HEAD = "a" * 40
-_OTHER_HEAD = "b" * 40
-_BASE_HEAD = "c" * 40
-_BLOB_SHA = "d" * 40
-
-_PR_READ_TOOL = "Github__pull_request_read"
-_FILE_READ_TOOL = "Github__get_file_contents"
+_REVIEW_HEAD = "a" * 40
 
 
-def _pr_subject(head_sha: str = _ASSIGNED_HEAD) -> PrReviewSubject:
+def _pr_subject() -> PrReviewSubject:
     return PrReviewSubject(
         repository_full_name=_REVIEW_REPO,
         pull_request_number=_REVIEW_PR_NUMBER,
-        head_sha=head_sha,
+        head_sha=_REVIEW_HEAD,
         issue_number=_REVIEW_ISSUE_NUMBER,
     )
 
 
-def _pr_review_interaction(head_sha: str = _ASSIGNED_HEAD) -> ReviewInteraction:
-    return ReviewInteraction(subject=_pr_subject(head_sha))
+def _pr_review_interaction() -> ReviewInteraction:
+    return ReviewInteraction(subject=_pr_subject())
 
 
 def _review_message() -> str:
     return (
-        f"REVIEW assignment: inspect {_REVIEW_REPO} PR #{_REVIEW_PR_NUMBER} at "
-        f"exact head {_ASSIGNED_HEAD} with your native GitHub MCP; read code at "
-        "that SHA with commit-addressed get_file_contents reads."
+        f"REVIEW assignment: inspect {_REVIEW_REPO} PR #{_REVIEW_PR_NUMBER} "
+        f"at exact head {_REVIEW_HEAD} and respond with the canonical "
+        "review_result envelope."
     )
 
 
@@ -1079,107 +1071,6 @@ def _review_result_payload() -> str:
     )
 
 
-def _tool_use(call_id: str, name: str, tool_input: dict[str, object]) -> dict[str, object]:
-    return {"type": "tool_use", "id": call_id, "name": name, "input": tool_input}
-
-
-def _tool_result(
-    call_id: str, name: str, content: object, *, is_error: bool = False
-) -> dict[str, object]:
-    block: dict[str, object] = {
-        "type": "tool_result",
-        "tool_use_id": call_id,
-        "name": name,
-        "content": content,
-    }
-    if is_error:
-        block["is_error"] = True
-    return block
-
-
-def _pr_read_pair(
-    call_id: str,
-    head_sha: str,
-    *,
-    repo: str = _REVIEW_REPO,
-    pr_number: int = _REVIEW_PR_NUMBER,
-) -> tuple[dict[str, object], dict[str, object]]:
-    owner, _, name = repo.partition("/")
-    tool_use = _tool_use(
-        call_id,
-        _PR_READ_TOOL,
-        {"method": "get", "owner": owner, "repo": name, "pullNumber": pr_number},
-    )
-    pr_payload = {
-        "number": pr_number,
-        "state": "open",
-        "head": {"ref": "feature", "sha": head_sha},
-        "base": {"ref": "main", "sha": _BASE_HEAD},
-    }
-    return tool_use, _tool_result(call_id, _PR_READ_TOOL, json.dumps(pr_payload))
-
-
-def _file_read_pair(
-    call_id: str,
-    ref: str,
-    *,
-    repo: str = _REVIEW_REPO,
-    path: str = _REVIEW_FILE,
-    with_uri: bool = True,
-    is_error: bool = False,
-) -> tuple[dict[str, object], dict[str, object]]:
-    owner, _, name = repo.partition("/")
-    tool_use = _tool_use(
-        call_id,
-        _FILE_READ_TOOL,
-        {"owner": owner, "repo": name, "path": path, "ref": ref, "sha": ""},
-    )
-    if is_error:
-        content: object = {"content": [{"type": "text", "text": "request failed"}]}
-    elif with_uri:
-        content = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"successfully downloaded text file (SHA: {_BLOB_SHA})",
-                },
-                {
-                    "type": "resource",
-                    "resource": {
-                        "uri": f"repo://{owner}/{name}/sha/{ref}/contents/{path}",
-                        "mimeType": "text/plain",
-                    },
-                },
-            ]
-        }
-    else:
-        content = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"successfully downloaded text file (SHA: {_BLOB_SHA})",
-                }
-            ]
-        }
-    return tool_use, _tool_result(call_id, _FILE_READ_TOOL, content, is_error=is_error)
-
-
-def _turn_messages(*pairs: tuple[dict[str, object], dict[str, object]]) -> list[dict[str, object]]:
-    """One assistant tool-use message plus the paired user tool-result message."""
-    messages: list[dict[str, object]] = []
-    uses = [pair[0] for pair in pairs]
-    results = [pair[1] for pair in pairs]
-    if uses:
-        messages.append({"role": "assistant", "content": uses, "ts": len(messages) + 10})
-    if results:
-        messages.append({"role": "user", "content": results, "ts": len(messages) + 10})
-    return messages
-
-
-def _text_message(text: str) -> dict[str, object]:
-    return {"role": "assistant", "content": [{"type": "text", "text": text}], "ts": 99}
-
-
 def _ready_reviewer_adapter() -> tuple[ClineAdapter, FakeClineSdkBackend, ScriptedResolver, str]:
     context = _context(
         _identity(role=WorkflowRole.REVIEWER),
@@ -1189,34 +1080,14 @@ def _ready_reviewer_adapter() -> tuple[ClineAdapter, FakeClineSdkBackend, Script
     return _ready_adapter(context=context)
 
 
-def _queue_verified_review_turn(
-    backend: FakeClineSdkBackend, session_id: str, suffix: list[dict[str, object]]
-) -> None:
-    """Script one fully verified review turn: prior transcript, send, suffix."""
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + suffix)
-
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + suffix)
-
-
-def test_verified_pr_review_returns_the_typed_result_without_new_sessions() -> None:
-    """The exact assigned PR/head with a successful SHA-addressed read releases
-    the existing typed ReviewResult: one snapshot, one send, one post-read,
-    no new session and no reconstruction."""
+def test_pr_review_returns_the_typed_result_through_the_shared_formal_path() -> None:
+    """A typed PR REVIEW uses the ordinary formal path: one verbatim send to
+    the exact existing session, no transcript reads, no reconstruction, and
+    no condition on the Reviewer's inspection method."""
     from openorc.protocol.models import ReviewResult
 
     adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD),
-            _file_read_pair("call-2", _ASSIGNED_HEAD),
-        ),
-    )
+    backend.queue_send(session_id, _completed(_review_result_payload()))
 
     result = adapter.realize_control(
         session_id,
@@ -1227,59 +1098,85 @@ def test_verified_pr_review_returns_the_typed_result_without_new_sessions() -> N
 
     assert isinstance(result, ReviewResult)
     assert result.outcome == "ACCEPTED"
+    # Construction contributes start plus the readiness-handshake send; the
+    # review turn is exactly one further send on the same session.
     operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send", "read_messages", "send", "read_messages"]
+    assert operations == ["start", "send", "send"]
     sends = [call for call in backend.calls() if call.operation == "send"]
     assert sends[-1].prompt == _review_message()
     assert sends[-1].session_id == session_id
 
 
-def test_verified_pr_review_tolerates_corrected_stale_observations_in_one_turn() -> None:
-    """Earlier stale metadata or wrong-ref reads followed by matching successful
-    reads in the same turn verify the assignment (qualified T3 pattern)."""
-    from openorc.protocol.models import ReviewResult
-
+def test_review_interaction_family_mismatch_is_rejected_before_any_effect() -> None:
+    """A REVIEW interaction dispatched with a foreign expected family fails
+    closed before any runtime effect, for both the canonical-PR and planning
+    subjects: REVIEW requires the review_result response family."""
     adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _OTHER_HEAD),  # stale head read, corrected below
-            _pr_read_pair("call-2", _ASSIGNED_HEAD),
-            _file_read_pair("call-3", _OTHER_HEAD),  # wrong-ref read, corrected below
-            _file_read_pair("call-4", _ASSIGNED_HEAD),
-        ),
+    planning = ReviewInteraction(
+        subject=PlanReviewSubject(
+            plan_revision_id="plan-rev-1",
+            repository_full_name=_REVIEW_REPO,
+            issue_number=_REVIEW_ISSUE_NUMBER,
+            plan="# Plan\n\n1. Implement the thing.\n",
+        )
     )
 
-    result = adapter.realize_control(
-        session_id,
-        _pr_review_interaction(),
-        message=_review_message(),
-        expected_family=REVIEW_RESULT_FAMILY,
-    )
+    with pytest.raises(ValueError):
+        adapter.realize_control(
+            session_id,
+            _pr_review_interaction(),
+            message=_review_message(),
+            expected_family=PLAN_RESULT_FAMILY,
+        )
+    with pytest.raises(ValueError):
+        adapter.realize_control(
+            session_id,
+            planning,
+            message="composed planning review prose",
+            expected_family=PLAN_RESULT_FAMILY,
+        )
 
-    assert isinstance(result, ReviewResult)
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send"]
 
 
-def test_prior_turn_evidence_cannot_verify_a_new_review_assignment() -> None:
-    """A matching earlier review revision's tool evidence lives only in the
-    pre-send snapshot: a new assignment with no current-turn tool evidence —
-    model claims included — fails closed."""
+def test_pr_review_composition_is_a_caller_obligation() -> None:
+    """The shared REVIEW realization requires the composed message and fails
+    before any effect without it."""
     adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    prior_turn = _turn_messages(
-        _pr_read_pair("call-1", _ASSIGNED_HEAD),
-        _file_read_pair("call-2", _ASSIGNED_HEAD),
-    )
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + prior_turn)
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(
-        session_id,
-        list(_RAW_MESSAGES)
-        + prior_turn
-        + [_text_message(f"OBSERVED_HEAD={_ASSIGNED_HEAD} COMPARISON=MATCH")],
-    )
 
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
+    with pytest.raises(ValueError):
+        adapter.realize_control(
+            session_id,
+            _pr_review_interaction(),
+            expected_family=REVIEW_RESULT_FAMILY,
+        )
+    with pytest.raises(ValueError):
+        adapter.realize_control(
+            session_id,
+            _pr_review_interaction(),
+            message="   ",
+            expected_family=REVIEW_RESULT_FAMILY,
+        )
+
+    operations = [call.operation for call in backend.calls()]
+    assert operations == ["start", "send"]
+
+
+def test_uncertain_pr_review_send_latches_the_session_like_ordinary_sends() -> None:
+    """An uncertain PR-review send keeps the ordinary classification and
+    latch: the outcome stays uncertain and same-ID reconstruction is
+    refused."""
+    context = _context(
+        _identity(role=WorkflowRole.REVIEWER),
+        cwd=_NEUTRAL_DIRECTORY,
+        workspace_root=_NEUTRAL_DIRECTORY,
+    )
+    adapter, backend, resolver, session_id = _ready_adapter(context=context)
+    resolver.set_bound(session_id, context)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
         adapter.realize_control(
             session_id,
             _pr_review_interaction(),
@@ -1287,217 +1184,8 @@ def test_prior_turn_evidence_cannot_verify_a_new_review_assignment() -> None:
             expected_family=REVIEW_RESULT_FAMILY,
         )
 
-
-def test_pr_review_without_any_tool_evidence_fails_closed() -> None:
-    """Model-only claims — however affirmative — are never evidence: a turn
-    that read nothing through the qualified GitHub MCP cannot verify."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        [_text_message(f"OBSERVED_HEAD={_ASSIGNED_HEAD} COMPARISON=MATCH")],
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_with_wrong_repository_evidence_fails_closed() -> None:
-    """Wrong-PR observations are rejected evidence: reads of another repository
-    neither verify nor contradict the assigned subject."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD, repo="openorc/other-fixture"),
-            _file_read_pair("call-2", _ASSIGNED_HEAD, repo="openorc/other-fixture"),
-        ),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_with_wrong_pr_number_evidence_fails_closed() -> None:
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD, pr_number=99),
-            _file_read_pair("call-2", _ASSIGNED_HEAD),
-        ),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_with_unresolved_head_mismatch_fails_closed() -> None:
-    """The final relevant PR read contradicts the assignment and nothing later
-    corrects it (qualified T2 pattern): the review fails closed even though an
-    assigned-SHA file read succeeded."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD),
-            _pr_read_pair("call-2", _OTHER_HEAD),
-            _file_read_pair("call-3", _ASSIGNED_HEAD),
-        ),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_with_failed_or_malformed_tool_results_fails_closed() -> None:
-    """Failed and malformed reads are rejected evidence: an error-flagged PR
-    read, a non-JSON PR result, and an errored file read verify nothing."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    error_pr = _pr_read_pair("call-1", _ASSIGNED_HEAD)
-    malformed_pr = _pr_read_pair("call-2", _ASSIGNED_HEAD)
-    error_file = _file_read_pair("call-3", _ASSIGNED_HEAD, is_error=True)
-    error_pr = (
-        error_pr[0],
-        _tool_result("call-1", _PR_READ_TOOL, "gateway timeout", is_error=True),
-    )
-    malformed_pr = (malformed_pr[0], _tool_result("call-2", _PR_READ_TOOL, "not json"))
-    _queue_verified_review_turn(
-        backend, session_id, _turn_messages(error_pr, malformed_pr, error_file)
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_without_a_commit_addressed_file_read_fails_closed() -> None:
-    """File reads at the wrong ref — and reads at the assigned ref whose result
-    carries no explicit commit binding — never satisfy the file check."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD),
-            _file_read_pair("call-2", _OTHER_HEAD),  # wrong ref
-            _file_read_pair("call-3", _ASSIGNED_HEAD, with_uri=False),  # no binding
-        ),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_pr_review_with_mismatched_commit_uri_binding_fails_closed() -> None:
-    """A URI whose repository or commit disagrees with the assignment is not a
-    binding for the assigned subject."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    foreign_repo_pair = _file_read_pair("call-2", _ASSIGNED_HEAD, repo="openorc/other-fixture")
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(_pr_read_pair("call-1", _ASSIGNED_HEAD), foreign_repo_pair),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_unsafe_transcript_boundary_fails_the_review_closed() -> None:
-    """A post-send transcript that is not an exact extension of the snapshot
-    cannot establish the current-turn boundary: the review is not verified."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    good_turn = _turn_messages(
-        _pr_read_pair("call-1", _ASSIGNED_HEAD),
-        _file_read_pair("call-2", _ASSIGNED_HEAD),
-    )
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(session_id, good_turn)
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_review_subject_error_never_carries_transcript_content() -> None:
-    """The unverified-review failure is safe by authoring: a static machine
-    reason only, with no fixture content and no exception chain."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        [_text_message(f"OBSERVED_HEAD={_ASSIGNED_HEAD} COMPARISON=MATCH")],
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError) as exc_info:
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-    error = exc_info.value
-    assert "review-fixture" not in str(error)
-    assert _ASSIGNED_HEAD not in str(error) and _ASSIGNED_HEAD not in repr(error)
-    assert _OTHER_HEAD not in str(error)
-    assert "OBSERVED_HEAD" not in str(error) and "MATCH" not in str(error)
-    assert error.__cause__ is None
-    assert error.__context__ is None
-
-    assert error.__cause__ is None
-    assert error.__context__ is None
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
 
 def test_planning_review_keeps_the_shared_prose_path() -> None:
@@ -1526,173 +1214,6 @@ def test_planning_review_keeps_the_shared_prose_path() -> None:
     assert isinstance(result, ReviewResult)
     operations = [call.operation for call in backend.calls()]
     assert operations == ["start", "send", "send"]
-
-
-def test_verified_pr_review_composition_is_a_caller_obligation() -> None:
-    """The verified path requires the composed message and the review_result
-    family, exactly like the shared prose path, and fails before any effect."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-
-    with pytest.raises(ValueError):
-        adapter.realize_control(session_id, _pr_review_interaction())
-    with pytest.raises(ValueError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message="   ",
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-    with pytest.raises(ValueError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=PLAN_RESULT_FAMILY,
-        )
-
-    operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send"]
-
-
-def test_failed_pre_send_read_prevents_the_review_send() -> None:
-    """A failed snapshot read means the current-turn boundary cannot be
-    attempted: the normalized error surfaces before any review is delivered."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    backend.queue_read_messages(session_id, ClineSessionNotFoundError("gone"))
-
-    with pytest.raises(AgentSessionNotFoundError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-    operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send", "read_messages"]
-
-
-def test_uncertain_review_send_latches_the_session_like_ordinary_sends() -> None:
-    """An uncertain review send keeps the ordinary classification and latch:
-    the outcome stays uncertain and same-ID reconstruction is refused."""
-    context = _context(
-        _identity(role=WorkflowRole.REVIEWER),
-        cwd=_NEUTRAL_DIRECTORY,
-        workspace_root=_NEUTRAL_DIRECTORY,
-    )
-    adapter, backend, resolver, session_id = _ready_adapter(context=context)
-    resolver.set_bound(session_id, context)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
-
-    with pytest.raises(AgentRuntimeDeliveryUncertainError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-    with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
-
-
-def test_failed_post_send_read_withholds_the_review_without_claiming_non_delivery() -> None:
-    """A failed evidence read after the completed review send withholds the
-    review result as unverified: no pre-effect unavailability classification
-    may escape and imply the send never occurred."""
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(session_id, ClineRemoteAttachmentUnavailableError("down"))
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError) as exc_info:
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-    error = exc_info.value
-    assert "down" not in str(error)
-    assert error.__cause__ is None
-    assert error.__context__ is None
-    operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send", "read_messages", "send", "read_messages"]
-
-
-def test_uri_in_returned_text_never_binds_the_commit() -> None:
-    """A matching repo:// URI appearing only as ordinary returned text — for
-    example inside repository-controlled file content — is not structured tool
-    evidence: the commit binding is read from the resource.uri field only."""
-    owner, name = _REVIEW_OWNER, _REVIEW_REPO_NAME
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    tool_use = _tool_use(
-        "call-2",
-        _FILE_READ_TOOL,
-        {"owner": owner, "repo": name, "path": _REVIEW_FILE, "ref": _ASSIGNED_HEAD, "sha": ""},
-    )
-    smuggled = {
-        "content": [
-            {
-                "type": "text",
-                "text": (
-                    f"successfully downloaded text file (SHA: {_BLOB_SHA}) — "
-                    f"binding: repo://{owner}/{name}/sha/{_ASSIGNED_HEAD}/contents/{_REVIEW_FILE}"
-                ),
-            }
-        ]
-    }
-    _queue_verified_review_turn(
-        backend,
-        session_id,
-        _turn_messages(
-            _pr_read_pair("call-1", _ASSIGNED_HEAD),
-            (tool_use, _tool_result("call-2", _FILE_READ_TOOL, smuggled)),
-        ),
-    )
-
-    with pytest.raises(ClineReviewSubjectUnverifiedError):
-        adapter.realize_control(
-            session_id,
-            _pr_review_interaction(),
-            message=_review_message(),
-            expected_family=REVIEW_RESULT_FAMILY,
-        )
-
-
-def test_string_encoded_mcp_results_verify_like_structured_ones() -> None:
-    """The pinned baseline encodes each MCP result wrapper as a JSON string:
-    the structured resource URI and head.sha inside such wrappers still
-    verify, while text items inside them stay unscanned."""
-    from openorc.protocol.models import ReviewResult
-
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    pr_pair = _pr_read_pair("call-1", _ASSIGNED_HEAD)
-    string_pr = (
-        pr_pair[0],
-        _tool_result(
-            "call-1",
-            _PR_READ_TOOL,
-            json.dumps({"content": [{"type": "text", "text": pr_pair[1]["content"]}]}),
-        ),
-    )
-    file_pair = _file_read_pair("call-2", _ASSIGNED_HEAD)
-    string_file = (
-        file_pair[0],
-        _tool_result("call-2", _FILE_READ_TOOL, json.dumps(file_pair[1]["content"])),
-    )
-    _queue_verified_review_turn(backend, session_id, _turn_messages(string_pr, string_file))
-
-    result = adapter.realize_control(
-        session_id,
-        _pr_review_interaction(),
-        message=_review_message(),
-        expected_family=REVIEW_RESULT_FAMILY,
-    )
-
-    assert isinstance(result, ReviewResult)
 
 
 # --- D6a: activity abort (issue #75) ---
@@ -1871,58 +1392,6 @@ def test_an_abort_on_one_session_leaves_another_sessions_send_independent() -> N
     producer_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
     assert not producer_thread.is_alive()
     assert producer_errors == []
-
-
-def test_abort_reaches_the_backend_during_a_verified_pr_review_send() -> None:
-    """The D5b verified-review path holds the per-session lock across its
-    pre-send read, send, and post-send evidence read; the abort still
-    reaches the backend while the review send is in flight."""
-    from openorc.protocol.models import ReviewResult
-
-    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
-    resolver.set_bound(
-        session_id,
-        _context(
-            _identity(role=WorkflowRole.REVIEWER),
-            cwd=_NEUTRAL_DIRECTORY,
-            workspace_root=_NEUTRAL_DIRECTORY,
-        ),
-    )
-    suffix = _turn_messages(
-        _pr_read_pair("call-1", _ASSIGNED_HEAD),
-        _file_read_pair("call-2", _ASSIGNED_HEAD),
-    )
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
-    backend.queue_send(session_id, _completed(_review_result_payload()))
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES) + suffix)
-    entered, release = threading.Event(), threading.Event()
-    backend.gate_operation("send", session_id, entered=entered, release=release)
-
-    outcomes: list[object] = []
-    review_thread, review_errors = _call_in_thread(
-        lambda: outcomes.append(
-            adapter.realize_control(
-                session_id,
-                _pr_review_interaction(),
-                message=_review_message(),
-                expected_family=REVIEW_RESULT_FAMILY,
-            )
-        )
-    )
-    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
-
-    adapter.abort_activity(session_id)
-
-    operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send", "read_messages", "send", "abort"]
-    assert review_thread.is_alive()
-
-    release.set()
-    review_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
-    assert not review_thread.is_alive()
-    assert review_errors == []
-    assert len(outcomes) == 1
-    assert isinstance(outcomes[0], ReviewResult)
 
 
 def test_abort_declines_while_reconstruction_holds_the_incarnation_section() -> None:

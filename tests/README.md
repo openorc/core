@@ -118,7 +118,7 @@ Environment variables:
 
 Behavior notes:
 
-- Run the module whole: the scenarios share module-scoped state in file order (A attachments → B workspace lifecycle → C verified review → D1/D2 interruption & reconciliation → D3 Hub-restart recovery → E activity/usage → cleanup).
+- Run the module whole: the scenarios share module-scoped state in file order (A attachments → B workspace lifecycle → C exact-subject review → D1/D2 interruption & reconciliation → D3 Hub-restart recovery → E activity/usage → cleanup).
 - Scenario D3 is a completion gate: with no restart mode configured it fails as `NOT EXECUTED` — distinct from a runtime `UNKNOWN` continuity classification — and the corresponding acceptance criterion stays unsatisfied pending execution or an explicit Owner-approved scope exception recorded on the PR.
 - Ordinary sends are never asserted to be refused by an uncertain-outcome latch; the implemented contract refuses same-ID reconstruction and gates settlement behind positive caller attestation (deterministic D6b suites own the full matrix).
 - A post-restart accumulated-usage reset is observational only; it is never session-loss evidence and never invalidates the durable binding.

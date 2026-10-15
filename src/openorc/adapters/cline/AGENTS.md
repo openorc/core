@@ -49,28 +49,26 @@ Treat documented public surfaces as the candidate contract. Use source inspectio
 - Runtime-internal rebuild under the same external session identity is not an OpenOrc session replacement.
 - Unexpected loss of the bound context blocks; never silently create a new one.
 
-## PR-review subject verification (D5b, issue #163)
+## REVIEW realization boundary (issue #198, D5b remediation)
 
-Realizing a REVIEW control whose subject is a `PrReviewSubject` is a verified
-interaction: the caller-composed message must name the assigned repository,
-PR number, and exact head SHA, and the parsed `review_result` is released only
-after current-turn `read_messages` tool evidence — paired `tool_use`/
-`tool_result` blocks for `Github__pull_request_read(method="get")` on the
-assigned PR and at least one commit-addressed
-`Github__get_file_contents(ref=<assigned SHA>)` read whose structured
-`resource.uri` carries the `repo://…/sha/<sha>/contents/…` binding (returned
-text, including repository-controlled file content, is never scanned) —
-establishes access to the exact assigned subject
-(`adapters/cline/review_subject.py`). Otherwise the interaction fails closed
-with the safe, non-content-bearing `ClineReviewSubjectUnverifiedError`; a
-failed post-send evidence read likewise withholds the result without any
-pre-effect classification of the completed send. Only the appended
-current-turn suffix may satisfy an assignment (pre-send snapshot under the
-per-session serialization); corrected stale observations are tolerated,
-unresolved mismatches and prior-turn evidence are not. Model prose is never
-evidence; planning reviews
-and ordinary sends are unchanged; this seam adds no GitHub authority,
-persistence, retries, or workflow logic.
+A typed `ReviewInteraction` — planning (`PlanReviewSubject`) or canonical-PR
+(`PrReviewSubject`) subject — realizes through the ordinary shared formal
+path: the caller-composed message is sent verbatim to the exact existing
+session and the reply is validated through the shared #65 funnel. The
+adapter pre-validates, before any effect, that the caller's expected family
+matches the interaction's own `review_result` family, but the Reviewer owns
+its inspection method: acceptance is never conditioned on MCP/tool names,
+arguments, results, transcript structure, prescribed files, or any
+inspection procedure, and the adapter performs no transcript attestation
+for reviews. The dispatched `PrReviewSubject` (GitHub-authoritative
+repository, PR number, exact reconciled head SHA) is interaction context —
+not a `review_result` schema field and need not be echoed by the model —
+and model prose is never workflow authority. GitHub stays the authority for
+the current canonical PR/head: existing reconciliation, stale-head guards,
+invalidation/re-review after a changed head, and exact expected-SHA merge
+authorization are unchanged. Public transcript `read_messages` remains used
+by same-ID reconstruction, interruption reconciliation/recovery, and
+activity observation — never as a review-acceptance gate.
 
 ## Runtime ownership
 

@@ -159,7 +159,7 @@ def assert_head_unchanged(pinned: str, observed: object) -> str:
     if observed_sha != pinned:
         raise FixtureSubjectError(
             f"the fixture PR's head moved during the review (pinned {pinned}, observed "
-            f"{observed_sha}); the verified review subject is no longer the prepared head"
+            f"{observed_sha}); the exact review subject is no longer the prepared head"
         )
     return observed_sha
 

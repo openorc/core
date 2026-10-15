@@ -60,7 +60,6 @@ from openorc.adapters.cline.reconciliation import (
     ClineSettlementOutcome,
     ClineSettlementRefusal,
 )
-from openorc.adapters.cline.review_subject import ClineReviewSubjectUnverifiedError
 from openorc.adapters.cline.values import (
     ClineConstructionMode,
     ClineRemoteConfig,
@@ -95,7 +94,6 @@ __all__ = [
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineRemoteConfig",
-    "ClineReviewSubjectUnverifiedError",
     "ClineRuntimeEndedActivity",
     "ClineRuntimeErrorActivity",
     "ClineRuntimeStatusActivity",
