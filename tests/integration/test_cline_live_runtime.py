@@ -55,8 +55,9 @@ CI or ordinary test runs.
 
 Scenarios (run the module whole; tests rely on module-scoped state in file
 order): A fresh attachments/initialization/exact binding; B Producer
-workspace lifecycle and original-base stability; C Reviewer verified
-GitHub-MCP exact-head review through the D5b tool-evidence gate; D1/D2
+workspace lifecycle and original-base stability; C Reviewer exact-head
+formal review bound to the dispatched typed subject (the Reviewer owns its
+inspection method; no tool attestation); D1/D2
 interruption/reconciliation (adapter-local guard semantics vs.
 cross-attachment continuity); E observational activity/usage, ordered
 before the Hub restart because the pinned runtime preserves transcripts
@@ -146,7 +147,6 @@ from openorc.services.session_admission import (
 )
 from openorc.services.session_runtime import establish_task_agent_session
 from tests.integration.cline_live_support import (
-    FIXTURE_CHANGED_PATH,
     FIXTURE_PR_NUMBER,
     FIXTURE_REPOSITORY,
     BoxCheckVerificationError,
@@ -1192,10 +1192,10 @@ def test_b_producer_workspace_lifecycle_and_original_base_stability(live: _Live)
     )
 
 
-# --- scenario C: Reviewer GitHub-MCP exact-head verified review ---------------
+# --- scenario C: Reviewer exact-head formal review ----------------------------
 
 
-def test_c_reviewer_verified_pr_review(live: _Live) -> None:
+def test_c_reviewer_exact_subject_formal_review(live: _Live) -> None:
     if live.resume:
         pytest.skip("stage-two resume mode runs only the recovery and cleanup scenarios")
     assert live.reviewer_session_id is not None
@@ -1222,16 +1222,14 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
         interaction = ReviewInteraction(subject=subject)
         message = (
             f"REVIEW assignment: inspect {FIXTURE_REPOSITORY} PR "
-            f"#{FIXTURE_PR_NUMBER} at exact head {pinned_head} with your "
-            "native GitHub MCP; read the changed file "
-            f"{FIXTURE_CHANGED_PATH} at that SHA with a commit-addressed "
-            "get_file_contents read. Then respond with the canonical review_result "
-            "envelope."
+            f"#{FIXTURE_PR_NUMBER} at exact head {pinned_head}, at your own "
+            "discretion as the assigned Reviewer. Then respond with the "
+            "canonical review_result envelope."
         )
-        # The parsed review_result is released only after the current-turn
-        # native tool evidence establishes access to the exact assigned PR and
-        # a commit-addressed read at the assigned SHA (D5b gate). No verdict
-        # is required for this intentionally trivial PR.
+        # OpenOrc supplied and bound the exact authoritative review subject
+        # above; how the Reviewer inspects it is the Reviewer's own method
+        # and is never asserted. Only the canonical typed review_result is
+        # required. No verdict is required for this intentionally trivial PR.
         result = bound.adapter.realize_control(
             reviewer_id,
             interaction,
@@ -1240,7 +1238,7 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
         )
         assert isinstance(result, ReviewResult)
         # Head-movement rejection: the reviewed subject must still exist at
-        # its verified exact head after the turn completed.
+        # its pinned exact head after the turn completed.
         try:
             post_review_payload, _ = _fetch_fixture_pull_request()
             post_review_head = post_review_payload.get("head")
@@ -1249,11 +1247,11 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
                 post_review_head.get("sha") if isinstance(post_review_head, dict) else None,
             )
         except FixtureSubjectError as error:
-            pytest.fail(f"the verified review cannot stand on a moved subject ({error})")
+            pytest.fail(f"the exact-subject review cannot stand on a moved subject ({error})")
     live.record(
-        "C reviewer verified review",
+        "C reviewer exact-subject review",
         "EXECUTED",
-        f"review_result released through the D5b tool-evidence gate "
+        f"typed review_result released through the exact-subject formal path "
         f"(outcome {result.outcome}); subject head {observed_head} unchanged "
         "after the review turn",
     )
