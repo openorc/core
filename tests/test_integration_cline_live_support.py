@@ -15,11 +15,17 @@ from __future__ import annotations
 
 import pytest
 from tests.integration.cline_live_support import (
+    FIXTURE_BASE_BRANCH,
     FIXTURE_CHANGED_PATH,
+    FIXTURE_HEAD_BRANCH,
     FIXTURE_PR_NUMBER,
     FIXTURE_REPOSITORY,
+    BoxCheckVerificationError,
+    CredentialSupplierError,
     FixtureSubjectError,
     assert_head_unchanged,
+    classify_box_check_exit,
+    credential_from_supplier_output,
     resolve_fixture_head_sha,
 )
 
@@ -33,14 +39,17 @@ def _payload(
     number: int = FIXTURE_PR_NUMBER,
     state: str = "open",
     draft: bool = False,
+    base_ref: str = FIXTURE_BASE_BRANCH,
+    head_ref: str = FIXTURE_HEAD_BRANCH,
+    head_repo: str = FIXTURE_REPOSITORY,
     head_sha: object = _SHA,
 ) -> dict[str, object]:
     return {
         "number": number,
         "state": state,
         "draft": draft,
-        "base": {"repo": {"full_name": full_name}},
-        "head": {"ref": "qual/d7-cline-live-review", "sha": head_sha},
+        "base": {"ref": base_ref, "repo": {"full_name": full_name}},
+        "head": {"ref": head_ref, "repo": {"full_name": head_repo}, "sha": head_sha},
     }
 
 
@@ -55,6 +64,21 @@ def test_valid_fixture_payload_resolves_the_pinned_head() -> None:
 def test_base_repository_must_be_the_prepared_fixture_repository() -> None:
     with pytest.raises(FixtureSubjectError, match="base repository"):
         resolve_fixture_head_sha(_payload(full_name="openorc/other"), _files(FIXTURE_CHANGED_PATH))
+
+
+def test_base_branch_must_be_the_prepared_base() -> None:
+    with pytest.raises(FixtureSubjectError, match="targets base"):
+        resolve_fixture_head_sha(_payload(base_ref="develop"), _files(FIXTURE_CHANGED_PATH))
+
+
+def test_head_branch_must_be_the_prepared_branch() -> None:
+    with pytest.raises(FixtureSubjectError, match="head branch"):
+        resolve_fixture_head_sha(_payload(head_ref="feature/other"), _files(FIXTURE_CHANGED_PATH))
+
+
+def test_head_repository_must_be_the_prepared_repository() -> None:
+    with pytest.raises(FixtureSubjectError, match="head repository"):
+        resolve_fixture_head_sha(_payload(head_repo="openorc/fork"), _files(FIXTURE_CHANGED_PATH))
 
 
 def test_pull_request_number_must_be_the_prepared_subject() -> None:
@@ -109,3 +133,36 @@ def test_malformed_observed_head_is_rejected() -> None:
 def test_a_malformed_pinned_sha_is_rejected_before_comparison() -> None:
     with pytest.raises(FixtureSubjectError, match="pinned head SHA"):
         assert_head_unchanged("", _SHA)
+
+
+# --- operator box-check outcome contract --------------------------------------
+
+
+def test_box_check_exit_zero_means_the_path_exists() -> None:
+    assert classify_box_check_exit(0) == "exists"
+
+
+def test_box_check_exit_one_means_the_path_is_absent() -> None:
+    assert classify_box_check_exit(1) == "absent"
+
+
+def test_any_other_box_check_exit_is_a_verification_failure() -> None:
+    for returncode in (2, 255, 130, -1):
+        with pytest.raises(BoxCheckVerificationError, match="never"):
+            classify_box_check_exit(returncode)
+
+
+# --- credential supplier output ------------------------------------------------
+
+
+def test_supplier_output_supplies_the_stripped_credential() -> None:
+    assert credential_from_supplier_output("current-token-value\n") == "current-token-value"
+    assert credential_from_supplier_output(b"current-token-value\r\n") == "current-token-value"
+    assert credential_from_supplier_output("  padded-current-token  ") == "padded-current-token"
+
+
+def test_empty_supplier_output_is_rejected_without_echoing_the_value() -> None:
+    with pytest.raises(CredentialSupplierError, match="empty current credential"):
+        credential_from_supplier_output("   \n")
+    with pytest.raises(CredentialSupplierError, match="no decodable stdout"):
+        credential_from_supplier_output(None)

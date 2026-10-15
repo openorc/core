@@ -25,15 +25,23 @@ from typing import Final
 FIXTURE_REPOSITORY: Final = "openorc/runtime-test-fixture"
 FIXTURE_PR_NUMBER: Final = 2
 FIXTURE_CHANGED_PATH: Final = "fixture/d7-review-subject.md"
+FIXTURE_BASE_BRANCH: Final = "main"
+FIXTURE_HEAD_BRANCH: Final = "qual/d7-cline-live-review"
 
 _SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
 
 __all__ = [
+    "FIXTURE_BASE_BRANCH",
     "FIXTURE_CHANGED_PATH",
+    "FIXTURE_HEAD_BRANCH",
     "FIXTURE_PR_NUMBER",
     "FIXTURE_REPOSITORY",
+    "BoxCheckVerificationError",
+    "CredentialSupplierError",
     "FixtureSubjectError",
     "assert_head_unchanged",
+    "classify_box_check_exit",
+    "credential_from_supplier_output",
     "resolve_fixture_head_sha",
 ]
 
@@ -44,6 +52,23 @@ class FixtureSubjectError(ValueError):
     Safe failure vocabulary only: the messages carry public fixture
     identifiers (repository, PR number, changed path, commit SHAs) and never
     content, credentials, or transcripts.
+    """
+
+
+class BoxCheckVerificationError(ValueError):
+    """The operator box check could not actually verify the Box-side path.
+
+    The outcome contract is explicit: exit 0 = path exists, exit 1 = path
+    absent, and ANY other exit status is a verification failure — a transport,
+    authentication, or remote-execution error is never cleanup evidence.
+    """
+
+
+class CredentialSupplierError(ValueError):
+    """The credential supplier produced no usable current credential.
+
+    The message carries only the safe structural fact; the supplied value
+    itself never enters the error text, logs, or evidence.
     """
 
 
@@ -74,6 +99,12 @@ def resolve_fixture_head_sha(
             f"the pull request's base repository is {full_name!r}, not the prepared "
             f"{FIXTURE_REPOSITORY!r}"
         )
+    base_ref = base.get("ref") if isinstance(base, Mapping) else None
+    if base_ref != FIXTURE_BASE_BRANCH:
+        raise FixtureSubjectError(
+            f"the prepared fixture pull request targets base {base_ref!r}, not the "
+            f"prepared {FIXTURE_BASE_BRANCH!r}"
+        )
     number = pull_request.get("number")
     if number != FIXTURE_PR_NUMBER:
         raise FixtureSubjectError(
@@ -86,6 +117,19 @@ def resolve_fixture_head_sha(
     if pull_request.get("draft") is not False:
         raise FixtureSubjectError("the prepared fixture pull request is a draft")
     head = pull_request.get("head")
+    head_ref = head.get("ref") if isinstance(head, Mapping) else None
+    if head_ref != FIXTURE_HEAD_BRANCH:
+        raise FixtureSubjectError(
+            f"the prepared fixture pull request originates from head branch {head_ref!r}, "
+            f"not the prepared {FIXTURE_HEAD_BRANCH!r}"
+        )
+    head_repo = head.get("repo") if isinstance(head, Mapping) else None
+    head_repo_name = head_repo.get("full_name") if isinstance(head_repo, Mapping) else None
+    if head_repo_name != FIXTURE_REPOSITORY:
+        raise FixtureSubjectError(
+            f"the prepared fixture pull request's head repository is {head_repo_name!r}, "
+            f"not the prepared {FIXTURE_REPOSITORY!r}"
+        )
     head_sha = head.get("sha") if isinstance(head, Mapping) else None
     sha = _require_sha(head_sha, "head SHA")
     if len(files) != 1:
@@ -118,3 +162,47 @@ def assert_head_unchanged(pinned: str, observed: object) -> str:
             f"{observed_sha}); the verified review subject is no longer the prepared head"
         )
     return observed_sha
+
+
+def classify_box_check_exit(returncode: int) -> str:
+    """Classify one operator box-check exit status under the explicit contract.
+
+    ``0`` means the addressed Box-side path exists and ``1`` means it does
+    not; ANY other exit status — an SSH transport failure, an authentication
+    error, or a remote-execution failure — is a verification failure that
+    must never be mistaken for evidence that a path is absent. The live
+    driver requires the operator-check command to preserve this distinction.
+    """
+    if returncode == 0:
+        return "exists"
+    if returncode == 1:
+        return "absent"
+    raise BoxCheckVerificationError(
+        f"the operator box check could not verify the Box-side path (exit {returncode}); "
+        "a transport, authentication, or remote-execution failure is never "
+        "absence or cleanup evidence"
+    )
+
+
+def credential_from_supplier_output(raw: object) -> str:
+    """Extract the current Hub credential from a supplier command's stdout.
+
+    The supplier is the narrow test-only hook the post-restart refresh uses:
+    its stdout is the current attach credential. Only the structural fact is
+    validated here; the credential value itself never enters error text,
+    logs, evidence, or command arguments anywhere downstream.
+    """
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        raise CredentialSupplierError(
+            "the credential supplier produced no decodable stdout payload"
+        )
+    credential = text.strip()
+    if not credential:
+        raise CredentialSupplierError(
+            "the credential supplier produced an empty current credential"
+        )
+    return credential

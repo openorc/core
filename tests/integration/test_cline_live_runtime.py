@@ -39,14 +39,19 @@ prerequisites plus the dynamic fixture-subject resolution over the public
 GitHub API.
 
 The prepared fixture PR's head SHA is resolved from GitHub at every preflight
-and pinned for the review interaction; head movement during the review is a
-stop condition, never a silent retarget. After a controlled Hub restart that
-rotated the attach credential, the current credential is installed through
-the test-only ``_refresh_current_hub_credential`` interface over the existing
-#55 trusted Vault rotation service (the test-side mirror of the future Cloud
-operator runner, openorc/cloud#54). Actual live verification of this suite is
-performed manually by the Owner after the Core and Cloud sides are both in
-place; nothing here runs live inference in CI or ordinary test runs.
+and pinned for the review interaction; the prepared base and head branches
+and the head repository are validated with it, and head movement during the
+review is a stop condition, never a silent retarget. After a controlled Hub
+restart that rotated the attach credential, the CURRENT credential is
+acquired through the test-only credential-supplier command hook (executed
+fresh at refresh time — a restart helper cannot update this process's
+environment) and installed through the test-only
+``_refresh_current_hub_credential`` interface over the existing #55 trusted
+Vault rotation service; together they mirror the future Cloud operator
+runner's post-restart acquisition and refresh (openorc/cloud#54). Actual
+live verification of this suite is performed manually by the Owner after the
+Core and Cloud sides are both in place; nothing here runs live inference in
+CI or ordinary test runs.
 
 Scenarios (run the module whole; tests rely on module-scoped state in file
 order): A fresh attachments/initialization/exact binding; B Producer
@@ -88,8 +93,12 @@ from tests.integration.cline_live_support import (
     FIXTURE_CHANGED_PATH,
     FIXTURE_PR_NUMBER,
     FIXTURE_REPOSITORY,
+    BoxCheckVerificationError,
+    CredentialSupplierError,
     FixtureSubjectError,
     assert_head_unchanged,
+    classify_box_check_exit,
+    credential_from_supplier_output,
     resolve_fixture_head_sha,
 )
 
@@ -171,8 +180,11 @@ _RESUME_ENV = "OPENORC_CLINE_LIVE_RESUME"
 _ATTESTED_VERSIONS_ENV = "OPENORC_CLINE_LIVE_ATTESTED_VERSIONS"
 _CONTROL_ENDPOINT_ENV = "OPENORC_CLINE_LIVE_CONTROL_ENDPOINT"
 _HUB_TOKEN_ENV = "OPENORC_CLINE_LIVE_HUB_TOKEN"
-_PROVIDER_ENV = "OPENORC_CLINE_LIVE_PROVIDER"
-_MODEL_ENV = "OPENORC_CLINE_LIVE_MODEL"
+_PRODUCER_PROVIDER_ENV = "OPENORC_CLINE_LIVE_PRODUCER_PROVIDER"
+_PRODUCER_MODEL_ENV = "OPENORC_CLINE_LIVE_PRODUCER_MODEL"
+_REVIEWER_PROVIDER_ENV = "OPENORC_CLINE_LIVE_REVIEWER_PROVIDER"
+_REVIEWER_MODEL_ENV = "OPENORC_CLINE_LIVE_REVIEWER_MODEL"
+_CREDENTIAL_COMMAND_ENV = "OPENORC_CLINE_LIVE_CREDENTIAL_COMMAND"
 _REPOSITORY_BASE_ENV = "OPENORC_CLINE_LIVE_REPOSITORY_BASE"
 _REVIEWER_DIRECTORY_ENV = "OPENORC_CLINE_LIVE_REVIEWER_DIRECTORY"
 _HANDOFF_ENV = "OPENORC_CLINE_LIVE_HANDOFF_PATH"
@@ -344,9 +356,21 @@ def _preflight(*, resume: bool) -> tuple[str, str]:
             )
         _required_env(_REPOSITORY_BASE_ENV, "the Producer repository base configuration")
         _required_env(_REVIEWER_DIRECTORY_ENV, "the neutral Reviewer directory configuration")
-        _required_env(_PROVIDER_ENV, "role binding provider configuration")
-        _required_env(_MODEL_ENV, "role binding model configuration")
+        _required_env(_PRODUCER_PROVIDER_ENV, "the Producer role binding provider configuration")
+        _required_env(_PRODUCER_MODEL_ENV, "the Producer role binding model configuration")
+        _required_env(_REVIEWER_PROVIDER_ENV, "the Reviewer role binding provider configuration")
+        _required_env(_REVIEWER_MODEL_ENV, "the Reviewer role binding model configuration")
         _required_env(_HUB_TOKEN_ENV, "the Connection control credential")
+        if os.environ.get(_ROTATE_ENV) == "1":
+            # A restart helper cannot update this process's environment after
+            # it starts, so a requested post-restart rotation must have a
+            # credential supplier command that is executed fresh at refresh
+            # time.
+            _required_env(
+                _CREDENTIAL_COMMAND_ENV,
+                "the post-restart current-Hub-credential supplier (executed at "
+                "refresh time; its stdout is the current token)",
+            )
     head_sha = _resolve_fixture_head()
     return attested, head_sha
 
@@ -421,9 +445,11 @@ def _pause_for_owner_restart() -> None:
     print(
         "D7 live: PAUSED for the Owner-approved manual Hub restart.\n"
         "  1. Restart the ClineBox Hub now (no unrelated active work may depend on it).\n"
-        f"  2. If the Hub attach credential changed, set {_HUB_TOKEN_ENV} to the current\n"
-        f"     value and {_ROTATE_ENV}=1 before the reconnect; rotation goes through the\n"
-        "     existing trusted connection-credential service, never a raw secret swap.\n"
+        f"  2. If the Hub attach credential changed, set {_ROTATE_ENV}=1 and provide\n"
+        f"     {_CREDENTIAL_COMMAND_ENV} — a command whose stdout is the CURRENT token,\n"
+        "     executed fresh at refresh time (the original process environment cannot\n"
+        "     be updated after start); the refresh goes through the existing trusted\n"
+        "     Vault rotation service, never a raw secret swap.\n"
         f"  3. Create the sentinel file {sentinel} to resume this test.",
         flush=True,
     )
@@ -496,8 +522,18 @@ class _Live:
         self.reviewer_directory = _required_env(
             _REVIEWER_DIRECTORY_ENV, "the neutral Reviewer directory configuration"
         )
-        provider = _required_env(_PROVIDER_ENV, "role binding provider configuration")
-        model = _required_env(_MODEL_ENV, "role binding model configuration")
+        producer_provider = _required_env(
+            _PRODUCER_PROVIDER_ENV, "the Producer role binding provider configuration"
+        )
+        producer_model = _required_env(
+            _PRODUCER_MODEL_ENV, "the Producer role binding model configuration"
+        )
+        reviewer_provider = _required_env(
+            _REVIEWER_PROVIDER_ENV, "the Reviewer role binding provider configuration"
+        )
+        reviewer_model = _required_env(
+            _REVIEWER_MODEL_ENV, "the Reviewer role binding model configuration"
+        )
         token = _required_env(_HUB_TOKEN_ENV, "the Connection control credential")
 
         profile_id, workspace_id, task_id = self._seed_durable_rows()
@@ -510,7 +546,10 @@ class _Live:
             session_capacity=2,
             enabled=True,
         )
-        for role in (WorkflowRole.PRODUCER, WorkflowRole.REVIEWER):
+        for role, provider, model in (
+            (WorkflowRole.PRODUCER, producer_provider, producer_model),
+            (WorkflowRole.REVIEWER, reviewer_provider, reviewer_model),
+        ):
             connection_repositories.set_role_binding(
                 self.pool,
                 workspace_id=workspace_id,
@@ -690,11 +729,17 @@ class _Live:
             )
         argv = [part.replace("{path}", path) for part in shlex.split(template)]
         completed = subprocess.run(argv, timeout=60.0, capture_output=True, check=False)
-        if (completed.returncode == 0) is not expect_exists:
+        # Explicit outcome contract: exit 0 = exists, exit 1 = absent, any
+        # other exit status is a verification failure — a transport,
+        # authentication, or remote-execution error is never cleanup evidence.
+        try:
+            observed = classify_box_check_exit(completed.returncode)
+        except BoxCheckVerificationError as error:
+            pytest.fail(f"the operator box check for {path!r} failed ({error})")
+        if (observed == "exists") is not expect_exists:
             pytest.fail(
                 f"the operator box check disagreed about {path!r} "
-                f"(expected {'exists' if expect_exists else 'absent'}, "
-                f"exit {completed.returncode})"
+                f"(expected {'exists' if expect_exists else 'absent'}, observed {observed})"
             )
         return "OPERATOR-CHECKED"
 
@@ -818,6 +863,40 @@ def live(request: pytest.FixtureRequest) -> Iterator[_Live]:
         yield state
     finally:
         state.finalize()
+
+
+def _fetch_current_hub_credential() -> str:
+    """Acquire the CURRENT Hub credential at refresh time (test-only seam).
+
+    A restart helper cannot update this process's environment after it
+    starts, so the post-restart refresh never re-reads the original
+    ``OPENORC_CLINE_LIVE_HUB_TOKEN`` value: it executes the explicitly
+    Owner-supplied credential-supplier command (``OPENORC_CLINE_LIVE_CREDENTIAL_COMMAND``)
+    fresh at refresh time and takes its stdout as the current token. The
+    value is captured without echo, never logged, never persisted, and never
+    passed in command arguments; it goes straight into the trusted Vault
+    rotation service. This is the supplier half of the test-side mirror of
+    the future Cloud operator runner's post-restart acquisition
+    (openorc/cloud#54).
+    """
+    command = _required_env(
+        _CREDENTIAL_COMMAND_ENV,
+        "the post-restart current-Hub-credential supplier (executed at refresh "
+        "time; its stdout is the current token)",
+    )
+    completed = subprocess.run(shlex.split(command), timeout=60.0, capture_output=True, check=False)
+    if completed.returncode != 0:
+        # Only the exit status is reported; the supplier's output can carry
+        # the current credential and is never echoed.
+        pytest.fail(
+            "the credential supplier command failed "
+            f"(exit {completed.returncode}); the current Hub credential was "
+            "not obtained and the reattachment must not rotate to a stale value"
+        )
+    try:
+        return credential_from_supplier_output(completed.stdout)
+    except CredentialSupplierError as error:
+        pytest.fail(f"the credential supplier returned no usable credential ({error})")
 
 
 def _refresh_current_hub_credential(state: _Live, credential: str) -> None:
@@ -1388,10 +1467,7 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
     # reattachment — merely reopening the same Connection never refreshes a
     # stale secret.
     if os.environ.get(_ROTATE_ENV) == "1":
-        _refresh_current_hub_credential(
-            live,
-            _required_env(_HUB_TOKEN_ENV, "the rotated Hub attach credential"),
-        )
+        _refresh_current_hub_credential(live, _fetch_current_hub_credential())
 
     # Reconnect through the ordinary Connection path: the fresh attachment
     # re-resolves the Hub's CURRENT attach credential; the prior incarnation
