@@ -30,12 +30,23 @@ Remote/local boundary
 ---------------------
 
 Session working directories live on the remote ClineBox. This module never
-asserts remote path existence through its own filesystem: Box-side directory
-readiness is Owner-operated setup evidence, and Task-checkout/cleanup
-verification runs on the actual Box through documented Owner/operator
-evidence or the explicitly Owner-approved
-``OPENORC_CLINE_LIVE_BOX_CHECK_COMMAND`` operator-check hook. Local
-preflight covers only local prerequisites.
+asserts remote path existence through its own filesystem. Task-checkout and
+cleanup verification always runs on the actual Box through the required
+Owner-approved ``OPENORC_CLINE_LIVE_BOX_CHECK_COMMAND`` operator-check hook:
+autonomous execution requires genuine Box-side verification, never an
+unperformed Owner attestation. Local preflight covers only local
+prerequisites plus the dynamic fixture-subject resolution over the public
+GitHub API.
+
+The prepared fixture PR's head SHA is resolved from GitHub at every preflight
+and pinned for the review interaction; head movement during the review is a
+stop condition, never a silent retarget. After a controlled Hub restart that
+rotated the attach credential, the current credential is installed through
+the test-only ``_refresh_current_hub_credential`` interface over the existing
+#55 trusted Vault rotation service (the test-side mirror of the future Cloud
+operator runner, openorc/cloud#54). Actual live verification of this suite is
+performed manually by the Owner after the Core and Cloud sides are both in
+place; nothing here runs live inference in CI or ordinary test runs.
 
 Scenarios (run the module whole; tests rely on module-scoped state in file
 order): A fresh attachments/initialization/exact binding; B Producer
@@ -73,6 +84,14 @@ from uuid import UUID, uuid4
 import pytest
 from psycopg import Connection
 from psycopg_pool import ConnectionPool
+from tests.integration.cline_live_support import (
+    FIXTURE_CHANGED_PATH,
+    FIXTURE_PR_NUMBER,
+    FIXTURE_REPOSITORY,
+    FixtureSubjectError,
+    assert_head_unchanged,
+    resolve_fixture_head_sha,
+)
 
 from openorc.adapters.agent_runtime.errors import AgentRuntimeUncertainOutcomeError
 from openorc.adapters.agent_runtime.results import AgentTextResponse
@@ -141,12 +160,11 @@ _PINNED_CLINE_VERSION = "3.0.68"
 _PINNED_CORE_VERSION = "0.0.90"
 _PINNED_SDK_VERSION = "0.0.90"
 
-# The prepared, deliberately unmerged review fixture (do not recreate; do
-# not merge, close, force-push, or otherwise modify it during D7).
-_FIXTURE_REPOSITORY = "openorc/runtime-test-fixture"
-_FIXTURE_PR_NUMBER = 2
-_FIXTURE_PR_HEAD_SHA = "81204ee712cc0627221d1024af3d2434e0006c0f"
-_FIXTURE_CHANGED_PATH = "fixture/d7-review-subject.md"
+# The prepared, deliberately unmerged review fixture identity (repository,
+# PR number, and sole changed file) lives in
+# ``tests/integration/cline_live_support.py`` together with its validation
+# rules. The head SHA is NOT fixed: each run resolves it from GitHub and
+# pins it for the review interaction.
 
 _OPT_IN_ENV = "OPENORC_CLINE_LIVE"
 _RESUME_ENV = "OPENORC_CLINE_LIVE_RESUME"
@@ -237,43 +255,65 @@ def _check_attested_remote_versions() -> str:
     return raw
 
 
-def _check_fixture_pr_head() -> None:
-    """Re-read the prepared fixture PR from GitHub immediately before the run.
+def _fetch_fixture_pull_request() -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Fetch the prepared fixture PR and its changed files from the public API.
 
-    The fixed head SHA is the prepared test subject; a moved head is a stop
-    condition, never a silent retarget.
+    Unauthenticated, non-secret reads of the public dummy repository; no
+    credential and no runtime involvement.
     """
-    url = f"https://api.github.com/repos/{_FIXTURE_REPOSITORY}/pulls/{_FIXTURE_PR_NUMBER}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "openorc-d7-live-validation",
-            "Accept": "application/vnd.github+json",
-        },
-    )
+    headers = {
+        "User-Agent": "openorc-d7-live-validation",
+        "Accept": "application/vnd.github+json",
+    }
+    base_url = f"https://api.github.com/repos/{FIXTURE_REPOSITORY}/pulls/{FIXTURE_PR_NUMBER}"
+
+    def _fetch(url: str) -> object:
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=15.0) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError) as error:
+            pytest.fail(
+                "preflight: the prepared fixture PR could not be re-read from the "
+                f"public GitHub API ({error}); resolve the network route before "
+                "the live run"
+            )
+
+    payload = _fetch(base_url)
+    files = _fetch(f"{base_url}/files")
+    if not isinstance(payload, dict) or not isinstance(files, list):
+        pytest.fail(
+            "preflight: the public GitHub API answered the fixture PR read with an "
+            "unexpected payload shape"
+        )
+    return payload, files
+
+
+def _resolve_fixture_head() -> str:
+    """Resolve and pin the fixture PR's current head for this run.
+
+    The head SHA is resolved from GitHub immediately before the run and
+    validated against the prepared PR identity and fixture structure; it is
+    then pinned for the review interaction. A moved head is re-resolved on
+    the next deliberate run, never silently retargeted mid-run.
+    """
+    payload, files = _fetch_fixture_pull_request()
     try:
-        with urllib.request.urlopen(request, timeout=15.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError) as error:
+        return resolve_fixture_head_sha(payload, files)
+    except FixtureSubjectError as error:
         pytest.fail(
-            "preflight: the fixture PR head could not be re-read from the public "
-            f"GitHub API ({error}); resolve the network route before the live run"
-        )
-    head = payload.get("head", {}).get("sha") if isinstance(payload, dict) else None
-    if head != _FIXTURE_PR_HEAD_SHA:
-        pytest.fail(
-            "preflight: fixture PR #2's head is not the prepared test subject "
-            f"(expected {_FIXTURE_PR_HEAD_SHA}, observed {head!r}); do not "
-            "silently retarget the test to a moved head"
+            f"preflight: the prepared fixture PR is not the expected review subject ({error})"
         )
 
 
-def _preflight(*, resume: bool) -> str:
+def _preflight(*, resume: bool) -> tuple[str, str]:
     """Local, non-secret preflight; fails closed before any agent effect.
 
     Local scope only: the Node runtime, built bridge artifacts, the bridge's
-    SDK pin, the Owner-attested remote trio, configuration syntax, and the
-    fixture PR head. Remote Box facts are never probed from this process.
+    SDK pin, the Owner-attested remote trio, configuration syntax, the
+    required Box-side operator-check hook, and the dynamically resolved
+    fixture PR subject. Remote Box facts are otherwise never probed from
+    this process.
     """
     if shutil.which("node") is None:
         pytest.fail("preflight: node is not on PATH; the D3 bridge child cannot launch")
@@ -284,6 +324,14 @@ def _preflight(*, resume: bool) -> str:
         )
     _check_bridge_sdk_pin()
     attested = _check_attested_remote_versions()
+    # Autonomous execution requires genuine Box-side checkout and cleanup
+    # verification: the operator-check hook is a required prerequisite, never
+    # a substitutable unperformed Owner attestation.
+    _required_env(
+        _BOX_CHECK_ENV,
+        "genuine Box-side checkout/cleanup verification (an operator-check "
+        "command template with a {path} placeholder, exit 0 = path exists)",
+    )
     if resume:
         _required_env(_HANDOFF_ENV, "the stage-two handoff record")
     else:
@@ -299,8 +347,8 @@ def _preflight(*, resume: bool) -> str:
         _required_env(_PROVIDER_ENV, "role binding provider configuration")
         _required_env(_MODEL_ENV, "role binding model configuration")
         _required_env(_HUB_TOKEN_ENV, "the Connection control credential")
-    _check_fixture_pr_head()
-    return attested
+    head_sha = _resolve_fixture_head()
+    return attested, head_sha
 
 
 # --- deliberate live-test interruption tooling (never production behavior) ---
@@ -409,7 +457,7 @@ class _Live:
         self.resume = resume
         self.database_url = database_url
         self.attested_versions = ""
-        self.checkout_attestation = "OWNER-ATTESTED (no operator check hook configured)"
+        self.fixture_head_sha: str | None = None
         self._pool: ConnectionPool[Connection[Any]] | None = None
         self.profile_id: UUID | None = None
         self.workspace_id: UUID | None = None
@@ -529,7 +577,7 @@ class _Live:
                     1_000_000_001,
                     "openorc",
                     "runtime-test-fixture",
-                    f"https://github.com/{_FIXTURE_REPOSITORY}",
+                    f"https://github.com/{FIXTURE_REPOSITORY}",
                     False,
                     "main",
                 ),
@@ -544,7 +592,7 @@ class _Live:
                     workspace_id,
                     repository_id,
                     149,
-                    _FIXTURE_PR_NUMBER,
+                    FIXTURE_PR_NUMBER,
                     uuid4(),
                     "d7" * 32,
                 ),
@@ -627,16 +675,19 @@ class _Live:
     def box_check(self, path: str, *, expect_exists: bool) -> str:
         """Verify a Box-side path through the Owner-approved operator hook.
 
-        The hook is an explicitly Owner-supplied command template (the
-        ``{path}`` placeholder receives the addressed Box-side path); its
-        outcome is recorded as evidence. Without a hook, the verification is
-        Owner-operated evidence recorded on the PR — the agent's COMPLETED
-        prose alone is never filesystem authority, and this process never
-        probes the remote path itself.
+        The hook is a required preflight prerequisite, so this verification
+        is always genuine: an explicitly Owner-supplied command template (the
+        ``{path}`` placeholder receives the addressed Box-side path) runs
+        against the actual Box, and its outcome is recorded as evidence. The
+        agent's COMPLETED prose alone is never filesystem authority, and this
+        process never probes the remote path itself.
         """
         template = os.environ.get(_BOX_CHECK_ENV, "").strip()
         if not template:
-            return "OWNER-ATTESTED (no operator check hook configured)"
+            pytest.fail(
+                "the operator box check command is not configured; autonomous "
+                "execution requires genuine Box-side checkout/cleanup verification"
+            )
         argv = [part.replace("{path}", path) for part in shlex.split(template)]
         completed = subprocess.run(argv, timeout=60.0, capture_output=True, check=False)
         if (completed.returncode == 0) is not expect_exists:
@@ -713,9 +764,9 @@ class _Live:
         summary = {
             "suite": "D7 live Cline runtime validation (issue #149)",
             "attested_versions": self.attested_versions,
-            "fixture_repository": _FIXTURE_REPOSITORY,
-            "fixture_pr_number": _FIXTURE_PR_NUMBER,
-            "fixture_pr_head": _FIXTURE_PR_HEAD_SHA,
+            "fixture_repository": FIXTURE_REPOSITORY,
+            "fixture_pr_number": FIXTURE_PR_NUMBER,
+            "fixture_pr_head": self.fixture_head_sha,
             "workspace_id": _safe_id(self.workspace_id),
             "task_id": _safe_id(self.task_id),
             "connection_id": _safe_id(self.connection_id),
@@ -754,7 +805,7 @@ def live(request: pytest.FixtureRequest) -> Iterator[_Live]:
         resume=resume,
         database_url=_required_env(_DATABASE_URL_ENV, "the non-production branch database"),
     )
-    state.attested_versions = _preflight(resume=resume)
+    state.attested_versions, state.fixture_head_sha = _preflight(resume=resume)
     if resume:
         # Stage two of the preserved-DB restart mode: the preserved database
         # is consumed as-is; the conftest migration reset is deliberately not
@@ -767,6 +818,36 @@ def live(request: pytest.FixtureRequest) -> Iterator[_Live]:
         yield state
     finally:
         state.finalize()
+
+
+def _refresh_current_hub_credential(state: _Live, credential: str) -> None:
+    """Refresh the test Connection's stored Hub credential (test-only seam).
+
+    The narrow test-only current-Hub-credential refresh interface: after a
+    controlled Hub restart that rotated the attach credential, the current
+    value is installed through the existing #55 trusted Vault rotation
+    service — the Vault secret is updated in place and the durable opaque
+    ``auth_reference`` stays stable — so the reattachment resolves the Hub's
+    CURRENT credential. Merely reopening the same Connection never refreshes
+    a stale secret. This is the test-side mirror of the future Cloud operator
+    runner's credential refresh (openorc/cloud#54); it is deliberately not
+    production API, not new credential storage, and never logs the value.
+    """
+    assert state.profile_id is not None
+    assert state.workspace_id is not None
+    assert state.connection_id is not None
+    rotate_connection_credential(
+        state.pool,
+        profile_id=state.profile_id,
+        workspace_id=state.workspace_id,
+        connection_id=state.connection_id,
+        credential=credential,
+    )
+    state.record(
+        "D3 credential rotation",
+        "EXECUTED",
+        "current Hub credential refreshed through the trusted Vault rotation service",
+    )
 
 
 def _attach_bound(
@@ -913,8 +994,8 @@ def test_b_producer_workspace_lifecycle_and_original_base_stability(live: _Live)
             working_directory=live.repository_base,
         )
         interaction = PrepareWorkspaceInteraction(
-            repository_full_name=_FIXTURE_REPOSITORY,
-            issue_number=_FIXTURE_PR_NUMBER,
+            repository_full_name=FIXTURE_REPOSITORY,
+            issue_number=FIXTURE_PR_NUMBER,
             task_uuid=live.task_id,
             target_directory=checkout,
         )
@@ -927,7 +1008,7 @@ def test_b_producer_workspace_lifecycle_and_original_base_stability(live: _Live)
         assert isinstance(result, WorkspaceResult)
         assert result.operation == "PREPARE"
         assert result.status == "COMPLETED"
-    live.checkout_attestation = live.box_check(checkout, expect_exists=True)
+    checkout_attestation = live.box_check(checkout, expect_exists=True)
 
     # Same-ID bootstrap-ACT -> PLAN reconstruction at the isolated checkout,
     # then one normal formal planning turn.
@@ -1024,7 +1105,7 @@ def test_b_producer_workspace_lifecycle_and_original_base_stability(live: _Live)
         "B producer workspace lifecycle",
         "EXECUTED",
         f"PREPARE/PLAN/IMPLEMENT realized through the production path; checkout "
-        f"attestation: {live.checkout_attestation}; the originally pinned base "
+        f"verification: {checkout_attestation}; the originally pinned base "
         "survived a test-scoped Connection configuration edit (restored)",
     )
 
@@ -1037,12 +1118,16 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
         pytest.skip("stage-two resume mode runs only the recovery and cleanup scenarios")
     assert live.reviewer_session_id is not None
     assert live.reviewer_directory is not None
+    assert live.fixture_head_sha is not None
     reviewer_id = live.reviewer_session_id
+    # The head SHA was resolved from GitHub at preflight and pinned for this
+    # review interaction; the review is bound to that exact resolved head.
+    pinned_head = live.fixture_head_sha
     subject = PrReviewSubject(
-        repository_full_name=_FIXTURE_REPOSITORY,
-        pull_request_number=_FIXTURE_PR_NUMBER,
-        head_sha=_FIXTURE_PR_HEAD_SHA,
-        issue_number=_FIXTURE_PR_NUMBER,
+        repository_full_name=FIXTURE_REPOSITORY,
+        pull_request_number=FIXTURE_PR_NUMBER,
+        head_sha=pinned_head,
+        issue_number=FIXTURE_PR_NUMBER,
     )
     with ExitStack() as stack:
         bound = _attach_bound(
@@ -1054,10 +1139,10 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
         )
         interaction = ReviewInteraction(subject=subject)
         message = (
-            f"REVIEW assignment: inspect {_FIXTURE_REPOSITORY} PR "
-            f"#{_FIXTURE_PR_NUMBER} at exact head {_FIXTURE_PR_HEAD_SHA} with your "
+            f"REVIEW assignment: inspect {FIXTURE_REPOSITORY} PR "
+            f"#{FIXTURE_PR_NUMBER} at exact head {pinned_head} with your "
             "native GitHub MCP; read the changed file "
-            f"{_FIXTURE_CHANGED_PATH} at that SHA with a commit-addressed "
+            f"{FIXTURE_CHANGED_PATH} at that SHA with a commit-addressed "
             "get_file_contents read. Then respond with the canonical review_result "
             "envelope."
         )
@@ -1072,11 +1157,23 @@ def test_c_reviewer_verified_pr_review(live: _Live) -> None:
             expected_family=REVIEW_RESULT_FAMILY,
         )
         assert isinstance(result, ReviewResult)
+        # Head-movement rejection: the reviewed subject must still exist at
+        # its verified exact head after the turn completed.
+        try:
+            post_review_payload, _ = _fetch_fixture_pull_request()
+            post_review_head = post_review_payload.get("head")
+            observed_head = assert_head_unchanged(
+                pinned_head,
+                post_review_head.get("sha") if isinstance(post_review_head, dict) else None,
+            )
+        except FixtureSubjectError as error:
+            pytest.fail(f"the verified review cannot stand on a moved subject ({error})")
     live.record(
         "C reviewer verified review",
         "EXECUTED",
         f"review_result released through the D5b tool-evidence gate "
-        f"(outcome {result.outcome}); subject head {_FIXTURE_PR_HEAD_SHA}",
+        f"(outcome {result.outcome}); subject head {observed_head} unchanged "
+        "after the review turn",
     )
 
 
@@ -1286,21 +1383,15 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
                 "and the corresponding acceptance criterion stays unsatisfied"
             )
 
-    # A Hub restart may rotate the attach credential: the current value goes
-    # through the existing trusted rotation service before the reattachment —
-    # merely reopening the same Connection never refreshes a stale secret.
+    # A Hub restart may rotate the attach credential: the current value is
+    # refreshed through the test-only credential-refresh interface before the
+    # reattachment — merely reopening the same Connection never refreshes a
+    # stale secret.
     if os.environ.get(_ROTATE_ENV) == "1":
-        assert live.profile_id is not None
-        assert live.workspace_id is not None
-        assert live.connection_id is not None
-        rotate_connection_credential(
-            live.pool,
-            profile_id=live.profile_id,
-            workspace_id=live.workspace_id,
-            connection_id=live.connection_id,
-            credential=_required_env(_HUB_TOKEN_ENV, "the rotated Hub attach credential"),
+        _refresh_current_hub_credential(
+            live,
+            _required_env(_HUB_TOKEN_ENV, "the rotated Hub attach credential"),
         )
-        live.record("D3 credential rotation", "EXECUTED", "trusted rotation service applied")
 
     # Reconnect through the ordinary Connection path: the fresh attachment
     # re-resolves the Hub's CURRENT attach credential; the prior incarnation
@@ -1443,8 +1534,8 @@ def test_z_cleanup_workspace_and_final_evidence(live: _Live) -> None:
         )
         bound.adapter.reconstruct_session(producer_id, target_mode=ClineConstructionMode.ACT)
         interaction = CleanupWorkspaceInteraction(
-            repository_full_name=_FIXTURE_REPOSITORY,
-            issue_number=_FIXTURE_PR_NUMBER,
+            repository_full_name=FIXTURE_REPOSITORY,
+            issue_number=FIXTURE_PR_NUMBER,
             task_uuid=live.task_id,
             target_directory=checkout,
         )
