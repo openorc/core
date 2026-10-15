@@ -33,6 +33,12 @@ Continuity invariants enforced here:
 - ``list_active_task_agent_sessions`` provides Connection-scoped active
   occupancy accounting (CONNECTING or READY) for later capacity admission
   services; admission decisions are not made here.
+- ``list_task_agent_sessions_by_external_session_id`` is the read-only exact
+  external-session lookup for the durable construction-context resolver
+  (issue #189): the partial unique index guarantees at most one non-null
+  identity per (Connection, external session), so zero matches and multiple
+  matches are both returned as plain facts and classified by services —
+  never guessed here.
 - ``count_active_task_agent_sessions_by_connection`` is the grouped occupancy
   count over several Connections for the capacity admission service (issue
   #68): representation-level counting only, never an admission decision.
@@ -67,6 +73,7 @@ __all__ = [
     "get_task_agent_session",
     "initialize_task_agent_session",
     "list_active_task_agent_sessions",
+    "list_task_agent_sessions_by_external_session_id",
     "mark_task_agent_session_ended",
     "mark_task_agent_session_lost",
 ]
@@ -179,6 +186,34 @@ def get_task_agent_session(
             (task_id, role.value),
         ).fetchone()
     return None if row is None else _session_from_row(row)
+
+
+def list_task_agent_sessions_by_external_session_id(
+    pool: DatabasePool, *, external_session_id: str
+) -> list[TaskAgentSession]:
+    """List the bindings bound to one exact external session identity.
+
+    Read-only lookup for the durable construction-context resolver (issue
+    #189), keyed by the exact opaque non-null external-session identity. The
+    schema's partial unique index guarantees at most one non-null identity
+    per ``(Connection, external_session_id)``, so the ordinary result is
+    exactly one row; zero matches and multiple matches (possible only across
+    Connections) are both returned as plain facts and classified by the
+    calling service — never guessed here. Deterministically ordered for
+    stable diagnostics.
+    """
+    if not isinstance(external_session_id, str) or not external_session_id.strip():
+        raise TaskAgentSessionDomainError(
+            "external_session_id must be a non-empty opaque external-session identity"
+        )
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
+            "where external_session_id = %s "
+            "order by connection_id, id",
+            (external_session_id,),
+        ).fetchall()
+    return [_session_from_row(row) for row in rows]
 
 
 def initialize_task_agent_session(

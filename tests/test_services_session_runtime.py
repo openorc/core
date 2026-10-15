@@ -63,6 +63,7 @@ from openorc.observability import (
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.initialization_assets import compose_initialization
+from openorc.services.cline_construction import DurableClineConstructionContextResolver
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
@@ -218,22 +219,6 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
     )
 
 
-def _binding_row(workspace_id: Any, role: str, connection_id: Any) -> tuple[Any, ...]:
-    # Canned row matching the #162 binding columns: the scripted flows use
-    # the unconfigured configuration state.
-    return (
-        uuid.uuid4(),
-        workspace_id,
-        role,
-        connection_id,
-        None,
-        None,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-    )
-
-
 def _connection_row(
     workspace_id: Any,
     connection_id: Any,
@@ -290,7 +275,7 @@ def _session_row(
     )
 
 
-_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 6
+_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 5
 _FINALIZE_LIFECYCLE = [
     "pool_enter",
     "tx_enter",
@@ -312,19 +297,18 @@ def _establish_results(
     connection_id: Any,
     *,
     binding_row: tuple[Any, ...],
-    route_row: tuple[Any, ...],
     connection_row: tuple[Any, ...],
     guidance: str = "",
     finalize_results: list[_CannedResult] | None = None,
 ) -> ScriptedConnection:
-    """Canned establish reads: the Phase-1 validation sequence, then the
-    optional finalize-phase sequence (workspace, barrier, initialize write)."""
+    """Canned establish reads: the Phase-1 validation sequence (no role-route
+    read since #189), then the optional finalize-phase sequence (workspace,
+    barrier, initialize write)."""
     results: list[_CannedResult] = [
         _ws_row(workspace_id, owner_profile_id, guidance=guidance),
         _BARRIER_ROW,
         _task_row(workspace_id),
         binding_row,
-        route_row,
         connection_row,
     ]
     if finalize_results is not None:
@@ -350,11 +334,16 @@ def _establish_adapter(
     )
 
 
-def _establish_kwargs(workspace_id: Any, task_id: Any) -> dict[str, Any]:
+def _establish_kwargs(
+    workspace_id: Any, task_id: Any, *, effective_configuration: Any = None
+) -> dict[str, Any]:
     return {
         "workspace_id": workspace_id,
         "task_id": task_id,
         "role": WorkflowRole.PRODUCER,
+        "effective_configuration": (
+            {} if effective_configuration is None else effective_configuration
+        ),
     }
 
 
@@ -395,7 +384,6 @@ def test_successful_establishment_finalizes_ready_exactly_once() -> None:
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(
             workspace_id, connection_id, safe_config=assembled_snapshot["configuration"]
         ),
@@ -405,7 +393,11 @@ def test_successful_establishment_finalizes_ready_exactly_once() -> None:
     adapter = _establish_adapter(conn.lifecycle)
 
     session = establish_task_agent_session(
-        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(
+            workspace_id, task_id, effective_configuration=assembled_snapshot["configuration"]
+        ),
     )
 
     # The exact binding finalized READY with the exact external identity and
@@ -478,7 +470,6 @@ def test_establishment_through_the_reusable_fake_agent_runtime() -> None:
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id, safe_config={}),
         guidance=guidance,
         finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
@@ -546,14 +537,17 @@ def test_effective_config_snapshot_excludes_secret_prompt_guidance_material() ->
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id, safe_config=safe_config),
         guidance=guidance,
         finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
     )
     adapter = _establish_adapter(conn.lifecycle)
 
-    establish_task_agent_session(_pool(conn), adapter, **_establish_kwargs(workspace_id, task_id))
+    establish_task_agent_session(
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(workspace_id, task_id, effective_configuration=safe_config),
+    )
 
     update_params = _initialize_updates(conn)[0][1]
     assert update_params is not None
@@ -589,7 +583,6 @@ def test_already_ready_binding_is_idempotent_without_runtime_call() -> None:
         task_id,
         connection_id,
         binding_row=ready_row,
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
     )
     adapter = _establish_adapter(conn.lifecycle)
@@ -602,37 +595,100 @@ def test_already_ready_binding_is_idempotent_without_runtime_call() -> None:
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
     assert session.external_session_id == "ext-existing"
     assert adapter.calls == []
-    # No Connection read and no durable write happened at all.
-    assert len(conn.executed) == 5
+    # Exact already-READY binding: no runtime call, no Connection read, and
+    # no durable write happened at all.
+    assert len(conn.executed) == 4
     assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
-    assert conn.lifecycle == ["pool_enter", "pool_exit"] * 5
+    assert conn.lifecycle == ["pool_enter", "pool_exit"] * 4
 
 
-def test_different_route_binding_is_a_continuity_conflict_before_any_runtime_call() -> None:
+def test_role_route_change_does_not_block_establishment_of_the_admitted_binding() -> None:
+    """Regression (issue #189): a role-binding change to another Connection
+    applies to FUTURE Task admissions only. An already-admitted CONNECTING
+    binding completes establishment against its persisted admitted
+    Connection even when the current route points elsewhere — the binding is
+    never invalidated and never silently re-pointed to the new route."""
     owner_profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     task_id = uuid.uuid4()
     bound_connection, repointed_connection = sorted((uuid.uuid4(), uuid.uuid4()))
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        bound_connection,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
     conn = _establish_results(
         workspace_id,
         owner_profile_id,
         task_id,
         bound_connection,
         binding_row=_session_row(workspace_id, task_id, "producer", bound_connection),
-        route_row=_binding_row(workspace_id, "producer", repointed_connection),
+        connection_row=_connection_row(workspace_id, bound_connection),
+        finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
+    )
+    adapter = _establish_adapter(conn.lifecycle)
+
+    session = establish_task_agent_session(
+        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+    )
+
+    # The admitted binding was established against its own Connection: the
+    # runtime handshake happened exactly once and READY was finalized.
+    assert len(adapter.calls) == 1
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert session.external_session_id == "ext-1"
+    assert session.connection_id == bound_connection
+    finalize_updates = [
+        sql for sql, _ in conn.executed if "update openorc.task_agent_sessions" in sql
+    ]
+    assert len(finalize_updates) == 1
+    # The repointed route was never read and the binding never re-pointed.
+    assert not any("workflow_role_bindings" in sql for sql, _ in conn.executed)
+
+
+def test_role_route_change_leaves_already_ready_establishment_idempotent() -> None:
+    """Regression (issue #189): returning an already-READY binding
+    idempotently stays a success after the role route changed — the admitted
+    Task/role/Connection binding is not invalidated by the new route."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    bound_connection, repointed_connection = sorted((uuid.uuid4(), uuid.uuid4()))
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        bound_connection,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
+    conn = _establish_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        bound_connection,
+        binding_row=ready_row,
         connection_row=_connection_row(workspace_id, bound_connection),
     )
     adapter = _establish_adapter(conn.lifecycle)
 
-    with pytest.raises(SessionContinuityConflictError):
-        establish_task_agent_session(
-            _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
-        )
+    session = establish_task_agent_session(
+        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+    )
 
+    # Idempotent success with no runtime call, no Connection read, and no
+    # durable write; a newly admitted Task would follow the new route
+    # instead (proven by the admission suite).
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert session.connection_id == bound_connection
     assert adapter.calls == []
-    # The conflict was decided from the route coherence check: the Connection
-    # was never read and nothing was written.
-    assert len(conn.executed) == 5
+    assert len(conn.executed) == 4
+    assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
 
 
 @pytest.mark.parametrize("terminal_status", ["lost", "ended"])
@@ -655,7 +711,6 @@ def test_terminal_binding_is_a_conflict_and_never_replaced(terminal_status: str)
             external_session_id="ext-historical",
             initialized_at=_OBSERVED,
         ),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
     )
     adapter = _establish_adapter(conn.lifecycle)
@@ -666,7 +721,7 @@ def test_terminal_binding_is_a_conflict_and_never_replaced(terminal_status: str)
         )
 
     assert adapter.calls == []
-    assert len(conn.executed) == 5
+    assert len(conn.executed) == 4
 
 
 def test_disabled_connection_fails_closed_before_any_runtime_call() -> None:
@@ -680,7 +735,6 @@ def test_disabled_connection_fails_closed_before_any_runtime_call() -> None:
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id, enabled=False),
     )
     adapter = _establish_adapter(conn.lifecycle)
@@ -691,7 +745,7 @@ def test_disabled_connection_fails_closed_before_any_runtime_call() -> None:
         )
 
     assert adapter.calls == []
-    assert len(conn.executed) == 6
+    assert len(conn.executed) == 5
 
 
 @pytest.mark.parametrize(
@@ -714,7 +768,6 @@ def test_known_creation_failure_leaves_binding_connecting(failure: Exception) ->
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
     )
     adapter = ScriptedAgentRuntimeAdapter([failure], lifecycle=conn.lifecycle)
@@ -752,7 +805,6 @@ def test_uncertain_creation_outcome_remains_connecting_and_is_not_replayed(
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
     )
     adapter = ScriptedAgentRuntimeAdapter([uncertain], lifecycle=conn.lifecycle)
@@ -780,7 +832,6 @@ def test_persistence_failure_after_known_readiness_is_recovery_required() -> Non
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
         finalize_results=[
             _ws_row(workspace_id, owner_profile_id),
@@ -839,7 +890,6 @@ def test_conditional_write_rejection_same_ready_identity_is_idempotent() -> None
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
         finalize_results=[
             _ws_row(workspace_id, owner_profile_id),
@@ -897,7 +947,6 @@ def test_conditional_write_rejection_is_classified_from_the_reloaded_binding(
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
         finalize_results=[
             _ws_row(workspace_id, owner_profile_id),
@@ -931,7 +980,6 @@ def test_conditional_write_rejection_missing_or_mis_scoped_fails_closed() -> Non
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
         finalize_results=[
             _ws_row(workspace_id, owner_profile_id),
@@ -961,7 +1009,6 @@ def test_conditional_write_rejection_with_missing_reload_fails_closed() -> None:
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
         finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, None, None],
     )
@@ -977,7 +1024,7 @@ def test_conditional_write_rejection_with_missing_reload_fails_closed() -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["missing-workspace", "missing-task", "missing-binding", "missing-route", "missing-connection"],
+    ["missing-workspace", "missing-task", "missing-binding", "missing-connection"],
 )
 def test_establish_scope_gaps_fail_closed_with_uniform_not_found(case: str) -> None:
     owner_profile_id = uuid.uuid4()
@@ -985,7 +1032,6 @@ def test_establish_scope_gaps_fail_closed_with_uniform_not_found(case: str) -> N
     task_id = uuid.uuid4()
     connection_id = uuid.uuid4()
     binding_row = _session_row(workspace_id, task_id, "producer", connection_id)
-    route_row = _binding_row(workspace_id, "producer", connection_id)
     by_case: dict[str, list[_CannedResult]] = {
         "missing-workspace": [None],
         "missing-task": [_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, None],
@@ -995,19 +1041,11 @@ def test_establish_scope_gaps_fail_closed_with_uniform_not_found(case: str) -> N
             _task_row(workspace_id),
             None,
         ],
-        "missing-route": [
-            _ws_row(workspace_id, owner_profile_id),
-            _BARRIER_ROW,
-            _task_row(workspace_id),
-            binding_row,
-            None,
-        ],
         "missing-connection": [
             _ws_row(workspace_id, owner_profile_id),
             _BARRIER_ROW,
             _task_row(workspace_id),
             binding_row,
-            route_row,
             None,
         ],
     }
@@ -1517,6 +1555,7 @@ def test_establish_malformed_role_fails_inside_the_span_without_database_access(
             workspace_id=uuid.uuid4(),
             task_id=uuid.uuid4(),
             role=malformed_role,
+            effective_configuration={},
         )
 
     assert conn.executed == []
@@ -1537,6 +1576,39 @@ def test_establish_non_adapter_runtime_is_an_invalid_command() -> None:
             workspace_id=uuid.uuid4(),
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
+            effective_configuration={},
+        )
+
+    assert conn.executed == []
+
+
+@pytest.mark.parametrize(
+    "malformed_selection",
+    [
+        None,
+        "not-a-mapping",
+        [],
+        {1: "non-string-key"},
+        {"nested": {2: "still-not-a-string-key"}},
+        {"x": float("nan")},
+    ],
+)
+def test_establish_malformed_effective_configuration_is_an_invalid_command(
+    malformed_selection: Any,
+) -> None:
+    """The composition-selected configuration is command shape: it is
+    validated in full canonical form before any authorization, persistence,
+    or telemetry effect (issue #189)."""
+    conn = ScriptedConnection([])
+
+    with pytest.raises(InvalidCommandError):
+        establish_task_agent_session(
+            _pool(conn),
+            ScriptedAgentRuntimeAdapter([]),
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            role=WorkflowRole.PRODUCER,
+            effective_configuration=malformed_selection,
         )
 
     assert conn.executed == []
@@ -1628,7 +1700,6 @@ def test_establishment_through_the_real_cline_adapter_and_scripted_backend() -> 
         task_id,
         connection_id,
         binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
-        route_row=_binding_row(workspace_id, "producer", connection_id),
         connection_row=_connection_row(workspace_id, connection_id, safe_config=safe_config),
         guidance=guidance,
         finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
@@ -1674,7 +1745,9 @@ def test_establishment_through_the_real_cline_adapter_and_scripted_backend() -> 
     adapter = ClineAdapter(backend, _WiredResolver())
 
     session = establish_task_agent_session(
-        _pool(conn), adapter, **_establish_kwargs(workspace_id, task_id)
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(workspace_id, task_id, effective_configuration=safe_config),
     )
 
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
@@ -1693,3 +1766,175 @@ def test_establishment_through_the_real_cline_adapter_and_scripted_backend() -> 
 
     # No database transaction was held across the runtime call.
     assert conn.lifecycle == _PHASE1_LIFECYCLE + _FINALIZE_LIFECYCLE
+
+
+def _configured_route_row(
+    workspace_id: Any,
+    role: str,
+    connection_id: Any,
+    *,
+    configured_provider: str | None,
+    configured_model: str | None,
+    role_prompt_override: str | None = None,
+) -> tuple[Any, ...]:
+    # Canned row matching the #162 binding columns with a concrete
+    # configuration state (the unconfigured sibling rows carry Nones).
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        role,
+        connection_id,
+        configured_provider,
+        configured_model,
+        role_prompt_override,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot() -> None:
+    """Regression (issue #189): fresh Cline construction and the durable READY
+    snapshot share ONE composition-selected configuration. The durable
+    Connection row carries an Owner-edited ``repository_base`` while the
+    selection still carries the originally selected one: the external session
+    is constructed at the selected base AND the pinned snapshot records the
+    selected base — a between-reads configuration change can never make the
+    constructed working directory and the pinned snapshot disagree."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    guidance = "Owner-authored guidance composed upstream into the initialization."
+    selected_base = "/srv/selected/repositories"
+    edited_base = "/srv/edited/repositories"
+    selected_configuration = {"repository_base": selected_base}
+    durable_safe_config = {"repository_base": edited_base}
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="cline-session-1",
+        initialized_at=_OBSERVED,
+        snapshot={"adapter": "cline", "configuration": selected_configuration},
+    )
+    conn = ScriptedConnection(
+        [
+            # Phase 1: service reads — workspace, barrier, task, binding, and
+            # the admitted Connection carrying the EDITED safe_config.
+            _ws_row(workspace_id, owner_profile_id, guidance=guidance),
+            _BARRIER_ROW,
+            _task_row(workspace_id),
+            _session_row(workspace_id, task_id, "producer", connection_id),
+            _connection_row(workspace_id, connection_id, safe_config=durable_safe_config),
+            # Phase 3: the durable resolver's fresh reads — the binding, the
+            # admitted Connection (again carrying the EDITED safe_config,
+            # which must not be substituted for the selection), and the
+            # current role configuration.
+            _session_row(workspace_id, task_id, "producer", connection_id),
+            _connection_row(workspace_id, connection_id, safe_config=durable_safe_config),
+            _configured_route_row(
+                workspace_id,
+                "producer",
+                connection_id,
+                configured_provider="configured-provider",
+                configured_model="configured-model",
+            ),
+            # Phase 4: finalize reads — workspace, barrier, initialize write.
+            _ws_row(workspace_id, owner_profile_id),
+            _BARRIER_ROW,
+            ready_row,
+        ]
+    )
+    backend = FakeClineSdkBackend()
+    backend.queue_start(ClineStartResult(session_id="cline-session-1"))
+    backend.queue_send(
+        "cline-session-1",
+        {
+            "finishReason": "completed",
+            "text": json.dumps({"type": "session_ready", "schema_version": 1, "status": "READY"}),
+        },
+    )
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn), bootstrap_repository_base=selected_base
+    )
+    adapter = ClineAdapter(backend, resolver)
+
+    session = establish_task_agent_session(
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(workspace_id, task_id, effective_configuration=selected_configuration),
+    )
+
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert session.external_session_id == "cline-session-1"
+
+    # The fresh construction ran at the SELECTED base, not the edited one.
+    start_calls = [call for call in backend.calls() if call.operation == "start"]
+    assert len(start_calls) == 1
+    assert start_calls[0].request is not None
+    assert start_calls[0].request.cwd == selected_base
+    assert start_calls[0].request.workspace_root == selected_base
+
+    # The pinned READY snapshot records exactly the selected configuration —
+    # never the since-edited durable safe_config.
+    update_params = _initialize_updates(conn)[0][1]
+    assert update_params is not None
+    assert update_params[1].obj == {
+        "adapter": "cline",
+        "configuration": selected_configuration,
+    }
+    assert update_params[1].obj["configuration"]["repository_base"] == selected_base
+
+    # No database transaction was held across the runtime call: Phase 1,
+    # then the resolver's three reads inside the runtime call, then finalize.
+    assert conn.lifecycle == (
+        _PHASE1_LIFECYCLE + ["pool_enter", "pool_exit"] * 3 + _FINALIZE_LIFECYCLE
+    )
+
+
+@pytest.mark.parametrize("mode", ["disabled", "missing", "cross-workspace"])
+def test_fresh_cline_construction_fails_closed_on_an_ineligible_admitted_connection(
+    mode: str,
+) -> None:
+    """Regression (issue #189): a CONNECTING binding whose admitted Connection
+    has been disabled (or has disappeared / become mis-scoped) since
+    admission never reaches a backend effect: the durable resolver verifies
+    the exact admitted Connection before supplying construction inputs, and
+    the adapter fails closed before any runtime start."""
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding_row = _session_row(workspace_id, task_id, "producer", connection_id)
+    connection_row = {
+        "disabled": _connection_row(workspace_id, connection_id, enabled=False),
+        "missing": None,
+        "cross-workspace": _connection_row(uuid.uuid4(), connection_id),
+    }[mode]
+    route_row = _configured_route_row(
+        workspace_id,
+        "producer",
+        connection_id,
+        configured_provider="configured-provider",
+        configured_model="configured-model",
+    )
+    conn = ScriptedConnection([binding_row, connection_row, route_row])
+    backend = FakeClineSdkBackend()
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
+    )
+    adapter = ClineAdapter(backend, resolver)
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.create_session(
+            AgentSessionCreationRequest(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                role=WorkflowRole.PRODUCER,
+                initialization=compose_initialization("producer", "guidance"),
+            )
+        )
+
+    # The refusal happened in the resolver: no backend effect at all.
+    assert backend.calls() == ()
