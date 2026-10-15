@@ -250,8 +250,6 @@ def _connection_row(
         1,
         enabled,
         None,
-        None,
-        None,
         _OBSERVED,
         _OBSERVED,
     )

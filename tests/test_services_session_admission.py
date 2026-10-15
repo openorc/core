@@ -168,8 +168,6 @@ def _connection_row(
         capacity,
         enabled,
         None,
-        None,
-        None,
         _OBSERVED,
         _OBSERVED,
     )

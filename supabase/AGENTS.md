@@ -119,8 +119,8 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   opaque `configured_provider`/`configured_model` pair, and the nullable
   `role_prompt_override`. The pair is configuration authority supplied by the
   Owner — never an enum, never validated through a catalog or readback, and
-  deliberately distinct from the Connection's nullable runtime-reported
-  observations.
+  deliberately distinct from the TaskAgentSession's nullable runtime-reported
+  provenance observations.
 - The pair is complete only when both values are present
   (`(configured_provider is null) = (configured_model is null)` CHECK) and
   present values are nonblank; existing/legacy bindings remain entirely
@@ -134,5 +134,24 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   configuration mutation that never rewrites an existing `TaskAgentSession`,
   its admitted Connection, or its historical effective configuration snapshot;
   later runtime construction/reconstruction resolves the then-current values.
+
+## Connection control endpoint and retired reported observations (issue #188)
+
+- `openorc.connections` no longer carries the retired Phase 1
+  Connection-level `reported_provider`/`reported_model` observation columns:
+  a forward-only migration dropped exactly those columns — no backfill, no
+  invented endpoint values, and no other column, table, constraint, or
+  privilege touched. Row identity, Workspace scope, role bindings, session
+  capacity, credential references, `repository_base`, and
+  `task_agent_sessions` runtime-reported provenance are preserved untouched.
+- The Cline control endpoint is an optional `control_endpoint` value inside
+  the existing `safe_config` JSON object under the adapter-defined v1 schema
+  (alongside `repository_base`). There is deliberately no new column, no
+  per-adapter table hierarchy, and no SQL-level URL validation: parsing and
+  validation are the Cline adapter-boundary primitive
+  (`adapters/cline/connection_endpoint.py`). A Connection without an endpoint
+  remains stored but is not attachable until the Owner configures it, and
+  endpoint parsing is never a safety property — dial-time egress/SSRF policy
+  belongs to the later attachment leaf.
 
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

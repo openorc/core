@@ -52,7 +52,7 @@ __all__ = [
 
 _CONNECTION_COLUMNS = (
     "id, workspace_id, adapter_type, name, safe_config, session_capacity, "
-    "enabled, auth_reference, reported_provider, reported_model, created_at, updated_at"
+    "enabled, auth_reference, created_at, updated_at"
 )
 
 # Qualified column list for join queries that alias openorc.connections as
@@ -60,13 +60,7 @@ _CONNECTION_COLUMNS = (
 # be ambiguous against the joined workspaces table.
 _CONNECTION_QUALIFIED_COLUMNS = (
     "c.id, c.workspace_id, c.adapter_type, c.name, c.safe_config, c.session_capacity, "
-    "c.enabled, c.auth_reference, c.reported_provider, c.reported_model, "
-    "c.created_at, c.updated_at"
-)
-
-_CONNECTION_COLUMNS = (
-    "id, workspace_id, adapter_type, name, safe_config, session_capacity, "
-    "enabled, auth_reference, reported_provider, reported_model, created_at, updated_at"
+    "c.enabled, c.auth_reference, c.created_at, c.updated_at"
 )
 
 _BINDING_COLUMNS = (
@@ -85,10 +79,8 @@ def _connection_from_row(row: Sequence[Any]) -> Connection:
         session_capacity=row[5],
         enabled=row[6],
         auth_reference=row[7],
-        reported_provider=row[8],
-        reported_model=row[9],
-        created_at=normalize_utc(row[10]),
-        updated_at=normalize_utc(row[11]),
+        created_at=normalize_utc(row[8]),
+        updated_at=normalize_utc(row[9]),
     )
 
 
@@ -102,15 +94,12 @@ def create_connection(
     session_capacity: int = 1,
     enabled: bool = True,
     auth_reference: str | None = None,
-    reported_provider: str | None = None,
-    reported_model: str | None = None,
 ) -> Connection:
     """Insert one Connection scoped to its Workspace.
 
     ``session_capacity`` is Owner-configured admission control (default 1:
     concurrency is explicitly enabled by the Owner). ``auth_reference`` is the
-    opaque OpenOrc-owned auth boundary; ``reported_provider``/``reported_model``
-    are nullable runtime-reported observations, never configuration.
+    opaque OpenOrc-owned auth boundary.
 
     ``safe_config`` is canonicalized through the domain (canonical JSON-object
     semantics) and supplied to the driver as an explicit ``Jsonb`` adapter —
@@ -121,8 +110,8 @@ def create_connection(
         row = conn.execute(
             "insert into openorc.connections "
             "(workspace_id, adapter_type, name, safe_config, session_capacity, enabled, "
-            "auth_reference, reported_provider, reported_model) "
-            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "auth_reference) "
+            "values (%s, %s, %s, %s, %s, %s, %s) "
             f"returning {_CONNECTION_COLUMNS}",
             (
                 workspace_id,
@@ -132,8 +121,6 @@ def create_connection(
                 session_capacity,
                 enabled,
                 auth_reference,
-                reported_provider,
-                reported_model,
             ),
         ).fetchone()
     assert row is not None
@@ -218,9 +205,9 @@ def update_connection(
 ) -> Connection | None:
     """Replace the mutable Owner configuration of one Connection.
 
-    Identity, Workspace scope, adapter type, and the runtime-reported
-    observation fields are never touched here. ``updated_at`` advances to the
-    database clock. Returns ``None`` when the Connection does not exist.
+    Identity, Workspace scope, and adapter type are never touched here.
+    ``updated_at`` advances to the database clock. Returns ``None`` when the
+    Connection does not exist.
 
     ``safe_config`` is canonicalized through the domain and supplied as an
     explicit ``Jsonb`` adapter, like every jsonb write at this boundary.

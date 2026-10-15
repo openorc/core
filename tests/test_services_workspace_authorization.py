@@ -291,8 +291,6 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             1,
             True,
             None,
-            None,
-            None,
             _OBSERVED,
             _OBSERVED,
         ),

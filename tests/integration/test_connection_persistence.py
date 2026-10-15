@@ -5,9 +5,10 @@ supplied non-production Supabase branch database and prove the durable
 Connection/WorkflowRoleBinding invariants directly: Workspace ownership,
 scope-consistent bindings, one binding per role (with mutable repointing),
 Producer/Reviewer sharing or separating Connections, Connection-scoped
-Owner-configured capacity, and nullable opaque runtime-reported provider/model
-observations. They are excluded from the ordinary deterministic baseline by
-the repository pytest configuration.
+Owner-configured capacity, and the #188 observation-retirement roundtrip
+(retired Connection-level provider/model observations absent, endpoint-bearing
+safe_config preserved). They are excluded from the ordinary deterministic
+baseline by the repository pytest configuration.
 
 Run explicitly when a target has been made available:
 
@@ -38,6 +39,7 @@ from psycopg.types.json import Jsonb
 
 from openorc.domain.connections import AdapterType, WorkflowRole
 from openorc.persistence import connections as connection_repositories
+from openorc.persistence import deletion as deletion_repositories
 from openorc.persistence.pool import DatabasePool
 
 # Every test in this module requires the explicitly supplied non-production
@@ -75,15 +77,13 @@ def _insert_connection(
     enabled: bool = True,
     safe_config: dict[str, Any] | None = None,
     auth_reference: str | None = None,
-    reported_provider: str | None = None,
-    reported_model: str | None = None,
 ) -> uuid.UUID:
     connection_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.connections "
         "(id, workspace_id, adapter_type, name, safe_config, session_capacity, enabled, "
-        "auth_reference, reported_provider, reported_model) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "auth_reference) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s)",
         (
             connection_id,
             workspace_id,
@@ -93,8 +93,6 @@ def _insert_connection(
             session_capacity,
             enabled,
             auth_reference,
-            reported_provider,
-            reported_model,
         ),
     )
     return connection_id
@@ -358,40 +356,114 @@ def test_capacity_is_connection_scoped_and_owner_configured(conn: Connection[Any
     assert row[0] == 4
 
 
-def test_reported_provider_model_accept_arbitrary_strings_and_null(
+def test_observation_retirement_roundtrip_preserves_connection_and_session_contracts(
     conn: Connection[Any],
 ) -> None:
+    """The targeted #188 real-Postgres migration/roundtrip check: after the
+    full committed migration chain, the retired Connection-level observations
+    are gone, a legacy-shaped endpoint-bearing Connection roundtrips through
+    repository update and disconnect preserving identity, scope, capacity,
+    credential reference, and safe_config, the role binding survives, and
+    TaskAgentSession runtime-reported provenance remains untouched."""
     profile_id = _insert_profile(conn)
     workspace_id = _insert_workspace(conn, profile_id)
+    repository_base = "/srv/openorc/repositories"
+    control_endpoint = "ws://127.0.0.1:25463/hub"
+    safe_config = {"repository_base": repository_base, "control_endpoint": control_endpoint}
     connection_id = _insert_connection(
         conn,
         workspace_id=workspace_id,
-        reported_provider="whatever-the-runtime-reported",
-        reported_model="opaque-token-with-ünicode-⚡",
+        session_capacity=2,
+        safe_config=safe_config,
+        auth_reference="vault://openorc/connection-auth/abc",
     )
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    row = conn.execute(
-        "select reported_provider, reported_model from openorc.connections where id = %s",
-        (connection_id,),
-    ).fetchone()
-    assert row is not None
-    # Runtime-reported observations accept arbitrary strings; they are never
-    # configuration authority and never enum-constrained.
-    assert row[0] == "whatever-the-runtime-reported"
-    assert row[1] == "opaque-token-with-ünicode-⚡"
+    # The retired Connection-level observation columns are absent from the
+    # final migrated schema — and only from it: session-level provenance
+    # columns on task_agent_sessions are deliberately untouched.
+    connection_columns = conn.execute(
+        "select column_name from information_schema.columns "
+        "where table_schema = 'openorc' and table_name = 'connections' "
+        "order by column_name"
+    ).fetchall()
+    assert [column[0] for column in connection_columns] == [
+        "adapter_type",
+        "auth_reference",
+        "created_at",
+        "enabled",
+        "id",
+        "name",
+        "safe_config",
+        "session_capacity",
+        "updated_at",
+        "workspace_id",
+    ]
+    session_provenance_columns = conn.execute(
+        "select column_name from information_schema.columns "
+        "where table_schema = 'openorc' and table_name = 'task_agent_sessions' "
+        "and column_name in ('reported_provider', 'reported_model', "
+        "'reported_runtime_version')"
+    ).fetchall()
+    assert len(session_provenance_columns) == 3
 
-    conn.execute(
-        "update openorc.connections set reported_provider = null, reported_model = null "
-        "where id = %s",
-        (connection_id,),
+    loaded = connection_repositories.get_connection(pool, connection_id)
+    assert loaded is not None
+    assert loaded.workspace_id == workspace_id
+    assert loaded.adapter == AdapterType("cline")
+    assert loaded.session_capacity == 2
+    assert loaded.auth_reference == "vault://openorc/connection-auth/abc"
+    assert dict(loaded.safe_config) == safe_config
+
+    # A role binding survives alongside the Connection configuration.
+    binding, _ = connection_repositories.set_role_binding(
+        pool,
+        workspace_id=workspace_id,
+        role=WorkflowRole.PRODUCER,
+        connection_id=connection_id,
+        configured_provider="configured-provider",
+        configured_model="configured-model",
+        role_prompt_override=None,
     )
-    cleared = conn.execute(
-        "select reported_provider, reported_model from openorc.connections where id = %s",
-        (connection_id,),
+    assert binding.connection_id == connection_id
+
+    # A whole-record configuration update preserves row identity and the
+    # untouched facts (Workspace scope, auth_reference) while advancing the
+    # Owner-configured fields — legacy rows gain no invented endpoint values.
+    updated = connection_repositories.update_connection(
+        pool,
+        connection_id,
+        name="renamed hub",
+        safe_config=safe_config,
+        session_capacity=3,
+        enabled=True,
+        auth_reference="vault://openorc/connection-auth/abc",
+    )
+    assert updated is not None
+    assert updated.id == connection_id
+    assert updated.name == "renamed hub"
+    assert updated.session_capacity == 3
+    assert updated.auth_reference == "vault://openorc/connection-auth/abc"
+    assert dict(updated.safe_config) == safe_config
+
+    # Disconnect is the revoke configuration change: eligibility and the
+    # credential reference move together while everything else is preserved.
+    disconnected = deletion_repositories.disconnect_connection(pool, connection_id)
+    assert disconnected is not None
+    assert disconnected.id == connection_id
+    assert disconnected.enabled is False
+    assert disconnected.auth_reference is None
+    assert disconnected.session_capacity == 3
+    assert dict(disconnected.safe_config) == safe_config
+
+    # The binding still references the same Connection row.
+    binding_count = conn.execute(
+        "select count(*) from openorc.workflow_role_bindings "
+        "where workspace_id = %s and role = 'producer' and connection_id = %s",
+        (workspace_id, connection_id),
     ).fetchone()
-    assert cleared is not None
-    assert cleared[0] is None
-    assert cleared[1] is None
+    assert binding_count is not None
+    assert binding_count[0] == 1
 
 
 def test_repository_upsert_repoints_binding_and_preserves_identity(

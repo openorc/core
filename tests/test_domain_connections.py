@@ -3,9 +3,9 @@
 Ordinary deterministic tests: no database, no network. These prove the
 domain invariants that later persistence/API behavior inherits: Owner-configured
 capacity admission, the boolean eligibility switch, the opaque nullable
-authentication-reference boundary, nullable opaque runtime-reported provider/
-model strings, structural-only safe-config validation, and the honest binding
-shape.
+authentication-reference boundary, the retired Connection-level reported
+observations (issue #188), structural-only safe-config validation, and the
+honest binding shape.
 """
 
 from __future__ import annotations
@@ -37,8 +37,6 @@ def _connection(**overrides: Any) -> Connection:
         "session_capacity": 1,
         "enabled": True,
         "auth_reference": None,
-        "reported_provider": None,
-        "reported_model": None,
         "created_at": datetime(2026, 9, 17, 8, 0, 0, tzinfo=UTC),
         "updated_at": datetime(2026, 9, 17, 8, 0, 0, tzinfo=UTC),
     }
@@ -115,34 +113,14 @@ def _binding(role: WorkflowRole = WorkflowRole.PRODUCER, **overrides: Any) -> Wo
     return WorkflowRoleBinding(**values)
 
 
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [
-        ("reported_provider", "whatever-runtime-said-1"),
-        ("reported_provider", ""),
-        ("reported_model", "gpt-4o-mini"),
-        ("reported_model", "opaque-token-with-ünicode-⚡"),
-    ],
-)
-def test_reported_provider_model_accept_arbitrary_strings(field_name: str, value: str) -> None:
-    # Runtime-reported observations accept arbitrary strings; they are not
-    # vocabularies, not enums, and never configuration authority.
-    connection = _connection(**{field_name: value})
-    assert getattr(connection, field_name) == value
-
-
-def test_reported_provider_model_accept_null() -> None:
-    connection = _connection(reported_provider=None, reported_model=None)
-    assert connection.reported_provider is None
-    assert connection.reported_model is None
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value"), [("reported_provider", 7), ("reported_model", [])]
-)
-def test_reported_provider_model_reject_non_strings(field_name: str, value: Any) -> None:
-    with pytest.raises(ConnectionDomainError):
-        _connection(**{field_name: value})
+@pytest.mark.parametrize("retired_field", ["reported_provider", "reported_model"])
+def test_connection_level_reported_observations_are_retired(retired_field: str) -> None:
+    # The Phase 1 Connection-level reported_provider/reported_model placeholder
+    # observations are retired (issue #188): the domain no longer represents
+    # them, and optional runtime-reported provenance lives only on
+    # TaskAgentSession. Constructing a Connection with one fails closed.
+    with pytest.raises(TypeError):
+        _connection(**{retired_field: "whatever-runtime-said"})  # type: ignore[arg-type]
 
 
 def test_safe_config_accepts_structurally_valid_json_content() -> None:
@@ -211,8 +189,6 @@ def test_no_raw_secret_field_exists_on_domain_objects() -> None:
             "session_capacity",
             "enabled",
             "auth_reference",
-            "reported_provider",
-            "reported_model",
             "created_at",
             "updated_at",
         }
