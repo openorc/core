@@ -14,6 +14,7 @@ loosen the review subject.
 from __future__ import annotations
 
 import pytest
+
 from tests.integration.cline_live_support import (
     FIXTURE_BASE_BRANCH,
     FIXTURE_CHANGED_PATH,

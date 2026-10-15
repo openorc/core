@@ -89,18 +89,6 @@ from uuid import UUID, uuid4
 import pytest
 from psycopg import Connection
 from psycopg_pool import ConnectionPool
-from tests.integration.cline_live_support import (
-    FIXTURE_CHANGED_PATH,
-    FIXTURE_PR_NUMBER,
-    FIXTURE_REPOSITORY,
-    BoxCheckVerificationError,
-    CredentialSupplierError,
-    FixtureSubjectError,
-    assert_head_unchanged,
-    classify_box_check_exit,
-    credential_from_supplier_output,
-    resolve_fixture_head_sha,
-)
 
 from openorc.adapters.agent_runtime.errors import AgentRuntimeUncertainOutcomeError
 from openorc.adapters.agent_runtime.results import AgentTextResponse
@@ -154,6 +142,18 @@ from openorc.services.session_admission import (
     admit_task_agent_sessions,
 )
 from openorc.services.session_runtime import establish_task_agent_session
+from tests.integration.cline_live_support import (
+    FIXTURE_CHANGED_PATH,
+    FIXTURE_PR_NUMBER,
+    FIXTURE_REPOSITORY,
+    BoxCheckVerificationError,
+    CredentialSupplierError,
+    FixtureSubjectError,
+    assert_head_unchanged,
+    classify_box_check_exit,
+    credential_from_supplier_output,
+    resolve_fixture_head_sha,
+)
 
 pytestmark = pytest.mark.integration
 
