@@ -30,6 +30,7 @@ from openorc.persistence.sessions import (
     get_task_agent_session,
     initialize_task_agent_session,
     list_active_task_agent_sessions,
+    list_task_agent_sessions_by_external_session_id,
     mark_task_agent_session_ended,
     mark_task_agent_session_lost,
 )
@@ -464,6 +465,57 @@ def test_list_active_task_agent_sessions_maps_rows_and_filters_active() -> None:
         )
         == []
     )
+
+
+def test_list_task_agent_sessions_by_external_session_id_maps_rows_and_parameters() -> None:
+    rows = [
+        _session_row(
+            external_session_id="ext-session-1",
+            lifecycle_status="ready",
+            effective_config_snapshot={"adapter": "cline"},
+            initialized_at=_observed_at(),
+            updated_at=_observed_at(),
+        ),
+        _session_row(
+            role="reviewer",
+            connection_id=uuid.uuid4(),
+            external_session_id="ext-session-1",
+            lifecycle_status="ready",
+            effective_config_snapshot={"adapter": "cline"},
+            initialized_at=_observed_at(),
+            updated_at=_observed_at(),
+        ),
+    ]
+    fake_conn = FakeConnection(None, rows)
+    listed = list_task_agent_sessions_by_external_session_id(
+        cast(DatabasePool, FakePool(fake_conn)), external_session_id="ext-session-1"
+    )
+    assert [session.id for session in listed] == [rows[0][0], rows[1][0]]
+    sql, params = fake_conn.executed[0]
+    # The exact-identity lookup is parameterized and deterministically
+    # ordered; zero and multiple matches are returned as plain facts for the
+    # calling service to classify (issue #189).
+    assert "where external_session_id = %s" in sql
+    assert "order by connection_id, id" in sql
+    assert params == ("ext-session-1",)
+    assert (
+        list_task_agent_sessions_by_external_session_id(
+            cast(DatabasePool, FakePool(FakeConnection(None, []))),
+            external_session_id="ext-session-1",
+        )
+        == []
+    )
+
+
+def test_list_task_agent_sessions_by_external_session_id_requires_the_identity() -> None:
+    fake_conn = FakeConnection()
+
+    with pytest.raises(TaskAgentSessionDomainError):
+        list_task_agent_sessions_by_external_session_id(
+            cast(DatabasePool, FakePool(fake_conn)), external_session_id="   "
+        )
+
+    assert fake_conn.executed == []
 
 
 def test_count_active_task_agent_sessions_groups_counts_by_connection() -> None:

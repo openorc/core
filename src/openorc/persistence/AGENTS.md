@@ -74,6 +74,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - Exactly one TaskAgentSession exists per (Task, role). Establishment never silently repoints an existing binding.
 - Session initialization facts external_session_id, initialized_at, effective_config_snapshot move coherently. The snapshot does not freeze live role provider/model/prompt values solely for reconstruction. LOST/ENDED never create a successor binding.
 - A non-null external_session_id is unique within its Connection.
+- `list_task_agent_sessions_by_external_session_id` is the read-only exact external-session lookup for the durable construction-context resolver (issue #189): zero matches and multiple matches (possible only across Connections) are returned as plain facts and classified by the calling service — never guessed in persistence.
 - Active Connection occupancy is CONNECTING or READY; services own admission decisions.
 
 ## Planning, review, gates, attempts, requests, blocks, and PRs

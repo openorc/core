@@ -12,16 +12,23 @@ in phases with no database transaction ever held across the runtime call:
 
 1. short read phase — reload/validate the exact Task/role binding: CONNECTING
    proceeds, an exact already-READY binding is idempotent success, LOST/ENDED
-   are terminal conflicts that never trigger replacement, and a binding
-   pointing at a different Connection than the current authorized route is a
-   continuity conflict; the routed Connection must exist, be Workspace-scoped,
-   and be enabled;
+   are terminal conflicts that never trigger replacement; the persisted
+   ADMITTED Connection must exist, be Workspace-scoped, and be enabled. A
+   later role-binding route change applies to future Task admissions only:
+   it never invalidates an already-admitted Task/role/Connection, and this
+   operation never silently switches to the new route (issue #189);
 2. composition phase (no transaction) — compose the canonical #66 role
    initialization through the protocol boundary and deliberately assemble the
-   NON-SECRET effective runtime/session configuration snapshot (the routed
-   Connection's adapter type plus its canonical ``safe_config``; never raw
-   credentials, initialization Markdown, rendered schemas, Workspace guidance,
-   control/prompt bodies, or transcripts);
+   NON-SECRET effective runtime/session configuration snapshot from the
+   composition-selected admitted-Connection configuration (the required
+   ``effective_configuration`` the caller read and selected once before this
+   service and shares with the injected construction-context resolver) plus
+   the durably-read admitted Connection's adapter type. The current
+   Connection ``safe_config`` is never re-read here, so fresh construction
+   and the durable READY snapshot agree by construction even across a
+   between-reads Owner configuration edit; never raw credentials,
+   initialization Markdown, rendered schemas, Workspace guidance,
+   control/prompt bodies, or transcripts enter the snapshot;
 3. external phase (no transaction) — invoke the #67
    ``AgentRuntimeAdapter.create_session`` readiness handshake exactly once for
    the exact admitted binding. A successful ready-session result already
@@ -70,7 +77,7 @@ from openorc.adapters.agent_runtime.results import (
     AgentSessionCreated,
     AgentSessionCreationRequest,
 )
-from openorc.domain.connections import Connection, WorkflowRole
+from openorc.domain.connections import AdapterType, WorkflowRole
 from openorc.domain.ownership import Workspace
 from openorc.domain.sessions import (
     TaskAgentSession,
@@ -80,7 +87,7 @@ from openorc.domain.sessions import (
 )
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.connections import get_connection, get_role_binding
+from openorc.persistence.connections import get_connection
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import (
@@ -123,11 +130,12 @@ logger = logging.getLogger(__name__)
 class SessionContinuityConflictError(ConflictError):
     """The binding's continuity facts disagree with current authorized state.
 
-    The exact Task/role binding points at a different Connection than the
-    current authorized route, or an already-initialized binding carries a
-    different external session identity than the one being finalized. Bindings
-    are never silently repointed, replaced, or overwritten: the external
-    session identity is immutable after initialization.
+    An already-initialized binding carries a different external session
+    identity than the one being finalized. Bindings are never silently
+    repointed, replaced, or overwritten: the external session identity is
+    immutable after initialization. A changed role-binding route is future
+    admission state (issue #189), never an establishment continuity conflict
+    against the persisted admitted Connection.
     """
 
 
@@ -249,23 +257,53 @@ def _reload_scoped_binding(
     return binding
 
 
+def _require_effective_configuration(
+    effective_configuration: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Classify a malformed selected configuration as an invalid command.
+
+    The composition-selected admitted-Connection configuration is the
+    authoritative snapshot content, so it is validated in full canonical
+    form at command shape: canonical JSON-object semantics over the whole
+    value. Malformed caller data can then never escape into authorization,
+    persistence mutation, or telemetry, and the raw value is never echoed
+    into the error text.
+    """
+    if not isinstance(effective_configuration, Mapping):
+        raise InvalidCommandError(
+            "the selected effective configuration must be a canonical JSON object"
+        )
+    try:
+        return canonical_effective_config_snapshot(effective_configuration)
+    except TaskAgentSessionDomainError as error:
+        raise InvalidCommandError(
+            "the selected effective configuration must be a canonical JSON object"
+        ) from error
+
+
 def _assemble_effective_config_snapshot(
-    connection: Connection,
+    adapter_type: AdapterType,
+    effective_configuration: Mapping[str, object],
 ) -> Mapping[str, object]:
     """Deliberately assemble the non-secret effective configuration snapshot.
 
-    The demonstrated v1 effective runtime/session configuration available at
-    this service boundary is the routed Connection's adapter type plus its
-    canonical non-secret ``safe_config`` (already canonical JSON by the
-    Connection domain invariant). Nothing else enters the snapshot: never raw
+    The snapshot records exactly the composition-selected admitted-Connection
+    configuration the caller supplied (``effective_configuration``, read and
+    selected once before establishment and shared with the injected
+    construction-context resolver's fresh-Producer bootstrap base) plus the
+    durably-read admitted Connection's adapter type. The current Connection
+    ``safe_config`` is never re-read here: a between-reads Owner edit is
+    absorbed by the selection, so fresh construction and the durable READY
+    snapshot agree by construction (issue #189). Nothing else enters the
+    snapshot: never raw
     credentials/tokens/auth secrets, initialization Markdown, rendered
     schemas, Workspace guidance, control/prompt bodies, or transcripts.
     """
     try:
         return canonical_effective_config_snapshot(
             {
-                "adapter": connection.adapter.value,
-                "configuration": dict(connection.safe_config),
+                "adapter": adapter_type.value,
+                "configuration": dict(effective_configuration),
             }
         )
     except TaskAgentSessionDomainError as error:
@@ -350,6 +388,7 @@ def establish_task_agent_session(
     workspace_id: UUID,
     task_id: UUID,
     role: WorkflowRole,
+    effective_configuration: Mapping[str, object],
 ) -> TaskAgentSession:
     """Establish one admitted Task/role binding through runtime readiness.
 
@@ -361,10 +400,20 @@ def establish_task_agent_session(
     session identity, the non-secret effective configuration snapshot, and the
     reported provenance exactly once.
 
+    ``effective_configuration`` is the complete non-secret selected
+    admitted-Connection safe_config the composition read and selected ONCE
+    before this service (issue #189). It is the authoritative snapshot
+    content and is shared with the injected construction-context resolver's
+    fresh-Producer bootstrap base, so the fresh construction and the durable
+    READY snapshot agree by construction: an Owner configuration edit
+    between the selection and the runtime call is absorbed by the selection
+    instead of silently diverging. No database transaction is open when the
+    selection is read.
+
     Returns the READY binding. An exact already-READY binding is idempotent
     success with no runtime call. Raises the typed authorization/not-found
     vocabulary (uniform :class:`NotFoundError` for a missing/unscoped
-    Workspace, Task, binding, role binding, or Connection), the typed
+    Workspace, Task, binding, or Connection), the typed
     continuity/terminal conflicts defined by this module, and — for the
     runtime handshake — :class:`ExternalOperationFailedError` for known
     failures and :class:`ExternalOperationUncertainError` for uncertain
@@ -384,6 +433,7 @@ def establish_task_agent_session(
         _require_uuid_command_field(task_id, "task_id")
         _require_workflow_role(role)
         _require_runtime_adapter(adapter)
+        _require_effective_configuration(effective_configuration)
         annotate_span(
             span,
             operation=_ESTABLISH_SPAN_NAME,
@@ -401,16 +451,11 @@ def establish_task_agent_session(
         binding = _require_scoped_binding(
             pool, workspace_id=workspace_id, task_id=task_id, role=role
         )
-        route = get_role_binding(pool, workspace_id=workspace_id, role=role)
-        if route is None or route.workspace_id != workspace_id:
-            raise NotFoundError(
-                "the requested workflow role binding is not available in this workspace"
-            )
-        if route.connection_id != binding.connection_id:
-            raise SessionContinuityConflictError(
-                "the task/role session binding points at a different connection "
-                "than the current route"
-            )
+        # A changed role-binding route is future admission state (issue
+        # #189): it never invalidates this already-admitted
+        # Task/role/Connection, and this operation never re-points the
+        # binding to the new route. The persisted admitted Connection is
+        # what establishment resolves and validates.
         if binding.lifecycle_status is TaskSessionLifecycleStatus.READY:
             # Exact already-READY binding: idempotent success with no runtime
             # call and no rewrite of the immutable initialization facts.
@@ -433,7 +478,7 @@ def establish_task_agent_session(
         # canonical #66 initialization is composed through the protocol
         # boundary and the non-secret snapshot is assembled deliberately. ---
         initialization = compose_initialization(role.value, workspace.guidance)
-        snapshot = _assemble_effective_config_snapshot(connection)
+        snapshot = _assemble_effective_config_snapshot(connection.adapter, effective_configuration)
         request = AgentSessionCreationRequest(
             workspace_id=workspace_id,
             task_id=task_id,
