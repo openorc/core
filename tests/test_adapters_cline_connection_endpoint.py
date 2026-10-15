@@ -33,6 +33,11 @@ from openorc.adapters.cline.connection_endpoint import (
         "ws://[2001:db8::1]:25463/hub",  # bracketed IPv6 host
         "ws://hub.example.com/hub/",
         "wss://hub.example.com/deep/endpoint/path",
+        "ws://localhost/hub",
+        "wss://hub-1.example.com/hub",
+        "ws://10.0.0.255/hub",
+        "ws://[fe80::1]/hub",
+        "wss://localhost:9443/hub",
     ],
 )
 def test_valid_endpoints_are_accepted_and_preserved_verbatim(endpoint: str) -> None:
@@ -77,6 +82,17 @@ def test_scheme_comparison_is_case_insensitive_and_value_stays_verbatim(
         "ws://hub.example.com/hub#fragment",  # fragment component
         "ws://hub.example.com:abc/hub",  # malformed port
         "ws://hub.example.com:99999/hub",  # out-of-range port
+        "ws://foo<script>/hub",  # malformed host characters (urlsplit blind spot)
+        "ws://foo\\evil/hub",  # malformed host characters (urlsplit blind spot)
+        "ws://host_name/hub",  # underscore label
+        "ws://-hub.example.com/hub",  # leading-hyphen label
+        "ws://hub-.example.com/hub",  # trailing-hyphen label
+        "ws://hub..example.com/hub",  # empty label
+        "ws://hub.example.com./hub",  # empty trailing label
+        "ws://exämple.com/hub",  # non-ASCII/IDN host (not v1-representable)
+        "ws://127.0.0.01/hub",  # leading-zero IPv4 octet
+        "ws://1.2.3.4.5/hub",  # all-numeric dotted form that is not IPv4
+        "ws://999/hub",  # all-numeric label that is not an IPv4 literal
     ],
 )
 def test_invalid_endpoints_are_rejected(bad_endpoint: Any) -> None:
@@ -105,6 +121,14 @@ def test_error_messages_never_echo_userinfo_credentials() -> None:
         parse_control_endpoint_url(secretish)
     assert "topsecret" not in str(excinfo.value)
     assert secretish not in str(excinfo.value)
+
+
+def test_error_messages_never_echo_malformed_host_characters() -> None:
+    malicious_host = "ws://foo<script>/hub"
+    with pytest.raises(ConnectionControlEndpointError) as excinfo:
+        parse_control_endpoint_url(malicious_host)
+    assert "<script>" not in str(excinfo.value)
+    assert malicious_host not in str(excinfo.value)
 
 
 def test_resolver_returns_absent_for_a_connection_without_an_endpoint() -> None:
