@@ -115,8 +115,6 @@ def _connection_row(
         1,
         enabled,
         auth_reference,
-        None,
-        None,
         _OBSERVED,
         _OBSERVED,
     )

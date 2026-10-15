@@ -27,8 +27,8 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - enabled means OpenOrc may use the Connection; it is not runtime health or reachability.
 - session_capacity is OpenOrc admission control, default 1, and is never discovered from the runtime.
 - Raw credentials never appear in domain objects. Runtime-owned provider/MCP/tool credentials remain runtime-owned. OpenOrc-owned control-endpoint authentication is represented only by auth_reference.
-- reported_provider, reported_model, and reported runtime metadata are nullable opaque observations, never configuration authority or enums.
-- safe_config contains canonical non-secret JSON only.
+- Connection-level reported_provider/reported_model observations are retired (issue #188): no Connection-level runtime-reported configuration metadata exists. Optional runtime-reported provenance lives only on TaskAgentSession.
+- safe_config contains canonical non-secret JSON only. The v1 Cline adapter schema defines its concrete fields (issue #188): repository_base plus an optional, adapter-validated control_endpoint — a complete ws:// or wss:// control URL the Core process reaches through the public SDK. A Connection without one stays stored but is not attachable until the Owner configures it; no endpoint value is ever invented. Parsing the endpoint is never a safety property — reaching it is bounded by dial-time egress/SSRF policy at the later attachment leaf.
 - Exactly one WorkflowRoleBinding exists per (Workspace, role) in v1. Producer and Reviewer bindings may reference the same Connection or separate Connections. The settled concrete role configuration is an opaque provider/model pair plus a nullable Owner role-prompt override; no provider catalog or generic runtime-config bag is implied. Runtime pools/failover are not v1 concepts.
 
 ## GitHub App installations and Repository routing (Phase 2B)

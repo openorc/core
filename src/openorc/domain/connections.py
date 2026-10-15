@@ -17,25 +17,28 @@ a workflow role (Producer or Reviewer) at a Connection.
 - ``session_capacity`` is Owner-configured OpenOrc admission control, scoped
   to the Connection and never discovered from the runtime. The default of 1
   is deliberate: concurrency must be explicitly enabled by the Owner.
-- ``reported_provider``/``reported_model`` are nullable opaque runtime-reported
-  observation strings — never configuration authority, never enums. A future
-  OpenOrc-side selection capability would add separate ``configured_*``
-  concepts rather than repurposing these fields.
 - ``safe_config`` is the non-secret Owner configuration container with
   canonical JSON-object semantics: string keys at every level, JSON-representable
   values only, sequences normalized to lists, and nothing relying on silent
-  key coercion. Concrete adapter configuration schemas enforce allowed fields
-  once those configurations exist. Secret material never belongs here.
+  key coercion. The domain validates canonical structure only; the concrete
+  adapter configuration schema defines the allowed v1 fields (issue #188):
+  ``repository_base`` plus an optional, adapter-validated Cline
+  ``control_endpoint`` — the reachable control endpoint the Core process
+  reaches through the public SDK, whose absence means a stored-but-not-
+  attachable Connection until the Owner configures it. No endpoint value is
+  ever invented for legacy rows. Secret material never belongs here, and
+  parsing the endpoint URL is never a safety property: reaching it is bounded
+  by dial-time egress/SSRF policy at the later attachment boundary.
 - Exactly one binding exists per ``(Workspace, role)`` in v1 (no runtime
   pools, no failover). Producer and Reviewer bindings are independent and may
   reference the same Connection or separate Connections. The settled concrete
   role configuration (issue #162) is the Owner-supplied opaque configured
   provider/model pair plus the nullable Owner-authored role-prompt Markdown
   override — configuration authority, deliberately distinct from the
-  Connection's nullable runtime-reported observations. A partial one-value
-  pair is not representable, and a blank pair member is not a valid opaque
-  identifier. ``role_prompt_override`` is ``None`` (use OpenOrc's current
-  shipped default for the role) or stored and passed verbatim: Core never
+  TaskAgentSession's nullable runtime-reported provenance observations. A
+  partial one-value pair is not representable, and a blank pair member is not
+  a valid opaque identifier. ``role_prompt_override`` is ``None`` (use
+  OpenOrc's current shipped default for the role) or stored and passed verbatim: Core never
   parses, classifies, or reasons about its prose, and the shipped default
   prompt bodies remain OpenOrc-owned code assets never materialized into
   persistence. No provider catalog, generic runtime-config bag, prompt
@@ -98,8 +101,6 @@ class Connection:
     session_capacity: int
     enabled: bool
     auth_reference: str | None
-    reported_provider: str | None
-    reported_model: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -124,13 +125,6 @@ class Connection:
                 "Connection.auth_reference must be None or a non-empty opaque reference "
                 "(NULL means no OpenOrc-owned auth reference is configured)"
             )
-        for field_name in ("reported_provider", "reported_model"):
-            value = getattr(self, field_name)
-            # Opaque runtime-reported observations: any string, or None. No
-            # vocabulary, no enum, no normalization — these are never
-            # configuration authority.
-            if value is not None and not isinstance(value, str):
-                raise ConnectionDomainError(f"Connection.{field_name} must be None or a string")
         object.__setattr__(self, "safe_config", canonical_safe_config(self.safe_config))
 
 

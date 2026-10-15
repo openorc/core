@@ -100,8 +100,6 @@ def _connection_row(**overrides: Any) -> tuple[Any, ...]:
         "session_capacity": 2,
         "enabled": True,
         "auth_reference": None,
-        "reported_provider": None,
-        "reported_model": None,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
     }
@@ -115,8 +113,6 @@ def _connection_row(**overrides: Any) -> tuple[Any, ...]:
         values["session_capacity"],
         values["enabled"],
         values["auth_reference"],
-        values["reported_provider"],
-        values["reported_model"],
         values["created_at"],
         values["updated_at"],
     )
@@ -170,8 +166,6 @@ def test_create_connection_maps_row_and_normalizes_utc() -> None:
     assert created.session_capacity == 2
     assert created.enabled is True
     assert created.auth_reference == "vault://openorc/connection-auth/abc"
-    assert created.reported_provider is None
-    assert created.reported_model is None
     assert created.created_at == _utc_observed_at()
     assert created.updated_at == _utc_observed_at()
     assert created.created_at.utcoffset() == timedelta(0)
@@ -184,7 +178,7 @@ def test_create_connection_maps_row_and_normalizes_utc() -> None:
     assert isinstance(params[3], Jsonb)
     assert params[3].obj == {"base_url": "https://hub.example.com"}
     assert params[0:3] == (row[1], "cline", "primary cline hub")
-    assert params[4:] == (2, True, "vault://openorc/connection-auth/abc", None, None)
+    assert params[4:] == (2, True, "vault://openorc/connection-auth/abc")
 
 
 def test_get_connection_maps_row_or_none() -> None:

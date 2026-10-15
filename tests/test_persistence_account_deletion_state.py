@@ -83,7 +83,7 @@ def test_locked_workspace_enumeration_is_deterministic_and_for_update() -> None:
     sql, params = conn.executed[0]
     assert sql == (
         "select id, workspace_id, adapter_type, name, safe_config, session_capacity, "
-        "enabled, auth_reference, reported_provider, reported_model, created_at, updated_at "
+        "enabled, auth_reference, created_at, updated_at "
         "from openorc.connections where workspace_id = %s order by id for update"
     )
     assert params == (workspace_id,)

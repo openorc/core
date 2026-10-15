@@ -31,6 +31,12 @@ from openorc.adapters.cline.activity import (
 )
 from openorc.adapters.cline.adapter import ClineAdapter
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
+from openorc.adapters.cline.connection_endpoint import (
+    CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY,
+    ConnectionControlEndpointError,
+    parse_control_endpoint_url,
+    resolve_connection_control_endpoint,
+)
 from openorc.adapters.cline.construction import (
     ClineConstructionContext,
     ClineConstructionContextResolver,
@@ -65,6 +71,7 @@ from openorc.adapters.cline.values import (
 )
 
 __all__ = [
+    "CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY",
     "ClineAccumulatedUsage",
     "ClineAdapter",
     "ClineActivityDetail",
@@ -106,8 +113,11 @@ __all__ = [
     "ClineToolCategory",
     "ClineTurnFinishReason",
     "ClineUsageActivity",
+    "ConnectionControlEndpointError",
     "JsonObject",
     "Subscription",
+    "parse_control_endpoint_url",
     "project_session_event",
     "project_usage_summary",
+    "resolve_connection_control_endpoint",
 ]

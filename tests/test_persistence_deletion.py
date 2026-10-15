@@ -250,8 +250,6 @@ def test_delete_connection_forces_the_connection_reference_constraints_immediate
         1,
         True,
         "auth-ref",
-        None,
-        None,
         observed,
         observed,
     )
@@ -291,8 +289,6 @@ def test_disconnect_connection_revokes_use_and_drops_the_auth_reference_atomical
         {},
         1,
         False,
-        None,
-        None,
         None,
         observed,
         observed,
