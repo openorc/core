@@ -22,21 +22,6 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from tests.fakes.cline_sdk_backend import (
-    OP_ABORT,
-    OP_CONNECT,
-    OP_DISPOSE,
-    OP_GET,
-    OP_GET_ACCUMULATED_USAGE,
-    OP_LIST_HISTORY,
-    OP_READ_MESSAGES,
-    OP_SEND,
-    OP_START,
-    OP_STOP,
-    OP_SUBSCRIBE,
-    FakeBackendCall,
-    FakeClineSdkBackend,
-)
 
 from openorc.adapters.cline import (
     ClineBackendUncertainOutcomeError,
@@ -51,6 +36,21 @@ from openorc.adapters.cline import (
     ClineSessionNotFoundError,
     ClineStartRequest,
     ClineStartResult,
+)
+from tests.fakes.cline_sdk_backend import (
+    OP_ABORT,
+    OP_CONNECT,
+    OP_DISPOSE,
+    OP_GET,
+    OP_GET_ACCUMULATED_USAGE,
+    OP_LIST_HISTORY,
+    OP_READ_MESSAGES,
+    OP_SEND,
+    OP_START,
+    OP_STOP,
+    OP_SUBSCRIBE,
+    FakeBackendCall,
+    FakeClineSdkBackend,
 )
 
 
