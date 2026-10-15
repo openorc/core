@@ -31,6 +31,7 @@ from openorc.adapters.cline.activity import (
 )
 from openorc.adapters.cline.adapter import ClineAdapter
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
+from openorc.adapters.cline.classification import classify_backend_failure
 from openorc.adapters.cline.connection_endpoint import (
     CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY,
     ConnectionControlEndpointError,
@@ -116,6 +117,7 @@ __all__ = [
     "ConnectionControlEndpointError",
     "JsonObject",
     "Subscription",
+    "classify_backend_failure",
     "parse_control_endpoint_url",
     "project_session_event",
     "project_usage_summary",

@@ -151,7 +151,10 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   validation are the Cline adapter-boundary primitive
   (`adapters/cline/connection_endpoint.py`). A Connection without an endpoint
   remains stored but is not attachable until the Owner configures it, and
-  endpoint parsing is never a safety property — dial-time egress/SSRF policy
-  belongs to the later attachment leaf.
+  endpoint parsing is never a safety property — a syntactically valid
+  endpoint says nothing about where it leads. The Core SDK attachment
+  performs no application-level egress/SSRF screening: protecting internal
+  services from Owner-configured endpoints is a deployment-operator
+  obligation (infrastructure isolation and network controls, issue #190).
 
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

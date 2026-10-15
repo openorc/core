@@ -27,8 +27,11 @@ a workflow role (Producer or Reviewer) at a Connection.
   reaches through the public SDK, whose absence means a stored-but-not-
   attachable Connection until the Owner configures it. No endpoint value is
   ever invented for legacy rows. Secret material never belongs here, and
-  parsing the endpoint URL is never a safety property: reaching it is bounded
-  by dial-time egress/SSRF policy at the later attachment boundary.
+  parsing the endpoint URL is never a safety property: a syntactically valid
+  endpoint says nothing about where it leads, and the Core SDK attachment
+  performs no application-level egress/SSRF screening — protecting internal
+  services from Owner-configured endpoints is a deployment-operator
+  obligation (infrastructure isolation and network controls, issue #190).
 - Exactly one binding exists per ``(Workspace, role)`` in v1 (no runtime
   pools, no failover). Producer and Reviewer bindings are independent and may
   reference the same Connection or separate Connections. The settled concrete
