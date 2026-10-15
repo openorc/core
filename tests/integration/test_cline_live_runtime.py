@@ -56,11 +56,14 @@ CI or ordinary test runs.
 Scenarios (run the module whole; tests rely on module-scoped state in file
 order): A fresh attachments/initialization/exact binding; B Producer
 workspace lifecycle and original-base stability; C Reviewer verified
-GitHub-MCP exact-head review through the D5b tool-evidence gate; D
+GitHub-MCP exact-head review through the D5b tool-evidence gate; D1/D2
 interruption/reconciliation (adapter-local guard semantics vs.
-cross-attachment continuity) plus the required Hub-restart recovery
-completion gate; E observational activity/usage; and authorized workspace
-cleanup.
+cross-attachment continuity); E observational activity/usage, ordered
+before the Hub restart because the pinned runtime preserves transcripts
+across restarts without guaranteeing that previously live sessions remain
+immediately addressable and E requires no post-restart Reviewer recovery;
+D3 the required Hub-restart recovery completion gate; and authorized
+workspace cleanup.
 
 Content discipline: raw attach credentials, Cline-native secrets,
 transcripts, prompts, and source content never enter test evidence, logs,
@@ -1402,6 +1405,87 @@ def test_d2_fresh_attachment_reconciles_the_exact_session(live: _Live) -> None:
     )
 
 
+# --- scenario E: observational activity and usage ------------------------------
+#
+# Ordered before the Hub restart (D3): the pinned Cline runtime preserves
+# transcripts across restarts but does not guarantee that previously live
+# sessions remain immediately addressable, and E addresses the still-live
+# Reviewer session with no recovery requirement of its own. E's usage
+# assertions stay restart-tolerant by contract either way.
+
+
+def test_e_activity_and_usage_observations(live: _Live) -> None:
+    if live.resume:
+        pytest.skip("stage-two resume mode runs only the recovery and cleanup scenarios")
+    assert live.reviewer_session_id is not None
+    assert live.reviewer_directory is not None
+    reviewer_id = live.reviewer_session_id
+    probe = f"d7{secrets.token_hex(8)}"
+    with ExitStack() as stack:
+        bound = _attach_bound(
+            live,
+            stack,
+            role=WorkflowRole.REVIEWER,
+            external_session_id=reviewer_id,
+            working_directory=live.reviewer_directory,
+        )
+        observations: list[Any] = []
+        subscription = bound.adapter.subscribe_activity(reviewer_id, observations.append)
+        reply = bound.adapter.send(
+            reviewer_id,
+            f"Run the shell command `echo {probe}` and report its exit status. Then reply done.",
+        )
+        assert isinstance(reply, AgentTextResponse)
+        _wait_for(
+            lambda: any(
+                observation.kind is ClineActivityKind.TURN_FINISHED for observation in observations
+            ),
+            timeout=_TURN_WAIT_SECONDS,
+            what="the turn_finished activity observation",
+        )
+        with suppress(Exception):
+            subscription.unsubscribe()
+        snapshot = bound.adapter.read_activity_snapshot(reviewer_id)
+        assert snapshot.session_id == reviewer_id
+        # Usage scopes are runtime bookkeeping: absent scopes stay None
+        # (unknown) and are never substituted from the other scope. A Hub
+        # restart may reset them while the conversation survives; a reset is
+        # observational only — never terminal-session-loss evidence and never
+        # a reason to invalidate the durable TaskAgentSession.
+        assert snapshot.usage is None or isinstance(snapshot.usage, ClineAccumulatedUsage)
+        assert snapshot.aggregate_usage is None or isinstance(
+            snapshot.aggregate_usage, ClineAccumulatedUsage
+        )
+    kinds = {observation.kind for observation in observations}
+    representative = kinds & {
+        ClineActivityKind.TOOL_STARTED,
+        ClineActivityKind.TOOL_COMPLETED,
+        ClineActivityKind.ITERATION_STARTED,
+        ClineActivityKind.COMMENTARY,
+        ClineActivityKind.TURN_FINISHED,
+    }
+    assert representative, "no representative session-scoped activity was observed"
+    # Content safety: command/tool inputs and outputs never leave the adapter
+    # in projected activity. Completed non-reasoning commentary is permitted
+    # content-bearing text by contract, so it is excluded from the scan.
+    leaked = [
+        type(observation.detail).__name__
+        for observation in observations
+        if not isinstance(observation.detail, ClineCommentaryActivity)
+        and observation.detail is not None
+        and probe in repr(observation.detail)
+    ]
+    assert not leaked, "prompt material leaked into projected activity details"
+    assert probe not in repr(snapshot), "prompt material leaked into the usage snapshot"
+    live.record(
+        "E observational activity/usage",
+        "EXECUTED",
+        f"session-scoped typed observations observed (kinds: "
+        f"{sorted(kind.value for kind in kinds)}); usage scopes optional and "
+        "content-safe; prompt material absent from non-commentary projections",
+    )
+
+
 # --- scenario D3: required Hub-restart recovery (completion gate) -------------
 
 
@@ -1511,81 +1595,6 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         f"current-credential reattachment, transcript survival "
         f"(pre {live.producer_count_before_restart} / post {count} messages), "
         "and same-ID recover_session with a post-recovery continuation turn",
-    )
-
-
-# --- scenario E: observational activity and usage ------------------------------
-
-
-def test_e_activity_and_usage_observations(live: _Live) -> None:
-    if live.resume:
-        pytest.skip("stage-two resume mode runs only the recovery and cleanup scenarios")
-    assert live.reviewer_session_id is not None
-    assert live.reviewer_directory is not None
-    reviewer_id = live.reviewer_session_id
-    probe = f"d7{secrets.token_hex(8)}"
-    with ExitStack() as stack:
-        bound = _attach_bound(
-            live,
-            stack,
-            role=WorkflowRole.REVIEWER,
-            external_session_id=reviewer_id,
-            working_directory=live.reviewer_directory,
-        )
-        observations: list[Any] = []
-        subscription = bound.adapter.subscribe_activity(reviewer_id, observations.append)
-        reply = bound.adapter.send(
-            reviewer_id,
-            f"Run the shell command `echo {probe}` and report its exit status. Then reply done.",
-        )
-        assert isinstance(reply, AgentTextResponse)
-        _wait_for(
-            lambda: any(
-                observation.kind is ClineActivityKind.TURN_FINISHED for observation in observations
-            ),
-            timeout=_TURN_WAIT_SECONDS,
-            what="the turn_finished activity observation",
-        )
-        with suppress(Exception):
-            subscription.unsubscribe()
-        snapshot = bound.adapter.read_activity_snapshot(reviewer_id)
-        assert snapshot.session_id == reviewer_id
-        # Usage scopes are runtime bookkeeping: absent scopes stay None
-        # (unknown) and are never substituted from the other scope. A Hub
-        # restart may reset them while the conversation survives; a reset is
-        # observational only — never terminal-session-loss evidence and never
-        # a reason to invalidate the durable TaskAgentSession.
-        assert snapshot.usage is None or isinstance(snapshot.usage, ClineAccumulatedUsage)
-        assert snapshot.aggregate_usage is None or isinstance(
-            snapshot.aggregate_usage, ClineAccumulatedUsage
-        )
-    kinds = {observation.kind for observation in observations}
-    representative = kinds & {
-        ClineActivityKind.TOOL_STARTED,
-        ClineActivityKind.TOOL_COMPLETED,
-        ClineActivityKind.ITERATION_STARTED,
-        ClineActivityKind.COMMENTARY,
-        ClineActivityKind.TURN_FINISHED,
-    }
-    assert representative, "no representative session-scoped activity was observed"
-    # Content safety: command/tool inputs and outputs never leave the adapter
-    # in projected activity. Completed non-reasoning commentary is permitted
-    # content-bearing text by contract, so it is excluded from the scan.
-    leaked = [
-        type(observation.detail).__name__
-        for observation in observations
-        if not isinstance(observation.detail, ClineCommentaryActivity)
-        and observation.detail is not None
-        and probe in repr(observation.detail)
-    ]
-    assert not leaked, "prompt material leaked into projected activity details"
-    assert probe not in repr(snapshot), "prompt material leaked into the usage snapshot"
-    live.record(
-        "E observational activity/usage",
-        "EXECUTED",
-        f"session-scoped typed observations observed (kinds: "
-        f"{sorted(kind.value for kind in kinds)}); usage scopes optional and "
-        "content-safe; prompt material absent from non-commentary projections",
     )
 
 
