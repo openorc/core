@@ -41,8 +41,9 @@ Boundary and discipline:
   while configuration rejection and runtime unavailability remain distinct
   typed causes of ``ExternalOperationFailedError``. Attachment-time failure
   never fabricates ``AGENT_SESSION_LOST``, never retries, and never replays.
-- Bounded lifetimes: the lease disposes the backend exactly once on normal
-  exit, failure, and cancellation. Every explicit re-attachment is a new
+- Bounded lifetimes: one ownership owns disposal from the moment the backend
+  exists — exactly once on normal exit, known and unexpected attachment
+  failures, and cancellation. Every explicit re-attachment is a new
   invocation with fresh Connection and credential reads — no in-memory secret
   survives rotation and the composition never switches Connections.
 - Secrets and endpoint material never enter domain DTOs, snapshots, spans,
@@ -378,39 +379,42 @@ def attach_cline_runtime(
         if phase is ClineAttachmentPhase.FRESH and role is WorkflowRole.PRODUCER:
             bootstrap_repository_base = _selected_producer_base(selection)
 
-        # --- Phase 3: the authenticated SDK attachment (external, no
-        # database transaction held). Failures preserve the normalized
-        # taxonomy and dispose the freshly created backend. ---
+        # --- Phase 3: the authenticated SDK attachment, composition, and
+        # bounded lease under ONE outer ownership: from the moment the
+        # backend exists, its disposal is guaranteed exactly once — covering
+        # remote-configuration construction, the connect call (typed
+        # taxonomy failures AND unexpected exceptions or interruption),
+        # adapter composition, and the yielded lease. The backend's own
+        # dispose is idempotent and local-only: it never issues
+        # stop/abort/delete and never replaces a session. ---
         backend = backend_factory()
         try:
-            backend.connect(
-                ClineRemoteConfig(
-                    endpoint=endpoint,
-                    client_identity=OPENORC_CLIENT_IDENTITY,
-                    auth_token=secret.secret_value(),
+            try:
+                backend.connect(
+                    ClineRemoteConfig(
+                        endpoint=endpoint,
+                        client_identity=OPENORC_CLIENT_IDENTITY,
+                        auth_token=secret.secret_value(),
+                    )
                 )
-            )
-        except ClineSdkBackendError as error:
-            backend.dispose()
-            failure = classify_backend_failure(error, operation=_CONNECT_OPERATION)
-            if isinstance(failure, AgentRuntimeUncertainOutcomeError):
-                logger.warning(
-                    "cline runtime attachment ended with an uncertain outcome; "
-                    "local bridge resources were released"
-                )
-                raise ExternalOperationUncertainError(
-                    "the outcome of the cline runtime attachment is unknown; "
-                    "no workflow effect was dispatched and nothing is retried here"
+            except ClineSdkBackendError as error:
+                # Known taxonomy failures translate through the normalized
+                # seam; unexpected exceptions and cancellation propagate
+                # unchanged — both through the guaranteed disposal below.
+                failure = classify_backend_failure(error, operation=_CONNECT_OPERATION)
+                if isinstance(failure, AgentRuntimeUncertainOutcomeError):
+                    logger.warning(
+                        "cline runtime attachment ended with an uncertain outcome; "
+                        "local bridge resources are released"
+                    )
+                    raise ExternalOperationUncertainError(
+                        "the outcome of the cline runtime attachment is unknown; "
+                        "no workflow effect was dispatched and nothing is retried here"
+                    ) from failure
+                raise ExternalOperationFailedError(
+                    "the cline runtime attachment failed before any workflow effect"
                 ) from failure
-            raise ExternalOperationFailedError(
-                "the cline runtime attachment failed before any workflow effect"
-            ) from failure
 
-        # --- Phase 4: composition and bounded lease. The resolver carries
-        # the one selection (fresh Producer base) and the caller-authorized
-        # working directory; the adapter consumes it. Exit disposes the
-        # backend exactly once — never a session effect. ---
-        try:
             resolver = DurableClineConstructionContextResolver(
                 pool,
                 bootstrap_repository_base=bootstrap_repository_base,

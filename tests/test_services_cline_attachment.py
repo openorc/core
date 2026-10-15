@@ -48,7 +48,7 @@ from openorc.adapters.cline.errors import (
     ClineRemoteAttachmentRejectedError,
     ClineRemoteAttachmentUnavailableError,
 )
-from openorc.adapters.cline.values import ClineStartResult
+from openorc.adapters.cline.values import ClineRemoteConfig, ClineStartResult
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import (
@@ -934,6 +934,76 @@ def test_attachment_failures_preserve_the_normalized_taxonomy(
     # The freshly created backend was disposed exactly once; no adapter
     # escaped the failed acquisition.
     assert [call.operation for call in backend.calls()] == ["connect", "dispose"]
+
+
+# --- unexpected connect-time failures and interruption ----------------------
+
+
+class _UnexpectedConnectFailureBackend(FakeClineSdkBackend):
+    """A fake backend whose ``connect`` fails outside the sanitized taxonomy."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__()
+        self._failure = failure
+
+    def connect(self, remote: ClineRemoteConfig) -> None:
+        raise self._failure
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("unexpected bridge failure"), KeyboardInterrupt()],
+    ids=["unexpected-exception", "interruption"],
+)
+def test_an_unexpected_or_interrupted_connect_still_disposes_the_backend_exactly_once(
+    failure: BaseException,
+) -> None:
+    """Regression (PR review): disposal is owned from backend construction.
+
+    A connect-time failure outside the sanitized backend taxonomy — or an
+    interruption of the acquisition — must neither be masked nor leak the
+    locally acquired bridge resources: the failure propagates unchanged and
+    the backend is disposed exactly once.
+    """
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    reference = _auth_reference(uuid.uuid4())
+    conn = ScriptedConnection(
+        [
+            _binding_row(workspace_id, task_id, connection_id),
+            _connection_row(
+                workspace_id,
+                connection_id,
+                safe_config=_selected_config(),
+                auth_reference=reference,
+            ),
+            _connection_row(
+                workspace_id,
+                connection_id,
+                safe_config=_selected_config(),
+                auth_reference=reference,
+            ),
+            (_SECRET,),
+        ]
+    )
+    backend = _UnexpectedConnectFailureBackend(failure)
+    factory = _ScriptedBackendFactory(backend)
+
+    with (
+        pytest.raises(type(failure)) as excinfo,
+        attach_cline_runtime(
+            _pool(conn),
+            **_attach_kwargs(workspace_id, task_id, backend_factory=factory),
+        ),
+    ):
+        pass  # pragma: no cover - the lease body never runs
+
+    # The unexpected failure is never masked by the taxonomy translation.
+    assert excinfo.value is failure
+    assert factory.constructed == 1
+    # connect never completed and was never recorded; disposal ran exactly once.
+    assert [call.operation for call in backend.calls()] == ["dispose"]
 
 
 # --- refresh, bounded cleanup, and no replay --------------------------------
