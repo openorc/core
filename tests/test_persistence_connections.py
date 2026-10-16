@@ -181,6 +181,50 @@ def test_create_connection_maps_row_and_normalizes_utc() -> None:
     assert params[4:] == (2, True, "vault://openorc/connection-auth/abc")
 
 
+def test_create_connection_implicit_default_capacity_is_two() -> None:
+    # Issue #200: the implicit Python creation default is 2 — one shared
+    # Connection serves a Task's Producer and Reviewer sessions under #68
+    # admission. The helper forwards the default explicitly in the INSERT
+    # parameter list; the database default itself is proven separately by the
+    # integration final-schema suite.
+    row = _connection_row(session_capacity=2)
+    fake_conn = FakeConnection(row)
+    created = create_connection(
+        cast(DatabasePool, FakePool(fake_conn)),
+        workspace_id=row[1],
+        adapter=AdapterType("cline"),
+        name="shared hub",
+    )
+
+    assert created.session_capacity == 2
+    sql, params = fake_conn.executed[0]
+    assert "openorc.connections" in sql
+    assert params is not None
+    assert params[0:3] == (row[1], "cline", "shared hub")
+    assert params[4] == 2
+
+
+def test_create_connection_passes_explicit_capacity_one_through() -> None:
+    # Explicitly configured capacity 1 remains a valid dedicated single-role
+    # Connection configuration; the default change never rewrites it.
+    row = _connection_row(session_capacity=1)
+    fake_conn = FakeConnection(row)
+    created = create_connection(
+        cast(DatabasePool, FakePool(fake_conn)),
+        workspace_id=row[1],
+        adapter=AdapterType("cline"),
+        name="dedicated producer hub",
+        session_capacity=1,
+    )
+
+    assert created.session_capacity == 1
+    sql, params = fake_conn.executed[0]
+    assert "openorc.connections" in sql
+    assert params is not None
+    assert params[0:3] == (row[1], "cline", "dedicated producer hub")
+    assert params[4] == 1
+
+
 def test_get_connection_maps_row_or_none() -> None:
     row = _connection_row()
     found = get_connection(cast(DatabasePool, FakePool(FakeConnection(row))), row[0])

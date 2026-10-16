@@ -91,15 +91,17 @@ def create_connection(
     adapter: AdapterType,
     name: str,
     safe_config: Mapping[str, object] | None = None,
-    session_capacity: int = 1,
+    session_capacity: int = 2,
     enabled: bool = True,
     auth_reference: str | None = None,
 ) -> Connection:
     """Insert one Connection scoped to its Workspace.
 
-    ``session_capacity`` is Owner-configured admission control (default 1:
-    concurrency is explicitly enabled by the Owner). ``auth_reference`` is the
-    opaque OpenOrc-owned auth boundary.
+    ``session_capacity`` is Owner-configured admission control. The default
+    is 2 (issue #200): one shared Connection serves both Task roles, whose
+    two #68 session reservations consume two slots. Explicit positive values,
+    including 1 for a dedicated single-role Connection, pass through
+    unchanged. ``auth_reference`` is the opaque OpenOrc-owned auth boundary.
 
     ``safe_config`` is canonicalized through the domain (canonical JSON-object
     semantics) and supplied to the driver as an explicit ``Jsonb`` adapter —
