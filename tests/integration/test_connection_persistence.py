@@ -162,8 +162,10 @@ def test_connection_defaults_encode_owner_admission_and_eligibility(
 
     assert row is not None
     session_capacity, enabled, safe_config, auth_reference = row
-    # Default 1: concurrency must be explicitly enabled by the Owner.
-    assert session_capacity == 1
+    # Final-schema default 2 (issue #200): one shared Connection serves a
+    # Task's Producer and Reviewer sessions, which consume two #68 admission
+    # slots. Explicit positive values, including 1, remain accepted.
+    assert session_capacity == 2
     # Owner-controlled eligibility defaults to permitted; it never encodes
     # runtime reachability or health.
     assert enabled is True
