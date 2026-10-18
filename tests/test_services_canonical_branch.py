@@ -161,6 +161,7 @@ def _task_row(
         None,
         None,
         "a" * 64,
+        None,
         _OBSERVED,
         _OBSERVED,
     )

@@ -147,6 +147,7 @@ def _task_row(
         current_plan_revision_id,
         current_owner_gate_id,
         "a" * 64,
+        None,
         _OBSERVED,
         _OBSERVED,
     )

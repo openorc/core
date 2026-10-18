@@ -120,10 +120,12 @@ class Task:
 
     ``github_issue_id`` is the stable external identity; ``status`` is the
     coarse primary workflow state; ``archived_at`` separates current from
-    archived history without erasing the terminal outcome; and
-    ``state_token`` is the opaque optimistic-concurrency token rotated by
-    every authoritative state mutation. Current-object pointers identify
-    related records without duplicating their content.
+    archived history without erasing the terminal outcome; ``queued_at`` is
+    the durable FIFO queue-entry timestamp carried exactly while the status
+    is queued (issue #76); and ``state_token`` is the opaque
+    optimistic-concurrency token rotated by every authoritative state
+    mutation. Current-object pointers identify related records without
+    duplicating their content.
     """
 
     id: UUID
@@ -133,6 +135,7 @@ class Task:
     github_issue_number: int
     status: TaskStatus
     archived_at: datetime | None
+    queued_at: datetime | None
     canonical_feature_branch: str | None
     state_token: UUID
     current_plan_revision_id: UUID | None
@@ -164,6 +167,21 @@ class Task:
             raise TaskDomainError(
                 "Task.canonical_feature_branch must be None or a non-empty string"
             )
+        # The durable FIFO queue-entry timestamp (issue #76): populated by the
+        # database clock exactly once when the Task first enters QUEUED,
+        # preserved unchanged for the lifetime of that queue wait, and cleared
+        # on the successful QUEUED -> PLANNING claim and on any later
+        # authorized path out of QUEUED. It is non-null iff the current status
+        # is QUEUED — the domain invariant mirrored by the database CHECK.
+        if self.queued_at is not None:
+            if not isinstance(self.queued_at, datetime):
+                raise TaskDomainError("Task.queued_at must be None or a datetime")
+            if self.queued_at.tzinfo is None:
+                raise TaskDomainError("Task.queued_at must be timezone-aware")
+            if self.status is not TaskStatus.QUEUED:
+                raise TaskDomainError("Task.queued_at is populated only while the status is queued")
+        elif self.status is TaskStatus.QUEUED:
+            raise TaskDomainError("a queued Task carries its durable queue-entry timestamp")
         _require_uuid(self.state_token, "state_token", nullable=False)
         _require_uuid(self.current_plan_revision_id, "current_plan_revision_id", nullable=True)
         _require_uuid(self.current_owner_gate_id, "current_owner_gate_id", nullable=True)

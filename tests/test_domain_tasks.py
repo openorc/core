@@ -34,6 +34,7 @@ def _task(**overrides: object) -> Task:
         "github_issue_number": 42,
         "status": TaskStatus.READY_TO_PLAN,
         "archived_at": None,
+        "queued_at": None,
         "canonical_feature_branch": None,
         "state_token": uuid4(),
         "current_plan_revision_id": None,
@@ -125,6 +126,35 @@ def test_archived_terminal_attempts_remain_distinguishable() -> None:
     assert cancelled.archived_at is not None and completed.archived_at is not None
 
 
+def test_queued_task_carries_its_durable_queue_entry_timestamp() -> None:
+    # The queue-entry fact (issue #76): a queued Task carries the DB-clock
+    # instant its current queue wait began; the iff-QUEUED domain invariant
+    # mirrors the database CHECK in both directions.
+    queued_at = datetime.now(UTC)
+    queued = _task(status=TaskStatus.QUEUED, queued_at=queued_at)
+    assert queued.queued_at == queued_at
+
+
+def test_non_queued_task_cannot_carry_a_queue_entry_timestamp() -> None:
+    with pytest.raises(TaskDomainError, match="only while the status is queued"):
+        _task(queued_at=datetime.now(UTC), status=TaskStatus.READY_TO_PLAN)
+
+
+def test_queued_task_without_a_queue_entry_timestamp_is_rejected() -> None:
+    with pytest.raises(TaskDomainError, match="queue-entry timestamp"):
+        _task(status=TaskStatus.QUEUED)
+
+
+def test_queue_entry_timestamp_must_be_timezone_aware() -> None:
+    with pytest.raises(TaskDomainError, match="timezone-aware"):
+        _task(queued_at=datetime(2026, 10, 18, 12, 0, 0), status=TaskStatus.QUEUED)
+
+
+def test_queue_entry_timestamp_must_be_a_datetime() -> None:
+    with pytest.raises(TaskDomainError, match="None or a datetime"):
+        _task(queued_at="2026-10-18T12:00:00Z", status=TaskStatus.QUEUED)
+
+
 def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
     # One fact, one home: current-object pointers only — no plan content,
     # no gate type/subject, no review outcomes, no blocking context, and no
@@ -138,6 +168,7 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "github_issue_number",
             "status",
             "archived_at",
+            "queued_at",
             "canonical_feature_branch",
             "state_token",
             "current_plan_revision_id",

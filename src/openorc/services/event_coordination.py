@@ -63,6 +63,7 @@ __all__ = [
     "owner_actor",
     "record_guidance_changed_event",
     "record_owner_gate_resolved_event",
+    "record_planning_started_event",
     "record_review_iteration_limit_changed_event",
     "record_role_binding_configuration_changed_event",
     "record_task_terminal_event",
@@ -210,6 +211,36 @@ def record_role_binding_configuration_changed_event(
         subject_type=_SUBJECT_TYPE_WORKSPACE,
         subject_id=workspace_id,
         context={"setting": "workflow_role_binding", "role": role.value},
+    )
+
+
+def record_planning_started_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one planning-start claim as its exact locked event type (issue #76).
+
+    Task-scoped: the Task is the subject and ``task_id`` is the exact
+    reference, so no redundant subject pair is added, and the helper accepts
+    no provider/model/prompt/session parameter — the event records only that
+    this Task's capacity admission claimed the planning startup. It is
+    recorded by the same composed transaction that commits the
+    ``queued``/``ready_to_plan`` -> ``planning`` conditional state write, so
+    a stale or failed mutation never writes it and a successful claim never
+    omits it.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.PLANNING_STARTED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
     )
 
 

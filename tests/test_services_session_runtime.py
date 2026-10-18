@@ -214,6 +214,7 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
         None,
         None,
         "a" * 64,
+        None,
         _OBSERVED,
         _OBSERVED,
     )
@@ -1097,6 +1098,8 @@ _LOSS_LIFECYCLE = [
     "tx_exit",
     "tx_enter",
     "tx_exit",
+    "tx_enter",
+    "tx_exit",
     "tx_exit",
     "pool_exit",
 ]
@@ -1112,6 +1115,9 @@ def _loss_results(
 ) -> ScriptedConnection:
     results: list[_CannedResult] = [
         _ws_row(workspace_id, owner_profile_id),
+        # The per-Workspace task-arbitration advisory lock (issue #76): a
+        # capacity-releasing lifecycle transition composes the boundary.
+        (True,),
         _task_row(workspace_id),
         binding_row,
     ]
@@ -1336,9 +1342,10 @@ def test_loss_scope_gaps_fail_closed_with_uniform_not_found(case: str) -> None:
     task_id = uuid.uuid4()
     by_case: dict[str, list[_CannedResult]] = {
         "missing-workspace": [None],
-        "missing-task": [_ws_row(workspace_id, owner_profile_id), None],
+        "missing-task": [_ws_row(workspace_id, owner_profile_id), (True,), None],
         "missing-binding": [
             _ws_row(workspace_id, owner_profile_id),
+            (True,),
             _task_row(workspace_id),
             None,
         ],
@@ -1489,7 +1496,7 @@ def test_end_missing_binding_fails_closed_with_uniform_not_found() -> None:
     workspace_id = uuid.uuid4()
     task_id = uuid.uuid4()
     conn = ScriptedConnection(
-        [_ws_row(workspace_id, owner_profile_id), _task_row(workspace_id), None]
+        [_ws_row(workspace_id, owner_profile_id), (True,), _task_row(workspace_id), None]
     )
 
     with pytest.raises(NotFoundError):

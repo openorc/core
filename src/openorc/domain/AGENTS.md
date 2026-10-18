@@ -44,6 +44,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - At most one current/non-archived Task exists for a repository issue. Archived CANCELLED and COMPLETED attempts remain history; a fresh Task may follow cancellation or a later reopened completed issue.
 - archived_at and terminal status are coherent: nonterminal Tasks are current; CANCELLED/COMPLETED Tasks are archived. Terminal transition goes through the archival operation.
 - Task.status is the canonical coarse lifecycle state only: ready_to_plan, queued, planning, waiting_for_owner, implementing, reviewing, blocked, cancelled, completed.
+- queued_at is the durable FIFO queue-entry fact (issue #76): DB-clock stamped exactly once on entering queued, stable across repeated capacity checks, cleared on leaving queued; non-null iff the status is queued. It is the canonical queue order key with the Task id — never creation time, an event timestamp, or queue infrastructure state.
 - Do not encode gate type, review outcome, block reason, session health, CI, or runtime telemetry into Task.status. Those facts have their own canonical homes.
 - state_token is an opaque optimistic-concurrency token. Every authoritative Task-state mutation rotates it; stale callers must fail without applying effects.
 - current_plan_revision_id and current_owner_gate_id are pointers only. They never duplicate target content/outcomes. There is no singular current Execution pointer.

@@ -38,7 +38,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from uuid import UUID
 
-from openorc.domain.connections import WorkflowRole
+from openorc.domain.connections import Connection, WorkflowRole
 from openorc.domain.sessions import (
     TaskAgentSession,
     TaskAgentSessionDomainError,
@@ -66,12 +66,17 @@ __all__ = [
     "ConnectionNotAdmissibleError",
     "SessionAdmissionOutcome",
     "SessionRouteConflictError",
+    "StructuralFeasibilityStatus",
+    "StructuralInfeasibilityFact",
+    "StructuralRouteFeasibility",
     "TerminalSessionConflictError",
     "admit_task_agent_sessions",
+    "assess_structural_route_feasibility",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.session_admission"
 _ADMIT_SPAN_NAME = "session_admission.admit_task_agent_sessions"
+_ASSESS_FEASIBILITY_SPAN_NAME = "session_admission.assess_structural_route_feasibility"
 
 
 class SessionRouteConflictError(ConflictError):
@@ -386,3 +391,195 @@ def admit_task_agent_sessions(
                 sessions=MappingProxyType(admitted),
                 blocked=(),
             )
+
+
+class StructuralFeasibilityStatus(StrEnum):
+    """The two outcomes of the structural route-feasibility assessment."""
+
+    FEASIBLE = "feasible"
+    STRUCTURALLY_INFEASIBLE = "structurally_infeasible"
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralInfeasibilityFact:
+    """Safe diagnostic facts for one structurally overloaded Connection.
+
+    Only non-secret configuration facts are carried: the Connection identity,
+    its Owner-configured capacity, and the total number of required roles
+    routed to it. Occupancy of OTHER Tasks is deliberately absent — it is
+    temporary contention, never a configuration fact.
+    """
+
+    connection_id: UUID
+    session_capacity: int
+    required_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralRouteFeasibility:
+    """The read-only structural feasibility of one Task's role routing.
+
+    ``FEASIBLE`` carries the resolved role -> Connection routes; the
+    all-or-nothing capacity decision remains :func:`admit_task_agent_sessions`.
+    ``STRUCTURALLY_INFEASIBLE`` carries the overloaded Connections: the Task's
+    complete required role-to-Connection multiset can never fit its routed
+    Connections' configured capacity, no matter what capacity ever frees.
+    """
+
+    status: StructuralFeasibilityStatus
+    routes: Mapping[WorkflowRole, UUID]
+    infeasible: tuple[StructuralInfeasibilityFact, ...]
+
+
+def assess_structural_route_feasibility(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    roles: Sequence[WorkflowRole],
+) -> StructuralRouteFeasibility:
+    """Assess whether a Task's routed roles can EVER complete admission.
+
+    The minimal read-only feasibility seam (issue #76) distinguishing an
+    impossible role-binding configuration from temporary occupation: the
+    resolved role -> Connection routing is a required multiset — every
+    required role must end up bound to its currently routed Connection — and
+    the assessment is structural exactly when one Connection's required role
+    count exceeds its configured ``session_capacity``, including roles the
+    Task already holds a valid reservation for (a shared capacity-1
+    Connection with an existing CONNECTING Producer and a still-needed
+    Reviewer can never complete admission; it is not capacity waiting).
+    Other Tasks' active occupancy is deliberately excluded: that is
+    contention #68's capacity decision arbitrates.
+
+    One short, database-only transaction reusing the #68 sequence: the
+    account-operational barrier first, exact Owner + Task authorization, the
+    authorized role-binding resolution, the deterministic Connection row
+    locks, and the same existing-binding classification as admission
+    (route-conflict/terminal/disabled/missing outcomes raise identically).
+    It reserves nothing and writes nothing, so it composes both standalone
+    and inside a caller's larger arbitration composition (passing the
+    transaction-scoped pool view makes its scope a nested SAVEPOINT).
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _ASSESS_FEASIBILITY_SPAN_NAME) as span:
+        _require_uuid_command_field(profile_id, "profile_id")
+        _require_uuid_command_field(workspace_id, "workspace_id")
+        _require_uuid_command_field(task_id, "task_id")
+        requested_roles = _normalize_requested_roles(roles)
+        annotate_span(
+            span,
+            operation=_ASSESS_FEASIBILITY_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        with composed_transaction(pool) as transaction_pool:
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            require_workspace_task(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
+            routes: dict[WorkflowRole, UUID] = {}
+            for role in requested_roles:
+                binding = require_workspace_role_binding(
+                    transaction_pool,
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                    role=role,
+                )
+                routes[role] = binding.connection_id
+
+            lock_order = _connection_lock_order(set(routes.values()))
+            locked_connections = list_connections_for_update(
+                transaction_pool, connection_ids=lock_order
+            )
+            locked_by_id = {connection.id: connection for connection in locked_connections}
+            for connection_id in lock_order:
+                connection = locked_by_id.get(connection_id)
+                if connection is None or connection.workspace_id != workspace_id:
+                    raise NotFoundError(
+                        "the requested connection is not available in this workspace"
+                    )
+                if not connection.enabled:
+                    raise ConnectionNotAdmissibleError(
+                        "the connection routed for this role is currently disabled"
+                    )
+            _classify_existing_route_bindings(
+                transaction_pool,
+                requested_roles=requested_roles,
+                routes=routes,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
+            return _structural_verdict(
+                requested_roles=requested_roles, routes=routes, locked_by_id=locked_by_id
+            )
+
+
+def _classify_existing_route_bindings(
+    transaction_pool: DatabasePool,
+    *,
+    requested_roles: tuple[WorkflowRole, ...],
+    routes: Mapping[WorkflowRole, UUID],
+    workspace_id: UUID,
+    task_id: UUID,
+) -> None:
+    """Classify existing Task/role bindings against the resolved routes.
+
+    The same classification admission performs before counting: a missing
+    binding needs no comment; a present binding must belong to the addressed
+    Task/Workspace and point at exactly the currently routed Connection, and
+    a terminal (LOST/ENDED) historical binding is never replaceable. Raises
+    the identical typed conflicts as admission so a caller's per-candidate
+    handling sees one vocabulary.
+    """
+    for role in requested_roles:
+        session = get_task_agent_session(transaction_pool, task_id=task_id, role=role)
+        if session is None:
+            continue
+        if session.workspace_id != workspace_id or session.task_id != task_id:
+            raise NotFoundError("the requested agent session is not available in this workspace")
+        if session.connection_id != routes[role]:
+            raise SessionRouteConflictError(
+                "the existing task/role session binding points at a different connection"
+            )
+        if session.lifecycle_status in (
+            TaskSessionLifecycleStatus.LOST,
+            TaskSessionLifecycleStatus.ENDED,
+        ):
+            raise TerminalSessionConflictError(
+                "the existing task/role session binding is a terminal historical session"
+            )
+
+
+def _structural_verdict(
+    *,
+    requested_roles: tuple[WorkflowRole, ...],
+    routes: Mapping[WorkflowRole, UUID],
+    locked_by_id: Mapping[UUID, Connection],
+) -> StructuralRouteFeasibility:
+    """Derive the structural verdict from the complete required multiset."""
+    required: dict[UUID, int] = {}
+    for role in requested_roles:
+        connection_id = routes[role]
+        required[connection_id] = required.get(connection_id, 0) + 1
+    infeasible = [
+        StructuralInfeasibilityFact(
+            connection_id=connection_id,
+            session_capacity=locked_by_id[connection_id].session_capacity,
+            required_count=required[connection_id],
+        )
+        for connection_id in sorted(required)
+        if required[connection_id] > locked_by_id[connection_id].session_capacity
+    ]
+    return StructuralRouteFeasibility(
+        status=(
+            StructuralFeasibilityStatus.FEASIBLE
+            if not infeasible
+            else StructuralFeasibilityStatus.STRUCTURALLY_INFEASIBLE
+        ),
+        routes=MappingProxyType(routes),
+        infeasible=tuple(infeasible),
+    )

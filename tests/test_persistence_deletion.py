@@ -89,6 +89,7 @@ def _task_row(archived: bool) -> tuple[Any, ...]:
         None,
         None,
         "a" * 64,
+        None,
         _observed_at(),
         _observed_at(),
     )

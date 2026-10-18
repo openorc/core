@@ -161,6 +161,7 @@ def _task_row() -> tuple[Any, ...]:
         None,
         None,
         "a" * 64,
+        None,
         _OBSERVED,
         _OBSERVED,
     )

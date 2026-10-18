@@ -28,6 +28,7 @@ surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``,
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -46,7 +47,9 @@ __all__ = [
     "get_task_for_update",
     "list_issue_attempts",
     "list_current_repository_tasks",
+    "list_queued_tasks",
     "list_workspace_tasks",
+    "lock_workspace_task_arbitration",
     "set_current_plan_revision",
     "set_current_owner_gate",
     "update_task_status",
@@ -56,12 +59,13 @@ _TASK_COLUMNS = (
     "id, workspace_id, repository_id, github_issue_id, github_issue_number, "
     "status, archived_at, canonical_feature_branch, state_token, "
     "current_plan_revision_id, current_owner_gate_id, "
-    "source_requirements_fingerprint, created_at, updated_at"
+    "source_requirements_fingerprint, queued_at, created_at, updated_at"
 )
 
 
 def _task_from_row(row: Sequence[Any]) -> Task:
     archived_at = row[6]
+    queued_at = row[12]
     return Task(
         id=row[0],
         workspace_id=row[1],
@@ -70,13 +74,14 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         github_issue_number=row[4],
         status=TaskStatus(row[5]),
         archived_at=None if archived_at is None else normalize_utc(archived_at),
+        queued_at=None if queued_at is None else normalize_utc(queued_at),
         canonical_feature_branch=row[7],
         state_token=row[8],
         current_plan_revision_id=row[9],
         current_owner_gate_id=row[10],
         source_requirements_fingerprint=row[11],
-        created_at=normalize_utc(row[12]),
-        updated_at=normalize_utc(row[13]),
+        created_at=normalize_utc(row[13]),
+        updated_at=normalize_utc(row[14]),
     )
 
 
@@ -229,6 +234,72 @@ def find_current_task_for_issue(
     return None if row is None else _task_from_row(row)
 
 
+def list_queued_tasks(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    after_queued_at: datetime | None = None,
+    after_task_id: UUID | None = None,
+    limit: int,
+) -> list[Task]:
+    """Return one bounded page of the Workspace's queued Tasks in FIFO order.
+
+    The one canonical queue-order read (issue #76): current queued Tasks
+    ordered by the durable ``(queued_at, id)`` key. Pagination is keyset
+    based — each page continues strictly after the caller's last examined
+    ``(queued_at, task_id)`` key — so admitted candidates leaving the queued
+    set never shift a page boundary and a caller scanning repeatedly with
+    the returned last key examines every candidate exactly once, oldest
+    first. ``limit`` bounds ONE page of a scan; the caller that needs the
+    full queue paginates with the cursor. A queue wait is a scheduling
+    state: this read decides nothing about admission.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    params: list[Any] = [workspace_id]
+    if after_queued_at is None:
+        predicate = ""
+    else:
+        if not isinstance(after_task_id, UUID):
+            raise TaskDomainError("the queue page cursor must carry both key parts")
+        if after_queued_at.tzinfo is None:
+            raise TaskDomainError("the queue page cursor timestamp must be timezone-aware")
+        predicate = " and (queued_at, id) > (%s, %s)"
+        params.extend([normalize_utc(after_queued_at), after_task_id])
+    params.append(limit)
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_TASK_COLUMNS} from openorc.tasks "
+            f"where workspace_id = %s and status = 'queued'{predicate} "
+            "order by queued_at, id limit %s",
+            tuple(params),
+        ).fetchall()
+    return [_task_from_row(row) for row in rows]
+
+
+def lock_workspace_task_arbitration(pool: DatabasePool, *, workspace_id: UUID) -> None:
+    """Take the per-Workspace Task-capacity arbitration advisory lock.
+
+    The serialization boundary for Task start/FIFO admission decisions
+    (issue #76): every transaction that arbitrates capacity — a competing
+    new start's decision, a queued-candidates wakeup sweep, or a lifecycle
+    transition that changes active (CONNECTING/READY) Connection occupancy —
+    composes this same transaction-scoped ``pg_advisory_xact_lock`` FIRST,
+    before any occupancy read or row lock it must observe consistently. The
+    lock is released at commit/rollback; transactions stay short. The key is
+    deterministically derived from the Workspace UUID (the low 63 bits, the
+    single-bigint advisory-key form): collisions can only add serialization
+    between unrelated Workspaces' arbitrations, never weaken a decision.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    advisory_key = workspace_id.int & ((1 << 63) - 1)
+    with transaction(pool) as conn:
+        conn.execute("select pg_advisory_xact_lock(%s)", (advisory_key,))
+
+
 def find_current_task_by_branch(
     pool: DatabasePool, *, repository_id: UUID, canonical_feature_branch: str
 ) -> Task | None:
@@ -274,10 +345,22 @@ def update_task_status(
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.tasks "
-            "set status = %s, state_token = gen_random_uuid(), updated_at = now() "
+            "set status = %s, "
+            # The durable queue-entry timestamp (issue #76): stamped by the
+            # DB clock exactly once when a Task first moves into queued,
+            # preserved unchanged while it stays queued (repeated capacity
+            # checks never rewrite it), and cleared when it leaves queued by
+            # any later authorized path. The iff-QUEUED CHECK is the durable
+            # backstop; the condition binding is still the exact expected
+            # state_token.
+            "queued_at = case "
+            "when %s = 'queued' and status <> 'queued' then now() "
+            "when status = 'queued' and %s <> 'queued' then null "
+            "else queued_at end, "
+            "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",
-            (status.value, task_id, expected_state_token),
+            (status.value, status.value, status.value, task_id, expected_state_token),
         ).fetchone()
     return None if row is None else _task_from_row(row)
 
@@ -310,7 +393,7 @@ def archive_task(
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.tasks "
-            "set status = %s, archived_at = now(), "
+            "set status = %s, archived_at = now(), queued_at = null, "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",

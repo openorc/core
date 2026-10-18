@@ -154,4 +154,49 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   is the one ApplicationError → HTTP mapping (401/403/404/409/422/503);
   routers stay thin and raise/propagate the typed vocabulary.
 
+## Task start, durable FIFO admission, and the planning claim (issue #76)
+
+- `task_start.py` owns Task start and the durable capacity queue. The Owner
+  start command runs three strictly ordered phases: a short authorization
+  transaction (account-operational barrier FIRST, exact Workspace/Task
+  ownership, subject load and the startability precheck) closed before any
+  external I/O; the fresh authoritative GitHub revalidation (route, B3
+  reconcile, B4 dependency observation) with no database transaction open —
+  a changed source, blocked/closed issue, unobservable blocking state, or
+  lost route is NOT capacity waiting and fails closed as a typed non-start
+  condition; and one short arbitration transaction (barrier FIRST, the
+  per-Workspace arbitration advisory lock, the locked re-read bound to the
+  caller's exact `state_token`, the durable-projection eligibility guard,
+  the structural feasibility verdict, one bounded FIFO establishment pass,
+  then the target's claim or queue entry).
+- Structural feasibility comes from the complete required role→Connection
+  multiset (`assess_structural_route_feasibility`, the read-only
+  session-admission seam): existing valid Task reservations count toward the
+  total requirement, other Tasks' occupancy does not. An impossible
+  configuration (both roles on one capacity-1 Connection, with or without an
+  existing reservation) is the actionable `TaskCapacityConfigurationError`
+  BEFORE any queue write — never an indefinite capacity wait. Temporary
+  occupation stays #68's all-or-nothing decision.
+- The durable eligibility guard revalidates every claimed Task against the
+  durable GitHub projection alone (identity, OPEN state, fingerprint
+  equality, empty mirrored blocked-by set) with no GitHub network call: a
+  Task that queued while eligible can become ineligible while waiting, and a
+  capacity wakeup must not advance it. TaskBlock creation and generalized
+  source-drift recovery remain #85.
+- The bounded establishment pass advances admissible older candidates in
+  durable `(queued_at, id)` order (each claim atomic: both reservations +
+  planning + cleared `queued_at` + one `planning_started` event) before the
+  target decides; where the fixed work budget cannot establish no-bypass,
+  the target durably queues itself with the observable
+  `ARBITRATION_DEFERRED` reason. FIFO safety rests on the serialization
+  boundary, never on assuming earlier scans stay valid. A queued Task is a
+  scheduling state: no `task_queued` event exists, failed capacity checks
+  preserve the original `queued_at`, and `reevaluate_queued_tasks` (system
+  invocation, Workspace-durable-Owner barrier, OPENORC-actor claims)
+  surfaces per-candidate conditions without stalling remaining candidates.
+- The explicitly started Task's claim records the OWNER actor;
+  arbitration-advanced and sweep-claimed Tasks record the OPENORC actor.
+  `planning` here means capacity admitted and startup claimed — never READY
+  sessions, workspace preparation, or a successful PLAN (issues #203/#77).
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
