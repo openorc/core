@@ -1339,3 +1339,41 @@ def test_sweep_malformed_workspace_command_is_invalid_before_any_effect() -> Non
         reevaluate_queued_tasks(_pool(conn), workspace_id="not-a-uuid")  # type: ignore[arg-type]
 
     assert conn.executed == []
+
+
+def test_missing_role_binding_is_a_candidate_conflict_that_never_stalls_followers() -> None:
+    conn = ScriptedConnection()
+    candidate_b_id = uuid.uuid4()
+    # The oldest candidate's Producer role binding is gone (a routing change
+    # after it queued): the first binding read resolves nothing.
+    conn.on(_role_is("producer")(_sql_has("workflow_role_bindings")), None)
+    _script_baseline(conn)
+    _script_task_reads(conn, task_id=_TASK_ID, row=_task_row())
+    _script_task_reads(conn, task_id=_CANDIDATE_ID, row=_candidate_row())
+    _script_candidate_claim(conn, task_id=candidate_b_id)
+    conn.on_repeat(_sql_has("select connection_id, count(*)"), [])
+    _script_events(conn)
+    conn.on_repeat(_sql_has("insert into openorc.workflow_events"), _event_row("github", None))
+    _queue_page(conn, [_candidate_row(), _candidate_row(task_id=candidate_b_id)])
+    _queue_page(conn, [])
+
+    outcome = reevaluate_queued_tasks(_pool(conn), workspace_id=_WORKSPACE_ID)
+
+    assert outcome.exhausted is True
+    assert [entry.disposition for entry in outcome.outcomes] == [
+        QueuedCandidateDisposition.CONFLICT,
+        QueuedCandidateDisposition.ADMITTED,
+    ]
+    # The binding-less candidate stayed queued with its original durable key
+    # and the eligible follower still advanced in the same sweep.
+    assert not any(
+        "update openorc.tasks" in sql and params is not None and params[3] == _CANDIDATE_ID
+        for sql, params in conn.executed
+    )
+    assert any(
+        "update openorc.tasks" in sql
+        and params is not None
+        and params[3] == candidate_b_id
+        and params[0] == "planning"
+        for sql, params in conn.executed
+    )

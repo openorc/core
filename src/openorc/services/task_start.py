@@ -501,11 +501,23 @@ def _arbitrate_queued_candidate(
             github_issue_number=candidate.github_issue_number,
             disposition=QueuedCandidateDisposition.CONFIGURATION_ERROR,
         )
+    except NotFoundError:
+        # A required routing subject is gone — a missing role binding or a
+        # missing Connection for this candidate's current routes. This is an
+        # actionable configuration condition for THIS candidate only
+        # (typically a role-binding change after it queued): it stays queued
+        # with its original timestamp and arbitration continues, so one
+        # anomalous waiter never blocks feasible followers.
+        return QueuedCandidateOutcome(
+            task_id=candidate.id,
+            github_issue_number=candidate.github_issue_number,
+            disposition=QueuedCandidateDisposition.CONFLICT,
+        )
     except ConflictError:
-        # Route conflict, terminal historical session, disabled/missing
-        # Connection, or a raced subject state: an actionable condition for
-        # this candidate only — never capacity waiting, never silently
-        # swallowed, and never a reason to stall the remaining candidates.
+        # Route conflict, terminal historical session, or a raced subject
+        # state: an actionable condition for this candidate only — never
+        # capacity waiting, never silently swallowed, and never a reason to
+        # stall the remaining candidates.
         return QueuedCandidateOutcome(
             task_id=candidate.id,
             github_issue_number=candidate.github_issue_number,

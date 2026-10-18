@@ -136,8 +136,29 @@ class _ScriptedGitHub:
     def get_issue_sub_issues(self, **_kwargs: Any) -> Any:
         raise AssertionError("the start path performs no hierarchy sync")
 
-    def resolve_related_issue_endpoints(self, **_kwargs: Any) -> Any:
-        raise AssertionError("the start path resolves no blockers in these scenarios")
+    def resolve_related_issue_endpoints(
+        self,
+        *,
+        github_installation_id: int,
+        local_github_repository_id: int,
+        fresh_owner_login: str,
+        fresh_repository_name: str,
+        related: list[GitHubRelatedIssueObservation],
+    ) -> list[Any]:
+        from openorc.adapters.github import GitHubRelatedIssueEndpoint
+
+        local_address = (
+            f"https://api.github.com/repos/{fresh_owner_login}/{fresh_repository_name}"
+        ).lower()
+        return [
+            GitHubRelatedIssueEndpoint(
+                github_repository_id=local_github_repository_id
+                if observation.repository_url.lower() == local_address
+                else 555,
+                github_issue_id=observation.github_issue_id,
+            )
+            for observation in related
+        ]
 
     def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
         raise AssertionError("the service must not compose raw #58 validation operations")
@@ -167,6 +188,18 @@ class _ScriptedGitHub:
         raise AssertionError("the service must not compose raw adapter operations")
 
 
+@pytest.fixture(autouse=True)
+def _pooler_neutral_connection(conn: Connection[Any]) -> None:
+    """Keep this module's connections on the pooler-neutral prepare policy.
+
+    The production DatabasePool pins ``prepare_threshold=None`` (the
+    persistence pooler-neutral rule): a transaction-mode pooler reuses server
+    sessions across client connections, so client-side auto-prepare collides
+    on server-side prepared statement names (DuplicatePreparedStatement).
+    """
+    conn.prepare_threshold = None
+
+
 def _apply_probe_timeouts(conn: Connection[Any]) -> None:
     conn.execute("set local lock_timeout = '500ms'")
     conn.execute("set local statement_timeout = '2s'")
@@ -193,6 +226,7 @@ def _ownership_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID, uuid.
         (project_id, workspace_id, "project"),
     )
     repository_id = uuid.uuid4()
+    installation_record_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.repositories "
         "(id, project_id, workspace_id, github_repository_id, owner_login, name, "
@@ -208,7 +242,7 @@ def _ownership_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID, uuid.
             "https://github.com/octocat/hello-world",
             False,
             "main",
-            uuid.uuid4(),
+            installation_record_id,
         ),
     )
     conn.execute(
@@ -216,7 +250,7 @@ def _ownership_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID, uuid.
         "(id, workspace_id, github_installation_id, github_account_id, account_login, "
         "account_type) values (%s, %s, %s, %s, %s, %s)",
         (
-            uuid.uuid4(),
+            installation_record_id,
             workspace_id,
             _GITHUB_INSTALLATION_ID,
             501,
@@ -259,7 +293,7 @@ def _insert_task(
     *,
     workspace_id: uuid.UUID,
     repository_id: uuid.UUID,
-    github_issue_id: int = 1000,
+    github_issue_id: int = 100000,
     github_issue_number: int = 100,
     status: str = "ready_to_plan",
     fingerprint: str = _FINGERPRINT,
@@ -340,6 +374,12 @@ def _planning_event_count(conn: Connection[Any], task_id: uuid.UUID) -> int:
     return row[0]
 
 
+def _cleanup_account(conn: Connection[Any], profile_id: uuid.UUID) -> None:
+    """Remove committed seed rows through the sanctioned Auth-root cascade."""
+    conn.execute("delete from auth.users where id = %s", (profile_id,))
+    conn.commit()
+
+
 def test_queue_entry_timestamp_is_stable_iff_queued_and_fifo_ordered(
     conn: Connection[Any],
 ) -> None:
@@ -376,11 +416,30 @@ def test_queue_entry_timestamp_is_stable_iff_queued_and_fifo_ordered(
     assert claimed.status is TaskStatus.PLANNING
     assert claimed.queued_at is None
 
-    # The canonical queue read orders by (queued_at, id).
+    # The canonical queue read orders by the durable (queued_at, id) key: the
+    # second Task queues first, then the first Task re-enters the queue by an
+    # authorized path (fresh DB-clock entry) and sorts behind it.
+    # Same-transaction stamps are equal by design (now() is transaction start
+    # time), so the second Task's key is forced to a deterministically earlier
+    # instant before the first Task re-enters the queue.
     _queue_task(conn, second_id, second_token)
-    conn.execute("update openorc.tasks set queued_at = now() where id = %s", (first_id,))
+    conn.execute(
+        "update openorc.tasks set queued_at = now() - interval '1 hour' where id = %s",
+        (second_id,),
+    )
+    second_key = conn.execute(
+        "select queued_at from openorc.tasks where id = %s", (second_id,)
+    ).fetchone()
+    assert second_key is not None and second_key[0] is not None
+    requeued = task_records.update_task_status(
+        pool, first_id, expected_state_token=claimed.state_token, status=TaskStatus.QUEUED
+    )
+    assert requeued is not None
+    assert requeued.status is TaskStatus.QUEUED
+    assert requeued.queued_at is not None
+    assert requeued.queued_at > second_key[0]
     listed = task_records.list_queued_tasks(pool, workspace_id=workspace_id, limit=10)
-    assert [task.id for task in listed] == [second_id]
+    assert [task.id for task in listed] == [second_id, first_id]
 
     # The database CHECK is the durable backstop: a non-queued row can never
     # carry a queue-entry timestamp (the iff invariant, enforced in SQL).
@@ -483,7 +542,11 @@ def test_sweep_never_overtakes_the_older_waiter_and_holds_the_release_boundary(
         conn, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=200000
     )
     newer_id, newer_token = _insert_task(
-        conn, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=300000
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=300000,
+        github_issue_number=300,
     )
     for issue_id, number in ((200000, 200), (300000, 300)):
         _insert_issue_projection(
@@ -493,104 +556,118 @@ def test_sweep_never_overtakes_the_older_waiter_and_holds_the_release_boundary(
             github_issue_id=issue_id,
             issue_number=number,
         )
-    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+    # Cross-connection racers need committed, visible seed rows; the owned
+    # graph is removed again through the Auth-root cascade below.
+    conn.commit()
+    try:
+        pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    # One active slot occupied by the occupier's Producer reservation.
-    occupant = admit_task_agent_sessions(
-        pool,
-        profile_id=owner,
-        workspace_id=workspace_id,
-        task_id=occupier_id,
-        roles=[WorkflowRole.PRODUCER],
-    )
-    assert occupant.status is AdmissionStatus.ADMITTED
-    assert _active_session_count(conn, connection_id) == 1
+        # One active slot occupied by the occupier's Producer reservation.
+        occupant = admit_task_agent_sessions(
+            pool,
+            profile_id=owner,
+            workspace_id=workspace_id,
+            task_id=occupier_id,
+            roles=[WorkflowRole.PRODUCER],
+        )
+        assert occupant.status is AdmissionStatus.ADMITTED
+        assert _active_session_count(conn, connection_id) == 1
 
-    # The older Task durably queues first.
-    older_queued = _queue_task(conn, older_id, older_token)
+        # The older Task durably queues first; the explicit commit closes the
+        # implicit fixture transaction so the newer start's entry stamp comes
+        # from a strictly later transaction and the FIFO keys compare.
+        older_queued = _queue_task(conn, older_id, older_token)
+        conn.commit()
 
-    # The newer start cannot overtake the older waiter: one free slot, both
-    # Tasks need two, so the newer start queues behind with a later key.
-    outcome = start_task_for_owner(
-        pool,
-        _ScriptedGitHub(),
-        profile_id=owner,
-        workspace_id=workspace_id,
-        task_id=newer_id,
-        expected_state_token=newer_token,
-    )
-    assert outcome.status is TaskStartStatus.QUEUED
-    assert outcome.queue_reason is TaskStartQueueReason.AWAITING_CAPACITY
-    newer_row = conn.execute(
-        "select queued_at from openorc.tasks where id = %s", (newer_id,)
-    ).fetchone()
-    assert newer_row is not None and newer_row[0] is not None
-    assert newer_row[0] > older_queued[0]
+        # The newer start cannot overtake the older waiter: one free slot, both
+        # Tasks need two, so the newer start queues behind with a later key.
+        outcome = start_task_for_owner(
+            pool,
+            _ScriptedGitHub(),
+            profile_id=owner,
+            workspace_id=workspace_id,
+            task_id=newer_id,
+            expected_state_token=newer_token,
+        )
+        assert outcome.status is TaskStartStatus.QUEUED
+        assert outcome.queue_reason is TaskStartQueueReason.AWAITING_CAPACITY
+        newer_row = conn.execute(
+            "select queued_at from openorc.tasks where id = %s", (newer_id,)
+        ).fetchone()
+        assert newer_row is not None and newer_row[0] is not None
+        assert newer_row[0] > older_queued[0]
 
-    # The capacity-releasing lifecycle transition composes the same
-    # per-Workspace arbitration lock: an end attempted while an arbitration
-    # window holds the lock is BLOCKED, never interleaved into a decision.
-    advisory_key = workspace_id.int & ((1 << 63) - 1)
-    release_outcomes: list[str] = []
-    release_errors: list[BaseException] = []
+        # The capacity-releasing lifecycle transition composes the same
+        # per-Workspace arbitration lock: an end attempted while an arbitration
+        # window holds the lock is BLOCKED, never interleaved into a decision.
+        advisory_key = workspace_id.int & ((1 << 63) - 1)
+        release_outcomes: list[str] = []
+        release_errors: list[BaseException] = []
 
-    def release_attempt() -> None:
-        try:
-            with connect(migrated_database) as racer_conn:
-                racer_conn.execute("set lock_timeout = '500ms'")
-                racer_conn.execute("set statement_timeout = '2s'")
-                end_task_agent_session(
-                    cast(DatabasePool, _SingleConnectionPool(racer_conn)),
-                    workspace_id=workspace_id,
-                    task_id=occupier_id,
-                    role=WorkflowRole.PRODUCER,
-                )
-            release_outcomes.append("ended")
-        except (LockNotAvailable, QueryCanceled):
-            release_outcomes.append("blocked")
-        except BaseException as error:  # noqa: BLE001 - collected and asserted below
-            release_errors.append(error)
+        def release_attempt() -> None:
+            try:
+                with connect(migrated_database, prepare_threshold=None) as racer_conn:
+                    racer_conn.execute("set lock_timeout = '500ms'")
+                    racer_conn.execute("set statement_timeout = '2s'")
+                    end_task_agent_session(
+                        cast(DatabasePool, _SingleConnectionPool(racer_conn)),
+                        workspace_id=workspace_id,
+                        task_id=occupier_id,
+                        role=WorkflowRole.PRODUCER,
+                    )
+                release_outcomes.append("ended")
+            except (LockNotAvailable, QueryCanceled):
+                release_outcomes.append("blocked")
+            except BaseException as error:  # noqa: BLE001 - collected and asserted below
+                release_errors.append(error)
 
-    with conn.transaction():
-        conn.execute("select pg_advisory_xact_lock(%s)", (advisory_key,))
-        thread = threading.Thread(target=release_attempt)
-        thread.start()
-        thread.join(timeout=30)
-        assert not thread.is_alive(), "the release probe deadlocked on the held lock"
-    assert release_errors == []
-    assert release_outcomes == ["blocked"]
-    assert _active_session_count(conn, connection_id) == 1
+        with conn.transaction():
+            conn.execute("select pg_advisory_xact_lock(%s)", (advisory_key,))
+            thread = threading.Thread(target=release_attempt)
+            thread.start()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "the release probe deadlocked on the held lock"
+        assert release_errors == []
+        assert release_outcomes == ["blocked"]
+        assert _active_session_count(conn, connection_id) == 1
 
-    # Now the release commits outside any arbitration window, freeing a slot.
-    end_task_agent_session(
-        pool, workspace_id=workspace_id, task_id=occupier_id, role=WorkflowRole.PRODUCER
-    )
-    assert _active_session_count(conn, connection_id) == 0
+        # Now the release commits outside any arbitration window, freeing a slot.
+        end_task_agent_session(
+            pool, workspace_id=workspace_id, task_id=occupier_id, role=WorkflowRole.PRODUCER
+        )
+        assert _active_session_count(conn, connection_id) == 0
 
-    # The wakeup sweep advances the OLDER waiter first; the newer Task stays
-    # queued with its original key and no capacity is oversubscribed.
-    sweep = reevaluate_queued_tasks(pool, workspace_id=workspace_id)
-    assert [entry.disposition for entry in sweep.outcomes] == [QueuedCandidateDisposition.ADMITTED]
-    assert sweep.exhausted is True
-    older_status = conn.execute(
-        "select status from openorc.tasks where id = %s", (older_id,)
-    ).fetchone()
-    assert older_status is not None and older_status[0] == "planning"
-    assert _active_session_count(conn, connection_id) == 2
-    assert _planning_event_count(conn, older_id) == 1
-    newer_after = conn.execute(
-        "select status, queued_at from openorc.tasks where id = %s", (newer_id,)
-    ).fetchone()
-    assert newer_after is not None
-    assert newer_after[0] == "queued"
-    assert newer_after[1] == newer_row[0]
+        # The wakeup sweep advances the OLDER waiter first; the newer Task stays
+        # queued with its original key and no capacity is oversubscribed.
+        sweep = reevaluate_queued_tasks(pool, workspace_id=workspace_id)
+        # The older waiter advances; the newer Task stays queued behind it —
+        # the sweep's own no-overtaking outcome.
+        assert [entry.disposition for entry in sweep.outcomes] == [
+            QueuedCandidateDisposition.ADMITTED,
+            QueuedCandidateDisposition.STILL_QUEUED,
+        ]
+        assert sweep.exhausted is True
+        older_status = conn.execute(
+            "select status from openorc.tasks where id = %s", (older_id,)
+        ).fetchone()
+        assert older_status is not None and older_status[0] == "planning"
+        assert _active_session_count(conn, connection_id) == 2
+        assert _planning_event_count(conn, older_id) == 1
+        newer_after = conn.execute(
+            "select status, queued_at from openorc.tasks where id = %s", (newer_id,)
+        ).fetchone()
+        assert newer_after is not None
+        assert newer_after[0] == "queued"
+        assert newer_after[1] == newer_row[0]
+    finally:
+        _cleanup_account(conn, owner)
 
 
 def test_concurrent_sweeps_never_duplicate_reservations_or_events(
     conn: Connection[Any],
     migrated_database: str,
 ) -> None:
-    _, workspace_id, repository_id = _ownership_chain(conn)
+    owner, workspace_id, repository_id = _ownership_chain(conn)
     connection_id = _insert_connection(conn, workspace_id=workspace_id, session_capacity=2)
     _set_role_bindings(conn, workspace_id=workspace_id, connection_id=connection_id)
     task_id, state_token = _insert_task(
@@ -604,42 +681,49 @@ def test_concurrent_sweeps_never_duplicate_reservations_or_events(
         issue_number=100,
     )
     _queue_task(conn, task_id, state_token)
+    # Cross-connection racers need committed, visible seed rows; the owned
+    # graph is removed again through the Auth-root cascade below.
+    conn.commit()
+    try:
+        outcomes: list[Any] = []
+        errors: list[BaseException] = []
 
-    outcomes: list[Any] = []
-    errors: list[BaseException] = []
-
-    def sweep() -> None:
-        try:
-            with connect(migrated_database) as racer_conn:
-                outcomes.append(
-                    reevaluate_queued_tasks(
-                        cast(DatabasePool, _SingleConnectionPool(racer_conn)),
-                        workspace_id=workspace_id,
+        def sweep() -> None:
+            try:
+                with connect(migrated_database, prepare_threshold=None) as racer_conn:
+                    outcomes.append(
+                        reevaluate_queued_tasks(
+                            cast(DatabasePool, _SingleConnectionPool(racer_conn)),
+                            workspace_id=workspace_id,
+                        )
                     )
-                )
-        except BaseException as error:  # noqa: BLE001 - collected and asserted below
-            errors.append(error)
+            except BaseException as error:  # noqa: BLE001 - collected and asserted below
+                errors.append(error)
 
-    threads = [threading.Thread(target=sweep) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=60)
-        assert not thread.is_alive()
-    assert errors == []
-    # Exactly one claim won the advisory-serialized arbitration: the other
-    # sweep observed an empty queue and claimed nothing twice.
-    admitted = sum(
-        1
-        for outcome in outcomes
-        for entry in outcome.outcomes
-        if entry.disposition is QueuedCandidateDisposition.ADMITTED
-    )
-    assert admitted == 1
-    assert _active_session_count(conn, connection_id) == 2
-    assert _planning_event_count(conn, task_id) == 1
-    row = conn.execute("select status from openorc.tasks where id = %s", (task_id,)).fetchone()
-    assert row is not None and row[0] == "planning"
+        threads = [threading.Thread(target=sweep) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            # Serialized by the advisory lock; remote-branch statement latency
+            # makes each sweep slow, so the join is generous.
+            thread.join(timeout=300)
+            assert not thread.is_alive()
+        assert errors == []
+        # Exactly one claim won the advisory-serialized arbitration: the other
+        # sweep observed an empty queue and claimed nothing twice.
+        admitted = sum(
+            1
+            for outcome in outcomes
+            for entry in outcome.outcomes
+            if entry.disposition is QueuedCandidateDisposition.ADMITTED
+        )
+        assert admitted == 1
+        assert _active_session_count(conn, connection_id) == 2
+        assert _planning_event_count(conn, task_id) == 1
+        row = conn.execute("select status from openorc.tasks where id = %s", (task_id,)).fetchone()
+        assert row is not None and row[0] == "planning"
+    finally:
+        _cleanup_account(conn, owner)
 
 
 def test_eligibility_contradicted_candidate_is_never_advanced(conn: Connection[Any]) -> None:
@@ -723,7 +807,11 @@ def test_no_capacity_oversubscription_when_the_target_races_the_queue(
         conn, workspace_id=workspace_id, repository_id=repository_id
     )
     second_id, second_token = _insert_task(
-        conn, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=300000
+        conn,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=300000,
+        github_issue_number=300,
     )
     for issue_id, number in ((100000, 100), (300000, 300)):
         _insert_issue_projection(
