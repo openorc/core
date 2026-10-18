@@ -96,7 +96,7 @@ from openorc.persistence.sessions import (
     mark_task_agent_session_ended,
     mark_task_agent_session_lost,
 )
-from openorc.persistence.tasks import get_task
+from openorc.persistence.tasks import get_task, lock_workspace_task_arbitration
 from openorc.protocol.initialization_assets import compose_initialization
 from openorc.services.errors import (
     ApplicationError,
@@ -580,6 +580,14 @@ def record_task_agent_session_lost(
         )
         with composed_transaction(pool) as transaction_pool:
             _require_workspace(transaction_pool, workspace_id)
+            # The per-Workspace arbitration lock (issue #76): a READY -> LOST
+            # transition releases active Connection capacity, so it composes
+            # the same serialization boundary every Task-capacity arbitration
+            # holds — a capacity release can never commit between an
+            # arbitration's FIFO scan and its capacity decision. The
+            # workspace read above takes no lock; this is the transaction's
+            # first lock acquisition.
+            lock_workspace_task_arbitration(transaction_pool, workspace_id=workspace_id)
             _require_scoped_task(transaction_pool, workspace_id=workspace_id, task_id=task_id)
             binding = _require_scoped_binding(
                 transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
@@ -642,6 +650,12 @@ def end_task_agent_session(
         )
         with composed_transaction(pool) as transaction_pool:
             _require_workspace(transaction_pool, workspace_id)
+            # The per-Workspace arbitration lock (issue #76): ending a
+            # CONNECTING/READY binding releases active Connection capacity,
+            # so it composes the same serialization boundary every
+            # Task-capacity arbitration holds. The workspace read above takes
+            # no lock; this is the transaction's first lock acquisition.
+            lock_workspace_task_arbitration(transaction_pool, workspace_id=workspace_id)
             _require_scoped_task(transaction_pool, workspace_id=workspace_id, task_id=task_id)
             binding = _require_scoped_binding(
                 transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role

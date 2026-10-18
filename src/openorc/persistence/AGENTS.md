@@ -179,6 +179,32 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
   establishment primitive; admission never creates a second `(Task, role)`
   row and never replaces a terminal (LOST/ENDED) historical binding.
 
+## Task FIFO queue order and the arbitration lock (issue #76)
+
+- `tasks.queued_at` is the durable FIFO queue-entry fact: populated by the
+  DB clock exactly once when a Task first moves into `queued`, preserved
+  unchanged for the lifetime of that queue wait (repeated failed capacity
+  checks never rewrite it), and cleared on the successful `queued ->
+  planning` claim and on any later authorized path out of `queued`
+  (`archive_task` included). It is non-null iff the current status is
+  `queued` — the `tasks_queued_iff_queued_at_chk` CHECK is the durable
+  backstop and `update_task_status`'s CASE maintains it in both
+  directions. `QUEUED` is never an RQ/Valkey job and there is no second
+  queue table: `Task.status` plus this one column are the canonical queue
+  state, and `list_queued_tasks` is the one canonical read —
+  Workspace-scoped, keyset-paginated, ordered `(queued_at, id)`.
+- `lock_workspace_task_arbitration` is the per-Workspace transaction-scoped
+  `pg_advisory_xact_lock` serialization boundary for Task-capacity
+  arbitration: every transaction that arbitrates capacity (a competing new
+  start, a queued-candidates sweep, the structural feasibility read) AND
+  every transition that changes active CONNECTING/READY occupancy (the
+  capacity-releasing lifecycle services `record_task_agent_session_lost` /
+  `end_task_agent_session`) composes it before any occupancy read it must
+  trust. A capacity release can therefore never commit between a scan and a
+  decision. The account-operational barrier remains the FIRST lock in
+  transactions that compose it; the advisory lock is the first lock in the
+  lifecycle transactions, and it is released at commit/rollback.
+
 ## Profile-scoped GitHub user authorization (issue #142)
 
 - `github_user_refresh_secrets.py` is the GitHub-user-purpose Vault boundary

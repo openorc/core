@@ -353,6 +353,7 @@ def _task_row(
         None,
         None,
         fingerprint,
+        None,
         _NOW,
         _NOW,
     )

@@ -32,7 +32,9 @@ from openorc.persistence.tasks import (
     get_task,
     list_current_repository_tasks,
     list_issue_attempts,
+    list_queued_tasks,
     list_workspace_tasks,
+    lock_workspace_task_arbitration,
     set_current_owner_gate,
     update_task_status,
 )
@@ -104,6 +106,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "github_issue_number": 42,
         "status": "ready_to_plan",
         "archived_at": None,
+        "queued_at": None,
         "canonical_feature_branch": None,
         "state_token": uuid.uuid4(),
         "current_plan_revision_id": None,
@@ -126,6 +129,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["current_plan_revision_id"],
         values["current_owner_gate_id"],
         values["source_requirements_fingerprint"],
+        values["queued_at"],
         values["created_at"],
         values["updated_at"],
     )
@@ -289,7 +293,8 @@ def test_find_current_task_by_branch_uses_ownership_lookup() -> None:
 
 def test_update_task_status_is_conditional_and_rotates_the_token() -> None:
     # The canned row mirrors the post-mutation row the database would return:
-    # new status, freshly rotated token.
+    # new status, freshly rotated token, queue entry cleared by the same
+    # statement when the Task leaves queued.
     original_token = uuid.uuid4()
     row = _task_row(status="waiting_for_owner", state_token=uuid.uuid4())
     fake_conn = FakeConnection(row)
@@ -307,9 +312,19 @@ def test_update_task_status_is_conditional_and_rotates_the_token() -> None:
     assert updated.state_token != original_token
     sql, params = fake_conn.executed[0]
     # Conditional on the expected token; rotates the token atomically.
-    assert "set status = %s, state_token = gen_random_uuid(), updated_at = now()" in sql
+    assert "set status = %s," in sql
+    assert "queued_at = case" in sql
+    assert "when %s = 'queued' and status <> 'queued' then now()" in sql
+    assert "when status = 'queued' and %s <> 'queued' then null" in sql
+    assert "else queued_at end" in sql
     assert "where id = %s and state_token = %s and archived_at is null" in sql
-    assert params == ("waiting_for_owner", row[0], original_token)
+    assert params == (
+        "waiting_for_owner",
+        "waiting_for_owner",
+        "waiting_for_owner",
+        row[0],
+        original_token,
+    )
 
 
 def test_update_task_status_returns_none_when_token_is_stale() -> None:
@@ -366,11 +381,10 @@ def test_archive_task_stamps_archival_and_rotates_the_token() -> None:
     assert archived.archived_at == _utc_observed_at()
     assert archived.state_token != original_token
     sql, params = fake_conn.executed[0]
-    # One atomic statement: terminal status + archival + token rotation.
-    assert (
-        "set status = %s, archived_at = now(), "
-        "state_token = gen_random_uuid(), updated_at = now()" in sql
-    )
+    # One atomic statement: terminal status + archival + queue-exit clear +
+    # token rotation (archival is an authorized path out of the queue).
+    assert "set status = %s, archived_at = now(), queued_at = null," in sql
+    assert "state_token = gen_random_uuid(), updated_at = now()" in sql
     assert "where id = %s and state_token = %s and archived_at is null" in sql
     assert params == ("cancelled", row[0], original_token)
 
@@ -590,3 +604,96 @@ def test_current_repository_tasks_listing_with_no_rows_returns_an_empty_list() -
         list_current_repository_tasks(pool, workspace_id=uuid.uuid4(), repository_id=uuid.uuid4())
         == []
     )
+
+
+def test_queued_row_maps_its_durable_queue_entry_timestamp() -> None:
+    row = _task_row(status="queued", queued_at=_observed_at())
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = get_task(pool, row[0])
+
+    assert task is not None
+    assert task.status is TaskStatus.QUEUED
+    assert task.queued_at == _utc_observed_at()
+    assert task.queued_at is not None
+    assert task.queued_at.utcoffset() == timedelta(0)
+    sql, _ = fake_conn.executed[0]
+    assert "queued_at" in sql
+
+
+def test_list_queued_tasks_is_the_workspace_scoped_fifo_page() -> None:
+    rows = [
+        _task_row(status="queued", queued_at=_observed_at()),
+        _task_row(status="queued", queued_at=_observed_at()),
+    ]
+    fake_conn = FakeConnection(None, rows)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_queued_tasks(pool, workspace_id=rows[0][1], limit=50)
+
+    assert len(listed) == 2
+    assert all(task.status is TaskStatus.QUEUED for task in listed)
+    assert all(task.queued_at == _utc_observed_at() for task in listed)
+    sql, params = fake_conn.executed[0]
+    # One canonical queue order: Workspace scope, queued only, durable key.
+    assert "where workspace_id = %s and status = 'queued'" in sql
+    assert "order by queued_at, id limit %s" in sql
+    assert params == (rows[0][1], 50)
+
+
+def test_list_queued_tasks_keyset_pagination_continues_after_the_cursor() -> None:
+    rows = [_task_row(status="queued", queued_at=_observed_at())]
+    fake_conn = FakeConnection(None, rows)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_queued_tasks(
+        pool,
+        workspace_id=rows[0][1],
+        after_queued_at=rows[0][12],
+        after_task_id=rows[0][0],
+        limit=25,
+    )
+
+    assert len(listed) == 1
+    sql, params = fake_conn.executed[0]
+    assert "and (queued_at, id) > (%s, %s)" in sql
+    # The cursor timestamp is normalized to UTC at the boundary.
+    assert params == (rows[0][1], _utc_observed_at(), rows[0][0], 25)
+
+
+def test_list_queued_tasks_rejects_a_malformed_cursor_or_limit() -> None:
+    fake_conn = FakeConnection(None, [])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    with pytest.raises(TaskDomainError, match="limit"):
+        list_queued_tasks(pool, workspace_id=uuid.uuid4(), limit=0)
+    naive_cursor = datetime(2026, 10, 18, 12, 0, 0)
+    with pytest.raises(TaskDomainError, match="timezone-aware"):
+        list_queued_tasks(
+            pool,
+            workspace_id=uuid.uuid4(),
+            after_queued_at=naive_cursor,
+            after_task_id=uuid.uuid4(),
+            limit=10,
+        )
+    with pytest.raises(TaskDomainError, match="cursor"):
+        list_queued_tasks(
+            pool,
+            workspace_id=uuid.uuid4(),
+            after_queued_at=_observed_at(),
+            limit=10,
+        )
+    assert fake_conn.executed == []
+
+
+def test_lock_workspace_task_arbitration_takes_the_transaction_scoped_lock() -> None:
+    workspace_id = uuid.uuid4()
+    fake_conn = FakeConnection((True,))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    lock_workspace_task_arbitration(pool, workspace_id=workspace_id)
+
+    sql, params = fake_conn.executed[0]
+    assert "pg_advisory_xact_lock" in sql
+    assert params == (workspace_id.int & ((1 << 63) - 1),)
