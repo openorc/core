@@ -244,3 +244,18 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
   role-prompt override) — no caller can silently erase configuration by
   omitting fields; the composite foreign key keeps cross-Workspace
   Connection targets a ForeignKeyViolation for service classification.
+
+## OwnerGate Reviewer-driven settlement primitive (issue #211)
+
+- `resolve_owner_gate` accepts every terminal OwnerGateStatus outcome:
+  the Owner-driven APPROVED/REJECTED/CANCELLED resolutions and the
+  Reviewer-driven REVIEW_RESOLUTION settlement (`outcome=SETTLED`). One
+  purpose-independent primitive serves all of them: gate row read, Task
+  row locked ``FOR UPDATE``, currency/token/archival checks, the one-shot
+  gate stamp with ``decided_at``, the current-pointer clear, and the
+  token rotation. The database CHECK restricts ``settled`` to
+  review_resolution gates; the calling service owns the exact-subject
+  proof (planning settlement in `task_planning_review_resolution`,
+  PR/head settlement later in E9). The STALE/NO_OP outcome contract is
+  unchanged, and the Owner-facing resolution service refuses ``SETTLED``
+  so ordinary Owner semantics stay untouched.

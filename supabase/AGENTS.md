@@ -172,4 +172,14 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   lockout, and no dispatch identity — issues #87/#88 own per-operation
   durable dispatch/replay.
 
+## OwnerGate settled status (issue #211)
+
+- `openorc.owner_gates.status` admits the terminal `settled` value only
+  for `gate_type = 'review_resolution'`: the additive migration replaced
+  the auto-named status CHECK (`owner_gates_status_check`) and the
+  decided-at coherence CHECK (re-added explicitly as
+  `owner_gates_decided_at_coherence_check`) with settled-aware versions.
+  The terminal stamp remains non-NULL exactly when the status is not
+  pending, and no other column, index, or privilege changed.
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

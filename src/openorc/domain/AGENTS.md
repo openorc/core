@@ -75,7 +75,12 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 ## Human authority and subordinate records
 
 - TaskPullRequest is the one canonical PR record for a Task in v1. A closed-unmerged PR is not replaced automatically. Mutable observed GitHub state updates the same record.
-- OwnerGate types are IMPLEMENTATION_AUTHORIZATION, PR_AUTHORIZATION, MERGE_DECISION, REVIEW_RESOLUTION. Statuses are PENDING, APPROVED, REJECTED, CANCELLED.
+- OwnerGate types are IMPLEMENTATION_AUTHORIZATION, PR_AUTHORIZATION,
+  MERGE_DECISION, REVIEW_RESOLUTION. Statuses are PENDING, APPROVED,
+  REJECTED, CANCELLED, SETTLED; SETTLED (issue #211) is the
+  Reviewer-driven settlement outcome of a REVIEW_RESOLUTION gate,
+  representable only for that gate type and reachable only through the
+  settlement services — never an Owner-attributed resolution.
 - Gates bind exact subjects: implementation authorization → PlanRevision; PR authorization → exact committed Producer head; merge decision → TaskPullRequest + exact head; review resolution → exhausted PlanRevision or TaskPullRequest + exact head.
 - Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed.
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.

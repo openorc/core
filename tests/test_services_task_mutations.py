@@ -768,6 +768,23 @@ def test_resolve_owner_gate_pending_outcome_is_invalid_command() -> None:
     assert conn.executed == []
 
 
+def test_resolve_owner_gate_settled_outcome_is_invalid_command() -> None:
+    """SETTLED is the Reviewer-driven settlement outcome (issue #211): the
+    Owner-facing resolution never attributes it to an Owner."""
+    pool, conn = _pool([])
+    with pytest.raises(InvalidCommandError):
+        task_mutations.resolve_owner_gate(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_TOKEN,
+            owner_gate_id=_GATE_ID,
+            outcome=OwnerGateStatus.SETTLED,
+            actor=_OWNER_ACTOR,
+        )
+    assert conn.executed == []
+
+
 def test_resolve_owner_gate_cross_task_gate_is_not_found() -> None:
     pool, conn = _pool([_task_row(), _gate_row(task_id=_OTHER_TASK_ID)])
     with pytest.raises(NotFoundError):

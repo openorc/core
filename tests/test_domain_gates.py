@@ -2,7 +2,7 @@
 
 Ordinary deterministic tests: no database, no network. These prove the
 human-authority invariants later persistence and workflow-service behavior
-inherit: the settled four-type and four-status vocabularies, the per-type
+inherit: the settled four-type and five-status vocabularies, the per-type
 exact-subject binding, resolution coherence (one terminal stamp), and the
 exact field set (no Task status, no optimistic-concurrency token, and no
 updated_at — a resolved gate is immutable history with no update path).
@@ -55,12 +55,13 @@ def test_gate_type_vocabulary_is_exactly_the_four_settled_decisions() -> None:
     }
 
 
-def test_gate_status_vocabulary_is_exactly_the_four_settled_statuses() -> None:
+def test_gate_status_vocabulary_is_exactly_the_five_settled_statuses() -> None:
     assert {member.value for member in OwnerGateStatus} == {
         "pending",
         "approved",
         "rejected",
         "cancelled",
+        "settled",
     }
 
 
@@ -249,9 +250,22 @@ def test_resolved_gate_carries_its_decided_at_stamp() -> None:
     )
     assert gate.is_resolved and not gate.is_pending
     assert gate.decided_at == _DECIDED_AT
-    for status in (OwnerGateStatus.REJECTED, OwnerGateStatus.CANCELLED):
+    for status in (OwnerGateStatus.REJECTED, OwnerGateStatus.CANCELLED, OwnerGateStatus.SETTLED):
         with pytest.raises(OwnerGateDomainError):
             _gate(status=status, plan_revision_id=uuid4(), decided_at=None)
+
+
+def test_settled_is_the_terminal_reviewer_driven_status() -> None:
+    # SETTLED (issue #211) is terminal like the Owner outcomes: it carries
+    # its decided_at stamp and is immutable resolved history afterwards.
+    gate = _gate(
+        gate_type=OwnerGateType.REVIEW_RESOLUTION,
+        status=OwnerGateStatus.SETTLED,
+        decided_at=_DECIDED_AT,
+    )
+    assert gate.status is OwnerGateStatus.SETTLED
+    assert gate.is_resolved and not gate.is_pending
+    assert gate.decided_at == _DECIDED_AT
 
 
 def test_resolved_gate_is_frozen_immutability() -> None:
