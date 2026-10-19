@@ -41,10 +41,12 @@ __all__ = [
     "archive_task",
     "bind_canonical_branch",
     "create_task",
+    "claim_task_planning_bootstrap",
     "find_current_task_by_branch",
     "find_current_task_for_issue",
     "get_task",
     "get_task_for_update",
+    "get_task_planning_bootstrap_claim",
     "list_issue_attempts",
     "list_current_repository_tasks",
     "list_queued_tasks",
@@ -161,6 +163,66 @@ def get_task_for_update(pool: DatabasePool, task_id: UUID) -> Task | None:
             (task_id,),
         ).fetchone()
     return None if row is None else _task_from_row(row)
+
+
+def get_task_planning_bootstrap_claim(pool: DatabasePool, *, task_id: UUID) -> UUID | None:
+    """Return the Task's one-shot planning-bootstrap claim token, or ``None``.
+
+    The focused read of the E1b replay-safety fact (issue #203): NULL means
+    the Task's bootstrap establishment has never been claimed (and the
+    Task exists — the calling service resolves subject existence first); a
+    non-NULL token means a bootstrap claim was durably written exactly once,
+    so no later continuation may re-dispatch session creation or workspace
+    preparation. Representation only: classifying the fact into workflow
+    outcomes is a service-layer concern.
+    """
+    if not isinstance(task_id, UUID):
+        raise TaskDomainError("task_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select planning_bootstrap_claim_token from openorc.tasks where id = %s",
+            (task_id,),
+        ).fetchone()
+    return None if row is None else row[0]
+
+
+def claim_task_planning_bootstrap(
+    pool: DatabasePool,
+    *,
+    task_id: UUID,
+    expected_state_token: UUID,
+    claim_token: UUID,
+) -> UUID | None:
+    """Write the one-shot planning-bootstrap claim exactly once (issue #203).
+
+    The E1b entry transaction's replay-safety write, composed immediately
+    BEFORE the first runtime session-creation dispatch: the claim token is
+    installed only while the row is current (exact ``expected_state_token``),
+    non-archived, and still unclaimed (``planning_bootstrap_claim_token IS
+    NULL``), and the write rotates ``state_token`` like every other
+    authoritative Task-state mutation. Returns the post-claim
+    ``state_token``, or ``None`` when the token no longer matches, the Task
+    is missing/already archived, or the bootstrap was already claimed — a
+    rejected claim is a stale or already-claimed operation that must never be
+    retried blindly and never dispatches a runtime effect.
+    """
+    if not isinstance(task_id, UUID):
+        raise TaskDomainError("task_id must be a UUID")
+    if not isinstance(expected_state_token, UUID):
+        raise TaskDomainError("expected_state_token must be a UUID")
+    if not isinstance(claim_token, UUID):
+        raise TaskDomainError("claim_token must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set planning_bootstrap_claim_token = %s, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and planning_bootstrap_claim_token is null "
+            "returning state_token",
+            (claim_token, task_id, expected_state_token),
+        ).fetchone()
+    return None if row is None else row[0]
 
 
 def list_workspace_tasks(

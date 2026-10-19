@@ -1,0 +1,36 @@
+-- One-shot planning-bootstrap claim token (issue #203, E1b).
+--
+-- ``openorc.tasks`` already records that a Task was claimed into the coarse
+-- ``planning`` state by the E1a start capability (issue #76): capacity was
+-- admitted, both role reservations were reserved, and one
+-- ``planning_started`` event committed with the claim. The E1b bootstrap
+-- continuation (issue #203) needs one more durable fact: whether the
+-- bootstrap's establishment has itself been CLAIMED, because the merged
+-- seams cannot otherwise distinguish a genuinely unclaimed bootstrap from
+-- the residue of a previously attempted one whose session-creation outcome
+-- is unknown (an uncertain ``create_session``, a known-failed creation, or a
+-- claimed-but-never-dispatched continuation all leave both bindings
+-- CONNECTING with NULL initialization facts).
+--
+-- The column is a small append-only addition: nullable
+-- ``planning_bootstrap_claim_token uuid``, written exactly once by the E1b
+-- entry transaction immediately BEFORE the first runtime session-creation
+-- dispatch — conditionally on the caller's exact ``state_token``, the row
+-- being non-archived, and the token still being NULL — and never rewritten
+-- or cleared for the Task's lifetime (archival included). Presence is the
+-- replay-safety gate: a prior claim means the continuation must never
+-- re-dispatch creation or PREPARE blindly; absence with both bindings
+-- CONNECTING is the one provably safe first establishment. The token is an
+-- opaque one-shot claim identity the claiming continuation binds its
+-- currentness rechecks to; it is not dispatch identity (issues #87/#88 own
+-- per-operation durable dispatch/replay) and never a second copy of
+-- canonical workflow state.
+--
+-- No backfill: existing planning rows (if any) carry NULL and remain
+-- claimable, which is exactly their true durable state. No new privilege is
+-- granted here: the openorc schema lockout established by the
+-- create_openorc_schema migration carries isolation, and runtime access is
+-- backend-only.
+
+alter table openorc.tasks
+    add column planning_bootstrap_claim_token uuid;
