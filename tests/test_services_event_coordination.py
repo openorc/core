@@ -22,6 +22,7 @@ import pytest
 
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGateStatus
+from openorc.domain.reviews import ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination
@@ -318,6 +319,135 @@ class TestOwnerGateResolvedEvent:
                 owner_gate_id=_GATE_ID,
                 actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
                 outcome=OwnerGateStatus.PENDING,
+            )
+        assert conn.executed == []
+
+    def test_settled_settlement_event_carries_the_reviewer_result_references(self) -> None:
+        # A Reviewer-driven settlement (issue #211) records REVIEWER
+        # provenance and identifies the settling formal result: the
+        # finalized review iteration and its reviewer outcome ride in the
+        # context next to the settled outcome value.
+        iteration_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        pool, conn = _pool(
+            [
+                (
+                    uuid.uuid4(),
+                    _WORKSPACE_ID,
+                    _TASK_ID,
+                    "owner_gate_resolved",
+                    "reviewer",
+                    str(session_id),
+                    "owner_gate",
+                    _GATE_ID,
+                    {
+                        "outcome": "settled",
+                        "review_iteration_id": str(iteration_id),
+                        "review_outcome": "changes_requested",
+                    },
+                    _OBSERVED,
+                )
+            ]
+        )
+        event_coordination.record_owner_gate_resolved_event(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_GATE_ID,
+            actor=event_coordination.WorkflowActorContext(
+                WorkflowEventActor.REVIEWER, str(session_id)
+            ),
+            outcome=OwnerGateStatus.SETTLED,
+            review_iteration_id=iteration_id,
+            review_outcome=ReviewOutcome.CHANGES_REQUESTED,
+        )
+        assert len(conn.executed) == 1
+        sql, params = conn.executed[0]
+        assert "insert into openorc.workflow_events" in sql
+        assert params is not None
+        assert params[0] == _WORKSPACE_ID
+        assert params[1] == _TASK_ID
+        assert params[2] == "owner_gate_resolved"
+        assert params[3] == "reviewer"
+        assert params[4] == str(session_id)
+        assert params[5] == "owner_gate"
+        assert params[6] == _GATE_ID
+        assert params[7].obj == {
+            "outcome": "settled",
+            "review_iteration_id": str(iteration_id),
+            "review_outcome": "changes_requested",
+        }
+
+    def test_settled_settlement_requires_the_result_references(self) -> None:
+        pool, conn = _pool([])
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.SETTLED,
+            )
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.SETTLED,
+                review_iteration_id=uuid.uuid4(),
+            )
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.SETTLED,
+                review_iteration_id="not-a-uuid",  # type: ignore[arg-type]
+                review_outcome=ReviewOutcome.ACCEPTED,
+            )
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.SETTLED,
+                review_iteration_id=uuid.uuid4(),
+                review_outcome="changes_requested",  # type: ignore[arg-type]
+            )
+        assert conn.executed == []
+
+    def test_owner_resolutions_never_carry_the_settlement_references(self) -> None:
+        # Ordinary Owner-driven resolution events keep their exact
+        # pre-#211 shape: the outcome value alone, never an iteration
+        # reference that would attribute a Reviewer settlement to an Owner.
+        pool, conn = _pool([])
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.APPROVED,
+                review_iteration_id=uuid.uuid4(),
+                review_outcome=ReviewOutcome.ACCEPTED,
+            )
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_owner_gate_resolved_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                owner_gate_id=_GATE_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+                outcome=OwnerGateStatus.REJECTED,
+                review_iteration_id=uuid.uuid4(),
             )
         assert conn.executed == []
 

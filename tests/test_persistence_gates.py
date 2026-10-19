@@ -617,3 +617,47 @@ def test_resolve_owner_gate_requires_a_terminal_outcome_and_uuid_token() -> None
             expected_task_state_token="not-a-uuid",  # type: ignore[arg-type]
         )
     assert fake_conn.executed == []
+
+
+def test_resolve_owner_gate_settles_a_review_resolution_gate_one_shot() -> None:
+    # SETTLED (issue #211) is the Reviewer-driven terminal settlement
+    # outcome: the same one-shot conditional resolution mechanics apply —
+    # the gate stamp with its decided_at, the pointer clear, and the token
+    # rotation. The database CHECK restricts settled to review_resolution
+    # gates; this primitive applies whatever terminal outcome it is given.
+    gate_row = _gate_row(gate_type="review_resolution")
+    task_row = _task_row(
+        id=gate_row[2], workspace_id=gate_row[1], current_owner_gate_id=gate_row[0]
+    )
+    settled_gate_row = _gate_row(
+        id=gate_row[0],
+        gate_type="review_resolution",
+        status="settled",
+        decided_at=_observed_at(),
+    )
+    cleared_task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        current_owner_gate_id=None,
+        state_token=uuid.uuid4(),
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row, settled_gate_row, cleared_task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    resolution = resolve_owner_gate(
+        pool,
+        owner_gate_id=gate_row[0],
+        outcome=OwnerGateStatus.SETTLED,
+        expected_task_state_token=task_row[8],
+    )
+
+    assert resolution.outcome is OwnerGateResolutionOutcome.RESOLVED
+    assert resolution.gate is not None
+    assert resolution.gate.status is OwnerGateStatus.SETTLED
+    assert resolution.gate.decided_at == _utc_observed_at()
+    assert resolution.task is not None
+    assert resolution.task.current_owner_gate_id is None
+    assert resolution.task.state_token == cleared_task_row[8]
+    # The settled stamp targets only the pending gate row.
+    assert fake_conn.executed[2][1] is not None
+    assert fake_conn.executed[2][1][0] == "settled"

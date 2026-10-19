@@ -8,9 +8,13 @@ exact Owner decision bound to the exact subject it governs.
 - v1 gate types are exactly IMPLEMENTATION_AUTHORIZATION,
   PR_AUTHORIZATION, MERGE_DECISION, and REVIEW_RESOLUTION. No speculative
   additional human-authority decision type exists.
-- Statuses are exactly PENDING, APPROVED, REJECTED, and CANCELLED. A gate
-  is created PENDING; APPROVED, REJECTED, and CANCELLED are terminal and
-  immutable once stamped with ``decided_at``.
+- Statuses are exactly PENDING, APPROVED, REJECTED, CANCELLED, and
+  SETTLED. A gate is created PENDING; APPROVED, REJECTED, CANCELLED, and
+  SETTLED are terminal and immutable once stamped with ``decided_at``.
+  SETTLED (issue #211) is the Reviewer-driven settlement outcome of a
+  REVIEW_RESOLUTION gate: it records that a formal Reviewer judgment —
+  never an Owner verdict — resolved the gate, and no other gate type may
+  carry it (enforced by the database CHECK and the settlement service).
 - OwnerGates are historical decision records. Resolved gates are immutable
   and never recycled: a later gate of the same type is a new row, never a
   rewrite of an old one. A pending gate that has lost currency (superseded
@@ -31,7 +35,11 @@ exact Owner decision bound to the exact subject it governs.
   Reviewer objection. It is a separate durable fact and never rewrites the
   historical Reviewer result to ACCEPTED; plan-subject approval leads to a
   new IMPLEMENTATION_AUTHORIZATION and PR/head-subject approval to a new
-  MERGE_DECISION (orchestration concerns, not stored on the gate).
+  MERGE_DECISION (orchestration concerns, not stored on the gate). A
+  Reviewer-driven settlement instead stamps SETTLED with Reviewer
+  provenance (issue #211): it is likewise a separate durable fact that
+  never rewrites the historical result and never reads as an Owner
+  approval.
 - The Task's ``current_owner_gate_id`` pointer identifies the one gate the
   Task is currently waiting on. The normal lifecycle is: install one
   pending gate as current; resolve it while current (which clears the
@@ -77,18 +85,26 @@ class OwnerGateType(StrEnum):
 class OwnerGateStatus(StrEnum):
     """The settled v1 OwnerGate status vocabulary.
 
-    ``PENDING`` is the only nonterminal status; the other three are
-    terminal outcomes stamped with ``decided_at`` and immutable afterwards.
+    ``PENDING`` is the only nonterminal status; the others are terminal
+    outcomes stamped with ``decided_at`` and immutable afterwards.
+    ``SETTLED`` (issue #211) is the Reviewer-driven settlement outcome,
+    valid only for review_resolution gates.
     """
 
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
+    SETTLED = "settled"
 
 
 _TERMINAL_GATE_STATUSES: frozenset[OwnerGateStatus] = frozenset(
-    {OwnerGateStatus.APPROVED, OwnerGateStatus.REJECTED, OwnerGateStatus.CANCELLED}
+    {
+        OwnerGateStatus.APPROVED,
+        OwnerGateStatus.REJECTED,
+        OwnerGateStatus.CANCELLED,
+        OwnerGateStatus.SETTLED,
+    }
 )
 
 
@@ -139,7 +155,7 @@ class OwnerGate:
         if not isinstance(self.status, OwnerGateStatus):
             raise OwnerGateDomainError(
                 "OwnerGate.status must be an OwnerGateStatus "
-                "(pending, approved, rejected, or cancelled)"
+                "(pending, approved, rejected, cancelled, or settled)"
             )
         _require_uuid(self.plan_revision_id, "plan_revision_id", nullable=True)
         _require_uuid(self.task_pull_request_id, "task_pull_request_id", nullable=True)

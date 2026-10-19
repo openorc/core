@@ -297,6 +297,13 @@ def resolve_owner_gate(
     ``FOR UPDATE`` first (every gate write happens under that lock), and
     both updates carry their own conditional guards as durable backstops.
 
+    ``outcome`` is any terminal OwnerGateStatus: the Owner-driven
+    APPROVED/REJECTED/CANCELLED resolutions and the Reviewer-driven
+    REVIEW_RESOLUTION settlement (``outcome=SETTLED``, issue #211). The
+    database CHECK restricts ``settled`` to review_resolution gates; the
+    calling service owns the exact-subject proof that only a settlement
+    seam applies it.
+
     A gate that is current but token-stale, or pending but no longer the
     Task's current gate (superseded or never installed), is a stale
     operation: nothing is applied to either the gate or the Task, the gate
@@ -312,7 +319,7 @@ def resolve_owner_gate(
     if not isinstance(outcome, OwnerGateStatus) or outcome is OwnerGateStatus.PENDING:
         raise OwnerGateDomainError(
             "resolve_owner_gate requires a terminal OwnerGateStatus outcome "
-            "(approved, rejected, or cancelled)"
+            "(approved, rejected, cancelled, or settled)"
         )
     if not isinstance(expected_task_state_token, UUID):
         raise OwnerGateDomainError("expected_task_state_token must be a UUID")

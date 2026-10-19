@@ -342,4 +342,44 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   `OWNER_GATE_CREATED` subjects the new gate; `REVIEW_LIMIT_REACHED`
   subjects the ReviewLoop. No event shadows canonical records.
 
+## E3c: Reviewer-driven REVIEW_RESOLUTION settlement (issue #211)
+
+- `task_planning_review_resolution.settle_planning_review_resolution` is the
+  ONE planning settlement seam: it consumes E4's future formal-result
+  recognition input — the validated typed `ReviewResult` recognized at the
+  Task's pending current REVIEW_RESOLUTION gate (no chat transport or parser
+  here) — and, in one short `composed_transaction`, rechecks the exact
+  authorized current non-archived `waiting_for_owner` Task under the caller's
+  expected token, the exact current pending plan-subject REVIEW_RESOLUTION
+  gate addressed through the Task's own current-gate pointer, the unchanged
+  exact current PlanRevision, the re-locked OPEN planning loop, and the exact
+  existing admitted READY Reviewer binding (verified after E4's external
+  send) — then allocates and finalizes a NEW next-numbered ReviewIteration
+  for the unchanged revision (no pre-reservation for advisory chat), records
+  the REVIEWER `PLAN_REVIEWED` event, stamps the gate `SETTLED` through the
+  shared conditional `resolve_owner_gate` persistence primitive (gate stamp +
+  pointer clear + token rotation), and records the REVIEWER
+  `OWNER_GATE_RESOLVED` event whose context carries `outcome=settled` plus
+  the settling `review_iteration_id`/`review_outcome` references.
+- Formal ACCEPTED closes the loop and yields the unchanged
+  PlanRevision/iteration evidence for E5 — no IMPLEMENTATION_AUTHORIZATION,
+  no implementation authority, and no Task status change (the Task stays
+  `waiting_for_owner` for E5's flow). Formal CHANGES_REQUESTED moves the
+  Task `waiting_for_owner` → `planning` under the post-settlement token and
+  routes ONLY the newly finalized findings to merged E2 `revise_task_plan`
+  OUTSIDE any transaction (the post-settlement token, the unchanged prior
+  revision, the new iteration); the historic exhausted findings are never
+  rerouted and an uncertain E2 operation is never resent. Only E2's newly
+  persisted revision and rotated token may launch E3a's next ordinary
+  REVIEW; the next disagreement immediately creates a NEW gate (settled
+  gates keep Owner mediation sticky through durable gate history) without
+  resetting the spent autonomous budget.
+- Fail closed: a stale/foreign/replayed settlement, a non-REVIEW_RESOLUTION
+  or PR/head-subject gate, a changed current PlanRevision, a non-READY or
+  missing Reviewer binding, a closed loop, and a non-formal
+  (non-`ReviewResult`) input apply nothing. The Owner-facing
+  `task_mutations.resolve_owner_gate` refuses `SETTLED` — it is never
+  Owner-attributed. PR/head-subject settlement belongs to E9 (#84), which
+  reuses the same purpose-independent persistence primitive.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

@@ -504,7 +504,10 @@ def resolve_owner_gate(
     and the pending gate is never rewritten after losing currency. A
     successful resolution commits its ``OWNER_GATE_RESOLVED`` event in the
     same composed transaction through the supplied actor context; every
-    failure path writes no event.
+    failure path writes no event. This Owner seam resolves only
+    Owner-expressible outcomes (approved/rejected/cancelled): ``settled``
+    is the Reviewer-driven settlement outcome of a REVIEW_RESOLUTION gate
+    (issue #211) and is refused here, never Owner-attributed.
     """
     with application_span(_TASK_MUTATIONS_TRACER_SCOPE, _RESOLVE_OWNER_GATE_SPAN_NAME) as span:
         _require_uuid_command(workspace_id, "workspace_id")
@@ -521,6 +524,12 @@ def resolve_owner_gate(
             raise InvalidCommandError(
                 "resolve_owner_gate requires a terminal OwnerGateStatus outcome "
                 "(approved, rejected, or cancelled)"
+            )
+        if outcome is OwnerGateStatus.SETTLED:
+            raise InvalidCommandError(
+                "settled is the Reviewer-driven settlement outcome of a "
+                "REVIEW_RESOLUTION gate (issue #211) and is never an "
+                "Owner-attributed resolution"
             )
         with composed_transaction(pool) as transaction_pool:
             task = require_current_task(

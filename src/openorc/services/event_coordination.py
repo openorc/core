@@ -297,14 +297,23 @@ def record_owner_gate_resolved_event(
     owner_gate_id: UUID,
     actor: WorkflowActorContext,
     outcome: OwnerGateStatus,
+    review_iteration_id: UUID | None = None,
+    review_outcome: ReviewOutcome | None = None,
 ) -> None:
     """Record one exact current OwnerGate resolution.
 
     Task-scoped; the primary modeled subject is the resolved OwnerGate
     (``subject_type``/``subject_id``) over the Task scope. Context carries
-    the single safe semantic ``outcome`` value (approved/rejected/
-    cancelled) — never the gate record, its canonical metadata, or any
-    duplicated state. A pending outcome is an invalid command, not an
+    the single safe semantic ``outcome`` value. Ordinary Owner-driven
+    resolutions (approved/rejected/cancelled) carry exactly that context
+    and nothing else. A Reviewer-driven settlement (``settled``, issue
+    #211) additionally carries the settling formal result's safe
+    references — the finalized ``review_iteration_id`` and its
+    ``review_outcome`` (the accepted/changes_requested judgment) — and both
+    are required with ``settled`` and forbidden with any Owner outcome, so
+    Owner-resolved events keep their exact pre-#211 shape. A pending
+    outcome is an invalid command, not an event. The summary, findings,
+    gate record, and every other canonical fact are never copied into the
     event.
     """
     _require_uuid_command(workspace_id, "workspace_id")
@@ -313,8 +322,30 @@ def record_owner_gate_resolved_event(
     if not isinstance(outcome, OwnerGateStatus) or outcome is OwnerGateStatus.PENDING:
         raise InvalidCommandError(
             "resolved-gate events require a terminal OwnerGateStatus outcome "
-            "(approved, rejected, or cancelled)"
+            "(approved, rejected, cancelled, or settled)"
         )
+    context: dict[str, str]
+    if outcome is OwnerGateStatus.SETTLED:
+        if review_iteration_id is None or review_outcome is None:
+            raise InvalidCommandError(
+                "settled-gate events require the settling review iteration "
+                "id and its reviewer outcome"
+            )
+        _require_uuid_command(review_iteration_id, "review_iteration_id")
+        if not isinstance(review_outcome, ReviewOutcome):
+            raise InvalidCommandError("settled-gate events require a ReviewOutcome review_outcome")
+        context = {
+            "outcome": outcome.value,
+            "review_iteration_id": str(review_iteration_id),
+            "review_outcome": review_outcome.value,
+        }
+    else:
+        if review_iteration_id is not None or review_outcome is not None:
+            raise InvalidCommandError(
+                "only settled-gate events carry the settling review iteration "
+                "references; owner resolutions carry the outcome value alone"
+            )
+        context = {"outcome": outcome.value}
     event_records.record_workflow_event(
         transaction_pool,
         workspace_id=workspace_id,
@@ -324,7 +355,7 @@ def record_owner_gate_resolved_event(
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_OWNER_GATE,
         subject_id=owner_gate_id,
-        context={"outcome": outcome.value},
+        context=context,
     )
 
 
