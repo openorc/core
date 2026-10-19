@@ -58,7 +58,7 @@ response parsing.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
@@ -74,7 +74,9 @@ __all__ = [
     "ReviewLoopPurpose",
     "ReviewLoopStatus",
     "ReviewOutcome",
+    "autonomous_budget_exhausted",
     "canonical_review_findings",
+    "count_changes_requested",
     "review_iteration_field_names",
     "review_loop_field_names",
 ]
@@ -362,3 +364,34 @@ def review_iteration_field_names() -> frozenset[str]:
     last-change timestamp beyond the semantic ``decided_at``.
     """
     return frozenset(field.name for field in fields(ReviewIteration))
+
+
+def count_changes_requested(iterations: Sequence[ReviewIteration]) -> int:
+    """Count the finalized ``CHANGES_REQUESTED`` iterations in review history.
+
+    The purpose-independent budget seam shared by the planning review loop
+    (E3b) and the later PR-review loop: each finalized change request is one
+    consumed unit of the loop's autonomous revision/remediation budget.
+    Unfinalized attempts, accepts, and non-reviewer judgments never count —
+    provider/runtime/protocol failures are structurally excluded from the
+    outcome vocabulary.
+    """
+    return sum(
+        1 for iteration in iterations if iteration.outcome is ReviewOutcome.CHANGES_REQUESTED
+    )
+
+
+def autonomous_budget_exhausted(loop: ReviewLoop, iterations: Sequence[ReviewIteration]) -> bool:
+    """Whether the loop's snapshotted autonomous revision budget is exhausted.
+
+    The snapshotted ``iteration_limit`` is the number of autonomous
+    Producer revisions/remediations the loop permits, never a cap on
+    ReviewIterations: with the v1 default of five, five change requests
+    each still permit one revision and the next review, and a sixth change
+    request exhausts the budget. The stored snapshot is authoritative — a
+    later Workspace setting edit affects future loops only. Owner-mediated
+    continuation deliberately refreshes nothing: stickiness is derived from
+    durable OwnerGate history at the service boundary, not here, so this
+    predicate stays a pure fact about the loop and its iteration history.
+    """
+    return count_changes_requested(iterations) > loop.iteration_limit

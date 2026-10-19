@@ -1252,3 +1252,46 @@ def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() ->
     # The failure telemetry is a safe classification only: the description
     # is the exception type name, never arbitrary message content.
     assert failed_span.status.description == "ExternalOperationUncertainError"
+
+
+def test_replaying_a_reviewed_revision_production_outcome_cannot_dispatch_again() -> None:
+    """Issue #210: after an in-budget finalization, the still-current token
+    cannot launch another ordinary REVIEW of the same plan before E2
+    publishes the next revision — protecting an in-flight E2 operation from
+    being superseded by a duplicate same-plan iteration."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    _script_reuse_entry(
+        conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        existing_loops=[_loop_row(limit=5)],
+        loop_row=_loop_row(limit=5),
+        loop_iterations=[
+            _iteration_row(
+                outcome="changes_requested",
+                summary="Needs work",
+                findings=_REVIEW_FINDINGS,
+                decided_at=_OBSERVED,
+            )
+        ],
+        iteration_row=_iteration_row(),
+    )
+    adapter = _prepared_reviewer_adapter(fake_pool, [_review_candidate()])
+
+    with pytest.raises(ConflictError):
+        dispatch_planning_review(
+            _pool(conn),
+            adapter,
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            plan_production=_production_outcome(),
+        )
+
+    _assert_no_reservation(conn)
+    _assert_no_task_mutation(conn)
+    assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
