@@ -63,6 +63,8 @@ __all__ = [
     "owner_actor",
     "record_guidance_changed_event",
     "record_owner_gate_resolved_event",
+    "record_plan_revision_created_event",
+    "record_plan_revision_revised_event",
     "record_planning_started_event",
     "record_review_iteration_limit_changed_event",
     "record_role_binding_configuration_changed_event",
@@ -73,6 +75,7 @@ __all__ = [
 # subject kinds need no schema migration, only a deliberate mapping here.
 _SUBJECT_TYPE_WORKSPACE = "workspace"
 _SUBJECT_TYPE_OWNER_GATE = "owner_gate"
+_SUBJECT_TYPE_PLAN_REVISION = "plan_revision"
 
 _TERMINAL_TASK_EVENT: dict[TaskStatus, WorkflowEventType] = {
     TaskStatus.CANCELLED: WorkflowEventType.TASK_CANCELLED,
@@ -316,6 +319,87 @@ def record_owner_gate_resolved_event(
         subject_type=_SUBJECT_TYPE_OWNER_GATE,
         subject_id=owner_gate_id,
         context={"outcome": outcome.value},
+    )
+
+
+def record_plan_revision_created_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_revision_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one immutable PlanRevision becoming the Task's first plan (issue #77).
+
+    Task-scoped; the primary modeled subject is the created PlanRevision
+    (``subject_type``/``subject_id``) over the Task scope. The actor is the
+    safe bound Producer logical identity supplied by the calling capability.
+    The helper accepts no plan-text, findings, prompt, or repository-context
+    parameter, so nothing but the modeled subject fact can ever be copied
+    into the event.
+    """
+    _record_plan_revision_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_revision_id=plan_revision_id,
+        actor=actor,
+        event_type=WorkflowEventType.PLAN_REVISION_CREATED,
+    )
+
+
+def record_plan_revision_revised_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_revision_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one E3-directed PlanRevision superseding the current plan (issue #77).
+
+    Task-scoped; the primary modeled subject is the new PlanRevision
+    (``subject_type``/``subject_id``) over the Task scope. The actor is the
+    safe bound Producer logical identity supplied by the calling capability.
+    The helper accepts no plan-text, findings, prompt, or repository-context
+    parameter, so nothing but the modeled subject fact can ever be copied
+    into the event.
+    """
+    _record_plan_revision_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_revision_id=plan_revision_id,
+        actor=actor,
+        event_type=WorkflowEventType.PLAN_REVISION_REVISED,
+    )
+
+
+def _record_plan_revision_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_revision_id: UUID,
+    actor: WorkflowActorContext,
+    event_type: WorkflowEventType,
+) -> None:
+    """Write one plan-revision event with its exact locked event type."""
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(plan_revision_id, "plan_revision_id")
+    if not isinstance(actor, WorkflowActorContext):
+        raise InvalidCommandError("plan revision events require a WorkflowActorContext actor")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=event_type,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_PLAN_REVISION,
+        subject_id=plan_revision_id,
     )
 
 
