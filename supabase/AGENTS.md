@@ -157,4 +157,19 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   services from Owner-configured endpoints is a deployment-operator
   obligation (infrastructure isolation and network controls, issue #190).
 
+## One-shot planning-bootstrap claim (issue #203)
+
+- `openorc.tasks.planning_bootstrap_claim_token` is the nullable one-shot E1b
+  replay-safety fact: written exactly once by the bootstrap continuation's
+  entry transaction, conditionally on the exact `state_token`, a
+  non-archived row, and a still-NULL token, immediately before the first
+  runtime session-creation dispatch, and never rewritten or cleared
+  (archival included). NULL means the bootstrap establishment was never
+  claimed; presence means a prior claim exists, so no later continuation may
+  re-dispatch session creation or workspace preparation. No backfill
+  (existing planning rows stay unclaimed, which is their true durable
+  state), no index, no grants beyond the established `openorc` schema
+  lockout, and no dispatch identity — issues #87/#88 own per-operation
+  durable dispatch/replay.
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

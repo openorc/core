@@ -26,10 +26,12 @@ from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import (
     archive_task,
     bind_canonical_branch,
+    claim_task_planning_bootstrap,
     create_task,
     find_current_task_by_branch,
     find_current_task_for_issue,
     get_task,
+    get_task_planning_bootstrap_claim,
     list_current_repository_tasks,
     list_issue_attempts,
     list_queued_tasks,
@@ -684,6 +686,98 @@ def test_list_queued_tasks_rejects_a_malformed_cursor_or_limit() -> None:
             after_queued_at=_observed_at(),
             limit=10,
         )
+    assert fake_conn.executed == []
+
+
+def test_get_task_planning_bootstrap_claim_reads_the_one_shot_fact() -> None:
+    task_id = uuid.uuid4()
+    claim_token = uuid.uuid4()
+    fake_conn = FakeConnection((claim_token,))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert get_task_planning_bootstrap_claim(pool, task_id=task_id) == claim_token
+
+    sql, params = fake_conn.executed[0]
+    assert "select planning_bootstrap_claim_token from openorc.tasks where id = %s" in sql
+    assert params == (task_id,)
+
+
+def test_get_task_planning_bootstrap_claim_returns_none_when_unclaimed() -> None:
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert get_task_planning_bootstrap_claim(pool, task_id=uuid.uuid4()) is None
+
+
+def test_claim_task_planning_bootstrap_writes_the_fact_and_rotates_the_token() -> None:
+    task_id = uuid.uuid4()
+    expected_state_token = uuid.uuid4()
+    claim_token = uuid.uuid4()
+    post_claim_state_token = uuid.uuid4()
+    fake_conn = FakeConnection((post_claim_state_token,))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        claim_task_planning_bootstrap(
+            pool,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            claim_token=claim_token,
+        )
+        == post_claim_state_token
+    )
+
+    sql, params = fake_conn.executed[0]
+    # Exactly-once by the IS-NULL predicate; conditional on the exact token;
+    # rotating the token like every authoritative Task-state mutation.
+    assert "set planning_bootstrap_claim_token = %s," in sql
+    assert "state_token = gen_random_uuid()" in sql
+    assert "where id = %s and state_token = %s and archived_at is null" in sql
+    assert "and planning_bootstrap_claim_token is null" in sql
+    assert "returning state_token" in sql
+    assert params == (claim_token, task_id, expected_state_token)
+
+
+def test_claim_task_planning_bootstrap_returns_none_when_already_claimed() -> None:
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        claim_task_planning_bootstrap(
+            pool,
+            task_id=uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            claim_token=uuid.uuid4(),
+        )
+        is None
+    )
+    sql, _ = fake_conn.executed[0]
+    assert "planning_bootstrap_claim_token is null" in sql
+
+
+@pytest.mark.parametrize("malformed", [None, "not-a-uuid", 7])
+def test_claim_task_planning_bootstrap_rejects_malformed_claim_token(
+    malformed: Any,
+) -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    with pytest.raises(TaskDomainError):
+        claim_task_planning_bootstrap(
+            pool,
+            task_id=uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            claim_token=malformed,
+        )
+    assert fake_conn.executed == []
+
+
+def test_get_task_planning_bootstrap_claim_rejects_malformed_task_id() -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    with pytest.raises(TaskDomainError):
+        get_task_planning_bootstrap_claim(pool, task_id="not-a-uuid")  # type: ignore[arg-type]
     assert fake_conn.executed == []
 
 

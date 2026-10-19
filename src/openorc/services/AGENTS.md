@@ -199,4 +199,54 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   `planning` here means capacity admitted and startup claimed — never READY
   sessions, workspace preparation, or a successful PLAN (issues #203/#77).
 
+## Planning bootstrap continuation (issue #203)
+
+- `task_planning_bootstrap.prepare_task_for_planning` is the ONE logical E1b
+  continuation for a Task claimed into coarse `planning` by the #76 start
+  capability: entry/claim (account barrier FIRST → the per-Workspace
+  arbitration lock → #53 Owner scope → the #54 exact current `planning` Task
+  → the one-shot claim fact → both durable role bindings) → establishment
+  (per-role branch BEFORE any lease: READY is reused with no runtime effect,
+  CONNECTING goes through #130 with the injected fresh lease's selected
+  configuration) → the pre-PREPARE exact-subject recheck → one typed #181
+  PREPARE to the exact bound Producer (only `PREPARE`/`COMPLETED` enables
+  planning) → the post-PREPARE recheck → the runtime-neutral
+  planning-context transition (production Cline: the #74/#190 same-ID
+  reconstruction into PLAN at the selected checkout) → the final recheck →
+  the E2 (#77) handoff outcome. It never admits capacity again, rebinds a
+  route, recreates a Task, replaces a session, clones in Core, or sends a
+  PLAN control.
+- The one-shot `tasks.planning_bootstrap_claim_token` fact is the
+  replay-safety discriminator, written exactly once (conditional on the
+  exact `state_token`, a non-archived row, and a still-NULL token)
+  immediately BEFORE the first creation dispatch and never rewritten.
+  Presence means a prior claim's establishment is unresolved: the
+  continuation fails closed (`PlanningBootstrapUnresolvedError`) with zero
+  runtime effects even when the caller supplies the refreshed current token
+  — a creation may have been dispatched with an unknown outcome, and the
+  merged seams cannot prove another creation safe. Absence with both
+  bindings CONNECTING is the one provably safe first establishment. This is
+  Task-level claim state, not #87/#88 dispatch identity: no outbox, job
+  queue, scheduler, recovery engine, or process-local single-flight exists
+  here, and uncertain external operations are never retried, downgraded, or
+  blindly replayed (Owner/recovery handling is later-layer work; #85/#87/
+  #88 and F2/F4 own the general machinery).
+- The continuation composes the injected runtime-neutral
+  `TaskBootstrapRuntimeComposition` seam (`establishment_lease` /
+  `interaction_lease` / `enter_planning_checkout`); the production Cline
+  composition is `cline_planning_bootstrap.ClineBootstrapRuntimeComposition`
+  over the #190 FRESH/BOUND attachment leases and the #74
+  `reconstruct_session` PLAN transition. `ClineConstructionMode`, SDK steps,
+  and mode authority never cross into the workflow service, and the
+  universal `AgentRuntimeAdapter` surface is never expanded.
+- Every recheck (pre-PREPARE, post-PREPARE, post-transition) verifies the
+  exact current Task/token, the continuation's own claim identity, and both
+  READY bindings' exact external identities before and after each
+  consequential external effect; the Producer checkout target is recovered
+  from the READY binding's own durable `effective_config_snapshot` (never
+  the live `Connection.safe_config`) and is exactly
+  `<original base>/<Task UUID>`; the Reviewer stays in its separately
+  supplied neutral non-repository directory; there is no checkout registry,
+  no new session fields, and no agent-reported path is ever authority.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
