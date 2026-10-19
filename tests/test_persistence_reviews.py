@@ -232,6 +232,23 @@ def test_get_review_loop_maps_closed_rows_or_returns_none() -> None:
     assert get_review_loop(empty_pool, review_loop_id=closed[0]) is None
 
 
+def test_get_review_loop_locked_read_takes_the_row_lock() -> None:
+    # The for_update variant is the create_review_iteration lock: revision
+    # production's finalize recheck (issue #207) serializes against
+    # concurrent iteration creation on the same loop row.
+    row = _loop_row()
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    loop = get_review_loop(pool, review_loop_id=row[0], for_update=True)
+
+    assert loop is not None
+    assert loop.id == row[0]
+    sql, params = fake_conn.executed[0]
+    assert "for update" in " ".join(sql.split()).lower()
+    assert params == (row[0],)
+
+
 def test_list_task_review_loops_filters_by_status() -> None:
     open_row = _loop_row(purpose="pr_review")
     fake_conn = FakeConnection(rows=[open_row])

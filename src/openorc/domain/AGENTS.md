@@ -17,7 +17,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - Profile is the canonical OpenOrc application identity and reuses the corresponding Supabase Auth user UUID. Ordinary domain references point to Profile, never directly to auth.users.
 - Ownership is Profile → Workspace → Project → Repository → Task. Workspace is the v1 security/configuration boundary.
 - A Workspace has exactly one Owner Profile in v1. Membership, invitations, team RBAC, and organization abstractions are out of scope.
-- Workspace configuration is typed. review_iteration_limit is positive and affects future ReviewLoops only; guidance is one current blank-by-default Owner-authored prose value. Guidance has no template/version/hash/history semantics and cannot redefine protocol, authority, session, or workflow behavior.
+- Workspace configuration is typed. review_iteration_limit is positive and affects future ReviewLoops only; it is the autonomous Producer revision/remediation budget for a planning ReviewLoop (default 5), not a cap on ReviewIterations. Guidance is one current blank-by-default Owner-authored prose value. Guidance has no template/version/hash/history semantics and cannot redefine protocol, authority, session, or workflow behavior.
 - Repository identity is its OpenOrc UUID plus the stable GitHub repository ID used for reconciliation. Mutable GitHub names, URLs, visibility, default branch, issue numbers, and similar presentation/address data are never sole identity.
 - The same external GitHub repository may exist independently in different Workspaces; within one Workspace it is canonicalized by stable GitHub identity.
 
@@ -64,13 +64,13 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 ## Planning and review
 
 - PlanRevision is immutable, versioned per Task, and stores the exact Producer plan plus repository_base_sha as audit/context. Base movement alone does not invalidate a cleared plan.
-- ReviewLoop purposes are PLANNING and PR_REVIEW only. The loop stores the effective iteration limit used for that loop; later Workspace configuration changes do not rewrite it.
+- ReviewLoop purposes are PLANNING and PR_REVIEW only. The loop stores the effective iteration limit used for that loop; later Workspace configuration changes do not rewrite it. That limit is the autonomous Producer revision/remediation budget, not a cap on ReviewIterations: the fifth CHANGES_REQUESTED still routes to the Producer, and further disagreement continues in Owner-mediated REVIEW_RESOLUTION.
 - ReviewIteration binds one exact subject and becomes immutable when its result is finalized.
 - Reviewer outcomes are exactly ACCEPTED and CHANGES_REQUESTED. Operational/provider/protocol failure is not a Reviewer outcome.
 - ACCEPTED has no findings. CHANGES_REQUESTED has at least one finding.
 - Planning review binds a PlanRevision. PR review binds the canonical TaskPullRequest plus exact reviewed head SHA. A changed PR head invalidates acceptance; target/base movement alone does not.
 - Review findings are durable historical evidence. The wire-envelope schema is protocol-owned and is not duplicated in domain state.
-- ReviewLoop exhaustion leads to Owner REVIEW_RESOLUTION. Owner override remains a distinct authority fact and never rewrites CHANGES_REQUESTED into ACCEPTED.
+- ReviewLoop exhaustion leads to Owner REVIEW_RESOLUTION. The loop remains OPEN across autonomous-budget exhaustion and Owner discussion; the Owner-mediated mode is sticky and continues with the same Reviewer session. New formal Reviewer results append immutable ReviewIterations; only a schema-valid, exact-subject Reviewer decision advances the workflow. Owner discussion prose is never workflow authority, and Reviewer acceptance after discussion is Reviewer acceptance — never an Owner APPROVED verdict.
 
 ## Human authority and subordinate records
 
