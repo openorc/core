@@ -16,10 +16,12 @@ scripted GitHub observation fake prove the E2 contract on its critical path:
   Task token, and records ``PLAN_REVISION_CREATED``; revision production
   routes the persisted finalized ``CHANGES_REQUESTED`` review verbatim to
   the same Producer session and records ``PLAN_REVISION_REVISED``;
-- wrong subjects, non-READY bindings, unfinalized/ACCEPTED/non-planning
-  reviews, invalid formal results, known failures, uncertain outcomes,
+- wrong subjects, non-READY bindings, unfinalized/ACCEPTED/non-planning/
+  closed-loop reviews, superseded-on-the-same-plan reviews (issue #207),
+  invalid formal results, known failures, uncertain outcomes,
   stale-after-reply subjects, and competing finalizations all refuse the
-  consequential write, and uncertainty is never permission to resend.
+  consequential write, and uncertainty is never permission to resend — a
+  superseding result finalized during the send also publishes nothing.
 
 Durable atomicity is proven by the integration-marked suite against a real
 Postgres. No live GitHub, runtime, or Postgres access.
@@ -102,6 +104,7 @@ _REVISION_1_ID = uuid.uuid4()
 _REVISION_2_ID = uuid.uuid4()
 _LOOP_ID = uuid.uuid4()
 _ITERATION_ID = uuid.uuid4()
+_ITERATION_2_ID = uuid.uuid4()
 _BASE_SHA = "c" * 40
 _PLAN_TEXT = "# Plan\n\nStep one.\n"
 _REVISED_PLAN_TEXT = "# Plan (revised)\n\nStep one, clarified.\n"
@@ -334,12 +337,19 @@ def _revision_row(
     return (revision_id, _WORKSPACE_ID, _TASK_ID, number, content, sha, _OBSERVED)
 
 
-def _loop_row(*, purpose: str = "planning", status: str = "open") -> tuple[Any, ...]:
-    return (_LOOP_ID, _WORKSPACE_ID, _TASK_ID, purpose, 3, status, None, _OBSERVED)
+def _loop_row(
+    *,
+    purpose: str = "planning",
+    status: str = "open",
+    closed_at: Any = None,
+) -> tuple[Any, ...]:
+    return (_LOOP_ID, _WORKSPACE_ID, _TASK_ID, purpose, 3, status, closed_at, _OBSERVED)
 
 
 def _iteration_row(
     *,
+    iteration_id: Any = _ITERATION_ID,
+    number: int = 1,
     outcome: str | None = "changes_requested",
     summary: str | None = "Needs work",
     findings: Any = _FINDINGS,
@@ -347,11 +357,11 @@ def _iteration_row(
     decided_at: Any = _OBSERVED,
 ) -> tuple[Any, ...]:
     return (
-        _ITERATION_ID,
+        iteration_id,
         _WORKSPACE_ID,
         _TASK_ID,
         _LOOP_ID,
-        1,
+        number,
         plan_revision_id,
         None,
         None,
@@ -629,6 +639,7 @@ def _script_revise_entry(
     iteration_row: tuple[Any, ...],
     loop_row: tuple[Any, ...],
     producer_row: tuple[Any, ...],
+    loop_iterations: list[tuple[Any, ...]] | None = None,
 ) -> None:
     """The revision entry transaction's canned sequence, in call order."""
     _script_account_and_workspace(conn)
@@ -637,6 +648,12 @@ def _script_revise_entry(
     conn.on(_sql_has("from openorc.plan_revisions where id"), revision_row)
     conn.on(_sql_has("from openorc.review_iterations where id"), iteration_row)
     conn.on(_sql_has("from openorc.review_loops where id"), loop_row)
+    # The #207 supersession guard: the loop's ordered iterations decide
+    # whether the named change request is still the latest one on the plan.
+    conn.on(
+        _sql_has("review_iterations where review_loop_id"),
+        loop_iterations if loop_iterations is not None else [iteration_row],
+    )
     conn.on(_role_is(_sql_has("from openorc.task_agent_sessions"), "producer"), producer_row)
     _script_route(conn)
 
@@ -650,17 +667,29 @@ def _script_revise_finalize(
     revision_row: tuple[Any, ...],
     pointer_row: tuple[Any, ...],
     producer_row: tuple[Any, ...] | None = None,
+    loop_row: tuple[Any, ...] | None = None,
+    loop_iterations: list[tuple[Any, ...]] | None = None,
 ) -> None:
     """The revision finalize transaction's canned sequence, in call order.
 
-    The composition rechecks the exact Task subject and the exact prepared
-    Producer binding before any write."""
+    The composition rechecks the exact Task subject, the exact prepared
+    Producer binding, the current prior revision, and — issue #207 — the
+    routed change request's supersession state (the loop row re-read locked,
+    then its ordered iterations) before any write."""
     conn.on(_TASK_READ, task_row)
     conn.on(
         _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
         producer_row if producer_row is not None else _production_ready_row(),
     )
     conn.on(_sql_has("from openorc.plan_revisions where id"), prior_row)
+    conn.on(
+        _sql_has("from openorc.review_loops where id", "for update"),
+        loop_row if loop_row is not None else _loop_row(),
+    )
+    conn.on(
+        _sql_has("review_iterations where review_loop_id"),
+        loop_iterations if loop_iterations is not None else [_iteration_row()],
+    )
     conn.on(_sql_has("from openorc.plan_revisions where task_id"), history)
     conn.on(_REVISION_INSERT, revision_row)
     conn.on(_POINTER_UPDATE, pointer_row)
@@ -1224,6 +1253,7 @@ def _script_revise_refusal(
     iteration_row: tuple[Any, ...] | None = None,
     loop_row: tuple[Any, ...] | None = None,
     producer_row: tuple[Any, ...] | None = None,
+    loop_iterations: list[tuple[Any, ...]] | None = None,
     iteration_missing: bool = False,
     prior_missing: bool = False,
 ) -> None:
@@ -1243,6 +1273,13 @@ def _script_revise_refusal(
         None if iteration_missing else (iteration_row or _iteration_row()),
     )
     env.conn.on(_sql_has("from openorc.review_loops where id"), loop_row or _loop_row())
+    # The #207 supersession guard reads the loop's ordered iterations once
+    # the iteration/loop checks pass; refusals before that read simply leave
+    # this handler unused.
+    env.conn.on(
+        _sql_has("review_iterations where review_loop_id"),
+        loop_iterations if loop_iterations is not None else [iteration_row or _iteration_row()],
+    )
     env.conn.on(
         _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
         producer_row or _production_ready_row(),
@@ -1336,6 +1373,183 @@ def test_revision_with_unknown_prior_revision_is_not_found() -> None:
 
     assert adapter.submitted_sends() == ()
     _assert_no_consequential_write(env.conn)
+
+
+def test_revision_superseded_on_the_same_plan_by_a_newer_change_request_refuses() -> None:
+    """Issue #207: an older finalized result on the current plan is never routed.
+
+    Two finalized CHANGES_REQUESTED iterations address the same current
+    PlanRevision; naming the older one fails closed at entry, before any
+    external effect, even though both results are individually valid and the
+    caller's Task token is current.
+    """
+    env = _Production()
+    _script_revise_refusal(
+        env,
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        ],
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_revise(adapter=adapter)
+
+    assert adapter.submitted_sends() == ()
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revision_superseded_by_a_newer_accepted_result_refuses() -> None:
+    """A newer ACCEPTED result on the same plan blocks the older change request."""
+    env = _Production()
+    _script_revise_refusal(
+        env,
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2, outcome="accepted", findings=[]),
+        ],
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_revise(adapter=adapter)
+
+    assert adapter.submitted_sends() == ()
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revision_superseded_by_a_newer_unfinalized_iteration_refuses() -> None:
+    """An unresolved newer attempt also makes the older change request ineligible."""
+    env = _Production()
+    _script_revise_refusal(
+        env,
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(
+                iteration_id=_ITERATION_2_ID,
+                number=2,
+                outcome=None,
+                summary=None,
+                findings=None,
+                decided_at=None,
+            ),
+        ],
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_revise(adapter=adapter)
+
+    assert adapter.submitted_sends() == ()
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revision_with_closed_planning_review_loop_refuses() -> None:
+    """A settled (closed) planning loop never routes a revision dispatch."""
+    env = _Production()
+    _script_revise_refusal(env, loop_row=_loop_row(status="closed", closed_at=_OBSERVED))
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(ConflictError):
+        env.run_revise(adapter=adapter)
+
+    assert adapter.submitted_sends() == ()
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revision_routes_the_latest_change_request_on_the_same_plan() -> None:
+    """Issue #207: with two finalized change requests on one plan, the latest routes.
+
+    The later result is the eligible revision input; its persisted
+    summary/findings reach the Producer verbatim and revision 2 publishes
+    through the unchanged normal path.
+    """
+    env = _Production()
+    _script_revise_entry(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iteration_row=_iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        ],
+    )
+    _script_revise_finalize(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        prior_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        history=[_revision_row(revision_id=_REVISION_1_ID, number=1)],
+        revision_row=_revision_row(
+            revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT
+        ),
+        pointer_row=_updated_task_row(pointer=_REVISION_2_ID),
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        ],
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    outcome = env.run_revise(adapter=adapter, iteration=_ITERATION_2_ID)
+
+    assert outcome.plan_revision.revision_number == 2
+    assert outcome.task.state_token == _NEXT_TOKEN
+    # The latest change request is the routed input, verbatim.
+    (control,) = adapter.realized_controls(_PRODUCER_EXTERNAL_ID)
+    assert control.message == _REVIEW_RESULT_SERIALIZED
+
+
+def test_superseding_result_finalized_during_the_send_is_never_published() -> None:
+    """Issue #207: the finalize recheck rejects a result that arrived during the send.
+
+    Entry proves iteration #1 is the latest change request; while the ONE
+    REVISE send runs, iteration #2 is created and finalized on the same
+    plan; the finalize transaction re-reads the loop (locked) and its
+    ordered iterations, fails closed with the typed stale error, and
+    publishes no revision, pointer write, or event.
+    """
+    env = _Production()
+    _script_revise_entry(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iteration_row=_iteration_row(),
+        loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_finalize(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        prior_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        history=[],  # never consumed: the supersession recheck fails first
+        revision_row=_revision_row(
+            revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT
+        ),
+        pointer_row=_updated_task_row(pointer=_REVISION_2_ID),
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        ],
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_revise(adapter=adapter)
+
+    # Exactly one send attempt; no consequential write escaped the refusal.
+    assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
+    assert not any(_REVISION_INSERT(sql, None) for sql, _ in env.conn.executed)
+    assert not any(_POINTER_UPDATE(sql, None) for sql, _ in env.conn.executed)
+    assert not any(_EVENT_INSERT(sql, None) for sql, _ in env.conn.executed)
+    # The finalize recheck re-locked the loop row before reading iterations.
+    assert any(
+        "for update" in sql and "from openorc.review_loops where id" in sql
+        for sql, _ in env.conn.executed
+    )
 
 
 def test_revision_with_non_ready_producer_refuses() -> None:

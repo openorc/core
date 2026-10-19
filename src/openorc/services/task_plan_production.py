@@ -10,9 +10,11 @@ transport-independent application-service operations:
   the Task's current plan with its atomically coordinated
   ``PLAN_REVISION_CREATED`` audit event.
 - ``revise_task_plan`` receives the E3-directed exact current prior
-  PlanRevision and finalized planning ``CHANGES_REQUESTED`` ReviewIteration,
-  routes that persisted review result verbatim to the same Producer session,
-  and turns the new validated ``plan_result`` into the next immutable
+  PlanRevision and finalized planning ``CHANGES_REQUESTED`` ReviewIteration
+  that is still the latest-numbered iteration addressing that exact revision
+  in the still-OPEN planning ReviewLoop (the #207 supersession guard), routes
+  that persisted review result verbatim to the same Producer session, and
+  turns the new validated ``plan_result`` into the next immutable
   PlanRevision with its ``PLAN_REVISION_REVISED`` audit event.
 
 Scope discipline (Phase 2E): OpenOrc coordinates messages, validated JSON,
@@ -35,7 +37,9 @@ Phase composition (both operations):
    already-current PlanRevision; revision production additionally proves the
    named prior PlanRevision is the Task's exact current revision and loads
    the finalized ``CHANGES_REQUESTED`` planning ReviewIteration addressed to
-   it), and the durable Repository → installation route;
+   it — the loop still OPEN and the iteration still the latest-numbered one
+   for that exact revision, so a superseded result on the same plan is never
+   dispatched (#207)), and the durable Repository → installation route;
 2. authoritative repository-base audit observation — installation-
    authenticated GitHub repository and default-branch reads with NO database
    transaction open; an inaccessible or missing base observation fails
@@ -51,8 +55,11 @@ Phase composition (both operations):
    exact Task subject, the exact expected session bindings (still READY and
    identity-matched — session loss and explicit ends do not rotate the Task
    token), and, for revisions, that the prior revision is still exactly
-   current, so a late response after any required subject moved on publishes
-   nothing; then derive the next per-Task revision number from the
+   current and the routed change request is still the latest-numbered one
+   for that exact revision (the loop row re-read ``FOR UPDATE``, serializing
+   against concurrent iteration creation — #207), so a late response or a
+   result finalized during the send after any required subject moved on
+   publishes nothing; then derive the next per-Task revision number from the
    existing history, insert the immutable PlanRevision carrying the exact
    plan text and the branch-observed base SHA, install it conditionally
    through the token-rotating pointer mutation, and record the coordinated
@@ -73,6 +80,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NoReturn
 from uuid import UUID
@@ -96,7 +104,12 @@ from openorc.adapters.github import (
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.ownership import Workspace
-from openorc.domain.reviews import ReviewIteration, ReviewLoopPurpose, ReviewOutcome
+from openorc.domain.reviews import (
+    ReviewIteration,
+    ReviewLoopPurpose,
+    ReviewLoopStatus,
+    ReviewOutcome,
+)
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
@@ -539,6 +552,7 @@ def _commit_new_plan_revision(
     actor: event_coordination.WorkflowActorContext,
     event_type: WorkflowEventType,
     prior_revision: planning_records.PlanRevision | None,
+    expected_review_iteration: ReviewIteration | None,
     expected_producer_session: TaskAgentSession,
     expected_reviewer_session: TaskAgentSession | None,
 ) -> TaskPlanProductionOutcome:
@@ -549,9 +563,12 @@ def _commit_new_plan_revision(
     bindings still READY and identity-matched — session loss and explicit
     ends do not rotate the Task token, so the token alone cannot prove the
     prepared sessions are still usable — and, per continuation kind, either
-    still-no current revision or the exact prior revision still current)
-    protects against late responses becoming authoritative after any
-    required subject moved on; the per-Task revision-number UNIQUE
+    still-no current revision or the exact prior revision still current
+    together with the routed change request still the latest-numbered one
+    for that exact revision, the loop row re-read ``FOR UPDATE`` so
+    concurrent iteration creation serializes behind this composition —
+    issue #207) protects against late responses becoming authoritative
+    after any required subject moved on; the per-Task revision-number UNIQUE
     constraint and the same-Task pointer foreign key are the durable
     backstops behind the derived next number. A rejected pointer write or a
     competing committed revision rolls the insert, pointer, and event back
@@ -598,6 +615,17 @@ def _commit_new_plan_revision(
         else:
             require_current_plan_revision(
                 transaction_pool, task=task, plan_revision_id=prior_revision.id
+            )
+            if expected_review_iteration is None:
+                raise InvalidCommandError(
+                    "revision finalization requires the routed review iteration"
+                )
+            _require_unsuperseded_review_iteration(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_review_iteration=expected_review_iteration,
+                prior_revision=prior_revision,
             )
         revisions = planning_records.list_task_plan_revisions(transaction_pool, task_id=task_id)
         next_number = max((revision.revision_number for revision in revisions), default=0) + 1
@@ -751,6 +779,7 @@ def produce_initial_task_plan(
             actor=_producer_actor(producer),
             event_type=WorkflowEventType.PLAN_REVISION_CREATED,
             prior_revision=None,
+            expected_review_iteration=None,
             expected_producer_session=producer,
             expected_reviewer_session=reviewer,
         )
@@ -774,7 +803,11 @@ def revise_task_plan(
     planning ``CHANGES_REQUESTED`` ReviewIteration: the iteration must
     belong to this Task's planning-purpose ReviewLoop and address exactly
     the current prior revision, and its persisted protocol-validated
-    summary/findings are the revision input verbatim. The routed REVISE
+    summary/findings are the revision input verbatim. The iteration must
+    additionally still be the latest-numbered one addressing that exact
+    revision in the still-OPEN planning loop — a newer result supersedes
+    the older one, at entry and again in the finalize transaction (issue
+    #207). The routed REVISE
     interaction continues the SAME prepared Producer session using the
     latest post-production Task token — it never demands a fresh bootstrap
     outcome and never reruns E1b startup/PREPARE/context switching (the
@@ -859,9 +892,38 @@ def revise_task_plan(
             actor=_producer_actor(producer),
             event_type=WorkflowEventType.PLAN_REVISION_REVISED,
             prior_revision=prior_revision,
+            expected_review_iteration=iteration,
             expected_producer_session=producer,
             expected_reviewer_session=None,
         )
+
+
+def _require_latest_routed_iteration(
+    iterations: Sequence[ReviewIteration],
+    *,
+    prior_revision: planning_records.PlanRevision,
+    iteration: ReviewIteration,
+) -> None:
+    """Require the routed iteration to be the latest one on the exact revision.
+
+    Supersession (issue #207) is decided by the loop's ordered, unique
+    per-loop numbering: only the latest-numbered iteration bound to the
+    exact prior PlanRevision may dispatch a Producer revision. A newer
+    ACCEPTED result, a newer change request, or a newer unresolved attempt
+    on the same plan supersedes an older finalized change request even
+    though both records are individually valid and the caller's Task token
+    is current; the superseded result fails closed with the typed stale
+    error and can never reach the Producer or publish a PlanRevision.
+    """
+    for later in iterations:
+        if (
+            later.iteration_number > iteration.iteration_number
+            and later.plan_revision_id == prior_revision.id
+        ):
+            raise StaleOperationError(
+                "the review iteration has been superseded on the current plan "
+                "revision by a newer review iteration; the continuation is stale"
+            )
 
 
 def _require_routed_review_iteration(
@@ -875,11 +937,17 @@ def _require_routed_review_iteration(
     """Resolve the finalized planning change request addressed to the prior revision.
 
     The caller names the iteration; the persisted record decides its
-    meaning. It must belong to this Task's planning-purpose ReviewLoop, be
-    finalized ``CHANGES_REQUESTED`` (the complete result-fact set), and
-    address exactly the Task's current prior revision — an ACCEPTED,
-    unfinalized, non-planning, or superseded-subject iteration is never
-    routed, and the findings are never taken from caller input.
+    meaning. It must belong to this Task's still-OPEN planning-purpose
+    ReviewLoop, be finalized ``CHANGES_REQUESTED`` (the complete result-fact
+    set), and address exactly the Task's current prior revision — an
+    ACCEPTED, unfinalized, non-planning, closed-loop, or superseded-subject
+    iteration is never routed. It must additionally be the latest-numbered
+    iteration addressing that exact revision in its loop (issue #207): a
+    newer ACCEPTED result, a newer change request, or a newer unresolved
+    attempt on the same plan supersedes an older finalized change request,
+    and the superseded result is never dispatched to the Producer even when
+    both results are individually valid and the caller's Task token is
+    current. The findings are never taken from caller input.
     """
     iteration = review_records.get_review_iteration(
         transaction_pool, review_iteration_id=review_iteration_id
@@ -893,6 +961,11 @@ def _require_routed_review_iteration(
         raise ConflictError(
             "the review iteration is not a planning review; revision production "
             "routes planning change requests only"
+        )
+    if loop.status is not ReviewLoopStatus.OPEN:
+        raise ConflictError(
+            "the planning review loop is no longer open; revision production "
+            "routes change requests from the open planning loop only"
         )
     if (
         iteration.outcome is not ReviewOutcome.CHANGES_REQUESTED
@@ -909,4 +982,52 @@ def _require_routed_review_iteration(
             "the review iteration addresses a different plan revision than the "
             "task's current revision; the continuation is stale"
         )
+    _require_latest_routed_iteration(
+        review_records.list_review_loop_iterations(transaction_pool, review_loop_id=loop.id),
+        prior_revision=prior_revision,
+        iteration=iteration,
+    )
     return iteration
+
+
+def _require_unsuperseded_review_iteration(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_review_iteration: ReviewIteration,
+    prior_revision: planning_records.PlanRevision,
+) -> None:
+    """Revalidate the routed change request inside the finalize transaction.
+
+    The same condition proven at entry is rechecked after the external send
+    (issue #207): the loop row is re-read ``FOR UPDATE`` — the lock
+    ``create_review_iteration`` takes, so concurrent iteration creation
+    serializes behind this composition instead of committing between the
+    recheck and the revision publication — and the loop's ordered iterations
+    must still name the routed change request the latest-numbered one for
+    the exactly-current prior PlanRevision. A result finalized during the
+    send fails closed with the typed stale error and publishes nothing.
+    """
+    loop = review_records.get_review_loop(
+        transaction_pool,
+        review_loop_id=expected_review_iteration.review_loop_id,
+        for_update=True,
+    )
+    if loop is None or loop.workspace_id != workspace_id or loop.task_id != task_id:
+        raise NotFoundError("the requested review loop is not available for this task")
+    if loop.purpose is not ReviewLoopPurpose.PLANNING:
+        raise ConflictError(
+            "the review iteration is not a planning review; revision production "
+            "routes planning change requests only"
+        )
+    if loop.status is not ReviewLoopStatus.OPEN:
+        raise ConflictError(
+            "the planning review loop is no longer open; revision production "
+            "routes change requests from the open planning loop only"
+        )
+    _require_latest_routed_iteration(
+        review_records.list_review_loop_iterations(transaction_pool, review_loop_id=loop.id),
+        prior_revision=prior_revision,
+        iteration=expected_review_iteration,
+    )

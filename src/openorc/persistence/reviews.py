@@ -160,11 +160,22 @@ def create_review_loop(
     return _review_loop_from_row(row)
 
 
-def get_review_loop(pool: DatabasePool, *, review_loop_id: UUID) -> ReviewLoop | None:
-    """Return one review loop by id, or ``None`` when it does not exist."""
+def get_review_loop(
+    pool: DatabasePool, *, review_loop_id: UUID, for_update: bool = False
+) -> ReviewLoop | None:
+    """Return one review loop by id, or ``None`` when it does not exist.
+
+    ``for_update`` reads the row ``SELECT ... FOR UPDATE`` inside the
+    caller's transaction — the same row lock ``create_review_iteration``
+    takes — so a transaction that must recheck the loop's latest iterations
+    against concurrent iteration creation (revision production's post-send
+    finalize recheck, issue #207) serializes on the loop row instead of
+    racing it.
+    """
+    lock = " for update" if for_update else ""
     with transaction(pool) as conn:
         row = conn.execute(
-            f"select {_REVIEW_LOOP_COLUMNS} from openorc.review_loops where id = %s",
+            f"select {_REVIEW_LOOP_COLUMNS} from openorc.review_loops where id = %s{lock}",
             (review_loop_id,),
         ).fetchone()
     return None if row is None else _review_loop_from_row(row)
