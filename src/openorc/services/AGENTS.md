@@ -249,4 +249,53 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   supplied neutral non-repository directory; there is no checkout registry,
   no new session fields, and no agent-reported path is ever authority.
 
+## E3a: exact-plan REVIEW dispatch (issue #209)
+
+- `task_planning_review_dispatch.dispatch_planning_review` is the ONE
+  runtime-facing, exact-plan REVIEW attempt seam: it consumes the exact
+  successful E2 handoff (`TaskPlanProductionOutcome` — the persisted current
+  PlanRevision and the post-update Task token), and returns the reserved
+  exact-subject attempt plus the validated typed `ReviewResult` as an
+  internal continuation input for E3b's decision finalization. It never
+  finalizes a verdict, records an iteration result, rotates the Task token,
+  or decides budget/exhaustion; REVIEW_RESOLUTION and durable
+  dispatch/replay are later-layer work (#85/#87–#90).
+- Entry composition (one short `composed_transaction`): account barrier →
+  exact Owner Workspace/Task scope → the Task row locked `FOR UPDATE`
+  (serializing concurrent dispatches for the same Task through existing
+  persistence — no new lock, index, or queue machinery) → the #54 exact
+  current `planning` Task under the E2 token → the supplied revision proven
+  exactly current and content-identical to its persisted row (a stale or
+  foreign plan refuses dispatch) → the exact admitted READY Reviewer
+  binding resolved by `(Task, role)` (never rebound, recreated, or
+  reinitialized) → the durable Repository/issue identity.
+- Loop/iteration discipline: on first review exactly one OPEN
+  `ReviewLoopPurpose.PLANNING` loop is established snapshotting the
+  Workspace's current positive `review_iteration_limit`; subsequent plans
+  and Owner-mediated continuation reuse the same loop (the stored budget
+  survives Workspace setting edits). More than one planning loop, or a
+  closed planning loop while the Task is still planning, fails closed. With
+  the loop row locked `FOR UPDATE`, any unfinalized iteration in the loop
+  (an unresolved earlier attempt) refuses another ordinary REVIEW, and the
+  next-numbered unfinalized ReviewIteration is then reserved atomically for
+  the exact current PlanRevision before any external send (unique per-loop
+  numbering and the loop-OPEN creation guard are the durable backstops; a
+  competing reservation is a stale operation). No PR-head fields.
+- The ONE REVIEW send: a deterministic inline-composed model-visible
+  message carrying exactly the persisted PlanRevision content verbatim plus
+  the durable repository/issue identity — agreeing exactly with the
+  `ReviewInteraction(subject=PlanReviewSubject(...))` sent to the exact
+  Reviewer session through the #67
+  `realize_control(..., expected_family=REVIEW_RESULT_FAMILY)` funnel, with
+  NO database transaction open. No separate REVIEW Markdown, no semantic
+  rubric, no protocol instruction prose, no Cline-specific path, no new
+  prompt template or control asset.
+- Known failure and uncertain runtime outcome are distinct typed errors;
+  an uncertain send leaves the reserved attempt unresolved — no verdict is
+  inferred, no replacement attempt is created, nothing is blindly resent,
+  and only a schema-valid exact-subject typed `ReviewResult` is ever
+  returned to E3b, which repeats the exact Task/token/current-plan/session
+  checks when it records the result and its workflow consequence in one
+  transaction.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
