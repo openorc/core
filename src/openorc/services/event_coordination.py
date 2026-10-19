@@ -53,6 +53,7 @@ from uuid import UUID
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGateStatus
+from openorc.domain.reviews import ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import events as event_records
 from openorc.persistence.pool import DatabasePool
@@ -62,11 +63,14 @@ __all__ = [
     "WorkflowActorContext",
     "owner_actor",
     "record_guidance_changed_event",
+    "record_owner_gate_created_event",
     "record_owner_gate_resolved_event",
+    "record_plan_reviewed_event",
     "record_plan_revision_created_event",
     "record_plan_revision_revised_event",
     "record_planning_started_event",
     "record_review_iteration_limit_changed_event",
+    "record_review_limit_reached_event",
     "record_role_binding_configuration_changed_event",
     "record_task_terminal_event",
 ]
@@ -76,6 +80,8 @@ __all__ = [
 _SUBJECT_TYPE_WORKSPACE = "workspace"
 _SUBJECT_TYPE_OWNER_GATE = "owner_gate"
 _SUBJECT_TYPE_PLAN_REVISION = "plan_revision"
+_SUBJECT_TYPE_REVIEW_ITERATION = "review_iteration"
+_SUBJECT_TYPE_REVIEW_LOOP = "review_loop"
 
 _TERMINAL_TASK_EVENT: dict[TaskStatus, WorkflowEventType] = {
     TaskStatus.CANCELLED: WorkflowEventType.TASK_CANCELLED,
@@ -400,6 +406,107 @@ def _record_plan_revision_event(
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_PLAN_REVISION,
         subject_id=plan_revision_id,
+    )
+
+
+def record_plan_reviewed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    review_iteration_id: UUID,
+    actor: WorkflowActorContext,
+    outcome: ReviewOutcome,
+) -> None:
+    """Record one finalized review decision on its iteration (issue #210).
+
+    Task-scoped; the primary modeled subject is the finalized
+    ReviewIteration — the canonical home of the recorded result — over the
+    Task scope. Context carries the single safe semantic ``outcome`` value
+    (accepted/changes_requested), mirroring the resolved-gate event: the
+    summary, the findings document, and every other canonical iteration
+    fact are never copied into the event. The actor is supplied by the
+    calling capability — the exact REVIEWER session records the Reviewer's
+    decision.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(review_iteration_id, "review_iteration_id")
+    if not isinstance(outcome, ReviewOutcome):
+        raise InvalidCommandError("reviewed events require a ReviewOutcome")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.PLAN_REVIEWED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_REVIEW_ITERATION,
+        subject_id=review_iteration_id,
+        context={"outcome": outcome.value},
+    )
+
+
+def record_owner_gate_created_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one pending OwnerGate decision record (issue #210).
+
+    Task-scoped; the primary modeled subject is the new pending gate over
+    the Task scope. No context is recorded: the gate's type, exact subject,
+    and status are canonical on the gate row and are never shadowed into
+    the event.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(owner_gate_id, "owner_gate_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.OWNER_GATE_CREATED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_OWNER_GATE,
+        subject_id=owner_gate_id,
+    )
+
+
+def record_review_limit_reached_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    review_loop_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record the FIRST exhaustion of a review loop's autonomous budget.
+
+    Task-scoped; the primary modeled subject is the ReviewLoop whose
+    snapshotted budget was crossed. No context is recorded: the
+    snapshotted ``iteration_limit`` is canonical on the loop row and is
+    never shadowed into the event. The calling capability emits this event
+    exactly once per loop — on the first exhaustion only; later
+    Owner-mediated disagreements create fresh REVIEW_RESOLUTION gates
+    without re-representing the already-exhausted budget as newly reached.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(review_loop_id, "review_loop_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.REVIEW_LIMIT_REACHED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_REVIEW_LOOP,
+        subject_id=review_loop_id,
     )
 
 

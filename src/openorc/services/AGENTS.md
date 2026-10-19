@@ -298,4 +298,48 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   checks when it records the result and its workflow consequence in one
   transaction.
 
+## E3b: bounded planning review decisions (issue #210)
+
+- `task_planning_review_decision.finalize_planning_review_decision` is the
+  ONE planning-loop decision seam: it consumes E3a's internal continuation
+  input (`TaskPlanningReviewDispatchOutcome`) and, in one short
+  `composed_transaction`, rechecks the exact authorized current non-archived
+  `planning` Task under the caller's expected token, the exact current
+  PlanRevision, the re-locked OPEN planning loop, the still-unfinalized
+  reserved attempt, and the exact READY Reviewer binding — then records the
+  result once (one-shot conditional write; a duplicate or raced delivery is
+  a stale operation, never a second result/event/gate), records the safe
+  REVIEWER `PLAN_REVIEWED` event, and commits the durable next decision.
+  It never assesses plan semantics and never settles gates (E3c).
+- Decision facts are derived from durable state, never caller input and
+  never new persistent counters: the budget state comes from
+  `openorc.domain.reviews.count_changes_requested` /
+  `autonomous_budget_exhausted` over the loop's snapshotted
+  `iteration_limit` (the number of autonomous Producer revisions, not a cap
+  on ReviewIterations; the Workspace setting is never consulted for an
+  existing loop), and Owner-mediated stickiness comes from durable
+  REVIEW_RESOLUTION gate history (`list_task_owner_gates`).
+- ACCEPTED closes the loop and yields the accepted PlanRevision/iteration
+  evidence for E5 without creating IMPLEMENTATION_AUTHORIZATION or
+  mutating the Task. An in-budget CHANGES_REQUESTED keeps the Task
+  PLANNING and the loop OPEN and routes the exact finalized findings to
+  merged E2 `revise_task_plan` OUTSIDE any transaction — only E2's newly
+  persisted revision and rotated token may launch E3a's next ordinary
+  REVIEW, and an uncertain E2 operation is never resent here. Exhaustion
+  creates and installs the exact-plan pending REVIEW_RESOLUTION gate and
+  moves the Task to `waiting_for_owner` in the same transaction.
+- `REVIEW_LIMIT_REACHED` is recorded on the FIRST exhaustion only — the
+  exhaustion that occurs with no prior REVIEW_RESOLUTION gate in durable
+  history. Later Owner-mediated disagreements create fresh gates with
+  `PLAN_REVIEWED`/`OWNER_GATE_CREATED` without re-representing the
+  already-exhausted budget. Exhausted findings are never forwarded into
+  gates or events. The amended E3a admission guard
+  (`_require_no_iteration_for_current_revision`) refuses another ordinary
+  REVIEW of a revision the loop already reviewed; E3c's formal
+  Owner-mediated evaluations are a separate later seam and are exempt.
+- Event mappings follow the resolved-gate precedent: `PLAN_REVIEWED`
+  subjects the finalized ReviewIteration with an `outcome`-value context;
+  `OWNER_GATE_CREATED` subjects the new gate; `REVIEW_LIMIT_REACHED`
+  subjects the ReviewLoop. No event shadows canonical records.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

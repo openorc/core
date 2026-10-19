@@ -42,7 +42,13 @@ Phase composition (one operation):
      Workspace setting edits. No additional loop table or index;
    - with the loop row locked ``FOR UPDATE``, refuse another ordinary REVIEW
      while an earlier attempt in the loop is still unresolved (an
-     unfinalized iteration is never bypassed, superseded, or rewritten);
+     unfinalized iteration is never bypassed, superseded, or rewritten),
+     and refuse another ordinary REVIEW of a plan revision the loop has
+     already reviewed at all (issue #210): only E2's newly persisted next
+     revision and rotated token may launch the next ordinary REVIEW, so a
+     replayed still-current production outcome can never re-review the
+     same plan while revision production is pending — E3c's formal
+     Owner-mediated evaluations are a separate later seam and are exempt;
    - then atomically reserve exactly one next-numbered unfinalized
      ReviewIteration for the exact current PlanRevision — the unique
      per-loop numbering and the loop-OPEN guard are the durable backstops,
@@ -323,6 +329,32 @@ def _require_no_unresolved_attempt(iterations: Sequence[ReviewIteration]) -> Non
             )
 
 
+def _require_no_iteration_for_current_revision(
+    iterations: Sequence[ReviewIteration], revision: PlanRevision
+) -> None:
+    """Refuse another ordinary REVIEW of a revision the loop already reviewed.
+
+    The exact current PlanRevision may be dispatched for ordinary REVIEW
+    only while no iteration in the loop binds it yet (issue #210): after a
+    finalization, only E2's newly persisted next revision and rotated
+    token may launch the next ordinary REVIEW. A replayed production
+    outcome whose token is still current can therefore never reserve a
+    second REVIEW of the same plan while revision production is pending —
+    which also protects an in-flight E2 operation from being superseded by
+    a newer same-plan iteration under the #207 latest-same-plan guard.
+    E3c's formal Owner-mediated evaluations are a separate later operation
+    and may append iterations against an unchanged subject through their
+    own seam; this guard constrains the ordinary REVIEW seam only.
+    """
+    for iteration in iterations:
+        if iteration.plan_revision_id == revision.id:
+            raise ConflictError(
+                "the current plan revision already has a review iteration in "
+                "this planning loop; only its next persisted revision may "
+                "launch another ordinary REVIEW"
+            )
+
+
 def _reserve_iteration(
     pool: DatabasePool,
     *,
@@ -537,6 +569,7 @@ def dispatch_planning_review(
                 transaction_pool, review_loop_id=loop.id
             )
             _require_no_unresolved_attempt(iterations)
+            _require_no_iteration_for_current_revision(iterations, persisted_revision)
             reserved = _reserve_iteration(
                 transaction_pool,
                 workspace_id=workspace_id,
