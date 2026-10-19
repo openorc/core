@@ -1364,6 +1364,59 @@ def test_a_continuation_without_the_dispatch_outcome_cannot_record_a_verdict() -
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
 
 
+class _PartialGitHubClient:
+    """An object carrying only one of the two consumed adapter capabilities."""
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> None:
+        return None
+
+
+def test_an_invalid_github_dependency_refuses_before_any_effect() -> None:
+    """A non-adapter GitHub dependency is an invalid command before any
+    transaction or durable effect — it can never strand an already-finalized
+    review by failing inside E2's revision production. The structurally valid
+    fake the suites use is accepted (every other test proves it)."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    adapter = _prepared_adapter(fake_pool, producer_outcomes=[], reviewer_outcomes=[])
+
+    with pytest.raises(InvalidCommandError):
+        finalize_planning_review_decision(
+            pool,
+            adapter,
+            cast(GitHubAppClient, object()),  # type: ignore[arg-type]
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=_dispatch_outcome(
+                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+            ),
+        )
+    with pytest.raises(InvalidCommandError):
+        finalize_planning_review_decision(
+            pool,
+            adapter,
+            cast(GitHubAppClient, _PartialGitHubClient()),  # type: ignore[arg-type]
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=_dispatch_outcome(
+                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+            ),
+        )
+
+    assert conn.executed == []
+    assert _count(conn, _RESULT_UPDATE) == 0
+    assert _count(conn, _EVENT_INSERT) == 0
+    assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
+    assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
+
+
 def test_owner_mediated_history_immediately_reopens_resolution() -> None:
     """Durable REVIEW_RESOLUTION gate history makes Owner mediation sticky:
     the very next change request — well within the untouched snapshot budget

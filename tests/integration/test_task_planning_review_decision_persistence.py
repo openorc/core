@@ -71,6 +71,30 @@ class _SingleConnectionPool:
         raise AssertionError("the test fixture owns the connection lifetime")
 
 
+class _UnusedGitHubClient:
+    """A structurally valid GitHubAppClient stub.
+
+    The exhaustion threshold never routes revision production, so neither
+    capability is ever called; the stub exists so the decision entry accepts
+    a real adapter dependency, never an arbitrary object.
+    """
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> None:
+        raise AssertionError("the exhaustion threshold never routes revision production")
+
+    def get_repository_branch(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        branch_name: str,
+    ) -> None:
+        raise AssertionError("the exhaustion threshold never routes revision production")
+
+
 def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     profile_id = uuid.uuid4()
     conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
@@ -268,7 +292,7 @@ def _exhausting_decision(pool: DatabasePool, facts: dict[str, Any]) -> Any:
     return finalize_planning_review_decision(
         pool,
         cast(AgentRuntimeAdapter, FakeAgentRuntimeAdapter()),
-        cast(GitHubAppClient, object()),
+        cast(GitHubAppClient, _UnusedGitHubClient()),
         profile_id=facts["profile_id"],
         workspace_id=facts["workspace_id"],
         task_id=facts["task_id"],

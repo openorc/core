@@ -67,6 +67,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
@@ -208,6 +209,31 @@ def _require_runtime(value: object) -> AgentRuntimeAdapter:
     if not isinstance(value, AgentRuntimeAdapter):
         raise InvalidCommandError("runtime must be an AgentRuntimeAdapter")
     return value
+
+
+# The GitHub adapter capabilities the routing path of this seam actually
+# consumes: the authoritative repository observation and the repository
+# base-branch observation E2's revision production audits against.
+_GITHUB_ROUTE_CAPABILITIES = ("get_installation_repository", "get_repository_branch")
+
+
+def _require_github(value: object) -> GitHubAppClient:
+    """Classify a malformed GitHub adapter dependency as an invalid command.
+
+    ``GitHubAppClient`` is a deliberately structural Protocol seam — services
+    never import the concrete HTTP client, and supported fakes implement only
+    the capabilities their seam consumes — so the entry boundary verifies the
+    adapter capabilities this seam's routing path actually consumes rather
+    than demanding full-protocol conformance from every fake. The check runs
+    before any transaction or durable effect: an invalid dependency can never
+    strand an already-finalized review, because E2's revision production would
+    otherwise fail with an unclassified error after the result became
+    immutable (issue #210).
+    """
+    for capability in _GITHUB_ROUTE_CAPABILITIES:
+        if not callable(getattr(value, capability, None)):
+            raise InvalidCommandError("github must be a GitHubAppClient")
+    return cast(GitHubAppClient, value)
 
 
 def _require_dispatch_outcome(value: object) -> TaskPlanningReviewDispatchOutcome:
@@ -686,6 +712,7 @@ def finalize_planning_review_decision(
         _require_uuid_command(task_id, "task_id")
         _require_uuid_command(expected_state_token, "expected_state_token")
         runtime_adapter = _require_runtime(runtime)
+        github_client = _require_github(github)
         attempt = _require_dispatch_outcome(dispatch)
         annotate_span(
             span,
@@ -709,7 +736,7 @@ def finalize_planning_review_decision(
             production = revise_task_plan(
                 pool,
                 runtime_adapter,
-                github,
+                github_client,
                 workspace_id=workspace_id,
                 task_id=task_id,
                 profile_id=profile_id,
