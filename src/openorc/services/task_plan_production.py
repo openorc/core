@@ -48,9 +48,11 @@ Phase composition (both operations):
    ``realize_control(..., expected_family=PLAN_RESULT_FAMILY)`` funnel, with
    NO database transaction open;
 4. atomic finalize — one short ``composed_transaction``: lock/recheck the
-   exact Task subject (and, for revisions, that the prior revision is still
-   exactly current) so a late response after external currentness moved
-   publishes nothing, derive the next per-Task revision number from the
+   exact Task subject, the exact expected session bindings (still READY and
+   identity-matched — session loss and explicit ends do not rotate the Task
+   token), and, for revisions, that the prior revision is still exactly
+   current, so a late response after any required subject moved on publishes
+   nothing; then derive the next per-Task revision number from the
    existing history, insert the immutable PlanRevision carrying the exact
    plan text and the branch-observed base SHA, install it conditionally
    through the token-rotating pointer mutation, and record the coordinated
@@ -537,17 +539,23 @@ def _commit_new_plan_revision(
     actor: event_coordination.WorkflowActorContext,
     event_type: WorkflowEventType,
     prior_revision: planning_records.PlanRevision | None,
+    expected_producer_session: TaskAgentSession,
+    expected_reviewer_session: TaskAgentSession | None,
 ) -> TaskPlanProductionOutcome:
     """Insert the immutable revision, install the pointer, and record the event.
 
-    One short composed transaction: the post-send currentness recheck (the
-    exact Task token, coarse planning state, and — per continuation kind —
-    either still-no current revision or the exact prior revision still
-    current) protects against late responses becoming authoritative; the
-    per-Task revision-number UNIQUE constraint and the same-Task pointer
-    foreign key are the durable backstops behind the derived next number.
-    A rejected pointer write or a competing committed revision rolls the
-    insert, pointer, and event back together — never two success outcomes.
+    One short composed transaction: the post-send exact-subject recheck (the
+    exact Task token and coarse planning state, the exact expected session
+    bindings still READY and identity-matched — session loss and explicit
+    ends do not rotate the Task token, so the token alone cannot prove the
+    prepared sessions are still usable — and, per continuation kind, either
+    still-no current revision or the exact prior revision still current)
+    protects against late responses becoming authoritative after any
+    required subject moved on; the per-Task revision-number UNIQUE
+    constraint and the same-Task pointer foreign key are the durable
+    backstops behind the derived next number. A rejected pointer write or a
+    competing committed revision rolls the insert, pointer, and event back
+    together — never two success outcomes.
     """
     with composed_transaction(pool) as transaction_pool:
         task = require_current_task(
@@ -559,6 +567,27 @@ def _commit_new_plan_revision(
         if task.status is not TaskStatus.PLANNING:
             raise StaleOperationError(
                 "the task is no longer in its coarse planning state; the continuation is stale"
+            )
+        # The exact prepared Producer binding must still be READY and
+        # identity-matched: session loss and explicit ends do not rotate the
+        # Task token, so the token alone cannot prove the session usable. The
+        # identity match proves the durable binding equals the expected
+        # (entry) binding, so the caller-derived actor identity is the same
+        # safe bound Producer logical identity at write time.
+        _require_prepared_binding(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=WorkflowRole.PRODUCER,
+            expected=expected_producer_session,
+        )
+        if expected_reviewer_session is not None:
+            _require_prepared_binding(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                role=WorkflowRole.REVIEWER,
+                expected=expected_reviewer_session,
             )
         if prior_revision is None:
             if task.current_plan_revision_id is not None:
@@ -683,7 +712,7 @@ def produce_initial_task_plan(
                 role=WorkflowRole.PRODUCER,
                 expected=preparation.producer_session,
             )
-            _require_prepared_binding(
+            reviewer = _require_prepared_binding(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
@@ -711,7 +740,7 @@ def produce_initial_task_plan(
             repository_observation=repository_observation,
         )
 
-        # --- Phase 4: atomic finalize. ---
+        # --- Phase 4: atomic finalize (both prepared sessions rechecked). ---
         return _commit_new_plan_revision(
             pool,
             workspace_id=workspace_id,
@@ -722,6 +751,8 @@ def produce_initial_task_plan(
             actor=_producer_actor(producer),
             event_type=WorkflowEventType.PLAN_REVISION_CREATED,
             prior_revision=None,
+            expected_producer_session=producer,
+            expected_reviewer_session=reviewer,
         )
 
 
@@ -817,7 +848,7 @@ def revise_task_plan(
             repository_observation=repository_observation,
         )
 
-        # --- Phase 4: atomic finalize (the prior revision must still be current). ---
+        # --- Phase 4: atomic finalize (the exact Producer session rechecked). ---
         return _commit_new_plan_revision(
             pool,
             workspace_id=workspace_id,
@@ -828,6 +859,8 @@ def revise_task_plan(
             actor=_producer_actor(producer),
             event_type=WorkflowEventType.PLAN_REVISION_REVISED,
             prior_revision=prior_revision,
+            expected_producer_session=producer,
+            expected_reviewer_session=None,
         )
 
 

@@ -598,9 +598,23 @@ def _script_initial_finalize(
     history: list[tuple[Any, ...]],
     revision_row: tuple[Any, ...],
     pointer_row: tuple[Any, ...],
+    producer_row: tuple[Any, ...] | None = None,
+    reviewer_row: tuple[Any, ...] | None = None,
 ) -> None:
-    """The finalize transaction's canned sequence, in call order."""
+    """The finalize transaction's canned sequence, in call order.
+
+    The composition rechecks the exact Task subject and BOTH prepared
+    session bindings before any write (session loss does not rotate the
+    Task token, so the token alone cannot prove the sessions usable)."""
     conn.on(_TASK_READ, task_row)
+    conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        producer_row if producer_row is not None else _production_ready_row(),
+    )
+    conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "reviewer"),
+        reviewer_row if reviewer_row is not None else _review_ready_row(),
+    )
     conn.on(_sql_has("from openorc.plan_revisions where task_id"), history)
     conn.on(_REVISION_INSERT, revision_row)
     conn.on(_POINTER_UPDATE, pointer_row)
@@ -635,9 +649,17 @@ def _script_revise_finalize(
     history: list[tuple[Any, ...]],
     revision_row: tuple[Any, ...],
     pointer_row: tuple[Any, ...],
+    producer_row: tuple[Any, ...] | None = None,
 ) -> None:
-    """The revision finalize transaction's canned sequence, in call order."""
+    """The revision finalize transaction's canned sequence, in call order.
+
+    The composition rechecks the exact Task subject and the exact prepared
+    Producer binding before any write."""
     conn.on(_TASK_READ, task_row)
+    conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        producer_row if producer_row is not None else _production_ready_row(),
+    )
     conn.on(_sql_has("from openorc.plan_revisions where id"), prior_row)
     conn.on(_sql_has("from openorc.plan_revisions where task_id"), history)
     conn.on(_REVISION_INSERT, revision_row)
@@ -1367,6 +1389,14 @@ def test_superseded_current_plan_after_reply_is_never_published() -> None:
         reviewer_row=_review_ready_row(),
     )
     env.conn.on(_TASK_READ, _task_row(current_plan_revision_id=_REVISION_1_ID))
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "reviewer"),
+        _review_ready_row(),
+    )
     adapter = _prepared_producer_adapter([_plan_candidate()])
 
     with pytest.raises(StaleOperationError):
@@ -1389,6 +1419,10 @@ def test_revision_superseded_after_reply_is_never_published() -> None:
     # Post-send: the prior revision is no longer the current pointer.
     env.conn.on(_TASK_READ, _task_row(current_plan_revision_id=_REVISION_2_ID))
     env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    env.conn.on(
         _sql_has("from openorc.plan_revisions where id"),
         _revision_row(revision_id=_REVISION_1_ID, number=1),
     )
@@ -1410,6 +1444,14 @@ def test_competing_finalization_proves_exactly_one_outcome() -> None:
         reviewer_row=_review_ready_row(),
     )
     env.conn.on(_TASK_READ, _task_row())
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "reviewer"),
+        _review_ready_row(),
+    )
     env.conn.on(_sql_has("from openorc.plan_revisions where task_id"), [])
     env.conn.on(
         _REVISION_INSERT,
@@ -1436,6 +1478,14 @@ def test_rejected_pointer_write_classifies_stale_and_writes_no_event() -> None:
         reviewer_row=_review_ready_row(),
     )
     env.conn.on(_TASK_READ, _task_row())
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "reviewer"),
+        _review_ready_row(),
+    )
     env.conn.on(_sql_has("from openorc.plan_revisions where task_id"), [])
     env.conn.on(_REVISION_INSERT, _revision_row(revision_id=_REVISION_1_ID, number=1))
     env.conn.on(_POINTER_UPDATE, None)
@@ -1447,6 +1497,111 @@ def test_rejected_pointer_write_classifies_stale_and_writes_no_event() -> None:
         env.run_initial(adapter=adapter)
 
     assert not any(_EVENT_INSERT(sql, None) for sql, _ in env.conn.executed)
+
+
+def test_producer_session_lost_after_reply_never_publishes() -> None:
+    """A READY→LOST session does not rotate the Task token: the finalize
+    composition must catch the unusable session by rechecking the exact
+    binding, never by trusting the unchanged token."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_initial_finalize(
+        env.conn,
+        task_row=_task_row(),
+        history=[],
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        pointer_row=_updated_task_row(pointer=_REVISION_1_ID),
+        producer_row=_session_row(
+            "producer",
+            session_id=_PRODUCER_SESSION_ID,
+            external_id=_PRODUCER_EXTERNAL_ID,
+            lifecycle="lost",
+        ),
+    )
+    adapter = _prepared_producer_adapter([_plan_candidate()])
+
+    with pytest.raises(ConflictError):
+        env.run_initial(adapter=adapter)
+
+    # The send happened, the reply arrived, and the lost session prevented
+    # any revision, pointer installation, or success event.
+    assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
+    _assert_no_consequential_write(env.conn)
+
+
+def test_reviewer_session_lost_after_reply_never_publishes() -> None:
+    """Initial production rechecks BOTH prepared sessions after the send:
+    a Reviewer session lost during the external phases blocks publication
+    even though the Producer's answer arrived."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_initial_finalize(
+        env.conn,
+        task_row=_task_row(),
+        history=[],
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        pointer_row=_updated_task_row(pointer=_REVISION_1_ID),
+        reviewer_row=_session_row(
+            "reviewer",
+            session_id=_REVIEWER_SESSION_ID,
+            external_id=_REVIEWER_EXTERNAL_ID,
+            lifecycle="lost",
+        ),
+    )
+    adapter = _prepared_producer_adapter([_plan_candidate()])
+
+    with pytest.raises(ConflictError):
+        env.run_initial(adapter=adapter)
+
+    assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revision_with_producer_session_lost_after_reply_never_publishes() -> None:
+    """The revision continuation rechecks the exact Producer binding after
+    the send: session loss blocks the consequential write and its event."""
+    env = _Production()
+    _script_revise_entry(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iteration_row=_iteration_row(),
+        loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_finalize(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        prior_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        history=[_revision_row(revision_id=_REVISION_1_ID, number=1)],
+        revision_row=_revision_row(
+            revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT
+        ),
+        pointer_row=_updated_task_row(pointer=_REVISION_2_ID),
+        producer_row=_session_row(
+            "producer",
+            session_id=_PRODUCER_SESSION_ID,
+            external_id=_PRODUCER_EXTERNAL_ID,
+            lifecycle="ended",
+        ),
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(ConflictError):
+        env.run_revise(adapter=adapter)
+
+    assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
+    _assert_no_consequential_write(env.conn)
 
 
 def test_statement_order_proves_no_transaction_around_external_calls() -> None:
