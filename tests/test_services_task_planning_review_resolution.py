@@ -1221,3 +1221,127 @@ def test_an_invalid_dependency_refuses_before_any_effect() -> None:
     assert _count(conn, _EVENT_INSERT) == 0
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
+
+
+def test_the_discussion_audit_flag_records_both_message_facts_in_the_settlement() -> None:
+    """With E4's coordination flag, the settlement transaction also commits the
+    two direction-only Owner ↔ Reviewer discussion message events bound to the
+    settled gate, after the settled-gate resolution event."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_settlement(conn, accepted=False)
+    adapter = _prepared_adapter(
+        fake_pool,
+        producer_outcomes=[plan_result_candidate(_REVISED_PLAN_TEXT)],
+        reviewer_outcomes=[],
+    )
+    github = FakeGitHubClient(fake_pool)
+
+    outcome = settle_planning_review_resolution(
+        pool,
+        adapter,
+        cast(GitHubAppClient, github),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        review_result=_changes_requested_result(),
+        record_discussion_message_events=True,
+    )
+
+    assert outcome.decision is PlanningReviewResolutionDecision.CONTINUATION_ROUTED
+    assert _event_types(conn) == [
+        "plan_reviewed",
+        "owner_gate_resolved",
+        "owner_reviewer_discussion_message",
+        "owner_reviewer_discussion_message",
+        "plan_revision_revised",
+    ]
+    (owner_event, reviewer_event) = _event_params_of_type(conn, "owner_reviewer_discussion_message")
+    assert owner_event[3] == "owner"
+    assert owner_event[4] == str(_OWNER_PROFILE_ID)
+    assert owner_event[5] == "owner_gate"
+    assert owner_event[6] == _GATE_1_ID
+    assert owner_event[7].obj == {"direction": "owner_to_reviewer"}
+    assert reviewer_event[3] == "reviewer"
+    assert reviewer_event[4] == str(_REVIEWER_SESSION_ID)
+    assert reviewer_event[5] == "owner_gate"
+    assert reviewer_event[6] == _GATE_1_ID
+    assert reviewer_event[7].obj == {"direction": "reviewer_to_owner"}
+    # The default (flag absent) sequence is unchanged for every other caller.
+    plain_conn = ScriptedConnection()
+    plain_pool = _pool(plain_conn)
+    _script_settlement(plain_conn, accepted=False)
+    plain_adapter = _prepared_adapter(
+        FakePool(plain_conn),
+        producer_outcomes=[plan_result_candidate(_REVISED_PLAN_TEXT)],
+        reviewer_outcomes=[],
+    )
+    settle_planning_review_resolution(
+        plain_pool,
+        plain_adapter,
+        cast(GitHubAppClient, FakeGitHubClient(FakePool(plain_conn))),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        review_result=_changes_requested_result(),
+    )
+    assert _event_types(plain_conn) == [
+        "plan_reviewed",
+        "owner_gate_resolved",
+        "plan_revision_revised",
+    ]
+
+
+def test_an_accepted_settlement_needs_no_e2_dependencies() -> None:
+    """A formal ACCEPTED never routes to E2: the settlement succeeds without a
+    runtime adapter or GitHub client, and E2 is never touched."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_settlement(conn, accepted=True)
+    adapter = _prepared_adapter(fake_pool, producer_outcomes=[], reviewer_outcomes=[])
+
+    outcome = settle_planning_review_resolution(
+        pool,
+        None,
+        None,
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        review_result=_accepted_result(),
+    )
+
+    assert outcome.decision is PlanningReviewResolutionDecision.SETTLED_ACCEPTED
+    assert outcome.revision_production is None
+    assert _count(conn, _REVISION_INSERT) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
+
+
+def test_a_changes_requested_settlement_refuses_missing_e2_dependencies() -> None:
+    """A formal CHANGES_REQUESTED proves its E2 dependencies BEFORE the
+    settlement transaction: a missing runtime adapter or GitHub client is an
+    invalid command that applies nothing (the no-stranding guarantee)."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_settlement(conn, accepted=False)
+
+    with pytest.raises(InvalidCommandError):
+        settle_planning_review_resolution(
+            pool,
+            None,
+            None,
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            review_result=_changes_requested_result(),
+        )
+
+    assert conn.executed == []
+    assert _count(conn, _RESULT_UPDATE) == 0
+    assert _count(conn, _EVENT_INSERT) == 0

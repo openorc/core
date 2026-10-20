@@ -48,6 +48,7 @@ leaves add their own mappings through this same boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from uuid import UUID
 
 from openorc.domain.connections import WorkflowRole
@@ -60,11 +61,13 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import InvalidCommandError
 
 __all__ = [
+    "OwnerReviewerDiscussionDirection",
     "WorkflowActorContext",
     "owner_actor",
     "record_guidance_changed_event",
     "record_owner_gate_created_event",
     "record_owner_gate_resolved_event",
+    "record_owner_reviewer_discussion_message_event",
     "record_plan_reviewed_event",
     "record_plan_revision_created_event",
     "record_plan_revision_revised_event",
@@ -356,6 +359,62 @@ def record_owner_gate_resolved_event(
         subject_type=_SUBJECT_TYPE_OWNER_GATE,
         subject_id=owner_gate_id,
         context=context,
+    )
+
+
+class OwnerReviewerDiscussionDirection(StrEnum):
+    """The safe direction-only vocabulary for Owner ↔ Reviewer discussion audit.
+
+    One discussion exchange produces exactly two message facts: the Owner's
+    message routed to the Reviewer, and the Reviewer's reply routed back.
+    The direction value is the only conversation-shaped fact an event
+    carries — never the message or reply text itself.
+    """
+
+    OWNER_TO_REVIEWER = "owner_to_reviewer"
+    REVIEWER_TO_OWNER = "reviewer_to_owner"
+
+
+def record_owner_reviewer_discussion_message_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    actor: WorkflowActorContext,
+    direction: OwnerReviewerDiscussionDirection,
+) -> None:
+    """Record one direction-only Owner ↔ Reviewer discussion message fact (issue #79).
+
+    Task-scoped; the primary modeled subject is the addressed OwnerGate
+    (``subject_type``/``subject_id``) over the Task scope, because the
+    discussion is admitted at exactly one pending current gate. Context
+    carries the single safe ``direction`` value and nothing else. The
+    helper accepts no message, reply, prose, prompt, or content parameter,
+    so no discussion text can ever be copied into the event: this audits
+    THAT the exchange occurred, not what was said. The caller supplies the
+    safe actor context (the authenticated OWNER Profile identity for the
+    Owner message, the REVIEWER session identity for the reply).
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(owner_gate_id, "owner_gate_id")
+    if not isinstance(actor, WorkflowActorContext):
+        raise InvalidCommandError("discussion message events require a WorkflowActorContext actor")
+    if not isinstance(direction, OwnerReviewerDiscussionDirection):
+        raise InvalidCommandError(
+            "discussion message events require an OwnerReviewerDiscussionDirection"
+        )
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.OWNER_REVIEWER_DISCUSSION_MESSAGE,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_OWNER_GATE,
+        subject_id=owner_gate_id,
+        context={"direction": direction.value},
     )
 
 
