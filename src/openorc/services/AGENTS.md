@@ -507,4 +507,81 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   both accept no content parameter, so no canonical fact is shadowed into
   event context.
 
+## E6: authorized Producer execution and the accepted-review handoff (issue #81)
+
+- `task_authorized_implementation_execution.execute_authorized_implementation`
+  is the ONE execution seam, and it automates exactly the proven manual
+  handoff: committed E5 Owner approval → the exact existing Producer session
+  PLAN→ACT → one send of the persisted accepted `review_result` JSON →
+  validate one typed `ImplementationResult` → record the Execution attempt
+  and outcome. Reviewer ACCEPTED is the message delivered to the Producer;
+  Owner APPROVED is permission to deliver it — a Reviewer result alone never
+  starts implementation. The caller cannot supply a free-text acceptance or
+  choose a Producer session.
+- Admission (one short transaction, fails closed before any write) derives
+  every authority fact from canonical state under the Task row `FOR UPDATE`:
+  account-operational + exact Owner Workspace/Task scope, the caller's exact
+  `state_token`, a non-archived `implementing` Task with no current gate and
+  an unchanged current PlanRevision, the E5-approved historical
+  IMPLEMENTATION_AUTHORIZATION gate bound to exactly that plan, the CLOSED
+  planning ReviewLoop whose latest finalized iteration for that revision is
+  ACCEPTED, and the existing READY Producer binding (never allocated,
+  replaced, reinitialized, or rebound). Initial-implementation exclusivity
+  refuses on ANY prior attempt history — concurrent/replayed starts,
+  earlier successes, unresolved dispatches, and older failed attempts alike;
+  retries belong to the later recovery layer (#85/#87–#89), never to a
+  second dispatch from this seam. `create_execution` reserves attempt 1 and
+  the focused claim moves it `queued → running` with the F5
+  `last_qualifying_activity_at` marker born in the same statement,
+  committing the dispatch claim before any effectful ACT transition or send,
+  with the Producer-attributed `EXECUTION_STARTED` audit recorded atomically.
+- The external phase is authority-gated with NO transaction open: the
+  deferred Producer attachment is acquired first, then the exact subject set
+  is revalidated (R1) before the native `ImplementInteraction` realization
+  on the same external session ID; after realization the optional D6c
+  activity subscription is established, the subject set is revalidated again
+  (R2) immediately before the one send, and the send carries the canonical
+  accepted envelope (shared `review_result_envelope.serialize_review_result`;
+  the ACCEPTED loader is `accepted_review_result_from_iteration`) with
+  `expected_family=IMPLEMENTATION_RESULT_FAMILY`. A schema-valid result is
+  necessarily `status: COMPLETED` (the schema pins the const). No
+  `implement.md`, no appended instructions, no plan re-send, no Reviewer
+  runtime action, no transcript synthesis.
+- The finalize (one short transaction) re-proves the exact subject set and
+  the still-running attempt under the Task row lock, then persists the
+  validated canonical `implementation_result` payload and the `succeeded`
+  stamp in one conditional statement with the Producer-attributed
+  `EXECUTION_COMPLETED` audit. The result's `branch` is a Producer
+  discovery/routing claim only — never canonical Task branch or GitHub head
+  state; E7 (#82) owns reconciliation and PR_AUTHORIZATION, and the Task is
+  never advanced here. Additive `openorc.executions` columns carry only the
+  nullable canonical result payload and the nullable activity marker — no
+  branch/SHA field, transcript, prompt, or dispatch table, ever.
+- Failure classification is truthful: a known failure that provably occurred
+  before any runtime effect (known attachment failure, known realization
+  failure, the R1 stale-authority refusal) finalizes
+  `failed_transient`/`failed_final` with a safe `execution_failed` audit
+  (`failure_kind` context token only); every post-claim uncertainty —
+  uncertain attachment/reconstruction, timeout/disconnect, session loss,
+  invalid formal completion after possible work, the R2 stale-authority
+  refusal, or a finalize that cannot commit an already-returned result —
+  leaves the attempt conservatively `running` (the durable
+  potentially-dispatched record), reports a typed content-safe error, and
+  never resends, never fabricates success, and never grants retry
+  permission. Settlement belongs to the later recovery layer; no abort or
+  retry engine is installed here.
+- The activity marker is advisory F5 fuel (issue #90 consumes it): the
+  injected subscription factory adapts the Cline-local D6c
+  `subscribe_activity` seam, the service owns the qualification filter
+  (thinking, iteration/work polling, tool lifecycle, non-formal commentary
+  qualify; notices, turn-finish, runtime status/error/ended, and usage
+  never do), and the listener stamps `last_qualifying_activity_at` with
+  database time through a short conditional write that is a rejected no-op
+  on finalized history. No activity content is ever persisted; unavailable
+  telemetry, other sessions, and subscription failure alter nothing.
+  `execution_started`/`execution_completed`/`execution_failed` #56 recorders
+  are Producer-attributed (`producer_actor`) with execution-subject
+  references and empty or failure-kind-only context — no canonical fact is
+  shadowed into event context.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

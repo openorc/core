@@ -395,6 +395,8 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             "queued",
             _OBSERVED,
             _OBSERVED,
+            None,
+            None,
         ),
         "runtime request": (
             uuid.uuid4(),
