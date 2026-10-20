@@ -44,7 +44,7 @@ from openorc.adapters.github import (
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.gates import OwnerGateStatus
-from openorc.domain.reviews import ReviewOutcome
+from openorc.domain.reviews import ReviewLoopStatus, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
@@ -60,6 +60,7 @@ from openorc.services.task_owner_reviewer_discussion import (
     send_owner_reviewer_discussion_message,
 )
 from openorc.services.task_planning_review_resolution import (
+    PlanningGateChangeRequestDecision,
     PlanningReviewResolutionDecision,
 )
 from tests.fakes.agent_runtime import (
@@ -784,7 +785,6 @@ def _script_settlement_flow(conn: ScriptedConnection, *, accepted: bool) -> None
     conn.on(_GATE_UPDATE, settled_gate)
     conn.on(_TASK_GATE_WRITE, t_cleared)
     if accepted:
-        conn.on(_LOOP_CLOSE, _loop_row(status="closed", closed_at=_OBSERVED))
         return
     t_planning = _task_row(status="planning", state_token=_TOKEN_3, gate_id=None)
     conn.on(_STATUS_UPDATE, t_planning)
@@ -1256,7 +1256,8 @@ def test_prose_with_embedded_example_json_at_a_resolution_gate_stays_ordinary() 
 def test_a_fenced_valid_acceptance_settles_atomically_without_e2() -> None:
     """One fenced standalone valid ACCEPTED review_result routes to the merged
     E3c planning settlement; the two discussion message facts commit inside
-    the settlement's transaction; the loop closes and E2 is never touched."""
+    the settlement's transaction; the loop stays OPEN (issue #219) and E2
+    is never touched."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
     pool = _pool(conn)
@@ -1297,10 +1298,11 @@ def test_a_fenced_valid_acceptance_settles_atomically_without_e2() -> None:
     assert reviewer_event[3] == "reviewer"
     assert reviewer_event[4] == str(_REVIEWER_SESSION_ID)
     assert reviewer_event[7].obj == {"direction": "reviewer_to_owner"}
-    # No E2 continuation, no Producer attachment, no GitHub observation.
+    # No E2 continuation, no Producer attachment, no GitHub observation, and
+    # no loop closure (issue #219 keeps the loop OPEN for E5).
     assert _count(conn, _REVISION_INSERT) == 0
     assert _count(conn, _STATUS_UPDATE) == 0
-    assert _count(conn, _LOOP_CLOSE) == 1
+    assert _count(conn, _LOOP_CLOSE) == 0
     assert producer_attachment.acquisitions == 0
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
     assert reviewer_attachment.acquisitions == 1
@@ -1649,3 +1651,281 @@ def test_the_post_send_audit_serializes_against_gate_resolution() -> None:
     )
     assert len(locked_positions) == 1
     assert locked_positions[0] < first_event_position
+
+
+# --- the implementation-gate change-request flow (issue #219) -----------------
+
+
+def _script_gate_change_flow(conn: ScriptedConnection, *, complete: bool = True) -> None:
+    """The E4 flow rounds plus the E3 G1 handoff and E2's production.
+
+    ``complete=False`` scripts only through the post-send recheck, for
+    advisory exchanges and fail-closed dispatch cases that must never reach
+    the seam.
+    """
+    _script_common(conn, session_repeats=True)
+    t_waiting = _task_row()
+    t_planning = _task_row(status="planning", state_token=_TOKEN_2, gate_id=None)
+    rev1 = _revision_row(revision_id=_REVISION_1_ID, number=1)
+    gate = _gate_row(gate_type="implementation_authorization")
+    for round_index in range(3):
+        if round_index == 0:
+            _phase1(conn, task_row=t_waiting, gate_row=gate, revision_row=rev1)
+        else:
+            _currentness_round(
+                conn,
+                task_row=t_waiting,
+                gate_row=gate,
+                revision_row=rev1,
+                locked_task=round_index == 2,
+            )
+    if not complete:
+        return
+    conn.on_repeat(_LOOPS_LIST, [_loop_row()])
+    conn.on_repeat(_LOOP_READ, _loop_row())
+    conn.on_repeat(_LOOP_READ_LOCKED, _loop_row())
+    conn.on_repeat(_LOOP_GUARD_LOCKED, ("open", "planning"))
+    conn.on_repeat(_REPO_READ, _repository_row())
+    conn.on_repeat(_INSTALLATION_READ, _installation_row())
+    it1 = _iteration_row(
+        iteration_id=_ITERATION_1_ID,
+        number=1,
+        plan_revision_id=_REVISION_1_ID,
+        outcome="accepted",
+        summary="Looks good",
+        findings=[],
+        decided_at=_OBSERVED,
+    )
+    it2 = _iteration_row(
+        iteration_id=_ITERATION_2_ID,
+        number=2,
+        plan_revision_id=_REVISION_1_ID,
+        outcome="changes_requested",
+        summary="Needs another pass",
+        findings=_NEW_FINDINGS,
+        decided_at=_OBSERVED,
+    )
+    it2_unfin = _iteration_row(
+        iteration_id=_ITERATION_2_ID, number=2, plan_revision_id=_REVISION_1_ID
+    )
+    conn.on(_TASK_READ, t_waiting)  # handoff workspace guard
+    conn.on(_TASK_READ_LOCKED, t_waiting)  # handoff Task lock
+    conn.on(_TASK_READ, t_waiting)  # handoff currentness
+    conn.on_repeat(_GATE_READ, gate)  # the guard + the primitive's re-read
+    conn.on_repeat(_REVISION_READ, rev1)
+    conn.on(_ITERATIONS_LIST, [it1])
+    conn.on(_ITERATION_INSERT, it2_unfin)
+    conn.on(_RESULT_UPDATE, it2)
+    conn.on_repeat(_ITERATIONS_LIST, [it1, it2])
+    # The supersession primitive: Task lock + conditional update.
+    conn.on(_TASK_READ_LOCKED, t_waiting)
+    conn.on(_TASK_GATE_WRITE, t_planning)
+    # --- E2 revision production (entry + finalize), in call order. ---
+    rev2 = _revision_row(revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT)
+    t_pointer = _task_row(
+        status="planning",
+        state_token=_TOKEN_4,
+        current_plan_revision_id=_REVISION_2_ID,
+        gate_id=None,
+    )
+    conn.on(_TASK_READ, t_planning)  # E2 workspace guard
+    conn.on(_TASK_READ_LOCKED, t_planning)  # E2 Task lock
+    conn.on(_TASK_READ, t_planning)  # E2 entry currentness
+    conn.on(_ITERATION_READ, it2)
+    conn.on(_REVISIONS_HISTORY, [rev1])
+    conn.on(_TASK_READ, t_planning)  # E2 finalize currentness
+    conn.on(_REVISION_INSERT, rev2)
+    conn.on(_POINTER_UPDATE, t_pointer)
+
+
+def test_ordinary_discussion_at_the_implementation_gate_stays_advisory() -> None:
+    """Issue #219 keeps E4's ordinary discussion path at every gate: a plain
+    Owner question at the implementation gate is advisory — two direction-only
+    message facts, no iteration, no gate change, and the Owner may still
+    approve."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_gate_change_flow(conn, complete=False)
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[_ORDINARY_REPLY])
+    attachment = _ReviewerAttachment(adapter)
+
+    outcome = _discussion_call(pool, attachment)
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.ORDINARY_REPLY
+    assert outcome.reply_text is not None
+    assert outcome.resolution is None
+    assert outcome.change_request is None
+    assert _event_types(conn) == [_DISCUSSION_EVENT_TYPE, _DISCUSSION_EVENT_TYPE]
+    assert _count(conn, _ITERATION_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
+
+
+def test_a_standalone_accepted_reply_at_the_implementation_gate_stays_advisory() -> None:
+    """Issue #219: even a standalone schema-valid ACCEPTED ``review_result``
+    at the implementation gate is advisory — no ReviewIteration, no gate
+    change, the ordinary exchange audit, and the gate stays approvable."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_gate_change_flow(conn, complete=False)
+    reply = (
+        "```json\n"
+        + json.dumps(accepted_review_result_candidate("Everything checks out."))
+        + "\n```"
+    )
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[reply])
+    attachment = _ReviewerAttachment(adapter)
+
+    outcome = _discussion_call(pool, attachment)
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.ORDINARY_REPLY
+    assert outcome.resolution is None
+    assert outcome.change_request is None
+    assert _event_types(conn) == [_DISCUSSION_EVENT_TYPE, _DISCUSSION_EVENT_TYPE]
+    assert _count(conn, _ITERATION_INSERT) == 0
+    assert _count(conn, _RESULT_UPDATE) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
+
+
+def test_a_standalone_change_request_at_the_implementation_gate_hands_planning_back() -> None:
+    """Issue #219: one standalone valid CHANGES_REQUESTED ``review_result``
+    at the implementation gate adds exactly one next-numbered same-plan
+    Reviewer iteration, atomically retires the gate as current (still
+    PENDING, never stamped), records the safe audit inside the handoff
+    transaction, rotates the Task currentness, and routes only that result
+    to E2 — no REVIEW_RESOLUTION gate and no ``OWNER_GATE_RESOLVED``."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_gate_change_flow(conn)
+    reply = json.dumps(
+        changes_requested_review_result_candidate(
+            "Needs another pass", [("Clarify the retry loop", "Explain the backoff path.")]
+        )
+    )
+    adapter = _prepared_adapter(
+        fake_pool,
+        reviewer_outcomes=[reply],
+        producer_outcomes=[plan_result_candidate(_REVISED_PLAN_TEXT)],
+    )
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    producer_attachment = _ProducerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool)
+
+    outcome = _discussion_call(
+        pool,
+        reviewer_attachment,
+        producer_attachment=producer_attachment,
+        github=github,
+    )
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.FORMAL_PLANNING_CHANGE_REQUESTED
+    assert outcome.reply_text is None
+    assert outcome.resolution is None
+    assert outcome.change_request is not None
+    assert (
+        outcome.change_request.decision
+        is PlanningGateChangeRequestDecision.PLANNING_CONTINUATION_ROUTED
+    )
+    assert outcome.change_request.review_iteration.id == _ITERATION_2_ID
+    assert outcome.change_request.review_iteration.outcome is ReviewOutcome.CHANGES_REQUESTED
+    assert outcome.change_request.plan_revision.id == _REVISION_1_ID
+    assert outcome.change_request.review_loop.status is ReviewLoopStatus.OPEN
+    assert outcome.change_request.superseded_gate.status is OwnerGateStatus.PENDING
+    assert outcome.task.state_token == _TOKEN_4
+    assert outcome.task.current_plan_revision_id == _REVISION_2_ID
+    # The handoff audit rides the handoff transaction: the REVIEWER plan
+    # review and the two direction-only message facts — never an Owner
+    # gate-resolution verdict — plus E2's revision event.
+    assert _event_types(conn) == [
+        "plan_reviewed",
+        _DISCUSSION_EVENT_TYPE,
+        _DISCUSSION_EVENT_TYPE,
+        "plan_revision_revised",
+    ]
+    assert _event_params_of_type(conn, "owner_gate_resolved") == []
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _count(conn, _GATE_INSERT) == 0
+    # Exactly the NEW findings routed to E2, with the Producer attachment
+    # acquired lazily exactly once.
+    (revise_send,) = adapter.realized_controls(_PRODUCER_EXTERNAL_ID)
+    assert revise_send.message is not None
+    assert "Clarify the retry loop" in revise_send.message
+    assert producer_attachment.acquisitions == 1
+    assert reviewer_attachment.acquisitions == 1
+    assert reviewer_attachment.disposals == 1
+
+
+def test_a_raced_resolution_at_the_implementation_gate_applies_nothing() -> None:
+    """An Owner approval racing the formal reply wins the post-send recheck's
+    Task-row lock: the moved-on token fails the still-current proof, the
+    exchange records nothing, and no handoff or E2 route ever follows."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_common(conn, session_repeats=True)
+    t_waiting = _task_row()
+    t_moved = _task_row(status="waiting_for_owner", state_token=_TOKEN_2, gate_id=None)
+    rev1 = _revision_row(revision_id=_REVISION_1_ID, number=1)
+    gate = _gate_row(gate_type="implementation_authorization")
+    _phase1(conn, task_row=t_waiting, gate_row=gate, revision_row=rev1)
+    _currentness_round(conn, task_row=t_waiting, gate_row=gate, revision_row=rev1)
+    _currentness_round(conn, task_row=t_moved, gate_row=gate, revision_row=rev1, locked_task=True)
+    reply = json.dumps(
+        changes_requested_review_result_candidate(
+            "Needs another pass", [("Clarify the retry loop", "Explain the backoff path.")]
+        )
+    )
+    adapter = _prepared_adapter(
+        fake_pool,
+        reviewer_outcomes=[reply],
+        producer_outcomes=[plan_result_candidate(_REVISED_PLAN_TEXT)],
+    )
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    producer_attachment = _ProducerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool)
+
+    with pytest.raises(StaleOperationError):
+        _discussion_call(
+            pool,
+            reviewer_attachment,
+            producer_attachment=producer_attachment,
+            github=github,
+        )
+
+    assert _event_types(conn) == []
+    assert _count(conn, _ITERATION_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _count(conn, _REVISION_INSERT) == 0
+    assert producer_attachment.acquisitions == 0
+
+
+def test_a_change_request_without_the_producer_dependency_fails_closed() -> None:
+    """The G1 change request always routes to E2, so a missing deferred
+    Producer attachment factory fails the dispatch closed before the seam —
+    no supersession, no audit, no partial effect."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_gate_change_flow(conn, complete=False)
+    reply = json.dumps(
+        changes_requested_review_result_candidate(
+            "Needs another pass", [("Clarify the retry loop", "Explain the backoff path.")]
+        )
+    )
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[reply])
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool)
+
+    with pytest.raises(InvalidCommandError):
+        _discussion_call(pool, reviewer_attachment, github=github)
+
+    assert _event_types(conn) == []
+    assert _count(conn, _ITERATION_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _count(conn, _REVISION_INSERT) == 0

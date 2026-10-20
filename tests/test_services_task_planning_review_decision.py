@@ -385,12 +385,13 @@ def _gate_row(
     gate_id: Any,
     plan_revision_id: Any,
     status: str = "pending",
+    gate_type: str = "review_resolution",
 ) -> tuple[Any, ...]:
     return (
         gate_id,
         _WORKSPACE_ID,
         _TASK_ID,
-        "review_resolution",
+        gate_type,
         status,
         plan_revision_id,
         None,
@@ -1091,10 +1092,11 @@ def _dispatch_outcome(*, iteration_id: Any, number: int, plan_revision_id: Any) 
     )
 
 
-def test_accepted_clearance_closes_the_loop_and_yields_the_plan_evidence() -> None:
-    """One representative ACCEPTED clearance: the loop closes, the exact
-    accepted PlanRevision/iteration evidence is yielded, and nothing else
-    happens — no E2 routing, no gate, no Task mutation."""
+def test_accepted_clearance_keeps_the_loop_open_and_yields_the_plan_evidence() -> None:
+    """One representative ACCEPTED clearance: the loop stays OPEN (issue
+    #219), the exact accepted PlanRevision/iteration evidence is yielded,
+    and nothing else happens — no E2 routing, no gate, no Task mutation,
+    and no loop closure (E5's Owner approval closes it atomically)."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
     pool = _pool(conn)
@@ -1136,7 +1138,6 @@ def test_accepted_clearance_closes_the_loop_and_yields_the_plan_evidence() -> No
     conn.on(_ITERATIONS_LIST, [it1_unfin])
     conn.on(_ITERATIONS_LIST, [it1_acc])
     _script_finalize_result(conn, finalized_row=it1_acc, iterations_after=[it1_acc], gates=[])
-    conn.on(_LOOP_CLOSE, _loop_row(limit=5, status="closed", closed_at=_OBSERVED))
     adapter = _prepared_adapter(
         fake_pool,
         producer_outcomes=[],
@@ -1164,8 +1165,8 @@ def test_accepted_clearance_closes_the_loop_and_yields_the_plan_evidence() -> No
     )
 
     assert decision.decision is PlanningReviewDecision.ACCEPTED_CLEAR
-    assert decision.review_loop.status is ReviewLoopStatus.CLOSED
-    assert decision.review_loop.closed_at is not None
+    assert decision.review_loop.status is ReviewLoopStatus.OPEN
+    assert decision.review_loop.closed_at is None
     assert decision.plan_revision.id == _REVISION_1_ID
     assert decision.review_iteration.id == _ITERATION_1_ID
     assert decision.review_iteration.outcome is not None
@@ -1187,7 +1188,9 @@ def test_accepted_clearance_closes_the_loop_and_yields_the_plan_evidence() -> No
 
 def test_duplicate_finalization_applies_nothing() -> None:
     """Replaying the same successful dispatch outcome after finalization is a
-    stale duplicate: no second result, event, gate, loop-close, or send."""
+    stale duplicate: no second result, event, gate, loop-close, or send —
+    and acceptance leaves the loop OPEN (issue #219), so no close ever
+    happens here."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
     pool = _pool(conn)
@@ -1230,7 +1233,6 @@ def test_duplicate_finalization_applies_nothing() -> None:
     conn.on(_ITERATIONS_LIST, [it1_acc])
     conn.on(_ITERATIONS_LIST, [it1_acc])
     _script_finalize_result(conn, finalized_row=it1_acc, iterations_after=[it1_acc], gates=[])
-    conn.on(_LOOP_CLOSE, _loop_row(limit=5, status="closed", closed_at=_OBSERVED))
     adapter = _prepared_adapter(
         fake_pool,
         producer_outcomes=[],
@@ -1273,7 +1275,7 @@ def test_duplicate_finalization_applies_nothing() -> None:
     assert _count(conn, _RESULT_UPDATE) == 1
     assert len(_event_params_of_type(conn, "plan_reviewed")) == 1
     assert _count(conn, _GATE_INSERT) == 0
-    assert _count(conn, _LOOP_CLOSE) == 1
+    assert _count(conn, _LOOP_CLOSE) == 0
     assert _count(conn, _TASK_WRITE) == 0
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 1
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
@@ -1597,3 +1599,112 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
     assert _count(conn, _POINTER_UPDATE) == 0
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 1
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 1
+
+
+def test_implementation_gate_history_immediately_reopens_resolution() -> None:
+    """Durable IMPLEMENTATION_AUTHORIZATION gate history (issue #219's
+    superseded accepted-plan gate) makes Owner mediation sticky too: the very
+    next change request — well within the untouched snapshot budget —
+    immediately creates a NEW REVIEW_RESOLUTION gate, moves to
+    ``waiting_for_owner``, and never fabricates a first
+    ``REVIEW_LIMIT_REACHED``."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_ws_reads(conn, first_reads=0, first_limit=5, later_limit=5)
+    _script_repeating_reads(
+        conn,
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        producer_row=_session_row(
+            "producer", session_id=_PRODUCER_SESSION_ID, external_id=_PRODUCER_EXTERNAL_ID
+        ),
+        loop_row=_loop_row(limit=5),
+    )
+    t1 = _task_row(state_token=_TOKEN_2, current_plan_revision_id=_REVISION_2_ID)
+    rev2 = _revision_row(revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT)
+    it1_cr = _cr_row(_ITERATION_1_ID, 1, _REVISION_1_ID)
+    it2_unfin = _iteration_row(
+        iteration_id=_ITERATION_2_ID, number=2, plan_revision_id=_REVISION_2_ID
+    )
+    it2_cr = _cr_row(_ITERATION_2_ID, 2, _REVISION_2_ID)
+    superseded_gate = _gate_row(
+        gate_id=_GATE_1_ID,
+        plan_revision_id=_REVISION_1_ID,
+        gate_type="implementation_authorization",
+    )
+    new_gate = _gate_row(gate_id=_GATE_2_ID, plan_revision_id=_REVISION_2_ID)
+    installed = _task_row(
+        state_token=_TOKEN_5, current_plan_revision_id=_REVISION_2_ID, gate_id=_GATE_2_ID
+    )
+    waiting = _task_row(
+        status="waiting_for_owner",
+        state_token=_TOKEN_6,
+        current_plan_revision_id=_REVISION_2_ID,
+        gate_id=_GATE_2_ID,
+    )
+    for _ in range(4):
+        conn.on(_TASK_READ, t1)
+    for _ in range(2):
+        conn.on(_TASK_READ_LOCKED, t1)
+    conn.on(_REVISION_READ, rev2)
+    conn.on(_REVISION_READ, rev2)
+    conn.on(_LOOPS_LIST, [_loop_row(limit=5)])
+    conn.on(_ITERATION_INSERT, it2_unfin)
+    conn.on(_ITERATIONS_LIST, [it1_cr])
+    conn.on(_ITERATIONS_LIST, [it1_cr, it2_unfin])
+    conn.on(_ITERATIONS_LIST, [it1_cr, it2_cr])
+    conn.on(_GATES_LIST, [superseded_gate])
+    _script_finalize_result(
+        conn, finalized_row=it2_cr, iterations_after=[it1_cr, it2_cr], gates=[superseded_gate]
+    )
+    conn.on(_GATE_INSERT, new_gate)
+    conn.on(_GATE_INSTALL, installed)
+    conn.on(_EVENT_INSERT, _event_row())
+    conn.on(_STATUS_UPDATE, waiting)
+    # No review_limit_reached handler is registered: an extra event insert
+    # would fail this test loudly instead of passing silently.
+    adapter = _prepared_adapter(
+        fake_pool, producer_outcomes=[], reviewer_outcomes=[_changes_requested_candidate()]
+    )
+    github = FakeGitHubClient(fake_pool)
+
+    dispatch = dispatch_planning_review(
+        pool,
+        adapter,
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        plan_production=_production_outcome(
+            revision_id=_REVISION_2_ID,
+            number=2,
+            content=_REVISED_PLAN_TEXT,
+            state_token=_TOKEN_2,
+            current_plan_revision_id=_REVISION_2_ID,
+        ),
+    )
+    decision = finalize_planning_review_decision(
+        pool,
+        adapter,
+        cast(GitHubAppClient, github),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_TOKEN_2,
+        dispatch=dispatch,
+    )
+
+    assert decision.decision is PlanningReviewDecision.EXHAUSTED
+    assert decision.resolution_gate is not None
+    assert decision.resolution_gate.id == _GATE_2_ID
+    assert decision.task.status is TaskStatus.WAITING_FOR_OWNER
+    assert decision.task.current_owner_gate_id == _GATE_2_ID
+    assert decision.task.state_token == _TOKEN_6
+    assert decision.review_loop.status is ReviewLoopStatus.OPEN
+    # The budget was NOT exhausted: the immediate resolution came from the
+    # implementation-gate history alone — and no first REVIEW_LIMIT_REACHED
+    # was fabricated for it.
+    assert _event_types(conn) == ["plan_reviewed", "owner_gate_created"]
+    assert _event_params_of_type(conn, "review_limit_reached") == []
+    assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0

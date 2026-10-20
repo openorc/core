@@ -318,19 +318,24 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   `iteration_limit` (the number of autonomous Producer revisions, not a cap
   on ReviewIterations; the Workspace setting is never consulted for an
   existing loop), and Owner-mediated stickiness comes from durable
-  REVIEW_RESOLUTION gate history (`list_task_owner_gates`).
-- ACCEPTED closes the loop and yields the accepted PlanRevision/iteration
-  evidence for E5 without creating IMPLEMENTATION_AUTHORIZATION or
-  mutating the Task. An in-budget CHANGES_REQUESTED keeps the Task
-  PLANNING and the loop OPEN and routes the exact finalized findings to
-  merged E2 `revise_task_plan` OUTSIDE any transaction — only E2's newly
-  persisted revision and rotated token may launch E3a's next ordinary
-  REVIEW, and an uncertain E2 operation is never resent here. Exhaustion
-  creates and installs the exact-plan pending REVIEW_RESOLUTION gate and
-  moves the Task to `waiting_for_owner` in the same transaction.
+  REVIEW_RESOLUTION and IMPLEMENTATION_AUTHORIZATION gate history
+  (`list_task_owner_gates`; issue #219 extends the sticky source to the
+  superseded accepted-plan implementation gate).
+- ACCEPTED leaves the single planning ReviewLoop OPEN (issue #219) and
+  yields the accepted PlanRevision/iteration evidence for E5 without
+  creating IMPLEMENTATION_AUTHORIZATION, mutating the Task, or closing the
+  loop — E5's Owner approval closes it atomically. An in-budget
+  CHANGES_REQUESTED keeps the Task PLANNING and the loop OPEN and routes
+  the exact finalized findings to merged E2 `revise_task_plan` OUTSIDE any
+  transaction — only E2's newly persisted revision and rotated token may
+  launch E3a's next ordinary REVIEW, and an uncertain E2 operation is never
+  resent here. Exhaustion creates and installs the exact-plan pending
+  REVIEW_RESOLUTION gate and moves the Task to `waiting_for_owner` in the
+  same transaction.
 - `REVIEW_LIMIT_REACHED` is recorded on the FIRST exhaustion only — the
-  exhaustion that occurs with no prior REVIEW_RESOLUTION gate in durable
-  history. Later Owner-mediated disagreements create fresh gates with
+  exhaustion that occurs with no prior REVIEW_RESOLUTION or
+  IMPLEMENTATION_AUTHORIZATION gate in durable history. Later Owner-mediated
+  disagreements create fresh gates with
   `PLAN_REVIEWED`/`OWNER_GATE_CREATED` without re-representing the
   already-exhausted budget. Exhausted findings are never forwarded into
   gates or events. The amended E3a admission guard
@@ -361,10 +366,12 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   pointer clear + token rotation), and records the REVIEWER
   `OWNER_GATE_RESOLVED` event whose context carries `outcome=settled` plus
   the settling `review_iteration_id`/`review_outcome` references.
-- Formal ACCEPTED closes the loop and yields the unchanged
-  PlanRevision/iteration evidence for E5 — no IMPLEMENTATION_AUTHORIZATION,
-  no implementation authority, and no Task status change (the Task stays
-  `waiting_for_owner` for E5's flow). Formal CHANGES_REQUESTED moves the
+- Formal ACCEPTED keeps the single planning ReviewLoop OPEN (issue #219)
+  and yields the unchanged PlanRevision/iteration evidence for E5 — no
+  IMPLEMENTATION_AUTHORIZATION, no implementation authority, no loop
+  closure (E5's Owner approval closes it atomically), and no Task status
+  change (the Task stays `waiting_for_owner` for E5's flow). Formal
+  CHANGES_REQUESTED moves the
   Task `waiting_for_owner` → `planning` under the post-settlement token and
   routes ONLY the newly finalized findings to merged E2 `revise_task_plan`
   OUTSIDE any transaction (the post-settlement token, the unchanged prior
@@ -388,6 +395,23 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   runtime adapter and GitHub client) are validated at entry exactly when the
   validated result routes to E2 — the same no-stranding guarantee, scoped to
   the routing outcome; a formal ACCEPTED legitimately needs neither.
+- The same module owns issue #219's sibling seam:
+  `supersede_implementation_authorization_with_changes` is the ONE G1
+  change-request handoff: at a still-current plan-subject
+  IMPLEMENTATION_AUTHORIZATION gate, a validated typed CHANGES_REQUESTED
+  `ReviewResult` (never an ACCEPTED reply — that stays E4's advisory
+  conversation) rechecks the same exact subjects in one short composed
+  transaction, allocates and finalizes the NEW next-numbered same-plan
+  ReviewIteration, records the REVIEWER `PLAN_REVIEWED` event, supersedes
+  the gate through the narrow conditional `supersede_current_owner_gate`
+  persistence primitive (pointer clear + `waiting_for_owner` → `planning` +
+  token rotation; the gate row stays pending history — no Owner stamp, no
+  SETTLED, no `OWNER_GATE_RESOLVED` event), and routes ONLY the new
+  findings to E2 outside the transaction on the post-supersession token.
+  The Producer/GitHub dependencies are validated at entry (the only formal
+  outcome routes to E2), the Task row lock serializes a raced Owner
+  approval/cancellation, a closed loop refuses the handoff, and E3b's
+  sticky rule treats the gate's durable history as Owner mediation.
 
 ## E4: Owner ↔ Reviewer discussion across gates (issue #79)
 
@@ -415,13 +439,20 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   standalone unfenced JSON object or exactly one fenced JSON object with
   nothing outside the fence; only that candidate is validated through the
   existing #65 `parse_formal_response`, and only a `review_result` family
-  result becomes formal. Ordinary gates never invoke recognition — all
-  content there is advisory.
+  result becomes formal. Recognition runs at REVIEW_RESOLUTION gates and —
+  issue #219 — at still-current plan-subject IMPLEMENTATION_AUTHORIZATION
+  gates, where only a `CHANGES_REQUESTED` result is a workflow trigger and
+  a schema-valid ACCEPTED reply (like ordinary prose) stays advisory with
+  the gate still approvable. All other gates never invoke recognition —
+  all content there is advisory.
 - Audit is two direction-only `OWNER_REVIEWER_DISCUSSION_MESSAGE` events per
   still-current exchange (Owner message, Reviewer reply) through the #56
   event-coordination helper — direction-only context, never text. For a
-  recognized formal result, E4 dispatches E3c's settlement with the audit
-  flag so the message facts commit atomically with settlement; a PR/head
+  recognized formal result, E4 dispatches the authoritative continuation
+  seam with the audit flag so the message facts commit atomically with it:
+  E3c's settlement at a plan-subject REVIEW_RESOLUTION gate, and issue
+  #219's E3 G1 change-request handoff at an implementation gate (only a
+  CHANGES_REQUESTED result ever reaches that dispatch); a PR/head
   REVIEW_RESOLUTION result fails closed until E9 (#84). Uncertain sends,
   stale races, and audit failures return typed safe errors and never
   present a failed exchange as success; recovery/durable dispatch belongs

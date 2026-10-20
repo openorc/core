@@ -680,9 +680,7 @@ def _script_settlement(conn: ScriptedConnection, *, accepted: bool) -> None:
     conn.on(_TASK_READ_LOCKED, t_waiting)  # the gate settlement's Task lock
     conn.on(_GATE_UPDATE, settled_gate)
     conn.on(_TASK_GATE_WRITE, t_cleared)
-    if accepted:
-        conn.on(_LOOP_CLOSE, _loop_row(status="closed", closed_at=_OBSERVED))
-    else:
+    if not accepted:
         conn.on(_STATUS_UPDATE, t_planning)
         # --- E2 revision production (entry + finalize), in call order. ---
         rev2 = _revision_row(revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT)
@@ -800,10 +798,11 @@ def test_a_formal_changes_requested_settles_the_gate_and_routes_new_findings_to_
     assert len(github.branch_calls) == 1
 
 
-def test_a_formal_accepted_settles_the_gate_closes_the_loop_and_never_touches_e2() -> None:
-    """The typed formal acceptance settles the gate, closes the loop, and
-    yields the accepted evidence with no Owner APPROVED verdict, no
-    IMPLEMENTATION_AUTHORIZATION, no E2 route, and no status move."""
+def test_a_formal_accepted_settles_the_gate_keeps_the_loop_open_and_never_touches_e2() -> None:
+    """The typed formal acceptance settles the gate, keeps the planning loop
+    OPEN (issue #219), and yields the accepted evidence with no Owner
+    APPROVED verdict, no IMPLEMENTATION_AUTHORIZATION, no E2 route, and no
+    status move."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
     pool = _pool(conn)
@@ -817,7 +816,7 @@ def test_a_formal_accepted_settles_the_gate_closes_the_loop_and_never_touches_e2
     assert outcome.review_iteration.id == _ITERATION_2_ID
     assert outcome.review_iteration.outcome is ReviewOutcome.ACCEPTED
     assert outcome.plan_revision.id == _REVISION_1_ID
-    assert outcome.review_loop.status is ReviewLoopStatus.CLOSED
+    assert outcome.review_loop.status is ReviewLoopStatus.OPEN
     assert outcome.task.status is TaskStatus.WAITING_FOR_OWNER
     assert outcome.task.state_token == _TOKEN_2
     assert outcome.task.current_owner_gate_id is None

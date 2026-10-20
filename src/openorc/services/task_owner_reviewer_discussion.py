@@ -3,14 +3,21 @@
 One focused Owner-authenticated service routes free-form Owner ↔ Reviewer
 discussion at every pending current OwnerGate of a non-archived
 ``waiting_for_owner`` Task through the Task's existing admitted READY
-Reviewer session. At ordinary gates the exchange is strictly advisory. At a
-pending current REVIEW_RESOLUTION gate alone, an explicitly recognizable
+Reviewer session. At ordinary gates the exchange is strictly advisory. At
+a pending current REVIEW_RESOLUTION gate, an explicitly recognizable
 standalone, schema-valid Reviewer ``review_result`` reply is a formal
 continuation of the same OPEN ReviewLoop and is dispatched — never applied
 here — to the authoritative exact-subject settlement seam (E3c planning
-today; E9 PR/head when that leaf lands). E4 owns message routing and
-recognition; it never mutates gates, loops, or iterations directly. The
-runtime owns conversation context; OpenOrc records no transcript.
+today; E9 PR/head when that leaf lands). At a still-current plan-subject
+IMPLEMENTATION_AUTHORIZATION gate, issue #219 makes exactly one reply
+formal: a standalone schema-valid ``review_result`` with
+``CHANGES_REQUESTED`` dispatches E3's implementation-gate change-request
+handoff (a new iteration for the unchanged accepted revision, the gate
+superseded, planning resumed); any ACCEPTED reply there — like ordinary
+prose — stays advisory and the Owner may still approve the gate. E4 owns
+message routing and recognition; it never mutates gates, loops, or
+iterations directly. The runtime owns conversation context; OpenOrc
+records no transcript.
 
 Composition order (authorization precedes every adapter acquisition):
 
@@ -41,10 +48,14 @@ Composition order (authorization precedes every adapter acquisition):
    ``OWNER_REVIEWER_DISCUSSION_MESSAGE`` events (Owner message, Reviewer
    reply) bound to the addressed gate — direction-only context, never any
    text; a still-current formal result at a plan-subject REVIEW_RESOLUTION
-   dispatches the E3c settlement with ``record_discussion_message_events``,
-   so the discussion facts commit atomically with the authoritative
-   settlement and no partial success is representable; a recognized result
-   at a PR/head-subject REVIEW_RESOLUTION gate fails closed until E9 (#84)
+   dispatches the E3c settlement, and a still-current formal
+   CHANGES_REQUESTED at a plan-subject IMPLEMENTATION_AUTHORIZATION
+   dispatches issue #219's E3 change-request handoff, each with
+   ``record_discussion_message_events`` so the discussion facts commit
+   atomically with the authoritative continuation and no partial success
+   is representable; a recognized ACCEPTED at the implementation gate is
+   advisory and records the ordinary exchange; a recognized result at a
+   PR/head-subject REVIEW_RESOLUTION gate fails closed until E9 (#84)
    adds its settlement seam.
 
 Recognition rule (deliberately stricter than the shared #65 parser's
@@ -56,7 +67,10 @@ unknown-version objects all stay ordinary displayed conversation. Only an
 isolated candidate is validated through the existing #65
 ``parse_formal_response``; the family must classify as ``review_result``
 and schema-validate, yielding the typed ``ReviewResult``. The parser matrix
-is reused, never duplicated or extended.
+is reused, never duplicated or extended. At the implementation gate
+(issue #219) the recognized outcome additionally decides formality: only
+``CHANGES_REQUESTED`` is a workflow trigger, and a schema-valid
+``ACCEPTED`` stays ordinary displayed conversation.
 
 Failure discipline: known/uncertain adapter failures, unavailable exact
 sessions, stale/foreign subjects, and raced resolutions return typed safe
@@ -108,8 +122,10 @@ from openorc.services.errors import (
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_planning_review_resolution import (
+    TaskPlanningGateChangeRequestOutcome,
     TaskPlanningReviewResolutionOutcome,
     settle_planning_review_resolution,
+    supersede_implementation_authorization_with_changes,
 )
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
@@ -156,6 +172,7 @@ class OwnerReviewerDiscussionExchange(StrEnum):
 
     ORDINARY_REPLY = "ordinary_reply"
     FORMAL_RESOLUTION_SETTLED = "formal_resolution_settled"
+    FORMAL_PLANNING_CHANGE_REQUESTED = "formal_planning_change_requested"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,9 +184,13 @@ class TaskOwnerReviewerDiscussionOutcome:
     is audited as two direction-only events bound to the addressed gate.
     On ``FORMAL_RESOLUTION_SETTLED`` the recognized formal result was
     dispatched to the authoritative exact-subject settlement seam and
-    ``resolution`` carries its outcome; the reply text is not re-exposed
-    here (the settlement events and the runtime's own conversation context
-    own the facts). ``task`` is the still-current Task observed by the
+    ``resolution`` carries its outcome. On
+    ``FORMAL_PLANNING_CHANGE_REQUESTED`` (issue #219) the recognized
+    CHANGES_REQUESTED result at the implementation gate was dispatched to
+    E3's change-request handoff and ``change_request`` carries its
+    outcome. The reply text is not re-exposed for any formal exchange
+    (the dispatched events and the runtime's own conversation context own
+    the facts). ``task`` is the still-current Task observed by the
     post-send recheck. A failed exchange returns a typed error instead of
     an outcome, never a falsely successful one.
     """
@@ -180,6 +201,7 @@ class TaskOwnerReviewerDiscussionOutcome:
     task: Task
     reply_text: str | None
     resolution: TaskPlanningReviewResolutionOutcome | None
+    change_request: TaskPlanningGateChangeRequestOutcome | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,18 +539,20 @@ def _dispatch_formal_resolution(
     producer_runtime_factory: ProducerRuntimeAttachmentFactory | None,
     github: GitHubAppClient | None,
 ) -> TaskOwnerReviewerDiscussionOutcome:
-    """Hand one recognized formal result to the authoritative settlement seam.
+    """Hand one recognized formal result to the authoritative continuation seam.
 
     E4 never mutates gates, loops, or iterations: a plan-subject
     REVIEW_RESOLUTION dispatches the merged E3c settlement with the
-    discussion-audit coordination flag, so the two direction-only message
-    facts commit inside the settlement's own transaction. A formal
-    CHANGES_REQUESTED routes new findings to E2, so the Producer-side
-    attachment is acquired lazily — only now, only for this path — around
-    the settlement call; a formal ACCEPTED needs no Producer attachment
-    and no GitHub client. A PR/head-subject REVIEW_RESOLUTION belongs to
-    E9 (#84): until that seam lands, a recognized result there fails
-    closed with no effect rather than being invented here. The settlement
+    discussion-audit coordination flag, and a still-current plan-subject
+    IMPLEMENTATION_AUTHORIZATION dispatches issue #219's E3 change-request
+    handoff the same way — only a CHANGES_REQUESTED result ever reaches
+    this dispatcher from that gate. A formal CHANGES_REQUESTED routes new
+    findings to E2, so the Producer-side attachment is acquired lazily —
+    only now, only for this path — around the seam call; a formal
+    ACCEPTED at REVIEW_RESOLUTION needs no Producer attachment and no
+    GitHub client. A PR/head-subject REVIEW_RESOLUTION belongs to E9
+    (#84): until that seam lands, a recognized result there fails closed
+    with no effect rather than being invented here. The dispatch target
     re-proves every exact subject in its own transaction, so a raced
     stale result applies nothing.
     """
@@ -538,6 +562,35 @@ def _dispatch_formal_resolution(
         raise ConflictError(
             "the PR/head-subject review resolution is not settleable through this "
             "seam; PR-review settlement arrives with later PR-review work"
+        )
+    if gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
+        # Issue #219: the Reviewer change request at the accepted-plan gate
+        # hands planning back to the Producer through E3's exact-plan G1
+        # handoff; only the CHANGES_REQUESTED outcome reaches this branch.
+        if producer_runtime_factory is None:
+            raise InvalidCommandError(
+                "the formal continuation requires the deferred producer runtime attachment factory"
+            )
+        with producer_runtime_factory() as producer_runtime:
+            change_request = supersede_implementation_authorization_with_changes(
+                pool,
+                producer_runtime,
+                github,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                review_result=formal_result,
+                record_discussion_message_events=True,
+            )
+        return TaskOwnerReviewerDiscussionOutcome(
+            exchange=OwnerReviewerDiscussionExchange.FORMAL_PLANNING_CHANGE_REQUESTED,
+            owner_gate=subjects.gate,
+            reviewer_session=subjects.reviewer,
+            task=change_request.task,
+            reply_text=None,
+            resolution=None,
+            change_request=change_request,
         )
     if formal_result.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
         if producer_runtime_factory is None:
@@ -575,6 +628,7 @@ def _dispatch_formal_resolution(
         task=resolution.task,
         reply_text=None,
         resolution=resolution,
+        change_request=None,
     )
 
 
@@ -599,8 +653,10 @@ def send_owner_reviewer_discussion_message(
     Phase-1 external session identity; the relevant currentness facts are
     revalidated after acquisition and again after the send; and the
     reply's classification decides only between ordinary audit and formal
-    settlement dispatch. No database transaction spans the attachment or
-    the send, and no failure path ever applies workflow authority.
+    continuation dispatch (the E3c settlement, or issue #219's E3
+    implementation-gate change-request handoff). No database transaction
+    spans the attachment or the send, and no failure path ever applies
+    workflow authority.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DISCUSSION_SPAN_NAME) as span:
         # --- Phase 0: command shape (no I/O). ---
@@ -657,11 +713,20 @@ def send_owner_reviewer_discussion_message(
             )
 
         # Recognition is pure text work on the already-received reply; it
-        # runs only at a REVIEW_RESOLUTION gate and decides which effects
-        # (if any) the still-current reply may have.
+        # runs only at REVIEW_RESOLUTION and plan-subject
+        # IMPLEMENTATION_AUTHORIZATION gates and decides which effects (if
+        # any) the still-current reply may have.
         formal_result: ReviewResult | None = None
         if subjects.gate.gate_type is OwnerGateType.REVIEW_RESOLUTION:
             formal_result = _recognize_formal_review_result(reply.text)
+        elif subjects.gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
+            recognized = _recognize_formal_review_result(reply.text)
+            if recognized is not None and recognized.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
+                # Issue #219: at the implementation gate only a valid
+                # CHANGES_REQUESTED reply is an actionable formal trigger;
+                # a standalone ACCEPTED — like ordinary prose — stays
+                # advisory and the Owner may still approve the gate.
+                formal_result = recognized
 
         # --- Phase 3: post-send recheck + effects (one short transaction). ---
         with composed_transaction(pool) as transaction_pool:
@@ -714,4 +779,5 @@ def send_owner_reviewer_discussion_message(
             task=current.task,
             reply_text=reply.text,
             resolution=None,
+            change_request=None,
         )

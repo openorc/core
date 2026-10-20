@@ -31,20 +31,27 @@ Durable decision semantics:
   loops only. No new persistent budget counters exist: the budget state is
   derived from the loop's ordered finalized iteration history.
 - Owner-mediated mode is sticky and derived from durable OwnerGate
-  history: once any REVIEW_RESOLUTION gate exists for the Task, every
-  further ``CHANGES_REQUESTED`` immediately creates a NEW exact-plan
-  REVIEW_RESOLUTION gate instead of refreshing the autonomous allowance.
-  After E3c's formal Owner-mediated settlement, the same OPEN loop
+  history: once any REVIEW_RESOLUTION gate — or any
+  IMPLEMENTATION_AUTHORIZATION gate (issue #219: a Reviewer-triggered
+  change request at the accepted-plan implementation gate) — exists for
+  the Task, every further ``CHANGES_REQUESTED`` immediately creates a NEW
+  exact-plan REVIEW_RESOLUTION gate instead of refreshing the autonomous
+  allowance. After E3c's formal Owner-mediated settlement or the
+  implementation-gate change-request handoff, the same OPEN loop
   continues; the sticky rule derives from recorded history, never from an
   in-memory flag.
 - ``REVIEW_LIMIT_REACHED`` is recorded on the FIRST exhaustion only — the
-  exhaustion that occurs while no REVIEW_RESOLUTION gate exists in
-  durable history. Later Owner-mediated disagreements create fresh gates
-  and record ``PLAN_REVIEWED``/``OWNER_GATE_CREATED`` without
-  re-representing the already-exhausted budget as newly reached.
-- ACCEPTED at any round closes the ReviewLoop and yields the exact
-  accepted PlanRevision and finalized iteration evidence for E5 — without
-  creating IMPLEMENTATION_AUTHORIZATION and without mutating the Task.
+  exhaustion that occurs while no REVIEW_RESOLUTION or
+  IMPLEMENTATION_AUTHORIZATION gate exists in durable history. Later
+  Owner-mediated disagreements create fresh gates and record
+  ``PLAN_REVIEWED``/``OWNER_GATE_CREATED`` without re-representing the
+  already-exhausted budget as newly reached.
+- ACCEPTED at any round leaves the single Task planning ReviewLoop OPEN
+  (issue #219) and yields the exact accepted PlanRevision and finalized
+  iteration evidence for E5 — without closing the loop, granting
+  implementation authority, creating IMPLEMENTATION_AUTHORIZATION, or
+  mutating the Task. E5's Owner approval closes the loop atomically; a
+  closed loop never reopens and never gains a second loop.
 - A within-budget ``CHANGES_REQUESTED`` keeps the Task PLANNING and the
   loop OPEN; the exact finalized findings are routed to merged E2
   (:func:`openorc.services.task_plan_production.revise_task_plan`) OUTSIDE
@@ -139,8 +146,10 @@ _PROTOCOL_REVIEW_OUTCOMES: Mapping[str, ReviewOutcome] = {
 class PlanningReviewDecision(StrEnum):
     """The durable next decision committed with one finalized planning review.
 
-    ``ACCEPTED_CLEAR`` closes the ReviewLoop and yields the accepted plan
-    evidence to E5. ``REVISION_ROUTED`` records an in-budget change request
+    ``ACCEPTED_CLEAR`` leaves the single planning ReviewLoop OPEN and
+    yields the accepted plan evidence to E5 (issue #219; E5's Owner
+    approval closes the loop atomically). ``REVISION_ROUTED`` records an
+    in-budget change request
     whose finalized findings were routed to E2 (the outcome always carries
     the produced revision continuation). ``EXHAUSTED`` records the
     Owner-resolution pause with its exact-plan REVIEW_RESOLUTION gate.
@@ -158,12 +167,13 @@ class TaskPlanningReviewDecisionOutcome:
     ``review_iteration`` is the finalized attempt (complete result facts,
     immutable from here on) and ``plan_revision`` the exact reviewed
     (current) PlanRevision. ``review_loop`` is the loop's post-mutation
-    state (CLOSED after acceptance; OPEN otherwise). ``task`` is the
-    post-mutation Task where one applied — ``waiting_for_owner`` with the
-    installed gate pointer and a rotated token when exhausted, the
-    revision-produced Task carried by ``revision_production`` when routed —
-    and the verified unchanged PLANNING Task after acceptance. E5 consumes
-    the accepted evidence; E3c consumes ``resolution_gate``.
+    state (OPEN after acceptance too — issue #219: E5's Owner approval
+    closes it; OPEN otherwise). ``task`` is the post-mutation Task where
+    one applied — ``waiting_for_owner`` with the installed gate pointer
+    and a rotated token when exhausted, the revision-produced Task carried
+    by ``revision_production`` when routed — and the verified unchanged
+    PLANNING Task after acceptance. E5 consumes the accepted evidence;
+    E3c consumes ``resolution_gate``.
     """
 
     decision: PlanningReviewDecision
@@ -415,16 +425,25 @@ def _finding_documents(result: ReviewResult) -> list[dict[str, str]]:
 
 
 def _owner_mediated_history(gates: Sequence[OwnerGate]) -> bool:
-    """Whether durable gate history already carries a REVIEW_RESOLUTION decision.
+    """Whether durable gate history already carries Owner mediation.
 
-    The one durable stickiness source (issue #210): once any
-    REVIEW_RESOLUTION gate exists for the Task — any status, any subject
-    form — the Task is in Owner-mediated mode and every further change
-    request immediately exhausts instead of refreshing the autonomous
-    allowance. Derived per decision from recorded history; no in-memory
-    flag and no persistent marker exist.
+    The one durable stickiness source (issue #210, extended by issue
+    #219): once any REVIEW_RESOLUTION gate — or any
+    IMPLEMENTATION_AUTHORIZATION gate — exists for the Task (any status,
+    any subject form), the Task is in Owner-mediated mode and every
+    further change request immediately exhausts instead of refreshing the
+    autonomous allowance. An IMPLEMENTATION_AUTHORIZATION gate enters
+    durable history only while the Task is ``waiting_for_owner``, and a
+    change request at it supersedes it through the G1 handoff, so its
+    presence at a PLANNING-state decision proves an implementation-gate
+    change request already happened. Derived per decision from recorded
+    history; no in-memory flag and no persistent marker exist.
     """
-    return any(gate.gate_type is OwnerGateType.REVIEW_RESOLUTION for gate in gates)
+    return any(
+        gate.gate_type is OwnerGateType.REVIEW_RESOLUTION
+        or gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION
+        for gate in gates
+    )
 
 
 def _reviewer_actor(reviewer: TaskAgentSession) -> event_coordination.WorkflowActorContext:
@@ -577,28 +596,25 @@ def _apply_decision(
 ) -> _Finalization:
     """Apply the derived decision's durable effects in the same transaction.
 
-    ACCEPTED closes the loop (the accepted evidence returns to the caller
-    for E5). An exhausted change request — past the snapshotted autonomous
-    budget, or with Owner mediation already sticky from durable gate
-    history — creates and installs the exact-plan pending
+    ACCEPTED leaves the single planning ReviewLoop OPEN (issue #219): the
+    accepted evidence returns to the caller for E5, whose Owner approval
+    closes the loop atomically. An exhausted change request — past the
+    snapshotted autonomous budget, or with Owner mediation already sticky
+    from durable gate history — creates and installs the exact-plan pending
     REVIEW_RESOLUTION gate and moves the Task to ``waiting_for_owner`` in
     one atomic composition, recording ``REVIEW_LIMIT_REACHED`` on the first
     exhaustion only. A within-budget change request leaves the Task
     PLANNING and the loop OPEN for the E2 routing that follows outside.
     """
     if finalized_outcome is ReviewOutcome.ACCEPTED:
-        closed_loop = review_records.close_review_loop(
-            transaction_pool, review_loop_id=locked_loop.id
-        )
-        if closed_loop is None:
-            raise StaleOperationError(
-                "the planning review loop is no longer open; the decision is stale"
-            )
+        # Issue #219: acceptance only makes the exact PlanRevision eligible
+        # for Owner authorization. The loop stays OPEN — E5's Owner approval
+        # closes it atomically — and the Task is not mutated here.
         return _Finalization(
             _Phase1Decision.ACCEPTED,
             finalized,
             persisted_revision,
-            closed_loop,
+            locked_loop,
             task,
             None,
         )
@@ -703,8 +719,9 @@ def finalize_planning_review_decision(
     uncertain E2 operation is never resent here. On exhaustion the
     exact-plan pending REVIEW_RESOLUTION gate is created and installed, the
     Task moves to ``waiting_for_owner``, and exhausted findings are never
-    forwarded. On acceptance the loop closes and the accepted evidence is
-    yielded for E5 without creating IMPLEMENTATION_AUTHORIZATION.
+    forwarded. On acceptance the loop stays OPEN (issue #219) and the
+    accepted evidence is yielded for E5 without creating
+    IMPLEMENTATION_AUTHORIZATION.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DECISION_SPAN_NAME) as span:
         _require_uuid_command(profile_id, "profile_id")

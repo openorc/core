@@ -259,3 +259,15 @@ Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/ser
   PR/head settlement later in E9). The STALE/NO_OP outcome contract is
   unchanged, and the Owner-facing resolution service refuses ``SETTLED``
   so ordinary Owner semantics stay untouched.
+- `supersede_current_owner_gate` (issue #219) is the sibling
+  Reviewer-triggered continuation primitive: the exact current pending gate
+  loses currency WITHOUT any terminal stamp — the gate row is never touched
+  and stays pending history (no `decided_at`, no Owner verdict, never the
+  REVIEW_RESOLUTION-only SETTLED status) — while the current-pointer
+  clears, the Task moves ``waiting_for_owner`` → ``planning``, and the
+  token rotates in one conditional update. Same lock/guard discipline as
+  resolution (Task row ``FOR UPDATE`` first, conditional guards as durable
+  backstops), a SUPERSEDED/STALE outcome contract with no one-shot NO_OP (a
+  replayed supersession finds the gate no longer current and classifies as
+  STALE), and the calling service owns the exact-subject proof (the E3 G1
+  change-request handoff).

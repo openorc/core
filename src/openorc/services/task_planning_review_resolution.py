@@ -13,6 +13,17 @@ for the unchanged exact PlanRevision, records the safe REVIEWER
 clears the exact current-gate pointer, rotates the Task ``state_token``,
 and commits the settlement's durable next decision.
 
+The same module also owns issue #219's sibling seam: at a still-current
+plan-subject ``IMPLEMENTATION_AUTHORIZATION`` gate, a standalone
+schema-valid Reviewer ``review_result`` with ``CHANGES_REQUESTED`` is the
+G1 change-request handoff — a NEW next-numbered immutable ReviewIteration
+for the unchanged exact PlanRevision, the pending implementation gate
+superseded (historically PENDING, no longer current, never stamped with
+an Owner outcome or the REVIEW_RESOLUTION-only SETTLED status), the Task
+``waiting_for_owner`` → ``planning`` with a rotated token, and only the
+newly finalized findings routed to E2 — so a later Reviewer ACCEPTED can
+reach E5 and create a NEW implementation gate.
+
 Durable settlement semantics:
 
 - ``SETTLED`` (issue #211) is the Reviewer-driven terminal gate status,
@@ -20,10 +31,13 @@ Durable settlement semantics:
   reachable only through this seam; the Owner-facing resolution service
   refuses it, so ordinary Owner APPROVED/REJECTED/CANCELLED semantics are
   unchanged and no Owner override exists.
-- A formal ACCEPTED closes the loop and yields the same exact cleared
+- A formal ACCEPTED settles the gate and yields the same exact cleared
   PlanRevision and the new finalized iteration as the accepted evidence
-  for E5's normal IMPLEMENTATION_AUTHORIZATION flow (#80). This seam
-  never issues that gate and never authorizes implementation.
+  for E5's normal IMPLEMENTATION_AUTHORIZATION flow (#80) while the
+  single planning ReviewLoop stays OPEN (issue #219): acceptance only
+  makes the exact PlanRevision eligible for Owner authorization, and
+  E5's Owner approval closes the loop atomically. This seam never issues
+  that gate, never authorizes implementation, and never closes the loop.
 - A formal CHANGES_REQUESTED settles the gate, moves the Task
   ``waiting_for_owner`` → ``planning``, and routes ONLY the newly
   finalized findings to merged E2
@@ -79,8 +93,11 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
-from openorc.persistence.gates import OwnerGateResolutionOutcome
+from openorc.persistence.gates import OwnerGateResolutionOutcome, OwnerGateSupersessionOutcome
 from openorc.persistence.gates import resolve_owner_gate as resolve_gate_records
+from openorc.persistence.gates import (
+    supersede_current_owner_gate as supersede_gate_records,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.models import (
@@ -106,13 +123,19 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "PlanningGateChangeRequestDecision",
     "PlanningReviewResolutionDecision",
+    "TaskPlanningGateChangeRequestOutcome",
     "TaskPlanningReviewResolutionOutcome",
     "settle_planning_review_resolution",
+    "supersede_implementation_authorization_with_changes",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_resolution"
 _SETTLEMENT_SPAN_NAME = "task_planning_review_resolution.settle_planning_review_resolution"
+_GATE_CHANGE_REQUEST_SPAN_NAME = (
+    "task_planning_review_resolution.supersede_implementation_authorization_with_changes"
+)
 
 # The settled protocol outcome vocabulary mapped onto the domain outcome
 # enum; the protocol funnel guarantees exactly these two spellings, and a
@@ -126,11 +149,12 @@ _PROTOCOL_REVIEW_OUTCOMES: Mapping[str, ReviewOutcome] = {
 class PlanningReviewResolutionDecision(StrEnum):
     """The durable next decision committed with one settled resolution gate.
 
-    ``SETTLED_ACCEPTED`` closes the ReviewLoop and yields the exact
-    cleared PlanRevision/iteration evidence for E5's normal
-    IMPLEMENTATION_AUTHORIZATION flow. ``CONTINUATION_ROUTED`` records the
-    settlement whose newly finalized findings were routed to E2 (the
-    outcome carries the produced revision continuation).
+    ``SETTLED_ACCEPTED`` yields the exact cleared PlanRevision/iteration
+    evidence for E5's normal IMPLEMENTATION_AUTHORIZATION flow while the
+    single planning ReviewLoop stays OPEN (issue #219; E5's Owner approval
+    closes it atomically). ``CONTINUATION_ROUTED`` records the settlement
+    whose newly finalized findings were routed to E2 (the outcome carries
+    the produced revision continuation).
     """
 
     SETTLED_ACCEPTED = "settled_accepted"
@@ -144,12 +168,13 @@ class TaskPlanningReviewResolutionOutcome:
     ``review_iteration`` is the NEW finalized settlement iteration
     (immutable from here on) for the unchanged exact ``plan_revision`` —
     the Task's still-current revision. ``review_loop`` is the loop's
-    post-mutation state (CLOSED after acceptance; OPEN otherwise). ``task``
-    is the post-settlement Task (``waiting_for_owner`` with a rotated
-    token and no current gate after acceptance; ``planning`` with a
-    rotated token when routed). ``resolution_gate`` is the settled gate.
-    E5 consumes the accepted evidence; the caller launches the next
-    ordinary E3a REVIEW from ``revision_production``.
+    post-mutation state (always OPEN here — issue #219: E5's Owner
+    approval closes it). ``task`` is the post-settlement Task
+    (``waiting_for_owner`` with a rotated token and no current gate after
+    acceptance; ``planning`` with a rotated token when routed).
+    ``resolution_gate`` is the settled gate. E5 consumes the accepted
+    evidence; the caller launches the next ordinary E3a REVIEW from
+    ``revision_production``.
     """
 
     decision: PlanningReviewResolutionDecision
@@ -159,6 +184,42 @@ class TaskPlanningReviewResolutionOutcome:
     task: Task
     resolution_gate: OwnerGate
     revision_production: TaskPlanProductionOutcome | None
+
+
+class PlanningGateChangeRequestDecision(StrEnum):
+    """The durable next decision committed by one G1 change-request handoff.
+
+    ``PLANNING_CONTINUATION_ROUTED`` records the superseded pending
+    implementation gate and the newly finalized Reviewer change request
+    whose exact findings were routed to E2 (the outcome carries the
+    produced revision continuation). No other decision exists: only a
+    ``CHANGES_REQUESTED`` result is actionable at an implementation gate.
+    """
+
+    PLANNING_CONTINUATION_ROUTED = "planning_continuation_routed"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningGateChangeRequestOutcome:
+    """The durable result of one implementation-gate change-request handoff.
+
+    ``review_iteration`` is the NEW finalized Reviewer change request
+    (immutable from here on) on the unchanged exact ``plan_revision`` —
+    the revision the superseded gate authorizes. ``review_loop`` is the
+    still-OPEN planning ReviewLoop. ``task`` is the post-handoff Task
+    (``planning`` with a rotated token and no current gate).
+    ``superseded_gate`` is the retired implementation gate — historically
+    PENDING with no terminal stamp and no longer current. E2's produced
+    revision continuation is carried by ``revision_production``.
+    """
+
+    decision: PlanningGateChangeRequestDecision
+    review_iteration: ReviewIteration
+    plan_revision: PlanRevision
+    review_loop: ReviewLoop
+    task: Task
+    superseded_gate: OwnerGate
+    revision_production: TaskPlanProductionOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +353,44 @@ def _require_settlement_gate(task: Task, transaction_pool: DatabasePool) -> Owne
         raise StaleOperationError(
             "the resolution gate no longer addresses the task's current plan "
             "revision; the settlement is stale"
+        )
+    return gate
+
+
+def _require_implementation_authorization_gate(
+    task: Task, transaction_pool: DatabasePool
+) -> OwnerGate:
+    """Prove the Task's current gate is the exact-plan implementation gate.
+
+    The superseded gate is THE Task's current gate — resolved from the
+    Task's pointer, never a caller-supplied id — and must be a pending
+    IMPLEMENTATION_AUTHORIZATION gate in the exact plan-subject form (the
+    exact current PlanRevision, no head SHA and no PR binding). Any other
+    gate type, subject form, or moved plan revision never supersedes
+    through the change-request seam (issue #219).
+    """
+    if task.current_owner_gate_id is None:
+        raise ConflictError("the task has no current owner gate to supersede")
+    gate = require_current_owner_gate(
+        transaction_pool, task=task, owner_gate_id=task.current_owner_gate_id
+    )
+    if gate.gate_type is not OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
+        raise ConflictError(
+            "only a pending implementation_authorization gate supersedes through "
+            "the planning change-request seam"
+        )
+    if (
+        gate.plan_revision_id is None
+        or gate.subject_head_sha is not None
+        or gate.task_pull_request_id is not None
+    ):
+        raise ConflictError(
+            "the implementation authorization gate carries no plan revision subject"
+        )
+    if gate.plan_revision_id != task.current_plan_revision_id:
+        raise StaleOperationError(
+            "the implementation authorization gate no longer addresses the task's "
+            "current plan revision; the change request is stale"
         )
     return gate
 
@@ -584,18 +683,15 @@ def _settle_resolution_transaction(
             )
 
         if finalized_outcome is ReviewOutcome.ACCEPTED:
-            closed_loop = review_records.close_review_loop(
-                transaction_pool, review_loop_id=locked_loop.id
-            )
-            if closed_loop is None:
-                raise StaleOperationError(
-                    "the planning review loop is no longer open; the settlement is stale"
-                )
+            # Issue #219: a formal acceptance makes the exact PlanRevision
+            # eligible for Owner authorization but leaves the single
+            # planning ReviewLoop OPEN — E5's Owner approval closes it
+            # atomically — and no Task mutation happens here.
             return _Settlement(
                 PlanningReviewResolutionDecision.SETTLED_ACCEPTED,
                 finalized,
                 revision,
-                closed_loop,
+                locked_loop,
                 settled_task,
                 settled_gate,
             )
@@ -651,11 +747,12 @@ def settle_planning_review_resolution(
     audit events, the gate's ``SETTLED`` stamp with Reviewer provenance,
     the cleared current-gate pointer, and the rotated Task token.
 
-    On a formal ACCEPTED the loop closes and the accepted evidence returns
-    for E5's normal IMPLEMENTATION_AUTHORIZATION flow — no gate is issued
-    and no implementation is authorized here. On a formal
-    CHANGES_REQUESTED the Task returns to ``planning`` and the exact
-    newly finalized findings route to merged E2
+    On a formal ACCEPTED the planning ReviewLoop stays OPEN (issue #219)
+    and the accepted evidence returns for E5's normal
+    IMPLEMENTATION_AUTHORIZATION flow — no gate is issued, no
+    implementation is authorized, and the loop is not closed here. On a
+    formal CHANGES_REQUESTED the Task returns to ``planning`` and the
+    exact newly finalized findings route to merged E2
     (:func:`revise_task_plan`) with NO database transaction open; only
     E2's newly persisted current PlanRevision and post-update token may
     launch E3a's next ordinary REVIEW, and an uncertain E2 operation is
@@ -744,4 +841,275 @@ def settle_planning_review_resolution(
             task=settlement.task,
             resolution_gate=settlement.settled_gate,
             revision_production=None,
+        )
+
+
+# --- the implementation-gate change-request handoff (issue #219) -------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GateChangeRequest:
+    """The committed Phase-1 facts awaiting the external consequence."""
+
+    finalized_iteration: ReviewIteration
+    superseded_revision: PlanRevision
+    loop: ReviewLoop
+    task: Task
+    superseded_gate: OwnerGate
+
+
+def _supersede_implementation_gate_transaction(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: ReviewResult,
+    record_discussion_message_events: bool,
+) -> _GateChangeRequest:
+    """Supersede the implementation gate and commit the continuation atomically.
+
+    Composition (database only; the external consequence follows outside):
+    the account operational barrier, exact Owner Workspace/Task scope, the
+    Task row locked ``FOR UPDATE`` (serializing the supersession against
+    every concurrent Task mutation — a raced Owner approval or cancellation
+    wins and the change request applies nothing), the exact current
+    ``waiting_for_owner`` Task under the caller's expected token, the exact
+    current pending plan-subject IMPLEMENTATION_AUTHORIZATION gate, the
+    unchanged exact current PlanRevision it authorizes, the re-locked OPEN
+    planning loop, and the exact existing admitted READY Reviewer binding.
+    The NEW next-numbered finalized change-request iteration is reserved
+    and finalized on the unchanged revision in the same transaction, the
+    safe REVIEWER audit events are recorded, and the gate is superseded
+    through the narrow conditional persistence primitive — pointer clear,
+    ``waiting_for_owner`` → ``planning``, token rotation — while the gate
+    row itself stays untouched: still PENDING with no ``decided_at`` stamp
+    (never an Owner APPROVED/REJECTED/CANCELLED verdict, never the
+    REVIEW_RESOLUTION-only SETTLED status), and no ``OWNER_GATE_RESOLVED``
+    event is emitted. When ``record_discussion_message_events`` is set
+    (E4's formal-exchange path, issue #79), the two direction-only
+    OWNER ↔ Reviewer discussion message events ride this same transaction,
+    so a failed event write rolls the entire supersession back.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        require_workspace_task(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        # Serialize the supersession against concurrent Task mutations on
+        # the Task row before any currentness decision (existing Task
+        # persistence; no new lock, index, or queue machinery).
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        if task.status is not TaskStatus.WAITING_FOR_OWNER:
+            raise ConflictError("the addressed task is not waiting on its owner gate")
+        gate = _require_implementation_authorization_gate(task, transaction_pool)
+        if gate.plan_revision_id is None:  # the plan-subject form proved above
+            raise ConflictError("the implementation gate carries no plan revision subject")
+        revision = require_current_plan_revision(
+            transaction_pool,
+            task=task,
+            plan_revision_id=gate.plan_revision_id,
+        )
+        locked_loop = _require_open_planning_loop(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        reviewer = _require_resolution_reviewer(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        finalized = _reserve_and_finalize_settlement_iteration(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            loop=locked_loop,
+            revision=revision,
+            result=result,
+            outcome=ReviewOutcome.CHANGES_REQUESTED,
+        )
+        if finalized.outcome is not ReviewOutcome.CHANGES_REQUESTED:
+            # Unreachable through the one-shot conditional write (the
+            # returned row carries the supplied change-request result);
+            # fail closed rather than record a verdict-less event.
+            raise ConflictError("the finalized review iteration carries no change request")
+
+        event_coordination.record_plan_reviewed_event(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            review_iteration_id=finalized.id,
+            actor=_reviewer_actor(reviewer),
+            outcome=ReviewOutcome.CHANGES_REQUESTED,
+        )
+
+        supersession = supersede_gate_records(
+            transaction_pool,
+            owner_gate_id=gate.id,
+            expected_task_state_token=expected_state_token,
+        )
+        if (
+            supersession.outcome is not OwnerGateSupersessionOutcome.SUPERSEDED
+            or supersession.gate is None
+            or supersession.task is None
+        ):
+            # The exact-subject guards above make this unreachable in
+            # practice; classify it as stale rather than proceed with a
+            # half-proved supersession.
+            raise StaleOperationError(
+                "the implementation authorization gate could not be superseded; "
+                "the change request is stale"
+            )
+        superseded_task = supersession.task
+
+        if record_discussion_message_events:
+            # E4's formal-exchange audit rides this same transaction (issue
+            # #79): two direction-only discussion message events for the
+            # exchange that produced this result — the Owner message routed
+            # to the Reviewer and the Reviewer reply that carried the formal
+            # change request — both subject-bound to the superseded gate. A
+            # failed event write rolls the whole supersession back, so the
+            # discussion facts and the authoritative handoff commit or
+            # vanish together and no partial success is representable.
+            event_coordination.record_owner_reviewer_discussion_message_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=gate.id,
+                actor=event_coordination.owner_actor(profile_id),
+                direction=event_coordination.OwnerReviewerDiscussionDirection.OWNER_TO_REVIEWER,
+            )
+            event_coordination.record_owner_reviewer_discussion_message_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=gate.id,
+                actor=_reviewer_actor(reviewer),
+                direction=event_coordination.OwnerReviewerDiscussionDirection.REVIEWER_TO_OWNER,
+            )
+
+        return _GateChangeRequest(
+            finalized_iteration=finalized,
+            superseded_revision=revision,
+            loop=locked_loop,
+            task=superseded_task,
+            superseded_gate=supersession.gate,
+        )
+
+
+def supersede_implementation_authorization_with_changes(
+    pool: DatabasePool,
+    runtime: AgentRuntimeAdapter | None,
+    github: GitHubAppClient | None,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    review_result: ReviewResult,
+    record_discussion_message_events: bool = False,
+) -> TaskPlanningGateChangeRequestOutcome:
+    """Hand one Reviewer change request at the implementation gate back to planning.
+
+    E4's formal-result recognition at a still-current plan-subject
+    IMPLEMENTATION_AUTHORIZATION gate (issue #219) supplies the validated
+    typed CHANGES_REQUESTED ``ReviewResult``; this seam rechecks every
+    exact subject and, in ONE short composed transaction, allocates and
+    finalizes a NEW next-numbered immutable ReviewIteration for the
+    unchanged exact PlanRevision, records the safe REVIEWER
+    ``PLAN_REVIEWED`` audit event, supersedes the exact current pending
+    implementation gate (pointer clear, ``waiting_for_owner`` →
+    ``planning``, token rotation — the gate stays historically PENDING
+    with no terminal stamp and no fabricated ``OWNER_GATE_RESOLVED``
+    event), and commits the durable continuation. A raced Owner
+    approval/cancellation serializes on the same Task row lock; only one
+    can succeed.
+
+    The E2 continuation dependencies are proven at entry — at this gate
+    the only formal outcome routes to E2 — so an unavailable Producer-side
+    runtime adapter or GitHub client can never strand an already-superseded
+    gate (the same no-stranding guarantee as the settlement seam). The
+    external E2 send happens with NO transaction open and an uncertain
+    outcome is never resent here: the supersession stays durable and
+    recovery belongs to E2's own seam and later orchestration. Only E2's
+    newly persisted revision and post-update token may launch E3a's next
+    ordinary REVIEW; the Reviewer's later ACCEPTED reaches E5 and creates
+    a NEW implementation gate.
+
+    Scope discipline (Phase 2E): this seam never assesses plan semantics,
+    never dispatches REVIEW (E3a), never decides the ordinary bounded
+    budget (E3b), never implements discussion transport (E4), never
+    creates or resolves gates beyond the one supersession, never issues
+    IMPLEMENTATION_AUTHORIZATION (E5), and never touches PR/head subjects.
+    A stale, foreign, replayed, superseded, non-READY, or non-formal input
+    never supersedes the gate: it fails closed with the typed vocabulary
+    and applies nothing.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _GATE_CHANGE_REQUEST_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        result = _require_formal_result(review_result)
+        if _resolution_outcome(result) is not ReviewOutcome.CHANGES_REQUESTED:
+            # Issue #219: only a change request is actionable at an
+            # implementation gate; an ACCEPTED reply is E4's advisory
+            # conversation and never reaches this seam.
+            raise InvalidCommandError(
+                "only a CHANGES_REQUESTED review result supersedes an "
+                "implementation authorization gate"
+            )
+        # The routing decision is fixed for this seam — the change request
+        # always routes to E2 — so both continuation dependencies are
+        # proven BEFORE the supersession transaction; an invalid or missing
+        # dependency can never strand an already-superseded gate.
+        runtime_adapter = _require_runtime(runtime)
+        github_client = _require_github(github)
+        annotate_span(
+            span,
+            operation=_GATE_CHANGE_REQUEST_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: gate supersession (database only). ---
+        change_request = _supersede_implementation_gate_transaction(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            result=result,
+            record_discussion_message_events=record_discussion_message_events,
+        )
+
+        # --- Phase 2: the external consequence, with NO transaction open. ---
+        production = revise_task_plan(
+            pool,
+            runtime_adapter,
+            github_client,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            profile_id=profile_id,
+            expected_state_token=change_request.task.state_token,
+            prior_plan_revision_id=change_request.superseded_revision.id,
+            review_iteration_id=change_request.finalized_iteration.id,
+        )
+        return TaskPlanningGateChangeRequestOutcome(
+            decision=PlanningGateChangeRequestDecision.PLANNING_CONTINUATION_ROUTED,
+            review_iteration=change_request.finalized_iteration,
+            plan_revision=change_request.superseded_revision,
+            review_loop=change_request.loop,
+            task=production.task,
+            superseded_gate=change_request.superseded_gate,
+            revision_production=production,
         )
