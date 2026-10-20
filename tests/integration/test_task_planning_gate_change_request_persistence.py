@@ -395,7 +395,13 @@ def test_the_gate_change_handoff_commits_its_cross_record_composition_atomically
         {"type": "plan_result", "schema_version": 1, "plan": _REVISED_PLAN_TEXT},
     )
 
-    outcome = _handoff_call(pool, adapter, github, facts)
+    outcome = _handoff_call(
+        pool,
+        adapter,
+        github,
+        facts,
+        record_discussion_message_events=True,
+    )
 
     assert outcome.decision is PlanningGateChangeRequestDecision.PLANNING_CONTINUATION_ROUTED
     gate = gate_repositories.get_owner_gate(pool, owner_gate_id=facts["gate_id"])
