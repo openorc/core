@@ -458,4 +458,53 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   present a failed exchange as success; recovery/durable dispatch belongs
   to #85/#87–#90, never to this service.
 
+## E5: implementation authorization and the planning close boundary (issue #80)
+
+- `task_implementation_authorization.open_implementation_authorization` is
+  the ONE gate-presentation seam: an Owner-authorized continuation of
+  accepted formal review that derives every clearance fact from the
+  canonical tables inside one short composed transaction — the account
+  operational barrier, exact Owner Workspace/Task scope, the Task row
+  locked `FOR UPDATE` under the caller's expected token, the pre-gate
+  state (`planning` after ordinary E3b acceptance, or `waiting_for_owner`
+  with no current gate after E3c settlement), the exact current
+  PlanRevision, the re-locked single OPEN planning ReviewLoop, and the
+  latest adjudicating finalized Reviewer ACCEPTED bound to that exact
+  revision — then creates and installs one pending exact-plan
+  IMPLEMENTATION_AUTHORIZATION gate, moves a still-`planning` Task to
+  `waiting_for_owner`, and records the safe OPENORC `OWNER_GATE_CREATED` +
+  `PLAN_READY` facts. It never trusts a caller's free-text acceptance or a
+  detached E3b/E3c outcome object, never dispatches the Producer, never
+  appends a Reviewer iteration, and a replay/race can never duplicate the
+  current gate. After #219 retires a presented gate, a distinct
+  Reviewer-accepted revision earns a NEW gate through the same path.
+- `approve_implementation_authorization` is the one irreversible planning
+  boundary: the exact current pending gate resolves APPROVED with truthful
+  OWNER provenance, the planning ReviewLoop closes exactly once (only
+  now), the Task moves `waiting_for_owner` to `implementing` under a
+  rotated token, and the `OWNER_GATE_RESOLVED` (approved) +
+  `IMPLEMENTATION_AUTHORIZED` events commit atomically with them — a
+  forced late failure leaves no partial facts. It returns the durable
+  Task/gate/revision/iteration/loop handoff for E6 (#81) and never
+  realizes or sends anything: E6 owns all runtime interaction, including
+  addressing the READY Producer binding. A post-approval replay is stale
+  (the resolution is one-shot), never a second approval.
+- `cancel_implementation_authorization` is the narrow cancel-at-gate
+  orchestration: the exact pending gate resolves CANCELLED with OWNER
+  provenance (never REJECTED — there is no Owner "Decline") and the Task
+  archives CANCELLED with its safe OWNER `TASK_CANCELLED` event in one
+  composition, so an exact pending gate cannot survive its Task's
+  cancellation. Broad cross-stage cancellation belongs to E10 (#85); a
+  Task with no current gate cancels through the existing `archive_task`
+  primitive.
+- E4's `send_owner_reviewer_discussion_message` stays the only discussion
+  transport at the pending gate; E5 reads no discussion state and adds no
+  reconsideration command, so ordinary discussion keeps the gate pending
+  and approvable, and an advisory standalone Reviewer ACCEPTED at the gate
+  never re-derives clearance. New #56 event mappings:
+  `record_plan_ready_event` (OPENORC, plan-revision subject) and
+  `record_implementation_authorized_event` (OWNER, plan-revision subject);
+  both accept no content parameter, so no canonical fact is shadowed into
+  event context.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

@@ -65,9 +65,13 @@ __all__ = [
     "WorkflowActorContext",
     "owner_actor",
     "record_guidance_changed_event",
+    "record_implementation_authorized_event",
+    "record_owner_gate_created_event",
+    "record_guidance_changed_event",
     "record_owner_gate_created_event",
     "record_owner_gate_resolved_event",
     "record_owner_reviewer_discussion_message_event",
+    "record_plan_ready_event",
     "record_plan_reviewed_event",
     "record_plan_revision_created_event",
     "record_plan_revision_revised_event",
@@ -469,6 +473,65 @@ def record_plan_revision_revised_event(
         plan_revision_id=plan_revision_id,
         actor=actor,
         event_type=WorkflowEventType.PLAN_REVISION_REVISED,
+    )
+
+
+def record_plan_ready_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_revision_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one Reviewer-accepted plan becoming ready for Owner authorization (issue #80).
+
+    Task-scoped; the primary modeled subject is the accepted PlanRevision
+    (``subject_type``/``subject_id``) over the Task scope. The actor is the
+    safe control-plane identity supplied by the calling capability: E5's
+    gate presentation is OpenOrc's coordination fact — the accepted plan is
+    presented automatically as the natural continuation of accepted formal
+    review — and never an Owner decision. The helper accepts no plan-text
+    or evidence parameter, so nothing but the modeled subject fact can ever
+    be copied into the event; the acceptance evidence stays canonical on
+    the ReviewIteration and the presented gate record.
+    """
+    _record_plan_revision_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_revision_id=plan_revision_id,
+        actor=actor,
+        event_type=WorkflowEventType.PLAN_READY,
+    )
+
+
+def record_implementation_authorized_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_revision_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record the Owner's implementation authorization of one exact plan (issue #80).
+
+    Task-scoped; the primary modeled subject is the authorized PlanRevision
+    (``subject_type``/``subject_id``) over the Task scope. The actor is the
+    authenticated Owner logical identity supplied by the calling capability:
+    this is the safe audit fact of the human authorization boundary, whose
+    decision record is the APPROVED IMPLEMENTATION_AUTHORIZATION gate
+    (subjected by the paired ``owner_gate_resolved`` event). The helper
+    accepts no plan-text or decision-detail parameter, so nothing but the
+    modeled subject fact can ever be copied into the event.
+    """
+    _record_plan_revision_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_revision_id=plan_revision_id,
+        actor=actor,
+        event_type=WorkflowEventType.IMPLEMENTATION_AUTHORIZED,
     )
 
 
