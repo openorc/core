@@ -41,7 +41,7 @@ from psycopg.errors import IntegrityError
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.cline.activity import ClineActivityKind, ClineActivityObservation
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.executions import ExecutionStatus
+from openorc.domain.executions import ExecutionDomainError, ExecutionStatus
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewOutcome
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import TaskStatus
@@ -542,9 +542,11 @@ def test_the_claim_completion_and_marker_conditionals_hold_on_real_rows(
     assert completed.status is ExecutionStatus.SUCCEEDED
     assert completed.implementation_result == payload
 
-    # Duplicate completion, post-finalization marker writes, and any
-    # further status transition are all rejected no-ops on absorbing
-    # history.
+    # Duplicate completion and post-finalization marker writes are rejected
+    # conditional no-ops: no row carries the caller's expected nonfinal
+    # status, so the guarded statements apply no row. A transition OUT of a
+    # terminal status is different in kind — the established lifecycle
+    # contract forbids it outright and rejects it before any SQL runs.
     assert (
         execution_repositories.complete_execution_with_result(
             pool, execution_id=execution.id, implementation_result=payload
@@ -552,15 +554,13 @@ def test_the_claim_completion_and_marker_conditionals_hold_on_real_rows(
         is None
     )
     assert execution_repositories.record_execution_activity(pool, execution_id=execution.id) is None
-    assert (
+    with pytest.raises(ExecutionDomainError):
         execution_repositories.update_execution_status(
             pool,
             execution_id=execution.id,
             expected_status=ExecutionStatus.SUCCEEDED,
             next_status=ExecutionStatus.RUNNING,
         )
-        is None
-    )
     reread = execution_repositories.get_execution(pool, execution_id=execution.id)
     assert reread is not None
     assert reread.status is ExecutionStatus.SUCCEEDED
