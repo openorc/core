@@ -584,4 +584,67 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   references and empty or failure-kind-only context — no canonical fact is
   shadowed into event context.
 
+## E7: the exact-head PR authorization gate (issue #82)
+
+- `task_pr_authorization.open_pr_authorization` is the ONE
+  `PR_AUTHORIZATION` presentation seam, and `approve_pr_authorization` /
+  `cancel_pr_authorization` are its only Owner actions — Approve and
+  Cancel, nothing else. The merged generic E4 discussion service is never
+  called at this gate type, and no Discuss, Decline/Reject,
+  changes-request, formal Reviewer iteration, or Reviewer pre-PR review
+  path exists here.
+- The trigger is durable, never conversational: only the persisted
+  successful current E6 Execution (the Task's latest attempt, `SUCCEEDED`,
+  non-NULL `implementation_result` whose persisted envelope re-derives as
+  the `implementation_result` family at the pinned schema version with
+  `status: COMPLETED` and a usable `branch` routing claim) may open the
+  gate. No webhook, runtime text, or caller-supplied branch/SHA/outcome is
+  authority; the original Producer binding is re-proven; an optional
+  caller `execution_id` must be exactly the latest attempt.
+- Composition: admission+authority (one short transaction under the Task
+  row lock: exact token, non-archived `implementing`, no current gate, no
+  canonical `TaskPullRequest`, the E5-approved exact-plan evidence, the
+  CLOSED planning loop with its Reviewer acceptance, the qualifying
+  execution) → fresh GitHub verification with NO transaction open (B3
+  `reconcile_repository_issue` on the Task's routed repository, then the
+  shared read-only `canonical_branch.observe_routed_repository_branch` B7
+  seam for the branch/head — GitHub alone supplies the committed SHA) →
+  the final short transaction re-proves every admission fact under the
+  lock and commits the one-time `bind_canonical_branch`, one pending
+  exact-head gate (`subject_head_sha` only — no PlanRevision, no PR
+  binding), `implementing → waiting_for_owner` under token rotation, and
+  the OPENORC `OWNER_GATE_CREATED` audit together. Replay/race can never
+  create a second gate or an orphaned bind; a bound same-branch
+  continuation re-verifies without rebinding; a different-branch claim is
+  a conflict, never adoption.
+- Source invalidity is reason-specific: ONLY a confirmed requirements
+  fingerprint change against the Task's immutable baseline takes the
+  atomic `BLOCKED / GITHUB_SOURCE_CHANGED` path — one short transaction
+  re-proving the drift durably under the Task lock, then
+  `create_task_block` + `implementing → blocked` (token rotation) + the
+  `task_blocked` audit (the first `record_task_blocked_event` mapping,
+  task_block subject, no context shadowing the block row) commit or roll
+  back together, with no gate. A closed source issue, a stable-identity
+  mismatch, access loss, known provider failure, and uncertain outcomes
+  are typed fail-closed refusals (`ConflictError` / `AuthorizationError` /
+  `ExternalOperation*Error`) that fabricate no drift, no block, and no
+  gate. Recovery from `blocked` belongs to later layers, not this leaf.
+- Approve: one short transaction proving the account barrier, exact Owner
+  scope, the current non-archived `waiting_for_owner` Task under the
+  expected token, the exact current pending `PR_AUTHORIZATION` gate with
+  its head-SHA subject, the bound canonical branch, and coherent E6
+  success/approved-plan evidence (the persisted branch claim equals the
+  bound branch); resolves ONLY that gate APPROVED one-shot (pointer clear
+  + token rotation) with the OWNER-attributed `OWNER_GATE_RESOLVED` audit
+  (authenticated Profile `actor_id` — E8's durable approving-Profile
+  recovery). The Task stays `waiting_for_owner`: no `reviewing`
+  transition, no PR creation, no dispatch, ever. Cancel: the E5
+  cancellation pattern — the gate CANCELLED with OWNER provenance and
+  terminal `cancelled` archival with `TASK_CANCELLED` in one transaction;
+  no GitHub artifact is touched.
+- E7 never calls `publish_task_pull_request`, `pr_compose`, GitHub
+  create-PR, Reviewer PR review, or merge, and never calls the Producer;
+  E8 (#83) owns publication. No database transaction spans GitHub I/O;
+  telemetry carries only the safe identifier vocabulary.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
