@@ -24,7 +24,11 @@ Normal lifecycle: one pending gate is installed as current (through
 replace an existing current gate), resolved while current, and only then
 may another pending gate be installed. Resolved gates are immutable
 historical records; a pending gate that loses currency stays pending as
-history and is never rewritten into an outcome.
+history and is never rewritten into an outcome. Currency can also be lost
+without any terminal stamp: :func:`supersede_current_owner_gate` (issue
+#219) clears the current pointer and returns the Task to planning while
+the addressed pending gate stays pending as history — the
+Reviewer-triggered continuation of an accepted-plan implementation gate.
 
 Subject construction is validated here to mirror the domain/DB coherence
 (a transaction cannot commit a subject shape the domain rejects): each
@@ -50,7 +54,7 @@ from openorc.domain.gates import (
     OwnerGateStatus,
     OwnerGateType,
 )
-from openorc.domain.tasks import Task
+from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import _TASK_COLUMNS, _task_from_row
 from openorc.persistence.time import normalize_utc
@@ -59,10 +63,13 @@ from openorc.persistence.transactions import transaction
 __all__ = [
     "OwnerGateResolution",
     "OwnerGateResolutionOutcome",
+    "OwnerGateSupersession",
+    "OwnerGateSupersessionOutcome",
     "create_owner_gate",
     "get_owner_gate",
     "list_task_owner_gates",
     "resolve_owner_gate",
+    "supersede_current_owner_gate",
 ]
 
 _OWNER_GATE_COLUMNS = (
@@ -378,4 +385,115 @@ def resolve_owner_gate(
             outcome=OwnerGateResolutionOutcome.RESOLVED,
             gate=_owner_gate_from_row(resolved_row),
             task=_task_from_row(cleared_task_row),
+        )
+
+
+class OwnerGateSupersessionOutcome(StrEnum):
+    """The explicit outcome of one :func:`supersede_current_owner_gate` attempt.
+
+    ``SUPERSEDED`` applied the authoritative Task transition: the pending
+    gate lost currency and stays pending as history. ``STALE`` applied
+    nothing (stale token, the gate is no longer pending, or the gate is no
+    longer the Task's current gate). There is deliberately no one-shot
+    ``NO_OP``: a supersession never rewrites the gate row, so a replayed
+    attempt can only find the gate no longer current and classify as
+    ``STALE``.
+    """
+
+    SUPERSEDED = "superseded"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerGateSupersession:
+    """The outcome of one current-gate supersession attempt.
+
+    ``task`` is the post-transition Task only for ``SUPERSEDED``. The
+    superseded ``gate`` is returned unchanged in both outcomes: it stays
+    exactly the durable pending record it was, with no ``decided_at``
+    stamp and no terminal status.
+    """
+
+    outcome: OwnerGateSupersessionOutcome
+    gate: OwnerGate | None
+    task: Task | None
+
+
+def supersede_current_owner_gate(
+    pool: DatabasePool,
+    *,
+    owner_gate_id: UUID,
+    expected_task_state_token: UUID,
+) -> OwnerGateSupersession:
+    """Supersede the Task's current gate as one authoritative Task transition.
+
+    Issue #219's narrow Reviewer-triggered continuation primitive: the
+    exact current pending gate loses currency WITHOUT any terminal stamp —
+    the gate row is never touched and stays pending as history (the
+    established superseded-pending-gate property) — while the Task's
+    ``current_owner_gate_id`` clears, the Task's status moves from
+    ``waiting_for_owner`` to ``planning``, and the ``state_token`` rotates
+    with its ``updated_at`` advancing, all in one atomic effect.
+
+    Success requires the gate to be pending, still the Task's current
+    gate, and the caller's ``expected_task_state_token`` to still match a
+    non-archived ``waiting_for_owner`` Task. The Task row is locked
+    ``FOR UPDATE`` first (every gate write happens under that lock) and
+    the Task update carries its own conditional guards as a durable
+    backstop, so a concurrent resolution or supersession serializes here
+    and only one continuation can win. This is never an Owner resolution:
+    it stamps no ``decided_at``, writes no terminal gate status, and
+    belongs to the E3/E4 continuation seam that separately records the
+    Reviewer's iteration and the safe audit trail.
+    """
+    if not isinstance(expected_task_state_token, UUID):
+        raise OwnerGateDomainError("expected_task_state_token must be a UUID")
+    with transaction(pool) as conn:
+        gate_row = conn.execute(
+            f"select {_OWNER_GATE_COLUMNS} from openorc.owner_gates where id = %s",
+            (owner_gate_id,),
+        ).fetchone()
+        if gate_row is None:
+            return OwnerGateSupersession(
+                outcome=OwnerGateSupersessionOutcome.STALE, gate=None, task=None
+            )
+        gate = _owner_gate_from_row(gate_row)
+        if gate.status is not OwnerGateStatus.PENDING:
+            return OwnerGateSupersession(
+                outcome=OwnerGateSupersessionOutcome.STALE, gate=gate, task=None
+            )
+        # Lock the Task row first: currency and token are verified under the
+        # lock, so a concurrent pointer move or resolution serializes here.
+        task_row = conn.execute(
+            f"select {_TASK_COLUMNS} from openorc.tasks where id = %s for update",
+            (gate.task_id,),
+        ).fetchone()
+        if task_row is None:
+            return OwnerGateSupersession(
+                outcome=OwnerGateSupersessionOutcome.STALE, gate=gate, task=None
+            )
+        task = _task_from_row(task_row)
+        if (
+            task.current_owner_gate_id != gate.id
+            or task.state_token != expected_task_state_token
+            or task.archived_at is not None
+            or task.status is not TaskStatus.WAITING_FOR_OWNER
+        ):
+            return OwnerGateSupersession(
+                outcome=OwnerGateSupersessionOutcome.STALE, gate=gate, task=None
+            )
+        superseded_task_row = conn.execute(
+            "update openorc.tasks "
+            "set current_owner_gate_id = null, status = 'planning', "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and current_owner_gate_id = %s and status = 'waiting_for_owner' "
+            f"returning {_TASK_COLUMNS}",
+            (gate.task_id, expected_task_state_token, gate.id),
+        ).fetchone()
+        assert superseded_task_row is not None
+        return OwnerGateSupersession(
+            outcome=OwnerGateSupersessionOutcome.SUPERSEDED,
+            gate=gate,
+            task=_task_from_row(superseded_task_row),
         )

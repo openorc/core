@@ -82,7 +82,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
   representable only for that gate type and reachable only through the
   settlement services — never an Owner-attributed resolution.
 - Gates bind exact subjects: implementation authorization → PlanRevision; PR authorization → exact committed Producer head; merge decision → TaskPullRequest + exact head; review resolution → exhausted PlanRevision or TaskPullRequest + exact head.
-- Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed.
+- Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed. Currency can also clear without any terminal stamp (issue #219): a Reviewer-triggered change request at an accepted-plan implementation gate supersedes the pending gate — pointer cleared, gate kept as pending history, never stamped with an Owner outcome or the REVIEW_RESOLUTION-only SETTLED status.
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.
 - RuntimeRequest remains a scoped Producer/runtime-originated ACTION_APPROVAL correlation only for adapter contracts that actually require OpenOrc participation. Cline v1 native tool approvals do not create RuntimeRequests. It is never free-form Owner ↔ Producer conversation.
 - TaskBlock stores one durable block reason and recovery context. Resolving a block does not erase why it existed and does not imply one universal resume transition.

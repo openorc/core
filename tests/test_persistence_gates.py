@@ -25,13 +25,16 @@ from typing import Any, cast
 import pytest
 
 from openorc.domain.gates import OwnerGateDomainError, OwnerGateStatus, OwnerGateType
+from openorc.domain.tasks import TaskStatus
 from openorc.persistence import gates as gates_module
 from openorc.persistence.gates import (
     OwnerGateResolutionOutcome,
+    OwnerGateSupersessionOutcome,
     create_owner_gate,
     get_owner_gate,
     list_task_owner_gates,
     resolve_owner_gate,
+    supersede_current_owner_gate,
 )
 from openorc.persistence.pool import DatabasePool
 
@@ -423,10 +426,13 @@ def test_the_module_surface_carries_the_resolution_contract() -> None:
     assert set(gates_module.__all__) == {
         "OwnerGateResolution",
         "OwnerGateResolutionOutcome",
+        "OwnerGateSupersession",
+        "OwnerGateSupersessionOutcome",
         "create_owner_gate",
         "get_owner_gate",
         "list_task_owner_gates",
         "resolve_owner_gate",
+        "supersede_current_owner_gate",
     }
 
 
@@ -661,3 +667,156 @@ def test_resolve_owner_gate_settles_a_review_resolution_gate_one_shot() -> None:
     # The settled stamp targets only the pending gate row.
     assert fake_conn.executed[2][1] is not None
     assert fake_conn.executed[2][1][0] == "settled"
+
+
+def test_supersede_current_owner_gate_applies_one_atomic_task_transition() -> None:
+    """Issue #219's narrow continuation primitive: the exact current pending
+    gate loses currency WITHOUT any terminal stamp — the gate row is never
+    touched and stays pending as history — while the pointer clears, the
+    Task moves ``waiting_for_owner`` → ``planning``, and the token rotates
+    in one conditional update."""
+    gate_row = _gate_row()
+    task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="waiting_for_owner",
+        current_owner_gate_id=gate_row[0],
+    )
+    superseded_task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="planning",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=None,
+        updated_at=_observed_at() + timedelta(minutes=1),
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row, superseded_task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=gate_row[0], expected_task_state_token=task_row[8]
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.SUPERSEDED
+    assert supersession.gate is not None
+    # The gate record is unchanged pending history: no terminal stamp.
+    assert supersession.gate.status is OwnerGateStatus.PENDING
+    assert supersession.gate.decided_at is None
+    assert supersession.task is not None
+    assert supersession.task.status is TaskStatus.PLANNING
+    assert supersession.task.current_owner_gate_id is None
+    assert supersession.task.state_token == superseded_task_row[8]
+    # Three statements: the gate read, the Task FOR UPDATE lock, and the one
+    # conditional Task update — the gate table is never written.
+    assert len(fake_conn.executed) == 3
+    gate_sql, task_lock_sql, task_update_sql = (sql for sql, _params in fake_conn.executed)
+    assert "from openorc.owner_gates where id" in gate_sql
+    assert "for update" in task_lock_sql
+    assert "update openorc.tasks" in task_update_sql
+    assert "current_owner_gate_id = null" in task_update_sql
+    assert "status = 'planning'" in task_update_sql
+    assert "waiting_for_owner" in task_update_sql
+    assert "update openorc.owner_gates" not in task_update_sql
+
+
+def test_supersede_refuses_when_the_gate_is_no_longer_current() -> None:
+    """A pending gate that already lost currency (superseded or never
+    installed) is a stale operation: nothing is applied and the gate stays
+    pending history."""
+    gate_row = _gate_row()
+    task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="waiting_for_owner",
+        current_owner_gate_id=None,
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=gate_row[0], expected_task_state_token=task_row[8]
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.STALE
+    assert supersession.gate is not None
+    assert supersession.gate.status is OwnerGateStatus.PENDING
+    assert supersession.task is None
+    assert len(fake_conn.executed) == 2
+
+
+def test_supersede_refuses_a_resolved_gate() -> None:
+    """A resolved gate is never rewritten; the supersession finds it
+    non-pending and applies nothing."""
+    gate_row = _gate_row(status="approved", decided_at=_observed_at())
+    fake_conn = FakeConnection(responses=[gate_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=gate_row[0], expected_task_state_token=uuid.uuid4()
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.STALE
+    assert supersession.gate is not None
+    assert supersession.gate.status is OwnerGateStatus.APPROVED
+    assert supersession.task is None
+    assert len(fake_conn.executed) == 1
+
+
+def test_supersede_refuses_a_stale_token() -> None:
+    """A stale Task token never supersedes the current gate."""
+    gate_row = _gate_row()
+    task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="waiting_for_owner",
+        current_owner_gate_id=gate_row[0],
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=gate_row[0], expected_task_state_token=uuid.uuid4()
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.STALE
+    assert supersession.gate is not None
+    assert supersession.task is None
+    assert len(fake_conn.executed) == 2
+
+
+def test_supersede_refuses_a_task_not_waiting_for_its_owner() -> None:
+    """The continuation continues from ``waiting_for_owner`` only; any other
+    Task status is a stale operation."""
+    gate_row = _gate_row()
+    task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="planning",
+        current_owner_gate_id=gate_row[0],
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=gate_row[0], expected_task_state_token=task_row[8]
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.STALE
+    assert supersession.gate is not None
+    assert supersession.task is None
+    assert len(fake_conn.executed) == 2
+
+
+def test_supersede_refuses_a_missing_gate() -> None:
+    """A vanished gate is a stale operation with nothing to return."""
+    fake_conn = FakeConnection(responses=[None])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool, owner_gate_id=uuid.uuid4(), expected_task_state_token=uuid.uuid4()
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.STALE
+    assert supersession.gate is None
+    assert supersession.task is None
+    assert len(fake_conn.executed) == 1
