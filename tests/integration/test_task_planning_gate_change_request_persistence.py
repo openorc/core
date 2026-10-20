@@ -128,13 +128,18 @@ def _insert_project(conn: Connection[Any], workspace_id: uuid.UUID) -> uuid.UUID
     return project_id
 
 
-def _insert_repository(conn: Connection[Any], *, workspace_id: uuid.UUID) -> uuid.UUID:
+def _insert_repository(
+    conn: Connection[Any],
+    *,
+    workspace_id: uuid.UUID,
+    github_installation_id: uuid.UUID,
+) -> uuid.UUID:
     repository_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.repositories "
         "(id, project_id, workspace_id, github_repository_id, owner_login, name, "
-        "html_url, is_private, default_branch) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "html_url, is_private, default_branch, github_installation_id) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             repository_id,
             _insert_project(conn, workspace_id),
@@ -145,6 +150,10 @@ def _insert_repository(conn: Connection[Any], *, workspace_id: uuid.UUID) -> uui
             "https://github.com/octocat/hello-world",
             False,
             "main",
+            # The production route resolver requires the repository-to-installation
+            # relationship: the durable UUID of the same-Workspace installation
+            # row, never the external numeric installation ID.
+            github_installation_id,
         ),
     )
     return repository_id
@@ -230,8 +239,10 @@ def _handoff_fixture(
     """
     profile_id = _insert_profile(conn)
     workspace_id = _insert_workspace(conn, profile_id)
-    repository_id = _insert_repository(conn, workspace_id=workspace_id)
-    _insert_installation(conn, workspace_id=workspace_id)
+    installation_id = _insert_installation(conn, workspace_id=workspace_id)
+    repository_id = _insert_repository(
+        conn, workspace_id=workspace_id, github_installation_id=installation_id
+    )
     task_id = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
     adapter = FakeAgentRuntimeAdapter()
