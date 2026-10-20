@@ -609,18 +609,24 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   `reconcile_repository_issue` on the Task's routed repository, then the
   shared read-only `canonical_branch.observe_routed_repository_branch` B7
   seam for the branch/head — GitHub alone supplies the committed SHA) →
-  the final short transaction re-proves every admission fact under the
+  the final short transaction re-proves the authenticated Owner's
+  account-operational barrier FIRST (the admission check does not remain
+  authoritative across the intervening GitHub calls), then every admission
+  fact under the
   lock and commits the one-time `bind_canonical_branch`, one pending
   exact-head gate (`subject_head_sha` only — no PlanRevision, no PR
   binding), `implementing → waiting_for_owner` under token rotation, and
   the OPENORC `OWNER_GATE_CREATED` audit together. Replay/race can never
   create a second gate or an orphaned bind; a bound same-branch
   continuation re-verifies without rebinding; a different-branch claim is
-  a conflict, never adoption.
+  a conflict, never adoption; a repository-wide branch-ownership collision
+  (`UniqueViolation`) is translated into the same stable `ConflictError`
+  with the whole composition rolled back.
 - Source invalidity is reason-specific: ONLY a confirmed requirements
   fingerprint change against the Task's immutable baseline takes the
   atomic `BLOCKED / GITHUB_SOURCE_CHANGED` path — one short transaction
-  re-proving the drift durably under the Task lock, then
+  re-proving the account barrier first and then the drift durably under
+  the Task lock, then
   `create_task_block` + `implementing → blocked` (token rotation) + the
   `task_blocked` audit (the first `record_task_blocked_event` mapping,
   task_block subject, no context shadowing the block row) commit or roll

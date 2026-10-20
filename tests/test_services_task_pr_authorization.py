@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from psycopg.errors import UniqueViolation
 
 from openorc.adapters.github import (
     GitHubAuthenticationRejectedError,
@@ -77,6 +78,8 @@ from openorc.services.task_pr_authorization import (
 )
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
+_ACCOUNT_OPERATIONAL_ROW: tuple[Any, ...] = (None, None, None)
+_ACCOUNT_DELETION_ACTIVE_ROW: tuple[Any, ...] = ("active", uuid.uuid4(), _OBSERVED)
 _WORKSPACE_ID = uuid.uuid4()
 _OTHER_WORKSPACE_ID = uuid.uuid4()
 _OWNER_PROFILE_ID = uuid.uuid4()
@@ -697,9 +700,23 @@ def _write_predicates_fired(conn: ScriptedConnection) -> bool:
 # --- scripted sequences (in service call order) -------------------------------------
 
 
-def _script_repeating_reads(conn: ScriptedConnection) -> None:
-    """Same-shaped reads whose result never changes across the whole flow."""
-    conn.on_repeat(_ACCOUNT_BARRIER, (None, None, None))
+def _script_repeating_reads(
+    conn: ScriptedConnection,
+    *,
+    account_barrier_outcomes: list[tuple[Any, ...]] | None = None,
+) -> None:
+    """Same-shaped reads whose result never changes across the whole flow.
+
+    ``account_barrier_outcomes`` scripts the account-deletion barrier reads
+    in exact call order instead of repeating one operational outcome — the
+    regression shape for authority changing between admission and a final
+    write transaction (each barrier read is consumed once, in order).
+    """
+    if account_barrier_outcomes is None:
+        conn.on_repeat(_ACCOUNT_BARRIER, (None, None, None))
+    else:
+        for outcome in account_barrier_outcomes:
+            conn.on(_ACCOUNT_BARRIER, outcome)
     conn.on_repeat(_WORKSPACE_READ, _ws_row())
     conn.on_repeat(_EVENT_INSERT, _event_row())
     conn.on_repeat(_SESSION_READ, _session_row())
@@ -758,12 +775,13 @@ def _script_open_success(
     loops: list[tuple[Any, ...]] | None = None,
     executions: list[tuple[Any, ...]] | None = None,
     issue_row: tuple[Any, ...] | None = None,
-    fail_branch_bind: bool = False,
+    account_barrier_outcomes: list[tuple[Any, ...]] | None = None,
+    fail_branch_bind: bool | Exception = False,
     fail_gate_install: bool = False,
     fail_status: bool = False,
 ) -> None:
     """The full presentation composition in call order."""
-    _script_repeating_reads(conn)
+    _script_repeating_reads(conn, account_barrier_outcomes=account_barrier_outcomes)
     admission_task = task_row if task_row is not None else _task_row()
     _script_authority_reads(
         conn,
@@ -785,8 +803,10 @@ def _script_open_success(
     conn.on(_ITERATIONS_LIST, iterations if iterations is not None else [_iteration_row()])
     conn.on(_EXECUTIONS_LIST, executions if executions is not None else [_execution_row()])
     conn.on(_ISSUE_FIND, issue_row if issue_row is not None else _issue_row())
-    if fail_branch_bind:
+    if fail_branch_bind is True:
         conn.on(_BRANCH_BIND, RuntimeError("forced late bind failure"))
+    elif isinstance(fail_branch_bind, Exception):
+        conn.on(_BRANCH_BIND, fail_branch_bind)
     else:
         conn.on(_BRANCH_BIND, _task_row(state_token=_TOKEN_2, canonical_branch=_CLAIMED_BRANCH))
     conn.on(_GATES_INSERT, _pr_gate_row())
@@ -815,10 +835,11 @@ def _script_drift_block(
     conn: ScriptedConnection,
     *,
     blocked_task_row: tuple[Any, ...] | None = None,
+    account_barrier_outcomes: list[tuple[Any, ...]] | None = None,
     fail_status: bool = False,
 ) -> None:
     """The atomic drift-block composition in call order (after the B3 update)."""
-    _script_repeating_reads(conn)
+    _script_repeating_reads(conn, account_barrier_outcomes=account_barrier_outcomes)
     drifting_task = _task_row()
     _script_authority_reads(conn, task_row=drifting_task)
     _script_b3_reconciliation(
@@ -1342,6 +1363,62 @@ def test_a_blocked_task_refuses_any_later_presentation() -> None:
     _assert_refused_before_any_effect(conn, pool, github, excinfo.value)
 
 
+def test_account_deletion_active_after_admission_refuses_the_presentation() -> None:
+    """The account-deletion barrier is re-proven FIRST in the final write
+    transaction: deletion becoming active after admission — across the
+    intervening GitHub calls — prevents the bind, the gate, the transition,
+    and the audit."""
+    conn = ScriptedConnection()
+    _script_open_success(
+        conn,
+        account_barrier_outcomes=[
+            _ACCOUNT_OPERATIONAL_ROW,  # the admission transaction
+            _ACCOUNT_OPERATIONAL_ROW,  # the B3 reconciliation write phase
+            _ACCOUNT_DELETION_ACTIVE_ROW,  # the final presentation transaction
+        ],
+    )
+    pool = _pool(conn)
+    github = _fake_github(cast(FakePool, pool))
+    with pytest.raises(ConflictError) as excinfo:
+        _open_call(pool, github)
+    assert type(excinfo.value) is ConflictError
+    # The barrier was the first lock acquisition of the final transaction:
+    # nothing after admission applied.
+    assert _count(conn, _BRANCH_BIND) == 0
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _event_types(conn) == []
+
+
+def test_account_deletion_active_after_admission_refuses_the_drift_block() -> None:
+    """Deletion becoming active after admission — and after the drift
+    discovery — prevents the atomic drift-block composition: no TaskBlock,
+    no blocked transition, and no audit."""
+    conn = ScriptedConnection()
+    _script_drift_block(
+        conn,
+        account_barrier_outcomes=[
+            _ACCOUNT_OPERATIONAL_ROW,  # the admission transaction
+            _ACCOUNT_OPERATIONAL_ROW,  # the B3 reconciliation write phase
+            _ACCOUNT_DELETION_ACTIVE_ROW,  # the final drift-block transaction
+        ],
+    )
+    pool = _pool(conn)
+    github = _fake_github(
+        cast(FakePool, pool),
+        issue_observation=_issue_observation(title="Found a bug v2"),
+    )
+    with pytest.raises(ConflictError) as excinfo:
+        _open_call(pool, github)
+    assert type(excinfo.value) is ConflictError
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _event_types(conn) == []
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _BRANCH_BIND) == 0
+
+
 @pytest.mark.parametrize(
     ("branch_error", "expected"),
     [
@@ -1391,6 +1468,26 @@ def test_a_bound_branch_continuation_reobserves_and_presents_without_rebinding()
     assert _count(conn, _STATUS_UPDATE) == 1
     # The branch read was addressed by the bound canonical name.
     assert github.branch_calls[0]["branch_name"] == _CLAIMED_BRANCH
+
+
+def test_a_repository_branch_ownership_collision_is_a_conflict_with_rollback() -> None:
+    """Another current Task of the Repository already owning the branch
+    rejects the bind with the driver's UniqueViolation, translated into the
+    stable ConflictError: no gate, transition, or audit is applied and the
+    composition rolls back."""
+    conn = ScriptedConnection()
+    _script_open_success(conn, fail_branch_bind=UniqueViolation("branch ownership"))
+    pool = _pool(conn)
+    github = _fake_github(cast(FakePool, pool))
+    with pytest.raises(ConflictError) as excinfo:
+        _open_call(pool, github)
+    # The established bind classification — never a stale classification.
+    assert type(excinfo.value) is ConflictError
+    assert "already owned by another current task" in str(excinfo.value)
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _event_types(conn) == []
 
 
 @pytest.mark.parametrize("failure", ["fail_branch_bind", "fail_gate_install", "fail_status"])

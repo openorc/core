@@ -66,6 +66,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
+from psycopg.errors import UniqueViolation
+
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
@@ -189,6 +191,7 @@ class _ImplementationAuthority:
 class _ImplementationClaim:
     """The discovered implementation claim carried into the GitHub phase."""
 
+    profile_id: UUID
     task: Task
     authority: _ImplementationAuthority
     execution: Execution
@@ -396,19 +399,28 @@ def _unexplained_rejection() -> StaleOperationError:
 
 
 def _block_source_requirements_drift(
-    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID, expected_state_token: UUID
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
 ) -> Task:
     """Atomically block the Task on confirmed requirements drift (issue #82).
 
-    One short composed transaction re-proves the exact currentness under
-    the Task row lock and the durable drift evidence against the freshly
-    written projection, then creates the ``github_source_changed``
-    TaskBlock, moves the Task ``implementing → blocked`` with a rotated
-    token, and records the ``task_blocked`` audit — commit or roll back
-    together. The distinct blocked path creates no PR gate; recovery from
-    the blocked state belongs to later layers, not this leaf.
+    One short composed transaction re-proves the authenticated Owner's
+    account-operational barrier FIRST (before any subject-row lock: the
+    admission check does not remain authoritative across the intervening
+    GitHub calls) and the durable drift evidence against the freshly
+    written projection under the Task row lock, then creates the
+    ``github_source_changed`` TaskBlock, moves the Task ``implementing →
+    blocked`` with a rotated token, and records the ``task_blocked`` audit —
+    commit or roll back together. The distinct blocked path creates no PR
+    gate; recovery from the blocked state belongs to later layers, not this
+    leaf.
     """
     with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
         locked = task_records.get_task_for_update(transaction_pool, task_id)
         if locked is None or locked.workspace_id != workspace_id:
             raise NotFoundError("the requested task is not available in this workspace")
@@ -503,6 +515,7 @@ def _verify_source_authority(
     if projection.requirements_fingerprint != task.source_requirements_fingerprint:
         _block_source_requirements_drift(
             pool,
+            profile_id=claim.profile_id,
             workspace_id=task.workspace_id,
             task_id=task.id,
             expected_state_token=claim.expected_state_token,
@@ -568,6 +581,7 @@ def _discover_implementation_claim(
         transaction_pool, task=task, execution_id=execution_id
     )
     return _ImplementationClaim(
+        profile_id=profile_id,
         task=task,
         authority=authority,
         execution=execution,
@@ -585,16 +599,20 @@ def _present_exact_head_gate(
 ) -> PrAuthorizationGateOpened:
     """The atomic bind + exact-head gate presentation (one short transaction).
 
-    Every admission fact is re-proven under the Task row lock — the exact
+    The authenticated Owner's account-operational barrier is re-proven FIRST
+    — before any subject-row lock, because the admission check does not
+    remain authoritative across the intervening GitHub calls — and every
+    admission fact is then re-proven under the Task row lock: the exact
     token and pre-gate state, the identical authority subjects and
-    qualifying execution, and the durable source projection — before the
-    one-time canonical-branch bind, the exact-head gate creation and
+    qualifying execution, and the durable source projection. Only then do
+    the one-time canonical-branch bind, the exact-head gate creation and
     installation, the ``implementing → waiting_for_owner`` transition, and
     the safe OPENORC audit commit or roll back together.
     """
     workspace_id = claim.task.workspace_id
     task_id = claim.task.id
     with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=claim.profile_id)
         locked = task_records.get_task_for_update(transaction_pool, task_id)
         if locked is None or locked.workspace_id != workspace_id:
             raise NotFoundError("the requested task is not available in this workspace")
@@ -628,12 +646,23 @@ def _present_exact_head_gate(
                 "continues on the canonical branch"
             )
         if bound_branch is None:
-            bound_task = task_records.bind_canonical_branch(
-                transaction_pool,
-                task_id,
-                expected_state_token=task.state_token,
-                canonical_feature_branch=observed_branch_name,
-            )
+            try:
+                bound_task = task_records.bind_canonical_branch(
+                    transaction_pool,
+                    task_id,
+                    expected_state_token=task.state_token,
+                    canonical_feature_branch=observed_branch_name,
+                )
+            except UniqueViolation as exc:
+                # The repository-wide branch-ownership index rejected the
+                # bind: another current Task of this Repository already owns
+                # the branch. Translated into the stable application
+                # conflict without exposing the other Task; the composition
+                # rolls back and nothing was applied.
+                raise ConflictError(
+                    "the canonical feature branch is already owned by another "
+                    "current task in this repository"
+                ) from exc
             if bound_task is None:
                 raise StaleOperationError(
                     "the canonical feature branch could not be bound; the presentation is stale"
