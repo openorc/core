@@ -404,8 +404,12 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   lazily invoked `producer_runtime_factory()`), and production composition
   binds the #190 BOUND `attach_cline_runtime` to the Phase-1 external
   session identity. The pre-send revalidation re-proves currentness after
-  acquisition; the post-send recheck re-proves it before any effect. No
-  database transaction spans an attachment or the send.
+  acquisition; the post-send recheck transaction FIRST takes the Task row
+  `FOR UPDATE` (the same lock an Owner gate resolution takes) before
+  rechecking currentness and writing effects, so a still-current decision
+  and its audit/dispatch can never interleave with a concurrent resolution;
+  the lock lives only inside that short transaction. No database
+  transaction spans an attachment or the send.
 - Recognition is deliberately stricter than the #65 parser's
   one-object-amid-prose tolerance: the whole normalized reply must be one
   standalone unfenced JSON object or exactly one fenced JSON object with

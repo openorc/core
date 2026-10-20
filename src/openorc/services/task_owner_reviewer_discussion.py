@@ -31,7 +31,12 @@ Composition order (authorization precedes every adapter acquisition):
    wall-clock time; the send is refused when the state moved on);
 5. the verbatim Owner message as ONE ordinary exact-session send
    (``expected_family=None``) with NO database transaction open;
-6. post-send recognition and one short recheck transaction: a still-current
+6. post-send recheck and one short recheck transaction that FIRST takes the
+   existing Task row ``FOR UPDATE`` — serializing the still-current decision
+   and its effects against concurrent Task mutations (an Owner gate
+   resolution stamps the gate and rotates the token under the same row
+   lock), so an ordinary exchange can never audit itself against a gate
+   that is no longer current: a still-current
    ordinary exchange records exactly two direction-only
    ``OWNER_REVIEWER_DISCUSSION_MESSAGE`` events (Owner message, Reviewer
    reply) bound to the addressed gate — direction-only context, never any
@@ -86,6 +91,7 @@ from openorc.domain.gates import OwnerGate, OwnerGateType
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.errors import ProtocolError
@@ -659,6 +665,17 @@ def send_owner_reviewer_discussion_message(
 
         # --- Phase 3: post-send recheck + effects (one short transaction). ---
         with composed_transaction(pool) as transaction_pool:
+            # Serialize against concurrent Task mutations FIRST (the same
+            # Task-row lock every authoritative Task mutation takes, E3c's
+            # established pattern): an Owner gate resolution stamps the gate
+            # and rotates the token under this lock, so the still-current
+            # decision below and the audit/dispatch it authorizes can never
+            # interleave with a concurrent resolution. The lock lives only
+            # inside this short transaction — never across the attachment
+            # or the send, which happened before it.
+            locked = task_records.get_task_for_update(transaction_pool, task_id)
+            if locked is None or locked.workspace_id != workspace_id:
+                raise NotFoundError("the requested task is not available in this workspace")
             current = _revalidate_currentness(
                 transaction_pool,
                 workspace_id=workspace_id,

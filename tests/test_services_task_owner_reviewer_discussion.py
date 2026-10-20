@@ -666,8 +666,16 @@ def _currentness_round(
     revision_row: tuple[Any, ...] | None = None,
     pr_row: tuple[Any, ...] | None = None,
     session_row: Any = _USE_SESSION_REPEAT,
+    locked_task: bool = False,
 ) -> None:
-    """One ``_revalidate_currentness`` round: task, gate, subject, session."""
+    """One ``_revalidate_currentness`` round: task, gate, subject, session.
+
+    ``locked_task`` scripts the post-send round's Task-row ``FOR UPDATE``
+    read, which the service takes before rechecking currentness so the
+    still-current decision serializes against concurrent Task mutations.
+    """
+    if locked_task:
+        conn.on(_TASK_READ_LOCKED, task_row)
     conn.on(_TASK_READ, task_row)
     conn.on(_GATE_READ, gate_row)
     if revision_row is not None:
@@ -729,6 +737,7 @@ def _script_discussion_flow(
                 gate_row=flow_gate,
                 revision_row=revision_row,
                 pr_row=pr_row,
+                locked_task=round_index == 2,
             )
 
 
@@ -743,7 +752,13 @@ def _script_settlement_flow(conn: ScriptedConnection, *, accepted: bool) -> None
         if round_index == 0:
             _phase1(conn, task_row=t_waiting, gate_row=gate, revision_row=rev1)
         else:
-            _currentness_round(conn, task_row=t_waiting, gate_row=gate, revision_row=rev1)
+            _currentness_round(
+                conn,
+                task_row=t_waiting,
+                gate_row=gate,
+                revision_row=rev1,
+                locked_task=round_index == 2,
+            )
     conn.on_repeat(_LOOPS_LIST, [_loop_row()])
     conn.on_repeat(_LOOP_READ, _loop_row())
     conn.on_repeat(_LOOP_READ_LOCKED, _loop_row())
@@ -1468,7 +1483,9 @@ def test_the_gate_resolving_after_the_send_is_stale_advisory_output() -> None:
         gate_row=_gate_row(),
         revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
     )
-    conn.on(_TASK_READ, _task_row(state_token=_TOKEN_2, gate_id=None))  # post-send recheck
+    resolved_task = _task_row(state_token=_TOKEN_2, gate_id=None)
+    conn.on(_TASK_READ_LOCKED, resolved_task)  # the post-send FOR UPDATE read
+    conn.on(_TASK_READ, resolved_task)  # the recheck's currentness read
     adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[_ORDINARY_REPLY])
     reviewer_attachment = _ReviewerAttachment(adapter)
 
@@ -1577,3 +1594,58 @@ def test_a_failed_settlement_audit_prevents_the_e2_continuation() -> None:
     assert github.repository_calls == []
     assert github.branch_calls == []
     assert producer_attachment.disposals == 1
+
+
+def test_the_post_send_audit_serializes_against_gate_resolution() -> None:
+    """The post-send transaction takes the Task row FOR UPDATE before the
+    currentness recheck and the audit inserts — the same lock an Owner gate
+    resolution takes — so a resolution that committed before the lock is
+    observed as a stale reply with no events, and a concurrent resolution can
+    never interleave between the recheck and the audit commit."""
+    # A resolution that committed before the post-send lock: the FOR UPDATE
+    # read observes the rotated token and cleared pointer; nothing audits.
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_common(conn, session_repeats=True)
+    rev1 = _revision_row(revision_id=_REVISION_1_ID, number=1)
+    _phase1(conn, task_row=_task_row(), gate_row=_gate_row(), revision_row=rev1)
+    _currentness_round(conn, task_row=_task_row(), gate_row=_gate_row(), revision_row=rev1)
+    resolved_task = _task_row(state_token=_TOKEN_2, gate_id=None)
+    conn.on(_TASK_READ_LOCKED, resolved_task)  # the post-send FOR UPDATE read
+    conn.on(_TASK_READ, resolved_task)  # the recheck's currentness read
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[_ORDINARY_REPLY])
+    reviewer_attachment = _ReviewerAttachment(adapter)
+
+    with pytest.raises(StaleOperationError):
+        _discussion_call(pool, reviewer_attachment)
+
+    (send,) = adapter.submitted_sends()
+    assert send.message == _OWNER_MESSAGE
+    assert _event_types(conn) == []
+    assert _count(conn, _TASK_READ_LOCKED) == 1
+
+    # Still-current exchange: exactly one Task-row lock, acquired before any
+    # audit insert inside the same short transaction.
+    happy_conn = ScriptedConnection()
+    happy_pool = _pool(happy_conn)
+    _script_discussion_flow(happy_conn, revision_row=rev1)
+    happy_adapter = _prepared_adapter(FakePool(happy_conn), reviewer_outcomes=[_ORDINARY_REPLY])
+    happy_attachment = _ReviewerAttachment(happy_adapter)
+
+    outcome = _discussion_call(happy_pool, happy_attachment)
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.ORDINARY_REPLY
+    assert _event_types(happy_conn) == [_DISCUSSION_EVENT_TYPE, _DISCUSSION_EVENT_TYPE]
+    locked_positions = [
+        index
+        for index, (sql, _params) in enumerate(happy_conn.executed)
+        if _TASK_READ_LOCKED(sql, None)
+    ]
+    first_event_position = next(
+        index
+        for index, (sql, _params) in enumerate(happy_conn.executed)
+        if _EVENT_INSERT(sql, None)
+    )
+    assert len(locked_positions) == 1
+    assert locked_positions[0] < first_event_position
