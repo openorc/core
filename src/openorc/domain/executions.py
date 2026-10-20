@@ -32,6 +32,13 @@ ended.
   canonical feature branch remains a Task-level exclusive ownership fact:
   an Execution may observe repository state but never becomes a competing
   branch owner.
+- A successful attempt optionally carries the E6 validated canonical
+  implementation_result payload (issue #81) — the Producer's formal
+  completion whose ``branch`` value is a discovery/routing claim only, never
+  GitHub authority — and an attempt may carry the F5 qualifying-activity
+  marker timestamp (issue #90's consumer). Both are written once by the
+  authorized-execution seam and never rewritten on finalized history; the
+  marker stores no activity content of any kind.
 
 This module carries transport-independent validation only. It performs no
 runtime dispatch, no workflow orchestration, and no Task state transitions.
@@ -39,6 +46,7 @@ runtime dispatch, no workflow orchestration, and no Task state transitions.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
@@ -102,6 +110,11 @@ class Execution:
     status: ExecutionStatus
     created_at: datetime
     updated_at: datetime
+    # Optional E6 facts (issue #81): the validated canonical implementation
+    # result attached to exactly one successful attempt, and the F5
+    # qualifying-activity marker advanced while the attempt was running.
+    implementation_result: Mapping[str, object] | None = None
+    last_qualifying_activity_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _require_uuid(self.id, "id")
@@ -119,6 +132,20 @@ class Execution:
                 "Execution.status must be an ExecutionStatus (queued, running, "
                 "paused, paused_for_approval, succeeded, failed_transient, "
                 "failed_final, or cancelled)"
+            )
+        if self.implementation_result is not None and not isinstance(
+            self.implementation_result, Mapping
+        ):
+            raise ExecutionDomainError(
+                "Execution.implementation_result must be a canonical JSON-object payload"
+            )
+        if self.last_qualifying_activity_at is not None and (
+            not isinstance(self.last_qualifying_activity_at, datetime)
+            or self.last_qualifying_activity_at.tzinfo is None
+        ):
+            raise ExecutionDomainError(
+                "Execution.last_qualifying_activity_at must be a timezone-aware "
+                "datetime when present"
             )
 
     @property

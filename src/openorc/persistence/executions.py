@@ -31,13 +31,22 @@ Executions are attempt/history records, not generic CRUD rows:
   kind: the canonical feature branch remains a Task-level exclusive
   ownership fact, and committed repository truth is GitHub's, reconciled
   later through GitHub.
+- The E6 additive operations (issue #81) are focused one-shot primitives on
+  the same guarded-conditional discipline: the dispatch claim moves a
+  queued attempt to running and initializes the qualifying-activity marker
+  in the same statement; the completion persists the validated canonical
+  implementation_result payload and stamps succeeded in one statement; the
+  activity marker advances only while the row is running. None of them
+  ever rewrites a finalized row.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
+
+from psycopg.types.json import Jsonb
 
 from openorc.domain.executions import (
     FINAL_EXECUTION_STATUSES,
@@ -50,15 +59,18 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "claim_execution_running",
+    "complete_execution_with_result",
     "create_execution",
     "get_execution",
     "list_task_executions",
+    "record_execution_activity",
     "update_execution_status",
 ]
 
 _EXECUTION_COLUMNS = (
     "id, workspace_id, task_id, producer_session_id, execution_number, status, "
-    "created_at, updated_at"
+    "created_at, updated_at, implementation_result, last_qualifying_activity_at"
 )
 
 
@@ -72,6 +84,8 @@ def _execution_from_row(row: Sequence[Any]) -> Execution:
         status=ExecutionStatus(row[5]),
         created_at=normalize_utc(row[6]),
         updated_at=normalize_utc(row[7]),
+        implementation_result=row[8],
+        last_qualifying_activity_at=None if row[9] is None else normalize_utc(row[9]),
     )
 
 
@@ -192,5 +206,77 @@ def update_execution_status(
             "where id = %s and status = %s "
             f"returning {_EXECUTION_COLUMNS}",
             (next_status.value, execution_id, expected_status.value),
+        ).fetchone()
+    return None if row is None else _execution_from_row(row)
+
+
+def claim_execution_running(pool: DatabasePool, *, execution_id: UUID) -> Execution | None:
+    """Apply the E6 dispatch claim to a queued attempt (issue #81).
+
+    One conditional statement moves the attempt from ``queued`` to
+    ``running`` and initializes ``last_qualifying_activity_at`` with the
+    database dispatch instant in the same write, so the F5 activity marker
+    is born atomically with the claim that authorizes activity writes.
+    ``None`` means the attempt is missing or no longer queued — a rejected
+    no-op that must never be retried blindly.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.executions "
+            "set status = 'running', last_qualifying_activity_at = now(), updated_at = now() "
+            "where id = %s and status = 'queued' "
+            f"returning {_EXECUTION_COLUMNS}",
+            (execution_id,),
+        ).fetchone()
+    return None if row is None else _execution_from_row(row)
+
+
+def complete_execution_with_result(
+    pool: DatabasePool,
+    *,
+    execution_id: UUID,
+    implementation_result: Mapping[str, object],
+) -> Execution | None:
+    """One-shot E6 finalize: persist the validated result and stamp success.
+
+    A single conditional statement attaches the validated canonical
+    ``implementation_result`` payload and moves the attempt from ``running``
+    to ``succeeded``, so the result and the terminal status can never
+    commit apart. ``None`` means the attempt is missing or no longer
+    running — duplicate or stale finalization is a rejected no-op, and a
+    finalized Execution is absorbing history that is never rewritten.
+    """
+    if not isinstance(implementation_result, Mapping):
+        raise ExecutionDomainError(
+            "complete_execution_with_result requires a canonical JSON-object "
+            "implementation_result payload"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.executions "
+            "set status = 'succeeded', implementation_result = %s, updated_at = now() "
+            "where id = %s and status = 'running' "
+            f"returning {_EXECUTION_COLUMNS}",
+            (Jsonb(dict(implementation_result)), execution_id),
+        ).fetchone()
+    return None if row is None else _execution_from_row(row)
+
+
+def record_execution_activity(pool: DatabasePool, *, execution_id: UUID) -> Execution | None:
+    """Advance the F5 qualifying-activity marker with database time.
+
+    The marker moves monotonically (database ``now()``) and only while the
+    attempt is still ``running``: a finalized Execution absorbs history and
+    late callbacks are dropped as a rejected no-op. No activity content is
+    persisted — the caller decides qualification; this statement only
+    stamps the instant.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.executions "
+            "set last_qualifying_activity_at = now(), updated_at = now() "
+            "where id = %s and status = 'running' "
+            f"returning {_EXECUTION_COLUMNS}",
+            (execution_id,),
         ).fetchone()
     return None if row is None else _execution_from_row(row)

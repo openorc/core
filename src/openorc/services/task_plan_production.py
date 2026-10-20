@@ -78,7 +78,6 @@ logical invocation identity these operations provide.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -127,8 +126,6 @@ from openorc.protocol.interaction import (
 )
 from openorc.protocol.models import (
     PLAN_RESULT_FAMILY,
-    REVIEW_RESULT_FAMILY,
-    SCHEMA_VERSION,
     PlanResult,
     ReviewFinding,
     ReviewResult,
@@ -149,6 +146,7 @@ from openorc.services.github_installation_route import (
     resolve_system_repository_installation_route,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
@@ -470,27 +468,6 @@ def _review_result_from_iteration(iteration: ReviewIteration) -> ReviewResult:
     )
 
 
-def _serialize_review_result(review_result: ReviewResult) -> str:
-    """The substantive Producer message: structural serialization only.
-
-    The routed artifact is the exact canonical ``review_result`` formal
-    envelope the Reviewer produced — no new remediation Markdown template,
-    no ``producer.plan.revise`` control, no inferred instructions, and no
-    rewriting of free-text fields.
-    """
-    payload = {
-        "type": REVIEW_RESULT_FAMILY,
-        "schema_version": SCHEMA_VERSION,
-        "outcome": review_result.outcome,
-        "summary": review_result.summary,
-        "findings": [
-            {"summary": finding.summary, "details": finding.details}
-            for finding in review_result.findings
-        ],
-    }
-    return json.dumps(payload)
-
-
 def _send_revision_plan(
     runtime: AgentRuntimeAdapter,
     session_id: str,
@@ -509,7 +486,7 @@ def _send_revision_plan(
     )
     interaction = ReviseInteraction(subject=subject, review_result=review_result)
     return _realize_plan_control(
-        runtime, session_id, interaction, message=_serialize_review_result(review_result)
+        runtime, session_id, interaction, message=serialize_review_result(review_result)
     )
 
 

@@ -120,5 +120,7 @@ def test_field_set_carries_no_git_sha_or_branch_ownership() -> None:
             "status",
             "created_at",
             "updated_at",
+            "implementation_result",
+            "last_qualifying_activity_at",
         }
     )

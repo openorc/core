@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from openorc.domain.executions import ExecutionDomainError, ExecutionStatus
 from openorc.persistence import executions as executions_module
@@ -103,6 +104,8 @@ def _execution_row(**overrides: Any) -> tuple[Any, ...]:
         "status": "queued",
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
+        "implementation_result": None,
+        "last_qualifying_activity_at": None,
     }
     values.update(overrides)
     return (
@@ -114,6 +117,8 @@ def _execution_row(**overrides: Any) -> tuple[Any, ...]:
         values["status"],
         values["created_at"],
         values["updated_at"],
+        values["implementation_result"],
+        values["last_qualifying_activity_at"],
     )
 
 
@@ -284,8 +289,108 @@ def test_update_execution_status_rejects_bad_status_values_and_no_ops() -> None:
 
 def test_the_module_surface_is_history_shaped() -> None:
     assert set(executions_module.__all__) == {
+        "claim_execution_running",
+        "complete_execution_with_result",
         "create_execution",
         "get_execution",
         "list_task_executions",
+        "record_execution_activity",
         "update_execution_status",
     }
+
+
+def test_claim_execution_running_moves_and_stamps_the_marker_atomically() -> None:
+    row = _execution_row(status="queued")
+    claimed = _execution_row(id=row[0], status="running")
+    fake_conn = FakeConnection(row=claimed)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    execution = executions_module.claim_execution_running(pool, execution_id=row[0])
+
+    assert execution is not None
+    assert execution.status is ExecutionStatus.RUNNING
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.executions" in sql
+    assert "set status = 'running', last_qualifying_activity_at = now(), updated_at = now()" in sql
+    assert "where id = %s and status = 'queued'" in sql
+    assert params == (row[0],)
+
+    empty_pool = cast(DatabasePool, FakePool(FakeConnection(None)))
+    assert executions_module.claim_execution_running(empty_pool, execution_id=row[0]) is None
+
+
+def test_complete_execution_with_result_persists_payload_and_success_atomically() -> None:
+    row = _execution_row(status="running")
+    payload: dict[str, Any] = {
+        "type": "implementation_result",
+        "schema_version": 1,
+        "status": "COMPLETED",
+        "branch": "feat/x",
+        "summary": "done",
+        "changes": ["a"],
+        "validation": ["b"],
+    }
+    completed = _execution_row(id=row[0], status="succeeded", implementation_result=payload)
+    fake_conn = FakeConnection(row=completed)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    execution = executions_module.complete_execution_with_result(
+        pool, execution_id=row[0], implementation_result=payload
+    )
+
+    assert execution is not None
+    assert execution.status is ExecutionStatus.SUCCEEDED
+    assert execution.implementation_result == payload
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.executions" in sql
+    assert "set status = 'succeeded', implementation_result = %s, updated_at = now()" in sql
+    assert "where id = %s and status = 'running'" in sql
+    assert params is not None
+    assert isinstance(params[0], Jsonb)
+    assert params[0].obj == payload
+    assert params[1] == row[0]
+
+    empty_pool = cast(DatabasePool, FakePool(FakeConnection(None)))
+    assert (
+        executions_module.complete_execution_with_result(
+            empty_pool, execution_id=row[0], implementation_result=payload
+        )
+        is None
+    )
+
+
+def test_complete_execution_with_result_rejects_a_non_object_payload() -> None:
+    pool = cast(DatabasePool, FakePool(FakeConnection()))
+    with pytest.raises(ExecutionDomainError):
+        executions_module.complete_execution_with_result(
+            pool,
+            execution_id=uuid.uuid4(),
+            implementation_result="not-a-payload",  # type: ignore[arg-type]
+        )
+
+
+def test_record_execution_activity_stamps_database_time_only_while_running() -> None:
+    row = _execution_row(status="running")
+    advanced = _execution_row(
+        id=row[0],
+        status="running",
+        last_qualifying_activity_at=_observed_at(),
+    )
+    fake_conn = FakeConnection(row=advanced)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    execution = executions_module.record_execution_activity(pool, execution_id=row[0])
+
+    assert execution is not None
+    assert execution.last_qualifying_activity_at == _utc_observed_at()
+    assert execution.last_qualifying_activity_at is not None
+    assert execution.last_qualifying_activity_at.utcoffset() == timedelta(0)
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.executions" in sql
+    assert "set last_qualifying_activity_at = now(), updated_at = now()" in sql
+    assert "where id = %s and status = 'running'" in sql
+    assert params == (row[0],)
+
+    # A finalized row is absorbing history: the late callback is a no-op.
+    empty_pool = cast(DatabasePool, FakePool(FakeConnection(None)))
+    assert executions_module.record_execution_activity(empty_pool, execution_id=row[0]) is None

@@ -89,6 +89,7 @@ _SUBJECT_TYPE_OWNER_GATE = "owner_gate"
 _SUBJECT_TYPE_PLAN_REVISION = "plan_revision"
 _SUBJECT_TYPE_REVIEW_ITERATION = "review_iteration"
 _SUBJECT_TYPE_REVIEW_LOOP = "review_loop"
+_SUBJECT_TYPE_EXECUTION = "execution"
 
 _TERMINAL_TASK_EVENT: dict[TaskStatus, WorkflowEventType] = {
     TaskStatus.CANCELLED: WorkflowEventType.TASK_CANCELLED,
@@ -138,6 +139,17 @@ class WorkflowActorContext:
 def owner_actor(profile_id: UUID) -> WorkflowActorContext:
     """The actor context for one authenticated OWNER action."""
     return WorkflowActorContext(WorkflowEventActor.OWNER, str(profile_id))
+
+
+def producer_actor(producer_session_id: UUID) -> WorkflowActorContext:
+    """The actor context for one Producer-attributed workflow fact.
+
+    ``actor_id`` is the stable Producer session binding UUID — the durable
+    identity of the session whose runtime produced the fact — never a
+    display name, model name, or raw runtime identifier.
+    """
+    _require_uuid_command(producer_session_id, "producer_session_id")
+    return WorkflowActorContext(WorkflowEventActor.PRODUCER, str(producer_session_id))
 
 
 def record_review_iteration_limit_changed_event(
@@ -532,6 +544,113 @@ def record_implementation_authorized_event(
         plan_revision_id=plan_revision_id,
         actor=actor,
         event_type=WorkflowEventType.IMPLEMENTATION_AUTHORIZED,
+    )
+
+
+def record_execution_started_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record the Producer-attributed dispatch claim of one attempt (issue #81).
+
+    Task-scoped; the primary modeled subject is the claimed Execution
+    (``subject_type``/``subject_id``) over the Task scope. The context is
+    deliberately empty: the event type is the fact, the attempt's canonical
+    state lives on the Execution row, and nothing canonical is ever copied
+    into the event.
+    """
+    _record_execution_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        actor=actor,
+        event_type=WorkflowEventType.EXECUTION_STARTED,
+    )
+
+
+def record_execution_completed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record the successful completion of one implementation attempt (issue #81).
+
+    The validated ``implementation_result`` payload lives on the Execution
+    row as its canonical home; the event never copies it.
+    """
+    _record_execution_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        actor=actor,
+        event_type=WorkflowEventType.EXECUTION_COMPLETED,
+    )
+
+
+def record_execution_failed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    actor: WorkflowActorContext,
+    failure_kind: str,
+) -> None:
+    """Record the truthful failure classification of one attempt (issue #81).
+
+    ``failure_kind`` is one stable, content-safe classification token
+    supplied by the calling seam (the stale-authority or runtime-pre-effect
+    classification); no exception text, no raw error content, and no
+    canonical-state copy ever enters the event.
+    """
+    if not isinstance(failure_kind, str) or not failure_kind.strip():
+        raise InvalidCommandError("execution failure events require a non-empty failure kind")
+    _record_execution_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        actor=actor,
+        event_type=WorkflowEventType.EXECUTION_FAILED,
+        context={"failure_kind": failure_kind},
+    )
+
+
+def _record_execution_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    actor: WorkflowActorContext,
+    event_type: WorkflowEventType,
+    context: dict[str, str] | None = None,
+) -> None:
+    """Write one execution event with its exact locked event type."""
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(execution_id, "execution_id")
+    if not isinstance(actor, WorkflowActorContext):
+        raise InvalidCommandError("execution events require a WorkflowActorContext actor")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=event_type,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_EXECUTION,
+        subject_id=execution_id,
+        context=context,
     )
 
 
