@@ -29,6 +29,12 @@ feature-branch **claim** into canonical Task state:
 - No Task-state transition is decided here: this leaf verifies and binds;
   the later Task workflow decides when the primitives may be invoked and
   what the verified head authorizes.
+- The read-only routed branch observation is shared: later workflow leaves
+  (issue #82's PR-authorization gate) reuse
+  :func:`observe_routed_repository_branch` for their authoritative
+  branch/head reads instead of duplicating the route resolution, the fresh
+  repository address walk, or the error translation, and perform their own
+  binding/decisions inside their own final short transactions.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from openorc.adapters.github import (
     GitHubAppClient,
     GitHubAuthenticationRejectedError,
     GitHubAuthorizationRejectedError,
+    GitHubBranchObservation,
     GitHubOutcomeUncertainError,
     GitHubRateLimitedError,
     GitHubRepositoryObservation,
@@ -68,6 +75,7 @@ __all__ = [
     "CanonicalBranchObservation",
     "CanonicalBranchVerification",
     "observe_bound_canonical_task_branch",
+    "observe_routed_repository_branch",
     "verify_canonical_task_branch",
 ]
 
@@ -119,6 +127,80 @@ def _translate_github_outcome(error: Exception) -> ApplicationError:
     )
     return ExternalOperationFailedError(
         "the authoritative GitHub branch verification failed as a known provider condition"
+    )
+
+
+def _observe_routed_branch(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    subject_branch: str,
+) -> GitHubBranchObservation:
+    """Resolve the durable route and read the subject branch from GitHub.
+
+    The shared authoritative-read seam: the repository access observation
+    through the exact routed installation first, then the documented branch
+    read addressed by the freshly observed owner/name. The verified head SHA
+    comes from GitHub only. The caller holds no database transaction.
+    """
+    route = resolve_system_repository_installation_route(
+        pool, workspace_id=workspace_id, repository_id=repository_id
+    )
+    try:
+        repository_observation: GitHubRepositoryObservation = github.get_installation_repository(
+            github_installation_id=route.github_installation_id,
+            github_repository_id=route.repository.identity.github_repository_id,
+        )
+        branch_observation = github.get_repository_branch(
+            github_installation_id=route.github_installation_id,
+            owner_login=repository_observation.owner_login,
+            repository_name=repository_observation.name,
+            branch_name=subject_branch,
+        )
+    except (
+        GitHubAuthorizationRejectedError,
+        GitHubAuthenticationRejectedError,
+        GitHubRateLimitedError,
+        GitHubRequestRejectedError,
+        GitHubOutcomeUncertainError,
+    ) as error:
+        raise _translate_github_outcome(error) from error
+    return branch_observation
+
+
+def observe_routed_repository_branch(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    subject_branch: str,
+) -> GitHubBranchObservation:
+    """Observe one repository branch's committed head through fresh authority.
+
+    The read-only complement of :func:`verify_canonical_task_branch` shared
+    with the PR-authorization leaf (issue #82): a later workflow command that
+    binds and decides inside its own final short transaction uses this seam
+    for its authoritative branch/head reads instead of duplicating the route
+    resolution, the fresh repository address walk, or the error translation.
+    The observation never binds a branch, never rotates a state token, and
+    never decides what the observed head authorizes; it fails closed with the
+    canonical verification error vocabulary.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise InvalidCommandError("workspace_id must be a UUID")
+    if not isinstance(repository_id, UUID):
+        raise InvalidCommandError("repository_id must be a UUID")
+    if not isinstance(subject_branch, str) or not subject_branch.strip():
+        raise InvalidCommandError("subject_branch must be a non-empty string")
+    return _observe_routed_branch(
+        pool,
+        github,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        subject_branch=subject_branch,
     )
 
 
@@ -183,30 +265,13 @@ def verify_canonical_task_branch(
                 "continues on the canonical branch"
             )
         subject_branch = bound_branch if bound_branch is not None else claimed_branch
-        route = resolve_system_repository_installation_route(
-            pool, workspace_id=workspace_id, repository_id=task.repository_id
+        branch_observation = _observe_routed_branch(
+            pool,
+            github,
+            workspace_id=workspace_id,
+            repository_id=task.repository_id,
+            subject_branch=subject_branch,
         )
-        try:
-            repository_observation: GitHubRepositoryObservation = (
-                github.get_installation_repository(
-                    github_installation_id=route.github_installation_id,
-                    github_repository_id=route.repository.identity.github_repository_id,
-                )
-            )
-            branch_observation = github.get_repository_branch(
-                github_installation_id=route.github_installation_id,
-                owner_login=repository_observation.owner_login,
-                repository_name=repository_observation.name,
-                branch_name=subject_branch,
-            )
-        except (
-            GitHubAuthorizationRejectedError,
-            GitHubAuthenticationRejectedError,
-            GitHubRateLimitedError,
-            GitHubRequestRejectedError,
-            GitHubOutcomeUncertainError,
-        ) as error:
-            raise _translate_github_outcome(error) from error
         if bound_branch is None:
             verified_task = bind_canonical_branch(
                 pool,
@@ -285,30 +350,13 @@ def observe_bound_canonical_task_branch(
             raise NotFoundError("the requested task is not available in this workspace")
         if task.canonical_feature_branch is None:
             raise NotFoundError("the task has no bound canonical feature branch")
-        route = resolve_system_repository_installation_route(
-            pool, workspace_id=workspace_id, repository_id=task.repository_id
+        branch_observation = _observe_routed_branch(
+            pool,
+            github,
+            workspace_id=workspace_id,
+            repository_id=task.repository_id,
+            subject_branch=task.canonical_feature_branch,
         )
-        try:
-            repository_observation: GitHubRepositoryObservation = (
-                github.get_installation_repository(
-                    github_installation_id=route.github_installation_id,
-                    github_repository_id=route.repository.identity.github_repository_id,
-                )
-            )
-            branch_observation = github.get_repository_branch(
-                github_installation_id=route.github_installation_id,
-                owner_login=repository_observation.owner_login,
-                repository_name=repository_observation.name,
-                branch_name=task.canonical_feature_branch,
-            )
-        except (
-            GitHubAuthorizationRejectedError,
-            GitHubAuthenticationRejectedError,
-            GitHubRateLimitedError,
-            GitHubRequestRejectedError,
-            GitHubOutcomeUncertainError,
-        ) as error:
-            raise _translate_github_outcome(error) from error
         return CanonicalBranchObservation(
             task_id=task_id,
             workspace_id=workspace_id,

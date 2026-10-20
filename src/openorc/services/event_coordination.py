@@ -64,10 +64,12 @@ __all__ = [
     "OwnerReviewerDiscussionDirection",
     "WorkflowActorContext",
     "owner_actor",
+    "producer_actor",
+    "record_execution_completed_event",
+    "record_execution_failed_event",
+    "record_execution_started_event",
     "record_guidance_changed_event",
     "record_implementation_authorized_event",
-    "record_owner_gate_created_event",
-    "record_guidance_changed_event",
     "record_owner_gate_created_event",
     "record_owner_gate_resolved_event",
     "record_owner_reviewer_discussion_message_event",
@@ -79,6 +81,7 @@ __all__ = [
     "record_review_iteration_limit_changed_event",
     "record_review_limit_reached_event",
     "record_role_binding_configuration_changed_event",
+    "record_task_blocked_event",
     "record_task_terminal_event",
 ]
 
@@ -86,6 +89,7 @@ __all__ = [
 # subject kinds need no schema migration, only a deliberate mapping here.
 _SUBJECT_TYPE_WORKSPACE = "workspace"
 _SUBJECT_TYPE_OWNER_GATE = "owner_gate"
+_SUBJECT_TYPE_TASK_BLOCK = "task_block"
 _SUBJECT_TYPE_PLAN_REVISION = "plan_revision"
 _SUBJECT_TYPE_REVIEW_ITERATION = "review_iteration"
 _SUBJECT_TYPE_REVIEW_LOOP = "review_loop"
@@ -746,6 +750,37 @@ def record_owner_gate_created_event(
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_OWNER_GATE,
         subject_id=owner_gate_id,
+    )
+
+
+def record_task_blocked_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_block_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one durable TaskBlock blocking condition (issue #82).
+
+    Task-scoped; the primary modeled subject is the new TaskBlock over the
+    Task scope. No context is recorded: the block's reason and recovery
+    context are canonical on the block row and are never shadowed into the
+    event. The calling capability emits this event atomically with the
+    block creation and its paired workflow effects.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(task_block_id, "task_block_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.TASK_BLOCKED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_TASK_BLOCK,
+        subject_id=task_block_id,
     )
 
 
