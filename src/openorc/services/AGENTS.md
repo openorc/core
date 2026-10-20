@@ -381,5 +381,46 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   `task_mutations.resolve_owner_gate` refuses `SETTLED` — it is never
   Owner-attributed. PR/head-subject settlement belongs to E9 (#84), which
   reuses the same purpose-independent persistence primitive.
+- E4 coordination (issue #79): `record_discussion_message_events=True` records
+  E4's two direction-only `OWNER_REVIEWER_DISCUSSION_MESSAGE` message facts
+  INSIDE the settlement transaction, so the exchange audit commits or rolls
+  back atomically with the settlement. The E2 continuation dependencies (the
+  runtime adapter and GitHub client) are validated at entry exactly when the
+  validated result routes to E2 — the same no-stranding guarantee, scoped to
+  the routing outcome; a formal ACCEPTED legitimately needs neither.
+
+## E4: Owner ↔ Reviewer discussion across gates (issue #79)
+
+- `task_owner_reviewer_discussion.send_owner_reviewer_discussion_message` is
+  the ONE Owner-authenticated discussion transport: at every pending current
+  OwnerGate of a non-archived `waiting_for_owner` Task it sends the Owner's
+  nonblank message verbatim to the exact admitted READY Reviewer session as
+  ONE ordinary `send(external_session_id, message, expected_family=None)`
+  interaction. All four pending gate types admit discussion against their
+  real subject form (exact current PlanRevision; the recorded pre-PR
+  committed head with no PR invented; canonical PR + exact reconciled head).
+- Authorization precedes EVERY adapter acquisition: the service takes
+  deferred attachment factories (`reviewer_runtime_factory(binding)` and a
+  lazily invoked `producer_runtime_factory()`), and production composition
+  binds the #190 BOUND `attach_cline_runtime` to the Phase-1 external
+  session identity. The pre-send revalidation re-proves currentness after
+  acquisition; the post-send recheck re-proves it before any effect. No
+  database transaction spans an attachment or the send.
+- Recognition is deliberately stricter than the #65 parser's
+  one-object-amid-prose tolerance: the whole normalized reply must be one
+  standalone unfenced JSON object or exactly one fenced JSON object with
+  nothing outside the fence; only that candidate is validated through the
+  existing #65 `parse_formal_response`, and only a `review_result` family
+  result becomes formal. Ordinary gates never invoke recognition — all
+  content there is advisory.
+- Audit is two direction-only `OWNER_REVIEWER_DISCUSSION_MESSAGE` events per
+  still-current exchange (Owner message, Reviewer reply) through the #56
+  event-coordination helper — direction-only context, never text. For a
+  recognized formal result, E4 dispatches E3c's settlement with the audit
+  flag so the message facts commit atomically with settlement; a PR/head
+  REVIEW_RESOLUTION result fails closed until E9 (#84). Uncertain sends,
+  stale races, and audit failures return typed safe errors and never
+  present a failed exchange as success; recovery/durable dispatch belongs
+  to #85/#87–#90, never to this service.
 
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

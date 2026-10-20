@@ -445,6 +445,7 @@ def _settle_resolution_transaction(
     task_id: UUID,
     expected_state_token: UUID,
     result: ReviewResult,
+    record_discussion_message_events: bool,
 ) -> _Settlement:
     """Settle the gate and commit the durable next decision in one transaction.
 
@@ -458,7 +459,10 @@ def _settle_resolution_transaction(
     admitted READY Reviewer binding, the NEW finalized settlement
     iteration, the safe audit events, the gate's one-shot SETTLED stamp
     with pointer clear and token rotation, and the settlement's durable
-    next decision.
+    next decision. When ``record_discussion_message_events`` is set (E4's
+    formal-exchange path, issue #79), the two direction-only
+    OWNER ↔ Reviewer discussion message events ride this same transaction,
+    so a failed event write rolls the entire settlement back.
     """
     with composed_transaction(pool) as transaction_pool:
         require_account_operational(transaction_pool, profile_id=profile_id)
@@ -553,6 +557,32 @@ def _settle_resolution_transaction(
             review_outcome=finalized_outcome,
         )
 
+        if record_discussion_message_events:
+            # E4's formal-exchange audit rides this same transaction (issue
+            # #79): two direction-only discussion message events for the
+            # exchange that produced this result — the Owner message routed
+            # to the Reviewer and the Reviewer reply that carried the formal
+            # result — both subject-bound to the settled gate. A failed
+            # event write rolls the whole settlement back, so the discussion
+            # facts and the authoritative settlement commit or vanish
+            # together and no partial success is representable.
+            event_coordination.record_owner_reviewer_discussion_message_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=settled_gate.id,
+                actor=event_coordination.owner_actor(profile_id),
+                direction=event_coordination.OwnerReviewerDiscussionDirection.OWNER_TO_REVIEWER,
+            )
+            event_coordination.record_owner_reviewer_discussion_message_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=settled_gate.id,
+                actor=_reviewer_actor(reviewer),
+                direction=event_coordination.OwnerReviewerDiscussionDirection.REVIEWER_TO_OWNER,
+            )
+
         if finalized_outcome is ReviewOutcome.ACCEPTED:
             closed_loop = review_records.close_review_loop(
                 transaction_pool, review_loop_id=locked_loop.id
@@ -597,14 +627,15 @@ def _settle_resolution_transaction(
 
 def settle_planning_review_resolution(
     pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
-    github: GitHubAppClient,
+    runtime: AgentRuntimeAdapter | None,
+    github: GitHubAppClient | None,
     *,
     profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
     review_result: ReviewResult,
+    record_discussion_message_events: bool = False,
 ) -> TaskPlanningReviewResolutionOutcome:
     """Settle the Task's exact current REVIEW_RESOLUTION gate with a formal result.
 
@@ -629,15 +660,35 @@ def settle_planning_review_resolution(
     E2's newly persisted current PlanRevision and post-update token may
     launch E3a's next ordinary REVIEW, and an uncertain E2 operation is
     never resent here.
+
+    ``record_discussion_message_events`` (issue #79) records E4's two
+    direction-only Owner ↔ Reviewer discussion message events inside this
+    settlement's transaction when the settlement is dispatched through
+    E4's formal-result path, so the exchange audit and the authoritative
+    settlement commit atomically; the default leaves the event sequence
+    exactly as before this parameter existed.
+
+    The E2 continuation dependencies (the Producer-side runtime adapter
+    and the GitHub client) are proven before the settlement commits
+    exactly when the validated result routes to E2 — the same
+    no-stranding guarantee as before, now scoped to the routing outcome.
+    A formal ACCEPTED never touches them, so E4's formal acceptance can
+    dispatch this settlement without acquiring a Producer attachment or
+    a GitHub client.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _SETTLEMENT_SPAN_NAME) as span:
         _require_uuid_command(profile_id, "profile_id")
         _require_uuid_command(workspace_id, "workspace_id")
         _require_uuid_command(task_id, "task_id")
         _require_uuid_command(expected_state_token, "expected_state_token")
-        runtime_adapter = _require_runtime(runtime)
-        github_client = _require_github(github)
         result = _require_formal_result(review_result)
+        # The routing decision is fully determined by the validated result
+        # outcome, so the E2 dependencies are proven BEFORE the settlement
+        # transaction exactly when the result routes to E2; an invalid or
+        # missing dependency can never strand an already-settled gate.
+        routes_to_e2 = _resolution_outcome(result) is ReviewOutcome.CHANGES_REQUESTED
+        runtime_adapter = _require_runtime(runtime) if routes_to_e2 else None
+        github_client = _require_github(github) if routes_to_e2 else None
         annotate_span(
             span,
             operation=_SETTLEMENT_SPAN_NAME,
@@ -653,10 +704,17 @@ def settle_planning_review_resolution(
             task_id=task_id,
             expected_state_token=expected_state_token,
             result=result,
+            record_discussion_message_events=record_discussion_message_events,
         )
 
         # --- Phase 2: the external consequence, with NO transaction open. ---
         if settlement.decision is PlanningReviewResolutionDecision.CONTINUATION_ROUTED:
+            if runtime_adapter is None or github_client is None:
+                # Unreachable: the CONTINUATION_ROUTED decision is derived
+                # from the same validated outcome that proved both E2
+                # dependencies at entry. Refuse rather than proceed with a
+                # half-proved continuation.
+                raise ConflictError("the E2 continuation dependencies are unavailable")
             production = revise_task_plan(
                 pool,
                 runtime_adapter,
