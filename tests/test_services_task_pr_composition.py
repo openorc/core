@@ -1514,3 +1514,48 @@ def test_telemetry_carries_only_the_sanctioned_vocabulary(
     assert "task_pr_composition.compose_and_publish_task_pr" in [span.name for span in spans]
     for span in spans:
         assert set(span.attributes or {}) <= _SANCTIONED_ATTRIBUTE_NAMES
+
+
+# --- reconciled head-SHA drift (review remediation) -------------------------------------
+
+
+def test_continuation_reconciliation_observing_a_changed_head_blocks_recoverably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Head-SHA drift observed by the authoritative continuation
+    reconciliation is recoverable stale publication authority: the atomic
+    ``stale_operation`` block composition applies where the Task remains
+    current, and the canonical record is never recreated or replaced."""
+    conn = ScriptedConnection()
+    _script_continuation(
+        conn,
+        observed_pr_row=_pr_row(head_sha=_RACED_SHA),
+        finalize="block",
+    )
+    pool = _pool(conn)
+    github = _FakeGitHub(
+        pool=cast(FakePool, pool),
+        repository_observation=GitHubRepositoryObservation(
+            github_repository_id=_GITHUB_REPOSITORY_ID,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        ),
+        pull_request_observation=_reconciliation_observation(head_sha=_RACED_SHA),
+    )
+    publication = _publication_fake(monkeypatch)
+    adapter = _prepared_adapter()
+
+    with pytest.raises(StaleOperationError):
+        _compose_call(pool, github, _FakeResolver(), _runtime_factory(adapter))
+
+    assert publication.commands == []
+    assert adapter.realized_controls() == ()
+    # Only the reconciliation's own update-only write touched the record:
+    # the drift block never recreates or replaces the canonical PR.
+    assert _count(conn, _PR_UPDATE) == 1
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _STATUS_UPDATE) == 1
+    assert _event_types(conn) == ["task_blocked"]

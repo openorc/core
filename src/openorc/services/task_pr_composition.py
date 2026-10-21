@@ -714,10 +714,16 @@ def _finalize_published_task_pr(
         gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=owner_gate_id)
         if gate is None or gate.task_id != task.id or gate.workspace_id != workspace_id:
             raise NotFoundError("the requested owner gate is not available for this task")
+        approved_head_sha = subjects.gate.subject_head_sha
+        if approved_head_sha is None:
+            # Narrowed by admission; kept explicit for fail-closed safety.
+            raise ConflictError(
+                "the pr authorization gate does not carry the exact head-sha subject"
+            )
         if (
             gate.gate_type is not OwnerGateType.PR_AUTHORIZATION
             or gate.status is not OwnerGateStatus.APPROVED
-            or gate.subject_head_sha != subjects.gate.subject_head_sha
+            or gate.subject_head_sha != approved_head_sha
         ):
             raise StaleOperationError(
                 "the approved pr authorization gate moved on; the publication is stale"
@@ -744,10 +750,20 @@ def _finalize_published_task_pr(
                 "the persisted canonical pull request does not match the "
                 "publication result; canonical records are never replaced"
             )
-        if pull_request.head_sha != gate.subject_head_sha:
-            raise StaleOperationError(
-                "the persisted pull request head no longer matches the approved "
-                "sha; the publication is stale"
+        if pull_request.head_sha != approved_head_sha:
+            # Reconciled head-SHA drift — observed during the authoritative
+            # continuation reconciliation or arising between the primitive's
+            # success and this finalization — is recoverable stale
+            # publication authority: it routes through the guard so the Task
+            # is blocked recoverably where still current and mutated nowhere
+            # when it has already moved on. The canonical record is never
+            # recreated or replaced.
+            raise _StalePublicationGuard(
+                reason=TaskBlockReason.STALE_OPERATION,
+                context={
+                    "authorized_head_sha": approved_head_sha,
+                    "observed_head_sha": pull_request.head_sha,
+                },
             )
         _require_review_eligible_pull_request(
             pull_request=pull_request,
