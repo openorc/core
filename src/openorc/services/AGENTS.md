@@ -653,4 +653,54 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   E8 (#83) owns publication. No database transaction spans GitHub I/O;
   telemetry carries only the safe identifier vocabulary.
 
+## E8: Producer PR composition and race-safe canonical PR publication (issue #83)
+
+- `task_pr_composition.compose_and_publish_task_pr` is the ONE publication
+  seam after E7's durable approval. Admission is one short DB-only
+  transaction that re-derives the persisted APPROVED historical
+  `PR_AUTHORIZATION` gate — the current-pointer guard is deliberately NOT
+  used (E7 intentionally cleared the pointer on approval) — its exact
+  head-SHA subject, and the single OWNER-attributed `owner_gate_resolved`
+  audit whose Profile is the only publication identity; a mismatched
+  caller/approver is rejected, never substituted. Fresh-path admission
+  additionally resolves the READY Producer binding (never created or
+  replaced), the current Workspace guidance, and the routed Repository
+  presentation context (full name and the workflow base from the durable
+  routed record — never from the Producer).
+- The fresh path runs ONE `PR_COMPOSE` interaction on the exact binding
+  through the #67 realize-control funnel with R1 (post-acquisition) and
+  post-interaction revalidations; uncertain outcomes are never resent and
+  known runtime/protocol failures stay distinct. The validated
+  `pr_result` title/body are presentation only: a missing effective
+  closing-keyword reference to the Task's exact issue in the authoritative
+  repository is appended once (fenced/inline-code examples, other issues,
+  and other repositories never satisfy it), and presentation can never
+  override the authoritative repository, branch, base, head SHA, or
+  approving Profile.
+- Publication goes through `pull_request_publication.publish_task_pull_request`
+  (B8) exactly once — never reimplemented, wrapped, or fallen back — and
+  only `PUBLISHED` (or a still-valid reconciled continuation record)
+  finalizes `waiting_for_owner → reviewing` with token rotation plus
+  exactly one `PR_CREATED` audit (subject the canonical TaskPullRequest,
+  truthful OPENORC actor, empty context). E8 never dispatches review;
+  #84 owns that.
+- The review-eligibility guard is re-proved from persistence in the
+  finalize: open + unmerged, the Task's canonical `head_ref`, the
+  authorized `base_ref`, the exact approved head SHA, and the stable
+  GitHub PR identity. Closed-unmerged records take the atomic
+  `pr_closed_unmerged` block; a confirmed merge refuses with zero durable
+  mutation (merge confirmation/completion belongs to E10 — never a false
+  unmerged-closure block). Reconciled head-SHA drift routes through the
+  same recoverable stale guard: `stale_operation` TaskBlock + `blocked`
+  transition + `task_blocked` audit where the Task remains current, zero
+  mutation where it has moved on — never a PR recreation or replacement.
+- The narrow continuation completes E8's own interrupted publication: an
+  admitted record carrying the exact approved head is reconciled
+  authoritatively through `reconcile_task_pull_request` and finalized —
+  never repeating the composition, re-creating, or adopting an unrelated
+  PR. `PREFLIGHT_STALE` and the post-create stale classifications use the
+  same recoverable block shape. No transaction spans the runtime
+  interaction, the reconciliation, or any GitHub call; telemetry carries
+  only the safe identifier vocabulary.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.
