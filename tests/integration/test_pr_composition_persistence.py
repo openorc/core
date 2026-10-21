@@ -287,19 +287,26 @@ def test_e8_publication_survives_interrupted_finalization_and_completes(
     def _boom(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("forced late pr_created failure")
 
-    monkeypatch.setattr(event_coordination, "record_pr_created_event", _boom)
-    with pytest.raises(RuntimeError, match="forced late pr_created failure"):
-        compose_and_publish_task_pr(
-            pool,
-            github,
-            resolver,
-            _runtime_factory(adapter),
-            profile_id=facts["profile_id"],
-            workspace_id=facts["workspace_id"],
-            task_id=facts["task_id"],
-            owner_gate_id=approved.owner_gate.id,
-            expected_state_token=approved.task.state_token,
+    # Scope the failure injection to the first invocation only: the real
+    # event recorder must be restored before the continuation recovery.
+    with monkeypatch.context() as failure_patch:
+        failure_patch.setattr(
+            event_coordination,
+            "record_pr_created_event",
+            _boom,
         )
+        with pytest.raises(RuntimeError, match="forced late pr_created failure"):
+            compose_and_publish_task_pr(
+                pool,
+                github,
+                resolver,
+                _runtime_factory(adapter),
+                profile_id=facts["profile_id"],
+                workspace_id=facts["workspace_id"],
+                task_id=facts["task_id"],
+                owner_gate_id=approved.owner_gate.id,
+                expected_state_token=approved.task.state_token,
+            )
     interrupted = task_repositories.get_task(pool, facts["task_id"])
     assert interrupted is not None
     assert interrupted.status is TaskStatus.WAITING_FOR_OWNER
