@@ -40,6 +40,7 @@ from openorc.adapters.github import GitHubPullRequestObservation, GitHubReposito
 from openorc.domain.connections import WorkflowRole
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import PrReviewSubject, ReviewInteraction
+from openorc.services import task_pr_review_dispatch
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationUncertainError,
@@ -161,13 +162,21 @@ class ScriptedConnection:
 
 
 class FakePool:
-    """Pool fake tracking checked-out connections for the transaction proof."""
+    """Pool fake tracking checked-out connections for the transaction proof.
+
+    ``checkouts`` counts every ``connection()`` acquisition, so a focused
+    test can prove that a composed transaction's operations share one
+    transaction-scoped connection (one checkout) instead of each repository
+    call acquiring its own (one checkout per statement)."""
 
     def __init__(self, conn: ScriptedConnection) -> None:
         self._conn = conn
         self.active_connections = 0
+        self.checkouts = 0
 
     def connection(self) -> Any:
+        self.checkouts += 1
+
         @contextmanager
         def managed() -> Iterator[ScriptedConnection]:
             self.active_connections += 1
@@ -340,6 +349,29 @@ def _iteration_row(
         findings,
         decided_at,
         _OBSERVED,
+    )
+
+
+def _reviewer_binding_domain() -> Any:
+    from openorc.domain.connections import WorkflowRole
+    from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
+
+    return TaskAgentSession(
+        id=_REVIEWER_SESSION_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        role=WorkflowRole.REVIEWER,
+        connection_id=_CONNECTION_ID,
+        external_session_id=_REVIEWER_EXTERNAL_ID,
+        lifecycle_status=TaskSessionLifecycleStatus.READY,
+        effective_config_snapshot={"repository_base": "/workspace/task-42"},
+        reported_provider=None,
+        reported_model=None,
+        reported_runtime_version=None,
+        initialized_at=_OBSERVED,
+        ended_at=None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
@@ -921,4 +953,98 @@ def test_reviewer_session_transition_after_reservation_sends_nothing() -> None:
         _dispatch_call(pool, reviewer_attachment, github)
 
     assert _count(conn, _ITERATION_INSERT) == 1
+    assert len(adapter.realized_controls()) == 0
+
+
+def test_the_post_attachment_revalidation_shares_one_transaction_scoped_connection() -> None:
+    """Finding 1 regression: the post-attachment currentness proof executes
+    its Task-lock, Task/token/status, PR identity/head, and Reviewer-binding
+    operations inside ONE composed transaction — the pool is checked out
+    exactly once and every statement runs on that same transaction-scoped
+    connection, so the Task row lock is held across the whole proof and a
+    concurrent Task transition can never interleave between the checks."""
+    conn = ScriptedConnection()
+    # The focused test passes the counting pool itself, so the checkout
+    # counter observes exactly what the helper acquires.
+    fake_pool = FakePool(conn)
+    pool = cast(DatabasePool, fake_pool)
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, _pr_row())
+    conn.on(_SESSION_READ, _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID))
+
+    task = task_pr_review_dispatch._revalidate_reserved_subjects(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        expected_pull_request_id=_PR_ID,
+        reserved_head_sha=_HEAD_SHA,
+        reviewer_session=_reviewer_binding_domain(),
+    )
+
+    assert task.id == _TASK_ID
+    # One composed transaction: exactly one checkout, all four statements on
+    # that single connection, and the connection released afterward.
+    assert fake_pool.checkouts == 1
+    assert len(conn.executed) == 4
+    assert fake_pool.active_connections == 0
+
+
+def test_a_wrong_branch_remediation_result_never_authorizes_a_review_iteration() -> None:
+    """Finding 2 regression: a durably SUCCEEDED remediation Execution whose
+    completion claims a branch other than the Task's canonical feature
+    branch never qualifies as review evidence — even with a GitHub-confirmed
+    changed head and otherwise-valid latest-CHANGES_REQUESTED linkage — so
+    the dispatch reserves no iteration and sends no REVIEW."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_phase_a0(conn)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, _pr_row())
+    conn.on(_REPO_READ, _repository_row())
+    conn.on(_INSTALLATION_READ, _installation_row())
+    conn.on(_WORKSPACE_READ, _ws_row())
+    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on(_REPO_READ_LOCKED, _repository_row())
+    conn.on(_PR_READ_LOCKED, _pr_row())
+    conn.on(_PR_UPDATE, _pr_row(head_sha=_NEW_HEAD_SHA))
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_REPO_READ, _repository_row())
+    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on(_WORKSPACE_READ, _ws_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, _pr_row(head_sha=_NEW_HEAD_SHA))
+    conn.on(_SESSION_READ, _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID))
+    conn.on(_WORKSPACE_READ, _ws_row())
+    conn.on(_LOOPS_LIST, [])
+    conn.on(_LOOP_INSERT, _loop_row())
+    conn.on(_LOOP_READ_LOCKED, _loop_row())
+    conn.on_repeat(_ITERATIONS_LIST, [])
+    conn.on(
+        _EXECUTIONS_LIST,
+        [
+            _execution_row(
+                status="succeeded",
+                result_payload={**_IMPLEMENTATION_PAYLOAD, "branch": "some/other-branch"},
+                claimed_iteration_id=uuid.uuid4(),
+            )
+        ],
+    )
+    conn.on(_GATES_LIST, [_approved_pr_authorization_gate_row()])
+    adapter = _prepared_adapter(
+        fake_pool, reviewer_outcomes=[accepted_review_result_candidate("Ship it.")]
+    )
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool, pull_request=_observation(head_sha=_NEW_HEAD_SHA))
+
+    with pytest.raises(ConflictError):
+        _dispatch_call(pool, reviewer_attachment, github)
+
+    # The wrong-branch completion never authorizes an iteration and nothing
+    # was sent to the Reviewer session.
+    assert _count(conn, _ITERATION_INSERT) == 0
     assert len(adapter.realized_controls()) == 0

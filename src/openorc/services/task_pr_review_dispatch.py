@@ -429,10 +429,62 @@ def _resolve_initial_authorized_head(transaction_pool: DatabasePool, *, task_id:
     return initial_head
 
 
+def _validate_dispatch_evidence_envelope(
+    payload: object, *, canonical_feature_branch: str
+) -> dict[str, object]:
+    """Re-derive the persisted completion's canonical envelope and branch.
+
+    Mirrors E7's durable-fact re-derivation of the qualifying E6 result
+    (never a parser rerun, never a trust of an in-memory typed result): the
+    envelope must be the ``implementation_result`` family at the pinned
+    protocol version with a completed status and a usable branch claim, and
+    the branch claim must correspond to the Task's currently bound canonical
+    feature branch. A wrong-branch result never authorizes a ReviewIteration
+    regardless of its Execution status or the current GitHub head — this
+    closes the bypass where a wrong-branch remediation completion that
+    correctly refused its own redispatch would otherwise be picked up by a
+    later dispatch as qualifying evidence.
+    """
+    if not isinstance(payload, dict):
+        raise ConflictError(
+            "the persisted implementation completion is not the canonical "
+            "implementation_result envelope; no review dispatch is produced"
+        )
+    if payload.get("type") != IMPLEMENTATION_RESULT_FAMILY:
+        raise ConflictError(
+            "the persisted implementation completion is not a validated "
+            "implementation_result envelope; no review dispatch is produced"
+        )
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise ConflictError(
+            "the persisted implementation completion carries an unsupported schema "
+            "version; no review dispatch is produced"
+        )
+    if payload.get("status") != "COMPLETED":
+        raise ConflictError(
+            "the persisted implementation completion is not a completed "
+            "implementation; no review dispatch is produced"
+        )
+    branch = payload.get("branch")
+    if not isinstance(branch, str) or not branch.strip():
+        raise ConflictError(
+            "the persisted implementation completion carries no usable branch claim; "
+            "no review dispatch is produced"
+        )
+    if branch != canonical_feature_branch:
+        raise ConflictError(
+            "the persisted implementation completion claims a branch other than the "
+            "task's bound canonical feature branch; it never qualifies as review "
+            "evidence"
+        )
+    return payload
+
+
 def _resolve_dispatch_evidence(
     transaction_pool: DatabasePool,
     *,
     task_id: UUID,
+    canonical_feature_branch: str,
     reconciled_head_sha: str,
     initial_authorized_head_sha: str,
     loop: ReviewLoop | None,
@@ -440,14 +492,16 @@ def _resolve_dispatch_evidence(
     """Resolve the latest appropriate successful Producer completion evidence.
 
     The durable evidence for the reconciled head is the latest successful
-    Execution with a non-NULL validated ``implementation_result``: the
-    initial E6 result for the durably authorized initial head, otherwise a
-    successful Execution recorded for the latest-numbered finalized PR
-    iteration (its one-shot remediation claim). A GitHub-observed changed
-    head never fabricates a Producer completion, and stale evidence never
-    dispatches: a changed head without corresponding remediation evidence
-    refuses with no reservation, no matter what head the caller's triggering
-    facts carry.
+    Execution with a non-NULL validated ``implementation_result`` whose
+    canonical envelope re-derives and whose branch claim corresponds to the
+    Task's bound canonical feature branch: the initial E6 result for the
+    durably authorized initial head, otherwise a successful Execution
+    recorded for the latest-numbered finalized PR iteration (its one-shot
+    remediation claim). A GitHub-observed changed head never fabricates a
+    Producer completion, and stale or wrong-branch evidence never
+    dispatches: a changed head without corresponding remediation evidence —
+    or a completed-but-wrong-branch result — refuses with no reservation, no
+    matter what head the caller's triggering facts carry.
     """
     history = [
         execution
@@ -461,12 +515,9 @@ def _resolve_dispatch_evidence(
             "task; there is no durable evidence to dispatch for review"
         )
     evidence = history[-1]
-    payload = evidence.implementation_result
-    if not isinstance(payload, dict):
-        raise ConflictError(
-            "the persisted implementation completion is not the canonical "
-            "implementation_result envelope; no review dispatch is produced"
-        )
+    payload = _validate_dispatch_evidence_envelope(
+        evidence.implementation_result, canonical_feature_branch=canonical_feature_branch
+    )
     iterations = (
         []
         if loop is None
@@ -628,7 +679,7 @@ def _realize_pr_review_control(
 
 
 def _revalidate_reserved_subjects(
-    transaction_pool: DatabasePool,
+    pool: DatabasePool,
     *,
     workspace_id: UUID,
     task_id: UUID,
@@ -652,43 +703,52 @@ def _revalidate_reserved_subjects(
     as an explicit recoverable blocked state — never silently bypassed and
     never re-dispatched blind. The transaction closes before the send; no
     GitHub I/O occurs inside it.
+
+    The entire proof runs inside ONE composed transaction: the Task row lock
+    taken by ``get_task_for_update`` is held to the transaction's commit, so
+    the token/status, PR identity/head, and Reviewer-binding checks all read
+    one transaction-scoped connection and a concurrent Task transition can
+    never interleave between them.
     """
-    locked = task_records.get_task_for_update(transaction_pool, task_id)
-    if locked is None or locked.workspace_id != workspace_id:
-        raise NotFoundError("the requested task is not available in this workspace")
-    task = require_current_task(
-        transaction_pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=expected_state_token,
-    )
-    if task.status is not TaskStatus.REVIEWING:
-        raise ConflictError(
-            "the addressed task is no longer reviewing; the dispatch is refused "
-            "without sending and the reserved attempt stays unfinalized for recovery"
+    with composed_transaction(pool) as transaction_pool:
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
         )
-    if task.current_owner_gate_id is not None:
-        raise ConflictError(
-            "the task carries a current owner gate; the dispatch is refused without "
-            "sending and the reserved attempt stays unfinalized for recovery"
+        if task.status is not TaskStatus.REVIEWING:
+            raise ConflictError(
+                "the addressed task is no longer reviewing; the dispatch is refused "
+                "without sending and the reserved attempt stays unfinalized for recovery"
+            )
+        if task.current_owner_gate_id is not None:
+            raise ConflictError(
+                "the task carries a current owner gate; the dispatch is refused without "
+                "sending and the reserved attempt stays unfinalized for recovery"
+            )
+        pull_request = require_task_pull_request_head(
+            transaction_pool, task=task, expected_head_sha=reserved_head_sha
         )
-    pull_request = require_task_pull_request_head(
-        transaction_pool, task=task, expected_head_sha=reserved_head_sha
-    )
-    if pull_request.id != expected_pull_request_id:
-        raise StaleOperationError(
-            "the canonical pull request identity changed after the review "
-            "reservation; the dispatch is refused without sending and the "
-            "reserved attempt stays unfinalized for recovery"
+        if pull_request.id != expected_pull_request_id:
+            raise StaleOperationError(
+                "the canonical pull request identity changed after the review "
+                "reservation; the dispatch is refused without sending and the "
+                "reserved attempt stays unfinalized for recovery"
+            )
+        reviewer = _require_ready_reviewer(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
         )
-    reviewer = _require_ready_reviewer(transaction_pool, workspace_id=workspace_id, task_id=task_id)
-    if reviewer.id != reviewer_session.id:
-        raise StaleOperationError(
-            "the reviewer session binding has moved on after the review "
-            "reservation; the dispatch is refused without sending and the "
-            "reserved attempt stays unfinalized for recovery"
-        )
-    return task
+        if reviewer.id != reviewer_session.id:
+            raise StaleOperationError(
+                "the reviewer session binding has moved on after the review "
+                "reservation; the dispatch is refused without sending and the "
+                "reserved attempt stays unfinalized for recovery"
+            )
+        return task
 
 
 # --- the dispatch operation ---------------------------------------------------------
@@ -865,6 +925,7 @@ def dispatch_pr_review(
             payload = _resolve_dispatch_evidence(
                 transaction_pool,
                 task_id=task_id,
+                canonical_feature_branch=task.canonical_feature_branch or "",
                 reconciled_head_sha=head_sha,
                 initial_authorized_head_sha=_resolve_initial_authorized_head(
                     transaction_pool, task_id=task_id
