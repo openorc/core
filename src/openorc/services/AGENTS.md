@@ -703,4 +703,76 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   interaction, the reconciliation, or any GitHub call; telemetry carries
   only the safe identifier vocabulary.
 
+## E9: commit-addressed PR review, remediation, and merge decision (issue #84)
+
+- The PR review conversation continues over the one canonical GitHub PR and
+  its exact reconciled head. `task_pr_review_dispatch.dispatch_pr_review` is
+  the ONE ordinary dispatch seam: Phase A0 is a short database-only
+  authenticated admission (account barrier + exact Owner Workspace/Task
+  scope) that is closed BEFORE the system-capable
+  `reconcile_task_pull_request` runs, so a foreign/cross-Owner invocation
+  can never trigger a GitHub read or mutate the target PR's persisted
+  reconciliation snapshot; Phase B re-proves everything under the Task row
+  `FOR UPDATE` plus the loop row `FOR UPDATE` (non-archived `REVIEWING` at
+  the expected token, no current OwnerGate, canonical feature branch, the
+  exact reconciled head, the exact admitted READY Reviewer session, one
+  OPEN `PR_REVIEW` loop established once with the Workspace limit snapshot,
+  no unresolved earlier attempts, no duplicate dispatch for an
+  already-reviewed head) and reserves exactly one next-numbered PR/head
+  iteration; Phase C re-reads the persisted reconciled head immediately
+  before the send (a moved head is a never-dispatched dead letter whose
+  reserved iteration stays unfinalized); Phase D sends ONE
+  `ReviewInteraction(PrReviewSubject)` with
+  `expected_family=REVIEW_RESULT_FAMILY` whose entire message is the
+  canonical structural JSON of the persisted `implementation_result` (no
+  prose, no SHA text, no rubric).
+- Durable completion evidence is the latest successful Execution with a
+  non-NULL `implementation_result`: the initial E6 result is valid exactly
+  while the reconciled head equals the published head; a changed head
+  requires a successful remediation attempt claiming the latest-numbered
+  finalized CHANGES_REQUESTED iteration of the PR loop. Stale evidence
+  never dispatches; a GitHub-observed changed head never fabricates a
+  Producer completion; base-branch movement alone is never a stale
+  review-subject condition.
+- `task_pr_review_decision` owns the atomic next decisions in one short
+  Task-locked transaction: finalize once + safe REVIEWER `PR_REVIEWED`
+  (subject the ReviewIteration; outcome value only in context), then a
+  within-budget `CHANGES_REQUESTED` keeps `REVIEWING` and routes the
+  remediation outside the transaction; an exhausted/sticky disagreement
+  installs the exact PR/head `REVIEW_RESOLUTION` (`REVIEWING` to
+  `WAITING_FOR_OWNER`, `REVIEW_LIMIT_REACHED` on the first exhaustion only);
+  an `ACCEPTED` installs the exact-head `MERGE_DECISION` with the loop left
+  OPEN (only E10 closes it). PR-scoped stickiness derives only from this
+  canonical PR's `REVIEW_RESOLUTION`/`MERGE_DECISION` gate history —
+  deliberately narrower than E3b's all-gates helper; planning gates never
+  consult into the PR budget.
+- `task_pr_remediation.route_pr_remediation` is the PR-specific Producer
+  continuation: a durable one-shot claim (`executions.review_iteration_id`
+  + partial unique index + composite-FK backstop — at most one attempt can
+  ever claim one finalized CHANGES_REQUESTED iteration, token-independent,
+  classified stale on `UniqueViolation`), the durable-before-send ordering,
+  no token rotation at claim, ONE `ReviseInteraction` with
+  `serialize_review_result` and `expected_family=IMPLEMENTATION_RESULT_FAMILY`
+  on the original Producer ACT session, E6's exact known-failure versus
+  uncertain/potentially-dispatched result discipline, then branch-claim
+  verification, B7 reconciliation of the SAME canonical PR, a
+  GitHub-confirmed NEW head, and the re-entered ordinary dispatch. Missing
+  push, wrong branch, closed/unmerged, or conflicting identity fails
+  closed — never invented success, never another PR.
+- `task_owner_reviewer_discussion` routes the PR/head formal continuations:
+  a standalone valid `review_result` at a PR/head `REVIEW_RESOLUTION`
+  dispatches `settle_pr_review_resolution` (new same-head finalized
+  iteration + `SETTLED` provenance via the #211 primitive; ACCEPTED means a
+  new MERGE_DECISION; CHANGES_REQUESTED means back to `REVIEWING` plus
+  remediation), and at a pending PR/head `MERGE_DECISION` only a standalone
+  valid `CHANGES_REQUESTED` is actionable —
+  `retire_pr_merge_decision_with_changes` retires G1 through the guarded
+  `supersede_current_owner_gate` `reviewing` destination (pending history,
+  never Owner-stamped, never SETTLED, no false gate-resolution event) while
+  a standalone ACCEPTED — like ordinary prose — stays advisory. The
+  remediation dependencies are validated at entry exactly when the result
+  routes to remediation (the #219 no-stranding guarantee), and the
+  discussion-audit flag commits the exchange events atomically with the
+  authoritative continuation.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

@@ -127,6 +127,12 @@ from openorc.services.task_planning_review_resolution import (
     settle_planning_review_resolution,
     supersede_implementation_authorization_with_changes,
 )
+from openorc.services.task_pr_review_decision import (
+    TaskPrMergeGateChangeRequestOutcome,
+    TaskPrReviewGateResolutionOutcome,
+    retire_pr_merge_decision_with_changes,
+    settle_pr_review_resolution,
+)
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -173,6 +179,10 @@ class OwnerReviewerDiscussionExchange(StrEnum):
     ORDINARY_REPLY = "ordinary_reply"
     FORMAL_RESOLUTION_SETTLED = "formal_resolution_settled"
     FORMAL_PLANNING_CHANGE_REQUESTED = "formal_planning_change_requested"
+    # Issue #84: the PR/head-subject formal continuations dispatch E9's
+    # dedicated seams instead of the planning settlement.
+    FORMAL_PR_RESOLUTION_SETTLED = "formal_pr_resolution_settled"
+    FORMAL_PR_MERGE_GATE_CHANGE_REQUESTED = "formal_pr_merge_gate_change_requested"
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +212,12 @@ class TaskOwnerReviewerDiscussionOutcome:
     reply_text: str | None
     resolution: TaskPlanningReviewResolutionOutcome | None
     change_request: TaskPlanningGateChangeRequestOutcome | None
+    # Issue #84: the PR/head-subject formal continuations carry their E9
+    # seam outcomes (the settled PR/head resolution — with its installed
+    # merge decision gate or routed remediation round — or the retired
+    # merge-gate change request).
+    pr_resolution: TaskPrReviewGateResolutionOutcome | None = None
+    pr_merge_gate_change_request: TaskPrMergeGateChangeRequestOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +552,7 @@ def _dispatch_formal_resolution(
     expected_state_token: UUID,
     subjects: _DiscussionSubjects,
     formal_result: ReviewResult,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
     producer_runtime_factory: ProducerRuntimeAttachmentFactory | None,
     github: GitHubAppClient | None,
 ) -> TaskOwnerReviewerDiscussionOutcome:
@@ -558,10 +575,90 @@ def _dispatch_formal_resolution(
     """
     gate = subjects.gate
     if gate.plan_revision_id is None:
-        # PR/head-subject resolution: E9's exact-subject settlement, not E4's.
-        raise ConflictError(
-            "the PR/head-subject review resolution is not settleable through this "
-            "seam; PR-review settlement arrives with later PR-review work"
+        # PR/head-subject form: E9's exact-subject PR-review seams (issue
+        # #84). At a pending PR/head MERGE_DECISION gate only a standalone
+        # valid CHANGES_REQUESTED is actionable — a formal ACCEPTED stays
+        # advisory exactly like ordinary prose, and the Owner may still
+        # approve the unchanged-head gate. At a PR/head REVIEW_RESOLUTION
+        # gate any schema-valid formal result settles it through E9's
+        # dedicated settlement. The dispatch target re-proves every exact
+        # subject in its own transaction, so a raced stale result applies
+        # nothing.
+        if gate.gate_type is OwnerGateType.MERGE_DECISION:
+            # Only a standalone valid CHANGES_REQUESTED reaches this branch:
+            # E4's recognition keeps a formal ACCEPTED advisory, and the
+            # retirement seam re-validates the outcome as its backstop.
+            if producer_runtime_factory is None or github is None:
+                raise InvalidCommandError(
+                    "the actionable merge-gate continuation requires the deferred "
+                    "producer runtime attachment factory and the GitHub client"
+                )
+            with producer_runtime_factory() as producer_runtime:
+                pr_change_request = retire_pr_merge_decision_with_changes(
+                    pool,
+                    producer_runtime,
+                    github,
+                    reviewer_runtime_factory,
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    review_result=formal_result,
+                    record_discussion_message_events=True,
+                )
+            return TaskOwnerReviewerDiscussionOutcome(
+                exchange=OwnerReviewerDiscussionExchange.FORMAL_PR_MERGE_GATE_CHANGE_REQUESTED,
+                owner_gate=subjects.gate,
+                reviewer_session=subjects.reviewer,
+                task=pr_change_request.task,
+                reply_text=None,
+                resolution=None,
+                change_request=None,
+                pr_resolution=None,
+                pr_merge_gate_change_request=pr_change_request,
+            )
+        if formal_result.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
+            if producer_runtime_factory is None or github is None:
+                raise InvalidCommandError(
+                    "the formal continuation requires the deferred producer runtime "
+                    "attachment factory and the GitHub client"
+                )
+            with producer_runtime_factory() as producer_runtime:
+                pr_resolution = settle_pr_review_resolution(
+                    pool,
+                    producer_runtime,
+                    github,
+                    reviewer_runtime_factory,
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    review_result=formal_result,
+                    record_discussion_message_events=True,
+                )
+        else:
+            pr_resolution = settle_pr_review_resolution(
+                pool,
+                None,
+                github,
+                reviewer_runtime_factory,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                review_result=formal_result,
+                record_discussion_message_events=True,
+            )
+        return TaskOwnerReviewerDiscussionOutcome(
+            exchange=OwnerReviewerDiscussionExchange.FORMAL_PR_RESOLUTION_SETTLED,
+            owner_gate=subjects.gate,
+            reviewer_session=subjects.reviewer,
+            task=pr_resolution.task,
+            reply_text=None,
+            resolution=None,
+            change_request=None,
+            pr_resolution=pr_resolution,
+            pr_merge_gate_change_request=None,
         )
     if gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
         # Issue #219: the Reviewer change request at the accepted-plan gate
@@ -713,9 +810,10 @@ def send_owner_reviewer_discussion_message(
             )
 
         # Recognition is pure text work on the already-received reply; it
-        # runs only at REVIEW_RESOLUTION and plan-subject
-        # IMPLEMENTATION_AUTHORIZATION gates and decides which effects (if
-        # any) the still-current reply may have.
+        # runs at REVIEW_RESOLUTION gates, at plan-subject
+        # IMPLEMENTATION_AUTHORIZATION gates, and at PR/head MERGE_DECISION
+        # gates, and decides which effects (if any) the still-current reply
+        # may have.
         formal_result: ReviewResult | None = None
         if subjects.gate.gate_type is OwnerGateType.REVIEW_RESOLUTION:
             formal_result = _recognize_formal_review_result(reply.text)
@@ -726,6 +824,15 @@ def send_owner_reviewer_discussion_message(
                 # CHANGES_REQUESTED reply is an actionable formal trigger;
                 # a standalone ACCEPTED — like ordinary prose — stays
                 # advisory and the Owner may still approve the gate.
+                formal_result = recognized
+        elif subjects.gate.gate_type is OwnerGateType.MERGE_DECISION:
+            # Issue #84: at the pending PR/head merge gate only a standalone
+            # valid CHANGES_REQUESTED reply is an actionable formal trigger;
+            # ordinary discussion, malformed or embedded JSON, and a
+            # standalone ACCEPTED all stay advisory while the head is
+            # unchanged.
+            recognized = _recognize_formal_review_result(reply.text)
+            if recognized is not None and recognized.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
                 formal_result = recognized
 
         # --- Phase 3: post-send recheck + effects (one short transaction). ---
@@ -768,6 +875,7 @@ def send_owner_reviewer_discussion_message(
                 expected_state_token=expected_state_token,
                 subjects=current,
                 formal_result=formal_result,
+                reviewer_runtime_factory=reviewer_runtime_factory,
                 producer_runtime_factory=producer_runtime_factory,
                 github=github,
             )

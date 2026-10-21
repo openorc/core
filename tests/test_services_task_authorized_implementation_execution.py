@@ -367,6 +367,7 @@ def _execution_row(
         _OBSERVED,
         implementation_result,
         last_activity,
+        None,
     )
 
 
