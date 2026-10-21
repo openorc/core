@@ -18,6 +18,13 @@ Executions are attempt/history records, not generic CRUD rows:
   ``unique (task_id, execution_number)`` constraint is the durable backstop
   and doubles as the attempt-history lookup). The identity constraint
   never enforces single-active-execution exclusivity.
+- The E9 remediation claim (issue #84): creation optionally binds the
+  attempt to one finalized CHANGES_REQUESTED ReviewIteration
+  (``review_iteration_id``). The composite foreign key keeps the claimed
+  iteration in the same Task/Workspace scope, and the partial unique index
+  on the column makes a second claim for the same iteration a
+  ``UniqueViolation`` — the durable one-shot remediation invariant,
+  independent of any Task state token.
 - Status transitions are guarded conditional updates: the update applies
   only while the row's current status is the caller's ``expected_status``,
   returning ``None`` otherwise (never retried blindly; typed-error
@@ -70,7 +77,8 @@ __all__ = [
 
 _EXECUTION_COLUMNS = (
     "id, workspace_id, task_id, producer_session_id, execution_number, status, "
-    "created_at, updated_at, implementation_result, last_qualifying_activity_at"
+    "created_at, updated_at, implementation_result, last_qualifying_activity_at, "
+    "review_iteration_id"
 )
 
 
@@ -86,6 +94,7 @@ def _execution_from_row(row: Sequence[Any]) -> Execution:
         updated_at=normalize_utc(row[7]),
         implementation_result=row[8],
         last_qualifying_activity_at=None if row[9] is None else normalize_utc(row[9]),
+        review_iteration_id=row[10],
     )
 
 
@@ -101,6 +110,7 @@ def create_execution(
     task_id: UUID,
     producer_session_id: UUID,
     execution_number: int,
+    review_iteration_id: UUID | None = None,
 ) -> Execution:
     """Insert one attempt record as a ``queued`` Execution for a Task.
 
@@ -112,8 +122,19 @@ def create_execution(
     ``execution_number``; a duplicate number raises ``UniqueViolation`` as
     the durable backstop. Attempts are history: a retry, recovery, or
     continuation is another row, never a rewrite of a finalized attempt.
+
+    ``review_iteration_id`` (issue #84) optionally binds the attempt as the
+    one-shot remediation claim of one finalized CHANGES_REQUESTED
+    ReviewIteration: the composite foreign key keeps the claimed iteration
+    in the same Task/Workspace scope, and the partial unique index on the
+    column means a second claim for the same iteration raises
+    ``UniqueViolation`` — completed, known-failed, and uncertain prior
+    claims alike. The default ``None`` leaves ordinary (non-remediation)
+    attempts unclaimed, exactly as before.
     """
     _require_positive_int(execution_number, "execution_number")
+    if review_iteration_id is not None and not isinstance(review_iteration_id, UUID):
+        raise ExecutionDomainError("create_execution requires a UUID review_iteration_id (or None)")
     with transaction(pool) as conn:
         role_row = conn.execute(
             "select role from openorc.task_agent_sessions where id = %s",
@@ -127,8 +148,9 @@ def create_execution(
             )
         row = conn.execute(
             "insert into openorc.executions "
-            "(workspace_id, task_id, producer_session_id, execution_number, status) "
-            "values (%s, %s, %s, %s, %s) "
+            "(workspace_id, task_id, producer_session_id, execution_number, status, "
+            "review_iteration_id) "
+            "values (%s, %s, %s, %s, %s, %s) "
             f"returning {_EXECUTION_COLUMNS}",
             (
                 workspace_id,
@@ -136,6 +158,7 @@ def create_execution(
                 producer_session_id,
                 execution_number,
                 ExecutionStatus.QUEUED.value,
+                review_iteration_id,
             ),
         ).fetchone()
     assert row is not None

@@ -29,6 +29,7 @@ from openorc.domain.tasks import TaskStatus
 from openorc.persistence import gates as gates_module
 from openorc.persistence.gates import (
     OwnerGateResolutionOutcome,
+    OwnerGateSupersessionDestination,
     OwnerGateSupersessionOutcome,
     create_owner_gate,
     get_owner_gate,
@@ -427,6 +428,7 @@ def test_the_module_surface_carries_the_resolution_contract() -> None:
         "OwnerGateResolution",
         "OwnerGateResolutionOutcome",
         "OwnerGateSupersession",
+        "OwnerGateSupersessionDestination",
         "OwnerGateSupersessionOutcome",
         "create_owner_gate",
         "get_owner_gate",
@@ -714,9 +716,69 @@ def test_supersede_current_owner_gate_applies_one_atomic_task_transition() -> No
     assert "for update" in task_lock_sql
     assert "update openorc.tasks" in task_update_sql
     assert "current_owner_gate_id = null" in task_update_sql
-    assert "status = 'planning'" in task_update_sql
+    assert "status = %s" in task_update_sql
     assert "waiting_for_owner" in task_update_sql
     assert "update openorc.owner_gates" not in task_update_sql
+    # The guarded destination is a bound parameter: the default (issue #219)
+    # returns the Task to planning.
+    update_params = fake_conn.executed[2][1]
+    assert update_params is not None
+    assert update_params[0] == "planning"
+
+
+def test_supersede_current_owner_gate_guarded_reviewing_destination() -> None:
+    """Issue #84 adds the PR-review destination: a Reviewer change request at
+    a pending PR/head MERGE_DECISION gate returns the Task to ``reviewing``
+    so the same canonical PR can be remediated and re-reviewed. The guard
+    vocabulary is closed and the transition constraints are identical."""
+    gate_row = _gate_row()
+    task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="waiting_for_owner",
+        current_owner_gate_id=gate_row[0],
+    )
+    superseded_task_row = _task_row(
+        id=gate_row[2],
+        workspace_id=gate_row[1],
+        status="reviewing",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=None,
+        updated_at=_observed_at() + timedelta(minutes=1),
+    )
+    fake_conn = FakeConnection(responses=[gate_row, task_row, superseded_task_row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    supersession = supersede_current_owner_gate(
+        pool,
+        owner_gate_id=gate_row[0],
+        expected_task_state_token=task_row[8],
+        destination=OwnerGateSupersessionDestination.REVIEWING,
+    )
+
+    assert supersession.outcome is OwnerGateSupersessionOutcome.SUPERSEDED
+    assert supersession.task is not None
+    assert supersession.task.status is TaskStatus.REVIEWING
+    assert supersession.task.current_owner_gate_id is None
+    update_params = fake_conn.executed[2][1]
+    assert update_params is not None
+    assert update_params[0] == "reviewing"
+
+
+def test_supersede_current_owner_gate_rejects_malformed_destinations() -> None:
+    """The destination vocabulary is closed: anything that is not the enum
+    (planning or reviewing) is rejected before any SQL runs."""
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    for bad in ("planning", "reviewing", None, 1):
+        with pytest.raises(OwnerGateDomainError):
+            supersede_current_owner_gate(
+                pool,
+                owner_gate_id=uuid.uuid4(),
+                expected_task_state_token=uuid.uuid4(),
+                destination=bad,  # type: ignore[arg-type]
+            )
+    assert fake_conn.executed == []
 
 
 def test_supersede_refuses_when_the_gate_is_no_longer_current() -> None:

@@ -25,6 +25,7 @@ attachment probes driving the real service composition. The suite proves:
 from __future__ import annotations
 
 import json
+import types
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -47,6 +48,7 @@ from openorc.domain.gates import OwnerGateStatus
 from openorc.domain.reviews import ReviewLoopStatus, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
+from openorc.services import task_owner_reviewer_discussion
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
@@ -554,6 +556,28 @@ class _ProducerAttachment:
     def __exit__(self, *_exc: object) -> bool:
         self.disposals += 1
         return False
+
+
+def _task_domain_stub() -> Any:
+    from openorc.domain.tasks import Task, TaskStatus
+
+    return Task(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        github_issue_number=42,
+        status=TaskStatus.REVIEWING,
+        archived_at=None,
+        canonical_feature_branch="feature/issue-42",
+        state_token=_STATE_TOKEN,
+        current_plan_revision_id=None,
+        current_owner_gate_id=None,
+        source_requirements_fingerprint="a" * 64,
+        queued_at=None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
 
 
 def _prepared_adapter(
@@ -1372,10 +1396,12 @@ def test_a_standalone_change_request_settles_atomically_and_routes_to_e2() -> No
     assert len(github.branch_calls) == 1
 
 
-def test_a_pr_head_subject_resolution_result_fails_closed() -> None:
+def test_a_pr_head_resolution_result_dispatches_the_e9_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A recognized formal result at a PR/head-subject REVIEW_RESOLUTION gate
-    belongs to E9's settlement: nothing is applied, nothing is audited, and
-    no Producer attachment is acquired."""
+    dispatches E9's exact-subject settlement seam with the discussion-audit
+    coordination flag; the ordinary-exchange audit is the seam's to record."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
     pool = _pool(conn)
@@ -1390,20 +1416,120 @@ def test_a_pr_head_subject_resolution_result_fails_closed() -> None:
     adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[reply])
     reviewer_attachment = _ReviewerAttachment(adapter)
     producer_attachment = _ProducerAttachment(adapter)
+    settlement_calls: list[dict[str, Any]] = []
 
-    with pytest.raises(ConflictError):
-        _discussion_call(
-            pool,
-            reviewer_attachment,
-            producer_attachment=producer_attachment,
-            github=FakeGitHubClient(fake_pool),
-        )
+    def _stub_settlement(*args: Any, **kwargs: Any) -> Any:
+        settlement_calls.append(kwargs)
+        return types.SimpleNamespace(task=_task_row() and _task_domain_stub())
 
-    assert _count(conn, _ITERATION_INSERT) == 0
-    assert _count(conn, _GATE_UPDATE) == 0
-    assert _event_types(conn) == []
+    monkeypatch.setattr(
+        task_owner_reviewer_discussion, "settle_pr_review_resolution", _stub_settlement
+    )
+
+    outcome = _discussion_call(
+        pool,
+        reviewer_attachment,
+        producer_attachment=producer_attachment,
+        github=FakeGitHubClient(fake_pool),
+    )
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.FORMAL_PR_RESOLUTION_SETTLED
+    assert len(settlement_calls) == 1
+    assert settlement_calls[0]["record_discussion_message_events"] is True
+    # A formal acceptance acquires no Producer attachment and no extra send.
     assert producer_attachment.acquisitions == 0
     assert reviewer_attachment.disposals == 1
+
+
+def test_an_actionable_pr_merge_gate_change_request_dispatches_the_e9_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a standalone valid CHANGES_REQUESTED is actionable at the pending
+    PR/head MERGE_DECISION gate: E4 acquires the deferred Producer attachment
+    around the E9 retirement seam and dispatches the discussion-audit flag."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    merge_gate = _gate_row(
+        gate_type="merge_decision",
+        plan_revision_id=None,
+        head_sha=_HEAD_SHA,
+        pr_id=_PR_ID,
+    )
+    _script_discussion_flow(conn, gate_row=merge_gate, pr_row=_pr_row())
+    reply = json.dumps(
+        changes_requested_review_result_candidate(
+            "The retry loop leaks the connection.", [("Fix the leak", "Close it in finally.")]
+        )
+    )
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[reply])
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    producer_attachment = _ProducerAttachment(adapter)
+    retirement_calls: list[dict[str, Any]] = []
+
+    def _stub_retirement(*args: Any, **kwargs: Any) -> Any:
+        retirement_calls.append(kwargs)
+        return types.SimpleNamespace(task=_task_domain_stub())
+
+    monkeypatch.setattr(
+        task_owner_reviewer_discussion,
+        "retire_pr_merge_decision_with_changes",
+        _stub_retirement,
+    )
+
+    outcome = _discussion_call(
+        pool,
+        reviewer_attachment,
+        producer_attachment=producer_attachment,
+        github=FakeGitHubClient(fake_pool),
+    )
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.FORMAL_PR_MERGE_GATE_CHANGE_REQUESTED
+    assert len(retirement_calls) == 1
+    assert retirement_calls[0]["record_discussion_message_events"] is True
+    # The Producer-side continuation dependency is established exactly when
+    # the actionable result routes to remediation.
+    assert producer_attachment.acquisitions == 1
+
+
+def test_an_acceptance_at_the_pr_merge_gate_stays_advisory() -> None:
+    """A standalone formal ACCEPTED at the pending PR/head MERGE_DECISION gate
+    is advisory like ordinary prose: the exchange audits as an ordinary reply,
+    the gate stays untouched, and nothing is dispatched."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    merge_gate = _gate_row(
+        gate_type="merge_decision",
+        plan_revision_id=None,
+        head_sha=_HEAD_SHA,
+        pr_id=_PR_ID,
+    )
+    _script_discussion_flow(conn, gate_row=merge_gate, pr_row=_pr_row())
+    reply = json.dumps(accepted_review_result_candidate("Ship it."))
+    adapter = _prepared_adapter(fake_pool, reviewer_outcomes=[reply])
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    producer_attachment = _ProducerAttachment(adapter)
+
+    outcome = _discussion_call(
+        pool,
+        reviewer_attachment,
+        producer_attachment=producer_attachment,
+        github=FakeGitHubClient(fake_pool),
+    )
+
+    assert outcome.exchange is OwnerReviewerDiscussionExchange.ORDINARY_REPLY
+    # The standalone ACCEPTED is displayed as ordinary conversation; the gate
+    # stays pending and approvable.
+    assert outcome.reply_text is not None
+    assert outcome.owner_gate.id == merge_gate[0]
+    assert producer_attachment.acquisitions == 0
+    # The two direction-only discussion events commit atomically in the
+    # post-send recheck transaction.
+    assert _event_types(conn) == [
+        _DISCUSSION_EVENT_TYPE,
+        _DISCUSSION_EVENT_TYPE,
+    ]
 
 
 def test_a_missing_producer_factory_refuses_a_formal_continuation() -> None:

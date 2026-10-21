@@ -106,6 +106,7 @@ def _execution_row(**overrides: Any) -> tuple[Any, ...]:
         "updated_at": _observed_at(),
         "implementation_result": None,
         "last_qualifying_activity_at": None,
+        "review_iteration_id": None,
     }
     values.update(overrides)
     return (
@@ -119,6 +120,7 @@ def _execution_row(**overrides: Any) -> tuple[Any, ...]:
         values["updated_at"],
         values["implementation_result"],
         values["last_qualifying_activity_at"],
+        values["review_iteration_id"],
     )
 
 
@@ -149,7 +151,9 @@ def test_create_execution_inserts_queued_and_maps_the_row() -> None:
     assert role_params == (row[3],)
     insert_sql, insert_params = fake_conn.executed[1]
     assert "insert into openorc.executions" in insert_sql
-    assert insert_params == (row[1], row[2], row[3], row[4], "queued")
+    # The ordinary (non-remediation) attempt carries no claim: the column
+    # inserts NULL exactly as before issue #84.
+    assert insert_params == (row[1], row[2], row[3], row[4], "queued", None)
 
 
 def test_create_execution_rejects_a_reviewer_or_missing_session_before_insert() -> None:
@@ -168,6 +172,49 @@ def test_create_execution_rejects_a_reviewer_or_missing_session_before_insert() 
     # The insert never ran: no Execution may be anchored to the session.
     assert len(reviewer_conn.executed) == 1
     assert len(missing_conn.executed) == 1
+
+
+def test_create_execution_binds_the_one_shot_remediation_claim() -> None:
+    # Issue #84: the optional ``review_iteration_id`` binds the attempt as
+    # the durable one-shot remediation claim of one finalized
+    # CHANGES_REQUESTED ReviewIteration. The insert carries the claim id and
+    # the returned row maps it; the database partial unique index that makes
+    # a second claim impossible is integration-suite territory.
+    claimed_iteration = uuid.uuid4()
+    row = _execution_row(review_iteration_id=claimed_iteration)
+    fake_conn = FakeConnection(responses=[("producer",), row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    execution = create_execution(
+        pool,
+        workspace_id=row[1],
+        task_id=row[2],
+        producer_session_id=row[3],
+        execution_number=row[4],
+        review_iteration_id=claimed_iteration,
+    )
+
+    assert execution is not None
+    assert execution.review_iteration_id == claimed_iteration
+    insert_sql, insert_params = fake_conn.executed[1]
+    assert "insert into openorc.executions" in insert_sql
+    assert "review_iteration_id" in insert_sql
+    assert insert_params == (row[1], row[2], row[3], row[4], "queued", claimed_iteration)
+
+
+def test_create_execution_rejects_malformed_claim_ids_before_any_sql() -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    with pytest.raises(ExecutionDomainError):
+        create_execution(
+            pool,
+            workspace_id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            producer_session_id=uuid.uuid4(),
+            execution_number=1,
+            review_iteration_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+    assert fake_conn.executed == []
 
 
 def test_create_execution_rejects_nonpositive_attempt_numbers() -> None:

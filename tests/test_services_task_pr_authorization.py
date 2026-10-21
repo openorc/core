@@ -385,6 +385,7 @@ def _execution_row(
         _OBSERVED,
         result,
         None,
+        None,
     )
 
 

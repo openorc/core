@@ -39,6 +39,13 @@ ended.
   marker timestamp (issue #90's consumer). Both are written once by the
   authorized-execution seam and never rewritten on finalized history; the
   marker stores no activity content of any kind.
+- An E9 PR-remediation attempt (issue #84) optionally names the finalized
+  CHANGES_REQUESTED ReviewIteration whose remediation it is
+  (``review_iteration_id``). The database partial unique index on that
+  column makes the association the durable one-shot remediation claim: at
+  most one attempt can ever claim one iteration, independent of any Task
+  state token. NULL on every attempt that is not a remediation
+  continuation.
 
 This module carries transport-independent validation only. It performs no
 runtime dispatch, no workflow orchestration, and no Task state transitions.
@@ -115,6 +122,13 @@ class Execution:
     # qualifying-activity marker advanced while the attempt was running.
     implementation_result: Mapping[str, object] | None = None
     last_qualifying_activity_at: datetime | None = None
+    # Optional E9 fact (issue #84): the finalized CHANGES_REQUESTED
+    # ReviewIteration whose remediation this attempt is. The database partial
+    # unique index makes the association the durable one-shot remediation
+    # claim: at most one attempt can ever claim one iteration. NULL for
+    # attempts that are not PR-remediation continuations (the initial
+    # authorized implementation attempt carries no claimed iteration).
+    review_iteration_id: UUID | None = None
 
     def __post_init__(self) -> None:
         _require_uuid(self.id, "id")
@@ -147,6 +161,8 @@ class Execution:
                 "Execution.last_qualifying_activity_at must be a timezone-aware "
                 "datetime when present"
             )
+        if self.review_iteration_id is not None and not isinstance(self.review_iteration_id, UUID):
+            raise ExecutionDomainError("Execution.review_iteration_id must be None or a UUID")
 
     @property
     def is_final(self) -> bool:

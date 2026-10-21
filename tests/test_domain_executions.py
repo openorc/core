@@ -110,6 +110,8 @@ def test_field_set_carries_no_git_sha_or_branch_ownership() -> None:
     # runtime sandboxes are runtime-private execution state, GitHub owns
     # committed repository truth, and the canonical branch is a Task-level
     # fact — no Git SHA field and no branch-ownership field exists here.
+    # ``review_iteration_id`` (issue #84) is the optional durable one-shot
+    # remediation-claim association, never a Git fact of its own.
     assert execution_field_names() == frozenset(
         {
             "id",
@@ -122,5 +124,6 @@ def test_field_set_carries_no_git_sha_or_branch_ownership() -> None:
             "updated_at",
             "implementation_result",
             "last_qualifying_activity_at",
+            "review_iteration_id",
         }
     )

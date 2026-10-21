@@ -64,6 +64,7 @@ __all__ = [
     "OwnerGateResolution",
     "OwnerGateResolutionOutcome",
     "OwnerGateSupersession",
+    "OwnerGateSupersessionDestination",
     "OwnerGateSupersessionOutcome",
     "create_owner_gate",
     "get_owner_gate",
@@ -388,6 +389,23 @@ def resolve_owner_gate(
         )
 
 
+class OwnerGateSupersessionDestination(StrEnum):
+    """The guarded Task-status destination of a gate supersession.
+
+    Issue #219 introduced the supersession with exactly one destination: the
+    Task returns to ``planning`` so the accepted plan can be revised. Issue
+    #84 adds the PR-review destination: a Reviewer change request at a
+    pending PR/head MERGE_DECISION gate returns the Task to ``reviewing`` so
+    the same canonical PR can be remediated and re-reviewed. The vocabulary
+    is closed — every other destination is rejected — and the transition
+    guards stay identical for both: the Task must be a non-archived
+    ``waiting_for_owner`` current-gate holder.
+    """
+
+    PLANNING = "planning"
+    REVIEWING = "reviewing"
+
+
 class OwnerGateSupersessionOutcome(StrEnum):
     """The explicit outcome of one :func:`supersede_current_owner_gate` attempt.
 
@@ -424,6 +442,7 @@ def supersede_current_owner_gate(
     *,
     owner_gate_id: UUID,
     expected_task_state_token: UUID,
+    destination: OwnerGateSupersessionDestination = OwnerGateSupersessionDestination.PLANNING,
 ) -> OwnerGateSupersession:
     """Supersede the Task's current gate as one authoritative Task transition.
 
@@ -432,8 +451,10 @@ def supersede_current_owner_gate(
     the gate row is never touched and stays pending as history (the
     established superseded-pending-gate property) — while the Task's
     ``current_owner_gate_id`` clears, the Task's status moves from
-    ``waiting_for_owner`` to ``planning``, and the ``state_token`` rotates
-    with its ``updated_at`` advancing, all in one atomic effect.
+    ``waiting_for_owner`` to the guarded ``destination`` (``planning`` for
+    the accepted-plan continuation, ``reviewing`` for the issue #84 PR-review
+    continuation), and the ``state_token`` rotates with its ``updated_at``
+    advancing, all in one atomic effect.
 
     Success requires the gate to be pending, still the Task's current
     gate, and the caller's ``expected_task_state_token`` to still match a
@@ -443,11 +464,16 @@ def supersede_current_owner_gate(
     backstop, so a concurrent resolution or supersession serializes here
     and only one continuation can win. This is never an Owner resolution:
     it stamps no ``decided_at``, writes no terminal gate status, and
-    belongs to the E3/E4 continuation seam that separately records the
+    belongs to the E3/E4/E9 continuation seam that separately records the
     Reviewer's iteration and the safe audit trail.
     """
     if not isinstance(expected_task_state_token, UUID):
         raise OwnerGateDomainError("expected_task_state_token must be a UUID")
+    if not isinstance(destination, OwnerGateSupersessionDestination):
+        raise OwnerGateDomainError(
+            "supersede_current_owner_gate requires an "
+            "OwnerGateSupersessionDestination (planning or reviewing)"
+        )
     with transaction(pool) as conn:
         gate_row = conn.execute(
             f"select {_OWNER_GATE_COLUMNS} from openorc.owner_gates where id = %s",
@@ -484,12 +510,12 @@ def supersede_current_owner_gate(
             )
         superseded_task_row = conn.execute(
             "update openorc.tasks "
-            "set current_owner_gate_id = null, status = 'planning', "
+            "set current_owner_gate_id = null, status = %s, "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             "and current_owner_gate_id = %s and status = 'waiting_for_owner' "
             f"returning {_TASK_COLUMNS}",
-            (gate.task_id, expected_task_state_token, gate.id),
+            (destination.value, gate.task_id, expected_task_state_token, gate.id),
         ).fetchone()
         assert superseded_task_row is not None
         return OwnerGateSupersession(

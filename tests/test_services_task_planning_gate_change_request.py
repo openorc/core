@@ -222,7 +222,7 @@ _LOOP_GUARD_LOCKED = _sql_has("select status, purpose from openorc.review_loops"
 # update carries a different SET list (its RETURNING clause shares column
 # names, so the broader task-write predicates are ambiguous).
 _SUPERSESSION_WRITE = _sql_has(
-    "update openorc.tasks", "current_owner_gate_id = null", "status = 'planning'"
+    "update openorc.tasks", "current_owner_gate_id = null", "status = %s"
 )
 _ITERATION_READ = _sql_has("from openorc.review_iterations where id")
 _ITERATIONS_LIST = _sql_has("review_iterations where review_loop_id")

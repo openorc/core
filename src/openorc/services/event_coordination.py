@@ -42,7 +42,8 @@ extension), the #54 terminal Task archival (``TASK_CANCELLED`` /
 ``TASK_COMPLETED``), and exact current OwnerGate resolution
 (``OWNER_GATE_RESOLVED``). Branch binding and other Phase 1 facts that
 deliberately have no event type remain non-evented; later Phase 2 workflow
-leaves add their own mappings through this same boundary.
+leaves add their own mappings through this same boundary (E9's issue #84
+PR-review decision adds ``PR_REVIEWED`` alongside ``PLAN_REVIEWED``).
 """
 
 from __future__ import annotations
@@ -75,6 +76,7 @@ __all__ = [
     "record_owner_reviewer_discussion_message_event",
     "record_plan_ready_event",
     "record_plan_reviewed_event",
+    "record_pr_reviewed_event",
     "record_plan_revision_created_event",
     "record_plan_revision_revised_event",
     "record_planning_started_event",
@@ -717,6 +719,44 @@ def record_plan_reviewed_event(
         workspace_id=workspace_id,
         task_id=task_id,
         event_type=WorkflowEventType.PLAN_REVIEWED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_REVIEW_ITERATION,
+        subject_id=review_iteration_id,
+        context={"outcome": outcome.value},
+    )
+
+
+def record_pr_reviewed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    review_iteration_id: UUID,
+    actor: WorkflowActorContext,
+    outcome: ReviewOutcome,
+) -> None:
+    """Record one finalized PR-review decision on its iteration (issue #84).
+
+    The PR-review sibling of :func:`record_plan_reviewed_event`, sharing its
+    exact discipline: Task-scoped, the primary modeled subject is the
+    finalized ReviewIteration — the canonical home of the recorded result —
+    over the Task scope, and the context carries the single safe semantic
+    ``outcome`` value only. The summary, the findings document, the PR/head
+    identity, and every other canonical fact are never copied into the
+    event. The actor is supplied by the calling capability — the exact
+    REVIEWER session records the Reviewer's decision.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(review_iteration_id, "review_iteration_id")
+    if not isinstance(outcome, ReviewOutcome):
+        raise InvalidCommandError("reviewed events require a ReviewOutcome")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.PR_REVIEWED,
         actor_type=actor.actor_type,
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_REVIEW_ITERATION,
