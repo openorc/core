@@ -206,6 +206,7 @@ _LOOP_GUARD_LOCKED = _sql_has("select status, purpose from openorc.review_loops"
 _ITERATIONS_LIST = _sql_has("review_iterations where review_loop_id")
 _ITERATION_INSERT = _sql_has("insert into openorc.review_iterations")
 _EXECUTIONS_LIST = _sql_has("from openorc.executions where task_id")
+_GATES_LIST = _sql_has("from openorc.owner_gates where task_id")
 
 
 def _ws_row(*, owner: Any = _OWNER_PROFILE_ID, limit: int = 2) -> tuple[Any, ...]:
@@ -257,7 +258,9 @@ def _pr_row(*, head_sha: str = _HEAD_SHA, task_id: Any = _TASK_ID) -> tuple[Any,
     )
 
 
-def _session_row(role: str, session_id: Any, external_id: str) -> tuple[Any, ...]:
+def _session_row(
+    role: str, session_id: Any, external_id: str, *, lifecycle: str = "ready"
+) -> tuple[Any, ...]:
     return (
         session_id,
         _WORKSPACE_ID,
@@ -265,7 +268,7 @@ def _session_row(role: str, session_id: Any, external_id: str) -> tuple[Any, ...
         role,
         _CONNECTION_ID,
         external_id,
-        "ready",
+        lifecycle,
         {"repository_base": "/workspace/task-42"},
         None,
         None,
@@ -336,6 +339,24 @@ def _iteration_row(
         summary,
         findings,
         decided_at,
+        _OBSERVED,
+    )
+
+
+def _approved_pr_authorization_gate_row() -> tuple[Any, ...]:
+    """The durable E7 authorization history: the durably APPROVED
+    ``PR_AUTHORIZATION`` gate binding exactly the initial authorized head
+    (the exact head-SHA subject form, no PR binding)."""
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "pr_authorization",
+        "approved",
+        None,
+        _HEAD_SHA,
+        None,
+        _OBSERVED,
         _OBSERVED,
     )
 
@@ -547,6 +568,7 @@ def _script_reservation(conn: ScriptedConnection, *, iterations: list[tuple[Any,
     conn.on(_LOOP_READ_LOCKED, _loop_row())
     conn.on_repeat(_ITERATIONS_LIST, iterations)
     conn.on(_EXECUTIONS_LIST, [_execution_row()])
+    conn.on(_GATES_LIST, [_approved_pr_authorization_gate_row()])
     conn.on(_LOOP_GUARD_LOCKED, ("open", "pr_review"))
     conn.on(_ITERATION_INSERT, _iteration_row())
 
@@ -592,6 +614,10 @@ def test_the_initial_handoff_dispatches_one_loop_iteration_and_the_structural_me
     _script_phase_a0(conn)
     _script_reconcile(conn)
     _script_reservation(conn, iterations=[])
+    # Phase C: the post-attachment currentness proof.
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_SESSION_READ, _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID))
     conn.on(_PR_READ, _pr_row())
     adapter = _prepared_adapter(
         fake_pool, reviewer_outcomes=[accepted_review_result_candidate("Ship it.")]
@@ -696,8 +722,11 @@ def test_a_head_change_without_remediation_evidence_refuses_with_no_reservation(
     pool = _pool(conn)
     _script_phase_a0(conn)
     # B7 observes a NEW head: the persisted snapshot advances (the durable
-    # reconciliation is truthful), but the dispatch's evidence is still the
-    # initial completion — stale evidence never dispatches.
+    # reconciliation is truthful). The caller's triggering facts carry the
+    # same updated head — a fabricated snapshot of the current reconciled
+    # PR — but the initial authorized head comes from the durable APPROVED
+    # PR_AUTHORIZATION gate, never from the command, so the stale initial
+    # completion is never upgraded into evidence.
     conn.on(_TASK_READ, _task_row())
     conn.on(_PR_READ, _pr_row())
     conn.on(_REPO_READ, _repository_row())
@@ -722,12 +751,20 @@ def test_a_head_change_without_remediation_evidence_refuses_with_no_reservation(
     conn.on(_LOOP_READ_LOCKED, _loop_row())
     conn.on_repeat(_ITERATIONS_LIST, [])
     conn.on(_EXECUTIONS_LIST, [_execution_row()])
+    conn.on(_GATES_LIST, [_approved_pr_authorization_gate_row()])
     adapter = _prepared_adapter(fake_pool)
     reviewer_attachment = _ReviewerAttachment(adapter)
     github = FakeGitHubClient(fake_pool, pull_request=_observation(head_sha=_NEW_HEAD_SHA))
 
+    # The triggering facts carry the caller-supplied updated head; the
+    # durable initial head is the approved gate's original SHA.
     with pytest.raises(StaleOperationError):
-        _dispatch_call(pool, reviewer_attachment, github)
+        _dispatch_call(
+            pool,
+            reviewer_attachment,
+            github,
+            published=_published(head_sha=_NEW_HEAD_SHA),
+        )
 
     # The reconciliation persisted the GitHub-observed head, but no review
     # iteration was reserved and nothing was sent.
@@ -743,8 +780,11 @@ def test_pre_send_head_movement_is_a_never_dispatched_dead_letter() -> None:
     _script_phase_a0(conn)
     _script_reconcile(conn)
     _script_reservation(conn, iterations=[])
-    # The pre-send durable recheck observes a moved head: fail closed
+    # The post-attachment revalidation observes a moved head: fail closed
     # without sending.
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_SESSION_READ, _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID))
     conn.on(_PR_READ, _pr_row(head_sha=_NEW_HEAD_SHA))
     adapter = _prepared_adapter(
         fake_pool, reviewer_outcomes=[accepted_review_result_candidate("Ship it.")]
@@ -768,6 +808,9 @@ def test_an_uncertain_send_leaves_the_reserved_iteration_unresolved() -> None:
     _script_phase_a0(conn)
     _script_reconcile(conn)
     _script_reservation(conn, iterations=[])
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_SESSION_READ, _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID))
     conn.on(_PR_READ, _pr_row())
     adapter = _prepared_adapter(
         fake_pool,
@@ -812,4 +855,70 @@ def test_duplicate_dispatch_for_an_already_reviewed_head_refuses() -> None:
         _dispatch_call(pool, reviewer_attachment, github)
 
     assert _count(conn, _ITERATION_INSERT) == 0
+    assert len(adapter.realized_controls()) == 0
+
+
+def test_task_authority_movement_after_reservation_sends_nothing() -> None:
+    """Finding 2 regression: a Task authority transition (here a raced token
+    rotation, as a cancellation or gate transition performs) between the
+    reservation and the send refuses the dispatch with zero runtime
+    realization calls even though the PR head is unchanged — the post-
+    attachment currentness proof covers the Task/token/status, the PR
+    identity/head, and the exact Reviewer binding, not the head alone."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_phase_a0(conn)
+    _script_reconcile(conn)
+    _script_reservation(conn, iterations=[])
+    # The Task's state token moved on during attachment acquisition (a
+    # concurrent authoritative Task mutation rotated it); the PR head is
+    # unchanged.
+    raced_token = uuid.uuid4()
+    conn.on(_TASK_READ_LOCKED, _task_row(state_token=raced_token))
+    conn.on(_TASK_READ, _task_row(state_token=raced_token))
+    adapter = _prepared_adapter(
+        fake_pool, reviewer_outcomes=[accepted_review_result_candidate("Ship it.")]
+    )
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool, pull_request=_observation())
+
+    with pytest.raises(StaleOperationError):
+        _dispatch_call(pool, reviewer_attachment, github)
+
+    # The reserved iteration stays unfinalized as the recoverable dead
+    # letter, and nothing was ever sent to the runtime session.
+    assert _count(conn, _ITERATION_INSERT) == 1
+    assert len(adapter.realized_controls()) == 0
+    assert reviewer_attachment.disposals == 1
+
+
+def test_reviewer_session_transition_after_reservation_sends_nothing() -> None:
+    """Finding 2 regression: a Reviewer binding that is no longer READY (a
+    session transition during attachment acquisition) refuses the dispatch
+    with zero runtime realization calls while the PR head is unchanged."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_phase_a0(conn)
+    _script_reconcile(conn)
+    _script_reservation(conn, iterations=[])
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, _pr_row())
+    # The Reviewer binding transitioned during acquisition (e.g. LOST).
+    conn.on(
+        _SESSION_READ,
+        _session_row("reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_ID, lifecycle="lost"),
+    )
+    adapter = _prepared_adapter(
+        fake_pool, reviewer_outcomes=[accepted_review_result_candidate("Ship it.")]
+    )
+    reviewer_attachment = _ReviewerAttachment(adapter)
+    github = FakeGitHubClient(fake_pool, pull_request=_observation())
+
+    with pytest.raises(ConflictError):
+        _dispatch_call(pool, reviewer_attachment, github)
+
+    assert _count(conn, _ITERATION_INSERT) == 1
     assert len(adapter.realized_controls()) == 0

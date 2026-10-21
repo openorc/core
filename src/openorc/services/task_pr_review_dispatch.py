@@ -86,6 +86,7 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.ownership import Repository
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import (
@@ -99,7 +100,7 @@ from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
-from openorc.persistence import pull_requests as pull_request_records
+from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.executions import ExecutionStatus
@@ -392,23 +393,61 @@ def _reserve_iteration(
 # --- durable Producer completion evidence -------------------------------------------
 
 
+def _resolve_initial_authorized_head(transaction_pool: DatabasePool, *, task_id: UUID) -> str:
+    """Derive the initial authorized PR head from durable E7 authorization.
+
+    The initial head is the exact subject of the Task's durably ``APPROVED``
+    ``PR_AUTHORIZATION`` gate — the authorization whose approval authorized
+    E8's publication of that head — re-derived from gate history inside the
+    caller's Task-locked transaction. The E8 command's publication facts are
+    a typed trigger only and are never consulted here: a caller-supplied
+    snapshot of the currently reconciled head after an unrelated GitHub head
+    change can never upgrade the stale initial completion into evidence.
+    The durable ``pr_authorization`` subject form binds exactly one head SHA
+    and no PR binding, so an incoherent history (no approval, or more than
+    one) refuses the dispatch.
+    """
+    pr_gates = [
+        gate
+        for gate in gate_records.list_task_owner_gates(transaction_pool, task_id=task_id)
+        if gate.gate_type is OwnerGateType.PR_AUTHORIZATION
+    ]
+    approved = [gate for gate in pr_gates if gate.status is OwnerGateStatus.APPROVED]
+    if len(approved) != 1:
+        raise ConflictError(
+            "the task's pr authorization history does not bind exactly one durably "
+            "approved initial head; the initial dispatch is refused"
+        )
+    initial_head = approved[0].subject_head_sha
+    if initial_head is None:
+        # Unreachable for the domain's exact pr_authorization subject form;
+        # fail closed rather than derive an absent authority.
+        raise ConflictError(
+            "the approved pr authorization gate carries no head-SHA subject; the "
+            "initial dispatch is refused"
+        )
+    return initial_head
+
+
 def _resolve_dispatch_evidence(
     transaction_pool: DatabasePool,
     *,
     task_id: UUID,
     reconciled_head_sha: str,
-    published_head_sha: str,
+    initial_authorized_head_sha: str,
     loop: ReviewLoop | None,
 ) -> dict[str, object]:
     """Resolve the latest appropriate successful Producer completion evidence.
 
     The durable evidence for the reconciled head is the latest successful
     Execution with a non-NULL validated ``implementation_result``: the
-    initial E6 result for the initial head, otherwise a successful Execution
-    recorded for the latest-numbered finalized PR iteration (its one-shot
-    remediation claim). A GitHub-observed changed head never fabricates a
-    Producer completion, and stale evidence never dispatches: a changed head
-    without corresponding remediation evidence refuses with no reservation.
+    initial E6 result for the durably authorized initial head, otherwise a
+    successful Execution recorded for the latest-numbered finalized PR
+    iteration (its one-shot remediation claim). A GitHub-observed changed
+    head never fabricates a Producer completion, and stale evidence never
+    dispatches: a changed head without corresponding remediation evidence
+    refuses with no reservation, no matter what head the caller's triggering
+    facts carry.
     """
     history = [
         execution
@@ -436,10 +475,11 @@ def _resolve_dispatch_evidence(
     finalized = [iteration for iteration in iterations if iteration.outcome is not None]
     if evidence.review_iteration_id is None:
         # Initial evidence: the initial E6 completion. It is valid exactly
-        # while the reconciled head is still the published initial head — a
-        # GitHub-observed head change with no remediation round never
-        # dispatches the stale initial result.
-        if reconciled_head_sha != published_head_sha:
+        # while the reconciled head is still the durably authorized initial
+        # head — a GitHub-observed head change with no remediation round
+        # never dispatches the stale initial result, whatever head the
+        # caller's triggering facts carry.
+        if reconciled_head_sha != initial_authorized_head_sha:
             raise StaleOperationError(
                 "the pull request head changed after the initial implementation "
                 "completion with no corresponding successful remediation; the "
@@ -587,26 +627,68 @@ def _realize_pr_review_control(
     return outcome
 
 
-def _recheck_reserved_head(
-    pool: DatabasePool, *, task_id: UUID, reserved_head_sha: str
-) -> TaskPullRequest:
-    """The pre-send durable recheck: a single read, no transaction, no GitHub.
+def _revalidate_reserved_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    expected_pull_request_id: UUID,
+    reserved_head_sha: str,
+    reviewer_session: TaskAgentSession,
+) -> Task:
+    """The post-attachment currentness proof: database only, before the send.
 
-    The persisted reconciled head is re-read immediately before the send. A
-    head that moved after the reservation makes the dispatch a
-    never-dispatched dead letter bound to a superseded head: no message is
-    sent, no verdict/event/gate exists, and the reserved iteration stays
-    unfinalized as an explicit recoverable blocked state — never silently
-    bypassed and never re-dispatched blind.
+    Attachment acquisition takes wall-clock time, so the exact reserved
+    subjects are re-proven under the Task row ``FOR UPDATE`` after the
+    Reviewer attachment is acquired and immediately before the send: the
+    exact current non-archived ``REVIEWING`` Task at the caller's expected
+    token with no current OwnerGate, the canonical PR still carrying exactly
+    the reserved head and identity, and the exact admitted READY Reviewer
+    binding. Cancellation, a gate transition, or Reviewer-session loss
+    during acquisition refuses the dispatch as a never-dispatched dead
+    letter bound to the reserved subjects: no message is sent, no
+    verdict/event/gate exists, and the reserved iteration stays unfinalized
+    as an explicit recoverable blocked state — never silently bypassed and
+    never re-dispatched blind. The transaction closes before the send; no
+    GitHub I/O occurs inside it.
     """
-    current = pull_request_records.get_task_pull_request_for_task(pool, task_id=task_id)
-    if current is None or current.head_sha != reserved_head_sha:
-        raise StaleOperationError(
-            "the reconciled pull request head moved after the review reservation; "
-            "the dispatch is refused without sending and the reserved attempt "
-            "stays unfinalized for recovery"
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.REVIEWING:
+        raise ConflictError(
+            "the addressed task is no longer reviewing; the dispatch is refused "
+            "without sending and the reserved attempt stays unfinalized for recovery"
         )
-    return current
+    if task.current_owner_gate_id is not None:
+        raise ConflictError(
+            "the task carries a current owner gate; the dispatch is refused without "
+            "sending and the reserved attempt stays unfinalized for recovery"
+        )
+    pull_request = require_task_pull_request_head(
+        transaction_pool, task=task, expected_head_sha=reserved_head_sha
+    )
+    if pull_request.id != expected_pull_request_id:
+        raise StaleOperationError(
+            "the canonical pull request identity changed after the review "
+            "reservation; the dispatch is refused without sending and the "
+            "reserved attempt stays unfinalized for recovery"
+        )
+    reviewer = _require_ready_reviewer(transaction_pool, workspace_id=workspace_id, task_id=task_id)
+    if reviewer.id != reviewer_session.id:
+        raise StaleOperationError(
+            "the reviewer session binding has moved on after the review "
+            "reservation; the dispatch is refused without sending and the "
+            "reserved attempt stays unfinalized for recovery"
+        )
+    return task
 
 
 # --- the dispatch operation ---------------------------------------------------------
@@ -650,18 +732,19 @@ def dispatch_pr_review(
     reserved — after refusing unresolved earlier attempts and duplicate
     dispatch for an already-reviewed head.
 
-    **Phase C — the pre-send durable recheck (single read, no transaction,
-    no GitHub I/O):** the persisted reconciled head is re-read immediately
-    before the send; a moved head fails closed without sending.
+    **Phase C — the post-attachment currentness proof (one short
+    database-only transaction, no GitHub I/O):** after the exact Reviewer
+    attachment is acquired, the reserved Task/token/``REVIEWING`` status,
+    the canonical PR identity/head, and the exact Reviewer binding are
+    re-proven under the Task row ``FOR UPDATE``; any moved subject fails
+    closed without sending.
 
-    **Phase D — the ONE send (outside transactions):** the exact Reviewer
-    attachment is acquired through the deferred factory bound to the Phase-1
-    session identity, the head is re-checked after acquisition, and ONE
-    ``ReviewInteraction`` with an exact ``PrReviewSubject`` is realized with
-    ``expected_family=REVIEW_RESULT_FAMILY`` on the original external
-    session, the entire message being the serialized persisted
-    ``implementation_result``. Known failure and uncertain outcome stay
-    distinct; an uncertain send leaves the reserved iteration unresolved.
+    **Phase D — the ONE send (outside transactions):** with the revalidation
+    transaction closed, ONE ``ReviewInteraction`` with an exact
+    ``PrReviewSubject`` is realized with ``expected_family=REVIEW_RESULT_FAMILY``
+    on the original external session, the entire message being the serialized
+    persisted ``implementation_result``. Known failure and uncertain outcome
+    stay distinct; an uncertain send leaves the reserved iteration unresolved.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
         # --- Phase 0: command shape (no I/O). ---
@@ -783,7 +866,9 @@ def dispatch_pr_review(
                 transaction_pool,
                 task_id=task_id,
                 reconciled_head_sha=head_sha,
-                published_head_sha=published_facts.pull_request.head_sha,
+                initial_authorized_head_sha=_resolve_initial_authorized_head(
+                    transaction_pool, task_id=task_id
+                ),
                 loop=locked_loop,
             )
             reserved = _reserve_iteration(
@@ -807,10 +892,20 @@ def dispatch_pr_review(
         interaction = ReviewInteraction(subject=subject)
         message = serialize_implementation_result_message(payload)
         with reviewer_factory(reviewer) as runtime:
-            # Phase C: the pre-send durable recheck — a single read after
-            # acquisition, immediately before the send. The reserved head is
-            # never re-checked inside a transaction.
-            _recheck_reserved_head(pool, task_id=task_id, reserved_head_sha=head_sha)
+            # Phase C: the post-attachment currentness proof — one short
+            # database-only transaction re-proving the exact reserved
+            # Task/token/status, PR identity/head, and Reviewer binding after
+            # acquisition and immediately before the send. The transaction
+            # closes before the send; no database transaction spans it.
+            _revalidate_reserved_subjects(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                expected_pull_request_id=pull_request.id,
+                reserved_head_sha=head_sha,
+                reviewer_session=reviewer,
+            )
             review_result = _realize_pr_review_control(
                 runtime,
                 reviewer.external_session_id or "",

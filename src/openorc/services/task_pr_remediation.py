@@ -125,6 +125,7 @@ from openorc.services.task_pull_request_reconciliation import (
     reconcile_task_pull_request,
 )
 from openorc.services.task_subject_guards import (
+    require_canonical_task_pull_request,
     require_current_task,
     require_task_pull_request_head,
 )
@@ -440,7 +441,7 @@ def _finalize_pre_effect_failure(
         )
 
 
-def _revalidate_claimed_subjects(
+def _revalidate_remediation_subjects_for_send(
     transaction_pool: DatabasePool,
     *,
     workspace_id: UUID,
@@ -448,14 +449,16 @@ def _revalidate_claimed_subjects(
     expected_state_token: UUID,
     producer_session: TaskAgentSession,
     head_sha: str,
-    require_ready_producer: bool,
 ) -> Task:
-    """Re-prove the exact claimed subjects under the Task row lock.
+    """The pre-send subject proof: the remediation subject is still current.
 
-    Attachment and realization take wall-clock time, so the pre-realization
-    recheck (R1) and the completion finalize repeat the identical proof. Any
-    moved subject is a stale operation: nothing is applied, nothing is
-    fabricated, and no retry permission is granted.
+    Attachment takes wall-clock time, so the exact claimed subjects are
+    re-proven under the Task row ``FOR UPDATE`` after acquisition and before
+    the REVISE realization: the exact current non-archived ``REVIEWING``
+    Task at the caller's token, the exact admitted READY Producer binding,
+    and the canonical PR still carrying exactly the addressed iteration's
+    reviewed head — the head is the remediation subject and must still be
+    current before any work is dispatched.
     """
     locked = task_records.get_task_for_update(transaction_pool, task_id)
     if locked is None or locked.workspace_id != workspace_id:
@@ -470,15 +473,65 @@ def _revalidate_claimed_subjects(
         raise ConflictError(
             "the addressed task is no longer reviewing; the remediation subjects have moved on"
         )
-    if require_ready_producer:
-        producer = _require_ready_producer(
-            transaction_pool, workspace_id=workspace_id, task_id=task_id
+    producer = _require_ready_producer(transaction_pool, workspace_id=workspace_id, task_id=task_id)
+    if producer.id != producer_session.id:
+        raise StaleOperationError(
+            "the producer session binding has moved on; the operation is stale"
         )
-        if producer.id != producer_session.id:
-            raise StaleOperationError(
-                "the producer session binding has moved on; the operation is stale"
-            )
     require_task_pull_request_head(transaction_pool, task=task, expected_head_sha=head_sha)
+    return task
+
+
+def _revalidate_claimed_subjects_for_completion(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    producer_session: TaskAgentSession,
+    expected_pull_request_id: UUID,
+) -> Task:
+    """The completion subject proof: Task, Producer binding, PR identity.
+
+    Records the validated completion against the already-claimed Execution
+    without requiring the addressed iteration's reviewed head to remain the
+    persisted reconciled head: the authorized Producer is expected to commit
+    and push before returning ``implementation_result``, and GitHub may
+    reconcile the new head through a webhook or another B7 invocation while
+    the Producer works. The Task row lock re-proves the exact current
+    non-archived ``REVIEWING`` Task at the caller's token, the Producer
+    binding still belongs to this Task and is exactly the claimed session
+    (READY is deliberately not required: the send already happened), and the
+    canonical PR record is still exactly the addressed one — by identity,
+    never by head equality. Any moved subject is a stale operation: nothing
+    is applied, nothing is fabricated, and no retry permission is granted.
+    """
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.REVIEWING:
+        raise ConflictError(
+            "the addressed task is no longer reviewing; the remediation subjects have moved on"
+        )
+    binding = get_task_agent_session(transaction_pool, task_id=task_id, role=WorkflowRole.PRODUCER)
+    if binding is None or binding.task_id != task_id or binding.workspace_id != workspace_id:
+        raise NotFoundError("the producer session binding is not available for this task")
+    if binding.id != producer_session.id:
+        raise StaleOperationError(
+            "the producer session binding has moved on; the completion is stale"
+        )
+    pull_request = require_canonical_task_pull_request(transaction_pool, task=task)
+    if pull_request.id != expected_pull_request_id:
+        raise StaleOperationError(
+            "the canonical pull request identity changed during remediation; "
+            "the completion is stale"
+        )
     return task
 
 
@@ -506,26 +559,28 @@ def _record_remediation_completion(
     expected_state_token: UUID,
     execution_id: UUID,
     producer_session: TaskAgentSession,
-    head_sha: str,
+    expected_pull_request_id: UUID,
     result: ImplementationResult,
 ) -> tuple[Task, Execution]:
     """Record the validated completion exactly once, conditionally.
 
-    One short transaction re-proving the still-current claimed subjects and
-    applying the one-shot conditional result recording with the safe
+    One short transaction re-proving the Task, the Producer binding, and the
+    canonical PR identity — deliberately without requiring the addressed
+    head to remain the persisted reconciled head, because a legitimate
+    Producer push may already have been reconciled by GitHub — and applying
+    the one-shot conditional result recording with the safe
     ``execution_completed`` audit. Any revalidation failure here leaves the
     attempt conservatively running — after effects may have begun, history
     is never rewritten and no false outcome is fabricated.
     """
     with composed_transaction(pool) as transaction_pool:
-        current_task = _revalidate_claimed_subjects(
+        current_task = _revalidate_claimed_subjects_for_completion(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
             producer_session=producer_session,
-            head_sha=head_sha,
-            require_ready_producer=False,
+            expected_pull_request_id=expected_pull_request_id,
         )
         finalized = execution_records.complete_execution_with_result(
             transaction_pool,
@@ -785,14 +840,13 @@ def route_pr_remediation(
         # R1: authority revalidation after acquisition, before realization.
         try:
             with composed_transaction(pool) as transaction_pool:
-                _revalidate_claimed_subjects(
+                _revalidate_remediation_subjects_for_send(
                     transaction_pool,
                     workspace_id=workspace_id,
                     task_id=task_id,
                     expected_state_token=expected_state_token,
                     producer_session=producer_session,
                     head_sha=head_sha,
-                    require_ready_producer=True,
                 )
         except (NotFoundError, ConflictError, StaleOperationError):
             # Authority moved on during composition, before any runtime
@@ -837,7 +891,7 @@ def route_pr_remediation(
             expected_state_token=expected_state_token,
             execution_id=execution_id,
             producer_session=producer_session,
-            head_sha=head_sha,
+            expected_pull_request_id=pull_request.id,
             result=completed,
         )
 

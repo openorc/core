@@ -120,8 +120,8 @@ def _task_domain() -> Any:
 # SQL predicates for the remediation seam's attempt writes.
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
 _EXECUTION_INSERT = _sql_has("insert into openorc.executions")
-_CLAIM_UPDATE = _sql_has("update openorc.executions", "status = 'running'")
-_COMPLETE_UPDATE = _sql_has("update openorc.executions", "status = 'succeeded'")
+_CLAIM_UPDATE = _sql_has("update openorc.executions", "set status = 'running'")
+_COMPLETE_UPDATE = _sql_has("update openorc.executions", "set status = 'succeeded'")
 
 
 def _event_returned_row(event_type: str) -> tuple[Any, ...]:
@@ -341,9 +341,12 @@ def _script_send_phase(
     conn.on(_TASK_READ, _task_row())
     conn.on(_SESSION_READ, _producer_session_row())
     conn.on(_PR_READ, _pr_row())
-    # The one-shot completion recording.
+    # The one-shot completion recording: Task, Producer binding identity,
+    # and canonical PR identity — deliberately without requiring the old
+    # head to remain the persisted reconciled head.
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
+    conn.on(_SESSION_READ, _producer_session_row())
     conn.on(_PR_READ, _pr_row())
     conn.on(_COMPLETE_UPDATE, _claimed_execution_row(status="succeeded"))
     conn.on(_EVENT_INSERT, _event_returned_row("execution_completed"))
@@ -548,3 +551,49 @@ def test_an_uncertain_send_leaves_the_claimed_attempt_running(
     assert _count(conn, _COMPLETE_UPDATE) == 0
     assert len(adapter.realized_controls()) == 1
     assert dispatch_calls == []
+
+
+def test_a_push_reconciled_during_the_interaction_still_records_the_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 3 regression: GitHub reconciles the Producer's push (a webhook
+    or another B7 invocation) while the Producer is still working, so the
+    persisted canonical PR head advances BEFORE the runtime returns the
+    validated completion. The completion must persist exactly once against
+    the claimed Execution — the old head is deliberately not required to
+    remain current after the send — and the authoritative reconciliation
+    then confirms the new head and re-enters the ordinary dispatch for it
+    without resending REVISE."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_claim(conn)
+    _script_send_phase(conn, observed_head=_NEW_HEAD_SHA)
+    # The completion transaction's PR identity read already observes the
+    # webhook-reconciled NEW head; identity matches, old-head currency is
+    # deliberately not required after the send.
+    adapter = _prepared_producer_adapter(
+        fake_pool,
+        producer_outcomes=[
+            implementation_result_candidate(
+                branch=_BRANCH,
+                summary="Implemented the requested changes.",
+                changes=["fix: applied review findings"],
+                validation=["pytest green"],
+            )
+        ],
+    )
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
+    dispatch_calls = _stub_dispatch(monkeypatch)
+
+    outcome = _remediation_call(pool, adapter, github.as_client())
+
+    # Exactly one REVISE was ever sent; the genuine completion persisted
+    # exactly once despite the advanced head; and the confirmed new head
+    # launched exactly one ordinary dispatch.
+    assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 1
+    assert _count(conn, _COMPLETE_UPDATE) == 1
+    assert _count(conn, _CLAIM_UPDATE) == 1
+    assert outcome.new_head_sha == _NEW_HEAD_SHA
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0]["published"].pull_request.head_sha == _NEW_HEAD_SHA
