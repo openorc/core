@@ -78,6 +78,7 @@ __all__ = [
     "record_plan_revision_created_event",
     "record_plan_revision_revised_event",
     "record_planning_started_event",
+    "record_pr_created_event",
     "record_review_iteration_limit_changed_event",
     "record_review_limit_reached_event",
     "record_role_binding_configuration_changed_event",
@@ -94,6 +95,7 @@ _SUBJECT_TYPE_PLAN_REVISION = "plan_revision"
 _SUBJECT_TYPE_REVIEW_ITERATION = "review_iteration"
 _SUBJECT_TYPE_REVIEW_LOOP = "review_loop"
 _SUBJECT_TYPE_EXECUTION = "execution"
+_SUBJECT_TYPE_TASK_PULL_REQUEST = "task_pull_request"
 
 _TERMINAL_TASK_EVENT: dict[TaskStatus, WorkflowEventType] = {
     TaskStatus.CANCELLED: WorkflowEventType.TASK_CANCELLED,
@@ -781,6 +783,37 @@ def record_task_blocked_event(
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_TASK_BLOCK,
         subject_id=task_block_id,
+    )
+
+
+def record_pr_created_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_pull_request_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one canonical pull request publication (issue #83).
+
+    Task-scoped; the primary modeled subject is the canonical TaskPullRequest
+    over the Task scope. No context is recorded: the PR's stable GitHub
+    identity, reconciled head, and base are canonical on the record and are
+    never shadowed into the event. The calling capability emits this event
+    atomically with the ``reviewing`` transition it finalizes.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(task_pull_request_id, "task_pull_request_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.PR_CREATED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_TASK_PULL_REQUEST,
+        subject_id=task_pull_request_id,
     )
 
 
