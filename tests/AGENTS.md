@@ -16,4 +16,8 @@ Where applicable, tests must prove session isolation/continuity, exact-subject r
 
 Normal test suites must not silently call live production GitHub, Supabase, Valkey, Cline Hub, or model inference. Real integration/E2E layers are explicit and separately configured.
 
+## Agent execution boundary
+
+Agents do not execute integration-marked suites or any `./scripts/devserver.sh --testdb` invocation themselves: real-database and other live-infrastructure validation is Owner-run. Agents author integration-marked modules, validate everything that does not require live infrastructure (the ordinary deterministic suite, ruff, pyright), and hand the Owner the exact command to run. An infrastructural flake in a live run is reported to the Owner for a re-run — it is never chased by the agent.
+
 Use `tests/README.md` for commands, suite layout, fixtures, markers, setup, and troubleshooting rather than bloating this standing policy file.
