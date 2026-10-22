@@ -52,8 +52,10 @@ from openorc.services.errors import (
     AuthorizationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
+    MergeConfirmedReconciliationPendingError,
     NotFoundError,
     StaleOperationError,
 )
@@ -594,7 +596,7 @@ def test_the_documented_head_mismatch_is_a_stale_operation_never_replayed() -> N
     assert len(github.merge_calls) == 1
 
 
-def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
+def test_a_known_policy_state_rejection_is_the_machine_readable_subtype() -> None:
     conn = ScriptedConnection()
     conn.on("from openorc.profiles", _guard_row())
     conn.on("from openorc.workspaces", _workspace_row())
@@ -610,7 +612,7 @@ def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
         ),
     )
 
-    with pytest.raises(ExternalOperationFailedError):
+    with pytest.raises(ExternalOperationRejectedError) as excinfo:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             github,
@@ -621,9 +623,136 @@ def test_a_known_policy_state_rejection_is_a_known_failure() -> None:
             expected_head_sha=_HEAD_SHA,
         )
 
-    # GitHub owns the merge policy; OpenOrc owns no transition here.
+    # GitHub owns the merge policy; the provider-owned refusal is the
+    # machine-readable subtype while remaining the known-failure superclass
+    # for callers that do not need the distinction.
+    assert isinstance(excinfo.value, ExternalOperationFailedError)
     assert len(github.merge_calls) == 1
     assert not any(sql.startswith("update") for sql, _ in conn.executed)
+
+
+def test_a_confirmed_merge_whose_reconciliation_fails_preserves_the_evidence() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        pull_request_observation=_pr_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+    # The post-merge authoritative reconciliation fails (a stale route, a
+    # provider condition, an access loss — any ApplicationError shape): the
+    # confirmed merge must never be lost behind the reconciliation error.
+    # The reconciliation's first read is the Task scope resolution.
+    conn.on("from openorc.tasks", StaleOperationError("the repository route moved"))
+
+    with pytest.raises(MergeConfirmedReconciliationPendingError) as excinfo:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    assert excinfo.value.merge_commit_sha == _MERGE_COMMIT_SHA
+    assert excinfo.value.expected_head_sha == _HEAD_SHA
+    # The confirmed merge is preserved evidence, never a repeated mutation.
+    assert len(github.merge_calls) == 1
+
+
+def test_a_confirmed_merge_whose_reconciliation_does_not_confirm_is_pending() -> None:
+    conn = ScriptedConnection()
+    for _ in range(2):
+        conn.on("from openorc.profiles", _guard_row())
+        conn.on("from openorc.workspaces", _workspace_row())
+        conn.on("from openorc.tasks", _task_row())
+        conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+        conn.on("from openorc.repositories where id", _repository_row())
+        conn.on("from openorc.github_installations", _installation_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.profiles", (None, None, None))
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("for update", _pull_request_row())
+    # The reconciliation succeeds but the authoritative observation still
+    # reads OPEN/unmerged after the confirmed MERGED answer: the durable
+    # snapshot stays unconfirmed, so the same typed pending condition is
+    # raised instead of a bare success.
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        pull_request_observation=_pr_observation(state="open", merged=False, merged_at=None),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+
+    with pytest.raises(MergeConfirmedReconciliationPendingError) as excinfo:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    assert excinfo.value.merge_commit_sha == _MERGE_COMMIT_SHA
+    assert excinfo.value.expected_head_sha == _HEAD_SHA
+    # The confirmed merge is never repeated on the unconfirmed snapshot.
+    assert len(github.merge_calls) == 1
+
+
+def test_a_stale_claim_revalidation_prevents_the_merge_call() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    github = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        merge_result=GitHubMergeRequestResult(
+            outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=_MERGE_COMMIT_SHA
+        ),
+    )
+
+    def _stale_claim(claim_pool: DatabasePool) -> None:
+        # The caller's durable one-shot claim revalidation runs inside the
+        # primitive's final pre-send composed transaction; a stale claim
+        # refuses the merge before any credential or GitHub work.
+        raise StaleOperationError("the approved merge claim is no longer current")
+
+    with pytest.raises(StaleOperationError):
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            github,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+            claim_revalidation=_stale_claim,
+        )
+
+    # The stale claim prevented the merge request entirely: no merge call,
+    # and the hook ran after the Phase 1 guards but before any external
+    # credential or GitHub work.
+    assert github.repository_calls == []
+    assert github.merge_calls == []
+    assert len(conn.executed) == 6
 
 
 def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None:
@@ -663,7 +792,7 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         repository_observation=_repository_observation(),
         error=GitHubRateLimitedError("rate limited (status 403)"),
     )
-    with pytest.raises(ExternalOperationFailedError):
+    with pytest.raises(ExternalOperationFailedError) as rate_excinfo:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             rate_limited,
@@ -673,6 +802,10 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
         )
+    # A rate limit is a known provider condition, never a provider-owned
+    # refusal of the merge itself: the plain known-failure type, never the
+    # machine-readable rejection subtype.
+    assert not isinstance(rate_excinfo.value, ExternalOperationRejectedError)
 
     conn = ScriptedConnection()
     conn.on("from openorc.profiles", _guard_row())
@@ -687,7 +820,7 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
         merge_error=GitHubAuthenticationRejectedError("rejected (status 401)"),
     )
     auth_resolver = FakeUserTokenResolver()
-    with pytest.raises(ExternalOperationFailedError):
+    with pytest.raises(ExternalOperationFailedError) as auth_excinfo:
         pull_request_merge.request_pull_request_merge(
             _pool(conn),
             auth_rejected,
@@ -697,6 +830,9 @@ def test_access_and_uncertain_merge_outcomes_classify_and_never_replay() -> None
             task_id=_TASK_ID,
             expected_head_sha=_HEAD_SHA,
         )
+    # A definitive pre-delivery authentication failure is proven
+    # non-delivery, never a GitHub-owned refusal of the merge itself.
+    assert not isinstance(auth_excinfo.value, ExternalOperationRejectedError)
     # A definitive 401-style non-delivery under the user credential performs
     # ONLY the bounded #142 recovery (one evict + one re-resolve + the
     # intersection re-proof) and then the merge retried EXACTLY once; the

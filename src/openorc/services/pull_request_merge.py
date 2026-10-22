@@ -26,22 +26,35 @@ expected head SHA the later workflow service supplies:
   documented head-mismatch rejection, classified here as a stale operation.
 - Known outcomes are distinct: known success (immediately confirmed by
   authoritative PR reconciliation supplying the durable merged facts),
-  expected-head mismatch (``StaleOperationError``), and other known
-  GitHub-owned policy/state rejection (``ExternalOperationFailedError`` —
-  required checks, conflicts, branch protection; OpenOrc owns none of that
-  policy). Authentication/access failure is the normalized integration
-  condition; timeout/connection loss/ambiguous response is uncertain and is
-  **never automatically replayed** — reconciliation and recovery for an
-  uncertain mutating call belong to the later recovery layer. A definitive
-  401-style non-delivery under the user credential performs only the single
-  bounded recovery the #142 token lifecycle allows, then retries the merge
-  exactly once.
+  expected-head mismatch (``StaleOperationError``), and a GitHub-owned
+  refusal of the merge itself (``ExternalOperationRejectedError``, a
+  machine-readable subtype of ``ExternalOperationFailedError`` — required
+  checks, conflicts, branch protection; OpenOrc owns none of that policy).
+  Every other known failure — authentication, authorization, rate limiting,
+  and pre-delivery credential resolution — stays the plain
+  ``ExternalOperationFailedError``, so callers distinguish a provider-owned
+  refusal from an access or delivery condition by type alone. A confirmed
+  merge whose authoritative reconciliation fails raises
+  ``MergeConfirmedReconciliationPendingError`` carrying the safe merge
+  evidence: the mutation is never repeated, and the caller re-attempts
+  reconciliation instead — the same typed condition covers a
+  reconciliation that succeeds without yet confirming the merge durably
+  (the observed snapshot still reads unmerged), so a bare success is never
+  returned on unconfirmed durable facts. Authentication/access failure is
+  the normalized
+  integration condition; timeout/connection loss/ambiguous response is
+  uncertain and is **never automatically replayed** — reconciliation and
+  recovery for an uncertain mutating call belong to the later recovery
+  layer. A definitive 401-style non-delivery under the user credential
+  performs only the single bounded recovery the #142 token lifecycle
+  allows, then retries the merge exactly once.
 - The later workflow service decides the Task ``COMPLETED`` transition and
   the Owner merge-decision policy; nothing of either lives here.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -57,15 +70,17 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
 )
-from openorc.domain.pull_requests import TaskPullRequest
+from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
+    MergeConfirmedReconciliationPendingError,
     StaleOperationError,
 )
 from openorc.services.github_installation_route import (
@@ -84,6 +99,7 @@ from openorc.services.task_pull_request_reconciliation import (
     reconcile_task_pull_request,
 )
 from openorc.services.task_subject_guards import require_task_pull_request_head
+from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
     "PullRequestMergeResult",
@@ -103,7 +119,11 @@ class PullRequestMergeResult:
     merge commit SHA GitHub's documented successful answer reported;
     ``reconciliation`` carries the durable post-merge PR record (closed,
     carrying its merge instant) plus the serialized before→current facts.
-    The Task ``COMPLETED`` transition belongs to the later workflow service.
+    The result is returned only when the post-merge reconciliation
+    affirmatively confirms the merge; a reconciliation that fails — or
+    succeeds without yet confirming the merge durably — raises
+    ``MergeConfirmedReconciliationPendingError`` instead. The Task
+    ``COMPLETED`` transition belongs to the later workflow service.
     """
 
     pull_request: TaskPullRequest
@@ -187,6 +207,19 @@ def _merge_request_with_bounded_recovery(
         )
 
 
+def _unconfirmed_merge(
+    merge_result: GitHubMergeRequestResult, expected_head_sha: str
+) -> MergeConfirmedReconciliationPendingError:
+    """The typed condition for a confirmed merge with unconfirmed durable facts."""
+    assert merge_result.merge_commit_sha is not None
+    return MergeConfirmedReconciliationPendingError(
+        "the exact-head GitHub merge request is confirmed merged, but its "
+        "authoritative durable reconciliation is unconfirmed",
+        merge_commit_sha=merge_result.merge_commit_sha,
+        expected_head_sha=expected_head_sha,
+    )
+
+
 def request_pull_request_merge(
     pool: DatabasePool,
     github: GitHubAppClient,
@@ -196,6 +229,7 @@ def request_pull_request_merge(
     workspace_id: UUID,
     task_id: UUID,
     expected_head_sha: str,
+    claim_revalidation: Callable[[DatabasePool], None] | None = None,
 ) -> PullRequestMergeResult:
     """Request the canonical PR's merge bound to the exact expected head.
 
@@ -215,6 +249,15 @@ def request_pull_request_merge(
     intersection failures are typed conditions with no installation-token
     fallback.
 
+    When the caller supplies ``claim_revalidation``, the primitive runs it
+    as the final pre-send validation inside one short database-only
+    composed transaction after the exact-head guard: the hook re-proves the
+    caller's durable one-shot merge claim against current durable state
+    under the Task row lock and raises typed errors on any failure. The
+    hook grants no merge authority of its own — the merge request still
+    carries the caller's exact-head binding — and the primitive stays
+    ignorant of the claim's workflow semantics.
+
     Phase 2 (no database transaction open): the repository access
     observation through the exact routed installation (installation
     authentication), then the documented exact-head merge request under the
@@ -222,11 +265,18 @@ def request_pull_request_merge(
     recovery the #142 lifecycle allows.
 
     Phase 3 (known-outcome classification): the documented head-mismatch
-    answer is a stale operation; any other definitive rejection is a known
-    GitHub-owned policy/state failure; on the known success the same
+    answer is a stale operation; a definitive GitHub-owned refusal of the
+    merge itself is the machine-readable ``ExternalOperationRejectedError``
+    subtype, while every other known failure (authentication, authorization,
+    rate limit, pre-delivery credential resolution) stays the plain
+    ``ExternalOperationFailedError``; on the known success the same
     authoritative reconciliation primitive immediately persists and returns
-    the durable merged facts (installation authentication) — the merge
-    request itself never mutates Task workflow state.
+    the durable merged facts (installation authentication) — a confirmed
+    merge whose reconciliation fails, or succeeds without yet confirming
+    the merge durably, raises ``MergeConfirmedReconciliationPendingError``
+    carrying the safe merge evidence: never the bare reconciliation error,
+    never a bare success on unconfirmed durable facts. The merge request
+    itself never mutates Task workflow state.
     """
     if not isinstance(profile_id, UUID):
         raise InvalidCommandError("profile_id must be a UUID")
@@ -265,6 +315,17 @@ def request_pull_request_merge(
             github_head_sha=expected_head_sha,
             github_pull_request_number=pull_request.github_pr_number,
         )
+        if claim_revalidation is not None:
+            # The caller's durable one-shot merge claim is re-proven as the
+            # final pre-send validation, inside one short database-only
+            # composed transaction: the hook rechecks currentness against
+            # durable state under the Task row lock and raises typed errors
+            # on any failure. It grants no merge authority of its own — the
+            # merge request still carries the caller's exact-head binding —
+            # and this primitive stays ignorant of the claim's semantics.
+            with composed_transaction(pool) as claim_pool:
+                claim_revalidation(claim_pool)
+
         # --- Credential resolution (external where it must refresh; no
         # transaction open): the accountable Profile's GitHub user
         # authorization, resolved ONLY after authorization and subject/route
@@ -320,9 +381,14 @@ def request_pull_request_merge(
             )
         if merge_result.outcome is GitHubMergeRequestOutcome.REJECTED:
             # A known GitHub-owned policy/state rejection (required checks,
-            # conflicts, branch protection): OpenOrc owns none of that
-            # policy and only reports the known failure.
-            raise ExternalOperationFailedError(
+            # conflicts, branch protection): GitHub received and refused the
+            # merge itself. The machine-readable subtype keeps this
+            # provider-owned refusal distinguishable from the plain
+            # ``ExternalOperationFailedError`` raised for authentication,
+            # authorization, rate-limit, and pre-delivery credential
+            # failures — OpenOrc owns none of that policy and only reports
+            # the known failure.
+            raise ExternalOperationRejectedError(
                 "GitHub rejected the merge request: the pull request is not mergeable "
                 "under GitHub's current merge policy or state"
             )
@@ -331,10 +397,23 @@ def request_pull_request_merge(
             and merge_result.merge_commit_sha is not None
         )
         # Known success: authoritative reconciliation supplies the durable
-        # merged facts. No Task-state transition is decided here.
-        reconciliation = reconcile_task_pull_request(
-            pool, github, workspace_id=workspace_id, task_id=task_id
-        )
+        # merged facts. No Task-state transition is decided here. The
+        # confirmed merge must never be buried behind a reconciliation
+        # error — nor returned as a bare success when the reconciliation
+        # succeeds without yet confirming the merge durably (the observed
+        # snapshot still reads unmerged). Both shapes preserve the
+        # confirmed outcome evidence in one typed condition so the caller
+        # can re-attempt reconciliation without ever repeating the merge
+        # mutation.
+        try:
+            reconciliation = reconcile_task_pull_request(
+                pool, github, workspace_id=workspace_id, task_id=task_id
+            )
+        except ApplicationError as error:
+            raise _unconfirmed_merge(merge_result, expected_head_sha) from error
+        reconciled = reconciliation.pull_request
+        if reconciled.state is not TaskPullRequestState.CLOSED or reconciled.merged_at is None:
+            raise _unconfirmed_merge(merge_result, expected_head_sha)
         return PullRequestMergeResult(
             pull_request=reconciliation.pull_request,
             merged_head_sha=expected_head_sha,

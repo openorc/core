@@ -56,6 +56,7 @@ from openorc.domain.github_webhooks import (
     GitHubWebhookRoutingResolution,
     GitHubWebhookRoutingTarget,
 )
+from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.github_issues import list_repository_github_issues
 from openorc.persistence.github_webhook_deliveries import (
@@ -73,6 +74,7 @@ from openorc.services import (
     github_issue_relations,
     github_reconciliation,
     task_intake,
+    task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
 from openorc.services.errors import (
@@ -584,6 +586,11 @@ def _dispatch_pull_request(
     number with no canonical record (an external/unrelated PR) is a typed
     expected decline; push notifications carry no PR identity and reconcile
     every canonical record in the routed repository.
+
+    After a successful reconciliation of a merged canonical PR, the narrow
+    E10a completion consequence (issue #227) applies the durable
+    completion/audit effects through the shared seam; the reconciliation
+    itself stays strictly update-only and no second GitHub read is made.
     """
     try:
         if delivery.github_pull_request_number is not None:
@@ -606,12 +613,28 @@ def _dispatch_pull_request(
                 )
             )
         for task_id in subjects:
-            task_pull_request_reconciliation.reconcile_task_pull_request(
+            reconciliation = task_pull_request_reconciliation.reconcile_task_pull_request(
                 pool,
                 github,
                 workspace_id=route.workspace_id,
                 task_id=task_id,
             )
+            if (
+                reconciliation.pull_request.state is TaskPullRequestState.CLOSED
+                and reconciliation.pull_request.merged_at is not None
+            ):
+                # The narrow E10a workflow consequence for an observed merge
+                # (issue #227): the reconciliation above already persisted the
+                # authoritative merged facts update-only; the shared completion
+                # seam owns the durable completion/audit effects and is
+                # idempotent under duplicate delivery/sweep/Owner completion
+                # races. No second reconciliation and no Phase 2E decision is
+                # made here.
+                task_merge_lifecycle.complete_confirmed_task_merge(
+                    pool,
+                    workspace_id=route.workspace_id,
+                    task_id=task_id,
+                )
     except NotFoundError:
         # The canonical subject disappeared between the lookup and the
         # reconciliation: nothing to reconcile.

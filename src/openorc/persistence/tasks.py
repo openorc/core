@@ -440,7 +440,10 @@ def archive_task(
     ``cancelled`` or ``completed``), stamps ``archived_at``, and rotates
     ``state_token`` in one statement. Archival is independent from terminal
     outcome — the outcome stays distinguishable through ``status`` — and both
-    CANCELLED and COMPLETED attempts become archived history.
+    CANCELLED and COMPLETED attempts become archived history. Archival also
+    clears the Task's ``current_owner_gate_id`` pointer (issue #227): an
+    archived Task has no actionable current gate, while the gate row itself
+    stays untouched pending/resolved history with its own provenance.
 
     The update is conditional on ``expected_state_token``. Returns the
     updated Task, or ``None`` when the token no longer matches or the Task
@@ -456,6 +459,7 @@ def archive_task(
         row = conn.execute(
             "update openorc.tasks "
             "set status = %s, archived_at = now(), queued_at = null, "
+            "current_owner_gate_id = null, "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",

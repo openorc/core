@@ -44,6 +44,7 @@ from openorc.services import (
     github_issue_relations,
     github_reconciliation,
     github_webhook_dispatch,
+    task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
 from openorc.services.canonical_branch import CanonicalBranchObservation
@@ -240,6 +241,7 @@ class Harness:
         self.pull_request_reconcile = ScriptedCapability(self.pool_fake)
         self.checks_projection = ScriptedCapability(self.pool_fake)
         self.dispatch = ScriptedCapability(self.pool_fake)
+        self.merge_completion = ScriptedCapability(self.pool_fake)
         self.settings = _settings()
 
 
@@ -288,6 +290,16 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
         )
         monkeypatch.setattr(
             commit_checks_projection, "project_commit_checks", harness.checks_projection
+        )
+        # The E10a completion seam is stubbed at the module boundary: the
+        # sweep tests prove the narrow consequence wiring, not the
+        # completion's own transactional composition. A call beyond the
+        # scripted results fails loudly, so an unexpected completion
+        # invocation can never pass silently.
+        monkeypatch.setattr(
+            task_merge_lifecycle,
+            "complete_confirmed_task_merge",
+            harness.merge_completion,
         )
         monkeypatch.setattr(
             github_webhook_dispatch, "dispatch_github_webhook_delivery", harness.dispatch
@@ -928,6 +940,7 @@ def test_missed_pr_head_state_and_merge_are_discovered_with_the_exact_head_check
     )
     conn.on("where task_id = %s", _pull_request_row(state="closed", merged_at=_NOW))
     harness.pull_request_reconcile.results = [_pr_reconciliation()]
+    harness.merge_completion.results = [None]
     harness.checks_projection.results = [_checks_projection()]
     conn.on("order by received_at, id limit %s", [])
 
@@ -944,6 +957,9 @@ def test_missed_pr_head_state_and_merge_are_discovered_with_the_exact_head_check
         ),
         (GitHubReconciliationSweepFamily.CHECKS, GitHubReconciliationSweepUnitStatus.RECONCILED),
     ]
+    # The narrow E10a completion consequence fired exactly once for the
+    # observed merge and added no extra outcome of its own.
+    assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_A}]
     _, pr_outcome, checks_outcome = result.outcomes
     assert pr_outcome.pull_request_updated is True
     assert pr_outcome.pull_request_head_changed is True
@@ -988,6 +1004,8 @@ def test_a_missed_closed_unmerged_pr_is_a_normalized_fact(harness_factory) -> No
     assert pr_outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
     assert pr_outcome.pull_request_merged is False
     assert pr_outcome.pull_request_closed_unmerged is True
+    # A closed-unmerged observation carries no merged-completion consequence.
+    assert harness.merge_completion.calls == []
     _assert_no_durable_writes(harness)
 
 
@@ -1020,6 +1038,9 @@ def test_a_failed_pr_reconciliation_never_projects_checks(harness_factory) -> No
         0: ExternalOperationFailedError("known provider condition")
     }
     harness.pull_request_reconcile.results = [_pr_reconciliation()]
+    # The second Task's PR reconciliation is merged by default: the completion
+    # consequence applies for it while the failed first Task gets none.
+    harness.merge_completion.results = [None]
     harness.checks_projection.results = [_checks_projection()]
 
     result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
@@ -1040,6 +1061,8 @@ def test_a_failed_pr_reconciliation_never_projects_checks(harness_factory) -> No
     # Only the independent second Task's checks were projected, and the sweep
     # continued normally.
     assert [call["task_id"] for call in harness.checks_projection.calls] == [_TASK_B]
+    # The merged-completion consequence applied only for the merged second Task.
+    assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_B}]
 
 
 def test_an_uncertain_pr_reconciliation_never_yields_current_head_checks_evidence(
@@ -1049,6 +1072,9 @@ def test_an_uncertain_pr_reconciliation_never_yields_current_head_checks_evidenc
     _script_two_task_pr_sweep(harness)
     harness.pull_request_reconcile.errors = {0: ExternalOperationUncertainError("unknown outcome")}
     harness.pull_request_reconcile.results = [_pr_reconciliation()]
+    # The second Task's PR reconciliation is merged by default: the completion
+    # consequence applies for it while the uncertain first Task gets none.
+    harness.merge_completion.results = [None]
     harness.checks_projection.results = [_checks_projection()]
 
     result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
@@ -1073,6 +1099,8 @@ def test_an_uncertain_pr_reconciliation_never_yields_current_head_checks_evidenc
     # Task's checks unit completed against its own freshly reconciled head.
     assert [o.task_id for o in checks_outcomes] == [_TASK_B]
     assert [call["task_id"] for call in harness.checks_projection.calls] == [_TASK_B]
+    # The merged-completion consequence applied only for the merged second Task.
+    assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_B}]
 
 
 def test_duplicate_and_out_of_order_deliveries_converge_oldest_first(harness_factory) -> None:
