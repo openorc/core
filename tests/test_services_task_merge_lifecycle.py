@@ -988,6 +988,59 @@ def test_confirmed_merge_with_failed_reconciliation_completes_without_repeating(
     assert "merge_rejected_by_github" not in _event_types(conn)
 
 
+def test_confirmed_merge_with_unconfirmed_reconciliation_blocks_with_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    _script_block(conn, token=_POST_APPROVAL_TOKEN, reason="external_operation_uncertain")
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        _reconciled(pull_request=_domain_pull_request()),
+    )
+    merge = _MergePrimitiveStub(
+        MergeConfirmedReconciliationPendingError(
+            "confirmed merged but its durable reconciliation is unconfirmed",
+            merge_commit_sha=_MERGE_COMMIT_SHA,
+            expected_head_sha=_HEAD_SHA,
+        )
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+
+    outcome = request_task_merge(
+        pool,
+        _guard(issues=[_issue_observation()], repository=_repository_observation()),
+        _token_resolver(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_RETRY_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
+    assert outcome.task.status is TaskStatus.BLOCKED
+    assert outcome.task_block is not None
+    assert outcome.task_block.reason.value == "external_operation_uncertain"
+    # The preserved confirmed-merge evidence rides the durable recovery
+    # context, and the confirmed merge is never repeated and never minted a
+    # retry gate.
+    block_inserts = [
+        params for sql, params in conn.executed if params is not None and _BLOCK_INSERT(sql, params)
+    ]
+    assert len(block_inserts) == 1
+    block_context = block_inserts[0][3].obj
+    assert block_context["merge_commit_sha"] == _MERGE_COMMIT_SHA
+    assert block_context["expected_head_sha"] == _HEAD_SHA
+    assert outcome.merge_commit_sha == _MERGE_COMMIT_SHA
+    assert len(merge.calls) == 1
+    assert _count(conn, _GATE_INSERT) == 0
+    assert _event_types(conn) == ["owner_gate_resolved", "merge_requested", "task_blocked"]
+
+
 def test_stale_claim_pre_send_fails_closed_and_applies_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

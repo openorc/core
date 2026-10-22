@@ -37,7 +37,11 @@ expected head SHA the later workflow service supplies:
   merge whose authoritative reconciliation fails raises
   ``MergeConfirmedReconciliationPendingError`` carrying the safe merge
   evidence: the mutation is never repeated, and the caller re-attempts
-  reconciliation instead. Authentication/access failure is the normalized
+  reconciliation instead — the same typed condition covers a
+  reconciliation that succeeds without yet confirming the merge durably
+  (the observed snapshot still reads unmerged), so a bare success is never
+  returned on unconfirmed durable facts. Authentication/access failure is
+  the normalized
   integration condition; timeout/connection loss/ambiguous response is
   uncertain and is **never automatically replayed** — reconciliation and
   recovery for an uncertain mutating call belong to the later recovery
@@ -66,7 +70,7 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
 )
-from openorc.domain.pull_requests import TaskPullRequest
+from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
@@ -115,7 +119,11 @@ class PullRequestMergeResult:
     merge commit SHA GitHub's documented successful answer reported;
     ``reconciliation`` carries the durable post-merge PR record (closed,
     carrying its merge instant) plus the serialized before→current facts.
-    The Task ``COMPLETED`` transition belongs to the later workflow service.
+    The result is returned only when the post-merge reconciliation
+    affirmatively confirms the merge; a reconciliation that fails — or
+    succeeds without yet confirming the merge durably — raises
+    ``MergeConfirmedReconciliationPendingError`` instead. The Task
+    ``COMPLETED`` transition belongs to the later workflow service.
     """
 
     pull_request: TaskPullRequest
@@ -199,6 +207,19 @@ def _merge_request_with_bounded_recovery(
         )
 
 
+def _unconfirmed_merge(
+    merge_result: GitHubMergeRequestResult, expected_head_sha: str
+) -> MergeConfirmedReconciliationPendingError:
+    """The typed condition for a confirmed merge with unconfirmed durable facts."""
+    assert merge_result.merge_commit_sha is not None
+    return MergeConfirmedReconciliationPendingError(
+        "the exact-head GitHub merge request is confirmed merged, but its "
+        "authoritative durable reconciliation is unconfirmed",
+        merge_commit_sha=merge_result.merge_commit_sha,
+        expected_head_sha=expected_head_sha,
+    )
+
+
 def request_pull_request_merge(
     pool: DatabasePool,
     github: GitHubAppClient,
@@ -251,10 +272,11 @@ def request_pull_request_merge(
     ``ExternalOperationFailedError``; on the known success the same
     authoritative reconciliation primitive immediately persists and returns
     the durable merged facts (installation authentication) — a confirmed
-    merge whose reconciliation fails raises
-    ``MergeConfirmedReconciliationPendingError`` carrying the safe merge
-    evidence, never the bare reconciliation error. The merge request itself
-    never mutates Task workflow state.
+    merge whose reconciliation fails, or succeeds without yet confirming
+    the merge durably, raises ``MergeConfirmedReconciliationPendingError``
+    carrying the safe merge evidence: never the bare reconciliation error,
+    never a bare success on unconfirmed durable facts. The merge request
+    itself never mutates Task workflow state.
     """
     if not isinstance(profile_id, UUID):
         raise InvalidCommandError("profile_id must be a UUID")
@@ -375,22 +397,23 @@ def request_pull_request_merge(
             and merge_result.merge_commit_sha is not None
         )
         # Known success: authoritative reconciliation supplies the durable
-        # merged facts. No Task-state transition is decided here. A
-        # reconciliation failure must never bury the confirmed merge behind
-        # a reconciliation error: the confirmed outcome evidence is
-        # preserved in a typed condition so the caller can re-attempt
-        # reconciliation without ever repeating the merge mutation.
+        # merged facts. No Task-state transition is decided here. The
+        # confirmed merge must never be buried behind a reconciliation
+        # error — nor returned as a bare success when the reconciliation
+        # succeeds without yet confirming the merge durably (the observed
+        # snapshot still reads unmerged). Both shapes preserve the
+        # confirmed outcome evidence in one typed condition so the caller
+        # can re-attempt reconciliation without ever repeating the merge
+        # mutation.
         try:
             reconciliation = reconcile_task_pull_request(
                 pool, github, workspace_id=workspace_id, task_id=task_id
             )
         except ApplicationError as error:
-            raise MergeConfirmedReconciliationPendingError(
-                "the exact-head GitHub merge request is confirmed merged, but its "
-                "authoritative durable reconciliation is unconfirmed",
-                merge_commit_sha=merge_result.merge_commit_sha,
-                expected_head_sha=expected_head_sha,
-            ) from error
+            raise _unconfirmed_merge(merge_result, expected_head_sha) from error
+        reconciled = reconciliation.pull_request
+        if reconciled.state is not TaskPullRequestState.CLOSED or reconciled.merged_at is None:
+            raise _unconfirmed_merge(merge_result, expected_head_sha)
         return PullRequestMergeResult(
             pull_request=reconciliation.pull_request,
             merged_head_sha=expected_head_sha,

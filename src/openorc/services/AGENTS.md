@@ -802,9 +802,10 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   limiting — proven pre-delivery non-delivery) records no GitHub-refusal
   event; after an authoritative no-merge proof on the unchanged accepted
   head a NEW pending exact-head `MERGE_DECISION` gate requires fresh Owner
-  authorization; a confirmed merge whose post-merge reconciliation fails
-  raises `MergeConfirmedReconciliationPendingError` (evidence preserved,
-  mutation never repeated, one reconciliation re-attempt); uncertain
+  authorization; a confirmed merge whose post-merge reconciliation fails —
+  or succeeds without yet confirming the merge durably — raises
+  `MergeConfirmedReconciliationPendingError` (evidence preserved, mutation
+  never repeated, one reconciliation re-attempt); uncertain
   outcomes block `EXTERNAL_OPERATION_UNCERTAIN` with durable safe context
   and are never repeated; an expected-head mismatch blocks
   `STALE_OPERATION` and never transfers Reviewer acceptance to the

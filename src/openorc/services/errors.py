@@ -142,11 +142,13 @@ class MergeConfirmedReconciliationPendingError(ApplicationError):
 
     Raised when the external system answered a known success and the
     follow-up authoritative reconciliation that persists the durable facts
-    failed: the mutation phase and its outcome evidence are preserved for
-    the caller instead of being lost behind a reconciliation error. The
-    caller must never repeat the mutation; it re-attempts reconciliation
-    and fails closed while the durable facts stay unconfirmed. The explicit
-    fields carry only safe canonical identifiers.
+    failed — or succeeded without yet confirming the mutation durably (for
+    example, the observed snapshot still reads unmerged): the mutation
+    phase and its outcome evidence are preserved for the caller instead of
+    being lost behind a reconciliation error or misread as a bare success.
+    The caller must never repeat the mutation; it re-attempts
+    reconciliation and fails closed while the durable facts stay
+    unconfirmed. The explicit fields carry only safe canonical identifiers.
     """
 
     def __init__(self, message: str, *, merge_commit_sha: str, expected_head_sha: str) -> None:
