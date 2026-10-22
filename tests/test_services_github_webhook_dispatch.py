@@ -33,9 +33,10 @@ from openorc.domain.github_webhooks import (
     GitHubWebhookRoutingResolution,
     GitHubWebhookRoutingTarget,
 )
+from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.observability import injected_tracer_source
 from openorc.persistence.pool import DatabasePool
-from openorc.services import github_webhook_dispatch
+from openorc.services import github_webhook_dispatch, task_merge_lifecycle
 from openorc.services.errors import (
     AuthenticationError,
     AuthorizationError,
@@ -44,6 +45,7 @@ from openorc.services.errors import (
     InvalidCommandError,
 )
 from openorc.services.github_webhook_dispatch import GitHubWebhookDispatchRouteStatus
+from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
 
 _NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _DELIVERY_ID = uuid.uuid4()
@@ -218,6 +220,27 @@ def _pull_request_row(task_id: uuid.UUID, repository_id: uuid.UUID) -> tuple[Any
     )
 
 
+def _reconciled_task_pull_request(
+    *, state: TaskPullRequestState, merged_at: datetime | None = None
+) -> TaskPullRequest:
+    """The durable TaskPullRequest a stubbed B7 reconciliation reports."""
+    return TaskPullRequest(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_A,
+        task_id=_TASK_ID,
+        repository_id=_REPOSITORY_A,
+        github_pr_id=555,
+        github_pr_number=7,
+        head_ref="openorc/task-1",
+        base_ref="main",
+        head_sha="b" * 40,
+        state=state,
+        merged_at=merged_at,
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+
+
 class FakeSubmission:
     """The queue seam fake asserting no open transaction at the enqueue boundary."""
 
@@ -244,8 +267,9 @@ class RecordingCapability:
         self._error = error
         self._fail_after = fail_after
         self.calls: list[dict[str, Any]] = []
+        self.result: Any = None
 
-    def __call__(self, *args: Any, **kwargs: Any) -> None:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         assert self._pool.active_connections == 0, (
             "no database transaction may span the external reconciliation invocation"
         )
@@ -257,6 +281,7 @@ class RecordingCapability:
         if should_fail:
             assert self._error is not None
             raise self._error
+        return self.result
 
 
 class Harness:
@@ -272,6 +297,7 @@ class Harness:
         self.repository_observation = RecordingCapability(self.pool_fake)
         self.pull_request_reconcile = RecordingCapability(self.pool_fake)
         self.checks_projection = RecordingCapability(self.pool_fake)
+        self.merge_completion = RecordingCapability(self.pool_fake)
 
 
 @pytest.fixture
@@ -300,6 +326,27 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
             github_webhook_dispatch.task_pull_request_reconciliation,
             "reconcile_task_pull_request",
             harness.pull_request_reconcile,
+        )
+        # The E10a completion seam is stubbed at the module boundary: the
+        # dispatch tests prove the narrow consequence wiring, not the
+        # completion's own transactional composition.
+        monkeypatch.setattr(
+            task_merge_lifecycle,
+            "complete_confirmed_task_merge",
+            harness.merge_completion,
+        )
+        # The default reconciled observation is a still-open canonical PR, so
+        # the merged-merge consequence fires only in the test that scripts a
+        # merged observation.
+        harness.pull_request_reconcile.result = TaskPullRequestReconciliation(
+            pull_request=_reconciled_task_pull_request(state=TaskPullRequestState.OPEN),
+            updated=True,
+            head_changed=False,
+            base_changed=False,
+            state_changed=False,
+            previous_head_sha=None,
+            previous_base_ref=None,
+            previous_state=None,
         )
         monkeypatch.setattr(
             github_webhook_dispatch.commit_checks_projection,
@@ -699,6 +746,48 @@ def test_pull_request_state_dispatch_reconciles_the_canonical_record_by_number(
     assert harness.pull_request_reconcile.calls == [
         {"workspace_id": _WORKSPACE_A, "task_id": _TASK_ID}
     ]
+    # A still-open reconciled PR applies no completion consequence.
+    assert harness.merge_completion.calls == []
+
+
+def test_a_merged_canonical_pr_dispatch_applies_the_e10a_completion_consequence(
+    harness_factory,
+) -> None:
+    harness = harness_factory()
+    harness.pull_request_reconcile.result = TaskPullRequestReconciliation(
+        pull_request=_reconciled_task_pull_request(
+            state=TaskPullRequestState.CLOSED, merged_at=_NOW
+        ),
+        updated=True,
+        head_changed=False,
+        base_changed=False,
+        state_changed=True,
+        previous_head_sha=None,
+        previous_base_ref=None,
+        previous_state=TaskPullRequestState.OPEN,
+    )
+    _script_delivery(
+        harness.conn,
+        _delivery_row(
+            event_name="pull_request",
+            action="closed",
+            routing_target="pull_request_state",
+            github_issue_number=None,
+            github_pull_request_number=7,
+        ),
+    )
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_pull_request(harness.conn, _pull_request_row(_TASK_ID, _REPOSITORY_A))
+    _script_processed(harness.conn, _DELIVERY_ID)
+
+    result = github_webhook_dispatch.dispatch_github_webhook_delivery(
+        harness.pool, _github_client(), delivery_guid="guid-1"
+    )
+
+    assert result.processed is True
+    # The narrow E10a consequence fires exactly once for the observed merge;
+    # the reconciliation stays the only GitHub-backed work on the route.
+    assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_ID}]
 
 
 def test_a_pull_request_number_without_a_canonical_record_typedly_declines(harness_factory) -> None:

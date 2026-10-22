@@ -775,4 +775,53 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   discussion-audit flag commits the exchange events atomically with the
   authoritative continuation.
 
+## E10a: exact-head merge authorization and GitHub-confirmed completion (issue #227)
+
+- `task_merge_lifecycle.request_task_merge` is the ONE Owner merge command:
+  at the Task's exact current pending `MERGE_DECISION` gate it re-proves the
+  same Profile's Workspace/Task Owner authority, the gate's exact canonical
+  `TaskPullRequest` + Reviewer-accepted head binding, and the OPEN
+  `PR_REVIEW` loop; authoritative B7 reconciliation (outside any
+  transaction) routes a confirmed merged PR to the shared completion path, a
+  confirmed closed-unmerged PR refuses without consuming the gate (#229 owns
+  it), and a changed head applies the narrow `stale_operation` block
+  consequence; the routed installation's issue-open guard refuses a
+  GitHub-closed source issue without consuming the pending gate. One short
+  composed transaction resolves the gate APPROVED and commits the OWNER
+  `OWNER_GATE_RESOLVED` + `MERGE_REQUESTED` audit pair — the durable
+  one-shot claim — and `pull_request_merge.request_pull_request_merge` is
+  called exactly once with the gate's SHA, the approving Profile, and the
+  `claim_revalidation` hook (the primitive's final pre-send transaction
+  re-proves the claim without granting a second merge authority).
+- Outcome classification states which external effect occurred, by type
+  only: a confirmed merge completes through the shared seam; a GitHub-owned
+  refusal (`ExternalOperationRejectedError`, the machine-readable subtype
+  the merge primitive raises for the `REJECTED` outcome) records
+  `MERGE_REJECTED_BY_GITHUB`, while the plain `ExternalOperationFailedError`
+  (credential resolution, authentication/authorization rejection, rate
+  limiting — proven pre-delivery non-delivery) records no GitHub-refusal
+  event; after an authoritative no-merge proof on the unchanged accepted
+  head a NEW pending exact-head `MERGE_DECISION` gate requires fresh Owner
+  authorization; a confirmed merge whose post-merge reconciliation fails
+  raises `MergeConfirmedReconciliationPendingError` (evidence preserved,
+  mutation never repeated, one reconciliation re-attempt); uncertain
+  outcomes block `EXTERNAL_OPERATION_UNCERTAIN` with durable safe context
+  and are never repeated; an expected-head mismatch blocks
+  `STALE_OPERATION` and never transfers Reviewer acceptance to the
+  unreviewed head.
+- `task_merge_lifecycle.complete_confirmed_task_merge` is the ONE
+  GitHub-authoritative completion seam, invoked by the Owner path AND — as
+  the narrow B6 consequence — by `github_webhook_dispatch._dispatch_pull_request`
+  and the sweep's PR-unit orchestration after a successfully reconciled
+  merged canonical PR. It reloads the durable merged facts under lock
+  (webhook inputs are never trusted), closes the OPEN `PR_REVIEW` loop
+  (absent is legitimate; the planning loop is never touched), archives
+  `COMPLETED` through the guarded archival primitive (which clears the
+  current-gate pointer without inventing Owner gate events), and commits
+  `PR_MERGED` (GITHUB) + `TASK_COMPLETED` (OPENORC) exactly once. Archived
+  `CANCELLED` history is immutable; an already-`COMPLETED` archive is the
+  idempotent `ALREADY_COMPLETED` no-op. Reconciliation stays strictly
+  update-only; the consequence call duplicates no GitHub read, webhook
+  dedupe, polling, or scheduling.
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

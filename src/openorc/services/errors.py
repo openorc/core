@@ -24,9 +24,11 @@ __all__ = [
     "AuthorizationError",
     "ConflictError",
     "ExternalOperationFailedError",
+    "ExternalOperationRejectedError",
     "ExternalOperationUncertainError",
     "IntegrationNotConfiguredError",
     "InvalidCommandError",
+    "MergeConfirmedReconciliationPendingError",
     "NotFoundError",
     "StaleOperationError",
 ]
@@ -115,3 +117,39 @@ class ExternalOperationUncertainError(ApplicationError):
     safe, or block for recovery — the LLM is never the idempotency
     mechanism.
     """
+
+
+class ExternalOperationRejectedError(ExternalOperationFailedError):
+    """A known failure the external system decided itself: it received and
+    refused the addressed operation under its own policy or state.
+
+    A machine-readable subtype of :class:`ExternalOperationFailedError` for
+    callers that must separate a provider-owned refusal of the operation
+    itself from the other known failures of the same operation
+    (authentication/authorization rejections, rate limits, pre-delivery
+    credential-resolution failures). The refused operation provably did not
+    apply, and the refusal provenance is the provider's own policy decision
+    — never an access or delivery condition. Callers that do not need the
+    distinction keep handling the superclass unchanged; the distinction is
+    made by type only, never by inspecting messages or chained provider
+    exceptions.
+    """
+
+
+class MergeConfirmedReconciliationPendingError(ApplicationError):
+    """An external mutation is confirmed applied, but its authoritative
+    durable reconciliation is unconfirmed.
+
+    Raised when the external system answered a known success and the
+    follow-up authoritative reconciliation that persists the durable facts
+    failed: the mutation phase and its outcome evidence are preserved for
+    the caller instead of being lost behind a reconciliation error. The
+    caller must never repeat the mutation; it re-attempts reconciliation
+    and fails closed while the durable facts stay unconfirmed. The explicit
+    fields carry only safe canonical identifiers.
+    """
+
+    def __init__(self, message: str, *, merge_commit_sha: str, expected_head_sha: str) -> None:
+        super().__init__(message)
+        self.merge_commit_sha = merge_commit_sha
+        self.expected_head_sha = expected_head_sha

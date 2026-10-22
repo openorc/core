@@ -43,7 +43,9 @@ extension), the #54 terminal Task archival (``TASK_CANCELLED`` /
 (``OWNER_GATE_RESOLVED``). Branch binding and other Phase 1 facts that
 deliberately have no event type remain non-evented; later Phase 2 workflow
 leaves add their own mappings through this same boundary (E9's issue #84
-PR-review decision adds ``PR_REVIEWED`` alongside ``PLAN_REVIEWED``).
+PR-review decision adds ``PR_REVIEWED`` alongside ``PLAN_REVIEWED``; E10a's
+issue #227 merge lifecycle adds ``MERGE_REQUESTED``,
+``MERGE_REJECTED_BY_GITHUB``, and ``PR_MERGED``).
 """
 
 from __future__ import annotations
@@ -71,6 +73,8 @@ __all__ = [
     "record_execution_started_event",
     "record_guidance_changed_event",
     "record_implementation_authorized_event",
+    "record_merge_rejected_by_github_event",
+    "record_merge_requested_event",
     "record_owner_gate_created_event",
     "record_owner_gate_resolved_event",
     "record_owner_reviewer_discussion_message_event",
@@ -81,6 +85,7 @@ __all__ = [
     "record_plan_revision_revised_event",
     "record_planning_started_event",
     "record_pr_created_event",
+    "record_pr_merged_event",
     "record_review_iteration_limit_changed_event",
     "record_review_limit_reached_event",
     "record_role_binding_configuration_changed_event",
@@ -850,6 +855,105 @@ def record_pr_created_event(
         workspace_id=workspace_id,
         task_id=task_id,
         event_type=WorkflowEventType.PR_CREATED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_TASK_PULL_REQUEST,
+        subject_id=task_pull_request_id,
+    )
+
+
+def record_merge_requested_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_pull_request_id: UUID,
+    owner_gate_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one Owner-authorized exact-head merge request (issue #227).
+
+    Task-scoped; the primary modeled subject is the canonical TaskPullRequest
+    over the Task scope. Context carries the single safe reference to the
+    resolved ``MERGE_DECISION`` gate whose approval authorized the request,
+    so the durable Owner provenance chain stays ``OWNER_GATE_RESOLVED`` plus
+    ``MERGE_REQUESTED``. No merge mechanics, GitHub response material, or
+    credential facts are recorded: the request itself and the exact head are
+    canonical on the gate and pull-request records.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(task_pull_request_id, "task_pull_request_id")
+    _require_uuid_command(owner_gate_id, "owner_gate_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.MERGE_REQUESTED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_TASK_PULL_REQUEST,
+        subject_id=task_pull_request_id,
+        context={"owner_gate_id": str(owner_gate_id)},
+    )
+
+
+def record_merge_rejected_by_github_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_pull_request_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one GitHub-owned refusal of a requested exact-head merge (issue #227).
+
+    Task-scoped; the primary modeled subject is the canonical TaskPullRequest
+    over the Task scope. GITHUB provenance: GitHub received and refused the
+    merge itself under its own policy or state. No context is recorded: the
+    refusal fact is the event, and GitHub error bodies, policy detail, and
+    OpenOrc-side recovery context are never copied into the audit.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(task_pull_request_id, "task_pull_request_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.MERGE_REJECTED_BY_GITHUB,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_TASK_PULL_REQUEST,
+        subject_id=task_pull_request_id,
+    )
+
+
+def record_pr_merged_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_pull_request_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one GitHub-confirmed merge of the canonical TaskPullRequest (issue #227).
+
+    Task-scoped; the primary modeled subject is the canonical TaskPullRequest
+    over the Task scope. GITHUB provenance: the merged fact comes from
+    authoritative GitHub reconciliation, whatever path requested the merge.
+    No context is recorded: the merged state, merge instant, and stable
+    GitHub identity are canonical on the TaskPullRequest record and are
+    never shadowed into the event.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(task_pull_request_id, "task_pull_request_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.PR_MERGED,
         actor_type=actor.actor_type,
         actor_id=actor.actor_id,
         subject_type=_SUBJECT_TYPE_TASK_PULL_REQUEST,
