@@ -180,6 +180,7 @@ def _abort_fixture(conn: Connection[Any]) -> dict[str, Any]:
         "pool": pool,
         "conn": conn,
         "workspace_id": workspace_id,
+        "repository_id": repository_id,
         "task_id": task_id,
         "profile_id": profile_id,
         "session_id": session_id,
@@ -253,6 +254,7 @@ def _cancel_fixture(conn: Connection[Any]) -> dict[str, Any]:
         "pool": pool,
         "conn": conn,
         "workspace_id": workspace_id,
+        "repository_id": repository_id,
         "task_id": task_id,
         "profile_id": profile_id,
         "pr_id": pr_id,
@@ -284,9 +286,18 @@ def _reconciled(pull_request: TaskPullRequest) -> TaskPullRequestReconciliation:
     )
 
 
-def _open_pull_request(workspace_id: uuid.UUID, task_id: uuid.UUID) -> TaskPullRequest:
+def _pull_request_observation(
+    pr_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    task_id: uuid.UUID,
+    *,
+    closed: bool,
+) -> TaskPullRequest:
+    """The authoritative observation of the fixture's canonical PR at the
+    SAME stable identity, open or (after the simulated closure) closed and
+    unmerged."""
     return TaskPullRequest(
-        id=uuid.uuid4(),
+        id=pr_id,
         workspace_id=workspace_id,
         task_id=task_id,
         repository_id=uuid.uuid4(),
@@ -295,22 +306,41 @@ def _open_pull_request(workspace_id: uuid.UUID, task_id: uuid.UUID) -> TaskPullR
         head_ref=_BRANCH,
         base_ref="main",
         head_sha=_HEAD_SHA,
-        state=TaskPullRequestState.OPEN,
+        state=TaskPullRequestState.CLOSED if closed else TaskPullRequestState.OPEN,
         merged_at=None,
         created_at=_OBSERVED,
         updated_at=_OBSERVED,
     )
 
 
-def _stub_close_machinery(monkeypatch: pytest.MonkeyPatch) -> _CloseGithub:
-    """Stub the reconciliation/credential/route seams at the cancel module."""
-    monkeypatch.setattr(
-        task_cancellation,
-        "reconcile_task_pull_request",
-        lambda pool, github, *, workspace_id, task_id: _reconciled(
-            _open_pull_request(workspace_id, task_id)
-        ),
-    )
+def _stub_close_machinery(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pr_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    task_id: uuid.UUID,
+) -> _CloseGithub:
+    """Stub the reconciliation/credential/route seams at the cancel module.
+
+    The fake authoritative reconciliation reflects the simulated GitHub
+    closure: the canonical PR observes OPEN until the fake close request is
+    delivered and CLOSED/unmerged afterwards, at the same stable PR
+    identity — mirroring production's rule that the durable outcome is
+    confirmed through fresh authoritative observation, never the close
+    answer alone."""
+    github = _CloseGithub()
+
+    def _reconcile(pool: Any, github_client: Any, *, workspace_id: Any, task_id: Any) -> Any:
+        return _reconciled(
+            _pull_request_observation(
+                pr_id=pr_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                closed=bool(github.close_calls),
+            )
+        )
+
+    monkeypatch.setattr(task_cancellation, "reconcile_task_pull_request", _reconcile)
 
     def _credential(pool: Any, resolver: Any, github: Any, *, profile_id: Any, route: Any) -> Any:
         return object()
@@ -327,7 +357,7 @@ def _stub_close_machinery(monkeypatch: pytest.MonkeyPatch) -> _CloseGithub:
             repository=SimpleNamespace(identity=SimpleNamespace(github_repository_id=77_000_005)),
         ),
     )
-    return _CloseGithub()
+    return github
 
 
 def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -> None:
@@ -403,7 +433,12 @@ def test_the_cancellation_composition_commits_atomically_and_releases_the_issue(
 ) -> None:
     facts = _cancel_fixture(conn)
     pool = facts["pool"]
-    github = _stub_close_machinery(monkeypatch)
+    github = _stub_close_machinery(
+        monkeypatch,
+        pr_id=facts["pr_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+    )
 
     outcome = cancel_task(
         pool,
@@ -466,7 +501,12 @@ def test_a_late_cancellation_failure_rolls_the_whole_composition_back(
         raise RuntimeError("forced late cancellation failure")
 
     monkeypatch.setattr(event_coordination, "record_task_terminal_event", _boom)
-    github = _stub_close_machinery(monkeypatch)
+    github = _stub_close_machinery(
+        monkeypatch,
+        pr_id=facts["pr_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+    )
 
     with pytest.raises(RuntimeError, match="forced late cancellation failure"):
         cancel_task(
