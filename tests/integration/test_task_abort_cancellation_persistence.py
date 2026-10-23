@@ -141,7 +141,9 @@ class _CloseGithub:
 
 
 def _abort_fixture(conn: Connection[Any]) -> dict[str, Any]:
-    """A ``planning`` Task with one READY bound Producer session."""
+    """An ``implementing`` Task with one READY bound Producer session owning
+    its RUNNING implementation Execution — the durable in-flight activity the
+    Owner Abort binds its admitted target to."""
     profile_id = _insert_profile(conn)
     workspace_id = _insert_workspace(conn, profile_id)
     installation_id = _insert_installation(conn, workspace_id=workspace_id)
@@ -150,7 +152,7 @@ def _abort_fixture(conn: Connection[Any]) -> dict[str, Any]:
     )
     task_id = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
-    _insert_ready_session(
+    session_id = _insert_ready_session(
         conn,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -161,13 +163,27 @@ def _abort_fixture(conn: Connection[Any]) -> dict[str, Any]:
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
     task = task_repositories.get_task(pool, task_id)
     assert task is not None
+    implementing = task_repositories.update_task_status(
+        pool,
+        task_id,
+        expected_state_token=task.state_token,
+        status=TaskStatus.IMPLEMENTING,
+    )
+    assert implementing is not None
+    conn.execute(
+        "insert into openorc.executions "
+        "(workspace_id, task_id, producer_session_id, execution_number, status) "
+        "values (%s, %s, %s, 1, 'running')",
+        (workspace_id, task_id, session_id),
+    )
     return {
         "pool": pool,
         "conn": conn,
         "workspace_id": workspace_id,
         "task_id": task_id,
         "profile_id": profile_id,
-        "state_token": task.state_token,
+        "session_id": session_id,
+        "state_token": implementing.state_token,
     }
 
 
@@ -373,7 +389,7 @@ def test_a_late_abort_failure_rolls_the_whole_composition_back(
 
     task = task_repositories.get_task(pool, facts["task_id"])
     assert task is not None
-    assert task.status is TaskStatus.PLANNING
+    assert task.status is TaskStatus.IMPLEMENTING
     assert task.state_token == facts["state_token"]
     assert list_task_blocks(pool, task_id=facts["task_id"]) == []
     assert intent_repositories.list_task_interrupt_intents(pool, task_id=facts["task_id"]) == []
@@ -483,3 +499,97 @@ def test_a_late_cancellation_failure_rolls_the_whole_composition_back(
     assert _event_counts(facts["conn"], facts["task_id"]) == {}
     # The external close request is never issued for a rolled-back composition.
     assert github.close_calls == []
+
+
+def test_an_interrupt_intent_cannot_reference_another_tasks_session(
+    conn: Connection[Any],
+) -> None:
+    """The composite subject foreign key binds the Interrupt intent's session
+    to the intent's own Task and Workspace: a cross-Task (or cross-Workspace)
+    reference is a database-rejected integrity violation, never a silently
+    accepted mis-scoped intent."""
+    import psycopg.errors
+
+    facts = _abort_fixture(conn)
+    # A second current Task in the same Workspace/Repository must carry a
+    # different GitHub issue (the one-current-Task-per-issue index).
+    other_task_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.tasks "
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, 7703, 43, 'ready_to_plan', %s)",
+        (other_task_id, facts["workspace_id"], facts["repository_id"], "b" * 64),
+    )
+    connection_row = conn.execute(
+        "select connection_id from openorc.task_agent_sessions where task_id = %s",
+        (facts["task_id"],),
+    ).fetchone()
+    assert connection_row is not None
+    connection_id = connection_row[0]
+    other_session_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.task_agent_sessions "
+        "(id, workspace_id, task_id, role, connection_id, external_session_id, "
+        "lifecycle_status, effective_config_snapshot, initialized_at) "
+        "values (%s, %s, %s, 'producer', %s, 'other-external-session', "
+        "'ready', '{}'::jsonb, now())",
+        (other_session_id, facts["workspace_id"], other_task_id, connection_id),
+    )
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        conn.execute(
+            "insert into openorc.task_interrupt_intents "
+            "(workspace_id, task_id, task_agent_session_id, workflow_role, "
+            "external_session_id, requested_by_profile_id, status) "
+            "values (%s, %s, %s, 'producer', 'other-external-session', %s, 'unsettled')",
+            (
+                facts["workspace_id"],
+                facts["task_id"],
+                other_session_id,
+                facts["profile_id"],
+            ),
+        )
+
+
+def test_a_pr_close_intent_cannot_reference_another_tasks_canonical_pr(
+    conn: Connection[Any],
+) -> None:
+    """The composite subject foreign key binds the PR-close intent's canonical
+    record to the intent's own Task and Workspace: a cross-Task (or
+    cross-Workspace) canonical PR reference is a database-rejected integrity
+    violation."""
+    import psycopg.errors
+
+    facts = _cancel_fixture(conn)
+    other_profile_id = _insert_profile(conn)
+    other_workspace_id = _insert_workspace(conn, other_profile_id)
+    other_installation_id = _insert_installation(conn, workspace_id=other_workspace_id)
+    other_repository_id = _insert_repository(
+        conn, workspace_id=other_workspace_id, github_installation_id=other_installation_id
+    )
+    other_task_id = _insert_task(
+        conn, workspace_id=other_workspace_id, repository_id=other_repository_id
+    )
+    other_pr_id = _insert_canonical_pr(
+        conn,
+        workspace_id=other_workspace_id,
+        task_id=other_task_id,
+        repository_id=other_repository_id,
+    )
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        conn.execute(
+            "insert into openorc.task_pull_request_close_intents "
+            "(workspace_id, task_id, task_pull_request_id, github_pr_id, "
+            "github_pr_number, requested_by_profile_id, status) "
+            "values (%s, %s, %s, %s, %s, %s, 'pending')",
+            (
+                facts["workspace_id"],
+                facts["task_id"],
+                other_pr_id,
+                900_719_925_474_100,
+                78,
+                facts["profile_id"],
+            ),
+        )

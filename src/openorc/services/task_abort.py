@@ -59,12 +59,16 @@ from openorc.adapters.agent_runtime import (
 from openorc.adapters.cline import ClineAdapter, ClineSettlementRefusal
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
+from openorc.domain.reviews import ReviewLoopStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import blocks as block_records
+from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
+from openorc.persistence import reviews as review_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
@@ -100,6 +104,16 @@ _DISPATCH_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.IMPLEMENTING,
         TaskStatus.REVIEWING,
         TaskStatus.WAITING_FOR_OWNER,
+    }
+)
+
+# The Execution statuses whose runtime work is still outstanding.
+_OPEN_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
+    {
+        ExecutionStatus.QUEUED,
+        ExecutionStatus.RUNNING,
+        ExecutionStatus.PAUSED,
+        ExecutionStatus.PAUSED_FOR_APPROVAL,
     }
 )
 
@@ -161,6 +175,7 @@ class TaskAbortOutcome:
     task: Task
     task_block: TaskBlock | None
     interrupt_outcomes: tuple[TaskInterruptOutcome, ...]
+    accounted_executions: tuple[Execution, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +249,49 @@ def _resolve_interrupt_target(
         task_agent_session_id=session.id,
         workflow_role=role,
         external_session_id=session.external_session_id,
+    )
+
+
+def _require_admitted_in_flight_activity(
+    transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
+) -> None:
+    """Bind the admitted role/session to its durable in-flight workflow activity.
+
+    The exact-active-target eligibility contract (issue #228): the addressed
+    session must own the admitted workflow interaction as proven by existing
+    durable state — never by the primary Task status or an SDK status
+    reading. A Producer session is bound to its durably open Execution
+    (``producer_session_id`` is the Execution's own session anchor); a
+    Reviewer session is bound to the Task's OPEN ReviewLoop carrying an
+    unfinalized ReviewIteration — the dispatched review turn still in
+    flight. A pending OwnerGate therefore admits Abort only when such an
+    in-flight fact exists (a paused-for-approval Execution, for example);
+    an ordinary exhausted-loop gate with none is idle and refuses.
+    """
+    if target.workflow_role is WorkflowRole.PRODUCER:
+        executions = execution_records.list_task_executions(transaction_pool, task_id=task.id)
+        if any(
+            execution.producer_session_id == target.task_agent_session_id
+            and execution.status in _OPEN_EXECUTION_STATUSES
+            for execution in executions
+        ):
+            return
+        raise ConflictError(
+            "the addressed producer session owns no durably admitted in-flight "
+            "implementation activity to interrupt"
+        )
+    loops = review_records.list_task_review_loops(
+        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
+    )
+    for loop in loops:
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if any(iteration.outcome is None for iteration in iterations):
+            return
+    raise ConflictError(
+        "the addressed reviewer session owns no durably admitted in-flight "
+        "review activity to interrupt"
     )
 
 
@@ -320,6 +378,8 @@ def _establish_abort_plan(
                 "an owner activity interruption is already outstanding; it must be "
                 "settled or reconciled before another abort"
             )
+        for target in targets:
+            _require_admitted_in_flight_activity(transaction_pool, task=task, target=target)
         block = block_records.create_task_block(
             transaction_pool,
             workspace_id=workspace_id,
@@ -360,6 +420,35 @@ def _establish_abort_plan(
             for target in targets
         )
         return _DispatchPlan(task=blocked, task_block=block, targets=intents)
+
+
+def _account_for_interrupted_executions(
+    pool: DatabasePool, *, task_id: UUID
+) -> tuple[Execution, ...]:
+    """The exact-attempt accounting of positively established cessation.
+
+    Called only after every outstanding interruption settled positively: the
+    Task's durably open Execution attempts transition to the existing
+    ``cancelled`` final status through the guarded conditional primitive, so
+    the implementation work the Owner interrupted is accounted for and the
+    later Cancel eligibility veto no longer sees outstanding runtime work.
+    Truthful history is preserved: a raced finalization (the guarded update
+    returning ``None``) is left exactly as the other writer recorded it, no
+    completion result is invented, and no interruption state machine exists.
+    """
+    accounted: list[Execution] = []
+    for execution in execution_records.list_task_executions(pool, task_id=task_id):
+        if execution.status not in _OPEN_EXECUTION_STATUSES:
+            continue
+        updated = execution_records.update_execution_status(
+            pool,
+            execution_id=execution.id,
+            expected_status=execution.status,
+            next_status=ExecutionStatus.CANCELLED,
+        )
+        if updated is not None:
+            accounted.append(updated)
+    return tuple(accounted)
 
 
 def _interrupt_outcome(
@@ -573,9 +662,17 @@ def abort_task_activity(
         all_settled = all(
             outcome.status is TaskInterruptIntentStatus.SETTLED for outcome in outcomes
         )
+        accounted_executions: tuple[Execution, ...] = ()
+        if all_settled:
+            # Positive cessation established for every outstanding
+            # interruption: the exact-attempt accounting of the interrupted
+            # runtime work applies now, so the later Cancel eligibility veto
+            # no longer sees outstanding runtime work.
+            accounted_executions = _account_for_interrupted_executions(pool, task_id=task_id)
         return TaskAbortOutcome(
             kind=TaskAbortOutcomeKind.SETTLED if all_settled else TaskAbortOutcomeKind.UNRESOLVED,
             task=plan.task,
             task_block=None,
             interrupt_outcomes=outcomes,
+            accounted_executions=accounted_executions,
         )

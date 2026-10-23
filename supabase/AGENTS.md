@@ -205,6 +205,15 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   `failed`/`unknown`) keeps the obligation observable across a crash
   between archival and the external closure attempt. Archived terminal
   Task history is never rewritten by any outcome.
+- Both subject references are COMPOSITE subject foreign keys enforcing
+  direct-scope coherence at the database: the Interrupt intent's session
+  edge binds `(task_agent_session_id, task_id, workspace_id)` against the
+  `task_agent_sessions_id_task_id_workspace_id_uniq` hook this migration
+  adds to `task_agent_sessions`, and the close intent's PR edge binds
+  `(task_pull_request_id, task_id, workspace_id)` against the canonical
+  record's existing `unique (id, task_id, workspace_id)` — an intent can
+  never reference another Task's (or another Workspace's) session or
+  canonical PR.
 - Deletion ownership follows the established classification: both tables
   cascade from their Task/Workspace (true ownership), the interrupted
   session binding and the canonical PR record cascade (the intents are

@@ -831,14 +831,23 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   command: stop OpenOrc first, then interrupt ClineBox. Its dispatch phase
   (current Task in `planning`/`implementing`/`reviewing`, or at a pending
   OwnerGate with a demonstrably in-flight runtime interaction) proves the
-  account/Owner/currentness/role guards before any Cline I/O and applies
-  ONE atomic composition — the `owner_action_required` TaskBlock with the
-  safe `owner_abort` context, the `blocked` transition under the rotated
-  token (a pending gate stays truthful pending history, unusable while
-  blocked), the OWNER `task_blocked` audit, and the durable one-shot
-  exact-session Interrupt intents — and only AFTER the commit invokes
-  `ClineAdapter.abort_activity` exactly once per exact admitted
-  Task/role session. An SDK acknowledgement is recorded in place and never
+  account/Owner/currentness guards before any Cline I/O, resolves the exact
+  existing bound `TaskAgentSession` targets, and binds EACH admitted
+  role/session to its durable in-flight workflow activity before recording
+  anything: a Producer target must own a durably OPEN Execution anchored to
+  that exact session (`producer_session_id`), and a Reviewer target must own
+  an OPEN ReviewLoop carrying an unfinalized ReviewIteration — the
+  dispatched review turn still in flight. An ordinary exhausted-loop OwnerGate
+  with no such fact is idle and refuses (no interrupting an idle session
+  over a visible gate). The atomic composition then applies the
+  `owner_action_required` TaskBlock with the safe `owner_abort` context, the
+  `blocked` transition under the rotated token (a pending gate stays
+  truthful pending history, unusable while blocked), the OWNER
+  `task_blocked` audit, and the durable one-shot exact-session Interrupt
+  intents. AFTER the commit, `ClineAdapter.abort_activity` is invoked
+  exactly once per exact target, and each safe outcome
+  (acknowledged / definitively failed / uncertain) is recorded on its
+  durable intent. An SDK acknowledgement is recorded in place and never
   settles the intent; a definitive non-delivery records `failed`; an
   uncertain outcome records `unknown` and is never replayed. The
   settlement phase (the Task already `blocked` by this control) never
@@ -846,10 +855,15 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   (`TaskInterruptSettlement`) it refuses and surfaces the unresolved
   interruption; with it, `ClineAdapter.settle_abort` runs outside any
   transaction and a positively settled intent is the only state in which
-  Cancel becomes available. The Task stays `blocked` regardless of the
-  Interrupt outcome; late formal results can never advance it; terminal
-  session identities are preserved (no `stop`/`start`/`send`, no
-  replacement session, no prompt).
+  Cancel becomes available. Positive cessation also applies the exact
+  -attempt accounting: the Task's durably open Execution attempts
+  transition to the existing `cancelled` final status through the guarded
+  conditional primitive (truthful history preserved — no invented
+  completion result, no interruption state machine), so the later Cancel
+  eligibility veto no longer sees outstanding runtime work. The Task stays
+  `blocked` regardless of the Interrupt outcome; late formal results can
+  never advance it; terminal session identities are preserved (no
+  `stop`/`start`/`send`, no replacement session, no prompt).
 - `task_cancellation.cancel_task` is the ONE Owner-authorized unified
   Cancel command from a current safely inactive Task (`ready_to_plan`,
   `queued`, the exact current pending OwnerGate of any type, or `blocked`
@@ -858,9 +872,14 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   irreversible mutation — a PR already authoritatively confirmed merged at
   the point of decision routes to E10a's `complete_confirmed_task_merge`
   (never an Owner `CANCELLED` claim), and a read failure still allows
-  cancellation with a durable unresolved PR-close obligation. One shared
-  short transaction (`task_cancellation.cancel_task_composition`, the ONE
-  common cancellation composition to which E5's
+  cancellation with a durable unresolved PR-close obligation. The final
+  decision transaction revalidates those facts under the Task row lock
+  BEFORE any mutation: the durable canonical PR identity must still match
+  the pre-decision record, and a merge B7 reconciliation confirmed between
+  the observation and the lock (no Task token rotation involved) routes to
+  E10a's completion service instead of an Owner `CANCELLED` claim. One
+  shared short transaction (`task_cancellation.cancel_task_composition`, the
+  ONE common cancellation composition to which E5's
   `cancel_implementation_authorization` and E7's `cancel_pr_authorization`
   now delegate, keeping their exact-addressed gate-type discipline)
   re-proves authorization/currentness/the accounted-runtime veto under the

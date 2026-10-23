@@ -221,6 +221,21 @@ def _require_uuid_command(value: object, name: str) -> None:
         raise InvalidCommandError(f"{name} must be a UUID")
 
 
+class _ConfirmedMergeAtDecision(Exception):
+    """Internal signal: the canonical PR is durably confirmed merged under
+    the final Task lock.
+
+    Raised by the shared composition BEFORE any cancellation mutation when
+    the durable canonical ``TaskPullRequest`` re-read under the Task row
+    lock carries a confirmed merge — B7 reconciliation can persist one
+    between the pre-decision observation and the decision transaction
+    without rotating the Task ``state_token``. The caller rolls the
+    read-only transaction back and routes to E10a's existing completion
+    service instead of recording an Owner ``CANCELLED`` claim over a merged
+    PR.
+    """
+
+
 def _is_confirmed_merged(pull_request: TaskPullRequest) -> bool:
     """Whether the durable record authoritatively carries a confirmed merge."""
     return pull_request.state is TaskPullRequestState.CLOSED and pull_request.merged_at is not None
@@ -285,6 +300,7 @@ def _cancel_composition(
     owner_gate_id: UUID | None,
     close_obligation: _CloseObligation,
     expected_gate_type: OwnerGateType | None = None,
+    preflight_pull_request_id: UUID | None = None,
 ) -> _CancelComposition:
     """The ONE shared atomic cancellation composition (issue #228 §3).
 
@@ -322,6 +338,27 @@ def _cancel_composition(
         )
         _require_cancel_eligible_status(task)
         _require_runtime_work_accounted(transaction_pool, task_id=task_id)
+        if preflight_pull_request_id is not None:
+            # The pre-decision canonical-PR facts are revalidated under the
+            # Task row lock BEFORE any mutation: B7 reconciliation can
+            # persist a confirmed merge between the pre-decision observation
+            # and this transaction without rotating the Task token, and a
+            # durable identity move is never silently rebound.
+            surviving = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
+            if (
+                surviving is None
+                or surviving.workspace_id != task.workspace_id
+                or surviving.id != preflight_pull_request_id
+            ):
+                raise ConflictError(
+                    "the canonical pull request record moved during cancellation; "
+                    "the cancellation is stale"
+                )
+            if _is_confirmed_merged(surviving):
+                # The PR was already authoritatively confirmed merged by the
+                # time the final Task lock was acquired: never an Owner
+                # CANCELLED claim — E10a's completion path applies.
+                raise _ConfirmedMergeAtDecision
         cancelled_gate: OwnerGate | None = None
         if task.status is TaskStatus.WAITING_FOR_OWNER:
             gate_id = owner_gate_id if owner_gate_id is not None else task.current_owner_gate_id
@@ -799,8 +836,10 @@ def cancel_task(
                     "the requested pull request record is not available for this task"
                 )
         close_obligation = _CloseObligation.NONE
+        preflight_pull_request_id: UUID | None = None
         reconciled: TaskPullRequest | None = None
         if pull_request is not None:
+            preflight_pull_request_id = pull_request.id
             # Fresh authoritative observation with no database transaction
             # open: the decision facts precede any irreversible mutation.
             try:
@@ -828,15 +867,33 @@ def cancel_task(
                     )
                 close_obligation = _resolve_close_obligation(reconciled)
         # --- Phase B: the one shared short decision transaction ---
-        composition = _cancel_composition(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            owner_gate_id=None,
-            close_obligation=close_obligation,
-        )
+        try:
+            composition = _cancel_composition(
+                pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                owner_gate_id=None,
+                close_obligation=close_obligation,
+                preflight_pull_request_id=preflight_pull_request_id,
+            )
+        except _ConfirmedMergeAtDecision:
+            # The durable canonical PR became confirmed merged between the
+            # pre-decision observation and the final Task lock: the
+            # read-only composition rolled back and E10a's completion path
+            # applies instead of an Owner CANCELLED claim.
+            completion = complete_confirmed_task_merge(
+                pool, workspace_id=workspace_id, task_id=task_id
+            )
+            return TaskCancellationOutcome(
+                kind=TaskCancellationOutcomeKind.COMPLETED,
+                task=completion.task,
+                owner_gate=None,
+                closed_loops=(),
+                pull_request=completion.pull_request,
+                close_intent=None,
+            )
         # --- Phase C: the one-shot closure attempt under the recorded
         # Profile's authorization, strictly after the commit ---
         final_intent = composition.close_intent

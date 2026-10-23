@@ -28,6 +28,7 @@ No live runtime or Postgres access.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
 
@@ -39,8 +40,11 @@ from openorc.adapters.agent_runtime import (
 )
 from openorc.adapters.cline import ClineSettlementOutcome, ClineSettlementRefusal
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.executions import ExecutionStatus
 from openorc.domain.intents import TaskInterruptIntentStatus
 from openorc.domain.tasks import TaskStatus
+from openorc.persistence import executions as execution_records
+from openorc.persistence import reviews as review_records
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
     ConflictError,
@@ -136,6 +140,103 @@ def _ready_session_row(*, lifecycle: str = "ready") -> tuple[Any, ...]:
         # ENDED requires its semantic stamp set exactly when the status is.
         row = (*row[:12], _OBSERVED, row[13], row[14])
     return row
+
+
+def _wire_activity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    executions: list[Any] | None = None,
+    loops: list[Any] | None = None,
+    iterations_by_loop: dict[Any, list[Any]] | None = None,
+) -> list[tuple[Any, Any, Any]]:
+    """Patch the durable in-flight activity readers at their module seams.
+
+    The activity proof reads the Producer's open Executions and the Task's
+    OPEN ReviewLoops with unfinalized ReviewIterations; the settlement
+    accounting re-reads them and applies the guarded status transition.
+    Returns the recorded ``(execution_id, expected, next)`` accounting
+    transitions.
+    """
+    accounted: list[tuple[Any, Any, Any]] = []
+    monkeypatch.setattr(
+        execution_records,
+        "list_task_executions",
+        lambda pool, *, task_id: list(executions or []),
+    )
+    monkeypatch.setattr(
+        review_records,
+        "list_task_review_loops",
+        lambda pool, *, task_id, status: list(loops or []),
+    )
+    monkeypatch.setattr(
+        review_records,
+        "list_review_loop_iterations",
+        lambda pool, *, review_loop_id: list((iterations_by_loop or {}).get(review_loop_id, [])),
+    )
+
+    def _update(pool: Any, *, execution_id: Any, expected_status: Any, next_status: Any) -> Any:
+        accounted.append((execution_id, expected_status, next_status))
+        for execution in executions or []:
+            if execution.id == execution_id:
+                execution.status = next_status
+                return execution
+        return None
+
+    monkeypatch.setattr(execution_records, "update_execution_status", _update)
+    return accounted
+
+
+def _open_execution(
+    *,
+    execution_id: Any = None,
+    producer_session_id: Any = _SESSION_ID,
+    status: ExecutionStatus = ExecutionStatus.RUNNING,
+) -> Any:
+    return SimpleNamespace(
+        id=execution_id if execution_id is not None else uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        producer_session_id=producer_session_id,
+        execution_number=1,
+        status=status,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        implementation_result=None,
+        last_qualifying_activity_at=None,
+        review_iteration_id=None,
+    )
+
+
+def _open_loop_with_unfinalized_iteration(
+    *,
+    loop_id: Any = None,
+) -> tuple[Any, dict[Any, list[Any]]]:
+    loop = SimpleNamespace(
+        id=loop_id if loop_id is not None else uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose="planning",
+        iteration_limit=2,
+        status="open",
+        closed_at=None,
+        created_at=_OBSERVED,
+    )
+    iteration = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        review_loop_id=loop.id,
+        iteration_number=1,
+        plan_revision_id=uuid4(),
+        task_pull_request_id=None,
+        reviewed_head_sha=None,
+        outcome=None,
+        summary=None,
+        findings=[],
+        decided_at=None,
+        created_at=_OBSERVED,
+    )
+    return loop, {loop.id: [iteration]}
 
 
 def _task_row_of(status: str) -> tuple[Any, ...]:
@@ -241,9 +342,12 @@ def _settlement_call(
     )
 
 
-def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit() -> None:
+def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="planning", session=_ready_session_row())
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
     conn.on(_BLOCK_INSERT, _block_row())
     conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
@@ -272,9 +376,12 @@ def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit() -
     assert _count(conn, _SESSION_WRITE) == 0
 
 
-def test_abort_at_a_pending_gate_never_touches_the_gate() -> None:
+def test_abort_at_a_pending_gate_never_touches_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = ScriptedConnection()
     _script_dispatch_head(conn, status="waiting_for_owner", session=_ready_session_row())
+    _wire_activity(
+        monkeypatch, executions=[_open_execution(status=ExecutionStatus.PAUSED_FOR_APPROVAL)]
+    )
     conn.on(_INTENTS_LIST, [])
     conn.on(_BLOCK_INSERT, _block_row())
     conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
@@ -291,9 +398,12 @@ def test_abort_at_a_pending_gate_never_touches_the_gate() -> None:
     assert _event_types(conn) == ["task_blocked"]
 
 
-def test_abort_records_a_definitive_dispatch_failure_on_the_intent() -> None:
+def test_abort_records_a_definitive_dispatch_failure_on_the_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="planning", session=_ready_session_row())
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
     conn.on(_BLOCK_INSERT, _block_row())
     conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
@@ -310,9 +420,12 @@ def test_abort_records_a_definitive_dispatch_failure_on_the_intent() -> None:
     assert outcome.task.status is TaskStatus.BLOCKED
 
 
-def test_abort_records_an_uncertain_dispatch_on_the_intent() -> None:
+def test_abort_records_an_uncertain_dispatch_on_the_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="planning", session=_ready_session_row())
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
     conn.on(_BLOCK_INSERT, _block_row())
     conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
@@ -329,10 +442,17 @@ def test_abort_records_an_uncertain_dispatch_on_the_intent() -> None:
     assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.UNKNOWN
 
 
-def test_abort_dispatches_each_exact_admitted_target_once() -> None:
+def test_abort_dispatches_each_exact_admitted_target_once(monkeypatch: pytest.MonkeyPatch) -> None:
     reviewer_session = _session_row("reviewer", uuid4(), "fake-session-2")
     conn = ScriptedConnection()
     _script_dispatch_head(conn, status="reviewing", session=_ready_session_row())
+    loop, iterations_by_loop = _open_loop_with_unfinalized_iteration()
+    _wire_activity(
+        monkeypatch,
+        executions=[_open_execution()],
+        loops=[loop],
+        iterations_by_loop=iterations_by_loop,
+    )
     conn.on(_SESSION_READ, reviewer_session)
     conn.on(_INTENTS_LIST, [])
     conn.on(_BLOCK_INSERT, _block_row())
@@ -369,10 +489,14 @@ def _script_settlement_head(conn: ScriptedConnection, *, intents: list[tuple[Any
     conn.on(_INTENTS_LIST, intents)
 
 
-def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting() -> None:
+def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = ScriptedConnection()
     _script_settlement_head(conn, intents=[_intent_row()])
     conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+    execution = _open_execution()
+    accounted = _wire_activity(monkeypatch, executions=[execution])
     adapter = _FakeClineAdapter()
 
     outcome = _settlement_call(
@@ -387,14 +511,23 @@ def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting()
     assert adapter.abort_calls == []
     assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
     assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.SETTLED
+    # Positive cessation established: the exact-attempt accounting applied
+    # the existing guarded transition to the cancelled final status.
+    assert accounted == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
+    assert len(outcome.accounted_executions) == 1
+    assert outcome.accounted_executions[0].status is ExecutionStatus.CANCELLED
     assert _count(conn, _BLOCK_INSERT) == 0
     assert _count(conn, _STATUS_UPDATE) == 0
     assert _event_types(conn) == []
 
 
-def test_a_settlement_refusal_keeps_the_interruption_unresolved() -> None:
+def test_a_settlement_refusal_keeps_the_interruption_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = ScriptedConnection()
     _script_settlement_head(conn, intents=[_intent_row()])
+    execution = _open_execution()
+    accounted = _wire_activity(monkeypatch, executions=[execution])
     conn.on(
         _INTENT_UPDATE,
         _intent_row(outcome={"settlement_refusal": "outstanding_abort"}),
@@ -418,6 +551,9 @@ def test_a_settlement_refusal_keeps_the_interruption_unresolved() -> None:
     annotate_sql = [sql for sql, _ in conn.executed if "set outcome = %s" in sql]
     assert len(annotate_sql) == 1
     assert all("set status = %s" not in sql for sql in annotate_sql)
+    # Cessation was never positively established: no execution accounting.
+    assert accounted == []
+    assert execution.status is ExecutionStatus.RUNNING
 
 
 def test_an_abort_without_evidence_refuses_and_surfaces_the_unresolved_interruption() -> None:
@@ -553,3 +689,63 @@ def test_malformed_abort_commands_fail_before_any_state_is_touched() -> None:
 
     assert adapter.abort_calls == []
     assert conn.executed == []
+
+
+def test_abort_rejects_a_target_role_without_in_flight_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Producer owns the open Execution; an admitted REVIEWER target has
+    # no unfinalized review turn, so the wrong-role command is refused
+    # before any block or Interrupt intent is recorded.
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    _wire_activity(monkeypatch, executions=[_open_execution()])
+    conn.on(_INTENTS_LIST, [])
+    adapter = _FakeClineAdapter()
+
+    with pytest.raises(ConflictError, match="reviewer session owns no durably admitted"):
+        _dispatch_call(_pool(conn), adapter, target_roles=(WorkflowRole.REVIEWER,))
+
+    assert adapter.abort_calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _event_types(conn) == []
+
+
+def test_abort_rejects_an_idle_owner_gate_without_in_flight_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An ordinary exhausted-loop gate carries no in-flight runtime fact:
+    # Abort must not interrupt an idle session over a visible gate.
+    for role in (WorkflowRole.PRODUCER, WorkflowRole.REVIEWER):
+        conn = ScriptedConnection()
+        _script_dispatch_head(conn, status="waiting_for_owner", session=_ready_session_row())
+        _wire_activity(monkeypatch)
+        conn.on(_INTENTS_LIST, [])
+        adapter = _FakeClineAdapter()
+
+        with pytest.raises(ConflictError, match="no durably admitted"):
+            _dispatch_call(_pool(conn), adapter, target_roles=(role,))
+
+        assert adapter.abort_calls == []
+        assert _count(conn, _BLOCK_INSERT) == 0
+        assert _count(conn, _STATUS_UPDATE) == 0
+        assert _event_types(conn) == []
+
+
+def test_abort_rejects_a_producer_target_bound_to_another_sessions_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The open Execution anchors a DIFFERENT Producer session: this Task's
+    # resolved producer binding owns no in-flight implementation work.
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    _wire_activity(monkeypatch, executions=[_open_execution(producer_session_id=uuid4())])
+    conn.on(_INTENTS_LIST, [])
+    adapter = _FakeClineAdapter()
+
+    with pytest.raises(ConflictError, match="producer session owns no durably admitted"):
+        _dispatch_call(_pool(conn), adapter)
+
+    assert adapter.abort_calls == []
+    assert _count(conn, _STATUS_UPDATE) == 0

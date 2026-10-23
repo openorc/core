@@ -902,3 +902,204 @@ def test_a_stale_token_cancels_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert _count(conn, _ARCHIVE_WRITE) == 0
     assert _event_types(conn) == []
+
+
+def test_a_merge_confirmed_under_the_final_lock_routes_to_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B7 reconciliation persists a confirmed merge between the pre-decision
+    observation and the final Task lock (no Task token rotation): the
+    composition's locked PR re-read observes it, the read-only decision
+    transaction rolls back, and E10a's completion path applies."""
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked")
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_pull_request(state=TaskPullRequestState.OPEN))
+    )
+    pr_sequence = [
+        _pull_request(state=TaskPullRequestState.OPEN),
+        _pull_request(state=TaskPullRequestState.CLOSED, merged_at=_OBSERVED),
+    ]
+    pr_reads: list[int] = []
+
+    def _pr_read(pool: Any, *, task_id: Any) -> Any:
+        pr_reads.append(task_id)
+        return pr_sequence[min(len(pr_reads), len(pr_sequence)) - 1]
+
+    completion_calls: list[tuple[Any, Any]] = []
+
+    def _completion(pool: Any, *, workspace_id: Any, task_id: Any) -> Any:
+        completion_calls.append((workspace_id, task_id))
+        return SimpleNamespace(
+            task=SimpleNamespace(status=TaskStatus.COMPLETED, archived_at=_OBSERVED),
+            pull_request=_pull_request(state=TaskPullRequestState.CLOSED, merged_at=_OBSERVED),
+        )
+
+    _wire(monkeypatch, reconcile=reconcile)
+    monkeypatch.setattr(task_cancellation, "get_task_pull_request_for_task", _pr_read)
+    monkeypatch.setattr(task_cancellation, "complete_confirmed_task_merge", _completion)
+    github = _CloseGithub()
+
+    outcome = _cancel_call(_pool(conn), github)
+
+    assert outcome.kind is TaskCancellationOutcomeKind.COMPLETED
+    assert len(completion_calls) == 1
+    # No Owner CANCELLED claim, no close obligation, no archival.
+    assert github.close_calls == []
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _CLOSE_INTENT_INSERT) == 0
+    assert _event_types(conn) == []
+
+
+def test_the_complete_implementing_abort_settlement_cancel_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full Owner path the interrupted-execution accounting enables:
+    IMPLEMENTING → Abort dispatch → positive settlement with the exact
+    attempt accounting → Cancel no longer vetoed and archives."""
+    from openorc.services.task_abort import (
+        TaskAbortOutcomeKind as _AbortOutcomeKind,
+    )
+    from openorc.services.task_abort import (
+        TaskInterruptSettlement as _TaskInterruptSettlement,
+    )
+    from tests.test_services_task_abort import (
+        _BLOCK_INSERT as _ABORT_BLOCK_INSERT,
+    )
+    from tests.test_services_task_abort import (
+        _EVENT_INSERT as _ABORT_EVENT_INSERT,
+    )
+    from tests.test_services_task_abort import (
+        _INTENT_INSERT as _ABORT_INTENT_INSERT,
+    )
+    from tests.test_services_task_abort import (
+        _INTENT_UPDATE as _ABORT_INTENT_UPDATE,
+    )
+    from tests.test_services_task_abort import (
+        _INTENTS_LIST as _ABORT_INTENTS_LIST,
+    )
+    from tests.test_services_task_abort import (
+        _SESSION_ID as _ABORT_SESSION_ID,
+    )
+    from tests.test_services_task_abort import (
+        _STATUS_UPDATE as _ABORT_STATUS_UPDATE,
+    )
+    from tests.test_services_task_abort import (
+        _block_row as _abort_block_row,
+    )
+    from tests.test_services_task_abort import (
+        _dispatch_call as _abort_dispatch_call,
+    )
+    from tests.test_services_task_abort import (
+        _FakeClineAdapter,
+    )
+    from tests.test_services_task_abort import (
+        _intent_row as _abort_intent_row,
+    )
+    from tests.test_services_task_abort import (
+        _ready_session_row as _abort_ready_session_row,
+    )
+    from tests.test_services_task_abort import (
+        _script_dispatch_head as _abort_script_dispatch_head,
+    )
+    from tests.test_services_task_abort import (
+        _script_settlement_head as _abort_script_settlement_head,
+    )
+    from tests.test_services_task_abort import (
+        _settlement_call as _abort_settlement_call,
+    )
+
+    execution = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        producer_session_id=_ABORT_SESSION_ID,
+        execution_number=1,
+        status=ExecutionStatus.RUNNING,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        implementation_result=None,
+        last_qualifying_activity_at=None,
+        review_iteration_id=None,
+    )
+    transitions: list[tuple[Any, Any, Any]] = []
+
+    def _list_executions(pool: Any, *, task_id: Any) -> list[Any]:
+        return [execution]
+
+    def _update_execution(
+        pool: Any, *, execution_id: Any, expected_status: Any, next_status: Any
+    ) -> Any:
+        transitions.append((execution_id, expected_status, next_status))
+        if execution.id == execution_id and execution.status is expected_status:
+            execution.status = next_status
+            return execution
+        return None
+
+    monkeypatch.setattr(execution_records, "list_task_executions", _list_executions)
+    monkeypatch.setattr(execution_records, "update_execution_status", _update_execution)
+
+    conn = ScriptedConnection()
+    # --- Phase 1: the Abort dispatch over the IMPLEMENTING Task ---
+    _abort_script_dispatch_head(conn, status="implementing", session=_abort_ready_session_row())
+    conn.on(_ABORT_INTENTS_LIST, [])
+    conn.on(_ABORT_BLOCK_INSERT, _abort_block_row())
+    conn.on(_ABORT_STATUS_UPDATE, _task_values(status="blocked", state_token=_CANCELLED_TOKEN))
+    conn.on(_ABORT_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_ABORT_INTENT_INSERT, _abort_intent_row())
+    conn.on(_ABORT_INTENT_UPDATE, _abort_intent_row(outcome={"dispatch": "acknowledged"}))
+    adapter = _FakeClineAdapter()
+
+    abort_outcome = _abort_dispatch_call(_pool(conn), adapter)
+
+    assert abort_outcome.kind is _AbortOutcomeKind.INTERRUPTED
+    assert adapter.abort_calls != []
+
+    # --- Phase 2: the Owner re-issues Abort with positive D6b evidence ---
+    _abort_script_settlement_head(conn, intents=[_abort_intent_row()])
+    conn.on(
+        _ABORT_INTENT_UPDATE,
+        _abort_intent_row(status="settled", outcome={"settlement": "confirmed"}),
+    )
+
+    settlement_outcome = _abort_settlement_call(
+        _pool(conn),
+        adapter,
+        settlement=_TaskInterruptSettlement(
+            runtime_work_settled=True, operation_accounted_for=True
+        ),
+    )
+
+    assert settlement_outcome.kind is _AbortOutcomeKind.SETTLED
+    # The interrupted Execution attempt is accounted for via the existing
+    # guarded transition to the cancelled final status.
+    assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
+    assert execution.status is ExecutionStatus.CANCELLED
+
+    # --- Phase 3: Cancel is no longer vetoed and archives the Task ---
+    _wire(
+        monkeypatch,
+        interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.SETTLED)],
+        executions=[execution],
+    )
+    conn2 = ScriptedConnection()
+    _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
+    _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
+    conn2.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn2.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+
+    outcome = cancel_task(
+        _pool(conn2),
+        cast(Any, _CloseGithub()),
+        cast(Any, object()),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_CANCELLED_TOKEN,
+    )
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+    assert _event_types(conn2) == ["task_cancelled"]
