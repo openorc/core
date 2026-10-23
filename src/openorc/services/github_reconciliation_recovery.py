@@ -495,9 +495,12 @@ def _sweep_issue_unit(
             delivery_guid=None,
             error=error,
         )
+    # A never-started Task (issue #233) carries no frozen baseline yet, so
+    # there is nothing to drift from: pre-start requirements changes are not
+    # drift evidence. A frozen baseline compares exactly as before.
     drift: bool | None = (
         None
-        if current_task is None
+        if current_task is None or current_task.source_requirements_fingerprint is None
         else reconciliation.issue.requirements_fingerprint
         != current_task.source_requirements_fingerprint
     )

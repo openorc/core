@@ -10,7 +10,7 @@ start contract on its critical path:
   advisory lock before its locked re-read;
 - no database transaction open across any external GitHub call (the fake
   pool tracks checked-out connections);
-- the typed non-start conditions: already-planning, queued, stale source
+- the typed non-start conditions: already-planning, queued, a durable projection
   fingerprint, identity loss, blocked/closed issue — each fails closed
   WITHOUT a queue write and, for the precheck conditions, without any
   GitHub call;
@@ -55,8 +55,8 @@ from openorc.services.task_start import (
     QueuedCandidateDisposition,
     TaskAlreadyPlanningError,
     TaskCapacityConfigurationError,
+    TaskEligibilityContradictedError,
     TaskEligibilityFailure,
-    TaskSourceDriftError,
     TaskSourceIdentityLossError,
     TaskStartQueueReason,
     TaskStartStateConflictError,
@@ -248,7 +248,7 @@ def _task_row(
     status: str = "ready_to_plan",
     state_token: Any = _STATE_TOKEN,
     queued_at: Any = None,
-    fingerprint: str = _FINGERPRINT,
+    fingerprint: str | None = None,
 ) -> tuple[Any, ...]:
     return (
         task_id,
@@ -535,7 +535,7 @@ def _script_task_update(
             "update openorc.tasks" in sql
             and params is not None
             and params[0] == status_value
-            and params[3] == task_id
+            and params[4] == task_id
         )
 
     conn.on_repeat(predicate, row)
@@ -740,7 +740,7 @@ def test_non_startable_states_conflict_before_any_github_work(
 ) -> None:
     conn = ScriptedConnection()
     github = FakeGitHubAppClient()
-    row = _task_row(status=status, queued_at=queued_at)
+    row = _task_row(status=status, queued_at=queued_at, fingerprint=_FINGERPRINT)
     _script_task_reads(conn, task_id=_TASK_ID, row=row)
     _script_baseline(conn)
 
@@ -752,19 +752,57 @@ def test_non_startable_states_conflict_before_any_github_work(
     _assert_no_session_reservations(conn)
 
 
-def test_stale_source_fingerprint_fails_closed_without_queueing() -> None:
+def test_requirements_edited_since_intake_start_and_freeze_the_fresh_fingerprint() -> None:
     conn = ScriptedConnection()
     github = FakeGitHubAppClient()
-    drifted = _issue_projection_row(fingerprint="b" * 64)
-    # Both the locked reconcile read and its returning write carry the fresh
-    # (drifted) requirements fingerprint.
-    conn.on(_sql_has("openorc.github_issues", "for update"), drifted)
-    conn.on(_sql_has("update openorc.github_issues"), drifted)
+    # The issue's requirements changed after intake (issue #233): the Task
+    # carries NO pre-start baseline, so there is nothing to compare against
+    # and the start proceeds. The freshly reconciled "b"*64 fingerprint is
+    # what Phase B observes (the locked reconcile read and its returning
+    # write) and what the arbitration's durable guard re-reads.
+    fresh = _issue_projection_row(fingerprint="b" * 64)
+    conn.on(_sql_has("openorc.github_issues", "for update"), fresh)
+    conn.on(_sql_has("update openorc.github_issues"), fresh)
+    conn.on_repeat(
+        _sql_lacks(_sql_has("from openorc.github_issues"), "for update", "update openorc"),
+        fresh,
+    )
+    _script_success_start(conn)
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+
+    assert outcome.status is TaskStartStatus.PLANNING
+    # The frozen baseline is the freshly reconciled fingerprint, captured in
+    # the SAME guarded statement as the planning claim (capture parameter
+    # position 1; the coalesce can never rewrite an existing baseline).
+    planning_updates = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
+    ]
+    assert len(planning_updates) == 1
+    assert planning_updates[0][1][1] == "b" * 64
+    assert "coalesce(source_requirements_fingerprint" in planning_updates[0][0]
+
+
+def test_a_stale_durable_projection_refuses_the_start_without_freezing_a_baseline() -> None:
+    conn = ScriptedConnection()
+    github = FakeGitHubAppClient()
+    # Phase B freshly reconciles "b"*64 (the locked read and its returning
+    # write), but the durable projection the arbitration guard re-reads
+    # still says "a"*64: the durable facts contradict the fingerprint being
+    # frozen, so the guard refuses — never queues, never freezes, and the
+    # Task stays ready_to_plan with no baseline.
+    fresh = _issue_projection_row(fingerprint="b" * 64)
+    conn.on(_sql_has("openorc.github_issues", "for update"), fresh)
+    conn.on(_sql_has("update openorc.github_issues"), fresh)
     _script_success_start(conn)
 
-    with pytest.raises(TaskSourceDriftError):
+    with pytest.raises(TaskEligibilityContradictedError) as excinfo:
         start_task_for_owner(_pool(conn), github, **_start_kwargs())
 
+    assert excinfo.value.reason is TaskEligibilityFailure.FINGERPRINT_DRIFT
     assert "issue" in github.calls
     _assert_no_task_writes(conn)
     _assert_no_session_reservations(conn)
@@ -948,8 +986,13 @@ _CANDIDATE_QUEUED_AT = datetime(2026, 10, 18, 11, 0, 0, tzinfo=UTC)
 def _candidate_row(
     *, task_id: Any = _CANDIDATE_ID, state_token: Any = _CANDIDATE_TOKEN
 ) -> tuple[Any, ...]:
+    # A queued candidate has started: it carries its frozen baseline.
     return _task_row(
-        task_id=task_id, status="queued", state_token=state_token, queued_at=_CANDIDATE_QUEUED_AT
+        task_id=task_id,
+        status="queued",
+        state_token=state_token,
+        queued_at=_CANDIDATE_QUEUED_AT,
+        fingerprint=_FINGERPRINT,
     )
 
 
@@ -960,7 +1003,9 @@ def _script_candidate_claim(conn: ScriptedConnection, *, task_id: Any) -> None:
         conn,
         task_id=task_id,
         status_value="planning",
-        row=_task_row(task_id=task_id, status="planning", state_token=uuid.uuid4()),
+        row=_task_row(
+            task_id=task_id, status="planning", state_token=uuid.uuid4(), fingerprint=_FINGERPRINT
+        ),
     )
     _script_session_reads(conn, task_id=task_id)
     _script_session_inserts(
@@ -986,14 +1031,14 @@ def test_establishment_pass_advances_the_older_candidate_before_the_target() -> 
     candidate_update_index = next(
         index
         for index, (sql, params) in enumerate(conn.executed)
-        if "update openorc.tasks" in sql and params is not None and params[3] == _CANDIDATE_ID
+        if "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
     )
     target_update_index = next(
         index
         for index, (sql, params) in enumerate(conn.executed)
         if "update openorc.tasks" in sql
         and params is not None
-        and params[3] == _TASK_ID
+        and params[4] == _TASK_ID
         and params[0] == "planning"
     )
     assert candidate_update_index < target_update_index
@@ -1040,7 +1085,7 @@ def test_establishment_pass_consuming_capacity_queues_the_target() -> None:
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[3] == _CANDIDATE_ID
+        and params[4] == _CANDIDATE_ID
         and params[0] == "planning"
         for sql, params in conn.executed
     )
@@ -1065,7 +1110,7 @@ def test_multi_page_queue_is_fully_examined_before_the_target_decides(
     assert outcome.status is TaskStartStatus.PLANNING
     # Every queued candidate across pages was claimed before the target.
     planning_targets = [
-        params[3]
+        params[4]
         for sql, params in conn.executed
         if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
     ]
@@ -1091,7 +1136,7 @@ def test_budget_exhaustion_defers_the_target_conservatively(
     assert outcome.status is TaskStartStatus.QUEUED
     assert outcome.queue_reason is TaskStartQueueReason.ARBITRATION_DEFERRED
     planning_updates = [
-        params[3]
+        params[4]
         for sql, params in conn.executed
         if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
     ]
@@ -1123,14 +1168,14 @@ def test_durable_projection_contradiction_never_advances_the_candidate() -> None
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[3] == _TASK_ID
+        and params[4] == _TASK_ID
         and params[0] == "planning"
         for sql, params in conn.executed
     )
     # The contradicted candidate was never claimed and stayed queued with
     # its original entry timestamp.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[3] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
 
@@ -1232,13 +1277,15 @@ def _script_success_start(
         conn,
         task_id=_TASK_ID,
         status_value="planning",
-        row=_task_row(status="planning", state_token=uuid.uuid4()),
+        row=_task_row(status="planning", state_token=uuid.uuid4(), fingerprint=_FINGERPRINT),
     )
     _script_task_update(
         conn,
         task_id=_TASK_ID,
         status_value="queued",
-        row=_task_row(status="queued", state_token=uuid.uuid4(), queued_at=_OBSERVED),
+        row=_task_row(
+            status="queued", state_token=uuid.uuid4(), queued_at=_OBSERVED, fingerprint=_FINGERPRINT
+        ),
     )
     _script_session_reads(conn, task_id=_TASK_ID)
     _script_session_inserts(
@@ -1283,13 +1330,13 @@ def test_sweep_surfaces_conditions_without_stalling_remaining_candidates() -> No
     # The ineligible oldest candidate stayed queued; the next candidate
     # still advanced.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[3] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[3] == candidate_b_id
+        and params[4] == candidate_b_id
         and params[0] == "planning"
         for sql, params in conn.executed
     )
@@ -1370,13 +1417,13 @@ def test_missing_role_binding_is_a_candidate_conflict_that_never_stalls_follower
     # The binding-less candidate stayed queued with its original durable key
     # and the eligible follower still advanced in the same sweep.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[3] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[3] == candidate_b_id
+        and params[4] == candidate_b_id
         and params[0] == "planning"
         for sql, params in conn.executed
     )

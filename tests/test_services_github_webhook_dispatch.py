@@ -2,7 +2,8 @@
 
 Covers the required behavioral matrix: target→capability routing per durable
 routing target; irrelevant/unsupported and unresolved-routing terminal
-handling; issue-family dispatch through the authoritative intake composition;
+handling; issue-family dispatch through the scoped issue reconciliation with
+NO Task intake (issue #233);
 relation fan-out over durable issue projections; repository-metadata
 re-observation (including installation-scoped fan-out); canonical-PR
 reconciliation by stable identity; checks/push fan-out; multi-route
@@ -21,6 +22,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -291,7 +293,7 @@ class Harness:
         self.conn = conn
         self.pool_fake = FakePool(conn)
         self.pool = cast(DatabasePool, self.pool_fake)
-        self.intake = RecordingCapability(self.pool_fake)
+        self.issue_reconcile = RecordingCapability(self.pool_fake)
         self.dependencies = RecordingCapability(self.pool_fake)
         self.hierarchy = RecordingCapability(self.pool_fake)
         self.repository_observation = RecordingCapability(self.pool_fake)
@@ -304,8 +306,16 @@ class Harness:
 def harness_factory(monkeypatch: pytest.MonkeyPatch):
     def _make() -> Harness:
         harness = Harness(ScriptedConnection())
+        # The issue-state route reconciles only (issue #233): the recording
+        # fake stands in for the B3 issue reconciliation; its result carries
+        # the stable identity the dependency/hierarchy syncs re-address.
         monkeypatch.setattr(
-            github_webhook_dispatch.task_intake, "intake_repository_task", harness.intake
+            github_webhook_dispatch.github_reconciliation,
+            "reconcile_repository_issue",
+            harness.issue_reconcile,
+        )
+        harness.issue_reconcile.result = SimpleNamespace(
+            issue=SimpleNamespace(identity=SimpleNamespace(github_issue_id=789))
         )
         monkeypatch.setattr(
             github_webhook_dispatch.github_issue_relations,
@@ -423,7 +433,7 @@ def _settings() -> Any:
 # --- dispatch: the authoritative reconciliation routes -------------------------
 
 
-def test_issue_state_dispatch_invokes_the_authoritative_intake_composition(
+def test_issue_state_dispatch_invokes_the_scoped_reconciliation_only(
     harness_factory,
 ) -> None:
     harness = harness_factory()
@@ -440,21 +450,62 @@ def test_issue_state_dispatch_invokes_the_authoritative_intake_composition(
         (outcome.workspace_id, outcome.repository_id, outcome.status.value)
         for outcome in result.route_outcomes
     ] == [(_WORKSPACE_A, _REPOSITORY_A, "reconciled")]
-    assert harness.intake.calls == [
+    # Issue discovery is a UI/read-model concern (issue #233): the B3 issue
+    # reconciliation runs, then the relevant B4 relationship mirrors — and
+    # NOTHING creates a Task, records a task_created event, or issues any
+    # Owner/task command. No task-intake capability exists on this route.
+    assert harness.issue_reconcile.calls == [
         {
             "workspace_id": _WORKSPACE_A,
             "repository_id": _REPOSITORY_A,
             "issue_number": 42,
         }
     ]
-    assert harness.dependencies.calls == []
+    assert harness.dependencies.calls == [
+        {
+            "workspace_id": _WORKSPACE_A,
+            "repository_id": _REPOSITORY_A,
+            "issue_number": 42,
+            "github_issue_id": 789,
+        }
+    ]
+    assert harness.hierarchy.calls == [
+        {
+            "workspace_id": _WORKSPACE_A,
+            "repository_id": _REPOSITORY_A,
+            "issue_number": 42,
+            "github_issue_id": 789,
+        }
+    ]
 
 
-def test_a_closed_issue_typedly_declines_and_marks_the_delivery_processed(harness_factory) -> None:
+def test_an_issue_notification_reconciles_without_any_task_intake(harness_factory) -> None:
+    # Every issue state (open or closed) reconciles: the route carries no
+    # intake eligibility refusal anymore (issue #233), so a closed issue is
+    # simply refreshed into the projection with the delivery marked
+    # processed and no Task or workflow consequence anywhere.
+    harness = harness_factory()
+    _script_delivery(harness.conn, _delivery_row())
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_processed(harness.conn, _DELIVERY_ID)
+
+    result = github_webhook_dispatch.dispatch_github_webhook_delivery(
+        harness.pool, _github_client(), delivery_guid="guid-1"
+    )
+
+    assert result.processed is True
+    assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.RECONCILED
+    assert harness.issue_reconcile.calls != []
+    assert harness.dependencies.calls != []
+
+
+def test_an_absent_workspace_subject_typedly_declines_and_marks_the_delivery_processed(
+    harness_factory,
+) -> None:
     from openorc.services.errors import NotFoundError as _NF
 
     harness = harness_factory()
-    harness.intake._error = _NF("the addressed GitHub issue is not open")
+    harness.issue_reconcile._error = _NF("the addressed workspace subject is absent")
     _script_delivery(harness.conn, _delivery_row())
     _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
     _script_processed(harness.conn, _DELIVERY_ID)
@@ -465,26 +516,7 @@ def test_a_closed_issue_typedly_declines_and_marks_the_delivery_processed(harnes
 
     assert result.processed is True
     assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.DECLINED
-    assert harness.intake.calls != []
-
-
-def test_a_blocked_issue_typedly_declines_and_marks_the_delivery_processed(harness_factory) -> None:
-    from openorc.services.task_intake import IssueBlockedEligibilityError
-
-    harness = harness_factory()
-    harness.intake._error = IssueBlockedEligibilityError(
-        "GitHub currently reports the addressed issue as blocked"
-    )
-    _script_delivery(harness.conn, _delivery_row())
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
-    _script_processed(harness.conn, _DELIVERY_ID)
-
-    result = github_webhook_dispatch.dispatch_github_webhook_delivery(
-        harness.pool, _github_client(), delivery_guid="guid-1"
-    )
-
-    assert result.processed is True
-    assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.DECLINED
+    assert harness.issue_reconcile.calls != []
 
 
 def test_an_issue_reconciliation_conflict_fails_known_and_stays_recoverable(
@@ -499,7 +531,7 @@ def test_an_issue_reconciliation_conflict_fails_known_and_stays_recoverable(
     from openorc.services.errors import ConflictError
 
     harness = harness_factory()
-    harness.intake._error = ConflictError(
+    harness.issue_reconcile._error = ConflictError(
         "the GitHub issue number durably maps to a different stable issue identity"
     )
     _script_delivery(harness.conn, _delivery_row())
@@ -520,7 +552,7 @@ def test_issue_state_known_provider_failure_leaves_the_delivery_recoverable(
     harness_factory,
 ) -> None:
     harness = harness_factory()
-    harness.intake._error = ExternalOperationFailedError("rate limited")
+    harness.issue_reconcile._error = ExternalOperationFailedError("rate limited")
     _script_delivery(harness.conn, _delivery_row())
     _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
 
@@ -532,12 +564,12 @@ def test_issue_state_known_provider_failure_leaves_the_delivery_recoverable(
     assert result.route_outcomes[0].status is GitHubWebhookDispatchRouteStatus.FAILED_KNOWN
     # No processed-marking was attempted: the unmatched scripted handler
     # proves the bounded recovery metadata stayed untouched.
-    assert harness.intake.calls != []
+    assert harness.issue_reconcile.calls != []
 
 
 def test_issue_state_uncertain_outcome_stays_uncertain_and_recoverable(harness_factory) -> None:
     harness = harness_factory()
-    harness.intake._error = ExternalOperationUncertainError("unknown outcome")
+    harness.issue_reconcile._error = ExternalOperationUncertainError("unknown outcome")
     _script_delivery(harness.conn, _delivery_row())
     _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
 
@@ -948,7 +980,7 @@ def test_a_replayed_dispatch_job_converges_idempotently(harness_factory) -> None
     )
 
     assert result.processed is True
-    assert harness.intake.calls == [
+    assert harness.issue_reconcile.calls == [
         {"workspace_id": _WORKSPACE_A, "repository_id": _REPOSITORY_A, "issue_number": 42}
     ]
 
@@ -1066,7 +1098,7 @@ def test_submission_uncertain_outcome_never_reenqueues_or_reconciles(harness_fac
     # no external workflow operation was triggered at submission: unresolved
     # processing stays recoverable by #62's independent path.
     assert submission.enqueued == ["guid-1"]
-    assert harness.intake.calls == []
+    assert harness.issue_reconcile.calls == []
     assert harness.repository_observation.calls == []
     assert not any("set processed_at" in sql for sql, _ in harness.conn.executed)
 

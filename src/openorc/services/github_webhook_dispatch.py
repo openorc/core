@@ -73,7 +73,6 @@ from openorc.services import (
     commit_checks_projection,
     github_issue_relations,
     github_reconciliation,
-    task_intake,
     task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
@@ -460,19 +459,20 @@ def _dispatch_issue_state(
     delivery: GitHubWebhookDelivery,
     route: GitHubWebhookResolvedRoute,
 ) -> GitHubWebhookDispatchRouteStatus:
-    """Route an issue notification into the authoritative intake composition.
+    """Route an issue notification into scoped issue reconciliation only.
 
-    ``intake_repository_task`` is the system-capable B3+B4 composition built
-    for this layer: the fresh issue reconciliation, the fresh dependency
-    observation, the eligibility check against those facts, the race-safe
-    creation, and the non-gating hierarchy sync all read GitHub
-    authoritatively. A closed issue, the typed blocked-issue eligibility
-    outcome, or an absent Workspace subject is a typed expected decline (the
-    fresh reconciliation and dependency mirror it performs were written
-    inside the composition); a reconciliation/data-integrity conflict
-    (stable identity or issue-number mismatch, a PR-shaped number, an
-    unserializable write) is a known failure that stays recoverable; Task
-    workflow consequences belong to Phase 2E.
+    Issue discovery is a UI/read-model concern (issue #233): the notification
+    refreshes the authoritative B3 issue projection and the relevant B4
+    relationship mirrors — the same scoped composition the intake and sweep
+    layers reuse — and NEVER creates a Task, records a ``task_created``
+    event, or issues any Owner/task command. Every issue state (open or
+    closed) reconciles; duplicate, replayed, delayed, and out-of-order
+    notifications converge because the reconciliation re-reads current
+    authoritative GitHub state. An absent Workspace subject is a typed
+    expected decline; generic reconciliation conflicts (stable identity or
+    issue-number mismatch, a PR-shaped number, an unserializable write) are
+    known failures that stay recoverable; Task workflow consequences belong
+    to Phase 2E.
     """
     if delivery.github_issue_number is None:
         logger.warning(
@@ -484,24 +484,53 @@ def _dispatch_issue_state(
         )
         return GitHubWebhookDispatchRouteStatus.FAILED_UNEXPECTED
     try:
-        task_intake.intake_repository_task(
+        reconciliation = github_reconciliation.reconcile_repository_issue(
             pool,
             github,
             workspace_id=route.workspace_id,
             repository_id=route.repository_id,
             issue_number=delivery.github_issue_number,
         )
-    except (NotFoundError, task_intake.IssueBlockedEligibilityError):
-        # Typed expected product outcomes: a closed issue, the blocked-issue
-        # eligibility outcome (the fresh reconciliation and dependency mirror
-        # it performs were written inside the composition), or an absent
-        # Workspace subject. Nothing remains outstanding. Generic
-        # reconciliation conflicts (stable identity/number mismatches,
-        # PR-shaped numbers, unserializable writes) do NOT decline here:
-        # they stay known failures below and remain recoverable.
+        github_issue_id = reconciliation.issue.identity.github_issue_id
+        github_issue_relations.synchronize_repository_issue_dependencies(
+            pool,
+            github,
+            workspace_id=route.workspace_id,
+            repository_id=route.repository_id,
+            issue_number=delivery.github_issue_number,
+            github_issue_id=github_issue_id,
+        )
+    except NotFoundError:
+        # Typed expected product outcome: an absent Workspace subject (an
+        # absent or foreign-Workspace repository, an unconfigured/foreign
+        # route, or a missing/foreign installation). Nothing remains
+        # outstanding. Reconciliation conflicts do NOT decline here: they
+        # stay known failures below and remain recoverable.
         return GitHubWebhookDispatchRouteStatus.DECLINED
     except ApplicationError as error:
         return _classify_route_failure(route, error)
+    except Exception as error:
+        return _log_unexpected_route(route, error)
+    # The hierarchy mirror is presentation-only (issue #60): its failure is
+    # logged as degraded relationship projection and deliberately swallowed —
+    # it must never fail a delivery whose authoritative reconciliation and
+    # dependency sync completed (the same non-gating treatment the intake
+    # composition gives its post-creation hierarchy sync).
+    try:
+        github_issue_relations.synchronize_repository_issue_hierarchy(
+            pool,
+            github,
+            workspace_id=route.workspace_id,
+            repository_id=route.repository_id,
+            issue_number=delivery.github_issue_number,
+            github_issue_id=github_issue_id,
+        )
+    except ApplicationError as error:
+        logger.warning(
+            "github webhook dispatch issue-state hierarchy sync failed "
+            "(non-gating; mirror preserved): %s",
+            type(error).__name__,
+        )
     except Exception as error:
         return _log_unexpected_route(route, error)
     return GitHubWebhookDispatchRouteStatus.RECONCILED

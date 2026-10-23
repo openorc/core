@@ -117,6 +117,7 @@ def _task_values(
     current_gate_id: Any = None,
     archived: bool = False,
     queued: bool = False,
+    fingerprint: Any = "a" * 64,
 ) -> tuple[Any, ...]:
     """One 15-column ``openorc.tasks`` row shaped like the durable model."""
     return (
@@ -131,20 +132,21 @@ def _task_values(
         state_token,
         None,
         current_gate_id,
-        "a" * 64,
+        fingerprint,
         _OBSERVED if queued else None,
         _OBSERVED,
         _OBSERVED,
     )
 
 
-def _archived_cancelled_row() -> tuple[Any, ...]:
+def _archived_cancelled_row(fingerprint: Any = "a" * 64) -> tuple[Any, ...]:
     return _task_values(
         status="cancelled",
         state_token=_CANCELLED_TOKEN,
         current_gate_id=None,
         archived=True,
         queued=False,
+        fingerprint=fingerprint,
     )
 
 
@@ -395,22 +397,30 @@ def _script_gate_resolution(
 
 def test_cancel_archives_a_ready_to_plan_task_directly(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = ScriptedConnection()
-    _script_authorization(conn, row=_task_values(status="ready_to_plan"))
-    _script_authorization(conn, row=_task_values(status="ready_to_plan"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    # A never-started ready_to_plan Task (issue #233) carries NO baseline:
+    # the cancellation must accept the null fingerprint, archive CANCELLED
+    # without inventing one, and require no fresh issue reconciliation, no
+    # runtime sessions, and no canonical PR (zero GitHub calls).
+    _script_authorization(conn, row=_task_values(status="ready_to_plan", fingerprint=None))
+    _script_authorization(conn, row=_task_values(status="ready_to_plan", fingerprint=None))
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(fingerprint=None))
     conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
     _wire(monkeypatch)
 
-    outcome = _cancel_call(_pool(conn), _CloseGithub())
+    github = _CloseGithub()
+    outcome = _cancel_call(_pool(conn), github)
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
     assert outcome.task.status is TaskStatus.CANCELLED
     assert outcome.task.archived_at is not None
+    assert outcome.task.source_requirements_fingerprint is None
     assert outcome.owner_gate is None
     assert outcome.close_intent is None
     assert _event_types(conn) == ["task_cancelled"]
     assert _count(conn, _GATE_READ) == 0
     assert _count(conn, _GATE_UPDATE) == 0
+    assert github.repository_calls == []
+    assert github.close_calls == []
 
 
 def test_cancel_archives_a_queued_task_and_clears_its_admission_obligation(
@@ -426,6 +436,9 @@ def test_cancel_archives_a_queued_task_and_clears_its_admission_obligation(
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.task.status is TaskStatus.CANCELLED
+    # A queued Task has started (issue #233): its frozen baseline is
+    # immutable through the cancellation — never erased, never invented.
+    assert outcome.task.source_requirements_fingerprint == "a" * 64
     archive_params = [params for sql, params in conn.executed if "archived_at = now()" in sql]
     assert len(archive_params) == 1
     assert _event_types(conn) == ["task_cancelled"]

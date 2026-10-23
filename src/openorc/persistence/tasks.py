@@ -94,21 +94,22 @@ def create_task(
     repository_id: UUID,
     github_issue_id: int,
     github_issue_number: int,
-    source_requirements_fingerprint: str,
+    source_requirements_fingerprint: str | None = None,
     status: TaskStatus = TaskStatus.READY_TO_PLAN,
 ) -> Task:
     """Insert one Task attempt for a stable GitHub issue within a Repository.
 
     A fresh Task starts nonterminal (default ``ready_to_plan``) with a NULL
-    canonical branch and its immutable source baseline: the exact B3
-    requirements fingerprint the issue carried when the caller's fresh
-    authoritative eligibility observation was made
-    (``source_requirements_fingerprint``, issue #60). Terminal attempts only
-    arise through :func:`archive_task`, the canonical branch is only bound
-    once later workflow/runtime logic has verified it
-    (:func:`bind_canonical_branch`), and at most one non-archived Task may
-    exist per ``(repository_id, github_issue_id)`` (the database partial
-    unique index enforces it).
+    canonical branch and NO source baseline: issue discovery and explicit
+    Owner intake do not freeze requirements (issue #60, corrected by issue
+    #233). ``source_requirements_fingerprint`` stays NULL until a successful
+    Owner Start freezes it atomically with the ``ready_to_plan`` transition
+    (:func:`update_task_status` capture). Terminal attempts only arise through
+    :func:`archive_task`, the canonical branch is only bound once later
+    workflow/runtime logic has verified it (:func:`bind_canonical_branch`),
+    and at most one non-archived Task may exist per
+    ``(repository_id, github_issue_id)`` (the database partial unique index
+    enforces it).
     """
     if status.is_terminal:
         raise TaskDomainError(
@@ -386,6 +387,7 @@ def update_task_status(
     *,
     expected_state_token: UUID,
     status: TaskStatus,
+    capture_source_requirements_fingerprint: str | None = None,
 ) -> Task | None:
     """Move a current Task to a nonterminal status, rotating ``state_token``.
 
@@ -393,6 +395,14 @@ def update_task_status(
     ``completed``) raise :class:`TaskDomainError` — terminal transitions go
     exclusively through :func:`archive_task`, which atomically sets the
     terminal status, stamps ``archived_at``, and rotates the token.
+
+    The Owner Start arbitration (issue #233) freezes the freshly verified
+    requirements fingerprint in the SAME guarded statement that transitions
+    the Task: ``capture_source_requirements_fingerprint`` is set only where
+    the baseline is still NULL (``coalesce``), so the capture is atomic with
+    the ``ready_to_plan`` -> ``queued``/``planning`` transition and can never
+    rewrite an existing frozen baseline. The default ``None`` is a no-op for
+    every other caller.
 
     The update is conditional on ``expected_state_token`` and replaces the
     token atomically. Returns the updated Task, or ``None`` when the token
@@ -408,6 +418,14 @@ def update_task_status(
         row = conn.execute(
             "update openorc.tasks "
             "set status = %s, "
+            # The Owner Start commitment capture (issue #233): the freshly
+            # verified requirements fingerprint is frozen in this same
+            # statement, and only where no baseline exists yet — coalesce can
+            # never rewrite an existing frozen baseline. The status-aware
+            # CHECK is the durable backstop: queued/planning and every later
+            # status reject a NULL baseline.
+            "source_requirements_fingerprint = "
+            "coalesce(source_requirements_fingerprint, %s), "
             # The durable queue-entry timestamp (issue #76): stamped by the
             # DB clock exactly once when a Task first moves into queued,
             # preserved unchanged while it stays queued (repeated capacity
@@ -422,7 +440,14 @@ def update_task_status(
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",
-            (status.value, status.value, status.value, task_id, expected_state_token),
+            (
+                status.value,
+                capture_source_requirements_fingerprint,
+                status.value,
+                status.value,
+                task_id,
+                expected_state_token,
+            ),
         ).fetchone()
     return None if row is None else _task_from_row(row)
 
