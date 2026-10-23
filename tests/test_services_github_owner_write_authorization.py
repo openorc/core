@@ -245,6 +245,9 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("the boundary never merges pull requests")
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
     def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
         raise AssertionError("the boundary never composes raw #58 validation operations")
 

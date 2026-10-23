@@ -397,6 +397,9 @@ class FakeGitHubAppClient:
         assert self._merge_result is not None
         return self._merge_result
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
     def validate_user_installation_repository_access(
         self,
         *,

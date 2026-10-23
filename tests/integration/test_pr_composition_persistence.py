@@ -193,6 +193,9 @@ class _FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("the E8 seam must not request merges")
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
 
 class _FakeResolver:
     def resolve(self, pool: DatabasePool, *, profile_id: Any) -> GitHubUserAccessToken:

@@ -226,6 +226,8 @@ _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _GATES_INSERT = _sql_has("insert into openorc.owner_gates")
 _GATE_UPDATE = _sql_has("update openorc.owner_gates")
 _LOOPS_LIST = _sql_has("from openorc.review_loops where task_id")
+_INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
+_RUNTIME_REQUESTS_LIST = _sql_has("from openorc.runtime_requests where task_id")
 _ITERATIONS_LIST = _sql_has("review_iterations where review_loop_id")
 _SESSION_READ = _sql_has("from openorc.task_agent_sessions")
 _EXECUTIONS_LIST = _sql_has("from openorc.executions where task_id")
@@ -627,6 +629,9 @@ class FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("the E7 seam must not request merges")
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
     def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
         raise AssertionError("the E7 seam must not compose raw #58 validation operations")
 
@@ -927,6 +932,9 @@ def _script_cancel(
     conn.on(_TASK_READ, waiting)  # workspace guard task read
     conn.on(_TASK_READ_LOCKED, waiting)  # get_task_for_update
     conn.on(_TASK_READ, waiting)  # require_current_task
+    conn.on(_INTENTS_LIST, [])  # the accounted-runtime veto reads
+    conn.on(_EXECUTIONS_LIST, [])
+    conn.on(_RUNTIME_REQUESTS_LIST, [])
     conn.on(_GATE_READ, _pr_gate_row())  # require_current_owner_gate
     conn.on(_GATE_READ, _pr_gate_row())  # the resolution's gate read
     conn.on(_TASK_READ_LOCKED, waiting)  # the resolution's Task row lock
@@ -940,6 +948,7 @@ def _script_cancel(
             canonical_branch=_CLAIMED_BRANCH,
         ),
     )
+    conn.on(_LOOPS_LIST, [])  # no OPEN review loop to close at this gate
     if fail_archive:
         conn.on(_ARCHIVE_WRITE, RuntimeError("forced late cancellation failure"))
     else:

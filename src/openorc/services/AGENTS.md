@@ -825,4 +825,73 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   update-only; the consequence call duplicates no GitHub read, webhook
   dedupe, polling, or scheduling.
 
+## E10b: Owner Abort and the unified Task cancellation (issue #228)
+
+- `task_abort.abort_task_activity` is the ONE Owner-authorized Abort
+  command: stop OpenOrc first, then interrupt ClineBox. Its dispatch phase
+  (current Task in `planning`/`implementing`/`reviewing`, or at a pending
+  OwnerGate with a demonstrably in-flight runtime interaction) proves the
+  account/Owner/currentness/role guards before any Cline I/O and applies
+  ONE atomic composition — the `owner_action_required` TaskBlock with the
+  safe `owner_abort` context, the `blocked` transition under the rotated
+  token (a pending gate stays truthful pending history, unusable while
+  blocked), the OWNER `task_blocked` audit, and the durable one-shot
+  exact-session Interrupt intents — and only AFTER the commit invokes
+  `ClineAdapter.abort_activity` exactly once per exact admitted
+  Task/role session. An SDK acknowledgement is recorded in place and never
+  settles the intent; a definitive non-delivery records `failed`; an
+  uncertain outcome records `unknown` and is never replayed. The
+  settlement phase (the Task already `blocked` by this control) never
+  re-interrupts: without positive caller-attested D6b evidence
+  (`TaskInterruptSettlement`) it refuses and surfaces the unresolved
+  interruption; with it, `ClineAdapter.settle_abort` runs outside any
+  transaction and a positively settled intent is the only state in which
+  Cancel becomes available. The Task stays `blocked` regardless of the
+  Interrupt outcome; late formal results can never advance it; terminal
+  session identities are preserved (no `stop`/`start`/`send`, no
+  replacement session, no prompt).
+- `task_cancellation.cancel_task` is the ONE Owner-authorized unified
+  Cancel command from a current safely inactive Task (`ready_to_plan`,
+  `queued`, the exact current pending OwnerGate of any type, or `blocked`
+  with every interruption settled). Ordering is load-bearing: the
+  available authoritative canonical-PR facts are established BEFORE any
+  irreversible mutation — a PR already authoritatively confirmed merged at
+  the point of decision routes to E10a's `complete_confirmed_task_merge`
+  (never an Owner `CANCELLED` claim), and a read failure still allows
+  cancellation with a durable unresolved PR-close obligation. One shared
+  short transaction (`task_cancellation.cancel_task_composition`, the ONE
+  common cancellation composition to which E5's
+  `cancel_implementation_authorization` and E7's `cancel_pr_authorization`
+  now delegate, keeping their exact-addressed gate-type discipline)
+  re-proves authorization/currentness/the accounted-runtime veto under the
+  Task row lock, then atomically resolves the gate `CANCELLED` with OWNER
+  provenance, closes every OPEN ReviewLoop, archives `CANCELLED` (which
+  clears `queued_at` and the current-gate pointer and releases the issue's
+  one-current-Task mapping), commits the one OWNER `TASK_CANCELLED` event,
+  and records the one-shot PR-close intent when the canonical open/unmerged
+  PR may require closure. The veto composes the durable outstanding-work
+  facts available in v1 (interrupt intents not positively settled, open
+  Executions, pending RuntimeRequests); per-send durable dispatch identity
+  arrives with F2 (#87/#89). Autonomous progression is inapplicable — the
+  Owner uses Abort first.
+- The one-shot post-archival closure attempt runs strictly after the
+  commit: a fresh B7 observation; already closed-unmerged records
+  `no_action` with no write; a PR observed merged after terminal
+  cancellation preserves the archived outcome and never rewrites history;
+  an open PR at the same stable identity is closed exactly once through
+  the new `GitHubAppClient.close_pull_request` primitive under the
+  recorded Profile's user credential (#143 machinery, bounded definitive-401
+  recovery included), and the observed outcome is confirmed through
+  reconciliation — never the close answer alone. Pre-delivery conditions
+  keep the obligation pending for the later reconciliation machinery; a
+  definitive rejection records `failed`; an unconfirmable outcome records
+  `unknown` — never blindly replayed. The durable intent records live in
+  `openorc.task_interrupt_intents` and
+  `openorc.task_pull_request_close_intents` (issue #228 migration); audit
+  events alone are not a work queue, and no general outbound-operation
+  framework exists here (F2/F4 own delivery identity; E10c #229 owns the
+  externally closed-unmerged terminal cause; F4b #230 owns non-cancellation
+  recovery).
+
+
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

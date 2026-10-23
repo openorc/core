@@ -184,6 +184,9 @@ class _ScriptedGitHub:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("this fake must not request merges")
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
     def get_installation_capabilities(self, github_installation_id: int) -> Any:
         raise AssertionError("the service must not compose raw adapter operations")
 

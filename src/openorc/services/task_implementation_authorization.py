@@ -94,6 +94,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_cancellation import cancel_task_composition
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -601,66 +602,26 @@ def cancel_implementation_authorization(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-            )
-            if task.status is not TaskStatus.WAITING_FOR_OWNER:
-                raise ConflictError("the addressed task is not waiting on its owner gate")
-            gate = require_current_owner_gate(
-                transaction_pool, task=task, owner_gate_id=owner_gate_id
-            )
-            if gate.gate_type is not OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
-                raise ConflictError(
-                    "only the current implementation authorization gate cancels through this seam"
-                )
-            resolution = resolve_gate_records(
-                transaction_pool,
-                owner_gate_id=gate.id,
-                outcome=OwnerGateStatus.CANCELLED,
-                expected_task_state_token=expected_state_token,
-            )
-            cancelled_gate, cancelled_task = _require_resolution_applied(resolution)
-            owner_actor = event_coordination.owner_actor(profile_id)
-            event_coordination.record_owner_gate_resolved_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=cancelled_gate.id,
-                actor=owner_actor,
-                outcome=OwnerGateStatus.CANCELLED,
-            )
-            archived = task_records.archive_task(
-                transaction_pool,
-                task_id,
-                expected_state_token=cancelled_task.state_token,
-                terminal_status=TaskStatus.CANCELLED,
-            )
-            if archived is None:
-                raise StaleOperationError(
-                    "the task could not be cancelled; the cancellation is stale"
-                )
-            event_coordination.record_task_terminal_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                actor=owner_actor,
-                terminal_status=TaskStatus.CANCELLED,
-            )
-            return CancelledImplementationAuthorization(
-                task=archived,
-                owner_gate=cancelled_gate,
-            )
+        # Since E10b (issue #228) the gate-cancellation entrypoints delegate
+        # to the ONE shared cancellation composition: the same
+        # authorization/currentness/gate composition, the exact pending
+        # gate resolved CANCELLED with truthful OWNER provenance, and the
+        # terminal ``cancelled`` archival with its safe OWNER
+        # ``TASK_CANCELLED`` event in one composition. Owner cancellation
+        # remains a terminal Task outcome — never a rejection of the
+        # implementation — and no GitHub artifact is touched.
+        composition = cancel_task_composition(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            owner_gate_id=owner_gate_id,
+            expected_gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+        )
+        owner_gate = composition.owner_gate
+        assert owner_gate is not None
+        return CancelledImplementationAuthorization(
+            task=composition.task,
+            owner_gate=owner_gate,
+        )
