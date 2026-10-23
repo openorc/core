@@ -54,12 +54,32 @@ The command's ordering is load-bearing (issue #228 §4):
   for the later reconciliation machinery; a definitive rejection records
   ``failed``; an unconfirmable outcome records ``unknown`` — never blindly
   replayed.
+
+E10c (issue #229) adds the second trusted admission path to the same shared
+composition: ``cancel_task_for_confirmed_pr_closure`` is the trusted
+GitHub-observation entrypoint for a canonical PR that existing authoritative
+reconciliation has durably confirmed CLOSED without merge. It takes no
+caller-selected actor, cause, PR number, Profile identity, or state token,
+and performs no external I/O: the evidence precondition is the durable
+canonical PR state itself, proved under the Task row lock and under the
+canonical PR row lock (``FOR UPDATE``) held through the terminal archival,
+so a concurrent B7 reconciliation can never commit a confirmed merge
+between the evidence decision and the cancellation. Unlike the Owner
+command it is not gated on runtime idleness, admits every non-archived
+Task status, resolves no OwnerGate (the pending gate stays untouched
+history and the archival clears the current-gate pointer), and records no
+PR-close intent — the external closure already happened. The terminal
+event carries truthful GITHUB provenance and the archival stamps the
+canonical ``pr_closed_unmerged`` terminal cause. Archived history is
+immutable: an already-archived Task is the idempotent no-op whatever its
+terminal outcome, and a raced confirmed merge refuses fail-closed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Final
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -74,6 +94,7 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
 )
+from openorc.domain.events import WorkflowEventActor
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
@@ -84,7 +105,7 @@ from openorc.domain.intents import (
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoop, ReviewLoopStatus
 from openorc.domain.runtime_requests import RuntimeRequestStatus
-from openorc.domain.tasks import Task, TaskStatus
+from openorc.domain.tasks import Task, TaskStatus, TaskTerminalCause
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
@@ -92,6 +113,7 @@ from openorc.persistence import intents as intent_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import runtime_requests as runtime_request_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import get_task_pull_request_for_task
 from openorc.services import event_coordination
@@ -117,6 +139,7 @@ from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_merge_lifecycle import complete_confirmed_task_merge
 from openorc.services.task_pull_request_reconciliation import reconcile_task_pull_request
 from openorc.services.task_subject_guards import (
+    require_canonical_task_pull_request_for_update,
     require_current_owner_gate,
     require_current_task,
 )
@@ -127,13 +150,22 @@ __all__ = [
     "TaskCancellationComposition",
     "TaskCancellationOutcome",
     "TaskCancellationOutcomeKind",
+    "TaskPrClosureOutcome",
+    "TaskPrClosureOutcomeKind",
     "cancel_task",
     "cancel_task_composition",
+    "cancel_task_for_confirmed_pr_closure",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_cancellation"
 _CANCEL_SPAN_NAME = "task_cancellation.cancel_task"
 _COMPOSITION_SPAN_NAME = "task_cancellation.cancel_task_composition"
+_PR_CLOSURE_SPAN_NAME = "task_cancellation.cancel_task_for_confirmed_pr_closure"
+
+# The external engineering system of record as the cancellation's provenance
+# (issue #229): GitHub is the authority that established the closure; no
+# GitHub user identity is investigated or attributed.
+_GITHUB_ACTOR: Final = event_coordination.WorkflowActorContext(WorkflowEventActor.GITHUB, None)
 
 # Cancel is inapplicable while autonomous progression is authorized: the
 # Owner uses the Abort control first (issue #228).
@@ -205,6 +237,29 @@ class TaskCancellationComposition:
     closed_loops: tuple[ReviewLoop, ...]
 
 
+class TaskPrClosureOutcomeKind(StrEnum):
+    """The classified outcome of one trusted PR-closure cancellation.
+
+    ``cancelled`` applied the terminal archival with its GITHUB-provenance
+    event and canonical terminal cause. ``already_terminal`` is the
+    idempotent no-op for an already archived Task — whatever its terminal
+    outcome, archived history is immutable and nothing is rewritten.
+    """
+
+    CANCELLED = "cancelled"
+    ALREADY_TERMINAL = "already_terminal"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPrClosureOutcome:
+    """The typed result of one trusted PR-closure cancellation."""
+
+    kind: TaskPrClosureOutcomeKind
+    task: Task
+    pull_request: TaskPullRequest | None
+    closed_loops: tuple[ReviewLoop, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class _CancelComposition:
     """The internal result of one composed cancellation, close intent included."""
@@ -213,6 +268,12 @@ class _CancelComposition:
     owner_gate: OwnerGate | None
     closed_loops: tuple[ReviewLoop, ...]
     close_intent: TaskPullRequestCloseIntent | None
+    # Whether this invocation applied the archival: False only for the
+    # trusted GitHub-observation path's idempotent already-archived no-op.
+    applied: bool = True
+    # The canonical PR evidence the trusted path proved under its row lock
+    # (the Owner paths carry their own pre/post-decision observations).
+    pull_request: TaskPullRequest | None = None
 
 
 def _require_uuid_command(value: object, name: str) -> None:
@@ -239,6 +300,11 @@ class _ConfirmedMergeAtDecision(Exception):
 def _is_confirmed_merged(pull_request: TaskPullRequest) -> bool:
     """Whether the durable record authoritatively carries a confirmed merge."""
     return pull_request.state is TaskPullRequestState.CLOSED and pull_request.merged_at is not None
+
+
+def _is_confirmed_closed_unmerged(pull_request: TaskPullRequest) -> bool:
+    """Whether the durable record authoritatively carries a closed-unmerged PR."""
+    return pull_request.state is TaskPullRequestState.CLOSED and pull_request.merged_at is None
 
 
 def _require_cancel_eligible_status(task: Task) -> None:
@@ -293,121 +359,196 @@ def _resolve_close_obligation(
 def _cancel_composition(
     pool: DatabasePool,
     *,
-    profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
-    expected_state_token: UUID,
-    owner_gate_id: UUID | None,
     close_obligation: _CloseObligation,
+    profile_id: UUID | None = None,
+    expected_state_token: UUID | None = None,
+    owner_gate_id: UUID | None = None,
     expected_gate_type: OwnerGateType | None = None,
     preflight_pull_request_id: UUID | None = None,
+    trusted_pr_closure: bool = False,
 ) -> _CancelComposition:
-    """The ONE shared atomic cancellation composition (issue #228 §3).
+    """The ONE shared atomic cancellation composition (issues #228 §3, #229 §2).
 
-    One short composed transaction: the account-operational barrier and the
-    exact Profile-owned Workspace/Task scope first, the Task row lock, the
-    currentness re-proof under the caller's expected token, the eligibility
-    classification and the accounted-runtime veto, then — atomically — the
-    exact current pending gate's ``CANCELLED`` resolution with truthful
-    OWNER provenance (only when one exists; no artificial gate is created
-    for blocked/queue states), the closure of every OPEN ReviewLoop as
-    actually present, the guarded terminal ``CANCELLED`` archival (which
-    clears ``queued_at`` and the current-gate pointer and releases the
-    issue's one-current-Task mapping), the OWNER ``task_cancelled`` audit,
-    and — only when the close obligation exists — the durable one-shot
-    PR-close intent. Everything commits or rolls back together; a stale
-    request mutates nothing.
+    One short composed transaction serving the two trusted admission paths
+    over one archival core. The Owner-authenticated command (#228) proves
+    the account-operational barrier and the exact Profile-owned
+    Workspace/Task scope first, the Task row lock, the currentness re-proof
+    under the caller's expected token, the eligibility classification and
+    the accounted-runtime veto, then — atomically — the exact current
+    pending gate's ``CANCELLED`` resolution with truthful OWNER provenance
+    (only when one exists; no artificial gate is created for blocked/queue
+    states). The trusted GitHub-observation path (#229) derives the
+    account-operational barrier from durable Workspace ownership, locks the
+    Task, and proves the durable canonical PR closed-unmerged under the PR
+    row lock held through the archival — no gate resolution, no runtime
+    veto, no caller-selected token.
+
+    Both paths close every OPEN ReviewLoop as actually present, apply the
+    guarded terminal ``CANCELLED`` archival (which clears ``queued_at`` and
+    the current-gate pointer and releases the issue's one-current-Task
+    mapping), commit exactly one terminal ``task_cancelled`` audit with the
+    path's truthful actor, stamp the trusted path's canonical
+    ``pr_closed_unmerged`` terminal cause, and — Owner path only, when the
+    close obligation exists — the durable one-shot PR-close intent.
+    Everything commits or rolls back together; a stale request mutates
+    nothing.
     """
-    owner_actor = event_coordination.owner_actor(profile_id)
     with composed_transaction(pool) as transaction_pool:
-        require_account_operational(transaction_pool, profile_id=profile_id)
-        require_workspace_task(
-            transaction_pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-        )
-        locked = task_records.get_task_for_update(transaction_pool, task_id)
-        if locked is None or locked.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
-        _require_cancel_eligible_status(task)
-        _require_runtime_work_accounted(transaction_pool, task_id=task_id)
-        if preflight_pull_request_id is not None:
-            # The pre-decision canonical-PR facts are revalidated under the
-            # Task row lock BEFORE any mutation: B7 reconciliation can
-            # persist a confirmed merge between the pre-decision observation
-            # and this transaction without rotating the Task token, and a
-            # durable identity move is never silently rebound.
-            surviving = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
-            if (
-                surviving is None
-                or surviving.workspace_id != task.workspace_id
-                or surviving.id != preflight_pull_request_id
-            ):
-                raise ConflictError(
-                    "the canonical pull request record moved during cancellation; "
-                    "the cancellation is stale"
-                )
-            if _is_confirmed_merged(surviving):
-                # The PR was already authoritatively confirmed merged by the
-                # time the final Task lock was acquired: never an Owner
-                # CANCELLED claim — E10a's completion path applies.
-                raise _ConfirmedMergeAtDecision
         cancelled_gate: OwnerGate | None = None
-        if task.status is TaskStatus.WAITING_FOR_OWNER:
-            gate_id = owner_gate_id if owner_gate_id is not None else task.current_owner_gate_id
-            if gate_id is None:
-                raise ConflictError(
-                    "the waiting task names no current owner gate to cancel through"
+        pull_request: TaskPullRequest | None = None
+        # The narrowed Owner-command state token, bound only on the
+        # Owner-authenticated admission path (the trusted path never uses
+        # one).
+        owner_expected_token: UUID
+        if trusted_pr_closure:
+            actor = _GITHUB_ACTOR
+            terminal_cause: TaskTerminalCause | None = TaskTerminalCause.PR_CLOSED_UNMERGED
+            # The account-wide Owner-mutation barrier (#97), derived from
+            # durable Workspace ownership rather than an authenticated
+            # caller: the FIRST lock acquisition of this write phase.
+            workspace = get_workspace(transaction_pool, workspace_id)
+            if workspace is None:
+                raise NotFoundError("the requested workspace is not available")
+            require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
+        else:
+            if profile_id is None or expected_state_token is None:
+                # Narrowed by the Owner-command callers; kept explicit for
+                # fail-closed safety.
+                raise InvalidCommandError(
+                    "the owner cancellation requires its profile and state token"
                 )
-            gate = require_current_owner_gate(transaction_pool, task=task, owner_gate_id=gate_id)
-            if expected_gate_type is not None and gate.gate_type is not expected_gate_type:
-                # The delegating gate entrypoint's exact-type discipline: the
-                # unified command resolves the current pending gate of any
-                # type, while a gate-scoped entrypoint admits only its own.
-                raise ConflictError(
-                    f"only the current {expected_gate_type.value} gate cancels through this seam"
-                )
-            resolution = gate_records.resolve_owner_gate(
+            owner_expected_token = expected_state_token
+            actor = event_coordination.owner_actor(profile_id)
+            terminal_cause = None
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            require_workspace_task(
                 transaction_pool,
-                owner_gate_id=gate.id,
-                outcome=OwnerGateStatus.CANCELLED,
-                expected_task_state_token=expected_state_token,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
             )
-            if resolution.outcome is gate_records.OwnerGateResolutionOutcome.RESOLVED:
-                cancelled_gate = resolution.gate
-                cancelled_task = resolution.task
-                if cancelled_gate is None or cancelled_task is None:
-                    raise StaleOperationError(
-                        "the owner gate resolution did not apply; the cancellation is stale"
-                    )
-            elif resolution.gate is None:
-                raise NotFoundError("the requested owner gate is not available for this task")
-            elif resolution.outcome is gate_records.OwnerGateResolutionOutcome.NO_OP:
-                raise StaleOperationError(
-                    "the owner gate has already been resolved; the cancellation is stale"
+        if trusted_pr_closure:
+            locked = task_records.get_task_for_update(transaction_pool, task_id)
+            if locked is None or locked.workspace_id != workspace_id:
+                raise NotFoundError("the requested task is not available in this workspace")
+            if locked.archived_at is not None:
+                # Already archived history is immutable, whatever its
+                # terminal outcome: the idempotent duplicate-race no-op —
+                # no second archival, loop closure, cause stamp, or event.
+                return _CancelComposition(
+                    task=locked,
+                    owner_gate=None,
+                    closed_loops=(),
+                    close_intent=None,
+                    applied=False,
+                    pull_request=get_task_pull_request_for_task(transaction_pool, task_id=task_id),
                 )
-            else:
+            # The trusted evidence precondition, serialized against
+            # concurrent observed-snapshot reconciliation (issue #229): the
+            # canonical PR row is locked FOR UPDATE and held through the
+            # archival, so a B7 write phase can never commit a confirmed
+            # merge between this decision and the cancellation. A raced
+            # confirmed merge — or any other non-evidence durable state —
+            # refuses fail-closed; the retryable read/reconciliation paths
+            # re-classify and route merged facts to E10a instead.
+            pull_request = require_canonical_task_pull_request_for_update(
+                transaction_pool, task=locked
+            )
+            if not _is_confirmed_closed_unmerged(pull_request):
                 raise StaleOperationError(
-                    "the owner gate is no longer the task's current gate; the cancellation is stale"
+                    "the canonical pull request is not confirmed closed-unmerged "
+                    "in durable state; the cancellation applies nothing"
                 )
-            event_coordination.record_owner_gate_resolved_event(
+            working_token = locked.state_token
+        else:
+            locked = task_records.get_task_for_update(transaction_pool, task_id)
+            if locked is None or locked.workspace_id != workspace_id:
+                raise NotFoundError("the requested task is not available in this workspace")
+            task = require_current_task(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                owner_gate_id=cancelled_gate.id,
-                actor=owner_actor,
-                outcome=OwnerGateStatus.CANCELLED,
+                expected_state_token=owner_expected_token,
             )
-            working_token = cancelled_task.state_token
-        else:
-            working_token = task.state_token
+            _require_cancel_eligible_status(task)
+            _require_runtime_work_accounted(transaction_pool, task_id=task_id)
+            if preflight_pull_request_id is not None:
+                # The pre-decision canonical-PR facts are revalidated under
+                # the Task row lock BEFORE any mutation: B7 reconciliation
+                # can persist a confirmed merge between the pre-decision
+                # observation and this transaction without rotating the Task
+                # token, and a durable identity move is never silently
+                # rebound.
+                surviving = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
+                if (
+                    surviving is None
+                    or surviving.workspace_id != task.workspace_id
+                    or surviving.id != preflight_pull_request_id
+                ):
+                    raise ConflictError(
+                        "the canonical pull request record moved during cancellation; "
+                        "the cancellation is stale"
+                    )
+                if _is_confirmed_merged(surviving):
+                    # The PR was already authoritatively confirmed merged by
+                    # the time the final Task lock was acquired: never an
+                    # Owner CANCELLED claim — E10a's completion path applies.
+                    raise _ConfirmedMergeAtDecision
+            if task.status is TaskStatus.WAITING_FOR_OWNER:
+                gate_id = owner_gate_id if owner_gate_id is not None else task.current_owner_gate_id
+                if gate_id is None:
+                    raise ConflictError(
+                        "the waiting task names no current owner gate to cancel through"
+                    )
+                gate = require_current_owner_gate(
+                    transaction_pool, task=task, owner_gate_id=gate_id
+                )
+                if expected_gate_type is not None and gate.gate_type is not expected_gate_type:
+                    # The delegating gate entrypoint's exact-type discipline:
+                    # the unified command resolves the current pending gate
+                    # of any type, while a gate-scoped entrypoint admits only
+                    # its own.
+                    raise ConflictError(
+                        "only the current "
+                        f"{expected_gate_type.value} gate cancels through this seam"
+                    )
+                resolution = gate_records.resolve_owner_gate(
+                    transaction_pool,
+                    owner_gate_id=gate.id,
+                    outcome=OwnerGateStatus.CANCELLED,
+                    expected_task_state_token=owner_expected_token,
+                )
+                if resolution.outcome is gate_records.OwnerGateResolutionOutcome.RESOLVED:
+                    cancelled_gate = resolution.gate
+                    cancelled_task = resolution.task
+                    if cancelled_gate is None or cancelled_task is None:
+                        raise StaleOperationError(
+                            "the owner gate resolution did not apply; the cancellation is stale"
+                        )
+                elif resolution.gate is None:
+                    raise NotFoundError("the requested owner gate is not available for this task")
+                elif resolution.outcome is gate_records.OwnerGateResolutionOutcome.NO_OP:
+                    raise StaleOperationError(
+                        "the owner gate has already been resolved; the cancellation is stale"
+                    )
+                else:
+                    raise StaleOperationError(
+                        "the owner gate is no longer the task's current gate; "
+                        "the cancellation is stale"
+                    )
+                event_coordination.record_owner_gate_resolved_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    owner_gate_id=cancelled_gate.id,
+                    actor=actor,
+                    outcome=OwnerGateStatus.CANCELLED,
+                )
+                working_token = cancelled_task.state_token
+            else:
+                working_token = task.state_token
 
         open_loops = review_records.list_task_review_loops(
             transaction_pool, task_id=task_id, status=ReviewLoopStatus.OPEN
@@ -425,6 +566,7 @@ def _cancel_composition(
             task_id,
             expected_state_token=working_token,
             terminal_status=TaskStatus.CANCELLED,
+            terminal_cause=terminal_cause,
         )
         if archived is None:
             raise StaleOperationError("the task could not be cancelled; the cancellation is stale")
@@ -432,11 +574,18 @@ def _cancel_composition(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            actor=owner_actor,
+            actor=actor,
             terminal_status=TaskStatus.CANCELLED,
         )
         close_intent: TaskPullRequestCloseIntent | None = None
         if close_obligation is not _CloseObligation.NONE:
+            if profile_id is None:
+                # Unreachable: the close obligation exists only on the
+                # Owner-authenticated path. Kept explicit for fail-closed
+                # safety and type narrowing.
+                raise InvalidCommandError(
+                    "the close obligation requires the accountable owner profile"
+                )
             surviving = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
             if surviving is None or surviving.workspace_id != archived.workspace_id:
                 raise ConflictError(
@@ -457,6 +606,7 @@ def _cancel_composition(
         owner_gate=cancelled_gate,
         closed_loops=tuple(closed_loops),
         close_intent=close_intent,
+        pull_request=pull_request,
     )
 
 
@@ -916,4 +1066,71 @@ def cancel_task(
             closed_loops=composition.closed_loops,
             pull_request=final_pull_request,
             close_intent=final_intent,
+        )
+
+
+def cancel_task_for_confirmed_pr_closure(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+) -> TaskPrClosureOutcome:
+    """Cancel the still-current Task whose canonical PR is confirmed closed-unmerged.
+
+    The ONE trusted GitHub-observation cancellation entrypoint (E10c, issue
+    #229). Callers must have just reconciled the canonical PR
+    authoritatively (the B6 webhook/sweep paths, or E7's post-publication
+    eligibility failure over the persisted canonical record); the evidence
+    is never trusted from a webhook assertion — the authoritative persisted
+    PR/current-Task facts are reloaded here under lock and re-proved. Takes
+    no caller-selected actor, cause, PR number, Profile identity, or
+    external status assertion, requires no user OAuth token, and cannot
+    itself call GitHub.
+
+    On the still-current, locked, non-archived Task — whatever its status,
+    including autonomous progression and ``BLOCKED`` — one atomic
+    composition through the shared E10b archival core closes every OPEN
+    ReviewLoop, archives the Task ``CANCELLED`` through the guarded
+    archival primitive with the canonical ``pr_closed_unmerged`` terminal
+    cause, and commits the terminal ``TASK_CANCELLED`` (GITHUB) exactly
+    once. A pending OwnerGate is never resolved as if its Owner chose
+    Cancel: the gate row stays untouched pending history and the archival
+    clears the current-gate pointer. No PR-close intent is recorded and no
+    close request is made — the external closure already happened.
+
+    The evidence is serialized against concurrent observed-snapshot
+    reconciliation: the canonical PR row is locked ``FOR UPDATE`` and held
+    through the archival, so a B7 write phase can never commit a confirmed
+    merge between the evidence decision and the cancellation; a raced
+    confirmed merge (or any other non-evidence durable state) refuses
+    fail-closed and applies nothing. Archived history is immutable — an
+    already-archived Task (``CANCELLED`` by Owner/GitHub or ``COMPLETED``
+    by merge) is the idempotent ``ALREADY_TERMINAL`` no-op, so duplicate
+    webhook/sweep deliveries produce at most one archival and event set.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    with application_span(_SERVICE_TRACER_SCOPE, _PR_CLOSURE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_PR_CLOSURE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        composition = _cancel_composition(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            close_obligation=_CloseObligation.NONE,
+            trusted_pr_closure=True,
+        )
+        return TaskPrClosureOutcome(
+            kind=(
+                TaskPrClosureOutcomeKind.CANCELLED
+                if composition.applied
+                else TaskPrClosureOutcomeKind.ALREADY_TERMINAL
+            ),
+            task=composition.task,
+            pull_request=composition.pull_request,
+            closed_loops=composition.closed_loops,
         )

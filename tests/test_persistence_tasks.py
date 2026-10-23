@@ -21,7 +21,7 @@ from typing import Any, cast
 
 import pytest
 
-from openorc.domain.tasks import TaskDomainError, TaskStatus
+from openorc.domain.tasks import TaskDomainError, TaskStatus, TaskTerminalCause
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import (
     archive_task,
@@ -116,6 +116,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "source_requirements_fingerprint": "a" * 64,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
+        "terminal_cause": None,
     }
     values.update(overrides)
     return (
@@ -134,6 +135,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["queued_at"],
         values["created_at"],
         values["updated_at"],
+        values["terminal_cause"],
     )
 
 
@@ -446,9 +448,10 @@ def test_archive_task_stamps_archival_and_rotates_the_token() -> None:
     # One atomic statement: terminal status + archival + queue-exit clear +
     # token rotation (archival is an authorized path out of the queue).
     assert "set status = %s, archived_at = now(), queued_at = null," in sql
+    assert "terminal_cause = %s" in sql
     assert "state_token = gen_random_uuid(), updated_at = now()" in sql
     assert "where id = %s and state_token = %s and archived_at is null" in sql
-    assert params == ("cancelled", row[0], original_token)
+    assert params == ("cancelled", None, row[0], original_token)
 
 
 def test_archive_task_supports_completed_outcome() -> None:
@@ -466,7 +469,52 @@ def test_archive_task_supports_completed_outcome() -> None:
     assert archived is not None
     assert archived.status is TaskStatus.COMPLETED
     assert archived.archived_at is not None
-    assert fake_conn.executed[0][1] == ("completed", row[0], original_token)
+    assert archived.terminal_cause is None
+    assert fake_conn.executed[0][1] == ("completed", None, row[0], original_token)
+
+
+def test_archive_task_stamps_the_confirmed_terminal_cause() -> None:
+    # The E10c terminal cause (issue #229) is stamped in the same guarded
+    # archival statement and maps back onto the returned Task.
+    original_token = uuid.uuid4()
+    row = _task_row(
+        status="cancelled",
+        archived_at=_observed_at(),
+        state_token=uuid.uuid4(),
+        terminal_cause="pr_closed_unmerged",
+    )
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    archived = archive_task(
+        pool,
+        row[0],
+        expected_state_token=original_token,
+        terminal_status=TaskStatus.CANCELLED,
+        terminal_cause=TaskTerminalCause.PR_CLOSED_UNMERGED,
+    )
+
+    assert archived is not None
+    assert archived.status is TaskStatus.CANCELLED
+    assert archived.terminal_cause is TaskTerminalCause.PR_CLOSED_UNMERGED
+    sql, params = fake_conn.executed[0]
+    assert "terminal_cause = %s" in sql
+    assert params == ("cancelled", "pr_closed_unmerged", row[0], original_token)
+
+
+def test_archive_task_refuses_a_terminal_cause_on_a_completed_archival() -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    with pytest.raises(TaskDomainError, match="terminal cause"):
+        archive_task(
+            pool,
+            uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            terminal_status=TaskStatus.COMPLETED,
+            terminal_cause=TaskTerminalCause.PR_CLOSED_UNMERGED,
+        )
+    assert fake_conn.executed == []
 
 
 @pytest.mark.parametrize("nonterminal", [TaskStatus.PLANNING, TaskStatus.BLOCKED])

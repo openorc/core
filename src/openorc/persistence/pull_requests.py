@@ -68,6 +68,7 @@ __all__ = [
     "find_task_pull_request_by_number",
     "get_task_pull_request",
     "get_task_pull_request_for_task",
+    "get_task_pull_request_for_task_for_update",
     "list_task_pull_requests_for_repository",
     "reconcile_task_pull_request_observed",
     "update_task_pull_request_observed",
@@ -194,6 +195,30 @@ def get_task_pull_request_for_task(pool: DatabasePool, *, task_id: UUID) -> Task
             f"select {_TASK_PULL_REQUEST_COLUMNS} from openorc.task_pull_requests "
             "where task_id = %s",
             (task_id,),
+        ).fetchone()
+    return None if row is None else _task_pull_request_from_row(row)
+
+
+def get_task_pull_request_for_task_for_update(
+    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> TaskPullRequest | None:
+    """Return the Task's canonical PR record locked ``FOR UPDATE``.
+
+    The row-locking read for workflow consequences whose terminal evidence
+    must stay serialized against concurrent observed-snapshot reconciliation
+    (issue #229): the lock is held to the end of the caller's transaction, so
+    a reconciled merged or closed fact cannot commit between the evidence
+    read and the consequence's own durable writes. Same ``unique (task_id)``
+    canonical resolution and explicit Workspace scope as the ordinary read;
+    ``None`` when the record (or its exact scope) does not exist durably.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(task_id, "task_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_TASK_PULL_REQUEST_COLUMNS} from openorc.task_pull_requests "
+            "where task_id = %s and workspace_id = %s for update",
+            (task_id, workspace_id),
         ).fetchone()
     return None if row is None else _task_pull_request_from_row(row)
 

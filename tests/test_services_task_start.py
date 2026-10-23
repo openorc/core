@@ -266,6 +266,7 @@ def _task_row(
         queued_at,
         _OBSERVED,
         _OBSERVED,
+        None,
     )
 
 

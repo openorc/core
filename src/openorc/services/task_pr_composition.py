@@ -105,6 +105,7 @@ from openorc.protocol.models import PR_RESULT_FAMILY, PrResult
 from openorc.services import (
     event_coordination,
     pull_request_publication,
+    task_cancellation,
     task_pull_request_reconciliation,
 )
 from openorc.services.errors import (
@@ -613,12 +614,15 @@ def _require_review_eligible_pull_request(
 ) -> None:
     """Require the persisted canonical PR to be eligible for owner review.
 
-    Beyond the stable identity and the exact approved head SHA, the record
-    must durably remain open and unmerged, with the Task's bound canonical
-    head branch and the authorized publication base. A closed-unmerged PR,
-    a confirmed merge, a retargeted base, or a changed head branch each
-    fails closed with its own typed signal — never replacement, adoption,
-    or dispatch. Generalized closed-PR and merge recovery belongs to E10.
+    The record must durably remain open and unmerged, with the Task's bound
+    canonical head branch and the authorized publication base. A
+    closed-unmerged PR, a confirmed merge, a retargeted base, or a changed
+    head branch each fails closed with its own typed signal — never
+    replacement, adoption, or dispatch. The confirmed closed-unmerged and
+    confirmed-merge classifications deliberately precede the finalize's
+    exact approved head-SHA drift handling (issue #229): an externally
+    established terminal PR state is never masked as a stale publication
+    subject. Generalized closed-PR and merge recovery belongs to E10.
     """
     if pull_request.state is not TaskPullRequestState.OPEN:
         if pull_request.merged_at is None:
@@ -750,6 +754,11 @@ def _finalize_published_task_pr(
                 "the persisted canonical pull request does not match the "
                 "publication result; canonical records are never replaced"
             )
+        _require_review_eligible_pull_request(
+            pull_request=pull_request,
+            task=task,
+            base_ref=subjects.base_ref,
+        )
         if pull_request.head_sha != approved_head_sha:
             # Reconciled head-SHA drift — observed during the authoritative
             # continuation reconciliation or arising between the primitive's
@@ -757,7 +766,11 @@ def _finalize_published_task_pr(
             # publication authority: it routes through the guard so the Task
             # is blocked recoverably where still current and mutated nowhere
             # when it has already moved on. The canonical record is never
-            # recreated or replaced.
+            # recreated or replaced. The eligibility classification above
+            # deliberately precedes this check (issue #229): a confirmed
+            # closed-unmerged canonical PR is the externally established
+            # terminal condition and must never be masked as a stale
+            # publication subject.
             raise _StalePublicationGuard(
                 reason=TaskBlockReason.STALE_OPERATION,
                 context={
@@ -765,11 +778,6 @@ def _finalize_published_task_pr(
                     "observed_head_sha": pull_request.head_sha,
                 },
             )
-        _require_review_eligible_pull_request(
-            pull_request=pull_request,
-            task=task,
-            base_ref=subjects.base_ref,
-        )
         reviewing = task_records.update_task_status(
             transaction_pool,
             task_id,
@@ -804,11 +812,15 @@ def _finalize_or_block(
 
     A review-eligibility guard failure rolls the finalize back with no
     partial state; where the Task remains current at the expected token the
-    reason-specific ``TaskBlock`` (``stale_operation``; ``pr_closed_unmerged``
-    exclusively for a closed-unmerged PR) is recorded atomically with the
-    ``blocked`` transition and the ``task_blocked`` audit, and the invocation
-    surfaces the typed stale outcome. A confirmed merge refuses with zero
-    durable mutation — its completion belongs to the later recovery layer.
+    reason-specific ``TaskBlock`` (``stale_operation``) is recorded
+    atomically with the ``blocked`` transition and the ``task_blocked``
+    audit, and the invocation surfaces the typed stale outcome. The
+    confirmed closed-unmerged branch is the exception (issue #229): it is
+    the externally established terminal condition, so instead of a BLOCKED
+    result the trusted GitHub-observation cancellation entrypoint applies
+    the terminal consequence after the rejecting transaction has rolled
+    back. A confirmed merge refuses with zero durable mutation — its
+    completion belongs to the later recovery layer.
     """
     try:
         return _finalize_published_task_pr(
@@ -821,6 +833,24 @@ def _finalize_or_block(
             expected_state_token=expected_state_token,
         )
     except _StalePublicationGuard as guard:
+        if guard.reason is TaskBlockReason.PR_CLOSED_UNMERGED:
+            # The confirmed closed-unmerged canonical PR is the externally
+            # established terminal condition (issue #229): the rejecting
+            # finalize transaction has already rolled back with no partial
+            # state, and the trusted GitHub-observation cancellation
+            # entrypoint applies the terminal consequence instead of a
+            # recoverable BLOCKED result. The entrypoint re-proves the
+            # durable evidence under its own locks and fails closed on any
+            # conflict.
+            task_cancellation.cancel_task_for_confirmed_pr_closure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
+            raise StaleOperationError(
+                "the canonical pull request is confirmed closed-unmerged; the "
+                "task is terminally cancelled"
+            ) from guard
         _block_stale_publication(
             pool,
             profile_id=subjects.approving_profile_id,

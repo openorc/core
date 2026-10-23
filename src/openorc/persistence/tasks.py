@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from openorc.domain.tasks import Task, TaskDomainError, TaskStatus
+from openorc.domain.tasks import Task, TaskDomainError, TaskStatus, TaskTerminalCause
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
@@ -61,7 +61,8 @@ _TASK_COLUMNS = (
     "id, workspace_id, repository_id, github_issue_id, github_issue_number, "
     "status, archived_at, canonical_feature_branch, state_token, "
     "current_plan_revision_id, current_owner_gate_id, "
-    "source_requirements_fingerprint, queued_at, created_at, updated_at"
+    "source_requirements_fingerprint, queued_at, created_at, updated_at, "
+    "terminal_cause"
 )
 
 
@@ -84,6 +85,7 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         source_requirements_fingerprint=row[11],
         created_at=normalize_utc(row[13]),
         updated_at=normalize_utc(row[14]),
+        terminal_cause=None if row[15] is None else TaskTerminalCause(row[15]),
     )
 
 
@@ -458,6 +460,7 @@ def archive_task(
     *,
     expected_state_token: UUID,
     terminal_status: TaskStatus,
+    terminal_cause: TaskTerminalCause | None = None,
 ) -> Task | None:
     """Archive a Task attempt with its terminal outcome, atomically.
 
@@ -470,6 +473,12 @@ def archive_task(
     archived Task has no actionable current gate, while the gate row itself
     stays untouched pending/resolved history with its own provenance.
 
+    ``terminal_cause`` (issue #229) is the optional canonical terminal cause
+    of an externally established cancellation, stamped in the same guarded
+    statement and never rewritten or cleared afterwards. It is admitted only
+    with the ``cancelled`` terminal status; an Owner-attributed cancellation
+    and every COMPLETED archival carry no cause.
+
     The update is conditional on ``expected_state_token``. Returns the
     updated Task, or ``None`` when the token no longer matches or the Task
     is missing/already archived (a stale operation that must not be retried
@@ -480,15 +489,25 @@ def archive_task(
             "archive_task requires a terminal status (cancelled or completed); "
             "nonterminal transitions use update_task_status"
         )
+    if terminal_cause is not None and not isinstance(terminal_cause, TaskTerminalCause):
+        raise TaskDomainError("archive_task terminal_cause must be None or a TaskTerminalCause")
+    if terminal_cause is not None and terminal_status is not TaskStatus.CANCELLED:
+        raise TaskDomainError("a terminal cause applies only to a cancelled archival")
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.tasks "
             "set status = %s, archived_at = now(), queued_at = null, "
+            "terminal_cause = %s, "
             "current_owner_gate_id = null, "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             f"returning {_TASK_COLUMNS}",
-            (terminal_status.value, task_id, expected_state_token),
+            (
+                terminal_status.value,
+                None if terminal_cause is None else terminal_cause.value,
+                task_id,
+                expected_state_token,
+            ),
         ).fetchone()
     return None if row is None else _task_from_row(row)
 

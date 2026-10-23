@@ -87,6 +87,7 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.
 - RuntimeRequest remains a scoped Producer/runtime-originated ACTION_APPROVAL correlation only for adapter contracts that actually require OpenOrc participation. Cline v1 native tool approvals do not create RuntimeRequests. It is never free-form Owner ↔ Producer conversation.
 - TaskBlock stores one durable block reason and recovery context. Resolving a block does not erase why it existed and does not imply one universal resume transition.
+- TaskTerminalCause (issue #229) is the canonical terminal cause of an externally established cancellation, carried on the archived Task row itself. It is separate from TaskBlock: an active TaskBlock describes a recoverable condition on a current Task, while a terminal cause describes immutable archived CANCELLED history whose truthful external provenance lives on the terminal event.
 - WorkflowEvent is append-oriented audit history for consequential OpenOrc facts. It is not event sourcing, current workflow state, operational logging, or runtime telemetry.
 - Logical WorkflowEvent actors are owner, openorc, producer, reviewer, runtime, github. Event context stays small and safe; never store raw credentials, request bodies, prompt/guidance prose, transcripts, or duplicated canonical records.
 

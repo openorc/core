@@ -21,6 +21,7 @@ from openorc.domain.tasks import (
     Task,
     TaskDomainError,
     TaskStatus,
+    TaskTerminalCause,
     task_field_names,
 )
 
@@ -211,8 +212,31 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "source_requirements_fingerprint",
             "created_at",
             "updated_at",
+            "terminal_cause",
         }
     )
+
+
+def test_a_terminal_cause_belongs_only_to_an_archived_cancelled_attempt() -> None:
+    # The E10c terminal cause (issue #229) is archived CANCELLED history: a
+    # current attempt never carries one, and a COMPLETED attempt never does.
+    cancelled = _task(
+        status=TaskStatus.CANCELLED,
+        archived_at=datetime.now(UTC),
+        terminal_cause=TaskTerminalCause.PR_CLOSED_UNMERGED,
+    )
+    assert cancelled.terminal_cause is TaskTerminalCause.PR_CLOSED_UNMERGED
+
+    with pytest.raises(TaskDomainError, match="terminal cause"):
+        _task(terminal_cause=TaskTerminalCause.PR_CLOSED_UNMERGED)
+    with pytest.raises(TaskDomainError, match="terminal cause"):
+        _task(
+            status=TaskStatus.COMPLETED,
+            archived_at=datetime.now(UTC),
+            terminal_cause=TaskTerminalCause.PR_CLOSED_UNMERGED,
+        )
+    with pytest.raises(TaskDomainError, match="TaskTerminalCause"):
+        _task(terminal_cause="pr_closed_unmerged")
     for forbidden in (
         "current_execution_id",
         "plan_content",

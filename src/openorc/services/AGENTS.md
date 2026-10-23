@@ -924,5 +924,56 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   externally closed-unmerged terminal cause; F4b #230 owns non-cancellation
   recovery).
 
+## E10c: the trusted PR-closure cancellation (issue #229)
+
+- `task_cancellation.cancel_task_for_confirmed_pr_closure` is the ONE trusted
+  GitHub-observation cancellation entrypoint: when existing authoritative B7
+  reconciliation has durably confirmed a Task's canonical PR CLOSED without
+  merge, the still-current Task is terminally cancelled through the shared
+  E10b composition (`_cancel_composition`'s second trusted admission mode —
+  two distinct trusted admission paths over one archival core). It takes no
+  caller-selected actor, cause, PR number, Profile identity, or state token,
+  and performs no external I/O: the evidence precondition is the durable
+  canonical PR state itself, re-proved under the Task row lock AND under the
+  canonical PR row lock (`require_canonical_task_pull_request_for_update`,
+  the focused `FOR UPDATE` read) held through the terminal archival, so a
+  concurrent B7 write phase can never commit a confirmed merge between the
+  evidence decision and the cancellation. A raced confirmed merge — or any
+  other non-evidence durable state — refuses fail-closed and applies
+  nothing; the retryable read/reconciliation paths re-classify and route
+  merged facts to E10a instead.
+- Unlike Owner Cancel, the externally confirmed terminal closure is not
+  gated on runtime idleness (no accounted-runtime veto), admits every
+  non-archived status, resolves no OwnerGate (the pending gate stays
+  untouched history and the archival clears the current-gate pointer per
+  E10a's historical-provenance policy), and records no PR-close intent —
+  the external closure already happened, so no Profile user credential is
+  required. The terminal `task_cancelled` event carries truthful GITHUB
+  provenance with no actor identity, and the archival stamps the canonical
+  `pr_closed_unmerged` terminal cause on the Task (`terminal_cause` — a
+  Task-owned archived fact, deliberately separate from an active TaskBlock;
+  the `TaskBlockReason` value survives only for historical rows and no new
+  live TaskBlock of that reason is ever written). Archived history is
+  immutable: an already-archived Task (`CANCELLED` by Owner/GitHub or
+  `COMPLETED` by merge) is the idempotent `ALREADY_TERMINAL` no-op.
+- The consequence is wired only into the existing observation paths:
+  `github_webhook_dispatch._dispatch_pull_request` applies it after a
+  successful B7 reconciliation of a closed-unmerged canonical PR (parallel
+  to the E10a merged branch; failures flow through the route failure
+  classification and keep the delivery recoverable — never marked processed
+  when the archival failed), and `github_reconciliation_recovery` applies it
+  at the sweep's PR-unit orchestration point through
+  `_cancel_closed_unmerged_task_consequence` (failures are contained as the
+  sweep's own typed outcome so the consequence gap stays visible and
+  re-runnable). E7's post-publication eligibility routes the confirmed
+  closed-unmerged branch of `_finalize_or_block` to this entrypoint after
+  the rejecting finalize transaction has rolled back — the eligibility
+  classification deliberately precedes the exact head-SHA drift check so an
+  externally established terminal PR state is never masked as a stale
+  publication subject, while `STALE_OPERATION` blocking for open-PR
+  mismatches and the confirmed-merge refusal are unchanged. No generic
+  blocking service, no GitHub PR-close write, no session/checkout mutation,
+  and no F2/F4 recovery belong here.
+
 
 Read domain plus relevant persistence/adapter/API/worker guides for cross-boundary changes.

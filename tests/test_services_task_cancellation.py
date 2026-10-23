@@ -52,21 +52,24 @@ from openorc.domain.intents import (
 )
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.runtime_requests import RuntimeRequestStatus
-from openorc.domain.tasks import TaskStatus
+from openorc.domain.tasks import TaskStatus, TaskTerminalCause
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import runtime_requests as runtime_request_records
 from openorc.persistence.pool import DatabasePool
-from openorc.services import task_cancellation
+from openorc.services import task_cancellation, task_subject_guards
 from openorc.services.errors import (
     AuthorizationError,
     ConflictError,
+    NotFoundError,
     StaleOperationError,
 )
 from openorc.services.task_cancellation import (
     TaskCancellationOutcomeKind,
+    TaskPrClosureOutcomeKind,
     cancel_task,
+    cancel_task_for_confirmed_pr_closure,
 )
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
@@ -118,8 +121,9 @@ def _task_values(
     archived: bool = False,
     queued: bool = False,
     fingerprint: Any = "a" * 64,
+    cause: Any = None,
 ) -> tuple[Any, ...]:
-    """One 15-column ``openorc.tasks`` row shaped like the durable model."""
+    """One 16-column ``openorc.tasks`` row shaped like the durable model."""
     return (
         _TASK_ID,
         _WORKSPACE_ID,
@@ -136,10 +140,11 @@ def _task_values(
         _OBSERVED if queued else None,
         _OBSERVED,
         _OBSERVED,
+        cause,
     )
 
 
-def _archived_cancelled_row(fingerprint: Any = "a" * 64) -> tuple[Any, ...]:
+def _archived_cancelled_row(fingerprint: Any = "a" * 64, cause: Any = None) -> tuple[Any, ...]:
     return _task_values(
         status="cancelled",
         state_token=_CANCELLED_TOKEN,
@@ -147,6 +152,7 @@ def _archived_cancelled_row(fingerprint: Any = "a" * 64) -> tuple[Any, ...]:
         archived=True,
         queued=False,
         fingerprint=fingerprint,
+        cause=cause,
     )
 
 
@@ -154,10 +160,11 @@ def _pull_request(
     *,
     state: TaskPullRequestState = TaskPullRequestState.OPEN,
     merged_at: datetime | None = None,
+    workspace_id: Any = _WORKSPACE_ID,
 ) -> TaskPullRequest:
     return TaskPullRequest(
         id=_PR_ID,
-        workspace_id=_WORKSPACE_ID,
+        workspace_id=workspace_id,
         task_id=_TASK_ID,
         repository_id=_REPOSITORY_ID,
         github_pr_id=_GITHUB_PR_ID,
@@ -1116,3 +1123,241 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
     assert outcome.task.status is TaskStatus.CANCELLED
     assert _event_types(conn2) == ["task_cancelled"]
+
+
+# --- E10c: the trusted GitHub-observation cancellation (issue #229) ---------------
+
+
+def _closure_call(pool: DatabasePool) -> Any:
+    return cancel_task_for_confirmed_pr_closure(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+    )
+
+
+def _script_closure_authorization(
+    conn: ScriptedConnection,
+    *,
+    row: tuple[Any, ...],
+) -> None:
+    """The trusted path's head: the workspace-derived barrier and locked Task."""
+    conn.on_repeat(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on_repeat(_WORKSPACE_READ, _ws_row())
+    conn.on(_TASK_READ_LOCKED, row)  # get_task_for_update
+
+
+def _lock_evidence(monkeypatch: pytest.MonkeyPatch, pull_request: TaskPullRequest | None) -> None:
+    """Script the row-locked canonical PR evidence read (issue #229)."""
+    monkeypatch.setattr(
+        task_subject_guards,
+        "get_task_pull_request_for_task_for_update",
+        lambda pool, *, workspace_id, task_id: pull_request,
+    )
+
+
+def _event_params_of_type(conn: Any, event_type: str) -> list[tuple[Any, ...]]:
+    matched: list[tuple[Any, ...]] = []
+    for sql, params in conn.executed:
+        if _EVENT_INSERT(sql, None) and params is not None and params[2] == event_type:
+            matched.append(params)
+    return matched
+
+
+def test_a_confirmed_closed_unmerged_observation_cancels_the_current_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The one trusted admission path (issue #229): the durable canonical PR
+    # evidence is re-proved under the PR row lock, the shared archival core
+    # applies, and the terminal event carries truthful GITHUB provenance
+    # with the canonical pr_closed_unmerged terminal cause. A pending
+    # OwnerGate is never resolved as if its Owner chose Cancel, and no
+    # PR-close intent exists — the external closure already happened.
+    conn = ScriptedConnection()
+    _script_closure_authorization(
+        conn,
+        row=_task_values(status="waiting_for_owner", current_gate_id=_GATE_ID),
+    )
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+
+    outcome = _closure_call(_pool(conn))
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminal_cause is TaskTerminalCause.PR_CLOSED_UNMERGED
+    assert outcome.pull_request is not None
+    assert outcome.pull_request.state is TaskPullRequestState.CLOSED
+    assert outcome.closed_loops == ()
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _count(conn, _CLOSE_INTENT_INSERT) == 0
+    assert _event_types(conn) == ["task_cancelled"]
+    (terminal_event,) = _event_params_of_type(conn, "task_cancelled")
+    assert terminal_event[3] == "github"
+    assert terminal_event[4] is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "ready_to_plan",
+        "queued",
+        "planning",
+        "waiting_for_owner",
+        "implementing",
+        "reviewing",
+        "blocked",
+    ],
+)
+def test_the_trusted_closure_admits_every_non_archived_status(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    # Unlike the Owner command, the externally confirmed terminal closure is
+    # not gated on runtime idleness or safe inactivity: every non-archived
+    # status is cancellable when the evidence holds.
+    conn = ScriptedConnection()
+    _script_closure_authorization(
+        conn, row=_task_values(status=status, queued=(status == "queued"))
+    )
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+
+    outcome = _closure_call(_pool(conn))
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+
+
+def test_the_trusted_closure_closes_open_review_loops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loops = [SimpleNamespace(id=_LOOP_ID, purpose="pr_review", iteration_limit=5)]
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status="reviewing"))
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(monkeypatch, loops=loops)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+
+    outcome = _closure_call(_pool(conn))
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
+    assert len(outcome.closed_loops) == 1
+    assert outcome.closed_loops[0].status == "closed"
+
+
+def test_outstanding_runtime_work_does_not_veto_the_external_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The external closure is not gated on runtime idleness: an unsettled
+    # interrupt intent, an open Execution, and a pending RuntimeRequest do
+    # not veto it. Late results cannot advance the archived Task, and the
+    # F4c cleanup waits for safe accounting independently.
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status="implementing"))
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.UNSETTLED)],
+        executions=[SimpleNamespace(status=ExecutionStatus.RUNNING)],
+        runtime_requests=[SimpleNamespace(status=RuntimeRequestStatus.PENDING)],
+    )
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+
+    outcome = _closure_call(_pool(conn))
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+
+
+def test_an_open_canonical_pull_request_causes_no_terminal_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values())
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.OPEN))
+
+    with pytest.raises(StaleOperationError):
+        _closure_call(_pool(conn))
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_confirmed_merged_canonical_pull_request_refuses_the_closure_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Confirmed merged facts are E10a's territory: a merge confirmed under
+    # the evidence lock (the raced-reconciliation case) refuses fail-closed
+    # and applies nothing; the retryable read/reconciliation paths
+    # re-classify and route it to the completion seam instead.
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status="reviewing"))
+    _wire(monkeypatch)
+    _lock_evidence(
+        monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=_OBSERVED)
+    )
+
+    with pytest.raises(StaleOperationError):
+        _closure_call(_pool(conn))
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+@pytest.mark.parametrize("status", ["cancelled", "completed"])
+def test_an_already_archived_task_is_the_idempotent_no_op(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    # Archived history is immutable whatever its terminal outcome: duplicate
+    # webhook/sweep deliveries find the Task already archived and rewrite
+    # nothing — no second archival, cause stamp, loop closure, or event.
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status=status, archived=True))
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+
+    outcome = _closure_call(_pool(conn))
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.ALREADY_TERMINAL
+    assert outcome.task.status is TaskStatus(status)
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_missing_canonical_pull_request_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values())
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, None)
+
+    with pytest.raises(NotFoundError):
+        _closure_call(_pool(conn))
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_cross_workspace_canonical_pull_request_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values())
+    _wire(monkeypatch)
+    _lock_evidence(
+        monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, workspace_id=uuid4())
+    )
+
+    with pytest.raises(NotFoundError):
+        _closure_call(_pool(conn))
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []

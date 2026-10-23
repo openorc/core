@@ -111,6 +111,7 @@ _ISSUE_NUMBER = 42
 _STATE_TOKEN = uuid.uuid4()
 _ROTATED_TOKEN = uuid.uuid4()
 _HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
+_OTHER_HEAD_SHA = "0123456789abcdef0123456789abcdef89abcdef"
 _RACED_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 _BRANCH = "openorc/task-42-implementation"
 _GITHUB_PR_ID = 900_719_925_474_099
@@ -247,6 +248,8 @@ _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _SESSION_READ = _sql_has("from openorc.task_agent_sessions")
 _EVENTS_BY_SUBJECT = _sql_has("from openorc.workflow_events", "subject_id = %s")
 _STATUS_UPDATE = _sql_has("update openorc.tasks set status", "queued_at = case")
+_ARCHIVE_UPDATE = _sql_has("update openorc.tasks set status", "archived_at = now()")
+_LOOPS_READ = _sql_has("from openorc.review_loops", "status = %s")
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
 
@@ -260,6 +263,8 @@ def _task_row(
     status: str = "waiting_for_owner",
     state_token: Any = _STATE_TOKEN,
     canonical_branch: Any = _BRANCH,
+    archived_at: Any = None,
+    terminal_cause: Any = None,
 ) -> tuple[Any, ...]:
     return (
         _TASK_ID,
@@ -268,7 +273,7 @@ def _task_row(
         _GITHUB_ISSUE_ID,
         _ISSUE_NUMBER,
         status,
-        None,
+        archived_at,
         canonical_branch,
         state_token,
         None,
@@ -277,6 +282,7 @@ def _task_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        terminal_cause,
     )
 
 
@@ -731,6 +737,24 @@ def _script_continuation(
         conn.on(_TASK_READ, _task_row())
         conn.on(_BLOCK_INSERT, _block_row())
         conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_ROTATED_TOKEN))
+    elif finalize == "cancel":
+        # The trusted E10c cancellation composition (issue #229) replaces
+        # the recoverable block: the workspace-derived account barrier and
+        # the barrier reads come from the repeating reads, then the locked
+        # Task, the locked canonical PR evidence, the loop reads, the
+        # guarded archival with its terminal cause, and the terminal event.
+        conn.on(_TASK_READ_LOCKED, _task_row())
+        conn.on(_PR_READ, observed_pr_row)
+        conn.on(_LOOPS_READ, [])
+        conn.on(
+            _ARCHIVE_UPDATE,
+            _task_row(
+                status="cancelled",
+                state_token=_ROTATED_TOKEN,
+                archived_at=_OBSERVED,
+                terminal_cause="pr_closed_unmerged",
+            ),
+        )
     conn.on_repeat(_EVENT_INSERT, _event_row())
 
 
@@ -1187,11 +1211,6 @@ def test_the_narrow_continuation_completes_without_composition_or_create(
 @pytest.mark.parametrize(
     ("observed_row", "observation", "expected_reason"),
     [
-        (
-            _pr_row(state="closed"),
-            _reconciliation_observation(state="closed"),
-            "pr_closed_unmerged",
-        ),
         (_pr_row(base_ref="develop"), _reconciliation_observation(), "stale_operation"),
     ],
 )
@@ -1227,6 +1246,53 @@ def test_an_ineligible_reconciled_record_blocks_recoverably(
     assert _count(conn, _BLOCK_INSERT) == 1
     assert _count(conn, _STATUS_UPDATE) == 1
     assert _event_types(conn) == ["task_blocked"]
+
+
+@pytest.mark.parametrize(
+    ("observed_row", "observation"),
+    [
+        (_pr_row(state="closed"), _reconciliation_observation(state="closed")),
+        (
+            # The precedence regression (issue #229): a drifted head SHA
+            # must never mask the confirmed closed-unmerged terminal
+            # condition as a stale publication subject.
+            _pr_row(state="closed", head_sha=_OTHER_HEAD_SHA),
+            _reconciliation_observation(state="closed"),
+        ),
+    ],
+)
+def test_a_confirmed_closed_unmerged_publication_cancels_the_task_terminally(
+    monkeypatch: pytest.MonkeyPatch,
+    observed_row: tuple[Any, ...],
+    observation: GitHubPullRequestObservation,
+) -> None:
+    conn = ScriptedConnection()
+    _script_continuation(conn, observed_pr_row=observed_row, finalize="cancel")
+    pool = _pool(conn)
+    github = _FakeGitHub(
+        pool=cast(FakePool, pool),
+        repository_observation=GitHubRepositoryObservation(
+            github_repository_id=_GITHUB_REPOSITORY_ID,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        ),
+        pull_request_observation=observation,
+    )
+    publication = _publication_fake(monkeypatch)
+    adapter = _prepared_adapter()
+
+    with pytest.raises(StaleOperationError, match="terminally cancelled"):
+        _compose_call(pool, github, _FakeResolver(), _runtime_factory(adapter))
+
+    assert publication.commands == []
+    assert adapter.realized_controls() == ()
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _ARCHIVE_UPDATE) == 1
+    assert _event_types(conn) == ["task_cancelled"]
 
 
 def test_a_confirmed_merge_refuses_without_false_recovery_state(

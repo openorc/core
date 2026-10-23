@@ -63,6 +63,7 @@ __all__ = [
     "Task",
     "TaskDomainError",
     "TaskStatus",
+    "TaskTerminalCause",
     "task_field_names",
 ]
 
@@ -110,6 +111,22 @@ _FINGERPRINT_OPTIONAL_STATUSES: frozenset[TaskStatus] = frozenset(
 )
 
 
+class TaskTerminalCause(StrEnum):
+    """The settled v1 terminal-cause vocabulary for archived Tasks.
+
+    A terminal cause is the canonical, queryable reason an attempt reached
+    its ``CANCELLED`` outcome when an external authority — not an OpenOrc
+    Owner — established it (issue #229). It is deliberately separate from
+    ``TaskBlockReason`` (``domain.blocks``): an active TaskBlock describes a
+    recoverable blocking condition on a current Task, while a terminal cause
+    describes immutable archived history. The vocabulary carries exactly the
+    values its producers need — currently the single E10c value — and never
+    speculative ones.
+    """
+
+    PR_CLOSED_UNMERGED = "pr_closed_unmerged"
+
+
 def _require_positive_int(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise TaskDomainError(f"Task.{name} must be a positive integer")
@@ -134,7 +151,9 @@ class Task:
     is queued (issue #76); and ``state_token`` is the opaque
     optimistic-concurrency token rotated by every authoritative state
     mutation. Current-object pointers identify related records without
-    duplicating their content.
+    duplicating their content. ``terminal_cause`` (issue #229) is the
+    optional canonical terminal cause of an externally established
+    cancellation — a Task-owned archived fact, never an active TaskBlock.
     """
 
     id: UUID
@@ -152,6 +171,13 @@ class Task:
     source_requirements_fingerprint: str | None
     created_at: datetime
     updated_at: datetime
+    # The canonical terminal cause (issue #229): populated exactly once,
+    # atomically with the guarded archival, when an external authority —
+    # never an OpenOrc Owner — established the CANCELLED outcome. The default
+    # keeps every existing construction site truthful: an Owner-attributed
+    # cancellation carries no terminal cause (its provenance lives on the
+    # terminal event), and a COMPLETED attempt never carries one.
+    terminal_cause: TaskTerminalCause | None = None
 
     def __post_init__(self) -> None:
         _require_positive_int(self.github_issue_id, "github_issue_id")
@@ -169,6 +195,16 @@ class Task:
             raise TaskDomainError(
                 "a terminal Task attempt (cancelled or completed) must be archived"
             )
+        # The canonical terminal cause (issue #229): an archived CANCELLED
+        # attempt may carry exactly one external-authority terminal cause; a
+        # current attempt never does, and a COMPLETED attempt never does.
+        if self.terminal_cause is not None:
+            if not isinstance(self.terminal_cause, TaskTerminalCause):
+                raise TaskDomainError("Task.terminal_cause must be None or a TaskTerminalCause")
+            if self.archived_at is None or self.status is not TaskStatus.CANCELLED:
+                raise TaskDomainError(
+                    "a terminal cause belongs only to an archived cancelled attempt"
+                )
         if self.canonical_feature_branch is not None and (
             not isinstance(self.canonical_feature_branch, str)
             or not self.canonical_feature_branch.strip()
