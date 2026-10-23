@@ -230,4 +230,21 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   cascades with the account root. No new privilege is granted: the
   openorc schema lockout carries isolation.
 
+## Task terminal cause (issue #229)
+
+- `openorc.tasks.terminal_cause` is the canonical, queryable terminal cause
+  of an externally established Task cancellation (E10c): a nullable text
+  column stamped exactly once, atomically with the guarded terminal
+  archival, and never rewritten or cleared afterwards. NULL is the ordinary
+  case — an Owner-attributed cancellation carries no terminal cause (its
+  provenance lives on the terminal event) and a COMPLETED attempt never
+  carries one. The explicitly named `tasks_terminal_cause_check` admits a
+  present value only on an archived row whose terminal status is
+  `cancelled`, and only for the single settled value `pr_closed_unmerged`.
+  It is deliberately separate from an active TaskBlock: an active TaskBlock
+  describes a recoverable blocking condition on a current Task, while a
+  terminal cause describes immutable archived history. No backfill
+  (historical rows keep their recorded facts exactly as they were) and no
+  new privilege (the openorc schema lockout carries isolation).
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

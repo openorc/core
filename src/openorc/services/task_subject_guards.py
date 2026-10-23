@@ -48,12 +48,16 @@ from openorc.domain.tasks import Task
 from openorc.persistence.gates import get_owner_gate
 from openorc.persistence.planning import get_plan_revision
 from openorc.persistence.pool import DatabasePool
-from openorc.persistence.pull_requests import get_task_pull_request_for_task
+from openorc.persistence.pull_requests import (
+    get_task_pull_request_for_task,
+    get_task_pull_request_for_task_for_update,
+)
 from openorc.persistence.tasks import get_task
 from openorc.services.errors import InvalidCommandError, NotFoundError, StaleOperationError
 
 __all__ = [
     "require_canonical_task_pull_request",
+    "require_canonical_task_pull_request_for_update",
     "require_current_owner_gate",
     "require_current_plan_revision",
     "require_current_task",
@@ -197,6 +201,28 @@ def require_canonical_task_pull_request(pool: DatabasePool, *, task: Task) -> Ta
     resolution mechanism.
     """
     pull_request = get_task_pull_request_for_task(pool, task_id=task.id)
+    if pull_request is None or pull_request.workspace_id != task.workspace_id:
+        raise NotFoundError("the requested pull request record is not available for this task")
+    return pull_request
+
+
+def require_canonical_task_pull_request_for_update(
+    pool: DatabasePool, *, task: Task
+) -> TaskPullRequest:
+    """Resolve the canonical TaskPullRequest under its row lock.
+
+    The row-locking variant of :func:`require_canonical_task_pull_request`
+    for consequences whose durable evidence must stay serialized against
+    concurrent observed-snapshot reconciliation (issue #229): the PR row
+    lock is held to the end of the caller's transaction, so the locked
+    pre-image this guard returns is exactly the state the consequence's own
+    writes commit against. Same canonical resolution, ``NotFoundError``
+    vocabulary, and explicit Workspace scope validation as the ordinary
+    guard.
+    """
+    pull_request = get_task_pull_request_for_task_for_update(
+        pool, workspace_id=task.workspace_id, task_id=task.id
+    )
     if pull_request is None or pull_request.workspace_id != task.workspace_id:
         raise NotFoundError("the requested pull request record is not available for this task")
     return pull_request

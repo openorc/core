@@ -179,6 +179,7 @@ def _task_row(workspace_id: Any, *, archived: bool) -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
     )
 
 

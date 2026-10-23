@@ -44,6 +44,7 @@ from openorc.services import (
     github_issue_relations,
     github_reconciliation,
     github_webhook_dispatch,
+    task_cancellation,
     task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
@@ -54,6 +55,7 @@ from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
+    StaleOperationError,
 )
 from openorc.services.github_issue_relations import DependencySyncResult, HierarchySyncResult
 from openorc.services.github_reconciliation import (
@@ -242,6 +244,7 @@ class Harness:
         self.checks_projection = ScriptedCapability(self.pool_fake)
         self.dispatch = ScriptedCapability(self.pool_fake)
         self.merge_completion = ScriptedCapability(self.pool_fake)
+        self.pr_closure_cancellation = ScriptedCapability(self.pool_fake)
         self.settings = _settings()
 
 
@@ -300,6 +303,13 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
             task_merge_lifecycle,
             "complete_confirmed_task_merge",
             harness.merge_completion,
+        )
+        # The E10c trusted cancellation entrypoint is stubbed at the module
+        # boundary on the same terms (issue #229).
+        monkeypatch.setattr(
+            task_cancellation,
+            "cancel_task_for_confirmed_pr_closure",
+            harness.pr_closure_cancellation,
         )
         monkeypatch.setattr(
             github_webhook_dispatch, "dispatch_github_webhook_delivery", harness.dispatch
@@ -368,6 +378,7 @@ def _task_row(
         None,
         _NOW,
         _NOW,
+        None,
     )
 
 
@@ -1026,6 +1037,7 @@ def test_a_missed_closed_unmerged_pr_is_a_normalized_fact(harness_factory) -> No
     harness.pull_request_reconcile.results = [
         _pr_reconciliation(pull_request=_durable_task_pull_request(merged_at=None))
     ]
+    harness.pr_closure_cancellation.results = [None]
     harness.checks_projection.results = [_checks_projection()]
     conn.on("order by received_at, id limit %s", [])
 
@@ -1035,11 +1047,61 @@ def test_a_missed_closed_unmerged_pr_is_a_normalized_fact(harness_factory) -> No
         outcome
         for outcome in result.outcomes
         if outcome.family is GitHubReconciliationSweepFamily.PULL_REQUEST
+        and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
     )
     assert pr_outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
     assert pr_outcome.pull_request_merged is False
     assert pr_outcome.pull_request_closed_unmerged is True
-    # A closed-unmerged observation carries no merged-completion consequence.
+    # The narrow E10c cancellation consequence fired exactly once for the
+    # observed closed-unmerged canonical PR (issue #229) and added no extra
+    # outcome of its own; the merged-completion seam is never invoked.
+    assert harness.pr_closure_cancellation.calls == [
+        {"workspace_id": _WORKSPACE_A, "task_id": _TASK_A}
+    ]
+    assert harness.merge_completion.calls == []
+    _assert_no_durable_writes(harness)
+
+
+def test_a_failed_closed_unmerged_consequence_stays_visible_and_rerunnable(
+    harness_factory,
+) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on(
+        "from openorc.tasks",
+        [_task_row(github_issue_id=502, issue_number=52)],
+    )
+    conn.on("where task_id = %s", _pull_request_row(state="closed", merged_at=None))
+    harness.pull_request_reconcile.results = [
+        _pr_reconciliation(pull_request=_durable_task_pull_request(merged_at=None))
+    ]
+    harness.pr_closure_cancellation.errors = {0: StaleOperationError("the cancellation is stale")}
+    harness.checks_projection.results = [_checks_projection()]
+    conn.on("order by received_at, id limit %s", [])
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+
+    # The contained consequence failure is reported as its own known-failure
+    # outcome so the gap stays visible and re-runnable by the next rotation;
+    # the observation and the checks projection are unaffected.
+    assert [(outcome.family, outcome.status) for outcome in result.outcomes] == [
+        (
+            GitHubReconciliationSweepFamily.REPOSITORY,
+            GitHubReconciliationSweepUnitStatus.RECONCILED,
+        ),
+        (
+            GitHubReconciliationSweepFamily.PULL_REQUEST,
+            GitHubReconciliationSweepUnitStatus.RECONCILED,
+        ),
+        (
+            GitHubReconciliationSweepFamily.PULL_REQUEST,
+            GitHubReconciliationSweepUnitStatus.FAILED_KNOWN,
+        ),
+        (GitHubReconciliationSweepFamily.CHECKS, GitHubReconciliationSweepUnitStatus.RECONCILED),
+    ]
     assert harness.merge_completion.calls == []
     _assert_no_durable_writes(harness)
 

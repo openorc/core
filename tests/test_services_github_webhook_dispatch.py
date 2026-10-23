@@ -38,7 +38,7 @@ from openorc.domain.github_webhooks import (
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.observability import injected_tracer_source
 from openorc.persistence.pool import DatabasePool
-from openorc.services import github_webhook_dispatch, task_merge_lifecycle
+from openorc.services import github_webhook_dispatch, task_cancellation, task_merge_lifecycle
 from openorc.services.errors import (
     AuthenticationError,
     AuthorizationError,
@@ -300,6 +300,7 @@ class Harness:
         self.pull_request_reconcile = RecordingCapability(self.pool_fake)
         self.checks_projection = RecordingCapability(self.pool_fake)
         self.merge_completion = RecordingCapability(self.pool_fake)
+        self.pr_closure_cancellation = RecordingCapability(self.pool_fake)
 
 
 @pytest.fixture
@@ -344,6 +345,13 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
             task_merge_lifecycle,
             "complete_confirmed_task_merge",
             harness.merge_completion,
+        )
+        # The E10c trusted cancellation entrypoint is stubbed at the module
+        # boundary on the same terms (issue #229).
+        monkeypatch.setattr(
+            task_cancellation,
+            "cancel_task_for_confirmed_pr_closure",
+            harness.pr_closure_cancellation,
         )
         # The default reconciled observation is a still-open canonical PR, so
         # the merged-merge consequence fires only in the test that scripts a
@@ -820,6 +828,50 @@ def test_a_merged_canonical_pr_dispatch_applies_the_e10a_completion_consequence(
     # The narrow E10a consequence fires exactly once for the observed merge;
     # the reconciliation stays the only GitHub-backed work on the route.
     assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_ID}]
+
+
+def test_a_closed_unmerged_canonical_pr_dispatch_applies_the_e10c_cancellation_consequence(
+    harness_factory,
+) -> None:
+    harness = harness_factory()
+    harness.pull_request_reconcile.result = TaskPullRequestReconciliation(
+        pull_request=_reconciled_task_pull_request(
+            state=TaskPullRequestState.CLOSED, merged_at=None
+        ),
+        updated=True,
+        head_changed=False,
+        base_changed=False,
+        state_changed=True,
+        previous_head_sha=None,
+        previous_base_ref=None,
+        previous_state=TaskPullRequestState.OPEN,
+    )
+    _script_delivery(
+        harness.conn,
+        _delivery_row(
+            event_name="pull_request",
+            action="closed",
+            routing_target="pull_request_state",
+            github_issue_number=None,
+            github_pull_request_number=7,
+        ),
+    )
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_pull_request(harness.conn, _pull_request_row(_TASK_ID, _REPOSITORY_A))
+    _script_processed(harness.conn, _DELIVERY_ID)
+
+    result = github_webhook_dispatch.dispatch_github_webhook_delivery(
+        harness.pool, _github_client(), delivery_guid="guid-1"
+    )
+
+    assert result.processed is True
+    # The narrow E10c consequence fires exactly once for the observed
+    # closed-unmerged canonical PR (issue #229); the reconciliation stays the
+    # only GitHub-backed work on the route and no close request is made.
+    assert harness.pr_closure_cancellation.calls == [
+        {"workspace_id": _WORKSPACE_A, "task_id": _TASK_ID}
+    ]
+    assert harness.merge_completion.calls == []
 
 
 def test_a_pull_request_number_without_a_canonical_record_typedly_declines(harness_factory) -> None:

@@ -151,6 +151,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "queued_at": None,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
+        "terminal_cause": None,
     }
     values.update(overrides)
     return (
@@ -169,6 +170,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["queued_at"],
         values["created_at"],
         values["updated_at"],
+        values["terminal_cause"],
     )
 
 

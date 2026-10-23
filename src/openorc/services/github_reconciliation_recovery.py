@@ -37,10 +37,12 @@ downstream dispatch did not complete. The sweep:
   blocks the independent units, and the sweep is safe to re-run after any
   partial completion;
 - reports normalized durable fact changes to the later workflow layer and,
-  since E10a (issue #227), applies exactly one narrow workflow consequence:
-  a successfully reconciled merged canonical PR for a current Task invokes
-  the shared completion seam. Every other Phase 2E consequence (``BLOCKED /
-  GITHUB_SOURCE_CHANGED``, ``PR_CLOSED_UNMERGED``, Reviewer dispatch, merge
+  since E10a (issue #227) and E10c (issue #229), applies exactly two narrow
+  workflow consequences: a successfully reconciled merged canonical PR for a
+  current Task invokes the shared completion seam, and a successfully
+  reconciled closed-unmerged canonical PR invokes the trusted cancellation
+  entrypoint. Every other Phase 2E consequence (``BLOCKED /
+  GITHUB_SOURCE_CHANGED``, Reviewer dispatch, merge
   authorization) is still decided elsewhere. Hierarchy changes are recovered for
   presentation only and never become blocking semantics; requirements drift
   is detected against the Task's immutable B4 source baseline without
@@ -81,6 +83,7 @@ from openorc.services import (
     github_issue_relations,
     github_reconciliation,
     github_webhook_dispatch,
+    task_cancellation,
     task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
@@ -705,10 +708,10 @@ def _sweep_pull_request_unit(
     before→current facts; the sweep additionally classifies the merged and
     closed-unmerged lifecycle observations. No Phase 2E consequence is
     decided inside the unit: the E10a merged-completion consequence
-    (issue #227) is applied by the sweep orchestration after a RECONCILED
-    merged outcome, and the closed-unmerged consequence stays with #229. A
-    not-found outcome is a typed decline (the canonical subject vanished
-    between the work-set read and the unit).
+    (issue #227) and the E10c closed-unmerged cancellation consequence
+    (issue #229) are applied by the sweep orchestration after a RECONCILED
+    outcome. A not-found outcome is a typed decline (the canonical subject
+    vanished between the work-set read and the unit).
     """
     try:
         reconciliation = task_pull_request_reconciliation.reconcile_task_pull_request(
@@ -793,6 +796,51 @@ def _complete_merged_task_consequence(
     """
     try:
         task_merge_lifecycle.complete_confirmed_task_merge(
+            pool, workspace_id=workspace_id, task_id=task_id
+        )
+    except ApplicationError as error:
+        return _known_failure_outcome(
+            GitHubReconciliationSweepFamily.PULL_REQUEST,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            task_id=task_id,
+            github_issue_id=None,
+            delivery_guid=None,
+            error=error,
+        )
+    except Exception as error:  # noqa: BLE001 - contained with safe classification
+        return _unexpected_failure_outcome(
+            GitHubReconciliationSweepFamily.PULL_REQUEST,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            task_id=task_id,
+            github_issue_id=None,
+            delivery_guid=None,
+            error=error,
+        )
+    return None
+
+
+def _cancel_closed_unmerged_task_consequence(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    task_id: UUID,
+) -> GitHubReconciliationSweepOutcome | None:
+    """Apply the narrow E10c cancellation consequence for one closed-unmerged PR.
+
+    The trusted GitHub-observation cancellation entrypoint (issue #229) owns
+    the durable terminal effects and is idempotent under duplicate sweep,
+    webhook, and Owner cancellation races, so a successful application (or
+    an idempotent already-terminal no-op) adds no extra outcome: the PR
+    unit's own RECONCILED closed-unmerged outcome already records the
+    observation. A failure is contained with the sweep's standard
+    classification and reported as its own outcome so the consequence gap
+    stays visible and re-runnable.
+    """
+    try:
+        task_cancellation.cancel_task_for_confirmed_pr_closure(
             pool, workspace_id=workspace_id, task_id=task_id
         )
     except ApplicationError as error:
@@ -1144,6 +1192,22 @@ def run_github_reconciliation_sweep(
                     # checks unit below still projects the merged PR's
                     # checks surface.
                     consequence_failure = _complete_merged_task_consequence(
+                        pool,
+                        workspace_id=repository.workspace_id,
+                        repository_id=repository.id,
+                        task_id=task.id,
+                    )
+                    if consequence_failure is not None:
+                        outcomes.append(consequence_failure)
+                if pull_request_outcome.pull_request_closed_unmerged:
+                    # The narrow E10c workflow consequence for an observed
+                    # closed-unmerged canonical PR (issue #229): the
+                    # reconciliation unit already persisted the authoritative
+                    # closed-unmerged facts update-only; the trusted
+                    # GitHub-observation cancellation entrypoint owns the
+                    # durable terminal effects and is idempotent under
+                    # duplicate sweep/webhook races.
+                    consequence_failure = _cancel_closed_unmerged_task_consequence(
                         pool,
                         workspace_id=repository.workspace_id,
                         repository_id=repository.id,

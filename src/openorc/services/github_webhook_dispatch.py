@@ -73,6 +73,7 @@ from openorc.services import (
     commit_checks_projection,
     github_issue_relations,
     github_reconciliation,
+    task_cancellation,
     task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
@@ -618,8 +619,12 @@ def _dispatch_pull_request(
 
     After a successful reconciliation of a merged canonical PR, the narrow
     E10a completion consequence (issue #227) applies the durable
-    completion/audit effects through the shared seam; the reconciliation
-    itself stays strictly update-only and no second GitHub read is made.
+    completion/audit effects through the shared seam; after a successful
+    reconciliation of a closed-unmerged canonical PR, the narrow E10c
+    cancellation consequence (issue #229) applies the terminal cancellation
+    through the trusted GitHub-observation entrypoint on the same terms. The
+    reconciliation itself stays strictly update-only and no second GitHub
+    read is made.
     """
     try:
         if delivery.github_pull_request_number is not None:
@@ -660,6 +665,23 @@ def _dispatch_pull_request(
                 # races. No second reconciliation and no Phase 2E decision is
                 # made here.
                 task_merge_lifecycle.complete_confirmed_task_merge(
+                    pool,
+                    workspace_id=route.workspace_id,
+                    task_id=task_id,
+                )
+            elif (
+                reconciliation.pull_request.state is TaskPullRequestState.CLOSED
+                and reconciliation.pull_request.merged_at is None
+            ):
+                # The narrow E10c workflow consequence for an observed
+                # closed-unmerged canonical PR (issue #229): the reconciliation
+                # above already persisted the authoritative closed-unmerged
+                # facts update-only; the trusted GitHub-observation
+                # cancellation entrypoint owns the durable terminal effects
+                # and is idempotent under duplicate delivery/sweep races. No
+                # second reconciliation and no Phase 2E decision is made
+                # here.
+                task_cancellation.cancel_task_for_confirmed_pr_closure(
                     pool,
                     workspace_id=route.workspace_id,
                     task_id=task_id,
