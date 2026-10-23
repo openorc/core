@@ -92,6 +92,8 @@ from openorc.adapters.github.observations_checks import (
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
+    GitHubPullRequestCloseOperation,
+    GitHubPullRequestCloseResult,
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     body_reports_pull_request_already_exists,
@@ -167,6 +169,8 @@ __all__ = [
     "GitHubIssueParentObservation",
     "GitHubMergeRequestOutcome",
     "GitHubMergeRequestResult",
+    "GitHubPullRequestCloseOperation",
+    "GitHubPullRequestCloseResult",
     "GitHubPullRequestFacts",
     "GitHubProfileUserAccessToken",
     "GitHubPullRequestObservation",

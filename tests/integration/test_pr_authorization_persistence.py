@@ -145,6 +145,9 @@ class _FakeGitHubAppClient:
     def merge_pull_request(self, **_kwargs: Any) -> Any:
         raise AssertionError("the E7 seam must not request merges")
 
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
     def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
         raise AssertionError("the E7 seam must not compose raw #58 validation operations")
 

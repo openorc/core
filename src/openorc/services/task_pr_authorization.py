@@ -106,6 +106,7 @@ from openorc.services.errors import (
 )
 from openorc.services.github_reconciliation import reconcile_repository_issue
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_cancellation import cancel_task_composition
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -955,80 +956,27 @@ def cancel_pr_authorization(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-            )
-            if task.status is not TaskStatus.WAITING_FOR_OWNER:
-                raise ConflictError("the addressed task is not waiting on its owner gate")
-            gate = require_current_owner_gate(
-                transaction_pool, task=task, owner_gate_id=owner_gate_id
-            )
-            if gate.gate_type is not OwnerGateType.PR_AUTHORIZATION:
-                raise ConflictError(
-                    "only the current pr authorization gate cancels through this seam"
-                )
-            resolution = gate_records.resolve_owner_gate(
-                transaction_pool,
-                owner_gate_id=gate.id,
-                outcome=OwnerGateStatus.CANCELLED,
-                expected_task_state_token=expected_state_token,
-            )
-            if resolution.outcome is gate_records.OwnerGateResolutionOutcome.RESOLVED:
-                cancelled_gate = resolution.gate
-                cancelled_task = resolution.task
-                if cancelled_gate is None or cancelled_task is None:
-                    raise _unexplained_rejection()
-            elif resolution.gate is None:
-                raise NotFoundError("the requested owner gate is not available for this task")
-            elif resolution.outcome is gate_records.OwnerGateResolutionOutcome.NO_OP:
-                raise StaleOperationError(
-                    "the owner gate has already been resolved; the cancellation is stale"
-                )
-            else:
-                raise StaleOperationError(
-                    "the owner gate is no longer the task's current gate; the cancellation is stale"
-                )
-            owner_actor = event_coordination.owner_actor(profile_id)
-            event_coordination.record_owner_gate_resolved_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=cancelled_gate.id,
-                actor=owner_actor,
-                outcome=OwnerGateStatus.CANCELLED,
-            )
-            archived = task_records.archive_task(
-                transaction_pool,
-                task_id,
-                expected_state_token=cancelled_task.state_token,
-                terminal_status=TaskStatus.CANCELLED,
-            )
-            if archived is None:
-                raise StaleOperationError(
-                    "the task could not be cancelled; the cancellation is stale"
-                )
-            event_coordination.record_task_terminal_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                actor=owner_actor,
-                terminal_status=TaskStatus.CANCELLED,
-            )
-            return CancelledPrAuthorization(task=archived, owner_gate=cancelled_gate)
+        # Since E10b (issue #228) the gate-cancellation entrypoints delegate
+        # to the ONE shared cancellation composition: the same
+        # authorization/currentness/gate composition, the exact pending
+        # gate resolved CANCELLED with truthful OWNER provenance and the
+        # terminal ``cancelled`` archival with `TASK_CANCELLED` in one
+        # transaction; no GitHub artifact is touched.
+        composition = cancel_task_composition(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            owner_gate_id=owner_gate_id,
+            expected_gate_type=OwnerGateType.PR_AUTHORIZATION,
+        )
+        owner_gate = composition.owner_gate
+        assert owner_gate is not None
+        return CancelledPrAuthorization(
+            task=composition.task,
+            owner_gate=owner_gate,
+        )
 
 
 def _resolve_producer_session(transaction_pool: DatabasePool, *, task: Task) -> TaskAgentSession:

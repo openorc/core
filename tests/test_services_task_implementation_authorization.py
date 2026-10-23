@@ -184,6 +184,9 @@ _STATUS_UPDATE = _sql_has("update openorc.tasks", "queued_at = case")
 _ARCHIVE_WRITE = _sql_has("update openorc.tasks", "archived_at = now()")
 _REVISION_READ = _sql_has("from openorc.plan_revisions where id")
 _LOOPS_LIST = _sql_has("from openorc.review_loops where task_id")
+_INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
+_EXECUTIONS_LIST = _sql_has("from openorc.executions where task_id")
+_RUNTIME_REQUESTS_LIST = _sql_has("from openorc.runtime_requests where task_id")
 _LOOP_READ_LOCKED = _sql_lacks(
     _sql_has("from openorc.review_loops where id", "for update"), "select status, purpose"
 )
@@ -461,6 +464,9 @@ def _script_cancellation(
     conn.on(_TASK_READ, waiting)  # workspace guard task read
     conn.on(_TASK_READ_LOCKED, waiting)  # get_task_for_update
     conn.on(_TASK_READ, waiting)  # require_current_task
+    conn.on(_INTENTS_LIST, [])  # the accounted-runtime veto reads
+    conn.on(_EXECUTIONS_LIST, [])
+    conn.on(_RUNTIME_REQUESTS_LIST, [])
     conn.on(_GATE_READ, gate)  # require_current_owner_gate
     conn.on(_GATE_READ, gate)  # the resolution's gate read
     conn.on(_TASK_READ_LOCKED, waiting)  # the resolution's Task row lock
@@ -469,6 +475,7 @@ def _script_cancellation(
         _TASK_GATE_WRITE,
         _task_row(status="waiting_for_owner", state_token=_TOKEN_2, gate_id=None),
     )
+    conn.on(_LOOPS_LIST, [])  # no OPEN review loop to close at this gate
     if fail_archive:
         conn.on(_ARCHIVE_WRITE, RuntimeError("forced late cancellation failure"))
     else:
@@ -1070,6 +1077,9 @@ def test_cancel_refuses_a_gate_that_lost_currency() -> None:
     conn.on(_TASK_READ, retired)
     conn.on(_TASK_READ_LOCKED, retired)
     conn.on(_TASK_READ, retired)
+    conn.on(_INTENTS_LIST, [])  # the accounted-runtime veto reads
+    conn.on(_EXECUTIONS_LIST, [])
+    conn.on(_RUNTIME_REQUESTS_LIST, [])
     conn.on(_GATE_READ, _gate_row())
 
     with pytest.raises(StaleOperationError, match="current gate"):

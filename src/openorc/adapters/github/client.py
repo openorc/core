@@ -110,6 +110,8 @@ from openorc.adapters.github.observations_checks import (
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
     GitHubMergeRequestResult,
+    GitHubPullRequestCloseOperation,
+    GitHubPullRequestCloseResult,
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     body_reports_pull_request_already_exists,
@@ -168,6 +170,7 @@ _CHECK_RUNS_SPAN_NAME = "github.get_commit_check_runs"
 _COMBINED_STATUS_SPAN_NAME = "github.get_commit_combined_status"
 _MERGE_SPAN_NAME = "github.merge_pull_request"
 _CREATE_PULL_REQUEST_SPAN_NAME = "github.create_pull_request"
+_CLOSE_PULL_REQUEST_SPAN_NAME = "github.close_pull_request"
 _USER_ACCESS_SPAN_NAME = "github.validate_user_installation_repository_access"
 
 # The installation repository listing requests the maximum documented page
@@ -325,6 +328,18 @@ class GitHubAppClient(Protocol):
         body: str | None,
     ) -> GitHubPullRequestFacts:
         """Create one branch-addressed pull request and report its stable identity."""
+        ...
+
+    def close_pull_request(
+        self,
+        *,
+        credential: GitHubProfileUserAccessToken,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+    ) -> GitHubPullRequestCloseResult:
+        """Request closure of one addressed pull request under the Profile-bound credential."""
         ...
 
     def get_installation_capabilities(
@@ -1004,6 +1019,75 @@ class HttpGitHubAppClient:
                 raise
             return parse_pull_request_facts(_json_body(response))
 
+    def close_pull_request(
+        self,
+        *,
+        credential: GitHubProfileUserAccessToken,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        pull_number: int,
+    ) -> GitHubPullRequestCloseResult:
+        """Request closure of one addressed pull request (the documented update).
+
+        The documented ``PATCH /repos/{owner}/{repo}/pulls/{pull_number}``
+        operation with ``state=closed`` under the exact Profile-bound
+        user-to-server credential (issue #143): closing a canonical pull
+        request is an Owner-accountable engineering-record mutation,
+        externally attributed to the accountable Profile's authorized
+        GitHub account — an installation token can never reach it and there
+        is no installation-token fallback. Closure authority derives from
+        the App's pull-request write validated at route/access time — never
+        from a read permission — and the routed installation identity
+        remains part of the operation's address. The request carries only
+        the documented ``state`` update.
+
+        A definitive non-success GitHub answered for the addressed
+        operation (validation failure, missing target) is the known
+        ``REJECTED`` outcome — GitHub applied nothing. Authentication/access
+        absence, rate limits, and uncertain outcomes (timeout, connection
+        loss, refused redirect on this mutating request, 5xx,
+        uninterpretable answer) raise the adapter's classified errors — an
+        uncertain close outcome is never silently replayed or reclassified,
+        and a definitive 401-style rejection propagates for the service's
+        single bounded user-token recovery pass (issue #142 lifecycle).
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        require_positive_int(pull_number, "pull_number")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _CLOSE_PULL_REQUEST_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_CLOSE_PULL_REQUEST_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+                github_pull_request_number=pull_number,
+            )
+            path = GITHUB_REPOSITORY_PULL_REQUEST_PATH.format(
+                owner=owner_login, repo=repository_name, pull_number=pull_number
+            )
+            body = json.dumps({"state": "closed"}).encode("utf-8")
+            try:
+                response = self._patch_with_user_access_token(credential, path, body)
+            except (
+                GitHubAuthenticationRejectedError,
+                GitHubAuthorizationRejectedError,
+                GitHubRateLimitedError,
+            ):
+                raise
+            except GitHubRequestRejectedError:
+                # A definitive non-success GitHub answered for the addressed
+                # operation itself (validation failure, missing target): the
+                # closure applied nothing. GitHub owns the policy; OpenOrc
+                # reports the known rejection.
+                return GitHubPullRequestCloseResult(
+                    outcome=GitHubPullRequestCloseOperation.REJECTED, pull_request=None
+                )
+            return GitHubPullRequestCloseResult(
+                outcome=GitHubPullRequestCloseOperation.CLOSED,
+                pull_request=parse_pull_request_facts(_json_body(response)),
+            )
+
     def get_issue_blocked_by(
         self,
         *,
@@ -1367,6 +1451,23 @@ class HttpGitHubAppClient:
         return self._transport.request(
             path,
             method="PUT",
+            authorization=f"Bearer {credential.access_token.token_value()}",
+            body=body,
+        )
+
+    def _patch_with_user_access_token(
+        self, credential: GitHubProfileUserAccessToken, path: str, body: bytes
+    ) -> GitHubHttpResponse:
+        """Perform one Owner-accountable user-token PATCH (PR-close update).
+
+        The same contract as :meth:`_post_with_user_access_token`: the raw
+        value is read only at this final request-construction boundary, a
+        definitive 401-style rejection propagates for the service's bounded
+        recovery, and uncertain outcomes are never replayed.
+        """
+        return self._transport.request(
+            path,
+            method="PATCH",
             authorization=f"Bearer {credential.access_token.token_value()}",
             body=body,
         )

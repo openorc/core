@@ -421,3 +421,34 @@ def parse_merge_response_payload(payload: object) -> GitHubMergeRequestResult:
     return GitHubMergeRequestResult(
         outcome=GitHubMergeRequestOutcome.MERGED, merge_commit_sha=merge_commit_sha
     )
+
+
+class GitHubPullRequestCloseOperation(Enum):
+    """The documented response classes of one pull-request closure request.
+
+    - ``CLOSED`` — the documented successful PR update: GitHub answered the
+      addressed PR payload after applying the ``state=closed`` update.
+    - ``REJECTED`` — a definitive non-success GitHub answered for the
+      addressed operation (validation failure, missing target): GitHub
+      applied nothing. Authentication/access absence, rate limits, and
+      uncertain outcomes raise the adapter's classified errors instead of a
+      result.
+    """
+
+    CLOSED = "closed"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubPullRequestCloseResult:
+    """Normalized result of one pull-request closure request.
+
+    ``pull_request`` carries the normalized PR facts of the successful
+    update answer; the known rejection carries none because GitHub applied
+    nothing. The close request itself is an update of the addressed PR —
+    the durable workflow truth is whatever the caller's authoritative
+    reconciliation observes afterwards, never this response alone.
+    """
+
+    outcome: GitHubPullRequestCloseOperation
+    pull_request: GitHubPullRequestFacts | None

@@ -182,4 +182,43 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
   The terminal stamp remains non-NULL exactly when the status is not
   pending, and no other column, index, or privilege changed.
 
+
+## Owner-control one-shot external-effect intents (issue #228)
+
+- `openorc.task_interrupt_intents` is the Owner Abort command's one-shot
+  exact-session Interrupt intent: registered unsettled, atomically with the
+  `owner_action_required` TaskBlock and the `blocked` transition, one row
+  per exact admitted Task/role session carrying the binding identity, the
+  opaque external session identity, the accountable Owner Profile, and a
+  forward-only status (`unsettled` → `settled`/`failed`/`unknown`). The
+  partial unique index admits at most one unsettled intent per session
+  binding, so a duplicate Abort can never blind-duplicate a pending
+  uncertainty; `outcome` is a small canonical JSON object of safe machine
+  facts only.
+- `openorc.task_pull_request_close_intents` is the Task cancellation's
+  one-shot PR-close obligation, committed atomically with the terminal
+  archival whenever the canonical open/unmerged pull request may require
+  closure: `unique (task_id)` mirrors the canonical `TaskPullRequest`
+  (one Task, at most one close intent ever), the stable `github_pr_id` and
+  the accountable Owner Profile are persisted at decision time, and the
+  forward-only status (`pending` → `close_requested`/`no_action`/
+  `failed`/`unknown`) keeps the obligation observable across a crash
+  between archival and the external closure attempt. Archived terminal
+  Task history is never rewritten by any outcome.
+- Both subject references are COMPOSITE subject foreign keys enforcing
+  direct-scope coherence at the database: the Interrupt intent's session
+  edge binds `(task_agent_session_id, task_id, workspace_id)` against the
+  existing `task_agent_sessions_id_task_id_workspace_id_uniq` hook
+  (migration 20260917231843), and the close intent's PR edge binds
+  `(task_pull_request_id, task_id, workspace_id)` against the canonical
+  record's existing `unique (id, task_id, workspace_id)` — an intent can
+  never reference another Task's (or another Workspace's) session or
+  canonical PR.
+- Deletion ownership follows the established classification: both tables
+  cascade from their Task/Workspace (true ownership), the interrupted
+  session binding and the canonical PR record cascade (the intents are
+  meaningless without their subjects), and the accountable Profile edge
+  cascades with the account root. No new privilege is granted: the
+  openorc schema lockout carries isolation.
+
 Read persistence, domain/services, API, and frontend guidance when schema/auth/type changes cross those boundaries.

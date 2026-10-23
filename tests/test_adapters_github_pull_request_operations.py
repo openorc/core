@@ -52,6 +52,7 @@ from openorc.adapters.github.observations_checks import (
 )
 from openorc.adapters.github.observations_pull_request import (
     GitHubMergeRequestOutcome,
+    GitHubPullRequestCloseOperation,
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     parse_merge_response_payload,
@@ -1094,4 +1095,82 @@ def test_create_pull_request_uninterpretable_success_is_uncertain() -> None:
             base_ref="main",
             title="feat: task 42",
             body=None,
+        )
+
+
+def test_close_pull_request_uses_the_documented_update_operation() -> None:
+    fetch = FakeFetcher([_json(200, {}, _pr_payload(state="closed", merged=False))])
+
+    result = _client(fetch).close_pull_request(
+        credential=_user_credential(),
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        pull_number=_PULL_NUMBER,
+    )
+
+    assert result.outcome is GitHubPullRequestCloseOperation.CLOSED
+    assert result.pull_request is not None
+    assert result.pull_request.github_pr_id == 900_719_925_474_099
+    assert result.pull_request.state == "closed"
+    # The documented PR update: PATCH with the state=closed body.
+    assert fetch.calls[0][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls/77"
+    assert fetch.calls[0][1] == "PATCH"
+    assert json.loads(fetch.calls[0][4] or b"{}") == {"state": "closed"}
+    _assert_owner_write_auth(fetch)
+
+
+def test_close_pull_request_definitive_rejections_are_github_owned() -> None:
+    # 422 (validation) is a documented definitive rejection GitHub owns; the
+    # closure applied nothing.
+    fetch = FakeFetcher([_json(422, {}, {"message": "validation failed"})])
+
+    result = _client(fetch).close_pull_request(
+        credential=_user_credential(),
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        pull_number=_PULL_NUMBER,
+    )
+
+    assert result.outcome is GitHubPullRequestCloseOperation.REJECTED
+    assert result.pull_request is None
+    _assert_owner_write_auth(fetch)
+
+
+def test_close_pull_request_access_rejections_are_classified() -> None:
+    fetch = FakeFetcher([_json(403, {}, {"message": "Forbidden"})])
+    with pytest.raises(GitHubAuthorizationRejectedError):
+        _client(fetch).close_pull_request(
+            credential=_user_credential(),
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            pull_number=_PULL_NUMBER,
+        )
+
+
+def test_close_pull_request_uncertain_outcomes_are_classified() -> None:
+    fetch = FakeFetcher([_json(500, {}, {"message": "boom"})])
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).close_pull_request(
+            credential=_user_credential(),
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            pull_number=_PULL_NUMBER,
+        )
+
+
+def test_close_pull_request_uninterpretable_success_is_uncertain() -> None:
+    # A 200 answer whose payload cannot be interpreted is an uncertain
+    # outcome — never a silently accepted success.
+    fetch = FakeFetcher([_json(200, {}, {"unexpected": "shape"})])
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).close_pull_request(
+            credential=_user_credential(),
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+            pull_number=_PULL_NUMBER,
         )
