@@ -50,21 +50,13 @@
 -- edges cascade too — as COMPOSITE subject foreign keys, so an intent can
 -- never reference another Task's (or another Workspace's) session or
 -- canonical PR: the session edge binds (id, task_id, workspace_id) against
--- the composite uniqueness hook added to ``task_agent_sessions`` here, and
--- the PR edge binds (id, task_id, workspace_id) against the canonical
--- record's existing ``unique (id, task_id, workspace_id)`` hook; the
--- accountable Profile edge cascades with the account root. No new privilege
--- is granted here: the openorc schema lockout established by the
--- create_openorc_schema migration carries isolation, and runtime access is
--- backend-only.
-
--- The composite uniqueness hook the Interrupt intent's subject foreign key
--- binds against (the sessions table deliberately carries no (id,
--- workspace_id) hook of its own; this additive constraint follows the
--- ``tasks_id_workspace_id_uniq`` precedent).
-alter table openorc.task_agent_sessions
-    add constraint task_agent_sessions_id_task_id_workspace_id_uniq
-    unique (id, task_id, workspace_id);
+-- the EXISTING ``task_agent_sessions_id_task_id_workspace_id_uniq`` hook
+-- (migration 20260917231843), and the PR edge binds (id, task_id,
+-- workspace_id) against the canonical record's existing ``unique (id,
+-- task_id, workspace_id)`` hook; the accountable Profile edge cascades with
+-- the account root. No new privilege is granted here: the openorc schema
+-- lockout established by the create_openorc_schema migration carries
+-- isolation, and runtime access is backend-only.
 
 create table openorc.task_interrupt_intents (
     id uuid primary key default gen_random_uuid(),

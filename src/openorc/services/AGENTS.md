@@ -831,15 +831,16 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   command: stop OpenOrc first, then interrupt ClineBox. Its dispatch phase
   (current Task in `planning`/`implementing`/`reviewing`, or at a pending
   OwnerGate with a demonstrably in-flight runtime interaction) proves the
-  account/Owner/currentness guards before any Cline I/O, resolves the exact
-  existing bound `TaskAgentSession` targets, and binds EACH admitted
-  role/session to its durable in-flight workflow activity before recording
-  anything: a Producer target must own a durably OPEN Execution anchored to
-  that exact session (`producer_session_id`), and a Reviewer target must own
-  an OPEN ReviewLoop carrying an unfinalized ReviewIteration — the
-  dispatched review turn still in flight. An ordinary exhausted-loop OwnerGate
-  with no such fact is idle and refuses (no interrupting an idle session
-  over a visible gate). The atomic composition then applies the
+  account/Owner/currentness guards before any Cline I/O, and resolves the
+  exact existing bound `TaskAgentSession` targets. Eligibility is
+  phase-specific: the autonomous phases (`planning`/`implementing`/
+  `reviewing`) are eligible against their appropriate existing bound
+  runtime session, while a WAITING_FOR_OWNER Task must demonstrate in-flight
+  activity — an ordinary pending gate does not establish active work, so a
+  Producer target must own a durably OPEN Execution anchored to that exact
+  session (`producer_session_id`) and a Reviewer target an OPEN ReviewLoop
+  carrying an unfinalized ReviewIteration; an idle gate refuses. The atomic
+  composition then applies the
   `owner_action_required` TaskBlock with the safe `owner_abort` context, the
   `blocked` transition under the rotated token (a pending gate stays
   truthful pending history, unusable while blocked), the OWNER
@@ -855,12 +856,16 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   (`TaskInterruptSettlement`) it refuses and surfaces the unresolved
   interruption; with it, `ClineAdapter.settle_abort` runs outside any
   transaction and a positively settled intent is the only state in which
-  Cancel becomes available. Positive cessation also applies the exact
-  -attempt accounting: the Task's durably open Execution attempts
+  Cancel becomes available. The settlement records and the exact-attempt
+  Execution accounting commit in ONE short transaction after the positive
+  cessation was established: the Task's durably open Execution attempts
   transition to the existing `cancelled` final status through the guarded
   conditional primitive (truthful history preserved — no invented
-  completion result, no interruption state machine), so the later Cancel
-  eligibility veto no longer sees outstanding runtime work. The Task stays
+  completion result, no interruption state machine), so a crash can never
+  leave a settled interruption with an unaccounted open Execution vetoing
+  Cancel while the settlement entrypoint could not run again; the
+  still-unsettled durable state remains truthfully re-settleable instead.
+  The Task stays
   `blocked` regardless of the Interrupt outcome; late formal results can
   never advance it; terminal session identities are preserved (no
   `stop`/`start`/`send`, no replacement session, no prompt).

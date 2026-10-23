@@ -208,8 +208,8 @@ Supabase/Postgres schema, migrations, persistence integration, and Supabase Auth
 - Both subject references are COMPOSITE subject foreign keys enforcing
   direct-scope coherence at the database: the Interrupt intent's session
   edge binds `(task_agent_session_id, task_id, workspace_id)` against the
-  `task_agent_sessions_id_task_id_workspace_id_uniq` hook this migration
-  adds to `task_agent_sessions`, and the close intent's PR edge binds
+  existing `task_agent_sessions_id_task_id_workspace_id_uniq` hook
+  (migration 20260917231843), and the close intent's PR edge binds
   `(task_pull_request_id, task_id, workspace_id)` against the canonical
   record's existing `unique (id, task_id, workspace_id)` — an intent can
   never reference another Task's (or another Workspace's) session or

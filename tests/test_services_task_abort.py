@@ -44,6 +44,7 @@ from openorc.domain.executions import ExecutionStatus
 from openorc.domain.intents import TaskInterruptIntentStatus
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import executions as execution_records
+from openorc.persistence import intents as intent_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
@@ -656,6 +657,103 @@ def test_a_lost_or_ended_session_binding_cannot_be_interrupted() -> None:
         assert _count(conn, _BLOCK_INSERT) == 0
 
 
+def test_abort_eligibility_covers_the_autonomous_planning_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The autonomous phases are eligible for Owner Abort against their
+    # appropriate existing bound runtime session without further durable
+    # activity proof; only a WAITING_FOR_OWNER gate must demonstrate it.
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="planning", session=_ready_session_row())
+    conn.on(_INTENTS_LIST, [])
+    conn.on(_BLOCK_INSERT, _block_row())
+    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_INTENT_INSERT, _intent_row())
+    conn.on(_INTENT_UPDATE, _intent_row(outcome={"dispatch": "acknowledged"}))
+    adapter = _FakeClineAdapter()
+
+    outcome = _dispatch_call(_pool(conn), adapter)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
+    assert _event_types(conn) == ["task_blocked"]
+
+
+def test_settlement_recording_and_execution_accounting_commit_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The crash boundary between the settlement records and the interrupted
+    Execution accounting cannot persist a half-settled state: one failure
+    inside the recording transaction rolls the settlement outcomes AND the
+    execution accounting back together, leaving the durable intents
+    unsettled (truthfully re-settleable) and the Execution untouched."""
+    conn = ScriptedConnection()
+    second_intent = _intent_row(intent_id=uuid4(), role="reviewer", external_id="fake-session-2")
+    _script_settlement_head(conn, intents=[_intent_row(), second_intent])
+    execution = _open_execution()
+    accounted = _wire_activity(monkeypatch, executions=[execution])
+    adapter = _FakeClineAdapter()
+
+    real_record = intent_records.record_task_interrupt_intent_outcome
+    recorded_ids: list[Any] = []
+
+    def _record(pool: Any, *, task_interrupt_intent_id: Any, status: Any, outcome: Any) -> Any:
+        recorded_ids.append(task_interrupt_intent_id)
+        if len(recorded_ids) == 2:
+            raise RuntimeError("forced settlement recording failure")
+        return real_record(
+            pool,
+            task_interrupt_intent_id=task_interrupt_intent_id,
+            status=status,
+            outcome=outcome,
+        )
+
+    monkeypatch.setattr(intent_records, "record_task_interrupt_intent_outcome", _record)
+    conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+
+    with pytest.raises(RuntimeError, match="forced settlement recording failure"):
+        _settlement_call(
+            _pool(conn),
+            adapter,
+            settlement=TaskInterruptSettlement(
+                runtime_work_settled=True, operation_accounted_for=True
+            ),
+        )
+
+    assert len(adapter.settle_calls) == 2
+    # The accounting never applied: no transition and the Execution is still
+    # durably open, exactly as the rollback left it.
+    assert accounted == []
+    assert execution.status is ExecutionStatus.RUNNING
+
+    # The still-unsettled durable state is truthfully re-settleable: a
+    # retried settlement completes and applies the accounting atomically.
+    monkeypatch.setattr(intent_records, "record_task_interrupt_intent_outcome", real_record)
+    _script_settlement_head(conn, intents=[_intent_row(), second_intent])
+    conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(
+            intent_id=second_intent[0],
+            role="reviewer",
+            external_id="fake-session-2",
+            status="settled",
+            outcome={"settlement": "confirmed"},
+        ),
+    )
+
+    retry = _settlement_call(
+        _pool(conn),
+        adapter,
+        settlement=TaskInterruptSettlement(runtime_work_settled=True, operation_accounted_for=True),
+    )
+
+    assert retry.kind is TaskAbortOutcomeKind.SETTLED
+    assert accounted == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
+    assert execution.status is ExecutionStatus.CANCELLED
+
+
 def test_malformed_abort_commands_fail_before_any_state_is_touched() -> None:
     conn = ScriptedConnection()
     adapter = _FakeClineAdapter()
@@ -691,27 +789,6 @@ def test_malformed_abort_commands_fail_before_any_state_is_touched() -> None:
     assert conn.executed == []
 
 
-def test_abort_rejects_a_target_role_without_in_flight_activity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The Producer owns the open Execution; an admitted REVIEWER target has
-    # no unfinalized review turn, so the wrong-role command is refused
-    # before any block or Interrupt intent is recorded.
-    conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
-    _wire_activity(monkeypatch, executions=[_open_execution()])
-    conn.on(_INTENTS_LIST, [])
-    adapter = _FakeClineAdapter()
-
-    with pytest.raises(ConflictError, match="reviewer session owns no durably admitted"):
-        _dispatch_call(_pool(conn), adapter, target_roles=(WorkflowRole.REVIEWER,))
-
-    assert adapter.abort_calls == []
-    assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
-    assert _event_types(conn) == []
-
-
 def test_abort_rejects_an_idle_owner_gate_without_in_flight_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -731,21 +808,3 @@ def test_abort_rejects_an_idle_owner_gate_without_in_flight_activity(
         assert _count(conn, _BLOCK_INSERT) == 0
         assert _count(conn, _STATUS_UPDATE) == 0
         assert _event_types(conn) == []
-
-
-def test_abort_rejects_a_producer_target_bound_to_another_sessions_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The open Execution anchors a DIFFERENT Producer session: this Task's
-    # resolved producer binding owns no in-flight implementation work.
-    conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
-    _wire_activity(monkeypatch, executions=[_open_execution(producer_session_id=uuid4())])
-    conn.on(_INTENTS_LIST, [])
-    adapter = _FakeClineAdapter()
-
-    with pytest.raises(ConflictError, match="producer session owns no durably admitted"):
-        _dispatch_call(_pool(conn), adapter)
-
-    assert adapter.abort_calls == []
-    assert _count(conn, _STATUS_UPDATE) == 0
