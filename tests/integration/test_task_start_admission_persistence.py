@@ -299,7 +299,7 @@ def _insert_task(
     github_issue_id: int = 100000,
     github_issue_number: int = 100,
     status: str = "ready_to_plan",
-    fingerprint: str = _FINGERPRINT,
+    fingerprint: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     task_id = uuid.uuid4()
     state_token = uuid.uuid4()
@@ -316,6 +316,8 @@ def _insert_task(
             github_issue_number,
             status,
             state_token,
+            # Intake records NO source baseline (issue #233): Owner Start
+            # freezes it atomically with the ready_to_plan transition.
             fingerprint,
         ),
     )
@@ -349,9 +351,11 @@ def _set_role_bindings(
 def _queue_task(conn: Connection[Any], task_id: uuid.UUID, state_token: uuid.UUID) -> Any:
     row = conn.execute(
         "update openorc.tasks set status = 'queued', queued_at = now(), "
+        "source_requirements_fingerprint = "
+        "coalesce(source_requirements_fingerprint, %s), "
         "state_token = gen_random_uuid() where id = %s and state_token = %s "
         "returning queued_at, state_token",
-        (task_id, state_token),
+        (_FINGERPRINT, task_id, state_token),
     ).fetchone()
     assert row is not None
     return row
@@ -396,7 +400,14 @@ def test_queue_entry_timestamp_is_stable_iff_queued_and_fifo_ordered(
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
     first_queued = task_records.update_task_status(
-        pool, first_id, expected_state_token=first_token, status=TaskStatus.QUEUED
+        pool,
+        first_id,
+        expected_state_token=first_token,
+        status=TaskStatus.QUEUED,
+        # Entering queued IS a start (issue #233): the frozen baseline is
+        # captured atomically with the transition — the status-aware CHECK
+        # would reject a NULL-baseline queued row.
+        capture_source_requirements_fingerprint=_FINGERPRINT,
     )
     assert first_queued is not None
     assert first_queued.status is TaskStatus.QUEUED
@@ -479,12 +490,17 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
     assert _active_session_count(conn, connection_id) == 2
     assert _planning_event_count(conn, task_id) == 1
     row = conn.execute(
-        "select status, queued_at, state_token from openorc.tasks where id = %s", (task_id,)
+        "select status, queued_at, state_token, source_requirements_fingerprint "
+        "from openorc.tasks where id = %s",
+        (task_id,),
     ).fetchone()
     assert row is not None
     assert row[0] == "planning"
     assert row[1] is None
     assert row[2] != state_token
+    # The successful start froze the freshly reconciled requirements
+    # fingerprint atomically with the planning claim (issue #233).
+    assert row[3] == _FINGERPRINT
 
     # Replaying the start for the claimed Task never issues another
     # admission, event, or session.
@@ -523,11 +539,16 @@ def test_structurally_infeasible_start_is_an_error_without_a_queue_write(
         )
 
     row = conn.execute(
-        "select status, queued_at from openorc.tasks where id = %s", (task_id,)
+        "select status, queued_at, source_requirements_fingerprint from openorc.tasks "
+        "where id = %s",
+        (task_id,),
     ).fetchone()
     assert row is not None
     assert row[0] == "ready_to_plan"
     assert row[1] is None
+    # A failed start leaves NO baseline: the Task stays ready_to_plan with
+    # the NULL fingerprint it was intaken with (issue #233).
+    assert row[2] is None
     assert _active_session_count(conn, connection_id) == 0
 
 

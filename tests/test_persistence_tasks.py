@@ -180,6 +180,30 @@ def test_create_task_maps_row_and_normalizes_utc() -> None:
     assert "9001" not in sql
 
 
+def test_create_task_inserts_a_null_baseline_for_ready_to_plan_intake() -> None:
+    # Issue discovery and explicit Owner intake create NO source baseline
+    # (issue #233): the fingerprint stays NULL until a successful Owner
+    # Start freezes it atomically with the ready_to_plan transition.
+    row = _task_row(source_requirements_fingerprint=None)
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    created = create_task(
+        pool,
+        workspace_id=row[1],
+        repository_id=row[2],
+        github_issue_id=9001,
+        github_issue_number=42,
+        status=TaskStatus.READY_TO_PLAN,
+    )
+
+    assert created.status is TaskStatus.READY_TO_PLAN
+    assert created.source_requirements_fingerprint is None
+    sql, params = fake_conn.executed[0]
+    assert params is not None
+    assert params == (row[1], row[2], 9001, 42, "ready_to_plan", None)
+
+
 def test_create_task_rejects_terminal_status_before_any_sql() -> None:
     fake_conn = FakeConnection()
     pool = cast(DatabasePool, FakePool(fake_conn))
@@ -322,11 +346,47 @@ def test_update_task_status_is_conditional_and_rotates_the_token() -> None:
     assert "where id = %s and state_token = %s and archived_at is null" in sql
     assert params == (
         "waiting_for_owner",
+        # The default no-capture: the coalesce keeps any existing baseline
+        # and this caller passes nothing to freeze (issue #233).
+        None,
         "waiting_for_owner",
         "waiting_for_owner",
         row[0],
         original_token,
     )
+
+
+def test_update_task_status_captures_the_frozen_baseline_atomically() -> None:
+    # The Owner Start commitment (issue #233): the freshly verified
+    # requirements fingerprint is frozen by the SAME conditional,
+    # token-rotating statement that transitions the Task, and the coalesce
+    # capture can never rewrite an existing frozen baseline.
+    # The canned row mirrors the post-mutation row the database would return:
+    # the planning claim with the frozen baseline (queued_at cleared by the
+    # same statement when the Task leaves queued).
+    original_token = uuid.uuid4()
+    row = _task_row(
+        status="planning",
+        source_requirements_fingerprint="b" * 64,
+        state_token=uuid.uuid4(),
+    )
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    updated = update_task_status(
+        pool,
+        row[0],
+        expected_state_token=original_token,
+        status=TaskStatus.PLANNING,
+        capture_source_requirements_fingerprint="b" * 64,
+    )
+
+    assert updated is not None
+    assert updated.status is TaskStatus.PLANNING
+    sql, params = fake_conn.executed[0]
+    assert "source_requirements_fingerprint = coalesce(source_requirements_fingerprint, %s)" in sql
+    assert params is not None
+    assert params[1] == "b" * 64
 
 
 def test_update_task_status_returns_none_when_token_is_stale() -> None:

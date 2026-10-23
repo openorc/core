@@ -350,7 +350,7 @@ def _task_row(
     issue_number: int = 52,
     status: str = "implementing",
     canonical_feature_branch: str | None = None,
-    fingerprint: str = _FINGERPRINT_BASE,
+    fingerprint: str | None = _FINGERPRINT_BASE,
 ) -> tuple[Any, ...]:
     return (
         task_id,
@@ -376,7 +376,7 @@ def _open_issue_row(
     github_issue_id: int,
     issue_number: int,
     state: str = "open",
-    fingerprint: str = _FINGERPRINT_BASE,
+    fingerprint: str | None = _FINGERPRINT_BASE,
 ) -> tuple[Any, ...]:
     return (
         uuid.uuid4(),
@@ -798,6 +798,41 @@ def test_unchanged_requirements_report_no_drift(harness_factory) -> None:
     assert issue_outcome.task_baseline_drift is False
     assert issue_outcome.issue_requirements_changed is False
     assert issue_outcome.issue_created is False
+    _assert_no_durable_writes(harness)
+
+
+def test_a_never_started_task_reports_no_baseline_comparison(harness_factory) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [_open_issue_row(github_issue_id=501, issue_number=51)])
+    conn.on(
+        "from openorc.tasks",
+        [_task_row(github_issue_id=501, issue_number=51, status="ready_to_plan", fingerprint=None)],
+    )
+    conn.on("from openorc.tasks", [])
+    conn.on("order by received_at, id limit %s", [])
+    harness.issue_reconcile.results = [
+        _issue_reconciliation(fingerprint=_FINGERPRINT_NEW, requirements_changed=True)
+    ]
+    harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
+    harness.hierarchy.results = [HierarchySyncResult(changed=False)]
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+
+    issue_outcome = next(
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.ISSUE
+    )
+    # A never-started Task (issue #233) carries no frozen baseline, so
+    # pre-start requirements changes are not drift evidence: the projection
+    # refresh is reported, and there is no baseline comparison to make —
+    # the same no-baseline outcome as an issue with no current Task.
+    assert issue_outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+    assert issue_outcome.task_baseline_drift is None
+    assert issue_outcome.issue_requirements_changed is True
+    assert issue_outcome.issue_current_fingerprint == _FINGERPRINT_NEW
     _assert_no_durable_writes(harness)
 
 

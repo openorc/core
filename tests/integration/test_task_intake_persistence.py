@@ -1,10 +1,10 @@
 """Integration coverage for the authoritative Task intake (issue #60).
 
 Real-Postgres, integration-marked coverage for the Task source baseline and
-the current-Task race backstop the deterministic suite cannot execute: the
-intake-created Task records the exact reconciled fingerprint, a lost
-current-Task uniqueness race leaves exactly one current Task, and archived
-attempts release the issue for a fresh attempt. Run explicitly by the Owner
+the current-Task race backstop the deterministic suite cannot execute: intake
+records NO source baseline (issue #233 — Owner Start freezes it), an archived
+attempt retains exactly the baseline it froze, and a lost current-Task
+uniqueness race leaves exactly one current Task. Run explicitly by the Owner
 through the documented ``--testdb`` command.
 """
 
@@ -19,7 +19,6 @@ from psycopg.errors import UniqueViolation
 pytestmark = pytest.mark.integration
 
 _FINGERPRINT_A = "a" * 64
-_FINGERPRINT_B = "b" * 64
 
 
 def _create_workspace_graph(conn: Connection) -> tuple[object, object]:
@@ -59,7 +58,7 @@ def _intake_task(
     workspace_id: object,
     repository_id: object,
     github_issue_id: int,
-    fingerprint: str,
+    fingerprint: str | None = None,
     task_id: object | None = None,
 ) -> None:
     conn.execute(
@@ -78,41 +77,34 @@ def _intake_task(
     )
 
 
-def test_the_source_baseline_is_immutable_attempt_history(conn: Connection) -> None:
+def test_intake_records_no_baseline_and_history_retains_what_it_froze(
+    conn: Connection,
+) -> None:
     workspace_id, project_id = _create_workspace_graph(conn)
     repository_id = _create_repository(conn, workspace_id, project_id, 111)
-    _intake_task(conn, workspace_id, repository_id, 503, _FINGERPRINT_A)
-    row = conn.execute(
-        "select source_requirements_fingerprint from openorc.tasks "
-        "where repository_id = %s and github_issue_id = %s",
-        (repository_id, 503),
-    ).fetchone()
-    assert row is not None and row[0] == _FINGERPRINT_A
-    # A later requirements change never rewrites the recorded baseline; a
-    # fresh attempt for the same issue may carry a different one.
+    # A started attempt that reached its terminal outcome retains the frozen
+    # baseline it committed at Owner Start (never rewritten, never erased).
+    started_id = uuid.uuid4()
     conn.execute(
-        "update openorc.tasks set archived_at = now(), status = 'cancelled' "
-        "where repository_id = %s",
-        (repository_id,),
+        "insert into openorc.tasks "
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "archived_at, source_requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, 'cancelled', now(), %s)",
+        (started_id, workspace_id, repository_id, 503, 42, _FINGERPRINT_A),
     )
-    _intake_task(conn, workspace_id, repository_id, 503, _FINGERPRINT_B)
-    # The semantic contract, asserted directly rather than through insertion
-    # order: both attempts are created inside one outer transaction, so
-    # now() is transaction-stable and created_at may be identical — created_at
-    # ordering is not an insertion order. Exactly the two expected attempts
-    # exist; the archived/cancelled historical attempt still carries the
-    # exactly observed baseline (never rewritten), and the current
-    # non-archived attempt carries the fresh fingerprint.
+    # The fresh intake attempt for the same issue carries NO baseline: the
+    # corrected contract freezes it only at a successful Owner Start.
+    _intake_task(conn, workspace_id, repository_id, 503)
     attempts = conn.execute(
-        "select source_requirements_fingerprint, archived_at from openorc.tasks "
-        "where repository_id = %s",
+        "select source_requirements_fingerprint, archived_at, status from openorc.tasks "
+        "where repository_id = %s order by created_at, id",
         (repository_id,),
     ).fetchall()
     assert len(attempts) == 2
     archived = [attempt for attempt in attempts if attempt[1] is not None]
     current = [attempt for attempt in attempts if attempt[1] is None]
     assert len(archived) == 1 and archived[0][0] == _FINGERPRINT_A
-    assert len(current) == 1 and current[0][0] == _FINGERPRINT_B
+    assert len(current) == 1 and current[0][0] is None and current[0][2] == "ready_to_plan"
 
 
 def test_a_racing_duplicate_intake_keeps_exactly_one_current_task(

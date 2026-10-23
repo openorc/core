@@ -4,7 +4,8 @@ Start an already-intaken, current, ``ready_to_plan`` Task only after fresh
 authoritative GitHub eligibility; fairly arbitrate the required Producer and
 Reviewer capacity across the Owner-configured Connection routes; durably
 queue the Task when capacity is temporarily occupied; and claim the Task for
-bootstrap (``planning``) atomically with both role reservations. The queue
+bootstrap (``planning``) atomically with both role reservations AND the
+frozen requirements baseline. The queue
 order is the durable ``(queued_at, id)`` Task fact — never an RQ/Valkey job,
 a second queue table, or process memory — and every decision is one short,
 database-only transaction.
@@ -22,15 +23,22 @@ The two invocable commands:
   or a second logical start) before any GitHub work. The GitHub freshness
   phase — no database transaction open — revalidates the exact same stable
   Repository + issue identity, the issue's OPEN state, the not-blocked-by
-  dependency state, and the requirements fingerprint against the Task's
-  immutable source baseline; drift, a blocked/closed issue, an unobservable
-  blocking state, or a lost route is NOT capacity waiting and fails closed as
-  the typed non-start condition (generalized TaskBlock/source-drift recovery
-  remains issue #85). The arbitration phase composes the account barrier
-  FIRST again, the per-Workspace advisory arbitration lock, the locked Task
-  re-read bound to the caller's exact ``state_token``, the durable
-  projection-based eligibility guard, the structural feasibility verdict, one
-  bounded FIFO establishment pass, and the target's own decision.
+  dependency state, and freshly reconciles the requirements fingerprint the
+  successful start will freeze: the Task carries NO baseline before Start
+  (issue #233), so issue title/body edits while it remains
+  ``ready_to_plan`` are not source drift; a blocked/closed issue, an
+  unobservable blocking state, or a lost route is NOT capacity waiting and
+  fails closed as the typed non-start condition (generalized TaskBlock/
+  source-drift recovery remains issue #85). The arbitration phase composes
+  the account barrier FIRST again, the per-Workspace advisory arbitration
+  lock, the locked Task re-read bound to the caller's exact ``state_token``,
+  the durable projection-based eligibility guard (against the fingerprint
+  being frozen), the structural feasibility verdict, one bounded FIFO
+  establishment pass, and the target's own decision — which freezes the
+  freshly verified fingerprint atomically with the ``planning`` claim or the
+  durable ``queued`` entry (a capacity-queued Task has started for
+  authority/baseline purposes even though agents have not yet run); a
+  losing, stale, or failed start leaves no baseline.
 - ``reevaluate_queued_tasks`` (system invocation over existing exact
   subjects; never a new Owner authorization and never changing the
   accountable Owner): bounded per-page arbitration units that scan the
@@ -128,7 +136,6 @@ __all__ = [
     "TaskCapacityConfigurationError",
     "TaskEligibilityContradictedError",
     "TaskEligibilityFailure",
-    "TaskSourceDriftError",
     "TaskSourceIdentityLossError",
     "TaskStartOutcome",
     "TaskStartQueueReason",
@@ -186,16 +193,6 @@ class TaskCapacityConfigurationError(ConflictError):
     capacity-1 Connection) — an actionable Owner configuration condition,
     never capacity waiting and never a queue state. Re-evaluate after the
     Owner changes the routing or capacity.
-    """
-
-
-class TaskSourceDriftError(ConflictError):
-    """The fresh authoritative requirements no longer match the Task baseline.
-
-    The Task's immutable ``source_requirements_fingerprint`` recorded at
-    intake no longer matches the current authoritative GitHub issue
-    requirements. This is source drift, not capacity waiting; generalized
-    durable TaskBlock/source-drift recovery remains issue #85.
     """
 
 
@@ -339,19 +336,32 @@ def _contradicted(reason: TaskEligibilityFailure) -> NoReturn:
     raise TaskEligibilityContradictedError(reason)
 
 
-def _require_durable_queue_eligibility(transaction_pool: DatabasePool, *, task: Task) -> None:
+def _require_durable_queue_eligibility(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    source_requirements_fingerprint: str | None = None,
+) -> None:
     """Prove the Task is still eligible against the durable GitHub projection.
 
     The database-only eligibility guard applied before claiming ANY Task's
     runtime capacity (issue #76): the durable projection for the Task's
     stable issue identity must exist, carry exactly that identity, report
-    the issue open, carry a requirements fingerprint equal to the Task's
-    immutable source baseline, and the mirrored blocked-by dependency state
-    must be empty. A Task that queued while eligible can become ineligible
-    while waiting; a capacity wakeup must not advance a known-changed Task.
-    No GitHub network call and no projection rewrite happens here — the
-    mirror is refreshed by the reconciliation capabilities, and this guard
-    revalidates against exactly what those capabilities durably observed.
+    the issue open, carry a requirements fingerprint equal to the compared
+    baseline, and the mirrored blocked-by dependency state must be empty. A
+    Task that queued while eligible can become ineligible while waiting; a
+    capacity wakeup must not advance a known-changed Task. No GitHub network
+    call and no projection rewrite happens here — the mirror is refreshed by
+    the reconciliation capabilities, and this guard revalidates against
+    exactly what those capabilities durably observed.
+
+    The compared requirements baseline is explicit (issue #233): a queued
+    candidate compares its own frozen baseline (the default, read from the
+    Task row), while a starting target compares the freshly verified
+    fingerprint that this same arbitration transaction will freeze — the
+    target's row baseline is still NULL until the capture commits. A NULL
+    compared baseline (possible only for a never-started Task outside its
+    own start) compares nothing.
     """
     projection = find_github_issue(
         transaction_pool, repository_id=task.repository_id, github_issue_id=task.github_issue_id
@@ -362,7 +372,12 @@ def _require_durable_queue_eligibility(transaction_pool: DatabasePool, *, task: 
         _contradicted(TaskEligibilityFailure.IDENTITY_LOST)
     if projection.state is not GitHubIssueState.OPEN:
         _contradicted(TaskEligibilityFailure.CLOSED_IN_PROJECTION)
-    if projection.requirements_fingerprint != task.source_requirements_fingerprint:
+    compared_baseline = (
+        source_requirements_fingerprint
+        if source_requirements_fingerprint is not None
+        else task.source_requirements_fingerprint
+    )
+    if compared_baseline is not None and projection.requirements_fingerprint != compared_baseline:
         _contradicted(TaskEligibilityFailure.FINGERPRINT_DRIFT)
     blockers = list_github_issue_blocked_by_edges(
         transaction_pool, repository_id=task.repository_id, github_issue_id=task.github_issue_id
@@ -372,22 +387,33 @@ def _require_durable_queue_eligibility(transaction_pool: DatabasePool, *, task: 
 
 
 def _claim_task_for_planning(
-    transaction_pool: DatabasePool, *, task: Task, actor: WorkflowActorContext
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    actor: WorkflowActorContext,
+    source_requirements_fingerprint: str | None = None,
 ) -> Task:
-    """Atomically claim the Task for bootstrap: planning + one logical start event.
+    """Atomically claim the Task for bootstrap: planning + baseline + one start event.
 
     The conditional, token-rotating status write (``queued_at`` is cleared by
     the same statement when the Task leaves ``queued``) and the
     ``planning_started`` event commit together as one durable logical claim.
-    A rejected write — a concurrent mutation won between the caller's locked
-    read and this write — is never applied and never retried blindly: the
-    typed stale outcome propagates to the caller's classification.
+    The Owner Start path passes ``source_requirements_fingerprint`` so the
+    freshly verified fingerprint is frozen by the SAME statement (issue
+    #233): the capture is conditioned on the still-NULL baseline, so a
+    successful planning claim and its immutable baseline commit — or roll
+    back — together. The queued-candidate sweep omits it: an already-queued
+    candidate's baseline is already frozen and the coalesce capture is a
+    no-op. A rejected write — a concurrent mutation won between the caller's
+    locked read and this write — is never applied and never retried blindly:
+    the typed stale outcome propagates to the caller's classification.
     """
     claimed = task_records.update_task_status(
         transaction_pool,
         task.id,
         expected_state_token=task.state_token,
         status=TaskStatus.PLANNING,
+        capture_source_requirements_fingerprint=source_requirements_fingerprint,
     )
     if claimed is None:
         raise StaleOperationError(
@@ -402,19 +428,30 @@ def _claim_task_for_planning(
     return claimed
 
 
-def _queue_task_for_capacity(transaction_pool: DatabasePool, *, task: Task) -> Task:
+def _queue_task_for_capacity(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    source_requirements_fingerprint: str | None = None,
+) -> Task:
     """Durably enter the Task into the FIFO capacity queue.
 
     The conditional, token-rotating status write stamps ``queued_at`` from
-    the database clock exactly once on entering ``queued``. No reservation is
-    made, no queue event exists, and the returned Task carries the entry
-    timestamp the FIFO order uses.
+    the database clock exactly once on entering ``queued``. The Owner Start
+    path passes ``source_requirements_fingerprint`` so the freshly verified
+    fingerprint is frozen by the SAME statement (issue #233): entering
+    ``queued`` IS a started Task for authority and baseline purposes even
+    though agents have not yet run, and the capture is conditioned on the
+    still-NULL baseline so it commits — or rolls back — atomically with the
+    queue entry. No reservation is made, no queue event exists, and the
+    returned Task carries the entry timestamp the FIFO order uses.
     """
     queued = task_records.update_task_status(
         transaction_pool,
         task.id,
         expected_state_token=task.state_token,
         status=TaskStatus.QUEUED,
+        capture_source_requirements_fingerprint=source_requirements_fingerprint,
     )
     if queued is None:
         raise StaleOperationError(
@@ -582,17 +619,23 @@ def _scan_and_advance_queue(
 
 def _revalidate_fresh_github_eligibility(
     pool: DatabasePool, github: GitHubAppClient, *, task: Task
-) -> None:
+) -> str:
     """Freshly revalidate the Task's authoritative eligibility (no transaction open).
 
-    The same B3/B4 critical path intake performs, over the existing Task's
-    immutable baseline instead of creating one: resolve the explicit
-    currently usable installation route; fresh issue reconciliation (the
-    exact same stable Repository + issue identity, the issue still OPEN,
-    the current requirements fingerprint); the fresh blocked-by dependency
-    observation. A changed source, a blocked/closed issue, an unobservable
-    blocking state, or a lost route is not capacity waiting: the typed
-    non-start condition fails closed.
+    The same B3/B4 critical path intake performs, without creating a
+    baseline: resolve the explicit currently usable installation route;
+    fresh issue reconciliation (the exact same stable Repository + issue
+    identity, the issue still OPEN, the current requirements fingerprint);
+    the fresh blocked-by dependency observation. A blocked/closed issue, an
+    unobservable blocking state, or a lost route is not capacity waiting:
+    the typed non-start condition fails closed.
+
+    Returns the freshly reconciled requirements fingerprint that a
+    successful start freezes (issue #233): the Task carries NO baseline
+    before Start, so there is nothing to compare against here — issue
+    title/body edits while the Task remains ``ready_to_plan`` are not source
+    drift, and the frozen baseline is exactly what this fresh observation
+    returns at the moment the start commits.
     """
     resolve_system_repository_installation_route(
         pool, workspace_id=task.workspace_id, repository_id=task.repository_id
@@ -612,11 +655,6 @@ def _revalidate_fresh_github_eligibility(
         raise TaskSourceIdentityLossError(
             "the fresh authoritative issue no longer carries the task's stable issue identity"
         )
-    if projection.requirements_fingerprint != task.source_requirements_fingerprint:
-        raise TaskSourceDriftError(
-            "the issue requirements changed since this task's eligibility was established; "
-            "the source baseline no longer matches"
-        )
     dependency_sync = synchronize_repository_issue_dependencies(
         pool,
         github,
@@ -629,6 +667,7 @@ def _revalidate_fresh_github_eligibility(
         raise IssueBlockedEligibilityError(
             "GitHub currently reports the addressed issue as blocked by an issue dependency"
         )
+    return projection.requirements_fingerprint
 
 
 def _require_startable_task(task: Task) -> None:
@@ -701,7 +740,8 @@ def start_task_for_owner(
             _require_startable_task(task)
         # Phase B: fresh authoritative eligibility, no database transaction
         # open (the B3/B4 critical path; an unobservable state fails closed).
-        _revalidate_fresh_github_eligibility(pool, github, task=task)
+        # The returned fingerprint is what a successful start freezes.
+        fresh_fingerprint = _revalidate_fresh_github_eligibility(pool, github, task=task)
         # Phase C: the arbitration decision under the serialization boundary.
         return _arbitrate_target_start(
             pool,
@@ -709,6 +749,7 @@ def start_task_for_owner(
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            source_requirements_fingerprint=fresh_fingerprint,
         )
 
 
@@ -719,6 +760,7 @@ def _arbitrate_target_start(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    source_requirements_fingerprint: str,
 ) -> TaskStartOutcome:
     """One short arbitration: FIFO establishment pass, then the target's decision.
 
@@ -727,9 +769,13 @@ def _arbitrate_target_start(
     capacity-releasing lifecycle transition composes, so no occupancy
     change can commit between the establishment scan and the decision. The
     locked re-read binds the decision to the caller's exact
-    ``state_token``; the durable eligibility guard, the structural verdict,
-    and the #68 all-or-nothing admission decide against one consistent
-    occupancy picture.
+    ``state_token``; the durable eligibility guard (against the freshly
+    verified fingerprint being frozen), the structural verdict, and the #68
+    all-or-nothing admission decide against one consistent occupancy
+    picture. A successful decision freezes
+    ``source_requirements_fingerprint`` in the same guarded statement that
+    claims ``planning`` or durably queues the Task (issue #233); a losing,
+    stale, or failed decision rolls back with no baseline.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _ARBITRATION_SPAN_NAME) as span:
         annotate_span(
@@ -756,9 +802,25 @@ def _arbitrate_target_start(
                     "the operation is stale"
                 )
             _require_startable_task(task)
+            if task.source_requirements_fingerprint is not None:
+                # Post-migration durable invariant (issue #233): a current
+                # ready_to_plan Task carries no baseline. A present baseline
+                # here would be a stale intake capture the corrected contract
+                # never froze — refuse instead of silently re-baselining or
+                # comparing against it.
+                raise ConflictError(
+                    "the current ready_to_plan task already carries a source "
+                    "requirements baseline; the corrected contract freezes it "
+                    "only at a successful Owner Start"
+                )
             # The fresh mirror Phase B just refreshed is the eligibility
-            # authority for the target's claim too.
-            _require_durable_queue_eligibility(transaction_pool, task=task)
+            # authority for the target's claim too; the compared baseline is
+            # the fingerprint this decision will freeze (issue #233).
+            _require_durable_queue_eligibility(
+                transaction_pool,
+                task=task,
+                source_requirements_fingerprint=source_requirements_fingerprint,
+            )
             feasibility = assess_structural_route_feasibility(
                 transaction_pool,
                 profile_id=profile_id,
@@ -790,6 +852,7 @@ def _arbitrate_target_start(
                         transaction_pool,
                         task=task,
                         actor=event_coordination.owner_actor(profile_id),
+                        source_requirements_fingerprint=source_requirements_fingerprint,
                     )
                     return TaskStartOutcome(
                         status=TaskStartStatus.PLANNING,
@@ -801,7 +864,11 @@ def _arbitrate_target_start(
             # establish no-bypass: the target durably queues with its own
             # entry timestamp, never rejected for having priority, and the
             # next bounded wakeup advances it in FIFO order.
-            queued = _queue_task_for_capacity(transaction_pool, task=task)
+            queued = _queue_task_for_capacity(
+                transaction_pool,
+                task=task,
+                source_requirements_fingerprint=source_requirements_fingerprint,
+            )
             return TaskStartOutcome(
                 status=TaskStartStatus.QUEUED,
                 task=queued,

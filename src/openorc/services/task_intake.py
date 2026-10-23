@@ -8,14 +8,18 @@ for:
 1. resolve the explicit currently usable installation route;
 2. fresh B3 issue reconciliation (issue existence/open state + the
    requirements fingerprint, refreshing the projection) — external GitHub
-   I/O with no database transaction open;
+   I/O with no database transaction open; the freshly reconciled fingerprint
+   refreshes the issue projection only and is deliberately NOT frozen onto
+   the Task (issue #233);
 3. fresh blocked-by dependency observation, mirrored in its own short
    transaction — authoritative input to eligibility; an unobservable
    blocking state fails closed;
 4. the final short transaction: eligibility against the facts just mirrored
    (issue open; empty blocked-by edge set ⇒ not blocked — parent/sub-issue
    hierarchy is categorically absent from the predicate), the current-Task
-   re-check, then ``create_task`` with the just-reconciled fingerprint. A
+   re-check, then ``create_task`` with NO source requirements baseline —
+   Owner Start (issue #233), not intake, is the commitment point that
+   freezes it. A
    concurrent duplicate converges on the existing database partial-unique
    invariant and is classified from re-read durable state, never from the
    constraint name. The ``task_created`` event is recorded atomically with
@@ -100,11 +104,12 @@ class IssueBlockedEligibilityError(ConflictError):
 class RepositoryTaskIntake:
     """The durable outcome of one authoritative Task intake invocation.
 
-    ``task`` is the current Task attempt with its immutable source baseline;
-    ``created`` is true exactly for the invocation whose insert won the
-    current-Task uniqueness invariant (a concurrent duplicate intake
-    classifies onto the existing current Task with ``created=False`` rather
-    than producing two current Tasks).
+    ``task`` is the current Task attempt carrying NO source requirements
+    baseline yet — Owner Start freezes it (issue #233); ``created`` is true
+    exactly for the invocation whose insert won the current-Task uniqueness
+    invariant (a concurrent duplicate intake classifies onto the existing
+    current Task with ``created=False`` rather than producing two current
+    Tasks).
     """
 
     task: Task
@@ -144,6 +149,11 @@ def intake_repository_task(
     ``AuthorizationError``/``ExternalOperationFailedError``/
     ``ExternalOperationUncertainError`` for the classified GitHub outcomes —
     in particular, an unobservable blocking state fails intake closed.
+
+    The created Task carries NO source requirements baseline: issue title/body
+    edits while it remains ``ready_to_plan`` are not source drift, and Owner
+    Start freezes the freshly verified fingerprint atomically with its
+    successful transition (issue #233).
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(repository_id, "repository_id")
@@ -182,14 +192,14 @@ def intake_repository_task(
                 "GitHub currently reports the addressed issue as blocked by an issue dependency"
             )
         # (4) The final short creation transaction: eligibility against the
-        # fresh facts just mirrored, then the race-classified create.
+        # fresh facts just mirrored, then the race-classified create. The
+        # Task is created with NO source baseline: Owner Start freezes it.
         task, created = _apply_intake_creation(
             pool,
             workspace_id=workspace_id,
             repository_id=repository_id,
             github_issue_id=projection.identity.github_issue_id,
             github_issue_number=projection.issue_number,
-            requirements_fingerprint=projection.requirements_fingerprint,
         )
         # (5) The non-gating hierarchy sync: strictly AFTER creation. Its
         # outcome never alters the already-determined intake result.
@@ -211,15 +221,16 @@ def _apply_intake_creation(
     repository_id: UUID,
     github_issue_id: int,
     github_issue_number: int,
-    requirements_fingerprint: str,
 ) -> tuple[Task, bool]:
     """Evaluate eligibility against fresh mirrored facts and create the Task.
 
     One short transaction: the account-deletion barrier first, the
     not-blocked check against the facts just mirrored, the current-Task
-    re-check, then the insert carrying the immutable source baseline and the
-    ``task_created`` event. A lost current-Task uniqueness race is
-    classified from re-read durable state, never from the constraint name.
+    re-check, then the insert — with NO source requirements baseline, because
+    Owner Start (not intake) is the commitment point that freezes it
+    (issue #233) — and the ``task_created`` event. A lost current-Task
+    uniqueness race is classified from re-read durable state, never from the
+    constraint name.
     """
     with composed_transaction(pool) as tx_pool:
         workspace = get_workspace(tx_pool, workspace_id)
@@ -247,7 +258,6 @@ def _apply_intake_creation(
                 repository_id=repository_id,
                 github_issue_id=github_issue_id,
                 github_issue_number=github_issue_number,
-                source_requirements_fingerprint=requirements_fingerprint,
                 status=TaskStatus.READY_TO_PLAN,
             )
         except UniqueViolation:

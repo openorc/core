@@ -345,7 +345,7 @@ def _issue_projection_row(state: str = "open") -> tuple[Any, ...]:
     )
 
 
-def _task_row(state_fingerprint: str = _FINGERPRINT) -> tuple[Any, ...]:
+def _task_row(state_fingerprint: str | None = None) -> tuple[Any, ...]:
     return (
         _TASK_ID,
         _WORKSPACE_ID,
@@ -482,7 +482,7 @@ def _script_happy_path(conn: ScriptedConnection) -> None:
     _script_route_resolution(conn)  # the hierarchy unit's own route resolution
 
 
-def test_intake_eligible_issue_creates_one_task_with_the_fresh_baseline() -> None:
+def test_intake_eligible_issue_creates_one_task_without_a_baseline() -> None:
     conn = ScriptedConnection()
     _script_happy_path(conn)
     pool = _pool(conn)
@@ -496,8 +496,9 @@ def test_intake_eligible_issue_creates_one_task_with_the_fresh_baseline() -> Non
     )
     assert result.created is True
     assert result.task.id == _TASK_ID
-    # The immutable source baseline: the exact fresh requirements fingerprint.
-    assert result.task.source_requirements_fingerprint == _FINGERPRINT
+    # Issue discovery/intake creates NO source requirements baseline
+    # (issue #233): Owner Start is the commitment point that freezes it.
+    assert result.task.source_requirements_fingerprint is None
     # Critical-path ordering: fresh issue reads, then the blocked-by
     # observation, and the hierarchy walk strictly AFTER creation.
     assert github.calls[0] == "repository"
@@ -507,6 +508,10 @@ def test_intake_eligible_issue_creates_one_task_with_the_fresh_baseline() -> Non
     insert_index = next(
         i for i, (sql, _) in enumerate(conn.executed) if "insert into openorc.tasks" in sql
     )
+    insert_params = conn.executed[insert_index][1]
+    assert insert_params is not None
+    # The INSERT itself carries a NULL baseline.
+    assert insert_params[5] is None
     assert insert_index > 0
     assert first_blocked_by < first_parent
 

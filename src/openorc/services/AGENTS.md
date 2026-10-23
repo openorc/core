@@ -162,13 +162,18 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   ownership, subject load and the startability precheck) closed before any
   external I/O; the fresh authoritative GitHub revalidation (route, B3
   reconcile, B4 dependency observation) with no database transaction open —
-  a changed source, blocked/closed issue, unobservable blocking state, or
-  lost route is NOT capacity waiting and fails closed as a typed non-start
-  condition; and one short arbitration transaction (barrier FIRST, the
-  per-Workspace arbitration advisory lock, the locked re-read bound to the
-  caller's exact `state_token`, the durable-projection eligibility guard,
-  the structural feasibility verdict, one bounded FIFO establishment pass,
-  then the target's claim or queue entry).
+  Start is the commitment point that freshly reconciles the requirements
+  fingerprint a successful start freezes (issue #233: the Task carries NO
+  baseline before Start, so pre-start issue edits are not drift), while a
+  blocked/closed issue, unobservable blocking state, or lost route is NOT
+  capacity waiting and fails closed as a typed non-start condition; and one
+  short arbitration transaction (barrier FIRST, the per-Workspace
+  arbitration advisory lock, the locked re-read bound to the caller's exact
+  `state_token`, the durable-projection eligibility guard against the
+  fingerprint being frozen, the structural feasibility verdict, one bounded
+  FIFO establishment pass, then the target's claim or queue entry — which
+  freezes the freshly verified fingerprint atomically with the transition;
+  a losing, stale, or failed start leaves no baseline).
 - Structural feasibility comes from the complete required role→Connection
   multiset (`assess_structural_route_feasibility`, the read-only
   session-admission seam): existing valid Task reservations count toward the
@@ -178,11 +183,13 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
   BEFORE any queue write — never an indefinite capacity wait. Temporary
   occupation stays #68's all-or-nothing decision.
 - The durable eligibility guard revalidates every claimed Task against the
-  durable GitHub projection alone (identity, OPEN state, fingerprint
-  equality, empty mirrored blocked-by set) with no GitHub network call: a
-  Task that queued while eligible can become ineligible while waiting, and a
-  capacity wakeup must not advance it. TaskBlock creation and generalized
-  source-drift recovery remain #85.
+  durable GitHub projection alone (identity, OPEN state, fingerprint equality
+  against the compared baseline — the fingerprint being frozen for a starting
+  target, the Task's own frozen baseline for a queued candidate — and empty
+  mirrored blocked-by set) with no GitHub network call: a Task that queued
+  while eligible can become ineligible while waiting, and a capacity wakeup
+  must not advance it. TaskBlock creation and generalized source-drift
+  recovery remain #85.
 - The bounded establishment pass advances admissible older candidates in
   durable `(queued_at, id)` order (each claim atomic: both reservations +
   planning + cleared `queued_at` + one `planning_started` event) before the

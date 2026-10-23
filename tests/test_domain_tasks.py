@@ -109,6 +109,41 @@ def test_task_rejects_invalid_fields(overrides: dict[str, object], message: str)
         _task(**overrides)
 
 
+def test_a_never_started_task_carries_no_baseline() -> None:
+    # Issue #233: the source baseline does not exist before a successful
+    # Owner Start. NULL is valid exactly for the never-started statuses —
+    # ready_to_plan and a cancelled attempt that never started.
+    assert _task(source_requirements_fingerprint=None).source_requirements_fingerprint is None
+    cancelled_never_started = _task(
+        status=TaskStatus.CANCELLED,
+        archived_at=datetime.now(UTC),
+        source_requirements_fingerprint=None,
+    )
+    assert cancelled_never_started.source_requirements_fingerprint is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        TaskStatus.QUEUED,
+        TaskStatus.PLANNING,
+        TaskStatus.WAITING_FOR_OWNER,
+        TaskStatus.IMPLEMENTING,
+        TaskStatus.REVIEWING,
+        TaskStatus.BLOCKED,
+        TaskStatus.COMPLETED,
+    ],
+)
+def test_a_started_task_requires_its_frozen_baseline(status: TaskStatus) -> None:
+    overrides: dict[str, object] = {"status": status, "source_requirements_fingerprint": None}
+    if status is TaskStatus.QUEUED:
+        overrides["queued_at"] = datetime.now(UTC)
+    if status is TaskStatus.COMPLETED:
+        overrides["archived_at"] = datetime.now(UTC)
+    with pytest.raises(TaskDomainError, match="frozen source requirements fingerprint"):
+        _task(**overrides)
+
+
 def test_terminal_status_without_archival_is_rejected() -> None:
     with pytest.raises(TaskDomainError, match="must be archived"):
         _task(status=TaskStatus.CANCELLED)

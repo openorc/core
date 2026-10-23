@@ -100,6 +100,15 @@ class TaskStatus(StrEnum):
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLED, TaskStatus.COMPLETED})
 
+# Statuses that may carry no frozen source requirements baseline (issue #233):
+# a Task that has never successfully started. `cancelled` is included because
+# an attempt can be cancelled directly from ready_to_plan without any start
+# ever committing; a cancelled attempt that did start retains its frozen
+# non-null baseline. Every other status requires a present frozen fingerprint.
+_FINGERPRINT_OPTIONAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.READY_TO_PLAN, TaskStatus.CANCELLED}
+)
+
 
 def _require_positive_int(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -140,7 +149,7 @@ class Task:
     state_token: UUID
     current_plan_revision_id: UUID | None
     current_owner_gate_id: UUID | None
-    source_requirements_fingerprint: str
+    source_requirements_fingerprint: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -185,17 +194,26 @@ class Task:
         _require_uuid(self.state_token, "state_token", nullable=False)
         _require_uuid(self.current_plan_revision_id, "current_plan_revision_id", nullable=True)
         _require_uuid(self.current_owner_gate_id, "current_owner_gate_id", nullable=True)
-        # The immutable Task source baseline (issue #60): the exact B3
-        # requirements fingerprint the issue carried when this attempt's
-        # eligibility was authoritatively established. It is historical
-        # authority for later source-drift detection and is never rewritten
-        # when GitHub requirements change. The issue body/title itself is
-        # deliberately not duplicated here.
-        if not isinstance(
+        # The immutable Task source baseline (issue #60, corrected by issue
+        # #233): frozen by a successful Owner Start atomically with the
+        # ready_to_plan -> queued/planning transition, and never rewritten
+        # when GitHub requirements change afterwards. Before Start the
+        # baseline does not exist: a never-started Task carries None, and the
+        # only statuses that may carry None are ready_to_plan and a cancelled
+        # attempt that never started. Any present value is a lowercase hex
+        # SHA-256 digest. The issue body/title itself is deliberately not
+        # duplicated here.
+        if self.source_requirements_fingerprint is None:
+            if self.status not in _FINGERPRINT_OPTIONAL_STATUSES:
+                raise TaskDomainError(
+                    "a started Task carries its frozen source requirements fingerprint"
+                )
+        elif not isinstance(
             self.source_requirements_fingerprint, str
         ) or not _FINGERPRINT_PATTERN.match(self.source_requirements_fingerprint):
             raise TaskDomainError(
-                "Task.source_requirements_fingerprint must be a lowercase hex SHA-256 digest"
+                "Task.source_requirements_fingerprint must be None or a lowercase hex "
+                "SHA-256 digest"
             )
 
 
