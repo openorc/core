@@ -121,153 +121,16 @@ Persistence owns durable representation and explicit data-access mechanics for O
 
 Read supabase/AGENTS.md for migration/Auth/Vault deployment rules and domain/services guidance for semantic changes.
 
-## GitHub webhook delivery intake (issue #61)
+## Focused concurrency and reconciliation contracts
 
-- `persistence/github_webhook_deliveries.py` owns the GUID-keyed delivery
-  records (`openorc.github_webhook_deliveries`) and their resolved Workspace
-  routing linkages (`openorc.github_webhook_delivery_routes`). A delivery
-  record exists only for a verified delivery; it carries provider-stable
-  identifiers and bounded classification/resolution metadata, never raw
-  payloads, signatures, secrets, or customer content, and carries no
-  Workspace foreign key (the delivery GUID is provider-owned identity that
-  survives Workspace lifecycle).
-- The deduplication insert is a single statement
-  (`INSERT ... ON CONFLICT (delivery_guid) DO NOTHING RETURNING`): the
-  returned row is the accepted record, a missing row is the already-accepted
-  duplicate, and concurrent duplicate inserts converge deterministically on
-  the durable unique constraint.
-- `persistence/github_webhook_routing.py` resolves a delivery's stable
-  installation/repository identity against the explicit B1 routing tables —
-  the webhook-direction complement of the #57 configuration-direction
-  resolvers, exact match only, never authorization, never owner/login
-  heuristics. Zero/mismatched routes are bounded fail-closed observations
-  (`unmapped_installation` / `unconfigured_repository` / `route_mismatch`),
-  never Workspace/Repository/Task authority.
-- Delivery and routing records are notification/recovery metadata, not
-  workflow authority; dispatch (#120) re-validates current durable routing
-  before any reconciliation effect.
+- Webhook delivery records deduplicate by GitHub delivery GUID, retain only bounded safe classification/routing metadata, and are distinct from durable Workspace routing fan-out rows. A duplicate delivery never becomes a second effect; dispatch must recheck the current repository route.
+- Canonical TaskPullRequest observations update only the already-created record. Lock and verify Task/Workspace/PR identity, never upsert a replacement PR or turn a different stable GitHub PR ID into the canonical one; a changed head and base-only movement are distinct observations.
+- Task role-session capacity admission locks all distinct relevant Connection rows in stable order and counts CONNECTING and READY bindings. An already-admitted role binding is reused; a terminal LOST/ENDED binding cannot be replaced.
+- FIFO Task admission uses `tasks.queued_at` set by the database clock exactly on queue entry and cleared on exit. Serialize queue arbitration through its durable database lock; process memory, RQ order, and Task creation time are not authority for FIFO.
+- The Profile-scoped GitHub user authorization record stores only stable human identity, an opaque Vault refresh reference, and forward-only lifecycle/generation facts. Refresh rotation and revocation are compare-and-swap guarded; raw credentials never enter ordinary rows. Vault deletion and pointer clearing must not leave a dangling active authorization.
+- Role binding configuration writes are whole-record and Workspace/Owner-scoped; provider/model form an opaque both-present-or-both-absent pair, with a nullable verbatim role-prompt override. Do not treat an existing TaskAgentSession as mutable configuration.
+- `REVIEW_RESOLUTION` settlement is a distinct Reviewer-driven terminal gate outcome, not an Owner APPROVED/REJECTED stamp. A Reviewer-driven change request at an ordinary pending approval gate may retire its currency without falsely resolving it as an Owner decision.
+- One-shot external-effect intents (Interrupt and PR close) persist their exact Task/session/PR/Owner identities atomically with the controlling Task transition. Never discard a pending or uncertain effect merely because the Task is archived.
+- The Task's immutable terminal cause for a confirmed closed-unmerged canonical PR is separate from a recoverable TaskBlock. Keep archival, status, terminal cause, and current-Task uniqueness coherent.
 
-## Canonical TaskPullRequest reconciliation (issue #63)
-
-- `reconcile_task_pull_request_observed` is the serialized, strictly
-  **update-only** observed-snapshot write for the one canonical
-  TaskPullRequest: the existing row is locked (`SELECT ... FOR UPDATE`) under
-  its exact Workspace/Task/record scope, an actually-different observation is
-  updated in place as one whole snapshot (an identical observation is a true
-  durable no-op that preserves `updated_at`), and the locked pre-image is
-  returned so head-change/base-change facts are computed from durable
-  serialized state, never a racy re-read.
-- There is deliberately no insert path: an absent row or mismatched scope is
-  the `MISSING` outcome. The canonical record's only creator is the later
-  race-safe PR publication operation (#64); no external-PR adoption path
-  exists at any layer.
-
-## TaskAgentSession admission locking (issue #68)
-
-- Capacity admission serializes on Connection row locks, never process
-  memory: `list_connections_for_update` locks the exact requested distinct
-  Connection rows (`SELECT ... FOR UPDATE ORDER BY id`) and
-  `count_active_task_agent_sessions_by_connection` is the grouped
-  CONNECTING/READY occupancy count. The count is meaningful only after the
-  caller holds those same locks.
-- Every admission path that counts occupancy and reserves must take the same
-  locks in deterministic ascending UUID order before its decision, inside one
-  short composed transaction with no external I/O. Service-side classification
-  of missing/cross-Workspace/disabled rows is made from the locked rows.
-- Active occupancy is exactly CONNECTING + READY. Reservation establishes
-  bindings only through the idempotent `ensure_task_agent_session`
-  establishment primitive; admission never creates a second `(Task, role)`
-  row and never replaces a terminal (LOST/ENDED) historical binding.
-
-## Task FIFO queue order and the arbitration lock (issue #76)
-
-- `tasks.queued_at` is the durable FIFO queue-entry fact: populated by the
-  DB clock exactly once when a Task first moves into `queued`, preserved
-  unchanged for the lifetime of that queue wait (repeated failed capacity
-  checks never rewrite it), and cleared on the successful `queued ->
-  planning` claim and on any later authorized path out of `queued`
-  (`archive_task` included). It is non-null iff the current status is
-  `queued` — the `tasks_queued_iff_queued_at_chk` CHECK is the durable
-  backstop and `update_task_status`'s CASE maintains it in both
-  directions. `QUEUED` is never an RQ/Valkey job and there is no second
-  queue table: `Task.status` plus this one column are the canonical queue
-  state, and `list_queued_tasks` is the one canonical read —
-  Workspace-scoped, keyset-paginated, ordered `(queued_at, id)`.
-- `lock_workspace_task_arbitration` is the per-Workspace transaction-scoped
-  `pg_advisory_xact_lock` serialization boundary for Task-capacity
-  arbitration: every transaction that arbitrates capacity (a competing new
-  start, a queued-candidates sweep, the structural feasibility read) AND
-  every transition that changes active CONNECTING/READY occupancy (the
-  capacity-releasing lifecycle services `record_task_agent_session_lost` /
-  `end_task_agent_session`) composes it before any occupancy read it must
-  trust. A capacity release can therefore never commit between a scan and a
-  decision. The account-operational barrier remains the FIRST lock in
-  transactions that compose it; the advisory lock is the first lock in the
-  lifecycle transactions, and it is released at commit/rollback.
-
-## Profile-scoped GitHub user authorization (issue #142)
-
-- `github_user_refresh_secrets.py` is the GitHub-user-purpose Vault boundary
-  over the shared exact-ID primitive. Its opaque v1 reference
-  (`openorc:github-user-refresh:v1:vault:<uuid>`) is deliberately not
-  cross-parseable with the Connection-purpose `auth_reference`; parsing,
-  description composition, and resolution/rotation/deletion semantics live
-  here, never generic Vault browsing.
-- `github_user_authorizations.py` owns the durable lifecycle: the row is
-  keyed by `profile_id` (one current authorization per Profile) and updated
-  in place for its whole Profile lifetime — reauthorization advances
-  `refresh_generation` monotonically (never delete-and-reinsert, never a
-  reset), the refresh-install compare-and-swap (`try_install_rotated_refresh`)
-  installs only when the durable generation matches AND the row is still
-  active, and revocation removes the usable reference and advances the
-  generation in one statement so no `(Profile, generation)` cache key
-  outlives a lifecycle transition. Revoked is durable currentness state,
-  deliberately distinct from never-authorized; the only row removal is the
-  sanctioned `auth.users → profiles` cascade.
-- Raw access/refresh tokens have no column and no path through these
-  modules: ordinary `openorc.*` tables carry only the opaque reference
-  pointer.
-
-## Role-binding runtime configuration writes (issue #162)
-
-- `set_role_binding` is the one whole-record configuration write for
-  `(workspace_id, role)`: a single conditional upsert whose
-  `ON CONFLICT DO UPDATE ... WHERE (row) IS DISTINCT FROM (excluded)` guard
-  makes the statement itself the atomic compare-and-set. An absent binding
-  is created; an identical stored configuration is locked-but-not-updated
-  (no RETURNING row), preserving `updated_at`; and the returned `changed`
-  fact comes from the statement outcome, never from a prior read, so a
-  concurrent identical creation that loses the upsert race reports no
-  change. Binding row identity (`id`/`created_at`) is always preserved.
-- Every write states the complete configuration record (routed
-  `connection_id`, opaque configured provider/model pair, nullable
-  role-prompt override) — no caller can silently erase configuration by
-  omitting fields; the composite foreign key keeps cross-Workspace
-  Connection targets a ForeignKeyViolation for service classification.
-
-## OwnerGate Reviewer-driven settlement primitive (issue #211)
-
-- `resolve_owner_gate` accepts every terminal OwnerGateStatus outcome:
-  the Owner-driven APPROVED/REJECTED/CANCELLED resolutions and the
-  Reviewer-driven REVIEW_RESOLUTION settlement (`outcome=SETTLED`). One
-  purpose-independent primitive serves all of them: gate row read, Task
-  row locked ``FOR UPDATE``, currency/token/archival checks, the one-shot
-  gate stamp with ``decided_at``, the current-pointer clear, and the
-  token rotation. The database CHECK restricts ``settled`` to
-  review_resolution gates; the calling service owns the exact-subject
-  proof (planning settlement in `task_planning_review_resolution`,
-  PR/head settlement later in E9). The STALE/NO_OP outcome contract is
-  unchanged, and the Owner-facing resolution service refuses ``SETTLED``
-  so ordinary Owner semantics stay untouched.
-- `supersede_current_owner_gate` (issue #219) is the sibling
-  Reviewer-triggered continuation primitive: the exact current pending gate
-  loses currency WITHOUT any terminal stamp — the gate row is never touched
-  and stays pending history (no `decided_at`, no Owner verdict, never the
-  REVIEW_RESOLUTION-only SETTLED status) — while the current-pointer
-  clears, the Task moves ``waiting_for_owner`` → ``planning``, and the
-  token rotates in one conditional update. Same lock/guard discipline as
-  resolution (Task row ``FOR UPDATE`` first, conditional guards as durable
-  backstops), a SUPERSEDED/STALE outcome contract with no one-shot NO_OP (a
-  replayed supersession finds the gate no longer current and classifies as
-  STALE), and the calling service owns the exact-subject proof (the E3 G1
-  change-request handoff).
+Read `supabase/AGENTS.md` for schema and migration requirements and services/domain guidance for authority semantics. Prefer concrete repository functions, schema constraints, and regression tests over embedding issue implementation narratives here.
