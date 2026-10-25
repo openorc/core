@@ -583,11 +583,16 @@ def execute_operation_job(encoded_invocation: str) -> None:
     """Execute one logical operation (RQ job entrypoint, issue #86).
 
     The queue payload is exactly the encoded wire invocation. The
-    entrypoint strictly decodes it, builds child-process-local dependencies
-    after any fork, and calls the shared dispatcher — the same
-    kind/handler mapping both modes use. Unregistered kinds fail closed;
-    handler failures never turn into reported operation success and never
-    leak arbitrary exception content through the raised error.
+    entrypoint strictly decodes it before any effect (malformed envelopes
+    raise the typed decode error unchanged), builds child-process-local
+    dependencies after any fork, and calls the shared dispatcher — the same
+    kind/handler mapping both modes use. Unregistered kinds fail closed.
+    Every exception escaping the dispatcher is classified with the
+    sanitized, unchained :class:`OperationExecutionError` — handler-raised
+    typed service errors (``InvalidCommandError`` and its subclasses)
+    included — so failures never turn into reported operation success and
+    never leak arbitrary exception content through the raised error or its
+    formatted traceback.
     """
     invocation = decode_operation_invocation(encoded_invocation)
     settings = Settings.from_env()
@@ -604,18 +609,19 @@ def execute_operation_job(encoded_invocation: str) -> None:
                 handlers=build_production_handlers(),
                 dependencies=build_default_operation_dependencies(settings),
             )
-        except InvalidCommandError:
-            raise
         except Exception as error:  # noqa: BLE001 - contained with safe classification
+            # Every exception escaping the dispatcher receives the sanitized,
+            # unchained classification — application-service handler failures
+            # included, InvalidCommandError and its subclasses included:
+            # queue failure reporting formats full tracebacks, and a raw
+            # typed error or any cause would carry the original (possibly
+            # secret-bearing) message into reported failures. The sanitized
+            # error and the type-only log line above are the entire safe
+            # classification.
             logger.warning(
                 "operation execution job did not complete (error type %s)",
                 type(error).__name__,
             )
-            # Raise WITHOUT chaining: queue failure reporting formats full
-            # tracebacks, and an explicit (or implicit) cause would carry the
-            # original — possibly secret-bearing — exception message into
-            # reported failures. The sanitized error and the type-only log
-            # line above are the entire safe classification.
             raise OperationExecutionError(
                 f"operation execution failed (kind={invocation.kind.value}, "
                 f"error type {type(error).__name__})"

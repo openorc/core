@@ -558,6 +558,48 @@ def test_malformed_invocation_failures_never_leak_payload_content_in_tracebacks(
     assert "secret-bearing internal detail" not in str(raised.value)
 
 
+def test_entrypoint_sanitizes_handler_raised_command_errors(
+    settings_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Application-service handlers may raise typed service errors carrying
+    # arbitrary content; the RQ entrypoint classifies every exception
+    # escaping the dispatcher with the sanitized, unchained failure so
+    # formatted tracebacks (queue failure reporting) can never leak it.
+    settings = settings_factory(
+        execution_mode=ExecutionMode.QUEUE, valkey_url="redis://127.0.0.1:6379/9"
+    )
+    handler = RecordingHandler(error=InvalidCommandError("secret-bearing internal detail"))
+    monkeypatch.setattr(invocation.Settings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setattr(
+        invocation,
+        "build_production_handlers",
+        lambda: {OperationKind.GITHUB_RECONCILIATION_SWEEP: handler},
+    )
+    dependencies, _pool, _github = make_dependencies(settings)
+    monkeypatch.setattr(
+        invocation, "build_default_operation_dependencies", lambda _settings: dependencies
+    )
+    wire = OperationInvocation(
+        kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
+        payload=ReconciliationSweepPayload(sweep_tick=2),
+    )
+
+    with pytest.raises(invocation.OperationExecutionError) as raised:
+        execute_operation_job(wire.encode())
+
+    message = str(raised.value)
+    assert "github_reconciliation_sweep" in message
+    assert "InvalidCommandError" in message
+    assert "secret-bearing internal detail" not in message
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    formatted = "".join(
+        traceback.format_exception(type(raised.value), raised.value, raised.value.__traceback__)
+    )
+    assert "secret-bearing internal detail" not in formatted
+
+
 def test_entrypoint_fails_closed_for_an_unregistered_kind(
     settings_factory: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -565,6 +607,7 @@ def test_entrypoint_fails_closed_for_an_unregistered_kind(
     settings = settings_factory(
         execution_mode=ExecutionMode.QUEUE, valkey_url="redis://127.0.0.1:6379/9"
     )
+    handler = RecordingHandler()
     monkeypatch.setattr(invocation.Settings, "from_env", classmethod(lambda cls: settings))
     monkeypatch.setattr(invocation, "build_production_handlers", lambda: {})
     wire = OperationInvocation(
@@ -572,5 +615,19 @@ def test_entrypoint_fails_closed_for_an_unregistered_kind(
         payload=WebhookDeliveryDispatchPayload(delivery_guid="guid-2"),
     )
 
-    with pytest.raises(InvalidInvocationError, match="no handler is registered"):
+    with pytest.raises(invocation.OperationExecutionError) as raised:
         execute_operation_job(wire.encode())
+
+    # Fail-closed dispatch is classified with the same sanitized, unchained
+    # failure: the safe message names the kind and the dispatcher's typed
+    # refusal by exception type name only.
+    message = str(raised.value)
+    assert "github_webhook_delivery_dispatch" in message
+    assert "InvalidInvocationError" in message
+    assert handler.calls == []
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    formatted = "".join(
+        traceback.format_exception(type(raised.value), raised.value, raised.value.__traceback__)
+    )
+    assert "no handler is registered" not in formatted
