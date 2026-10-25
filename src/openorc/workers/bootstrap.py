@@ -16,7 +16,7 @@ import redis
 import rq
 from redis.exceptions import RedisError
 
-from openorc.config import Settings
+from openorc.config import ConfigurationError, ExecutionMode, Settings
 from openorc.observability import (
     ObservabilitySurface,
     initialize_observability,
@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 class WorkerBootstrapError(Exception):
     """Raised when the worker cannot start against its configured backend."""
+
+
+class WorkerModeError(Exception):
+    """Raised when the worker process is launched with a non-queue configuration.
+
+    The RQ worker process must be explicitly in queue execution mode
+    (issue #86): a deployment/operator runs only the configured claimant
+    mode, and mode selection alone does not make in-flight work safe to
+    replay (cutover reconciliation is later-leaf work).
+    """
 
 
 class ObservabilityLifecycle(Protocol):
@@ -58,7 +68,17 @@ class ProcessObservabilityLifecycle:
 
 
 def create_redis_client(settings: Settings) -> redis.Redis:
-    """Create a Redis-compatible client from configured settings."""
+    """Create a Redis-compatible client from configured settings.
+
+    Fails fast when no explicitly configured queue backend URL exists: the
+    URL is queue-mode-only configuration and no implicit localhost default
+    is ever selected (issue #86).
+    """
+    if settings.valkey_url is None:
+        raise ConfigurationError(
+            "no Redis-compatible queue backend URL is configured: VALKEY_URL "
+            "must be explicitly supplied in queue execution mode"
+        )
     return redis.Redis.from_url(settings.valkey_url)
 
 
@@ -84,7 +104,9 @@ def run_worker(
     Connection failure or client-construction failure (including malformed
     backend URLs that redis-py's parser rejects) fails fast with
     :class:`WorkerBootstrapError` so the process never idles against an
-    unreachable or misconfigured backend.
+    unreachable or misconfigured backend. Launching with a non-queue
+    execution mode fails fast with :class:`WorkerModeError` before any
+    backend contact (issue #86).
 
     The worker process owns observability terminally (issue #108):
     initialization happens at start (once per process, guarded by the
@@ -92,6 +114,13 @@ def run_worker(
     ``finally`` after the loop exits — normally or on error — because the
     worker process is ending at that point.
     """
+    if settings.execution_mode is not ExecutionMode.QUEUE:
+        raise WorkerModeError(
+            "the RQ worker process requires queue execution mode; set "
+            f"OPENORC_EXECUTION_MODE=queue (configured mode is "
+            f"{settings.execution_mode.value!r}, and regular mode runs "
+            "operations through the API-local executor)"
+        )
     make_client = client_factory if client_factory is not None else create_redis_client
     make_worker = worker_builder if worker_builder is not None else build_worker
     lifecycle = observability if observability is not None else ProcessObservabilityLifecycle()

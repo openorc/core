@@ -15,6 +15,8 @@ from openorc.config import (
     DEFAULT_API_HOST,
     DEFAULT_API_PORT,
     DEFAULT_ENVIRONMENT,
+    ConfigurationError,
+    ExecutionMode,
     Settings,
 )
 from openorc.workers import bootstrap
@@ -42,7 +44,7 @@ def test_build_worker_accepts_explicit_queue_names() -> None:
 def test_run_worker_fails_fast_when_backend_ping_fails(
     settings_factory: Callable[..., Settings],
 ) -> None:
-    settings = settings_factory()
+    settings = settings_factory(execution_mode=ExecutionMode.QUEUE)
     failing_client = cast(
         "redis.Redis",
         _FakeRedisClient(ping_error=RedisConnectionError("connection refused")),
@@ -55,7 +57,7 @@ def test_run_worker_fails_fast_when_backend_ping_fails(
 def test_run_worker_wraps_client_construction_errors(
     settings_factory: Callable[..., Settings],
 ) -> None:
-    settings = settings_factory()
+    settings = settings_factory(execution_mode=ExecutionMode.QUEUE)
 
     def malformed(_settings: Settings) -> redis.Redis:
         raise ValueError("unsupported scheme")
@@ -72,6 +74,7 @@ def test_run_worker_wraps_malformed_valkey_url_from_redis_parser() -> None:
         api_host=DEFAULT_API_HOST,
         api_port=DEFAULT_API_PORT,
         api_reload=False,
+        execution_mode=ExecutionMode.QUEUE,
         valkey_url="http://127.0.0.1:1/0",
     )
 
@@ -83,7 +86,7 @@ def test_run_worker_starts_worker_loop_once_connected(
     settings_factory: Callable[..., Settings],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = settings_factory()
+    settings = settings_factory(execution_mode=ExecutionMode.QUEUE)
     fake_client = cast("redis.Redis", _FakeRedisClient())
     fake_worker = Mock(spec=rq.Worker)
 
@@ -96,6 +99,61 @@ def test_run_worker_starts_worker_loop_once_connected(
 
     assert cast("_FakeRedisClient", fake_client).ping_calls == 1
     fake_worker.work.assert_called_once_with()
+
+
+def test_run_worker_refuses_regular_mode_settings(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    settings = settings_factory()
+
+    with pytest.raises(bootstrap.WorkerModeError, match="queue execution mode"):
+        bootstrap.run_worker(
+            settings,
+            client_factory=lambda _settings: cast("redis.Redis", _FakeRedisClient()),
+        )
+
+
+def test_run_worker_refuses_regular_mode_before_any_backend_contact() -> None:
+    settings = Settings(
+        environment=DEFAULT_ENVIRONMENT,
+        api_host=DEFAULT_API_HOST,
+        api_port=DEFAULT_API_PORT,
+        api_reload=False,
+    )
+
+    def unexpected_client(_settings: Settings) -> redis.Redis:
+        raise AssertionError("no queue backend contact may happen in regular mode")
+
+    with pytest.raises(bootstrap.WorkerModeError):
+        bootstrap.run_worker(settings, client_factory=unexpected_client)
+
+
+def test_create_redis_client_fails_fast_without_a_configured_url() -> None:
+    settings = Settings(
+        environment=DEFAULT_ENVIRONMENT,
+        api_host=DEFAULT_API_HOST,
+        api_port=DEFAULT_API_PORT,
+        api_reload=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="VALKEY_URL"):
+        bootstrap.create_redis_client(settings)
+
+
+def test_create_redis_client_uses_the_explicitly_configured_url() -> None:
+    settings = Settings(
+        environment=DEFAULT_ENVIRONMENT,
+        api_host=DEFAULT_API_HOST,
+        api_port=DEFAULT_API_PORT,
+        api_reload=False,
+        execution_mode=ExecutionMode.QUEUE,
+        valkey_url="redis://127.0.0.1:6379/2",
+    )
+
+    client = bootstrap.create_redis_client(settings)
+
+    assert isinstance(client, redis.Redis)
+    assert client.connection_pool.connection_kwargs["host"] == "127.0.0.1"
 
 
 class _FakeRedisClient:

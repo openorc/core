@@ -10,7 +10,11 @@ from __future__ import annotations
 import sys
 
 from openorc.config import ConfigurationError, Settings
-from openorc.workers.bootstrap import WorkerBootstrapError, run_worker
+from openorc.workers.bootstrap import (
+    WorkerBootstrapError,
+    WorkerModeError,
+    run_worker,
+)
 
 
 def main() -> None:
@@ -22,5 +26,5 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ConfigurationError, WorkerBootstrapError) as exc:
+    except (ConfigurationError, WorkerBootstrapError, WorkerModeError) as exc:
         sys.exit(f"openorc-worker: {exc}")

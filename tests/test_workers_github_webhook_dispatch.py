@@ -235,3 +235,29 @@ def test_a_definitive_redis_error_classifies_as_known_failure(queue_harness) -> 
     assert outcome is job_module.EnqueueOutcome.KNOWN_FAILED
     assert holder.queue is not None
     assert holder.queue.enqueued == []
+
+
+def test_a_missing_valkey_url_classifies_as_known_failure_without_backend_contact() -> None:
+    # Issue #86: VALKEY_URL is queue-mode-only configuration with no implicit
+    # localhost default. The RQ-specific seam classifies the missing backend
+    # as a definitive refusal (the delivery stays durably outstanding for
+    # reconciliation) instead of crashing the intake route; F3b rewires this
+    # submission path through the shared invocation boundary.
+    unconfigured = Settings(
+        environment="test",
+        api_host="127.0.0.1",
+        api_port=3999,
+        api_reload=False,
+        valkey_url=None,
+        database_url="postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+        db_pool_min=1,
+        db_pool_max=5,
+        db_pool_timeout=5.0,
+        github_app_id=1234,
+        github_app_private_key="not-a-real-key",
+    )
+    submission = job_module.build_github_webhook_dispatch_submission(unconfigured)
+
+    outcome = submission.enqueue("guid-1")
+
+    assert outcome is job_module.EnqueueOutcome.KNOWN_FAILED

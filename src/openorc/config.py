@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from urllib.parse import urlparse
 
 ENVIRONMENT_VAR = "OPENORC_ENV"
@@ -81,14 +82,26 @@ GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR = "OPENORC_GITHUB_APP_USER_FLOW_CLIENT_SE
 # never depends on it (every unit re-derives current durable state).
 GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR = "OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
+# Execution-mode selection (issue #86): runtime/deployment environment
+# configuration, not a database setting or build variant. ``regular`` is the
+# bounded API-local executor default and requires no queue backend;
+# ``queue`` is the RQ/Valkey opt-in that requires an explicitly supplied
+# VALKEY_URL.
+EXECUTION_MODE_VAR = "OPENORC_EXECUTION_MODE"
+EXECUTION_MODE_REGULAR = "regular"
+EXECUTION_MODE_QUEUE = "queue"
+# Bounded local-executor capacity (issue #86): fixed bounded parallelism
+# (active workers) and a separate bounded pending-admission capacity, both
+# per serving process. Both running and waiting work must stay bounded.
+LOCAL_EXECUTOR_WORKERS_VAR = "OPENORC_LOCAL_EXECUTOR_WORKERS"
+LOCAL_EXECUTOR_PENDING_VAR = "OPENORC_LOCAL_EXECUTOR_PENDING"
 
 DEFAULT_ENVIRONMENT = "development"
 PRODUCTION_ENVIRONMENT = "production"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 3000
-DEFAULT_VALKEY_URL = "redis://127.0.0.1:6379/0"
 # Documented Supabase local-stack endpoint (`supabase start`); the only
-# non-environment Postgres default, mirroring DEFAULT_VALKEY_URL.
+# non-environment Postgres default.
 DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 # Pool bounds are per process, not deployment-wide: sizing deployments must
 # account for process count x pool size.
@@ -104,6 +117,27 @@ DEFAULT_SUPABASE_JWT_AUDIENCE = "authenticated"
 # the whole eligible set per invocation. A scheduling knob only: sweep
 # correctness and convergence never depend on the value.
 DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS = 16
+# Bounded local-executor defaults (issue #86): 2 active workers and 8
+# pending-admission slots per serving process. Both bounds are positive by
+# construction (minimum 1); supplied values below the minimum are
+# configuration errors, never silently clamped.
+DEFAULT_LOCAL_EXECUTOR_WORKERS = 2
+DEFAULT_LOCAL_EXECUTOR_PENDING = 8
+
+
+class ExecutionMode(StrEnum):
+    """Closed execution-mode vocabulary (issue #86).
+
+    The mode determines only where/how an operation is delivered:
+    ``regular`` is the bounded API-local executor (no queue backend, no RQ
+    worker), ``queue`` is the RQ/Valkey opt-in. Both modes invoke identical
+    application services; neither local memory nor RQ IDs are workflow
+    truth.
+    """
+
+    REGULAR = "regular"
+    QUEUE = "queue"
+
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -238,7 +272,15 @@ class Settings:
     api_host: str
     api_port: int
     api_reload: bool
-    valkey_url: str
+    # Execution-mode selection (issue #86): runtime/deployment environment
+    # configuration with regular as the default. regular startup/submission/
+    # shutdown never requires or touches a queue backend; queue requires the
+    # explicitly supplied VALKEY_URL below.
+    execution_mode: ExecutionMode = ExecutionMode.REGULAR
+    # The Redis-compatible queue backend URL, required only in queue mode
+    # (issue #86): no implicit localhost default is selected, so an unset or
+    # blank value is None and queue-mode configuration fails without it.
+    valkey_url: str | None = None
     database_url: str = DEFAULT_DATABASE_URL
     db_pool_min: int = DEFAULT_DB_POOL_MIN
     db_pool_max: int = DEFAULT_DB_POOL_MAX
@@ -272,6 +314,11 @@ class Settings:
     # per this many ticks. Scheduling configuration only — the sweep re-derives
     # its work set and correctness state from Postgres/GitHub every run.
     github_reconciliation_sweep_partitions: int = DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS
+    # Bounded local-executor capacity (issue #86), per serving process:
+    # fixed bounded parallelism plus a separate bounded pending-admission
+    # capacity so both running and waiting work stay bounded.
+    local_executor_workers: int = DEFAULT_LOCAL_EXECUTOR_WORKERS
+    local_executor_pending: int = DEFAULT_LOCAL_EXECUTOR_PENDING
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -308,12 +355,41 @@ class Settings:
                     f"{API_RELOAD_VAR} must be a boolean-like value, got {api_reload_raw!r}"
                 )
 
-        valkey_url = _read(source, VALKEY_URL_VAR) or DEFAULT_VALKEY_URL
-        scheme = urlparse(valkey_url).scheme.lower()
-        if scheme not in _VALKEY_URL_SCHEMES:
+        # Execution-mode selection (issue #86): only the closed regular/queue
+        # vocabulary is accepted; invalid values fail configuration
+        # validation so misconfiguration surfaces at startup.
+        execution_mode_raw = _read(source, EXECUTION_MODE_VAR)
+        execution_mode = ExecutionMode.REGULAR
+        if execution_mode_raw is not None:
+            normalized = execution_mode_raw.strip().lower()
+            if normalized == EXECUTION_MODE_REGULAR:
+                execution_mode = ExecutionMode.REGULAR
+            elif normalized == EXECUTION_MODE_QUEUE:
+                execution_mode = ExecutionMode.QUEUE
+            else:
+                raise ConfigurationError(
+                    f"{EXECUTION_MODE_VAR} must be one of "
+                    f"{EXECUTION_MODE_REGULAR!r} or {EXECUTION_MODE_QUEUE!r}; "
+                    f"got {execution_mode_raw!r}"
+                )
+
+        # The queue backend URL is queue-mode-only (issue #86): no implicit
+        # localhost default is selected. Unset/blank stays None; regular mode
+        # requires no queue backend. A supplied URL is scheme-validated so
+        # misconfiguration surfaces at startup, not deep in client code.
+        valkey_url = _read(source, VALKEY_URL_VAR)
+        if valkey_url is not None:
+            scheme = urlparse(valkey_url).scheme.lower()
+            if scheme not in _VALKEY_URL_SCHEMES:
+                raise ConfigurationError(
+                    f"{VALKEY_URL_VAR} must use one of the schemes "
+                    f"{', '.join(sorted(_VALKEY_URL_SCHEMES))}; got scheme {scheme!r}"
+                )
+        if execution_mode is ExecutionMode.QUEUE and valkey_url is None:
             raise ConfigurationError(
-                f"{VALKEY_URL_VAR} must use one of the schemes "
-                f"{', '.join(sorted(_VALKEY_URL_SCHEMES))}; got scheme {scheme!r}"
+                f"{EXECUTION_MODE_QUEUE!r} execution mode requires an explicitly "
+                f"supplied {VALKEY_URL_VAR}: no implicit localhost queue backend "
+                "is selected"
             )
 
         database_url = _read(source, DATABASE_URL_VAR) or DEFAULT_DATABASE_URL
@@ -420,6 +496,22 @@ class Settings:
             default=DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS,
         )
 
+        # Bounded local-executor capacity (issue #86): positive bounds only;
+        # malformed or sub-minimum supplied values fail in every environment
+        # so misconfiguration never surfaces at runtime.
+        local_executor_workers = _read_int(
+            source,
+            LOCAL_EXECUTOR_WORKERS_VAR,
+            minimum=1,
+            default=DEFAULT_LOCAL_EXECUTOR_WORKERS,
+        )
+        local_executor_pending = _read_int(
+            source,
+            LOCAL_EXECUTOR_PENDING_VAR,
+            minimum=1,
+            default=DEFAULT_LOCAL_EXECUTOR_PENDING,
+        )
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -438,6 +530,7 @@ class Settings:
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
             api_port=api_port,
             api_reload=api_reload,
+            execution_mode=execution_mode,
             valkey_url=valkey_url,
             database_url=database_url,
             db_pool_min=db_pool_min,
@@ -452,5 +545,7 @@ class Settings:
             github_app_user_flow_client_id=github_app_user_flow_client_id,
             github_app_user_flow_client_secret=github_app_user_flow_client_secret,
             github_reconciliation_sweep_partitions=github_reconciliation_sweep_partitions,
+            local_executor_workers=local_executor_workers,
+            local_executor_pending=local_executor_pending,
             otlp_endpoint=otlp_endpoint,
         )

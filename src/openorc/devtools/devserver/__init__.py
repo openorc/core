@@ -55,7 +55,12 @@ from openorc.devtools.devserver.logging import (
     redact_url,
     sanitize_cli_error,
 )
-from openorc.devtools.devserver.orchestrator import NGROK_LOG_PATH, Devserver, main
+from openorc.devtools.devserver.orchestrator import (
+    NGROK_LOG_PATH,
+    Devserver,
+    main,
+    resolve_execution_mode,
+)
 from openorc.devtools.devserver.processes import (
     ChildProcess,
     CommandResolver,
@@ -71,7 +76,6 @@ from openorc.devtools.devserver.supabase import (
     parse_branch_environment,
 )
 from openorc.devtools.devserver.valkey import (
-    DEFAULT_VALKEY_URL,
     QueueClient,
     ValkeyManager,
     default_queue_client_factory,
@@ -80,7 +84,6 @@ from openorc.devtools.devserver.valkey import (
 
 __all__ = [
     "DEFAULT_TESTDB_COMMAND",
-    "DEFAULT_VALKEY_URL",
     "LOG_PREFIX",
     "NGROK_LOG_PATH",
     "BranchEnvironment",
@@ -108,6 +111,7 @@ __all__ = [
     "main",
     "parse_args",
     "parse_branch_environment",
+    "resolve_execution_mode",
     "redact_url",
     "sanitize_cli_error",
     "stop_child",

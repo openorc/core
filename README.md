@@ -73,12 +73,12 @@ Core is **Cline-first in v1, runtime-neutral at its architecture boundaries**. O
 
 ### Execution modes
 
-The v1 execution design provides two deployment choices over **one shared workflow implementation**:
+The v1 execution design provides two deployment choices over **one shared workflow implementation**, selected through `OPENORC_EXECUTION_MODE`:
 
-- **Regular mode (default design):** a bounded local executor, without a separate worker service or Valkey.
-- **Queue mode:** RQ/Valkey delivers the same operations to independently deployed workers.
+- **Regular mode (default):** a bounded local executor owned by the API serving process, without a separate worker service or Valkey. Capacity is bounded (`OPENORC_LOCAL_EXECUTOR_WORKERS`, default 2; `OPENORC_LOCAL_EXECUTOR_PENDING`, default 8), and saturation or shutdown refuses before acceptance.
+- **Queue mode:** RQ/Valkey delivers the same operations to independently deployed workers through an explicitly supplied `VALKEY_URL` (no implicit default backend).
 
-Postgres remains the durable authority in both modes. Mode-neutral delivery is being completed in Phase 2; existing local development tooling still uses RQ/Valkey.
+Both modes submit the same typed operation invocations through one shared dispatcher, and the RQ worker refuses to start in regular mode. Postgres remains the durable authority in both modes; neither local memory nor RQ IDs are workflow truth. Mode-neutral delivery for the existing GitHub webhook/sweep jobs lands with their regular/queue integration work.
 
 ## Project status
 

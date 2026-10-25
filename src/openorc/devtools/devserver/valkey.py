@@ -25,10 +25,10 @@ from openorc.devtools.devserver.processes import (
 )
 
 # OpenOrc queue naming is defined in src/openorc/workers/queues.py (openorc:
-# prefix; canonical default queue openorc:default). The devserver local
-# default is Redis DB index 2, the recommended local namespace (see
-# .env.example); an exported VALKEY_URL always wins.
-DEFAULT_VALKEY_URL = "redis://127.0.0.1:6379/2"
+# prefix; canonical default queue openorc:default). No VALKEY_URL default is
+# selected here: queue mode uses the exact URL the developer supplies through
+# .env or the exported environment (issue #86); an exported VALKEY_URL always
+# wins over .env.
 
 LOCAL_VALKEY_URL_RE = re.compile(r"^redis://(127\.0\.0\.1|localhost):([0-9]+)/([0-9]+)$")
 

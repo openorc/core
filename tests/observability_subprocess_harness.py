@@ -40,7 +40,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import set_tracer_provider
 
-from openorc.config import Settings
+from openorc.config import ExecutionMode, Settings
 from openorc.observability import (
     ObservabilityConfigurationError,
     ObservabilityFactories,
@@ -77,6 +77,7 @@ def _settings(endpoint: str | None) -> Settings:
         api_host="127.0.0.1",
         api_port=3000,
         api_reload=False,
+        execution_mode=ExecutionMode.QUEUE,
         valkey_url="redis://127.0.0.1:6379/0",
         otlp_endpoint=endpoint,
     )

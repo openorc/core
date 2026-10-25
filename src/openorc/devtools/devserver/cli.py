@@ -19,6 +19,10 @@ class RunConfig:
     include_app: bool = True
     include_api: bool = True
     include_worker: bool = True
+    # True only when the operator explicitly requested the worker surface
+    # (--worker-only); regular execution mode refuses it because a worker is
+    # meaningless without queue mode.
+    worker_only: bool = False
     auto_valkey: bool = True
     auto_ngrok: bool = True
     auto_supabase: bool = True
@@ -42,12 +46,13 @@ class RunConfig:
 USAGE = """Usage: ./devserver.sh [options]
 
 Default:
-  Start the local OpenOrc manual E2E stack:
+  Start the local OpenOrc manual E2E stack in the configured execution mode
+  (OPENORC_EXECUTION_MODE from the environment or .env; default regular):
     - ephemeral hosted Supabase branch (current-checkout migrations)
-    - local Redis-compatible queue backend (default db index 2)
-    - local API
-    - local worker
-    - local Vue app (foreground)
+    - regular mode (default): local API + local Vue app (foreground); no RQ
+      worker and no queue backend are started
+    - queue mode: local API + RQ worker + local Redis-compatible queue
+      backend using the exact VALKEY_URL you supply (no default is selected)
 
 Options:
   --app-only
@@ -60,12 +65,14 @@ Options:
 
   --worker-only
       Start only the worker (foreground).
+      Requires queue execution mode (OPENORC_EXECUTION_MODE=queue).
 
   --no-worker
       Do not start worker processes.
 
   --no-valkey
       Do not auto-start or reset the local queue backend.
+      Only meaningful in queue mode.
 
   --no-ngrok
       Do not start ngrok.
@@ -114,9 +121,10 @@ Notes:
   - The default Supabase environment is ephemeral; the branch created by a run
     is deleted on exit (including on failure) unless --keep-supabase is given.
   - The production Supabase project must never be used as a development target.
-  - A queue server already responding at VALKEY_URL is reused and left running
-    on exit; the selected local DB (default redis://127.0.0.1:6379/2) is still
-    flushed for a clean start. Non-local URLs are never flushed or managed.
+  - In queue mode, a queue server already responding at VALKEY_URL is reused
+    and left running on exit; the explicitly selected local DB is still
+    flushed for a clean start. Non-local URLs are never flushed or managed,
+    and no VALKEY_URL default is ever selected for you.
   - A devserver-started queue server runs redis-server directly with
     persistence disabled and is stopped on exit (never via brew services).
   - API/worker processes run from the repository .venv (uv sync); there is no
@@ -197,6 +205,7 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
             config.include_app = False
             config.include_api = False
             config.include_worker = True
+            config.worker_only = True
             config.auto_ngrok = False
         elif arg == "--no-worker":
             config.include_worker = False

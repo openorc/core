@@ -31,7 +31,6 @@ import pytest
 
 from openorc.devtools.devserver import (
     DEFAULT_TESTDB_COMMAND,
-    DEFAULT_VALKEY_URL,
     NGROK_LOG_PATH,
     Devserver,
     DevserverError,
@@ -47,6 +46,7 @@ from openorc.devtools.devserver import (
     parse_args,
     parse_branch_environment,
     redact_url,
+    resolve_execution_mode,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +56,11 @@ PIN_VERSION = (REPO_ROOT / "supabase" / "cli-version").read_text(encoding="utf-8
 
 REF_PARENT = "a" * 20
 REF_PRODUCTION = "c" * 20
+
+# The developer-supplied queue URL every queue-mode harness run uses (issue
+# #86: the devserver selects no VALKEY_URL default, so tests supply one
+# explicitly — a local /2 URL keeps working when a developer provides it).
+QUEUE_MODE_VALKEY_URL = "redis://127.0.0.1:6379/2"
 
 BRANCH_DB_URL = (
     "postgresql://postgres.bbbbbbbb:branchsecret@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
@@ -381,6 +386,10 @@ def make_harness(
         "OPENORC_SUPABASE_BRANCH_WAIT_MAX_ATTEMPTS": "2",
         "OPENORC_SUPABASE_BRANCH_WAIT_SLEEP_SECONDS": "0",
         "OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS": "0",
+        # Queue-mode harness default: the existing lifecycle tests exercise
+        # the RQ worker/queue-backend path with an explicitly supplied URL.
+        "OPENORC_EXECUTION_MODE": "queue",
+        "VALKEY_URL": QUEUE_MODE_VALKEY_URL,
     }
     if env:
         for key, value in env.items():
@@ -1089,7 +1098,7 @@ def test_devserver_owned_valkey_started_with_persistence_disabled_and_stopped(
     )
     assert backend.log_path == log_path
     assert harness.queue.flushes == 1
-    assert set(harness.queue_factory_urls) == {DEFAULT_VALKEY_URL}
+    assert set(harness.queue_factory_urls) == {QUEUE_MODE_VALKEY_URL}
     # The owned server is stopped (TERM) during cleanup and its invocation
     # temp directory is removed; the log file is intentionally left behind.
     assert ("signal", "queue-backend", signal.SIGTERM) in harness.events
@@ -1140,6 +1149,84 @@ def test_no_valkey_disables_start_and_flush(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Execution-mode selection (issue #86)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_execution_mode_defaults_to_regular() -> None:
+    assert resolve_execution_mode({}) == "regular"
+    assert resolve_execution_mode({"OPENORC_EXECUTION_MODE": ""}) == "regular"
+
+
+def test_resolve_execution_mode_accepts_queue_and_normalizes_case() -> None:
+    assert resolve_execution_mode({"OPENORC_EXECUTION_MODE": "queue"}) == "queue"
+    assert resolve_execution_mode({"OPENORC_EXECUTION_MODE": "  Queue "}) == "queue"
+    assert resolve_execution_mode({"OPENORC_EXECUTION_MODE": "REGULAR"}) == "regular"
+
+
+def test_resolve_execution_mode_rejects_invalid_values() -> None:
+    with pytest.raises(DevserverError, match="OPENORC_EXECUTION_MODE"):
+        resolve_execution_mode({"OPENORC_EXECUTION_MODE": "turbo"})
+
+
+def test_regular_mode_starts_no_worker_or_queue_backend(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        env={"OPENORC_EXECUTION_MODE": "regular", "VALKEY_URL": None},
+    )
+
+    assert harness.devserver.run() == 0
+
+    # No RQ worker and no queue backend start; the API still does.
+    assert not [call for call in harness.runner.spawn_calls if call.label == "worker"]
+    assert not [call for call in harness.runner.spawn_calls if call.label == "queue-backend"]
+    assert [call for call in harness.runner.spawn_calls if call.label == "api"]
+    assert harness.queue_factory_urls == []
+    assert harness.queue.flushes == 0
+    assert any("Regular execution mode" in message for message in harness.log.messages_of("log"))
+
+
+def test_queue_mode_requires_an_explicitly_supplied_valkey_url(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, env={"VALKEY_URL": None})
+
+    assert harness.devserver.run() == 1
+    errors = harness.log.messages_of("error")
+    assert any("VALKEY_URL" in message for message in errors)
+    assert not [call for call in harness.runner.spawn_calls if call.label == "worker"]
+
+
+def test_worker_only_requires_queue_execution_mode(tmp_path: Path) -> None:
+    harness = make_harness(
+        tmp_path,
+        config=parse_args(["--worker-only"]),
+        env={"OPENORC_EXECUTION_MODE": "regular"},
+    )
+
+    assert harness.devserver.run() == 1
+    errors = harness.log.messages_of("error")
+    assert any("--worker-only requires queue execution mode" in message for message in errors)
+    assert not [call for call in harness.runner.spawn_calls if call.label == "worker"]
+
+
+def test_invalid_execution_mode_fails_closed(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path, env={"OPENORC_EXECUTION_MODE": "turbo"})
+
+    assert harness.devserver.run() == 1
+    errors = harness.log.messages_of("error")
+    assert any("OPENORC_EXECUTION_MODE" in message for message in errors)
+    assert not [call for call in harness.runner.spawn_calls if call.label == "worker"]
+
+
+def test_worker_only_in_queue_mode_still_runs_the_worker_foreground(
+    tmp_path: Path,
+) -> None:
+    harness = make_harness(tmp_path, config=parse_args(["--worker-only"]))
+    assert harness.devserver.run() == 0
+    worker = next(call for call in harness.runner.spawn_calls if call.label == "worker")
+    assert worker.env is not None and worker.env["VALKEY_URL"] == QUEUE_MODE_VALKEY_URL
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle, modes, and cleanup ordering
 # ---------------------------------------------------------------------------
 
@@ -1160,7 +1247,7 @@ def test_full_lifecycle_stop_order_and_supabase_deletion_last(tmp_path: Path) ->
     assert api.env["OPENORC_API_PORT"] == "3000"
     worker = next(call for call in harness.runner.spawn_calls if call.label == "worker")
     assert worker.env is not None and worker.env["OPENORC_ENV"] == "development"
-    assert worker.env["VALKEY_URL"] == DEFAULT_VALKEY_URL
+    assert worker.env["VALKEY_URL"] == QUEUE_MODE_VALKEY_URL
 
     # Teardown: the foreground app already exited naturally (no signal), then
     # worker, then API, then the owned queue backend last of the processes.
@@ -1303,7 +1390,7 @@ def test_credentials_exported_to_children_never_env_file(tmp_path: Path) -> None
         assert env["DATABASE_URL"] == BRANCH_DB_URL
         assert env["OPENORC_ENV"] == "development"
     assert api.env is not None and api.env["OPENORC_API_PORT"] == "3000"
-    assert worker.env is not None and worker.env["VALKEY_URL"] == DEFAULT_VALKEY_URL
+    assert worker.env is not None and worker.env["VALKEY_URL"] == QUEUE_MODE_VALKEY_URL
 
     # Generated branch credentials never reach tracked/generated repo files.
     assert (harness.root / ".env").read_text(encoding="utf-8") == "NOTE=untouched\n"

@@ -19,15 +19,20 @@ from openorc.config import (
     DEFAULT_DB_POOL_MIN,
     DEFAULT_DB_POOL_TIMEOUT,
     DEFAULT_ENVIRONMENT,
-    DEFAULT_VALKEY_URL,
+    DEFAULT_LOCAL_EXECUTOR_PENDING,
+    DEFAULT_LOCAL_EXECUTOR_WORKERS,
     ENVIRONMENT_VAR,
+    EXECUTION_MODE_VAR,
     GITHUB_APP_USER_FLOW_CLIENT_ID_VAR,
     GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR,
     GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
     GITHUB_WEBHOOK_SECRET_VAR,
+    LOCAL_EXECUTOR_PENDING_VAR,
+    LOCAL_EXECUTOR_WORKERS_VAR,
     OTLP_ENDPOINT_VAR,
     VALKEY_URL_VAR,
     ConfigurationError,
+    ExecutionMode,
     Settings,
 )
 
@@ -39,7 +44,8 @@ def test_defaults_when_environment_is_empty() -> None:
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 3000
     assert settings.api_reload is False
-    assert settings.valkey_url == "redis://127.0.0.1:6379/0"
+    assert settings.execution_mode is ExecutionMode.REGULAR
+    assert settings.valkey_url is None
 
 
 def test_environment_values_override_defaults() -> None:
@@ -65,7 +71,7 @@ def test_blank_values_fall_back_to_defaults() -> None:
 
     assert settings.environment == "development"
     assert settings.api_port == 3000
-    assert settings.valkey_url == "redis://127.0.0.1:6379/0"
+    assert settings.valkey_url is None
 
 
 @pytest.mark.parametrize("raw", ["not-a-port", "0", "70000"])
@@ -128,11 +134,95 @@ def test_from_env_defaults_to_process_environment(
     assert settings.api_host == DEFAULT_API_HOST
     assert settings.api_port == DEFAULT_API_PORT
     assert settings.api_reload is False
-    assert settings.valkey_url == DEFAULT_VALKEY_URL
+    assert settings.valkey_url is None
     assert settings.database_url == DEFAULT_DATABASE_URL
     assert settings.db_pool_min == DEFAULT_DB_POOL_MIN
     assert settings.db_pool_max == DEFAULT_DB_POOL_MAX
     assert settings.db_pool_timeout == DEFAULT_DB_POOL_TIMEOUT
+
+
+def test_execution_mode_defaults_to_regular() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.execution_mode is ExecutionMode.REGULAR
+
+
+def test_execution_mode_queue_is_accepted() -> None:
+    settings = Settings.from_env(
+        {EXECUTION_MODE_VAR: "queue", VALKEY_URL_VAR: "redis://queue.example:6379/3"}
+    )
+
+    assert settings.execution_mode is ExecutionMode.QUEUE
+    assert settings.valkey_url == "redis://queue.example:6379/3"
+
+
+def test_execution_mode_is_case_and_whitespace_tolerant() -> None:
+    settings = Settings.from_env(
+        {EXECUTION_MODE_VAR: "  Queue ", VALKEY_URL_VAR: "redis://queue.example:6379/3"}
+    )
+
+    assert settings.execution_mode is ExecutionMode.QUEUE
+
+
+@pytest.mark.parametrize("raw", ["async", "QUEUE-MODE", "1"])
+def test_invalid_execution_mode_values_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_EXECUTION_MODE"):
+        Settings.from_env({EXECUTION_MODE_VAR: raw})
+
+
+def test_blank_execution_mode_falls_back_to_the_regular_default() -> None:
+    settings = Settings.from_env({EXECUTION_MODE_VAR: ""})
+
+    assert settings.execution_mode is ExecutionMode.REGULAR
+
+
+def test_queue_mode_requires_an_explicitly_supplied_valkey_url() -> None:
+    with pytest.raises(ConfigurationError, match="VALKEY_URL"):
+        Settings.from_env({EXECUTION_MODE_VAR: "queue"})
+
+
+def test_queue_mode_rejects_a_blank_valkey_url() -> None:
+    with pytest.raises(ConfigurationError, match="VALKEY_URL"):
+        Settings.from_env({EXECUTION_MODE_VAR: "queue", VALKEY_URL_VAR: "   "})
+
+
+def test_regular_mode_requires_no_valkey_url() -> None:
+    settings = Settings.from_env({EXECUTION_MODE_VAR: "regular"})
+
+    assert settings.execution_mode is ExecutionMode.REGULAR
+    assert settings.valkey_url is None
+
+
+def test_local_executor_capacity_defaults_are_bounded() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.local_executor_workers == DEFAULT_LOCAL_EXECUTOR_WORKERS == 2
+    assert settings.local_executor_pending == DEFAULT_LOCAL_EXECUTOR_PENDING == 8
+
+
+def test_local_executor_capacity_overrides_from_the_environment() -> None:
+    settings = Settings.from_env(
+        {LOCAL_EXECUTOR_WORKERS_VAR: "4", LOCAL_EXECUTOR_PENDING_VAR: "16"}
+    )
+
+    assert settings.local_executor_workers == 4
+    assert settings.local_executor_pending == 16
+
+
+@pytest.mark.parametrize(
+    ("var", "raw"),
+    [
+        (LOCAL_EXECUTOR_WORKERS_VAR, "0"),
+        (LOCAL_EXECUTOR_WORKERS_VAR, "-2"),
+        (LOCAL_EXECUTOR_WORKERS_VAR, "abc"),
+        (LOCAL_EXECUTOR_PENDING_VAR, "0"),
+        (LOCAL_EXECUTOR_PENDING_VAR, "-8"),
+        (LOCAL_EXECUTOR_PENDING_VAR, "1.5"),
+    ],
+)
+def test_malformed_local_executor_capacity_is_rejected(var: str, raw: str) -> None:
+    with pytest.raises(ConfigurationError, match=var):
+        Settings.from_env({var: raw})
 
 
 @pytest.mark.parametrize("raw", ["http://127.0.0.1:1/0", "not-a-url"])

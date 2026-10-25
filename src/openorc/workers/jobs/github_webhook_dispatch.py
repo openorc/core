@@ -18,7 +18,7 @@ from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from openorc.adapters.github import HttpGitHubAppClient
-from openorc.config import Settings
+from openorc.config import ConfigurationError, Settings
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import get_database_pool
 from openorc.services.errors import InvalidCommandError
@@ -99,6 +99,13 @@ class _RQWebhookDispatchSubmission:
                 "openorc.workers.jobs.github_webhook_dispatch.dispatch_github_webhook_delivery_job",
                 delivery_guid,
             )
+        except ConfigurationError:
+            # A missing explicitly configured VALKEY_URL (issue #86: the URL
+            # is queue-mode-only with no implicit localhost default) is a
+            # definitive refusal, not a crash: the delivery stays durably
+            # outstanding for reconciliation. F3b rewires this submission
+            # path through the shared invocation boundary.
+            return EnqueueOutcome.KNOWN_FAILED
         except (RedisTimeoutError, RedisConnectionError):
             return EnqueueOutcome.UNCERTAIN
         except RedisError:
