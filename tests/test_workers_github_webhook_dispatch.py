@@ -22,7 +22,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from openorc.config import Settings
+from openorc.config import ExecutionMode, Settings
 from openorc.observability import injected_tracer_source
 from openorc.services.errors import InvalidCommandError
 from openorc.workers.jobs import github_webhook_dispatch as job_module
@@ -257,6 +257,34 @@ def test_a_missing_valkey_url_classifies_as_known_failure_without_backend_contac
         github_app_private_key="not-a-real-key",
     )
     submission = job_module.build_github_webhook_dispatch_submission(unconfigured)
+
+    outcome = submission.enqueue("guid-1")
+
+    assert outcome is job_module.EnqueueOutcome.KNOWN_FAILED
+
+
+def test_regular_mode_with_a_configured_url_classifies_as_known_failure() -> None:
+    # Issue #86 mode isolation regression: even when a regular-mode
+    # deployment's environment carries VALKEY_URL, the Redis-compatible
+    # backend is queue-mode-only — the legacy submission must refuse with
+    # KNOWN_FAILED (never connect and enqueue work no worker would consume).
+    # The real client factory runs unpatched and must refuse before any
+    # backend contact.
+    regular_with_url = Settings(
+        environment="test",
+        api_host="127.0.0.1",
+        api_port=3999,
+        api_reload=False,
+        execution_mode=ExecutionMode.REGULAR,
+        valkey_url="redis://127.0.0.1:6379/2",
+        database_url="postgresql://postgres:postgres@127.0.0.1:54322/postgres",
+        db_pool_min=1,
+        db_pool_max=5,
+        db_pool_timeout=5.0,
+        github_app_id=1234,
+        github_app_private_key="not-a-real-key",
+    )
+    submission = job_module.build_github_webhook_dispatch_submission(regular_with_url)
 
     outcome = submission.enqueue("guid-1")
 

@@ -8,6 +8,7 @@ redis/rq seams, and no live Postgres, Valkey, or GitHub is touched.
 from __future__ import annotations
 
 import json
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -132,6 +133,18 @@ def test_encoded_wire_form_is_stable_json() -> None:
     assert encoded == {"kind": "github_reconciliation_sweep", "payload": {"sweep_tick": 7}}
 
 
+def test_mismatched_kind_and_payload_is_refused_at_construction() -> None:
+    # Construction-time correspondence keeps every execution mode's
+    # invocations equivalent: a sweep-kind invocation can never carry a
+    # webhook-dispatch payload, so the mismatch is refused before any
+    # submission, dispatch, or handler effect could exist.
+    with pytest.raises(InvalidInvocationError, match="does not match the operation kind"):
+        OperationInvocation(
+            kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
+            payload=WebhookDeliveryDispatchPayload(delivery_guid="guid"),
+        )
+
+
 # --- task-scoped component machinery (envelope only, no workflow wiring) ---
 
 
@@ -178,6 +191,7 @@ def test_task_scope_component_strictly_rejects_malformed_input(raw: object) -> N
         '{"kind": "github_reconciliation_sweep", "payload": {"sweep_tick": true}}',
         '{"kind": "github_reconciliation_sweep", "payload": {"sweep_tick": "3"}}',
         '{"kind": "github_reconciliation_sweep", "payload": {"tick": 3}}',
+        '{"kind": "github_reconciliation_sweep", "payload": {"delivery_guid": "x"}}',
         '{"kind": "github_webhook_delivery_dispatch", "payload": {}}',
         '{"kind": "github_webhook_delivery_dispatch", "payload": {"delivery_guid": ""}}',
         '{"kind": "github_webhook_delivery_dispatch", "payload": {"delivery_guid": 7}}',
@@ -511,6 +525,37 @@ def test_entrypoint_wraps_handler_failures_with_safe_classification(
     assert "github_reconciliation_sweep" in message
     assert "RuntimeError" in message
     assert "secret-bearing internal detail" not in message
+    # The sanitized failure carries no exception chain at all: queue failure
+    # reporting formats full tracebacks, and a cause would leak the original
+    # (possibly secret-bearing) message into reported failures.
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    formatted = "".join(
+        traceback.format_exception(type(raised.value), raised.value, raised.value.__traceback__)
+    )
+    assert "secret-bearing internal detail" not in formatted
+
+
+def test_malformed_invocation_failures_never_leak_payload_content_in_tracebacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_from_env(cls: type) -> Any:
+        raise AssertionError("settings must not be read for a malformed payload")
+
+    monkeypatch.setattr(invocation.Settings, "from_env", classmethod(unexpected_from_env))
+    malformed = (
+        '{"kind": "github_reconciliation_sweep", '
+        '"payload": {"sweep_tick": "secret-bearing internal detail"}}'
+    )
+
+    with pytest.raises(InvalidInvocationError) as raised:
+        execute_operation_job(malformed)
+
+    formatted = "".join(
+        traceback.format_exception(type(raised.value), raised.value, raised.value.__traceback__)
+    )
+    assert "secret-bearing internal detail" not in formatted
+    assert "secret-bearing internal detail" not in str(raised.value)
 
 
 def test_entrypoint_fails_closed_for_an_unregistered_kind(

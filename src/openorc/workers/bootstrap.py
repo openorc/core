@@ -70,10 +70,16 @@ class ProcessObservabilityLifecycle:
 def create_redis_client(settings: Settings) -> redis.Redis:
     """Create a Redis-compatible client from configured settings.
 
-    Fails fast when no explicitly configured queue backend URL exists: the
-    URL is queue-mode-only configuration and no implicit localhost default
-    is ever selected (issue #86).
+    Queue-backend access is a queue-mode capability (issue #86): regular
+    mode never connects to Valkey even when a URL happens to be configured
+    in the environment, and queue mode requires the explicitly supplied URL
+    — no implicit localhost default is ever selected.
     """
+    if settings.execution_mode is not ExecutionMode.QUEUE:
+        raise ConfigurationError(
+            "the Redis-compatible queue backend is available only in queue "
+            "execution mode: regular mode never connects to Valkey"
+        )
     if settings.valkey_url is None:
         raise ConfigurationError(
             "no Redis-compatible queue backend URL is configured: VALKEY_URL "

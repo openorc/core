@@ -111,9 +111,10 @@ def _require_exact_fields(raw: object, allowed: frozenset[str]) -> dict[str, obj
         raise InvalidInvocationError("the invocation payload must be a JSON object")
     unexpected = frozenset(raw) - allowed
     if unexpected:
-        raise InvalidInvocationError(
-            f"the invocation payload has unexpected fields: {sorted(unexpected)}"
-        )
+        # Untrusted input field names are never echoed into errors: the
+        # message is static so nothing payload-derived can reach reported
+        # failures.
+        raise InvalidInvocationError("the invocation payload has unexpected fields")
     missing = allowed - frozenset(raw)
     if missing:
         raise InvalidInvocationError(
@@ -134,10 +135,12 @@ def _require_canonical_uuid(raw: object, field: str) -> str:
         raise InvalidInvocationError(f"the invocation field {field!r} must be a UUID string")
     try:
         return str(UUID(raw))
-    except ValueError as error:
+    except ValueError:
+        # No chaining: malformed-invocation failures stay fully sanitized in
+        # reported tracebacks.
         raise InvalidInvocationError(
             f"the invocation field {field!r} must be a UUID string"
-        ) from error
+        ) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +239,14 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.GITHUB_RECONCILIATION_SWEEP: frozenset({"sweep_tick"}),
 }
 
+# The typed payload each operation kind carries; construction-time
+# correspondence keeps every mode's invocations equivalent and strictly
+# validated (issue #86).
+_PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
+    OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: WebhookDeliveryDispatchPayload,
+    OperationKind.GITHUB_RECONCILIATION_SWEEP: ReconciliationSweepPayload,
+}
+
 
 def _decode_webhook_delivery_dispatch_payload(raw: object) -> WebhookDeliveryDispatchPayload:
     fields = _require_exact_fields(
@@ -294,6 +305,17 @@ class OperationInvocation:
     kind: OperationKind
     payload: OperationPayload
 
+    def __post_init__(self) -> None:
+        # Construction-time correspondence: an invocation declaring one kind
+        # can never carry another kind's payload, so every execution mode
+        # receives equivalent, strictly validated invocations.
+        if not isinstance(self.kind, OperationKind):
+            raise InvalidInvocationError("the invocation kind must be an operation kind")
+        if not isinstance(self.payload, _PAYLOAD_TYPES[self.kind]):
+            raise InvalidInvocationError(
+                f"the payload type does not match the operation kind {self.kind.value!r}"
+            )
+
     def encode(self) -> str:
         """Encode to the stable JSON wire form."""
         return json.dumps(
@@ -316,13 +338,16 @@ def decode_operation_invocation(raw: str | bytes | Mapping[str, object]) -> Oper
     else:
         try:
             document = json.loads(raw)
-        except (TypeError, ValueError) as error:
-            raise InvalidInvocationError("the invocation is not valid JSON") from error
+        except (TypeError, ValueError):
+            # No chaining: malformed-invocation failures stay fully sanitized
+            # in reported tracebacks.
+            raise InvalidInvocationError("the invocation is not valid JSON") from None
     if not isinstance(document, dict):
         raise InvalidInvocationError("the invocation must be a JSON object")
     unexpected = frozenset(document) - {"kind", "payload"}
     if unexpected:
-        raise InvalidInvocationError(f"the invocation has unexpected fields: {sorted(unexpected)}")
+        # Untrusted input keys are never echoed into errors.
+        raise InvalidInvocationError("the invocation has unexpected fields")
     missing = {"kind", "payload"} - frozenset(document)
     if missing:
         raise InvalidInvocationError(
@@ -586,7 +611,12 @@ def execute_operation_job(encoded_invocation: str) -> None:
                 "operation execution job did not complete (error type %s)",
                 type(error).__name__,
             )
+            # Raise WITHOUT chaining: queue failure reporting formats full
+            # tracebacks, and an explicit (or implicit) cause would carry the
+            # original — possibly secret-bearing — exception message into
+            # reported failures. The sanitized error and the type-only log
+            # line above are the entire safe classification.
             raise OperationExecutionError(
                 f"operation execution failed (kind={invocation.kind.value}, "
                 f"error type {type(error).__name__})"
-            ) from error
+            ) from None

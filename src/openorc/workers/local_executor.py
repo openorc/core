@@ -34,6 +34,7 @@ from openorc.workers.invocation import (
     OperationKind,
     SubmissionRefusalReason,
     SubmissionResult,
+    invoke_operation,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,13 @@ class BoundedLocalExecutor:
         return DrainResult(drained=drained, outstanding=outstanding)
 
     def _execute(self, invocation: OperationInvocation) -> None:
-        """Run one admitted operation, containing failure with safe classification."""
+        """Run one admitted operation through the shared dispatcher.
+
+        Both modes execute through the same ``invoke_operation`` boundary,
+        so local execution observes the same fail-closed dispatch semantics
+        and spans as queue execution. Handler failures are contained with
+        safe classification and never escape into the pool thread.
+        """
         with self._condition:
             self._pending -= 1
             self._active += 1
@@ -155,7 +162,9 @@ class BoundedLocalExecutor:
                 _TRACER_SCOPE, f"local_executor.execute_operation.{invocation.kind.value}"
             ) as span:
                 annotate_span(span, operation=invocation.kind.value)
-                self._handlers[invocation.kind](invocation.payload, dependencies=self._dependencies)
+                invoke_operation(
+                    invocation, handlers=self._handlers, dependencies=self._dependencies
+                )
         except Exception as error:  # noqa: BLE001 - contained with safe classification
             # The span boundary classified the failure safely; arbitrary
             # exception content never reaches operational logs, and the

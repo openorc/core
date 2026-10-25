@@ -16,6 +16,7 @@ import pytest
 
 from openorc.config import Settings
 from openorc.workers.invocation import (
+    InvalidInvocationError,
     OperationDependencies,
     OperationInvocation,
     OperationKind,
@@ -227,6 +228,23 @@ def test_submit_refuses_a_kind_without_a_registered_handler(
         assert result.refusal_reason is SubmissionRefusalReason.NO_HANDLER_FOR_KIND
     finally:
         executor.shutdown()
+
+
+def test_mismatched_kind_and_payload_never_reaches_a_local_handler(
+    settings_factory: Any,
+) -> None:
+    # Local admission and queue delivery use the same strictly validated
+    # invocations: the correspondence is enforced at construction, so a
+    # mismatched invocation is refused before any handler effect could exist.
+    handler = RecordingHandler()
+
+    with pytest.raises(InvalidInvocationError, match="does not match the operation kind"):
+        OperationInvocation(
+            kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
+            payload=WebhookDeliveryDispatchPayload(delivery_guid="guid"),
+        )
+
+    assert handler.calls == []
 
 
 def test_handler_receives_the_decoded_payload_and_dependencies(

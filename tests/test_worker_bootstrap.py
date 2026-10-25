@@ -134,9 +134,25 @@ def test_create_redis_client_fails_fast_without_a_configured_url() -> None:
         api_host=DEFAULT_API_HOST,
         api_port=DEFAULT_API_PORT,
         api_reload=False,
+        execution_mode=ExecutionMode.QUEUE,
     )
 
     with pytest.raises(ConfigurationError, match="VALKEY_URL"):
+        bootstrap.create_redis_client(settings)
+
+
+def test_create_redis_client_refuses_regular_mode_even_with_a_configured_url() -> None:
+    # Issue #86 mode isolation: a regular-mode deployment never connects to
+    # Valkey even when a URL happens to be configured in its environment.
+    settings = Settings(
+        environment=DEFAULT_ENVIRONMENT,
+        api_host=DEFAULT_API_HOST,
+        api_port=DEFAULT_API_PORT,
+        api_reload=False,
+        valkey_url="redis://127.0.0.1:6379/2",
+    )
+
+    with pytest.raises(ConfigurationError, match="regular mode never connects to Valkey"):
         bootstrap.create_redis_client(settings)
 
 
