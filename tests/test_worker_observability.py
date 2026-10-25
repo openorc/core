@@ -10,7 +10,7 @@ import redis
 import rq
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from openorc.config import Settings
+from openorc.config import ExecutionMode, Settings
 from openorc.observability import observability_status
 from openorc.workers import bootstrap
 
@@ -53,7 +53,7 @@ def test_worker_initializes_then_shuts_down_terminally_in_finally(
     events = lifecycle.events
 
     bootstrap.run_worker(
-        settings_factory(),
+        settings_factory(execution_mode=ExecutionMode.QUEUE),
         client_factory=lambda _settings: cast("redis.Redis", _FakeRedisClient(events)),
         worker_builder=lambda _client: cast("rq.Worker", _FakeWorker(events)),
         observability=lifecycle,
@@ -73,7 +73,7 @@ def test_worker_shuts_down_when_backend_connect_fails(
 
     with pytest.raises(bootstrap.WorkerBootstrapError):
         bootstrap.run_worker(
-            settings_factory(),
+            settings_factory(execution_mode=ExecutionMode.QUEUE),
             client_factory=lambda _settings: cast("redis.Redis", _FailingClient()),
             observability=lifecycle,
         )
@@ -89,7 +89,7 @@ def test_worker_shuts_down_when_the_loop_errors(
 
     with pytest.raises(RuntimeError, match="loop failure"):
         bootstrap.run_worker(
-            settings_factory(),
+            settings_factory(execution_mode=ExecutionMode.QUEUE),
             client_factory=lambda _settings: cast("redis.Redis", _FakeRedisClient(events)),
             worker_builder=lambda _client: cast(
                 "rq.Worker", _FakeWorker(events, RuntimeError("loop failure"))
@@ -104,7 +104,7 @@ def test_default_lifecycle_leaves_telemetry_unconfigured(
     settings_factory: Callable[..., Settings],
 ) -> None:
     bootstrap.run_worker(
-        settings_factory(),
+        settings_factory(execution_mode=ExecutionMode.QUEUE),
         client_factory=lambda _settings: cast("redis.Redis", _FakeRedisClient([])),
         worker_builder=lambda _client: cast("rq.Worker", _FakeWorker([])),
     )

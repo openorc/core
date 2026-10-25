@@ -47,7 +47,6 @@ from openorc.devtools.devserver.supabase import (
     SupabaseManager,
 )
 from openorc.devtools.devserver.valkey import (
-    DEFAULT_VALKEY_URL,
     QueueClient,
     ValkeyManager,
     default_queue_client_factory,
@@ -55,7 +54,29 @@ from openorc.devtools.devserver.valkey import (
 
 DEFAULT_APP_PORT = 8081
 DEFAULT_API_PORT = 3000
+# Execution-mode selection (issue #86): read from the merged environment
+# (already-exported variables win over .env); regular is the default and no
+# invalid value is ever silently normalized into a mode.
+DEFAULT_EXECUTION_MODE = "regular"
+EXECUTION_MODE_REGULAR = "regular"
+EXECUTION_MODE_QUEUE = "queue"
+EXECUTION_MODE_VAR = "OPENORC_EXECUTION_MODE"
 FOREGROUND_POLL_SECONDS = 0.2
+
+
+def resolve_execution_mode(env: Mapping[str, str]) -> str:
+    """Resolve the execution mode from the merged environment (regular default)."""
+    raw = env.get(EXECUTION_MODE_VAR)
+    if raw is None or raw == "":
+        return DEFAULT_EXECUTION_MODE
+    normalized = raw.strip().lower()
+    if normalized not in (EXECUTION_MODE_REGULAR, EXECUTION_MODE_QUEUE):
+        raise DevserverError(
+            f"{EXECUTION_MODE_VAR} must be {EXECUTION_MODE_REGULAR!r} or "
+            f"{EXECUTION_MODE_QUEUE!r}; got {raw!r}"
+        )
+    return normalized
+
 
 NGROK_LOG_PATH = Path("/tmp/openorc-ngrok.log")
 
@@ -115,6 +136,7 @@ class Devserver:
         )
         self._supabase: SupabaseManager | None = None
         self._valkey: ValkeyManager | None = None
+        self._execution_mode: str = DEFAULT_EXECUTION_MODE
         self._shutdown_signum: int | None = None
         self._cleanup_done = False
         self._previous_signal_handlers: dict[int, Any] = {}
@@ -233,6 +255,15 @@ class Devserver:
             return self._execute_testdb()
         self._require_base_tools()
         load_env_file(self._root / ".env", self._env, self._log)
+        self._execution_mode = resolve_execution_mode(self._env)
+        if self._config.worker_only and self._execution_mode == EXECUTION_MODE_REGULAR:
+            raise DevserverError(
+                "--worker-only requires queue execution mode: set "
+                f"{EXECUTION_MODE_VAR}=queue (a worker is meaningless in regular "
+                "mode, where the API process executes operations locally)"
+            )
+        if self._execution_mode == EXECUTION_MODE_REGULAR and self._config.include_worker:
+            self._log.log("Regular execution mode: no RQ worker or queue backend is started.")
         api_port = self._env_value("LOCAL_API_PORT", str(DEFAULT_API_PORT))
         app_port = self._env_value("LOCAL_APP_PORT", str(DEFAULT_APP_PORT))
 
@@ -315,9 +346,19 @@ class Devserver:
         return manager.wait_until_ready()
 
     def _prepare_valkey(self) -> None:
+        if self._execution_mode != EXECUTION_MODE_QUEUE:
+            # Regular mode never starts, accesses, or flushes a queue backend
+            # and never exports a VALKEY_URL (issue #86).
+            return
         if not self._config.include_worker:
             return
-        valkey_url = self._env_value("VALKEY_URL", DEFAULT_VALKEY_URL)
+        valkey_url = self._env_value("VALKEY_URL", "")
+        if not valkey_url:
+            raise DevserverError(
+                "queue execution mode requires an explicitly supplied VALKEY_URL "
+                "(in .env or the exported environment); no localhost default is "
+                "selected"
+            )
         manager = ValkeyManager(
             valkey_url,
             runner=self._runner,
@@ -364,7 +405,12 @@ class Devserver:
                 runner=self._runner,
                 env=self._service_env({"OPENORC_API_PORT": api_port}),
             )
-        if config.include_worker and config.include_app:
+        worker_starts = (
+            config.include_worker
+            and config.include_app
+            and self._execution_mode == EXECUTION_MODE_QUEUE
+        )
+        if worker_starts:
             self._log.log("Starting OpenOrc worker in background...")
             self._supervisor.start(
                 "worker",

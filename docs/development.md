@@ -34,13 +34,20 @@ uv sync        # creates or updates the local .venv from uv.lock (dev group incl
 
 uv is the dependency/build tool, not a runtime dependency: environments that receive a prepared environment run the same entrypoints with their own interpreter (`python apps/api/main.py`). API and worker configuration comes from environment variables (see `.env.example`); neither process requires persistent local filesystem state.
 
-### Queue backend
+### Execution modes
 
-The worker connects to any Redis-compatible backend selected through `VALKEY_URL`; when unset, the application falls back to its built-in default (`redis://127.0.0.1:6379/0`).
+`OPENORC_EXECUTION_MODE` selects where logical operations are delivered; both modes invoke the same shared application services, and Postgres remains the durable authority.
+
+- **`regular` (default):** the API process executes operations through one bounded local executor per serving process (`OPENORC_LOCAL_EXECUTOR_WORKERS`, default 2, minimum 1; `OPENORC_LOCAL_EXECUTOR_PENDING`, default 8, minimum 1 — both running and waiting work are bounded). No RQ worker and no queue backend are required, started, or contacted. The RQ worker refuses to start in regular mode.
+- **`queue` (opt-in):** operations are delivered through RQ/Valkey to independently deployed workers. This mode requires an explicitly supplied `VALKEY_URL` and fails configuration/startup without one; no implicit localhost backend is ever selected.
+
+### Queue backend (queue mode only)
+
+In queue mode, the worker connects to any Redis-compatible backend selected through the explicitly supplied `VALKEY_URL`.
 
 - `openorc:` is the stable application-level RQ queue prefix. Deployment isolation is provided by the Redis/Valkey namespace selected by `VALKEY_URL`. In the current reference/local setup this may be a Redis DB index; another deployment may use a dedicated instance/service.
 - The canonical default queue is `openorc:default` (defined in `src/openorc/workers/queues.py`); future OpenOrc queues derive from the same prefix.
-- For local OpenOrc development, `VALKEY_URL=redis://127.0.0.1:6379/2` is the recommended namespace (see `.env.example`), keeping the local stack out of a Redis namespace shared with other local development tooling.
+- `VALKEY_URL` is queue-mode-only configuration and is always explicitly supplied (private `.env` or the deployment environment); the tracked `.env.example` template intentionally contains no endpoint value.
 - No server binary or server version is pinned: the queue backend contract is Redis-compatibility through `VALKEY_URL`. The exact-pinned `rq` and `redis` Python packages are application dependencies under the repository dependency policy, not server-version indicators.
 - RQ is asynchronous execution machinery, not workflow truth; durable workflow state belongs in Postgres, not queue payloads.
 - The GitHub reconciliation/recovery sweep (repeatable missed-delivery recovery) rides the canonical default queue through `src/openorc/workers/jobs/github_reconciliation_sweep.py`. Periodic reconciliation is a deployment scheduling concern, not a core-internal scheduler: an external scheduler enqueues the job with successive tick values modulo the configured partition count (`OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS`, default 16), and operator/manual recovery enqueues the same job without a tick (the full sweep). The tick is a scheduling position only, never workflow truth — every sweep unit re-derives its bounded current-work set from Postgres and re-reads fresh authoritative GitHub state, so replayed, delayed, or reordered jobs are harmless.
@@ -146,32 +153,34 @@ The ordinary pytest baseline excludes tests marked `integration` by default; `py
 
 ## Manual local E2E (devserver)
 
-`scripts/devserver.sh` starts the full local stack against a fresh ephemeral hosted Supabase branch. It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
+`scripts/devserver.sh` starts the local stack against a fresh ephemeral hosted Supabase branch, following the configured execution mode (issue #86): **regular mode (default)** starts the API and the Vue app only — no RQ worker and no queue backend — while **queue mode** (`OPENORC_EXECUTION_MODE=queue` from the environment or `.env`) additionally starts the RQ worker and the local Redis-compatible queue backend using the exact `VALKEY_URL` you supply (no default is selected; queue mode fails without it). It is a **human-run** tool for the Owner's manual E2E verification; agents do not run it during ordinary implementation work.
 
 The orchestration is implemented in Python (`src/openorc/devtools/devserver/`, a package of focused modules: CLI, environment, logging, subprocess mechanics, Supabase branch lifecycle, queue-backend ownership, and the orchestrator); `scripts/devserver.sh` is a deliberately small stable wrapper that resolves the repository root, requires the repository `.venv` (`uv sync`), and execs the Python entrypoint with all arguments unchanged. Signals (Ctrl-C/SIGTERM) only request shutdown — exactly one dependency-aware cleanup path performs all teardown.
 
 ```bash
-bash scripts/devserver.sh                 # full stack: Supabase branch + queue + API + worker + app (foreground)
+bash scripts/devserver.sh                 # regular mode: Supabase branch + API + app (foreground)
+OPENORC_EXECUTION_MODE=queue bash scripts/devserver.sh   # queue mode: + worker + queue backend at your VALKEY_URL
 bash scripts/devserver.sh --help          # component modes, --testdb, --no-* controls, --keep-supabase
 ```
 
-What a default run does:
+What a default (regular mode) run does:
 
 1. creates a unique ephemeral Supabase branch from `OPENORC_SUPABASE_PROJECT_REF`;
 2. waits for genuine branch readiness (published credentials plus a live database, bounded timeout);
 3. exports branch credentials (`SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `DATABASE_URL`) to the stack process tree only — never to tracked files;
 4. applies current-checkout migrations through `scripts/supabase-apply-migrations.sh` (fails hard on error) and `supabase/seed.sql` when present;
-5. ensures the local Redis-compatible queue backend (`VALKEY_URL`, default `redis://127.0.0.1:6379/2`) and flushes the selected local DB before the worker starts;
-6. starts the API and RQ worker from the repository `.venv` (`uv sync`), and runs the Vue dev server in the foreground;
-7. on any exit (including Ctrl-C or failure) runs a single dependency-aware cleanup: the app/worker/API stop first, the worker is allowed to finish its RQ shutdown while the queue backend is still alive, a devserver-started queue server stops only after that, and only the branch created by that run is deleted.
+5. starts the API from the repository `.venv` (`uv sync`) — the API executes operations through its bounded local executor — and runs the Vue dev server in the foreground; no worker, no Valkey access, and no Redis DB flush happen in this mode;
+6. on any exit (including Ctrl-C or failure) runs a single dependency-aware cleanup that stops the started processes and deletes only the branch created by that run.
+
+In queue mode the run additionally ensures the local queue backend at the supplied `VALKEY_URL` and flushes the selected local DB before the worker starts, then starts the API and RQ worker with the Vue dev server in the foreground; cleanup stops the app/worker/API first, allows the worker to finish its RQ shutdown while the queue backend is still alive, and stops a devserver-started queue server only after that.
 
 Lifecycle and safety properties:
 
-- A queue server already responding at `VALKEY_URL` is reused and left running; the selected local DB is still flushed. A devserver-started queue server runs `redis-server` directly (never `brew services`) with persistence disabled and is stopped on exit. Non-local URLs are never flushed or managed.
+- In queue mode, a queue server already responding at `VALKEY_URL` is reused and left running; the selected local DB is still flushed. A devserver-started queue server runs `redis-server` directly (never `brew services`) with persistence disabled and is stopped on exit. Non-local URLs are never flushed or managed.
 - The production Supabase project is never a development target: the stack only consumes credentials of the branch created by the run, and the migration tooling re-verifies non-production identity.
 - `--keep-supabase` preserves the branch for debugging and says so loudly (branches cost compute; delete them manually).
 
-Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, local `redis-server`, npm dependencies, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
+Prerequisites: pinned Supabase CLI (see `docs/supabase-migrations.md`), `.env` with `OPENORC_SUPABASE_PROJECT_REF` (and optionally `OPENORC_SUPABASE_PRODUCTION_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`), `.venv` from `uv sync`, npm dependencies, a local `redis-server` plus an explicitly supplied `VALKEY_URL` only for queue mode, and optionally `NGROK_RESERVED_URL` for webhook/callback testing.
 
 ### Running the integration suite against an ephemeral branch (`--testdb`)
 

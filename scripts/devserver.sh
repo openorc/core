@@ -20,9 +20,19 @@
 # Local development model (see README "Manual local E2E" for the full
 # lifecycle and safety properties):
 #
-#   Browser -> Vue app (foreground) -> FastAPI API -> RQ worker
+#   Regular execution mode (OPENORC_EXECUTION_MODE default):
+#     Browser -> Vue app (foreground) -> FastAPI API
+#                                     (operations execute through the
+#                                      bounded API-local executor; no RQ
+#                                      worker and no queue backend start)
+#                          API -> Supabase preview branch (ephemeral)
+#
+#   Queue execution mode (OPENORC_EXECUTION_MODE=queue):
+#     Browser -> Vue app (foreground) -> FastAPI API -> RQ worker
 #                                                   -> local Redis-compatible
-#                                                      queue backend
+#                                                      queue backend at the
+#                                                      exact VALKEY_URL you
+#                                                      supply (no default)
 #                          API/worker -> Supabase preview branch (ephemeral)
 #
 # ./scripts/devserver.sh --testdb [-- <command> [args...]] provisions an
