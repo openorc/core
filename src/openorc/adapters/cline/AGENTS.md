@@ -2,98 +2,21 @@
 
 ## Boundary
 
-Cline v1 support is an official Agent Runtime adapter in core. The Python adapter depends on an internal language-neutral SDK backend implemented initially by `packages/cline-sdk-bridge`.
+Use the official pinned `@cline/sdk` / `ClineCore` public remote-session surface through the narrow Python backend/Node bridge. Do not reimplement Hub wire protocol, parse private Cline files, or mirror the entire SDK into OpenOrc. Consult current official Cline SDK documentation before source archaeology or live qualification; upgrade the qualified CLI/core/SDK baseline deliberately together, with affected remote-runtime checks.
 
-Use the official Cline SDK path; do not reimplement the Cline Hub wire protocol, private on-disk state, or runtime internals when the documented public abstraction satisfies the contract.
+## Sessions, authority, and working context
 
-OpenOrc orchestrates **persistent Cline sessions assigned to workflow roles**. It does not own Cline's internal agent topology or native runtime configuration.
+- Preserve exact Task-scoped Producer/Reviewer sessions and distinct working contexts. Initialize once through validated `session_ready`; never replace an established external identity because a send, Hub, or bridge failed.
+- Cline-native PLAN/ACT construction mode realizes the authorized role workflow. Reviewer stays PLAN; Producer may ACT only for authorized checkout preparation, post-implementation-authorization work, and terminal checkout cleanup. Mode/working-directory changes use the qualified same-ID reconstruction with the raw existing messages; do not create another OpenOrc session or resend initialization.
+- The caller owns durable Task/role/Connection routing, selected base/checkout identity, and workflow authority. Adapter construction resolves current safe role configuration and only the already-selected exact working context; runtime/provider IDs are opaque and Cline owns provider authentication and native settings.
+- Never infer workflow acceptance, session loss, delivery, or completion from Cline bookkeeping status or optional telemetry. Confirm lost context using supported positive evidence, not missing events or an unavailable Hub.
+- Native tool approval is Cline-owned. v1 auto-approves enabled tools, disables `ask_question`, and registers no OpenOrc interactive approval executor; do not set spawn-agent/team flags.
 
-## Documentation-first rule
+## Delivery, review, and telemetry
 
-Before source archaeology, packet probing, or live experiments, read the current official Cline SDK documentation relevant to the change. At minimum for Cline adapter/bridge work consult:
+- Unknown send/reconstruction/interrupt outcomes require public-read reconciliation, not blind replay. Bridge/client disconnect may leave work completing Hub-side; restart may reset usage and require same-ID reconstruction.
+- Planning REVIEW sends the exact canonical PlanRevision; PR REVIEW supplies canonical PR and reconciled head SHA to the existing Reviewer session. Formal result validation and workflow consequences remain outside the Cline backend. Do not demand a private Reviewer checkout or certify the Reviewer's tool inspection.
+- Activity projections are explicitly read-only, Task/session-bound allowlists. Suppress reasoning, prompts, formal envelopes, tool/MCP inputs and outputs, raw errors, and credential-bearing data; only permitted completed assistant commentary and safe usage/status facts reach authorized clients. Usage is advisory and not evidence of success or continuity.
+- Connection `control_endpoint` is a validated `ws://`/`wss://` shape in safe config, never a credential or an assertion that its destination is safe. Deployment network isolation owns egress/SSRF protection.
 
-- https://docs.cline.bot/sdk/overview
-- https://docs.cline.bot/sdk/clinecore
-- https://docs.cline.bot/sdk/architecture/overview
-- API reference:
-  - https://docs.cline.bot/sdk/reference/cline-core
-  - https://docs.cline.bot/sdk/reference/agent
-  - https://docs.cline.bot/sdk/reference/gateway
-  - https://docs.cline.bot/sdk/reference/tools-api
-  - https://docs.cline.bot/sdk/reference/events
-  - https://docs.cline.bot/sdk/reference/types
-- https://docs.cline.bot/sdk/events
-- https://docs.cline.bot/sdk/tools
-- https://docs.cline.bot/sdk/plugins
-- https://docs.cline.bot/sdk/guides/permission-handling
-- https://docs.cline.bot/sdk/guides/going-to-production
-
-Treat documented public surfaces as the candidate contract. Use source inspection or live qualification only for pinned-version behavior, remote Cline Box semantics, or genuine ambiguity. Do not experimentally rediscover documented APIs.
-
-## SDK/package boundary
-
-- `@cline/sdk` / `ClineCore` is the primary OpenOrc runtime-session integration surface.
-- Lower-level `Agent` / `AgentRuntime` APIs are not the OpenOrc integration layer.
-- Do not depend on `@cline/llms`, a configured-provider catalog, or effective provider/model readback. Provider/model identifiers arrive as opaque OpenOrc role configuration.
-- Do not mirror ClineCore wholesale into Python. Expose only the session/configuration/control/event operations OpenOrc actually needs.
-- The supported CLI, Hub/core, and SDK versions are one qualified compatibility baseline. A newer upstream release is not authorization to update any component independently; changed public seams require documentation-first, targeted remote-runtime requalification and deliberate pin/contract updates.
-
-## Session invariants
-
-- Preserve one exact Producer and one exact Reviewer external session per Task for the Task lifetime.
-- Session creation is idempotent for `(Task, role)` and usable only after the OpenOrc readiness handshake succeeds.
-- Producer and Reviewer have isolated working contexts even on one Hub.
-- The qualified v1 Producer construction lifecycle is native Cline ACT at the authorized existing repository base (fresh bootstrap readiness, then the separately authorized PREPARE_WORKSPACE preparation) -> same-ID PLAN at the isolated Task checkout (planning) -> IMPLEMENT realizes the authorized same-ID PLAN->ACT reconstruction at that checkout -> authorized cleanup reconstructs the same ACT session back at the original base, outside the checkout. The Reviewer is always constructed in native PLAN at a neutral non-repository directory. On the pinned baseline, mode/working-directory changes use the qualified same-external-session-ID reconstruction path (read_messages -> stop -> same-ID start with the raw transcript verbatim) rather than per-send mode tags as current-mode authority.
-- Initial bootstrap ACT is workspace-preparation context, never implementation authority: only the already-authorized semantic IMPLEMENT control realizes PLAN->ACT, and a received WorkspaceResult never changes construction context by itself.
-- Adapter instances operate on existing bound sessions through the wiring-resolved durable Task/role/Connection binding (the injected read-only construction-context resolver) plus explicitly established caller context; an adapter-local memory of sessions it created or reconstituted is only an optimization, and its absence is never session-loss evidence. Exact-session absence is claimed only from positively established backend evidence, and identity-establishment misses fail closed before any runtime effect without claiming loss. The durable resolver implementation is the services-layer `openorc.services.cline_construction.DurableClineConstructionContextResolver` (issue #189): fresh resolution validates the exact CONNECTING binding and the admitted Connection's eligibility before supplying inputs; bound resolution keys on the exact external session identity and answers `None` on any unestablishable context; fresh-Producer construction and the durable READY snapshot share the one composition-selected base via `bootstrap_repository_base`/`effective_configuration`.
-- Runtime-internal rebuild under the same external session identity is not an OpenOrc session replacement.
-- Unexpected loss of the bound context blocks; never silently create a new one.
-
-## REVIEW realization boundary (issue #198, D5b remediation)
-
-A typed `ReviewInteraction` — planning (`PlanReviewSubject`) or canonical-PR
-(`PrReviewSubject`) subject — realizes through the ordinary shared formal
-path: the caller-composed message is sent verbatim to the exact existing
-session and the reply is validated through the shared #65 funnel. The
-adapter pre-validates, before any effect, that the caller's expected family
-matches the interaction's own `review_result` family, but the Reviewer owns
-its inspection method: acceptance is never conditioned on MCP/tool names,
-arguments, results, transcript structure, prescribed files, or any
-inspection procedure, and the adapter performs no transcript attestation
-for reviews. The dispatched `PrReviewSubject` (GitHub-authoritative
-repository, PR number, exact reconciled head SHA) is interaction context —
-not a `review_result` schema field and need not be echoed by the model —
-and model prose is never workflow authority. GitHub stays the authority for
-the current canonical PR/head: existing reconciliation, stale-head guards,
-invalidation/re-review after a changed head, and exact expected-SHA merge
-authorization are unchanged. Public transcript `read_messages` remains used
-by same-ID reconstruction, interruption reconciliation/recovery, and
-activity observation — never as a review-acceptance gate.
-
-## Runtime ownership
-
-OpenOrc owns Task/role binding, exact external-session routing, workflow semantics, and the role/session configuration it deliberately selects.
-
-For Cline v1, OpenOrc stores opaque provider/model identifiers plus an optional role-prompt override on the role binding. Each fresh construction or legitimate same-ID reconstruction resolves the then-current values; runtime-reported provider/model metadata is optional observation, never configuration authority.
-
-Cline owns provider authentication and native runtime configuration, including tools, MCP, plugins, skills, sub-agents/teams, filesystem/tool execution, runtime persistence, private conversational state, and other native behavior inside the session. OpenOrc's deliberate v1 session tool policy is the narrow exception to Cline-native approval configuration. A managed Cline Box does not transfer those concerns into OpenOrc merely because Cloud owns the host lifecycle.
-
-Do not parse private Cline files or invent a shadow configured-provider registry. If a selected provider/model is unusable because native Cline configuration/authentication is missing, surface the supported runtime failure.
-
-OpenOrc Connection rows never model Cline-owned provider/MCP/tool credentials. OpenOrc-owned authentication reaches the runtime only through an opaque reference boundary (`connections.auth_reference`), never as a persisted secret. Connection `enabled` and `session_capacity` remain OpenOrc admission/eligibility semantics, not runtime health or discovered Cline capacity.
-
-The Cline Connection `safe_config` schema (issue #188) is adapter-defined: `repository_base` plus one optional, validated `control_endpoint` — a complete `ws://`/`wss://` control URL the Core process reaches through the public SDK (explicit host in a supported form — DNS name, IPv4 literal, or bracketed IPv6 literal; `urlsplit` alone does not validate hostname syntax, so malformed host characters, non-ASCII/IDN hosts, and invalid address literals are typed rejections — plus a valid endpoint path, no userinfo/query/fragment or other secret-bearing URL components, and whitespace/control characters rejected). `adapters/cline/connection_endpoint.py` is the single parsing/validation primitive consumed by the future configuration mutation/read (G1) and attachment wiring (D8b); it validates shape only, returns the value verbatim (never normalized), and its errors name the failing aspect without echoing the raw value. A Connection without an endpoint stays stored but unattachable until configured. Parsing is never a safety property: a syntactically valid endpoint says nothing about where it actually leads. The SDK attachment (D8b) performs no application-level egress/SSRF screening and no transport interception: protecting internal services, metadata endpoints, loopback services, and other tenants from Owner-configured endpoints is a deployment-operator obligation (infrastructure isolation and network controls, issue #190), not a Core attachment behavior.
-
-## Delivery / telemetry
-
-Use public ClineCore reads/history plus supported events/state for delivery reconciliation, controls, usage, and optional runtime telemetry. A fresh client is not assumed to replay an already-running turn's event stream; uncertain accepted sends reconcile through public persisted state before any retry.
-
-The #148 D6b seam is caller-invoked and adapter-local: `reconcile_session` classifies exact-session continuity (accessible / recoverable / lost / unknown) through public reads only; `settle_uncertain_send`/`settle_abort` release exactly one caller-attested uncertainty kind under the adapter's lock ordering; `recover_session` performs authorized Hub-restart recovery through the single same-ID reconstruction seam. All three consume the backend's already-established attachment — establishing or restoring the D4 attachment (including the current `ClineRemoteConfig`) is caller/wiring responsibility, and the adapter never reconnects or replaces transport state. Terminal loss requires positive coherent absence across independent public reads on a healthy attachment AND a demonstrated exhaustive public-history contract (`ClineSessionEvidence.history_exhaustive`); the pinned backend contract guarantees no such exhaustiveness, so enumeration absence alone never classifies a session terminally lost today — pure read failures never latch uncertainty (only `_EFFECTFUL_OPERATIONS` outcomes do, per effect kind); uncertain stop/start outcomes stay sticky within the adapter instance.
-
-Cline v1 registers no interactive approval/question executors or capabilities, and native tool approvals do not become OpenOrc `RuntimeRequest`s. The deliberate v1 session policy auto-approves enabled tools and disables `ask_question`; do not set `enableSpawnAgent` or `enableAgentTeams`, which remain Cline-owned. Owner activity interruption uses the public abort semantics; `stop(sessionId)` belongs to same-ID runtime reconstruction, not to the user-facing activity-control surface.
-
-Do not blindly replay uncertain sends. Runtime telemetry and Cline record status are not workflow authority.
-
-The #164 D6c observation seam is Cline-local and read-only: `subscribe_activity` delivers a safe typed projection (`adapters/cline/activity.py`) of the attached backend's session events for the exact bound session, and `read_activity_snapshot` reports the pinned `SessionUsageSummary` scopes (`usage` root/lead-agent totals, `aggregateUsage` totals including teammates and subagents) the runtime currently accounts for it. Both resolve the durable binding first and fail closed before any backend effect, take no send/reconstruction lock, and never reconnect, replace, or manage transport state. The projection is an allowlist, never sanitization: reasoning content, prompts, command/tool/MCP inputs and outputs, raw errors, and snapshot contents never leave the adapter in projected activity; completed non-reasoning assistant commentary is deliberately permitted content-bearing agent-reported text for the authorized Task-facing product projection only (formal response envelopes are suppressed, not relabelled). All observation is advisory runtime bookkeeping: no event, completion, or usage reading completes an Execution/Task, validates a review, settles uncertainty, or classifies session loss, and usage is never evidence of delivery, continuity, success, or progress (a Hub restart may reset it within the same conversation).
-
-Read `packages/cline-sdk-bridge/AGENTS.md` for bridge changes and services/domain guidance for semantic changes.
+Read `packages/cline-sdk-bridge/AGENTS.md` for bridge changes and services/domain guidance for workflow changes.
