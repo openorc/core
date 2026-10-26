@@ -294,7 +294,7 @@ class FakeGitHubAppClient:
 
 
 def _ws_row() -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _installation_row() -> tuple[Any, ...]:
@@ -362,6 +362,7 @@ def _task_row(state_fingerprint: str | None = None) -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 

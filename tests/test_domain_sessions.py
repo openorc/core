@@ -340,6 +340,8 @@ def test_no_replacement_secret_or_telemetry_fields_exist() -> None:
             "ended_at",
             "created_at",
             "updated_at",
+            "retained_cost_usd",
+            "cost_observed_at",
         }
     )
 

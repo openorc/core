@@ -86,6 +86,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import NoReturn
@@ -392,6 +393,7 @@ def _claim_task_for_planning(
     task: Task,
     actor: WorkflowActorContext,
     source_requirements_fingerprint: str | None = None,
+    authorized_task_budget_usd: Decimal | None = None,
 ) -> Task:
     """Atomically claim the Task for bootstrap: planning + baseline + one start event.
 
@@ -402,9 +404,13 @@ def _claim_task_for_planning(
     freshly verified fingerprint is frozen by the SAME statement (issue
     #233): the capture is conditioned on the still-NULL baseline, so a
     successful planning claim and its immutable baseline commit — or roll
-    back — together. The queued-candidate sweep omits it: an already-queued
-    candidate's baseline is already frozen and the coalesce capture is a
-    no-op. A rejected write — a concurrent mutation won between the caller's
+    back — together. It also passes the then-current Workspace
+    ``authorized_task_budget_usd`` (issue #240), frozen by the same
+    statement and conditioned on the still-NULL authorization. The
+    queued-candidate sweep omits both: an already-queued candidate's
+    baseline and authorization were frozen at its queue entry and the
+    coalesce captures are no-ops — a queued wakeup never rewrites them. A
+    rejected write — a concurrent mutation won between the caller's
     locked read and this write — is never applied and never retried blindly:
     the typed stale outcome propagates to the caller's classification.
     """
@@ -414,6 +420,7 @@ def _claim_task_for_planning(
         expected_state_token=task.state_token,
         status=TaskStatus.PLANNING,
         capture_source_requirements_fingerprint=source_requirements_fingerprint,
+        capture_authorized_task_budget_usd=authorized_task_budget_usd,
     )
     if claimed is None:
         raise StaleOperationError(
@@ -433,6 +440,7 @@ def _queue_task_for_capacity(
     *,
     task: Task,
     source_requirements_fingerprint: str | None = None,
+    authorized_task_budget_usd: Decimal | None = None,
 ) -> Task:
     """Durably enter the Task into the FIFO capacity queue.
 
@@ -443,8 +451,12 @@ def _queue_task_for_capacity(
     ``queued`` IS a started Task for authority and baseline purposes even
     though agents have not yet run, and the capture is conditioned on the
     still-NULL baseline so it commits — or rolls back — atomically with the
-    queue entry. No reservation is made, no queue event exists, and the
-    returned Task carries the entry timestamp the FIFO order uses.
+    queue entry. It also passes the then-current Workspace
+    ``authorized_task_budget_usd`` (issue #240), frozen by the same
+    statement: a queued Task carries its original spending authorization
+    when capacity later becomes available, and no later default edit or
+    wakeup rewrites it. No reservation is made, no queue event exists, and
+    the returned Task carries the entry timestamp the FIFO order uses.
     """
     queued = task_records.update_task_status(
         transaction_pool,
@@ -452,6 +464,7 @@ def _queue_task_for_capacity(
         expected_state_token=task.state_token,
         status=TaskStatus.QUEUED,
         capture_source_requirements_fingerprint=source_requirements_fingerprint,
+        capture_authorized_task_budget_usd=authorized_task_budget_usd,
     )
     if queued is None:
         raise StaleOperationError(
@@ -813,6 +826,13 @@ def _arbitrate_target_start(
                     "requirements baseline; the corrected contract freezes it "
                     "only at a successful Owner Start"
                 )
+            # The then-current Workspace spending default (issue #240): read
+            # inside the same arbitration transaction so the authorization is
+            # captured atomically with the guarded start transition and can
+            # never silently diverge from a concurrent default edit.
+            workspace = get_workspace(transaction_pool, workspace_id)
+            if workspace is None:
+                raise NotFoundError("the requested workspace is not available")
             # The fresh mirror Phase B just refreshed is the eligibility
             # authority for the target's claim too; the compared baseline is
             # the fingerprint this decision will freeze (issue #233).
@@ -853,6 +873,7 @@ def _arbitrate_target_start(
                         task=task,
                         actor=event_coordination.owner_actor(profile_id),
                         source_requirements_fingerprint=source_requirements_fingerprint,
+                        authorized_task_budget_usd=workspace.default_task_budget_usd,
                     )
                     return TaskStartOutcome(
                         status=TaskStartStatus.PLANNING,
@@ -868,6 +889,7 @@ def _arbitrate_target_start(
                 transaction_pool,
                 task=task,
                 source_requirements_fingerprint=source_requirements_fingerprint,
+                authorized_task_budget_usd=workspace.default_task_budget_usd,
             )
             return TaskStartOutcome(
                 status=TaskStartStatus.QUEUED,

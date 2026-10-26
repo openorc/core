@@ -379,6 +379,7 @@ def _task_row(
         _NOW,
         _NOW,
         None,
+        None,
     )
 
 

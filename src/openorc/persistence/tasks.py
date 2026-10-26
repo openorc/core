@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -62,7 +63,7 @@ _TASK_COLUMNS = (
     "status, archived_at, canonical_feature_branch, state_token, "
     "current_plan_revision_id, current_owner_gate_id, "
     "source_requirements_fingerprint, queued_at, created_at, updated_at, "
-    "terminal_cause"
+    "terminal_cause, authorized_task_budget_usd"
 )
 
 
@@ -86,6 +87,7 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         created_at=normalize_utc(row[13]),
         updated_at=normalize_utc(row[14]),
         terminal_cause=None if row[15] is None else TaskTerminalCause(row[15]),
+        authorized_task_budget_usd=row[16],
     )
 
 
@@ -390,6 +392,7 @@ def update_task_status(
     expected_state_token: UUID,
     status: TaskStatus,
     capture_source_requirements_fingerprint: str | None = None,
+    capture_authorized_task_budget_usd: Decimal | None = None,
 ) -> Task | None:
     """Move a current Task to a nonterminal status, rotating ``state_token``.
 
@@ -406,6 +409,15 @@ def update_task_status(
     rewrite an existing frozen baseline. The default ``None`` is a no-op for
     every other caller.
 
+    The same statement captures the Owner-authorized USD Task budget
+    (issue #240): ``capture_authorized_task_budget_usd`` is set only where
+    the authorization is still NULL (``coalesce``), so a successful start
+    copies the then-current Workspace default atomically with the
+    transition, a queued Task keeps the authorization it queued with when
+    capacity later admits it, a queued-wakeup claim (which passes ``None``)
+    and any later Workspace default edit never rewrite it. ``None`` means no
+    spending policy is authorized — disabled, never zero.
+
     The update is conditional on ``expected_state_token`` and replaces the
     token atomically. Returns the updated Task, or ``None`` when the token
     no longer matches or the Task is missing/already archived (a stale
@@ -415,6 +427,15 @@ def update_task_status(
         raise TaskDomainError(
             "update_task_status only accepts nonterminal Task statuses; "
             "terminal transitions go exclusively through archive_task"
+        )
+    if capture_authorized_task_budget_usd is not None and (
+        isinstance(capture_authorized_task_budget_usd, bool)
+        or not isinstance(capture_authorized_task_budget_usd, Decimal)
+        or not capture_authorized_task_budget_usd.is_finite()
+        or capture_authorized_task_budget_usd <= 0
+    ):
+        raise TaskDomainError(
+            "capture_authorized_task_budget_usd must be None or a positive finite USD amount"
         )
     with transaction(pool) as conn:
         row = conn.execute(
@@ -428,6 +449,14 @@ def update_task_status(
             # status reject a NULL baseline.
             "source_requirements_fingerprint = "
             "coalesce(source_requirements_fingerprint, %s), "
+            # The Owner spending-authorization capture (issue #240): the
+            # then-current Workspace default is frozen in this same
+            # statement, and only where no authorization exists yet —
+            # coalesce can never rewrite a captured authorization. The
+            # status-aware CHECK is the durable backstop: a ready_to_plan
+            # row rejects a present authorization.
+            "authorized_task_budget_usd = "
+            "coalesce(authorized_task_budget_usd, %s), "
             # The durable queue-entry timestamp (issue #76): stamped by the
             # DB clock exactly once when a Task first moves into queued,
             # preserved unchanged while it stays queued (repeated capacity
@@ -445,6 +474,7 @@ def update_task_status(
             (
                 status.value,
                 capture_source_requirements_fingerprint,
+                capture_authorized_task_budget_usd,
                 status.value,
                 status.value,
                 task_id,

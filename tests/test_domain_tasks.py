@@ -213,6 +213,7 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "created_at",
             "updated_at",
             "terminal_cause",
+            "authorized_task_budget_usd",
         }
     )
 

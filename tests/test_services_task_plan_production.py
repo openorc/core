@@ -237,7 +237,7 @@ _REVISION_INSERT = _sql_has("insert into openorc.plan_revisions")
 
 
 def _ws_row(*, guidance: str = "") -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, guidance)
+    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, guidance, None)
 
 
 def _task_row(
@@ -263,6 +263,7 @@ def _task_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 
@@ -329,6 +330,8 @@ def _session_row(
         _OBSERVED if lifecycle == "ended" else None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

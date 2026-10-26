@@ -82,7 +82,7 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 def _ws_row(workspace_id: Any, profile_id: Any) -> tuple[Any, ...]:
-    return (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _installation_row(

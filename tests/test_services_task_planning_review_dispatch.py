@@ -213,7 +213,7 @@ _RESULT_UPDATE = _sql_has("update openorc.review_iterations")
 
 
 def _ws_row(*, limit: int = 5) -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, limit, "")
+    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, limit, "", None)
 
 
 def _task_row(
@@ -240,6 +240,7 @@ def _task_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 
@@ -270,6 +271,8 @@ def _session_row(
         _OBSERVED if lifecycle == "ended" else None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

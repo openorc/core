@@ -189,7 +189,7 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 def _ws_row() -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _installation_row() -> tuple[Any, ...]:
@@ -267,6 +267,7 @@ def _task_row(
         _OBSERVED,
         _OBSERVED,
         None,
+        None,
     )
 
 
@@ -324,6 +325,8 @@ def _session_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 
@@ -536,7 +539,7 @@ def _script_task_update(
             "update openorc.tasks" in sql
             and params is not None
             and params[0] == status_value
-            and params[4] == task_id
+            and params[5] == task_id
         )
 
     conn.on_repeat(predicate, row)
@@ -1032,14 +1035,14 @@ def test_establishment_pass_advances_the_older_candidate_before_the_target() -> 
     candidate_update_index = next(
         index
         for index, (sql, params) in enumerate(conn.executed)
-        if "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
+        if "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
     )
     target_update_index = next(
         index
         for index, (sql, params) in enumerate(conn.executed)
         if "update openorc.tasks" in sql
         and params is not None
-        and params[4] == _TASK_ID
+        and params[5] == _TASK_ID
         and params[0] == "planning"
     )
     assert candidate_update_index < target_update_index
@@ -1086,7 +1089,7 @@ def test_establishment_pass_consuming_capacity_queues_the_target() -> None:
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[4] == _CANDIDATE_ID
+        and params[5] == _CANDIDATE_ID
         and params[0] == "planning"
         for sql, params in conn.executed
     )
@@ -1111,7 +1114,7 @@ def test_multi_page_queue_is_fully_examined_before_the_target_decides(
     assert outcome.status is TaskStartStatus.PLANNING
     # Every queued candidate across pages was claimed before the target.
     planning_targets = [
-        params[4]
+        params[5]
         for sql, params in conn.executed
         if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
     ]
@@ -1137,7 +1140,7 @@ def test_budget_exhaustion_defers_the_target_conservatively(
     assert outcome.status is TaskStartStatus.QUEUED
     assert outcome.queue_reason is TaskStartQueueReason.ARBITRATION_DEFERRED
     planning_updates = [
-        params[4]
+        params[5]
         for sql, params in conn.executed
         if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
     ]
@@ -1169,14 +1172,14 @@ def test_durable_projection_contradiction_never_advances_the_candidate() -> None
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[4] == _TASK_ID
+        and params[5] == _TASK_ID
         and params[0] == "planning"
         for sql, params in conn.executed
     )
     # The contradicted candidate was never claimed and stayed queued with
     # its original entry timestamp.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
 
@@ -1331,13 +1334,13 @@ def test_sweep_surfaces_conditions_without_stalling_remaining_candidates() -> No
     # The ineligible oldest candidate stayed queued; the next candidate
     # still advanced.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[4] == candidate_b_id
+        and params[5] == candidate_b_id
         and params[0] == "planning"
         for sql, params in conn.executed
     )
@@ -1418,13 +1421,13 @@ def test_missing_role_binding_is_a_candidate_conflict_that_never_stalls_follower
     # The binding-less candidate stayed queued with its original durable key
     # and the eligible follower still advanced in the same sweep.
     assert not any(
-        "update openorc.tasks" in sql and params is not None and params[4] == _CANDIDATE_ID
+        "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
     assert any(
         "update openorc.tasks" in sql
         and params is not None
-        and params[4] == candidate_b_id
+        and params[5] == candidate_b_id
         and params[0] == "planning"
         for sql, params in conn.executed
     )

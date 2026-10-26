@@ -243,7 +243,7 @@ def _discussion_event_insert(sql: str, params: tuple[Any, ...] | None) -> bool:
 
 
 def _ws_row(*, owner: Any = _OWNER_PROFILE_ID) -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, owner, "platform", _OBSERVED, _OBSERVED, 2, "")
+    return (_WORKSPACE_ID, owner, "platform", _OBSERVED, _OBSERVED, 2, "", None)
 
 
 def _task_row(
@@ -270,6 +270,7 @@ def _task_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 
@@ -301,6 +302,8 @@ def _session_row(
         _OBSERVED if resolved_lifecycle == "ended" else None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

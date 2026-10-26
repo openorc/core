@@ -219,7 +219,7 @@ _GATES_LIST = _sql_has("from openorc.owner_gates where task_id")
 
 
 def _ws_row(*, owner: Any = _OWNER_PROFILE_ID, limit: int = 2) -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, owner, "platform", _OBSERVED, _OBSERVED, limit, "")
+    return (_WORKSPACE_ID, owner, "platform", _OBSERVED, _OBSERVED, limit, "", None)
 
 
 def _task_row(
@@ -246,6 +246,7 @@ def _task_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 
@@ -287,6 +288,8 @@ def _session_row(
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

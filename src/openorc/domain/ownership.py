@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 __all__ = [
@@ -103,6 +104,10 @@ class Workspace:
     semantics, and it can never redefine formal schemas, initialization
     semantics, workflow controls, authority, communication topology, exact
     review-subject identity, session boundaries, or state transitions.
+    ``default_task_budget_usd`` (issue #240) is the Owner-authorized default
+    USD Task budget: NULL means spending policy is disabled (never zero,
+    never an implicit limit), and the value copied onto each Task at its
+    successful Owner Start is that Task's immutable authorization.
     """
 
     id: UUID
@@ -112,6 +117,11 @@ class Workspace:
     updated_at: datetime
     review_iteration_limit: int
     guidance: str
+    # The Owner-authorized default USD Task budget (issue #240): NULL is the
+    # ordinary unconfigured case (spending policy disabled — no implicit
+    # limit, never zero). Carried as an exact decimal, never a binary float.
+    # The default keeps every existing construction site truthful.
+    default_task_budget_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -126,6 +136,16 @@ class Workspace:
         if not isinstance(self.guidance, str):
             raise OwnershipError(
                 f"Workspace.guidance must be a string, got {type(self.guidance).__name__}"
+            )
+        if self.default_task_budget_usd is not None and (
+            isinstance(self.default_task_budget_usd, bool)
+            or not isinstance(self.default_task_budget_usd, Decimal)
+            or not self.default_task_budget_usd.is_finite()
+            or self.default_task_budget_usd <= 0
+        ):
+            raise OwnershipError(
+                "Workspace.default_task_budget_usd must be None or a positive "
+                "finite USD amount (an exact decimal; NULL disables spending policy)"
             )
 
 

@@ -117,6 +117,7 @@ def _ws_row(owner_profile_id: Any, workspace_id: Any = None) -> tuple[Any, ...]:
         _OBSERVED,
         5,
         "",
+        None,
     )
 
 
@@ -179,6 +180,7 @@ def _task_row(workspace_id: Any, *, archived: bool) -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 
@@ -541,8 +543,8 @@ def test_delete_workspace_record_cleans_every_referenced_vault_secret() -> None:
         auth_reference=runtime_control_secrets.encode_connection_auth_reference(secret_a),
     )
     connection_b = _connection_row(workspace_id, auth_reference=None)
-    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
-    deleted_workspace = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
+    deleted_workspace = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
     conn = ScriptedConnection(
         [
             _guard_operational_row(),
@@ -589,8 +591,8 @@ def test_delete_workspace_record_cleans_every_referenced_vault_secret() -> None:
 def test_delete_workspace_with_zero_connections_still_locks_the_root() -> None:
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
-    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
-    deleted_workspace = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
+    deleted_workspace = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
     conn = ScriptedConnection(
         [
             _guard_operational_row(),
@@ -635,7 +637,7 @@ def test_delete_workspace_resolution_fails_closed_uniformly() -> None:
             _pool(missing), profile_id=profile_id, workspace_id=uuid.uuid4()
         )
 
-    other_workspace = (uuid.uuid4(), uuid.uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "")
+    other_workspace = (uuid.uuid4(), uuid.uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "", None)
     cross = ScriptedConnection([_guard_operational_row(), _ws_row(profile_id), other_workspace])
     with pytest.raises(NotFoundError):
         administrative_deletion.delete_workspace_record(
@@ -713,7 +715,7 @@ def test_delete_workspace_opens_one_service_span_with_safe_attributes() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     profile_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
-    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    workspace_row = (workspace_id, profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
     conn = ScriptedConnection(
         [
             _guard_operational_row(),

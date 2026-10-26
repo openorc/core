@@ -255,7 +255,7 @@ _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
 
 
 def _ws_row(*, guidance: str = "") -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 2, guidance)
+    return (_WORKSPACE_ID, _OWNER_PROFILE_ID, "platform", _OBSERVED, _OBSERVED, 2, guidance, None)
 
 
 def _task_row(
@@ -283,6 +283,7 @@ def _task_row(
         _OBSERVED,
         _OBSERVED,
         terminal_cause,
+        None,
     )
 
 
@@ -325,6 +326,8 @@ def _session_row() -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

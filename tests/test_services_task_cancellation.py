@@ -123,7 +123,7 @@ def _task_values(
     fingerprint: Any = "a" * 64,
     cause: Any = None,
 ) -> tuple[Any, ...]:
-    """One 16-column ``openorc.tasks`` row shaped like the durable model."""
+    """One 17-column ``openorc.tasks`` row shaped like the durable model."""
     return (
         _TASK_ID,
         _WORKSPACE_ID,
@@ -141,6 +141,7 @@ def _task_values(
         _OBSERVED,
         _OBSERVED,
         cause,
+        None,
     )
 
 

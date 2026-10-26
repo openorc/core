@@ -101,6 +101,7 @@ def _ws_row(owner_profile_id: Any) -> tuple[Any, ...]:
         _OBSERVED,
         5,
         "",
+        None,
     )
 
 

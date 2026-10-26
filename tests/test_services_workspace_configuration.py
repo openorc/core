@@ -109,6 +109,7 @@ def _ws_row(
         _OBSERVED,
         review_iteration_limit,
         guidance,
+        None,
     )
 
 

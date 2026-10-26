@@ -142,6 +142,8 @@ def _binding_row(
         _OBSERVED if lifecycle_status == "ended" else None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 

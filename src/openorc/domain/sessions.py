@@ -56,6 +56,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from math import isinf, isnan
 from types import MappingProxyType
@@ -212,6 +213,17 @@ class TaskAgentSession:
     ended_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # The best-effort session cost checkpoint (issue #240): the last RETAINED
+    # nonnegative aggregate Cline-reported USD cost observed for the exact
+    # bound external session, plus its observation instant. Both NULL is the
+    # ordinary unobserved state (unknown — never zero); both move together,
+    # and the retained value is the high-water reported reading so repeated,
+    # out-of-order, and Hub-reset lower snapshots never decrease it. The
+    # Task's observed expenditure is never duplicated here or on the Task:
+    # it is derived by summing these per-session checkpoints. The defaults
+    # keep every existing construction site truthful.
+    retained_cost_usd: Decimal | None = None
+    cost_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, WorkflowRole):
@@ -285,6 +297,42 @@ class TaskAgentSession:
             raise TaskAgentSessionDomainError(
                 "TaskAgentSession.ended_at must be set exactly when lifecycle_status is ENDED"
             )
+        # The session cost checkpoint (issue #240) moves as one coherent
+        # pair and only for an initialized binding: an external session that
+        # was never bound cannot have reported any usage, so an observation
+        # on a CONNECTING (or never-initialized) row is unrepresentable.
+        # NULL together is the ordinary unobserved state — unknown, never
+        # zero. The database CHECK mirrors the pair coherence and the
+        # nonnegative amount.
+        cost_checkpoint = (self.retained_cost_usd, self.cost_observed_at)
+        if any(fact is not None for fact in cost_checkpoint):
+            if not all(fact is not None for fact in cost_checkpoint):
+                raise TaskAgentSessionDomainError(
+                    "TaskAgentSession cost checkpoint must move as one pair: "
+                    "retained_cost_usd and cost_observed_at are NULL together "
+                    "(never observed) or set together"
+                )
+            if (
+                isinstance(self.retained_cost_usd, bool)
+                or not isinstance(self.retained_cost_usd, Decimal)
+                or not self.retained_cost_usd.is_finite()
+                or self.retained_cost_usd < 0
+            ):
+                raise TaskAgentSessionDomainError(
+                    "TaskAgentSession.retained_cost_usd must be a nonnegative "
+                    "finite USD amount (an exact decimal)"
+                )
+            if not isinstance(self.cost_observed_at, datetime) or (
+                self.cost_observed_at.tzinfo is None
+            ):
+                raise TaskAgentSessionDomainError(
+                    "TaskAgentSession.cost_observed_at must be a timezone-aware datetime"
+                )
+            if self.external_session_id is None:
+                raise TaskAgentSessionDomainError(
+                    "a TaskAgentSession cost checkpoint requires an initialized "
+                    "external session: no usage can exist before initialization"
+                )
 
 
 def task_agent_session_field_names() -> frozenset[str]:

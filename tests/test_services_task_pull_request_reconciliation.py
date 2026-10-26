@@ -164,6 +164,7 @@ def _task_row() -> tuple[Any, ...]:
         _OBSERVED,
         _OBSERVED,
         None,
+        None,
     )
 
 
@@ -224,7 +225,7 @@ def _installation_row() -> tuple[Any, ...]:
 
 
 def _workspace_row() -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, uuid.uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (_WORKSPACE_ID, uuid.uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _repository_observation() -> GitHubRepositoryObservation:
