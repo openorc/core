@@ -539,6 +539,14 @@ class TestAtomicCostLimitBlock:
 
     def test_an_idle_task_blocks_without_gratuitous_intents(self, conn: Connection[Any]) -> None:
         workspace_id, task_id, connection_id, producer_session_id = _seed_budgeted_task(conn)
+        # The idle-at-a-pending-Owner-gate scenario: the Task waits for its
+        # Owner with no demonstrated in-flight runtime activity. (The
+        # planning phase itself now admits its bound Producer session, so
+        # the gate wait is the genuinely idle state.)
+        conn.execute(
+            "update openorc.tasks set status = 'waiting_for_owner' where id = %s",
+            (task_id,),
+        )
         pool = cast(DatabasePool, _SingleConnectionPool(conn))
         assert (
             session_repositories.checkpoint_task_agent_session_cost(

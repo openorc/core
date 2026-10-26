@@ -23,9 +23,12 @@ Boundary discipline:
   ``ClineActivitySnapshot.aggregate_usage`` — never a raw SDK object).
   Snapshot reads are SDK I/O and happen OUTSIDE any database transaction;
   the checkpoint and the budget evaluation compose in one fresh short
-  ``composed_transaction`` under the Task row lock, acquired first so
-  Task-then-session lock ordering stays consistent with every other Task
-  mutation.
+  ``composed_transaction`` whose FIRST lock acquisition is the
+  account-operational barrier (the accountable Workspace Owner Profile,
+  resolved from durable Workspace state, composed before the Task row lock
+  per the profile_lifecycle_guard ordering contract with account
+  deletion), after which Task-then-session lock ordering stays consistent
+  with every other Task mutation.
 - Absent, unusable, stale, or foreign observations are unknown truth:
   they checkpoint nothing, block nothing, and never authorize anything.
   Unavailable readings are deliberately nonblocking (no speculative
@@ -53,11 +56,13 @@ from openorc.domain.blocks import TaskBlock
 from openorc.domain.intents import TaskInterruptIntent
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import ownership as ownership_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_abort
 from openorc.services.errors import InvalidCommandError
+from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
@@ -221,10 +226,13 @@ def observe_session_usage(
 ) -> SessionCostObservation:
     """Checkpoint one session's aggregate reported cost and evaluate its Task budget.
 
-    One fresh short composed transaction, under the Task row lock acquired
-    first: the exact-scope high-water checkpoint (only when the binding
-    tuple and a strictly greater amount both match), then the budget
-    evaluation against the role-agnostic retained-cost aggregate. A reached
+    One fresh short composed transaction whose FIRST lock acquisition is the
+    account-operational barrier (the accountable Workspace Owner Profile,
+    resolved from durable Workspace state, composed before the Task row lock
+    per the profile_lifecycle_guard ordering contract): the exact-scope
+    high-water checkpoint (only when the binding tuple and a strictly
+    greater amount both match), then the budget evaluation against the
+    role-agnostic retained-cost aggregate. A reached
     threshold composes the shared Owner-authorized cost-limit block in the
     SAME transaction — block, ``blocked`` transition, OWNER audit, and
     exact one-shot Interrupt intents commit or roll back together — with
@@ -244,9 +252,21 @@ def observe_session_usage(
             task_id=str(task_id),
         )
         with composed_transaction(pool) as transaction_pool:
-            # The Task lock is the first acquisition, keeping the
-            # Task-then-session ordering consistent with every other Task
-            # mutation and with the blocking composition below.
+            # The account-operational barrier is the FIRST lock acquisition
+            # of this Owner-attributed transaction: the accountable
+            # Workspace Owner Profile is resolved from durable Workspace
+            # state and its FOR KEY SHARE guard composes BEFORE the Task row
+            # lock, preserving the profile_lifecycle_guard ordering contract
+            # with account deletion. Task scope, budget, and threshold are
+            # then revalidated under the Task lock, and the checkpoint keeps
+            # the Task-then-session ordering consistent with every other
+            # Task mutation and with the blocking composition below.
+            workspace = ownership_records.get_workspace(transaction_pool, workspace_id=workspace_id)
+            if workspace is None:
+                # The addressed Workspace row is missing: a stale/foreign
+                # classification, never a guessed-around durable invariant.
+                return SessionCostObservation(kind=SessionCostObservationKind.IGNORED_FOREIGN)
+            require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
             locked = task_records.get_task_for_update(transaction_pool, task_id)
             if locked is None or locked.workspace_id != workspace_id:
                 return SessionCostObservation(kind=SessionCostObservationKind.IGNORED_FOREIGN)
@@ -306,8 +326,12 @@ def check_task_budget_before_dispatch(
     """The cost-aware pre-dispatch gate before new model-backed autonomous work.
 
     The seam #88 F3a wires into Cline-backed workflow invocations in both
-    ``regular`` and ``queue`` modes: one short composed transaction under
-    the Task row lock evaluates the retained known session cost sum against
+    ``regular`` and ``queue`` modes: one short composed transaction whose
+    FIRST lock acquisition is the account-operational barrier (the
+    accountable Workspace Owner Profile, resolved from durable Workspace
+    state, composed before the Task row lock per the profile_lifecycle_guard
+    ordering contract) then, under the Task row lock, evaluates the retained
+    known session cost sum against
     the Task's authorized budget and — exactly when the threshold is
     reached — composes the shared atomic cost-limit block in the same
     transaction. ``allow`` permits the existing authorized work; ``blocked``
@@ -326,6 +350,14 @@ def check_task_budget_before_dispatch(
             task_id=str(task_id),
         )
         with composed_transaction(pool) as transaction_pool:
+            # The account-operational barrier is the FIRST lock acquisition:
+            # the accountable Workspace Owner Profile composes before the
+            # Task row lock, preserving the profile_lifecycle_guard ordering
+            # contract with account deletion.
+            workspace = ownership_records.get_workspace(transaction_pool, workspace_id=workspace_id)
+            if workspace is None:
+                return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT)
+            require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
             locked = task_records.get_task_for_update(transaction_pool, task_id)
             if locked is None or locked.workspace_id != workspace_id:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT)

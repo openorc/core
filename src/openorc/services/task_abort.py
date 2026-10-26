@@ -310,6 +310,30 @@ def _has_admitted_in_flight_activity(
     return False
 
 
+def _has_cost_limit_eligible_activity(
+    transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
+) -> bool:
+    """Whether the admitted session holds activity the standing budget decision
+    may interrupt (issue #240).
+
+    The demonstrated in-flight facts apply in every phase: a Producer-bound
+    open Execution anchored to that exact session, a Reviewer-owned OPEN
+    ReviewLoop carrying an unfinalized iteration. The autonomous
+    ``planning`` phase additionally admits its bound Producer session:
+    plan production and the planning bootstrap run as admitted model-backed
+    interactions OUTSIDE any Execution, and E10b's own dispatch rule already
+    treats the autonomous phases as eligible against their appropriate
+    bound session without further proof — so a budget crossing during an
+    active planning turn still interrupts it. A genuinely idle pending
+    Owner gate (``waiting_for_owner``) gains nothing from any phase: only
+    demonstrated in-flight activity is interruptible there, preserving the
+    no-gratuitous-Interrupt behavior.
+    """
+    if _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
+        return True
+    return task.status is TaskStatus.PLANNING and target.workflow_role is WorkflowRole.PRODUCER
+
+
 def _require_admitted_in_flight_activity(
     transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
 ) -> None:
@@ -539,13 +563,12 @@ def _resolve_cost_limit_interrupt_targets(
 
     The cost-policy control never trusts Cline's transient status and never
     hardcodes a role list: every READY bound session of the Task — the
-    role-agnostic binding read — is examined against the shared durable
-    in-flight facts (a Producer-bound open Execution anchored to that exact
-    session; a Reviewer-owned OPEN ReviewLoop carrying an unfinalized
-    iteration). Sessions without demonstrated in-flight activity are never
-    gratuitously interrupted: where the Task is idle (typically at a pending
-    Owner gate), the block composes with zero targets and the pending gate
-    stays truthful pending history for F4b.
+    role-agnostic binding read — is examined against the cost-path
+    eligibility facts (:func:`_has_cost_limit_eligible_activity`).
+    Sessions without eligible activity are never gratuitously interrupted:
+    where the Task is idle (typically at a pending Owner gate), the block
+    composes with zero targets and the pending gate stays truthful pending
+    history for F4b.
     """
     targets: list[_InterruptTarget] = []
     for session in session_records.list_task_agent_sessions(transaction_pool, task_id=task.id):
@@ -558,7 +581,7 @@ def _resolve_cost_limit_interrupt_targets(
             workflow_role=session.role,
             external_session_id=session.external_session_id,
         )
-        if _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
+        if _has_cost_limit_eligible_activity(transaction_pool, task=task, target=target):
             targets.append(target)
     return tuple(targets)
 
@@ -597,20 +620,30 @@ def apply_owner_authorized_cost_limit_block(
 
     The trusted internal admission of the persisted standing budget decision
     (issue #240) — services only, never an API/RQ surface. Requires an open
-    composed transaction (call it inside one; it acquires the Task row lock
-    first and every subsequent read/write keeps that ordering). Everything
-    is verified against the locked durable state: the current non-archived
-    Task in the exact Workspace, its non-NULL authorized budget, the
-    DB-derived accountable Workspace Owner Profile (behind the same
-    account-operational barrier every Owner-attributed mutation composes),
-    and the threshold re-checked against the role-agnostic retained-cost
-    aggregate under the lock. An already-blocked Task never receives a
-    duplicate block, duplicate intent, or new interrupt; an
-    archived/terminal, foreign, or unauthorized Task and a threshold no
-    longer true under the lock are classified no-ops, never errors. A
-    detected cost-limit policy never silently settles or cancels existing
-    work.
+    composed transaction. The account-operational barrier is the FIRST lock
+    acquisition — the accountable Workspace Owner Profile is resolved from
+    durable Workspace state and its FOR KEY SHARE guard composes BEFORE the
+    Task row lock, preserving the profile_lifecycle_guard ordering contract
+    with account deletion — and Task scope, budget, and threshold are then
+    revalidated under that lock. Everything is verified against the locked
+    durable state: the current non-archived Task in the exact Workspace, its
+    non-NULL authorized budget, and the threshold re-checked against the
+    role-agnostic retained-cost aggregate. An already-blocked Task never
+    receives a duplicate block, duplicate intent, or new interrupt; an
+    archived/terminal, foreign, or unauthorized Task, a missing Workspace,
+    and a threshold no longer true under the lock are classified no-ops,
+    never errors. A detected cost-limit policy never silently settles or
+    cancels existing work.
     """
+    # The accountable Owner is resolved from durable Workspace state before
+    # any lock: the account-operational barrier below is therefore the first
+    # lock acquisition of this Owner-attributed mutation.
+    workspace = ownership_records.get_workspace(transaction_pool, workspace_id=workspace_id)
+    if workspace is None:
+        # The addressed Workspace row is missing: a stale/foreign
+        # classification, never a guessed-around durable invariant.
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
+    require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
     locked = task_records.get_task_for_update(transaction_pool, task_id)
     if locked is None or locked.workspace_id != workspace_id or locked.archived_at is not None:
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
@@ -623,15 +656,6 @@ def apply_owner_authorized_cost_limit_block(
         # No standing spending authorization exists (disabled, or a
         # pre-migration started Task): no policy decision is ever invented.
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
-    workspace = ownership_records.get_workspace(transaction_pool, workspace_id=workspace_id)
-    if workspace is None:
-        # The locked Task proves its Workspace; a missing row here would be
-        # a durable invariant violation, never guessed around.
-        raise ConflictError("the task's workspace is no longer available; the cost policy is stale")
-    # The accountable Owner is the durable Workspace Owner, never a
-    # telemetry event's provenance; the account-operational barrier composes
-    # so a claimed deletion still latches this Owner-attributed mutation.
-    require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
     costs = session_records.sum_task_retained_session_costs(transaction_pool, task_id=task_id)
     if costs.known_total_usd is None or costs.known_total_usd < budget:
         # The threshold is not true under the lock: refuse to manufacture a

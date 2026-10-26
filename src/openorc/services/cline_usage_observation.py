@@ -13,7 +13,9 @@ engine, no unbounded callback threads, and no per-event database writes.
 - Live ``USAGE_OBSERVED`` signals only REQUEST a cumulative re-read: the
   observer coalesces bursts through per-session single-flight evaluation —
   at most one evaluation runs at a time, arrivals during an evaluation
-  collapse into one trailing re-run, and coalesced callbacks never flood
+  collapse into one trailing re-run, the exit decision and the evaluator
+  slot reset are one atomic critical section so a notification can never
+  be dropped in the handoff interval, and coalesced callbacks never flood
   the database (the high-water checkpoint makes repeated equal readings
   no-op writes).
 - The cumulative ``read_activity_snapshot`` read is SDK I/O and happens
@@ -177,13 +179,26 @@ class SessionUsageCostObserver:
             while True:
                 self._run_evaluation()
                 with self._lock:
-                    again = self._pending and not self._closed
+                    # The exit decision and the in-evaluation reset are ONE
+                    # atomic critical section: a notification that arrives
+                    # while an evaluation is running is either consumed by
+                    # this evaluator's trailing re-run or handled by a newly
+                    # admitted evaluator that sees the reset flag — it can
+                    # never be dropped in a handoff interval between the two.
+                    if self._closed or not self._pending:
+                        self._in_evaluation = False
+                        return
                     self._pending = False
-                if not again:
-                    break
-        finally:
+        except BaseException:
+            # A truly unexpected escape must not leave this session's
+            # observation permanently stalled: release the evaluator slot
+            # and re-raise. Notifications that arrived during the dying
+            # evaluation keep their pending flag and are consumed by the
+            # next admitted evaluator. The normal exit path above already
+            # reset the flag atomically, so this handler never races it.
             with self._lock:
                 self._in_evaluation = False
+            raise
 
     def _run_evaluation(self) -> None:
         # The snapshot read is SDK I/O with no database transaction open;
@@ -198,14 +213,30 @@ class SessionUsageCostObserver:
                 self._task_agent_session_id,
             )
             return
-        observation = task_cost_accounting.observe_session_usage(
-            self._pool,
-            workspace_id=self._workspace_id,
-            task_id=self._task_id,
-            task_agent_session_id=self._task_agent_session_id,
-            connection_id=self._connection_id,
-            aggregate_total_cost=aggregate_snapshot_cost_usd(snapshot),
-        )
+        try:
+            observation = task_cost_accounting.observe_session_usage(
+                self._pool,
+                workspace_id=self._workspace_id,
+                task_id=self._task_id,
+                task_agent_session_id=self._task_agent_session_id,
+                connection_id=self._connection_id,
+                aggregate_total_cost=aggregate_snapshot_cost_usd(snapshot),
+            )
+        except Exception as error:  # noqa: BLE001 - best-effort boundary
+            # A transient persistence failure, an account-operational
+            # refusal, or any other service error is contained here: the
+            # live observation stays best-effort and never disrupts the
+            # workflow interaction through the adapter's subscribed
+            # listener. Only the safe exception type name is logged — never
+            # arbitrary exception text. Direct application-service callers
+            # keep their typed errors untouched; this boundary is the
+            # listener's alone.
+            logger.warning(
+                "cline usage observation failed (%s) for task session %s",
+                type(error).__name__,
+                self._task_agent_session_id,
+            )
+            return
         self._handle_dispatches(observation)
 
     def _handle_dispatches(self, observation: task_cost_accounting.SessionCostObservation) -> None:

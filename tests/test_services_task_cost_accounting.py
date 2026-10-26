@@ -24,6 +24,7 @@ from openorc.domain.executions import ExecutionStatus
 from openorc.persistence import executions as execution_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence.pool import DatabasePool
+from openorc.services import task_abort
 from openorc.services.errors import InvalidCommandError
 from openorc.services.task_cost_accounting import (
     BudgetGateDecisionKind,
@@ -394,6 +395,121 @@ def test_foreign_task_observation_is_refused_before_any_write(
 
     assert observation.kind is SessionCostObservationKind.IGNORED_FOREIGN
     assert not _sql_of_kind(conn, lambda sql: "update openorc.task_agent_sessions" in sql)
+
+
+def test_active_planning_interaction_is_interrupted_on_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A planning-phase Producer interaction runs as an admitted model-backed
+    # interaction OUTSIDE any Execution (plan production, the planning
+    # bootstrap): the autonomous phase's own admission makes the bound
+    # READY Producer session an interrupt target, so a budget crossing
+    # during the active turn interrupts it instead of silently letting it
+    # continue consuming funds.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(conn, monkeypatch, status="planning", sessions=[_ready_session_row()])
+
+    observation = _observe(conn)
+
+    assert observation.kind is SessionCostObservationKind.BLOCKED
+    assert observation.task_block is not None
+    assert observation.task_block.reason is TaskBlockReason.COST_LIMIT
+    assert len(observation.interrupt_dispatches) == 1
+    assert observation.interrupt_dispatches[0][1] == _EXTERNAL_SESSION_ID
+    intent_params = next(
+        params
+        for sql, params in conn.executed
+        if "insert into openorc.task_interrupt_intents" in sql
+    )
+    assert intent_params is not None
+
+
+def test_idle_waiting_for_owner_gate_still_blocks_without_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The planning-phase admission never leaks into an idle Owner gate: a
+    # waiting_for_owner Task with no demonstrated in-flight activity keeps
+    # the no-gratuitous-Interrupt behavior.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(
+        conn,
+        monkeypatch,
+        status="waiting_for_owner",
+        sessions=[_ready_session_row()],
+    )
+
+    observation = _observe(conn)
+
+    assert observation.kind is SessionCostObservationKind.BLOCKED
+    assert observation.interrupt_dispatches == ()
+    assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
+
+
+def _assert_barrier_precedes_task_lock(conn: ScriptedConnection) -> None:
+    """The Profile FOR KEY SHARE guard composes before the Task FOR UPDATE lock."""
+    executed = [sql for sql, _ in conn.executed]
+    barrier_index = next(
+        index for index, sql in enumerate(executed) if "from openorc.profiles" in sql
+    )
+    task_lock_index = next(
+        index
+        for index, sql in enumerate(executed)
+        if "from openorc.tasks where id" in sql and "for update" in sql
+    )
+    assert "for key share" in " ".join(executed[barrier_index].split()).lower()
+    assert barrier_index < task_lock_index
+
+
+def test_the_observation_path_barriers_before_the_task_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lock-order contract: the account-operational barrier (Profile FOR KEY
+    # SHARE) is the first lock acquisition of the Owner-attributed
+    # observation transaction, ahead of the Task FOR UPDATE lock — the
+    # opposite order would deadlock against Profile-root account deletion.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(conn, monkeypatch, known_total=Decimal("20.00"))
+
+    observation = _observe(conn, cost=Decimal("20.50"))
+
+    assert observation.kind is SessionCostObservationKind.CHECKPOINTED
+    _assert_barrier_precedes_task_lock(conn)
+
+
+def test_the_pre_dispatch_gate_barriers_before_the_task_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _wire_budgeted_task(conn, monkeypatch, known_total=Decimal("20.00"))
+
+    decision = _gate(conn)
+
+    assert decision.kind is BudgetGateDecisionKind.ALLOW
+    _assert_barrier_precedes_task_lock(conn)
+
+
+def test_the_establish_seam_barriers_before_the_task_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The shared blocking composition is also safe when driven directly
+    # through its own short transaction (the #88 F3a pre-dispatch seam): it
+    # resolves the accountable Owner from durable Workspace state and
+    # composes the barrier before its own Task lock.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(conn, monkeypatch, executions=[_open_execution()])
+
+    result = task_abort.establish_owner_authorized_cost_limit_block(
+        cast(DatabasePool, _pool(conn)), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert result.kind is task_abort.CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS
+    _assert_barrier_precedes_task_lock(conn)
+    intent_params = next(
+        params
+        for sql, params in conn.executed
+        if "insert into openorc.task_interrupt_intents" in sql
+    )
+    assert intent_params is not None and intent_params[5] == _OWNER_PROFILE_ID
 
 
 def _gate(

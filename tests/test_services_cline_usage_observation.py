@@ -297,6 +297,124 @@ def test_start_and_dispose_are_idempotent_and_disposal_stops_evaluation(
     assert adapter.snapshot_reads == 0
 
 
+def test_service_failure_is_contained_at_the_observer_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transient persistence failure, an account-operational refusal, or
+    # any other application-service error must stay best-effort at the
+    # listener boundary: it never propagates into the adapter's subscribed
+    # listener and never disrupts the workflow interaction. (Direct
+    # application-service callers keep their typed errors untouched.)
+    def _boom(pool: Any, **kwargs: Any) -> None:
+        raise RuntimeError("transient persistence failure")
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", _boom)
+    adapter = _FakeAdapter(snapshot=_snapshot(aggregate=ClineAccumulatedUsage(total_cost=1.0)))
+    observer = _observer(adapter)
+    observer.start()
+
+    adapter.emit_usage()  # must not raise through the listener
+
+    assert adapter.snapshot_reads == 1
+    observer.dispose()
+
+
+class _ReleaseHookLock:
+    """A lock wrapper that fires an armed hook exactly once, right after a release.
+
+    The deterministic seam for the evaluator handoff race: arming the hook
+    before the evaluator's exit-decision critical section makes the very
+    next release — the handoff — run a concurrent emit inline.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hook: Any = None
+
+    def arm(self, hook: Any) -> None:
+        self._hook = hook
+
+    def __enter__(self) -> _ReleaseHookLock:
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._lock.release()
+        hook = self._hook
+        if hook is not None:
+            self._hook = None
+            hook()
+
+
+def test_the_evaluation_handoff_never_drops_a_pending_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the single-flight handoff race: the exit decision and
+    # the in-evaluation reset are one atomic critical section. A usage
+    # notification that arrives exactly in the handoff interval must be
+    # handled by a newly admitted evaluator, never silently dropped while
+    # an active turn may still be crossing its budget.
+    calls: list[Decimal | None] = []
+    monkeypatch.setattr(
+        task_cost_accounting,
+        "observe_session_usage",
+        lambda pool, **kwargs: (
+            calls.append(kwargs["aggregate_total_cost"]),
+            SimpleNamespace(interrupt_dispatches=()),
+        )[1],
+    )
+    snapshot = _snapshot(aggregate=ClineAccumulatedUsage(total_cost=0.4))
+    main_blocked = threading.Event()
+    second_read_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+
+    class _BlockingAdapter(_FakeAdapter):
+        def read_activity_snapshot(self, session_id: str) -> Any:  # noqa: ANN401 - test fake
+            self.snapshot_reads += 1
+            if self.snapshot_reads == 1:
+                main_blocked.set()
+                assert release_first.wait(timeout=5)
+            elif self.snapshot_reads == 2:
+                second_read_started.set()
+                assert release_second.wait(timeout=5)
+            return self._snapshot
+
+    blocking_adapter = _BlockingAdapter(snapshot=snapshot)
+    observer = _observer(blocking_adapter)
+    hook_lock = _ReleaseHookLock()
+    # The deterministic handoff seam: swap in a lock wrapper that fires an
+    # armed hook exactly once, right after a release.
+    observer._lock = hook_lock  # type: ignore[assignment]
+    observer.start()
+
+    def emit_second() -> None:
+        # Coalesced into the first evaluator's trailing re-run; then, while
+        # that trailing evaluation blocks in its SDK read, arm the handoff
+        # hook and release it: the next lock release is the evaluator's
+        # exit decision, and a notification arriving exactly there must be
+        # handled by a newly admitted evaluator.
+        assert main_blocked.wait(timeout=5)
+        blocking_adapter.emit_usage()
+        release_first.set()
+        assert second_read_started.wait(timeout=5)
+        hook_lock.arm(lambda: blocking_adapter.emit_usage())
+        release_second.set()
+
+    second = threading.Thread(target=emit_second)
+    second.start()
+    blocking_adapter.emit_usage()  # evaluation 1 (blocked), then trailing evaluation 2
+    second.join(timeout=5)
+
+    # Three evaluations ran: the blocked first, the trailing coalesced
+    # second, and the handoff notification's own evaluation. With the
+    # dropped-notification bug the handoff emit would only set a pending
+    # flag nobody consumes and the read count would stay at two.
+    assert blocking_adapter.snapshot_reads == 3
+    assert len(calls) == 3
+    observer.dispose()
+
+
 def test_observer_identity_shape_fails_closed() -> None:
     adapter = _FakeAdapter()
     with pytest.raises(ValueError):
