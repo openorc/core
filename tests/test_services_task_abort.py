@@ -139,7 +139,7 @@ def _ready_session_row(*, lifecycle: str = "ready") -> tuple[Any, ...]:
     row = _session_row("producer", _SESSION_ID, _EXTERNAL_SESSION_ID, lifecycle=lifecycle)
     if lifecycle == "ended":
         # ENDED requires its semantic stamp set exactly when the status is.
-        row = (*row[:12], _OBSERVED, row[13], row[14])
+        row = (*row[:12], _OBSERVED, *row[13:])
     return row
 
 
@@ -244,7 +244,7 @@ def _task_row_of(status: str) -> tuple[Any, ...]:
     row = _task_row(status=status, state_token=_STATE_TOKEN)
     if status == "queued":
         # A queued Task carries its durable queue-entry timestamp.
-        row = (*row[:12], _OBSERVED, row[13], row[14], row[15])
+        row = (*row[:12], _OBSERVED, *row[13:])
     return row
 
 

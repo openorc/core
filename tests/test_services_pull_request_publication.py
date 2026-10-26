@@ -190,6 +190,7 @@ def _task_row(*, state_token: uuid.UUID = _STATE_TOKEN, archived: bool = False) 
         _OBSERVED,
         _OBSERVED,
         None,
+        None,
     )
 
 
@@ -227,7 +228,7 @@ def _installation_row() -> tuple[Any, ...]:
 
 
 def _workspace_row(*, owner_profile_id: uuid.UUID = _PROFILE_ID) -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _guard_row() -> tuple[Any, ...]:

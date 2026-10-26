@@ -39,7 +39,10 @@ def _block(**overrides: Any) -> TaskBlock:
     return TaskBlock(**values)
 
 
-def test_reason_vocabulary_is_exactly_the_twelve_settled_values() -> None:
+def test_reason_vocabulary_is_the_settled_values_plus_cost_limit() -> None:
+    # The initial vocabulary was exactly the twelve settled values; issue
+    # #240 adds exactly one additive Owner-authorized spending-policy
+    # reason, COST_LIMIT — and nothing else.
     assert {member.value for member in TaskBlockReason} == {
         "review_failure",
         "runtime_failure",
@@ -52,6 +55,7 @@ def test_reason_vocabulary_is_exactly_the_twelve_settled_values() -> None:
         "runtime_request_rejected",
         "pr_closed_unmerged",
         "owner_action_required",
+        "cost_limit",
         "unknown",
     }
 
@@ -59,10 +63,11 @@ def test_reason_vocabulary_is_exactly_the_twelve_settled_values() -> None:
 def test_review_loop_exhaustion_is_not_a_block_reason() -> None:
     # ReviewLoop iteration-limit exhaustion is represented through the
     # Task's waiting_for_owner status plus a REVIEW_RESOLUTION OwnerGate —
-    # never as a TaskBlock reason.
+    # never as a TaskBlock reason. (The additive COST_LIMIT reason is an
+    # Owner-authorized spending bound, not a review-loop bound.)
+    assert "review_iteration_limit" not in {member.value for member in TaskBlockReason}
     assert not any(
-        "exhaust" in member.value or "iteration" in member.value or "limit" in member.value
-        for member in TaskBlockReason
+        "exhaust" in member.value or "iteration" in member.value for member in TaskBlockReason
     )
     with pytest.raises(TaskBlockDomainError):
         _block(reason="review_loop_exhausted")  # type: ignore[arg-type]

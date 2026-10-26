@@ -20,6 +20,7 @@ persistence one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -58,14 +59,17 @@ __all__ = [
     "reclaim_uncertain_account_deletion_attempt",
     "set_repository_installation_route",
     "update_repository_metadata",
+    "update_workspace_default_task_budget_usd",
     "update_workspace_guidance",
     "update_workspace_review_iteration_limit",
 ]
 
 # The full Workspace column list, including the first-class configuration
-# settings added by issue #53 (review_iteration_limit, guidance).
+# settings added by issue #53 (review_iteration_limit, guidance) and the
+# Owner-authorized default USD Task budget added by issue #240.
 _WORKSPACE_COLUMNS = (
-    "id, owner_profile_id, name, created_at, updated_at, review_iteration_limit, guidance"
+    "id, owner_profile_id, name, created_at, updated_at, review_iteration_limit, "
+    "guidance, default_task_budget_usd"
 )
 
 # The full Repository column list, including the issue #57 explicit
@@ -90,6 +94,7 @@ def _workspace_from_row(row: Sequence[Any]) -> Workspace:
         updated_at=normalize_utc(row[4]),
         review_iteration_limit=row[5],
         guidance=row[6],
+        default_task_budget_usd=row[7],
     )
 
 
@@ -263,6 +268,59 @@ def update_workspace_review_iteration_limit(
         ).fetchone()
     assert updated_row is not None
     return _workspace_from_row(updated_row), previous.review_iteration_limit, True
+
+
+def update_workspace_default_task_budget_usd(
+    pool: DatabasePool,
+    workspace_id: UUID,
+    *,
+    default_task_budget_usd: Decimal | None,
+) -> tuple[Workspace, Decimal | None, bool] | None:
+    """Set the Workspace's Owner-authorized default USD Task budget (issue #240).
+
+    One deliberate ``SELECT ... FOR UPDATE`` inside one short transaction
+    captures the exact before-state, then the write happens only when the
+    value actually differs. The locked same-transaction previous/new facts
+    are the safe audit handoff for a consequential configuration-change
+    event (#56). ``None`` disables the spending policy — it is a legitimate
+    change, never a no-op against a configured value — and a configured
+    value is a positive exact decimal (the domain and the durable CHECK both
+    enforce it). The default affects future Tasks only: each Task keeps the
+    authorization copied onto it at its successful Owner Start as immutable
+    historical configuration, which is never rewritten when this setting
+    changes.
+
+    Returns ``(updated Workspace, previous default, changed)``; a no-op
+    returns the unchanged Workspace with ``changed=False`` and does not
+    advance ``updated_at``. Returns ``None`` when the Workspace does not
+    exist.
+    """
+    if default_task_budget_usd is not None and (
+        isinstance(default_task_budget_usd, bool)
+        or not isinstance(default_task_budget_usd, Decimal)
+        or not default_task_budget_usd.is_finite()
+        or default_task_budget_usd <= 0
+    ):
+        raise ValueError("default_task_budget_usd must be None or a positive finite USD amount")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces where id = %s for update",
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        previous = _workspace_from_row(row)
+        if previous.default_task_budget_usd == default_task_budget_usd:
+            return previous, previous.default_task_budget_usd, False
+        updated_row = conn.execute(
+            "update openorc.workspaces "
+            "set default_task_budget_usd = %s, updated_at = now() "
+            "where id = %s "
+            f"returning {_WORKSPACE_COLUMNS}",
+            (default_task_budget_usd, workspace_id),
+        ).fetchone()
+    assert updated_row is not None
+    return _workspace_from_row(updated_row), previous.default_task_budget_usd, True
 
 
 def update_workspace_guidance(

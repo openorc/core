@@ -51,6 +51,7 @@ issue #227 merge lifecycle adds ``MERGE_REQUESTED``,
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
@@ -72,6 +73,7 @@ __all__ = [
     "record_execution_failed_event",
     "record_execution_started_event",
     "record_guidance_changed_event",
+    "record_default_task_budget_changed_event",
     "record_implementation_authorized_event",
     "record_merge_rejected_by_github_event",
     "record_merge_requested_event",
@@ -194,6 +196,40 @@ def record_review_iteration_limit_changed_event(
             "setting": "review_iteration_limit",
             "previous": previous_limit,
             "new": new_limit,
+        },
+    )
+
+
+def record_default_task_budget_changed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    actor: WorkflowActorContext,
+    previous_budget: Decimal | None,
+    new_budget: Decimal | None,
+) -> None:
+    """Record one default-Task-budget Workspace configuration change (issue #240).
+
+    Workspace-scoped (no Task), subject the Workspace, context the setting
+    key plus the exact locked previous/new values as exact decimal strings —
+    either side may be ``None`` (disabling the spending policy is a
+    legitimate, audited change). Never any other Workspace content.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_money_command(previous_budget, "previous_budget")
+    _require_money_command(new_budget, "new_budget")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_WORKSPACE,
+        subject_id=workspace_id,
+        context={
+            "setting": "default_task_budget_usd",
+            "previous": None if previous_budget is None else str(previous_budget),
+            "new": None if new_budget is None else str(new_budget),
         },
     )
 
@@ -1004,3 +1040,21 @@ def _require_int_command(value: object, name: str) -> None:
     """Reject a malformed integer argument before any event is written."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise InvalidCommandError(f"{name} must be an integer")
+
+
+def _require_money_command(value: object, name: str) -> None:
+    """Reject a malformed USD amount argument before any event is written.
+
+    An exact decimal (never a binary float, never a bool), finite, and
+    positive — or ``None`` for the disabling value. The audit context
+    stringifies it; the event helper admits only already-validated values.
+    """
+    if value is None:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value <= 0
+    ):
+        raise InvalidCommandError(f"{name} must be None or a positive finite decimal")

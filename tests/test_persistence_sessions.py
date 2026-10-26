@@ -119,6 +119,8 @@ def _session_row(**overrides: Any) -> tuple[Any, ...]:
         "ended_at": None,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
+        "retained_cost_usd": None,
+        "cost_observed_at": None,
     }
     values.update(overrides)
     return (
@@ -137,6 +139,8 @@ def _session_row(**overrides: Any) -> tuple[Any, ...]:
         values["ended_at"],
         values["created_at"],
         values["updated_at"],
+        values["retained_cost_usd"],
+        values["cost_observed_at"],
     )
 
 

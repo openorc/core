@@ -189,8 +189,11 @@ def test_create_workspace_maps_row_and_parameters() -> None:
     workspace_id = uuid.uuid4()
     observed = _observed_at()
     # The configuration settings are not insert inputs: the row is completed
-    # by the durable column defaults (review_iteration_limit 5, guidance '').
-    conn = FakeConnection(row=(workspace_id, profile_id, "platform", observed, observed, 5, ""))
+    # by the durable column defaults (review_iteration_limit 5, guidance '',
+    # and a NULL default task budget).
+    conn = FakeConnection(
+        row=(workspace_id, profile_id, "platform", observed, observed, 5, "", None)
+    )
 
     workspace = create_workspace(
         cast(DatabasePool, FakePool(conn)), owner_profile_id=profile_id, name="platform"
@@ -362,6 +365,7 @@ def _workspace_row(
     *,
     review_iteration_limit: int = 5,
     guidance: str = "",
+    default_task_budget_usd: Any = None,
 ) -> tuple[Any, ...]:
     observed = _observed_at()
     return (
@@ -372,6 +376,7 @@ def _workspace_row(
         observed,
         review_iteration_limit,
         guidance,
+        default_task_budget_usd,
     )
 
 

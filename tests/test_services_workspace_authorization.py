@@ -91,6 +91,7 @@ def _ws_row(
         _OBSERVED,
         review_iteration_limit,
         guidance,
+        None,
     )
 
 
@@ -157,7 +158,8 @@ def test_a_directly_loaded_foreign_workspace_is_not_authority() -> None:
         )
     assert [sql for sql, _ in conn.executed] == [
         "select id, owner_profile_id, name, created_at, updated_at, "
-        "review_iteration_limit, guidance from openorc.workspaces where id = %s"
+        "review_iteration_limit, guidance, default_task_budget_usd "
+        "from openorc.workspaces where id = %s"
     ]
 
 
@@ -323,6 +325,7 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             _OBSERVED,
             _OBSERVED,
             None,
+            None,
         ),
         "session": (
             uuid.uuid4(),
@@ -340,6 +343,8 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             None,
             _OBSERVED,
             _OBSERVED,
+            None,
+            None,
         ),
         "plan revision": (
             uuid.uuid4(),
@@ -662,6 +667,8 @@ def test_session_and_role_binding_resolution_scopes_fail_closed() -> None:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
     with pytest.raises(NotFoundError):
         workspace_authorization.require_task_agent_session(

@@ -55,6 +55,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, fields
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
@@ -178,6 +179,15 @@ class Task:
     # cancellation carries no terminal cause (its provenance lives on the
     # terminal event), and a COMPLETED attempt never carries one.
     terminal_cause: TaskTerminalCause | None = None
+    # The Owner-authorized USD Task budget (issue #240): captured exactly
+    # once, atomically with the successful Owner Start transition out of
+    # ``ready_to_plan``, from the then-current Workspace default. The default
+    # keeps every existing construction site truthful; NULL is the ordinary
+    # unstarted and pre-migration-started state (spending policy disabled —
+    # never an implicit limit, never zero). Carried as an exact decimal,
+    # never a binary float, and never rewritten by a later Workspace default
+    # edit or queued wakeup.
+    authorized_task_budget_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
         _require_positive_int(self.github_issue_id, "github_issue_id")
@@ -251,6 +261,29 @@ class Task:
                 "Task.source_requirements_fingerprint must be None or a lowercase hex "
                 "SHA-256 digest"
             )
+        # The Owner-authorized spending authorization (issue #240), captured
+        # atomically with the same guarded start transition that froze the
+        # baseline: a never-started Task carries None, a started Task keeps
+        # the authorization it started with (including a cancelled attempt's
+        # immutable historical value), and a present value is a positive
+        # finite exact decimal. The database CHECK mirrors the never-started
+        # NULL invariant.
+        if self.authorized_task_budget_usd is not None:
+            if (
+                isinstance(self.authorized_task_budget_usd, bool)
+                or not isinstance(self.authorized_task_budget_usd, Decimal)
+                or not self.authorized_task_budget_usd.is_finite()
+                or self.authorized_task_budget_usd <= 0
+            ):
+                raise TaskDomainError(
+                    "Task.authorized_task_budget_usd must be None or a positive "
+                    "finite USD amount (an exact decimal; NULL disables spending policy)"
+                )
+            if self.status is TaskStatus.READY_TO_PLAN:
+                raise TaskDomainError(
+                    "a ready_to_plan Task carries no authorized budget yet: the "
+                    "authorization is captured only by a successful Owner Start"
+                )
 
 
 def task_field_names() -> frozenset[str]:

@@ -144,7 +144,7 @@ def _guard_active_attempt_row() -> tuple[Any, ...]:
 
 
 def _workspace_row(*, owner_profile_id: uuid.UUID = _PROFILE_ID) -> tuple[Any, ...]:
-    return (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "")
+    return (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None)
 
 
 def _task_row() -> tuple[Any, ...]:
@@ -164,6 +164,7 @@ def _task_row() -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 

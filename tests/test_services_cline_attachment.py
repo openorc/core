@@ -208,6 +208,8 @@ def _binding_row(
         _OBSERVED if lifecycle_status == "ended" else None,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
     )
 
 
@@ -266,6 +268,7 @@ def _ws_row(workspace_id: Any, owner_profile_id: Any, *, guidance: str = "") -> 
         _OBSERVED,
         5,
         guidance,
+        None,
     )
 
 
@@ -286,6 +289,7 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        None,
         None,
     )
 

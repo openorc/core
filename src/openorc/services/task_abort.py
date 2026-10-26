@@ -43,12 +43,32 @@ The Task stays ``blocked`` regardless of the Interrupt outcome; late formal
 results can never advance it. Terminal session identities are preserved:
 the command never calls ``stop``/``start``/``send``, never allocates a
 replacement session, and never sends an agent prompt.
+
+**Trusted internal admission (issue #240).** The same blocking machinery is
+the one Owner-authorized cost-limit control:
+:func:`apply_owner_authorized_cost_limit_block` /
+:func:`establish_owner_authorized_cost_limit_block` compose the identical
+atomic blocking composition — one ``COST_LIMIT`` TaskBlock with the safe
+``owner_abort`` control context, the guarded ``blocked`` transition, the
+OWNER ``task_blocked`` audit, and the exact one-shot Interrupt intents —
+driven by the Task's persisted standing budget decision instead of a live
+Owner command. The accountable Owner Profile is derived from the durable
+Workspace row (never from a telemetry event), the threshold is re-verified
+under the Task row lock, the exact in-flight targets are derived from
+durable Task/session/work facts (open Executions anchored to the bound
+session; OPEN ReviewLoops carrying an unfinalized iteration), and a Task
+idle at a pending Owner gate enters ``BLOCKED`` with no gratuitous
+Interrupt. There is deliberately no second abort implementation: settlement,
+dispatch, and outcome recording are exactly E10b's, and the interactive
+Owner Abort command's contract is unchanged. F4b (issue #230) owns
+``COST_LIMIT`` resolution; nothing here resumes or retries the blocked Task.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
@@ -68,6 +88,7 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
+from openorc.persistence import ownership as ownership_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
@@ -85,11 +106,16 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "CostLimitBlockOutcomeKind",
+    "OwnerAuthorizedCostLimitBlock",
     "TaskAbortOutcome",
     "TaskAbortOutcomeKind",
     "TaskInterruptOutcome",
     "TaskInterruptSettlement",
     "abort_task_activity",
+    "apply_owner_authorized_cost_limit_block",
+    "dispatch_registered_task_interrupt",
+    "establish_owner_authorized_cost_limit_block",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_abort"
@@ -252,6 +278,38 @@ def _resolve_interrupt_target(
     )
 
 
+def _has_admitted_in_flight_activity(
+    transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
+) -> bool:
+    """Whether the admitted role/session demonstrates durable in-flight activity.
+
+    The phase-specific eligibility fact shared by the interactive Owner
+    Abort and the cost-policy control (issues #228/#240): a Producer target
+    demonstrates in-flight activity by owning a durably OPEN Execution
+    anchored to that exact session (``producer_session_id``), a Reviewer
+    target by owning an OPEN ReviewLoop carrying an unfinalized
+    ReviewIteration — the dispatched review turn still in flight. Never the
+    primary Task status alone, and never an SDK status reading.
+    """
+    if target.workflow_role is WorkflowRole.PRODUCER:
+        executions = execution_records.list_task_executions(transaction_pool, task_id=task.id)
+        return any(
+            execution.producer_session_id == target.task_agent_session_id
+            and execution.status in _OPEN_EXECUTION_STATUSES
+            for execution in executions
+        )
+    loops = review_records.list_task_review_loops(
+        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
+    )
+    for loop in loops:
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if any(iteration.outcome is None for iteration in iterations):
+            return True
+    return False
+
+
 def _require_admitted_in_flight_activity(
     transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
 ) -> None:
@@ -263,37 +321,13 @@ def _require_admitted_in_flight_activity(
     runtime session, while a WAITING_FOR_OWNER Task must demonstrate
     in-flight activity — an ordinary pending gate does not establish active
     work, so interrupting over one is refused. The demonstration reuses the
-    existing durable facts only: a Producer target must own a durably OPEN
-    Execution anchored to that exact session (``producer_session_id``), and
-    a Reviewer target must own an OPEN ReviewLoop carrying an unfinalized
-    ReviewIteration — the dispatched review turn still in flight. Never the
-    primary Task status alone, and never an SDK status reading.
+    existing durable facts only, through
+    :func:`_has_admitted_in_flight_activity`.
     """
-    if target.workflow_role is WorkflowRole.PRODUCER:
-        executions = execution_records.list_task_executions(transaction_pool, task_id=task.id)
-        if any(
-            execution.producer_session_id == target.task_agent_session_id
-            and execution.status in _OPEN_EXECUTION_STATUSES
-            for execution in executions
-        ):
-            return
+    if not _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
         raise ConflictError(
-            "the addressed producer session owns no durably admitted in-flight "
-            "implementation activity to interrupt"
+            "the addressed session owns no durably admitted in-flight runtime activity to interrupt"
         )
-    loops = review_records.list_task_review_loops(
-        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
-    )
-    for loop in loops:
-        iterations = review_records.list_review_loop_iterations(
-            transaction_pool, review_loop_id=loop.id
-        )
-        if any(iteration.outcome is None for iteration in iterations):
-            return
-    raise ConflictError(
-        "the addressed reviewer session owns no durably admitted in-flight "
-        "review activity to interrupt"
-    )
 
 
 def _owner_abort_block_context(targets: tuple[_InterruptTarget, ...]) -> dict[str, object]:
@@ -389,46 +423,302 @@ def _establish_abort_plan(
             # existing bound runtime session without further proof.
             for target in targets:
                 _require_admitted_in_flight_activity(transaction_pool, task=task, target=target)
-        block = block_records.create_task_block(
+        return _apply_owner_authorized_block(
             transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
+            task=task,
+            owner_profile_id=profile_id,
             reason=TaskBlockReason.OWNER_ACTION_REQUIRED,
             context=_owner_abort_block_context(targets),
+            targets=targets,
         )
-        blocked = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=task.state_token,
-            status=TaskStatus.BLOCKED,
+
+
+def _apply_owner_authorized_block(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    owner_profile_id: UUID,
+    reason: TaskBlockReason,
+    context: Mapping[str, object],
+    targets: tuple[_InterruptTarget, ...],
+) -> _DispatchPlan:
+    """The atomic Owner-attributed blocking composition, before any external I/O.
+
+    The one shared composition of the interactive Owner Abort (issue #228)
+    and the persisted standing cost-policy control (issue #240), inside the
+    caller's open composed transaction: one current TaskBlock with its
+    reason/recovery context, the guarded ``blocked`` transition under the
+    Task's exact state token, the OWNER ``task_blocked`` audit, and the
+    exact one-shot Interrupt intents for the resolved targets — created
+    BEFORE any Cline I/O and committed or rolled back together. Failure of
+    any step rolls back every blocking decision fact.
+    """
+    block = block_records.create_task_block(
+        transaction_pool,
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        reason=reason,
+        context=context,
+    )
+    blocked = task_records.update_task_status(
+        transaction_pool,
+        task.id,
+        expected_state_token=task.state_token,
+        status=TaskStatus.BLOCKED,
+    )
+    if blocked is None:
+        raise StaleOperationError(
+            "the task could not move to blocked; the owner-authorized control is stale"
         )
-        if blocked is None:
-            raise StaleOperationError(
-                "the task could not move to blocked; the owner abort is stale"
+    event_coordination.record_task_blocked_event(
+        transaction_pool,
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        task_block_id=block.id,
+        actor=event_coordination.owner_actor(owner_profile_id),
+    )
+    intents = tuple(
+        (
+            intent_records.create_task_interrupt_intent(
+                transaction_pool,
+                workspace_id=task.workspace_id,
+                task_id=task.id,
+                task_agent_session_id=target.task_agent_session_id,
+                workflow_role=target.workflow_role,
+                external_session_id=target.external_session_id,
+                requested_by_profile_id=owner_profile_id,
+            ),
+            target,
+        )
+        for target in targets
+    )
+    return _DispatchPlan(task=blocked, task_block=block, targets=intents)
+
+
+class CostLimitBlockOutcomeKind(StrEnum):
+    """The classified outcome of one persisted standing cost-limit blocking.
+
+    ``blocked_with_interrupts`` composed the block and registered exact
+    Interrupt intents for durably in-flight sessions (dispatch happens
+    post-commit, outside any transaction); ``blocked_idle`` composed the
+    block for a Task with no durably demonstrable in-flight runtime
+    activity — no gratuitous Interrupt exists; ``already_blocked`` found the
+    Task already blocked (one durable block stands, never a duplicate);
+    ``not_applicable`` found no current budget-controlled blocking decision
+    under the lock (stale, foreign, archived, unauthorized, or the
+    threshold no longer true).
+    """
+
+    BLOCKED_WITH_INTERRUPTS = "blocked_with_interrupts"
+    BLOCKED_IDLE = "blocked_idle"
+    ALREADY_BLOCKED = "already_blocked"
+    NOT_APPLICABLE = "not_applicable"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerAuthorizedCostLimitBlock:
+    """The typed result of one persisted standing cost-limit blocking.
+
+    ``task``/``task_block`` are present only for the two blocking kinds.
+    ``interrupt_dispatches`` carries the exact post-commit obligations as
+    ``(intent, external_session_id)`` pairs: dispatch them through
+    :func:`dispatch_registered_task_interrupt` strictly after the
+    composition committed and with no database transaction open.
+    """
+
+    kind: CostLimitBlockOutcomeKind
+    task: Task | None = None
+    task_block: TaskBlock | None = None
+    interrupt_dispatches: tuple[tuple[TaskInterruptIntent, str], ...] = ()
+
+
+def _resolve_cost_limit_interrupt_targets(
+    transaction_pool: DatabasePool, *, task: Task
+) -> tuple[_InterruptTarget, ...]:
+    """Derive the exact in-flight interrupt targets from durable facts only.
+
+    The cost-policy control never trusts Cline's transient status and never
+    hardcodes a role list: every READY bound session of the Task — the
+    role-agnostic binding read — is examined against the shared durable
+    in-flight facts (a Producer-bound open Execution anchored to that exact
+    session; a Reviewer-owned OPEN ReviewLoop carrying an unfinalized
+    iteration). Sessions without demonstrated in-flight activity are never
+    gratuitously interrupted: where the Task is idle (typically at a pending
+    Owner gate), the block composes with zero targets and the pending gate
+    stays truthful pending history for F4b.
+    """
+    targets: list[_InterruptTarget] = []
+    for session in session_records.list_task_agent_sessions(transaction_pool, task_id=task.id):
+        if session.lifecycle_status is not TaskSessionLifecycleStatus.READY:
+            continue
+        if session.external_session_id is None or not session.external_session_id.strip():
+            continue
+        target = _InterruptTarget(
+            task_agent_session_id=session.id,
+            workflow_role=session.role,
+            external_session_id=session.external_session_id,
+        )
+        if _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
+            targets.append(target)
+    return tuple(targets)
+
+
+def _cost_limit_block_context(
+    *,
+    targets: tuple[_InterruptTarget, ...],
+    observed_cost_usd: Decimal,
+    authorized_budget_usd: Decimal,
+    has_unobserved_sessions: bool,
+) -> dict[str, object]:
+    """The safe typed ``owner_abort`` TaskBlock context of one cost-limit block.
+
+    It is still an Owner-authorized ``owner_abort`` control — the standing
+    budget decision — so the context records that control identity, the
+    exact threshold facts (observed known total and authorized budget as
+    exact decimal strings; never floats), whether any constituent reading
+    was unknown, and the interrupted session identities. Never transcript
+    content, prompts, credentials, or raw provider errors.
+    """
+    return {
+        "control": "owner_abort",
+        "reason_provenance": "owner_authorized_task_budget",
+        "observed_cost_usd": str(observed_cost_usd),
+        "authorized_budget_usd": str(authorized_budget_usd),
+        "aggregate_includes_unobserved_sessions": has_unobserved_sessions,
+        "target_roles": [target.workflow_role.value for target in targets],
+        "task_agent_session_ids": [str(target.task_agent_session_id) for target in targets],
+    }
+
+
+def apply_owner_authorized_cost_limit_block(
+    transaction_pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> OwnerAuthorizedCostLimitBlock:
+    """Compose the Owner-authorized cost-limit block inside an open transaction.
+
+    The trusted internal admission of the persisted standing budget decision
+    (issue #240) — services only, never an API/RQ surface. Requires an open
+    composed transaction (call it inside one; it acquires the Task row lock
+    first and every subsequent read/write keeps that ordering). Everything
+    is verified against the locked durable state: the current non-archived
+    Task in the exact Workspace, its non-NULL authorized budget, the
+    DB-derived accountable Workspace Owner Profile (behind the same
+    account-operational barrier every Owner-attributed mutation composes),
+    and the threshold re-checked against the role-agnostic retained-cost
+    aggregate under the lock. An already-blocked Task never receives a
+    duplicate block, duplicate intent, or new interrupt; an
+    archived/terminal, foreign, or unauthorized Task and a threshold no
+    longer true under the lock are classified no-ops, never errors. A
+    detected cost-limit policy never silently settles or cancels existing
+    work.
+    """
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id or locked.archived_at is not None:
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
+    if locked.status is TaskStatus.BLOCKED:
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.ALREADY_BLOCKED)
+    if locked.status not in _DISPATCH_ELIGIBLE_STATUSES:
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
+    budget = locked.authorized_task_budget_usd
+    if budget is None:
+        # No standing spending authorization exists (disabled, or a
+        # pre-migration started Task): no policy decision is ever invented.
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
+    workspace = ownership_records.get_workspace(transaction_pool, workspace_id=workspace_id)
+    if workspace is None:
+        # The locked Task proves its Workspace; a missing row here would be
+        # a durable invariant violation, never guessed around.
+        raise ConflictError("the task's workspace is no longer available; the cost policy is stale")
+    # The accountable Owner is the durable Workspace Owner, never a
+    # telemetry event's provenance; the account-operational barrier composes
+    # so a claimed deletion still latches this Owner-attributed mutation.
+    require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
+    costs = session_records.sum_task_retained_session_costs(transaction_pool, task_id=task_id)
+    if costs.known_total_usd is None or costs.known_total_usd < budget:
+        # The threshold is not true under the lock: refuse to manufacture a
+        # blocking decision from earlier, weaker observations.
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
+    targets = _resolve_cost_limit_interrupt_targets(transaction_pool, task=locked)
+    plan = _apply_owner_authorized_block(
+        transaction_pool,
+        task=locked,
+        owner_profile_id=workspace.owner_profile_id,
+        reason=TaskBlockReason.COST_LIMIT,
+        context=_cost_limit_block_context(
+            targets=targets,
+            observed_cost_usd=costs.known_total_usd,
+            authorized_budget_usd=budget,
+            has_unobserved_sessions=costs.has_unobserved_sessions,
+        ),
+        targets=targets,
+    )
+    return OwnerAuthorizedCostLimitBlock(
+        kind=(
+            CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS
+            if targets
+            else CostLimitBlockOutcomeKind.BLOCKED_IDLE
+        ),
+        task=plan.task,
+        task_block=plan.task_block,
+        interrupt_dispatches=tuple(
+            (intent, target.external_session_id) for intent, target in plan.targets
+        ),
+    )
+
+
+def establish_owner_authorized_cost_limit_block(
+    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> OwnerAuthorizedCostLimitBlock:
+    """Compose the Owner-authorized cost-limit block in one short transaction.
+
+    The pre-dispatch seam for #88 F3a: one short composed transaction
+    verifies the current Task/budget/threshold under the Task row lock and,
+    exactly when the persisted standing decision applies, commits the
+    ``COST_LIMIT`` block, the guarded ``blocked`` transition, the OWNER
+    audit, and the exact one-shot Interrupt intents together. Returns the
+    typed outcome; dispatch obligations are handled strictly after the
+    commit through :func:`dispatch_registered_task_interrupt` — never
+    inside any transaction.
+    """
+    with application_span(
+        _SERVICE_TRACER_SCOPE, "task_abort.establish_owner_authorized_cost_limit_block"
+    ) as span:
+        annotate_span(
+            span,
+            operation="task_abort.establish_owner_authorized_cost_limit_block",
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        with composed_transaction(pool) as transaction_pool:
+            return apply_owner_authorized_cost_limit_block(
+                transaction_pool, workspace_id=workspace_id, task_id=task_id
             )
-        event_coordination.record_task_blocked_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_block_id=block.id,
-            actor=event_coordination.owner_actor(profile_id),
-        )
-        intents = tuple(
-            (
-                intent_records.create_task_interrupt_intent(
-                    transaction_pool,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    task_agent_session_id=target.task_agent_session_id,
-                    workflow_role=target.workflow_role,
-                    external_session_id=target.external_session_id,
-                    requested_by_profile_id=profile_id,
-                ),
-                target,
-            )
-            for target in targets
-        )
-        return _DispatchPlan(task=blocked, task_block=block, targets=intents)
+
+
+def dispatch_registered_task_interrupt(
+    pool: DatabasePool,
+    cline_adapter: ClineAdapter,
+    *,
+    intent: TaskInterruptIntent,
+    external_session_id: str,
+) -> TaskInterruptOutcome:
+    """Dispatch one registered Interrupt intent post-commit and record its outcome.
+
+    The trusted internal seam over the exact same E10b dispatch machinery
+    (issue #228) for the persisted standing cost-policy control (issue
+    #240): strictly after the blocking composition committed, with no
+    database transaction open, the adapter's classified outcomes map onto
+    the durable intent exactly as the interactive Owner Abort records them.
+    """
+    return _dispatch_interrupt(
+        pool,
+        cline_adapter,
+        intent=intent,
+        target=_InterruptTarget(
+            task_agent_session_id=intent.task_agent_session_id,
+            workflow_role=intent.workflow_role,
+            external_session_id=external_session_id,
+        ),
+    )
 
 
 def _account_for_interrupted_executions(

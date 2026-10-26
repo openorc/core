@@ -117,6 +117,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
         "terminal_cause": None,
+        "authorized_task_budget_usd": None,
     }
     values.update(overrides)
     return (
@@ -136,6 +137,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["created_at"],
         values["updated_at"],
         values["terminal_cause"],
+        values["authorized_task_budget_usd"],
     )
 
 
@@ -350,6 +352,10 @@ def test_update_task_status_is_conditional_and_rotates_the_token() -> None:
         "waiting_for_owner",
         # The default no-capture: the coalesce keeps any existing baseline
         # and this caller passes nothing to freeze (issue #233).
+        None,
+        # The default no-capture for the authorized budget: the coalesce
+        # keeps any existing authorization and this caller passes nothing
+        # to copy (issue #240).
         None,
         "waiting_for_owner",
         "waiting_for_owner",

@@ -42,6 +42,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - Composite foreign keys are the standard durable backstop when a child stores both parent identity and workspace_id.
 - Workspace settings are first-class typed columns, not a generic JSON settings bag.
 - review_iteration_limit is positive and guidance defaults to blank text. Same-value configuration writes are no-ops and must not fabricate audit changes.
+- default_task_budget_usd (issue #240) is a nullable positive exact numeric amount: NULL disables spending policy. A Task's authorized budget is captured atomically with its guarded start transition (coalesce, never rewritten) and its observed expenditure is derived by summing the role-agnostic retained per-session cost checkpoints, never duplicated on the Task.
 - Authorization policy never moves into SQL repositories merely because persistence can join the necessary rows.
 
 ## GitHub installation routing (issue #57)

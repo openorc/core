@@ -684,7 +684,7 @@ def test_credentials_cannot_be_reinstalled_in_the_post_commit_window() -> None:
             None,  # GitHub user authorization: none durably present
             # --- the post-commit window: a concurrent configure attempt ---
             (None, None, None),  # the account barrier read of the configure flow
-            (uuid.uuid4(), profile_id, "platform", _OBSERVED, _OBSERVED, 5, ""),  # ws read
+            (uuid.uuid4(), profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None),  # ws read
             _connection_row(
                 workspace_id, auth_reference=None, enabled=False
             ),  # row-locked connection read: disabled by the revocation barrier

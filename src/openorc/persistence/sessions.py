@@ -42,6 +42,12 @@ Continuity invariants enforced here:
 - ``count_active_task_agent_sessions_by_connection`` is the grouped occupancy
   count over several Connections for the capacity admission service (issue
   #68): representation-level counting only, never an admission decision.
+- The session cost checkpoint (issue #240) is the exact-scope, high-water
+  write of one binding's retained aggregate Cline-reported USD cost, and the
+  retained-cost aggregation is the role-agnostic read that derives a Task's
+  observed expenditure from every TaskAgentSession matching the Task. No
+  workflow policy is decided here: classification and enforcement belong to
+  services.
 
 Violated database invariants (uniqueness, foreign keys, CHECK constraints)
 surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``,
@@ -51,6 +57,8 @@ surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``,
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -68,21 +76,26 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "TaskRetainedSessionCosts",
+    "checkpoint_task_agent_session_cost",
     "count_active_task_agent_sessions_by_connection",
     "ensure_task_agent_session",
     "get_task_agent_session",
     "initialize_task_agent_session",
     "list_active_task_agent_sessions",
+    "list_task_agent_sessions",
     "list_task_agent_sessions_by_external_session_id",
     "mark_task_agent_session_ended",
     "mark_task_agent_session_lost",
+    "sum_task_retained_session_costs",
 ]
 
 _SESSION_COLUMNS = (
     "id, workspace_id, task_id, role, connection_id, external_session_id, "
     "lifecycle_status, effective_config_snapshot, "
     "reported_provider, reported_model, reported_runtime_version, "
-    "initialized_at, ended_at, created_at, updated_at"
+    "initialized_at, ended_at, created_at, updated_at, "
+    "retained_cost_usd, cost_observed_at"
 )
 
 
@@ -103,6 +116,8 @@ def _session_from_row(row: Sequence[Any]) -> TaskAgentSession:
         ended_at=None if row[12] is None else normalize_utc(row[12]),
         created_at=normalize_utc(row[13]),
         updated_at=normalize_utc(row[14]),
+        retained_cost_usd=row[15],
+        cost_observed_at=None if row[16] is None else normalize_utc(row[16]),
     )
 
 
@@ -387,3 +402,130 @@ def count_active_task_agent_sessions_by_connection(
             (list(connection_ids),),
         ).fetchall()
     return {row[0]: int(row[1]) for row in rows}
+
+
+def list_task_agent_sessions(pool: DatabasePool, *, task_id: UUID) -> list[TaskAgentSession]:
+    """List every TaskAgentSession binding of one Task, in deterministic order.
+
+    The role-agnostic read behind the Task expenditure aggregate (issue
+    #240): every binding row matching the exact Task — every lifecycle
+    status and every role that exists — selected by ``task_id`` alone with
+    no role predicate and no role branch anywhere in the statement. Whether
+    a future workflow topology admits additional role bindings changes
+    nothing about this read: ownership is the Task, not a role list.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
+            "where task_id = %s order by created_at, id",
+            (task_id,),
+        ).fetchall()
+    return [_session_from_row(row) for row in rows]
+
+
+def checkpoint_task_agent_session_cost(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_agent_session_id: UUID,
+    connection_id: UUID,
+    retained_cost_usd: Decimal,
+) -> TaskAgentSession | None:
+    """Retain one binding's aggregate reported cost as its high-water checkpoint.
+
+    The narrow conditional checkpoint update (issue #240): the write applies
+    only to the exact binding row addressed by its id AND its full
+    Task/Workspace/Connection ownership tuple, and only when the reported
+    amount is strictly greater than the currently retained one (or the
+    binding has never reported). The retained value is therefore the
+    high-water reading: repeated equal observations, out-of-order reads,
+    and a Hub restart's counter reset can never decrease the retained
+    amount or double count — the resulting undercount after a reset is
+    accepted (no Hub epoch identity and no retrospective reconstruction
+    exist). The observation instant is stamped by the database clock in the
+    same statement, never substituted by ``updated_at``.
+
+    The amount must be a nonnegative finite exact decimal (the domain and
+    the durable CHECK enforce it). Returns the updated binding, or ``None``
+    when the observation does not apply: a stale, foreign (cross-Task/
+    Workspace/Connection), or not-higher reading matches no row and is a
+    no-op that must not be retried blindly — classification is a
+    service-layer concern.
+    """
+    if (
+        isinstance(retained_cost_usd, bool)
+        or not isinstance(retained_cost_usd, Decimal)
+        or not retained_cost_usd.is_finite()
+        or retained_cost_usd < 0
+    ):
+        raise TaskAgentSessionDomainError(
+            "checkpoint_task_agent_session_cost requires a nonnegative finite "
+            "USD amount (an exact decimal)"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_agent_sessions "
+            "set retained_cost_usd = %s, cost_observed_at = now(), updated_at = now() "
+            "where id = %s and task_id = %s and workspace_id = %s "
+            "and connection_id = %s "
+            "and (retained_cost_usd is null or retained_cost_usd < %s) "
+            f"returning {_SESSION_COLUMNS}",
+            (
+                retained_cost_usd,
+                task_agent_session_id,
+                task_id,
+                workspace_id,
+                connection_id,
+                retained_cost_usd,
+            ),
+        ).fetchone()
+    return None if row is None else _session_from_row(row)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRetainedSessionCosts:
+    """The role-agnostic retained-cost facts of one Task's session bindings.
+
+    ``known_total_usd`` is the sum of the retained known per-session cost
+    checkpoints across every TaskAgentSession matching the Task — ``None``
+    when no session has ever reported a cost (unknown, never a fabricated
+    zero). ``has_unobserved_sessions`` records that at least one binding
+    row carries no retained checkpoint, so a caller can distinguish a
+    complete aggregate from one with unknown constituents without the
+    aggregate ever pretending to be billing-grade.
+    """
+
+    known_total_usd: Decimal | None
+    has_unobserved_sessions: bool
+
+
+def sum_task_retained_session_costs(
+    pool: DatabasePool, *, task_id: UUID
+) -> TaskRetainedSessionCosts:
+    """Aggregate the retained known session costs of one Task, by ownership only.
+
+    The derived Task expenditure fact (issue #240): one aggregate statement
+    over ``openorc.task_agent_sessions`` filtered by ``task_id`` alone —
+    deliberately no role predicate and no role branch, so the aggregate is
+    provably independent of the v1 role vocabulary and remains correct for
+    any future binding topology. The per-session retained checkpoints are
+    already high-water values (subagent usage is inside the runtime's
+    aggregate scope and was never double-added at the checkpoint), so the
+    sum counts every constituent exactly once.
+
+    Persistence returns the database facts only; translating them into a
+    budget decision belongs to services.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select sum(retained_cost_usd), "
+            "coalesce(bool_or(retained_cost_usd is null), false) "
+            "from openorc.task_agent_sessions where task_id = %s",
+            (task_id,),
+        ).fetchone()
+    assert row is not None  # an aggregate over zero rows still yields one row
+    return TaskRetainedSessionCosts(
+        known_total_usd=row[0],
+        has_unobserved_sessions=bool(row[1]),
+    )

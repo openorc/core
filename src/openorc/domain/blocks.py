@@ -3,12 +3,17 @@
 A TaskBlock is one durable blocking condition on a Task, persisted with
 its reason and its reason/recovery context (Phase 1, issue #24).
 
-- The initial reason vocabulary is exactly the twelve settled values:
+- The initial reason vocabulary was exactly the twelve settled values:
   REVIEW_FAILURE, RUNTIME_FAILURE, AGENT_SESSION_LOST,
   CONNECTION_UNAVAILABLE, INVALID_CREDENTIALS,
   EXTERNAL_OPERATION_UNCERTAIN, STALE_OPERATION, GITHUB_SOURCE_CHANGED,
   RUNTIME_REQUEST_REJECTED, PR_CLOSED_UNMERGED, OWNER_ACTION_REQUIRED,
-  and UNKNOWN.
+  and UNKNOWN. Issue #240 adds one additive Owner-authorized
+  spending-policy reason, COST_LIMIT: the durable blocking condition
+  entered when a Task's retained known session cost sum reaches its
+  non-NULL authorized budget, composed through the same E10b
+  Owner-attributed blocking machinery with an ``owner_abort`` control
+  context (reason-specific resolution belongs to F4b, issue #230).
 - ReviewLoop iteration-limit exhaustion is deliberately not a TaskBlock
   reason: it is represented through the Task's ``waiting_for_owner``
   status plus a REVIEW_RESOLUTION OwnerGate. It is structurally excluded
@@ -55,7 +60,12 @@ class TaskBlockReason(StrEnum):
 
     ReviewLoop iteration-limit exhaustion is deliberately absent: it is
     represented through the Task's ``waiting_for_owner`` status plus a
-    REVIEW_RESOLUTION OwnerGate, never as a TaskBlock reason.
+    REVIEW_RESOLUTION OwnerGate, never as a TaskBlock reason. COST_LIMIT
+    (issue #240) is the one additive Owner-authorized spending-policy
+    reason: budget exhaustion observed by the cost-accounting service,
+    composed through the same Owner-attributed blocking machinery as the
+    interactive Owner Abort and resolved only by explicit additional
+    spending authorization (F4b, issue #230).
     """
 
     REVIEW_FAILURE = "review_failure"
@@ -69,6 +79,7 @@ class TaskBlockReason(StrEnum):
     RUNTIME_REQUEST_REJECTED = "runtime_request_rejected"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
     OWNER_ACTION_REQUIRED = "owner_action_required"
+    COST_LIMIT = "cost_limit"
     UNKNOWN = "unknown"
 
 

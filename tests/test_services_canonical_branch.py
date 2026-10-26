@@ -165,6 +165,7 @@ def _task_row(
         _OBSERVED,
         _OBSERVED,
         None,
+        None,
     )
 
 
