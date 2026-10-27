@@ -26,6 +26,7 @@ from openorc.adapters.cline.activity import (
     ClineToolCategory,
     ClineTurnFinishReason,
     ClineUsageActivity,
+    project_qualifying_pulse,
     project_session_event,
     project_usage_summary,
 )
@@ -117,6 +118,7 @@ __all__ = [
     "Subscription",
     "classify_backend_failure",
     "parse_control_endpoint_url",
+    "project_qualifying_pulse",
     "project_session_event",
     "project_usage_summary",
     "resolve_connection_control_endpoint",

@@ -29,6 +29,16 @@ fence, the same presentation tolerance the shared protocol funnel applies
 to formal responses — so formal protocol output is never relabelled as
 progress.
 
+The E6 qualifying-activity pulse (issue #246) is the smallest content-free,
+runtime-neutral projection on top of this vocabulary:
+``project_qualifying_pulse`` classifies an observation as genuine
+implementation activity (thinking indicators, commentary, tool lifecycle,
+iteration progress) versus passive runtime bookkeeping, and
+``ClineAdapter.subscribe_qualifying_activity`` delivers only a
+zero-argument pulse to its consumer — no kind, detail, session, or SDK
+content crosses that seam. The pulse is advisory runtime observation and
+never workflow authority.
+
 All observation is advisory. A completed turn, tool, or SDK ``done`` event
 never completes an OpenOrc Execution/Task, validates a review, grants Owner
 authority, selects the current workflow phase, settles an uncertain
@@ -86,6 +96,7 @@ __all__ = [
     "ClineToolCategory",
     "ClineTurnFinishReason",
     "ClineUsageActivity",
+    "project_qualifying_pulse",
     "project_session_event",
     "project_usage_summary",
 ]
@@ -987,3 +998,41 @@ def _accumulated_usage(scope: object) -> ClineAccumulatedUsage | None:
     ):
         return None
     return usage
+
+
+# The runtime-neutral qualifying-activity vocabulary (issue #246): the D6c
+# kinds that represent genuine implementation activity and may advance the
+# authorized-implementation service's advisory Execution marker through the
+# zero-argument qualifying pulse. Passive runtime status/idle/ended/error/
+# turn-finish notices and usage observations never qualify, and the pulse
+# carries none of this vocabulary — only the fact that qualifying activity
+# was observed for the exact bound session.
+_QUALIFYING_PULSE_KINDS: Final[frozenset[ClineActivityKind]] = frozenset(
+    {
+        ClineActivityKind.THINKING_STARTED,
+        ClineActivityKind.THINKING_ENDED,
+        ClineActivityKind.COMMENTARY,
+        ClineActivityKind.TOOL_STARTED,
+        ClineActivityKind.TOOL_PROGRESS,
+        ClineActivityKind.TOOL_COMPLETED,
+        ClineActivityKind.TOOL_FAILED,
+        ClineActivityKind.ITERATION_STARTED,
+        ClineActivityKind.ITERATION_ENDED,
+    }
+)
+
+
+def project_qualifying_pulse(observation: ClineActivityObservation) -> bool:
+    """Classify one D6c observation as a qualifying activity pulse (issue #246).
+
+    The vendor-local half of the E6 qualifying-activity seam: the shared
+    authorized-implementation service never receives Cline vocabulary, only
+    a zero-argument pulse callback, so this projection is where the
+    qualifying classification lives. Genuine exact-session implementation
+    activity — thinking indicators, agent commentary, tool lifecycle, and
+    iteration progress — qualifies; passive status/idle/ended notices,
+    runtime errors, turn-finish reports, and usage observations never do.
+    Session identity is enforced by the subscribing adapter before the
+    pulse fires, never by the consumer.
+    """
+    return observation.kind in _QUALIFYING_PULSE_KINDS

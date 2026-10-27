@@ -26,9 +26,11 @@ A scripted SQL-connection seam proves the E6 seams on their critical paths:
   outcomes, invalid formal completions, stale finalize subjects, and a
   raced duplicate finalize never resend, never fabricate success, and
   never overwrite history;
-- activity: qualifying exact-session observations advance the marker;
-  passive status/usage/idle kinds, other sessions, subscription failure,
-  unavailable telemetry, and late callbacks after finalization never do.
+- activity: content-free runtime-neutral qualifying pulses (issue #246)
+  advance the marker with coalescing; subscription failure, unavailable
+  telemetry, and late callbacks after finalization never do. The qualified
+  kind vocabulary and exact-session enforcement live behind the Cline
+  adapter boundary and are pinned by the adapter suite, not here.
 
 No live GitHub, runtime, or Postgres access; the new SQL
 composition/concurrent-claim seams are proven by the integration-marked
@@ -53,22 +55,6 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
-from openorc.adapters.cline.activity import (
-    ClineActivityKind,
-    ClineActivityObservation,
-    ClineCommentaryActivity,
-    ClineFinishActivity,
-    ClineIterationActivity,
-    ClineNoticeActivity,
-    ClineNoticeCategory,
-    ClineRuntimeEndedActivity,
-    ClineRuntimeErrorActivity,
-    ClineRuntimeStatusActivity,
-    ClineToolActivity,
-    ClineToolCategory,
-    ClineTurnFinishReason,
-    ClineUsageActivity,
-)
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
@@ -500,35 +486,35 @@ class _FailingAttachment:
 
 
 class _ScriptedActivitySubscription:
-    """Delivers scripted observations to the listener on establishment."""
+    """Delivers scripted zero-argument qualifying pulses on establishment."""
 
-    def __init__(self, observations: Sequence[ClineActivityObservation] = ()) -> None:
-        self._observations = list(observations)
+    def __init__(self, pulses: int = 0) -> None:
+        self._pulse_count = pulses
         self.session_ids: list[str] = []
-        self.listeners: list[Callable[[ClineActivityObservation], None]] = []
+        self.pulses: list[Callable[[], None]] = []
         self.closed = 0
 
     def __call__(
         self,
         _runtime: Any,  # noqa: ANN401 - the service passes its resolved adapter
         session_id: str,
-        listener: Callable[[ClineActivityObservation], None],
+        pulse: Callable[[], None],
     ) -> AbstractContextManager[None]:
         self.session_ids.append(session_id)
-        self.listeners.append(listener)
+        self.pulses.append(pulse)
         return self
 
     def __enter__(self) -> None:
-        for observation in self._observations:
-            self.listeners[-1](observation)
+        for _ in range(self._pulse_count):
+            self.pulses[-1]()
         return None
 
     def __exit__(self, *_exc: object) -> bool:
         self.closed += 1
         return False
 
-    def deliver_late(self, observation: ClineActivityObservation) -> None:
-        self.listeners[-1](observation)
+    def deliver_late(self) -> None:
+        self.pulses[-1]()
 
 
 class _RaisingSubscription:
@@ -538,7 +524,7 @@ class _RaisingSubscription:
         self,
         _runtime: Any,  # noqa: ANN401
         _session_id: str,
-        _listener: Callable[[ClineActivityObservation], None],
+        _pulse: Callable[[], None],
     ) -> AbstractContextManager[None]:
         return self
 
@@ -547,15 +533,6 @@ class _RaisingSubscription:
 
     def __exit__(self, *_exc: object) -> bool:
         return False
-
-
-def _observation(
-    kind: ClineActivityKind,
-    *,
-    session_id: str = _EXTERNAL_SESSION_ID,
-    detail: Any = None,  # noqa: ANN401 - typed per the D6c vocabulary
-) -> ClineActivityObservation:
-    return ClineActivityObservation(session_id=session_id, kind=kind, detail=detail)
 
 
 def _prepared_adapter(
@@ -699,16 +676,6 @@ _RESULT_CANDIDATE = implementation_result_candidate(
     validation=["tests pass"],
 )
 
-_TOOL_DETAIL = ClineToolActivity(category=ClineToolCategory.OTHER, tool_name="apply_patch")
-_ITERATION_DETAIL = ClineIterationActivity(iteration=2)
-_COMMENTARY_DETAIL = ClineCommentaryActivity(text="progress", truncated=False)
-_USAGE_DETAIL = ClineUsageActivity(input_tokens=10, output_tokens=5)
-_NOTICE_DETAIL = ClineNoticeActivity(category=ClineNoticeCategory.STATUS)
-_FINISH_DETAIL = ClineFinishActivity(reason=ClineTurnFinishReason.COMPLETED)
-_RUNTIME_ERROR_DETAIL = ClineRuntimeErrorActivity(recoverable=False)
-_RUNTIME_STATUS_DETAIL = ClineRuntimeStatusActivity(status="running")
-_RUNTIME_ENDED_DETAIL = ClineRuntimeEndedActivity(reason="disposed")
-
 _COMPLETE_RESULT_ROW = _execution_row(
     status="succeeded",
     implementation_result=dict(_RESULT_CANDIDATE),
@@ -829,70 +796,43 @@ def test_the_send_message_is_the_persisted_acceptance_with_zero_findings() -> No
 # --- activity marker -------------------------------------------------------------
 
 
-def test_qualifying_observations_advance_the_marker_and_passive_ones_do_not() -> None:
-    """Genuine exact-session activity writes the marker; passive status,
-    usage, ended notices, and other-session observations never do."""
+def test_qualifying_pulses_advance_the_bound_running_executions_marker() -> None:
+    """Content-free pulses from the caller's subscription write the marker
+    of the exact running attempt they were established for, addressing only
+    the bound Producer session and closing exactly once."""
     conn = ScriptedConnection()
     _script_happy_path(conn, complete_row=_COMPLETE_RESULT_ROW, with_activity_writes=True)
     pool, runtime, attachment = _arrange(conn, send_outcomes=[_RESULT_CANDIDATE])
-    subscription = _ScriptedActivitySubscription(
-        [
-            _observation(ClineActivityKind.TOOL_STARTED, detail=_TOOL_DETAIL),
-            _observation(ClineActivityKind.USAGE_OBSERVED, detail=_USAGE_DETAIL),
-            _observation(ClineActivityKind.RUNTIME_STATUS, detail=_RUNTIME_STATUS_DETAIL),
-            _observation(ClineActivityKind.TURN_FINISHED, detail=_FINISH_DETAIL),
-            _observation(
-                ClineActivityKind.TOOL_STARTED,
-                session_id="another-session",
-                detail=_TOOL_DETAIL,
-            ),
-        ]
-    )
+    subscription = _ScriptedActivitySubscription(pulses=1)
     outcome = _execute_call(
         cast(DatabasePool, pool),
         producer_runtime_factory=attachment,
         activity_subscription_factory=subscription,
     )
 
-    # Only the one qualifying TOOL_STARTED observation produced a write, on
-    # the exact bound session.
+    # The one pulse produced exactly one marker write; the subscription was
+    # addressed to the exact bound external session and closed exactly once.
     assert _count(conn, _EXECUTION_ACTIVITY) == 1
     assert subscription.session_ids == [_EXTERNAL_SESSION_ID]
     assert subscription.closed == 1
     assert outcome.execution.last_qualifying_activity_at == _OBSERVED
 
 
-def test_the_full_qualifying_activity_vocabulary_writes_and_coalesces() -> None:
-    """Thinking, iteration/work polling, commentary, and tool lifecycle
-    qualify; notices, runtime errors/status/ended never do; noisy bursts
-    coalesce without losing the marker."""
+def test_pulse_bursts_coalesce_without_losing_the_marker() -> None:
+    """Noisy pulse bursts coalesce to a bounded number of marker writes,
+    but never zero: the marker keeps advancing while the attempt runs."""
     conn = ScriptedConnection()
     _script_happy_path(conn, complete_row=_COMPLETE_RESULT_ROW, with_activity_writes=True)
     pool, runtime, attachment = _arrange(conn, send_outcomes=[_RESULT_CANDIDATE])
-    subscription = _ScriptedActivitySubscription(
-        [
-            _observation(ClineActivityKind.THINKING_STARTED),
-            _observation(ClineActivityKind.ITERATION_STARTED, detail=_ITERATION_DETAIL),
-            _observation(ClineActivityKind.COMMENTARY, detail=_COMMENTARY_DETAIL),
-            _observation(
-                ClineActivityKind.TOOL_FAILED,
-                detail=ClineToolActivity(category=ClineToolCategory.OTHER),
-            ),
-            _observation(ClineActivityKind.ITERATION_ENDED, detail=_ITERATION_DETAIL),
-            _observation(ClineActivityKind.THINKING_ENDED),
-            _observation(ClineActivityKind.NOTICE, detail=_NOTICE_DETAIL),
-            _observation(ClineActivityKind.RUNTIME_ERROR, detail=_RUNTIME_ERROR_DETAIL),
-            _observation(ClineActivityKind.RUNTIME_ENDED, detail=_RUNTIME_ENDED_DETAIL),
-        ]
-    )
+    subscription = _ScriptedActivitySubscription(pulses=6)
     _execute_call(
         cast(DatabasePool, pool),
         producer_runtime_factory=attachment,
         activity_subscription_factory=subscription,
     )
 
-    # Six qualifying observations coalesce to a bounded number of writes,
-    # but never zero; the passive kinds wrote nothing.
+    # Six immediate pulses coalesce to a bounded number of writes,
+    # but never zero.
     assert 1 <= _count(conn, _EXECUTION_ACTIVITY) <= 6
 
 
@@ -913,8 +853,8 @@ def test_unavailable_or_failed_telemetry_never_gates_the_attempt() -> None:
 
 
 def test_late_callbacks_after_finalize_cannot_write_history() -> None:
-    """A late observation delivered after the service returned is advisory:
-    its conditional write is a rejected no-op against the finalized row and
+    """A late pulse delivered after the service returned is advisory: its
+    conditional write is a rejected no-op against the finalized row and
     never raises into the attempt."""
     conn = ScriptedConnection()
     _script_happy_path(conn, complete_row=_COMPLETE_RESULT_ROW)
@@ -928,9 +868,9 @@ def test_late_callbacks_after_finalize_cannot_write_history() -> None:
     events_before = _event_types(conn)
 
     # The late conditional write applies no row (the status is no longer
-    # running); the listener swallows the rejection either way.
+    # running); the pulse listener swallows the rejection either way.
     conn.on_repeat(_EXECUTION_ACTIVITY, None)
-    subscription.deliver_late(_observation(ClineActivityKind.TOOL_STARTED, detail=_TOOL_DETAIL))
+    subscription.deliver_late()
 
     assert _event_types(conn) == events_before
     assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
