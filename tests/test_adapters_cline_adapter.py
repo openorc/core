@@ -68,6 +68,7 @@ from openorc.adapters.cline.activity import (
     ClineToolCategory,
     ClineTurnFinishReason,
     ClineUsageActivity,
+    project_qualifying_pulse,
     project_session_event,
     project_usage_summary,
 )
@@ -2522,6 +2523,134 @@ def test_activity_subscriptions_do_not_cross_feed_between_bound_sessions() -> No
     assert producer_observations[0].session_id == session_id
     assert _kinds(reviewer_observations) == [ClineActivityKind.ITERATION_STARTED]
     assert reviewer_observations[0].session_id == other_session
+
+
+# --- E6 qualifying-activity pulse (issue #246) ---------------------------------------
+
+
+def _pulse_collector() -> tuple[list[tuple[object, ...]], Callable[[], None]]:
+    """A zero-argument pulse recorder that would capture any leaked content."""
+    calls: list[tuple[object, ...]] = []
+
+    def pulse(*args: object) -> None:
+        calls.append(args)
+
+    return calls, pulse
+
+
+def test_the_qualifying_pulse_projection_admits_only_implementation_activity() -> None:
+    """Exactly the implementation-activity vocabulary qualifies; passive
+    status/idle/ended/error/turn-finish and usage observations never do."""
+    session = "cline-session-1"
+    qualified = [
+        ClineActivityObservation(session_id=session, kind=ClineActivityKind.THINKING_STARTED),
+        ClineActivityObservation(session_id=session, kind=ClineActivityKind.THINKING_ENDED),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.COMMENTARY,
+            detail=ClineCommentaryActivity(text="progress", truncated=False),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.TOOL_STARTED,
+            detail=ClineToolActivity(category=ClineToolCategory.OTHER, tool_name="apply_patch"),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.TOOL_PROGRESS,
+            detail=ClineToolActivity(category=ClineToolCategory.OTHER),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.TOOL_COMPLETED,
+            detail=ClineToolActivity(category=ClineToolCategory.OTHER),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.TOOL_FAILED,
+            detail=ClineToolActivity(category=ClineToolCategory.OTHER),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.ITERATION_STARTED,
+            detail=ClineIterationActivity(iteration=1),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.ITERATION_ENDED,
+            detail=ClineIterationActivity(iteration=1),
+        ),
+    ]
+    passive = [
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.NOTICE,
+            detail=ClineNoticeActivity(category=ClineNoticeCategory.STATUS),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.TURN_FINISHED,
+            detail=ClineFinishActivity(reason=ClineTurnFinishReason.COMPLETED),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.RUNTIME_ERROR,
+            detail=ClineRuntimeErrorActivity(recoverable=False),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.RUNTIME_STATUS,
+            detail=ClineRuntimeStatusActivity(status="running"),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.RUNTIME_ENDED,
+            detail=ClineRuntimeEndedActivity(reason="disposed"),
+        ),
+        ClineActivityObservation(
+            session_id=session,
+            kind=ClineActivityKind.USAGE_OBSERVED,
+            detail=ClineUsageActivity(input_tokens=10, output_tokens=5),
+        ),
+    ]
+
+    assert all(project_qualifying_pulse(observation) for observation in qualified)
+    assert not any(project_qualifying_pulse(observation) for observation in passive)
+
+
+def test_subscribe_qualifying_activity_pulses_only_qualified_exact_session_events() -> None:
+    """The qualifying pulse subscription delivers a zero-argument pulse for
+    qualified observations of the exact bound session only — never for
+    passive kinds, never for foreign sessions — and no content crosses."""
+    adapter, backend, resolver, session_id = _bound_adapter()
+    calls, pulse = _pulse_collector()
+
+    subscription = adapter.subscribe_qualifying_activity(session_id, pulse)
+    backend.emit(_agent_event(session_id, {"type": "iteration_start", "iteration": 1}))
+    backend.emit(
+        _agent_event(session_id, {"type": "content_end", "contentType": "text", "text": "working"})
+    )
+    backend.emit(_status_event(session_id, "running"))
+    backend.emit(_ended_event(session_id, "disposed"))
+    backend.emit(_agent_event("another-session", {"type": "iteration_start", "iteration": 1}))
+
+    assert subscription.active is True
+    assert resolver.bound_queries == [session_id]
+    assert [call.operation for call in backend.calls()] == ["subscribe"]
+    # Two qualifying observations pulsed; passive status/ended and the
+    # foreign-session event never did — and the pulse carried no arguments.
+    assert calls == [(), ()]
+
+
+def test_subscribe_qualifying_activity_refuses_an_unbound_session_before_backend_effects() -> None:
+    adapter, backend, _resolver, _session_id = _bound_adapter()
+    calls, pulse = _pulse_collector()
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.subscribe_qualifying_activity("unbound-session", pulse)
+
+    assert backend.calls() == ()
+    assert calls == []
 
 
 def test_project_session_event_drops_events_addressed_to_another_session() -> None:

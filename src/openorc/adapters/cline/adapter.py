@@ -80,6 +80,14 @@ state. Consumers receive only
 :mod:`openorc.adapters.cline.activity` observations — never the opaque SDK
 event payload — and every observation stays advisory runtime bookkeeping
 that never decides workflow meaning.
+
+The E6 qualifying pulse (``subscribe_qualifying_activity``, issue #246) is
+the narrow runtime-neutral derivative of ``subscribe_activity``: the exact
+bound session's projected observations are filtered through the
+adapter-local qualifying classification, and the consumer is notified with
+a zero-argument pulse — no kind, detail, session, or SDK content crosses —
+so shared application services consume implementation-activity signals
+without any Cline vocabulary.
 """
 
 from __future__ import annotations
@@ -108,6 +116,7 @@ from openorc.adapters.agent_runtime.results import (
 from openorc.adapters.cline.activity import (
     ClineActivityObservation,
     ClineActivitySnapshot,
+    project_qualifying_pulse,
     project_session_event,
     project_usage_summary,
 )
@@ -1189,6 +1198,70 @@ class ClineAdapter(AgentRuntimeAdapter):
             def _deliver(event: ClineSessionEvent) -> None:
                 for observation in project_session_event(event, expected_session_id=session_id):
                     listener(observation)
+
+            return self._backend_operation(
+                "subscribe",
+                lambda: self._backend.subscribe(session_id, _deliver),
+                session_id=session_id,
+            )
+
+    def subscribe_qualifying_activity(
+        self,
+        session_id: str,
+        pulse: Callable[[], None],
+    ) -> Subscription:
+        """Subscribe the zero-argument qualifying pulse of the exact bound session (issue #246).
+
+        The narrow runtime-neutral derivative of :meth:`subscribe_activity`
+        behind the shared authorized-implementation service's advisory
+        Execution activity marker: the attached backend's session events for
+        the exact external session ID of the bound Task/role session are
+        projected through the same D6c mapping, and only observations of the
+        adapter-local qualifying vocabulary — genuine implementation activity
+        (thinking indicators, commentary, tool lifecycle, iteration
+        progress) — notify the consumer through a zero-argument pulse. The
+        consumer never receives the opaque SDK event payload and never
+        receives any Cline observation, kind, or detail: the qualification
+        lives entirely behind this boundary, and the pulse carries nothing.
+
+        Preconditions and discipline mirror ``subscribe_activity`` exactly:
+        the exact Task/role/Connection binding is resolved through the
+        injected resolver before any backend effect and a missing or
+        mismatched binding fails closed as a configuration rejection; the
+        already-attached D4 backend is consumed as-is; the subscription and
+        its delivery take no per-session send/reconstruction lock; the
+        subscription is addressed to the exact session and every event's own
+        ``session_id`` is verified again before projection, so different
+        Producer/Reviewer sessions, Tasks, and Connections cannot cross-feed;
+        and delivery rides the backend's existing bounded event dispatch —
+        best-effort live observation with no historical replay, no
+        exactly-once guarantee, and no recovery of a turn's lost mid-flight
+        events. Unsubscribe is explicit and idempotent through the returned
+        handle; disposal never implies a workflow decision.
+
+        Every pulse is advisory runtime bookkeeping: it never completes an
+        OpenOrc Execution/Task, never alters the service's dispatch or
+        finalization semantics, and an absent or failing subscription proves
+        nothing about session health.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.subscribe_qualifying_activity") as span:
+            annotate_span(span, operation="cline_adapter.subscribe_qualifying_activity")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not callable(pulse):
+                raise ValueError("pulse must be callable")
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+
+            def _deliver(event: ClineSessionEvent) -> None:
+                for observation in project_session_event(event, expected_session_id=session_id):
+                    if project_qualifying_pulse(observation):
+                        pulse()
 
             return self._backend_operation(
                 "subscribe",

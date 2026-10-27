@@ -2,7 +2,7 @@
 
 E6 reproduces exactly one proven manual step: after the human has approved
 proceeding at the E5 gate (issue #80), the persisted accepted Reviewer
-``review_result`` envelope is delivered to the **existing** Producer Cline
+``review_result`` envelope is delivered to the **existing** Producer
 session, the session is natively switched PLAN→ACT on the same external
 session ID, and the single model-visible implementation message is the
 structural serialization of that accepted envelope. The service records one
@@ -40,10 +40,11 @@ transaction spans an attachment or any runtime call):
    subject set is **revalidated** (R1) before the native ``ImplementInteraction``
    realization on the same external session ID — an authority change during
    attachment refuses reconstruction and finalizes the never-dispatched
-   attempt truthfully. After realization the optional D6c activity
-   subscription is established, the exact subject set is revalidated again
-   (R2) immediately before the one send, and the send carries the canonical
-   accepted envelope with ``expected_family=IMPLEMENTATION_RESULT_FAMILY``,
+   attempt truthfully. After realization the optional runtime-neutral
+   qualifying-activity subscription (issue #246) is established, the exact
+   subject set is revalidated again (R2) immediately before the one send,
+   and the send carries the canonical accepted envelope with
+   ``expected_family=IMPLEMENTATION_RESULT_FAMILY``,
    expecting exactly one typed ``ImplementationResult`` (whose schema pins
    ``status`` to ``COMPLETED``).
 3. **The one-shot finalize** (one short transaction): the exact subject set
@@ -66,15 +67,17 @@ already-returned result — leaves the attempt conservatively ``running``
 error, and never resends, never fabricates success, and never grants retry
 permission. Settlement belongs to the later recovery layer (#85/#87–#89).
 
-The activity marker (issue #90's consumer) is advisory only: qualifying
-exact-session observations (thinking, iteration/work polling, tool
-lifecycle, non-formal commentary) advance ``last_qualifying_activity_at``
-monotonically with database time while the attempt is running; passive
-status/idle/ended notices, usage snapshots, and other sessions never do;
-unavailable telemetry changes nothing; late callbacks cannot write finalized
-history. No watchdog, scheduler, second telemetry pipeline, or
-adapter-independent observation framework is built here, and no
-RuntimeRequest approval routing, abort engine, or retry engine is installed.
+The activity marker (issue #90's consumer) is advisory only: the caller's
+optional runtime-neutral qualifying-activity subscription (issue #246)
+delivers zero-argument pulses — the supplying runtime adapter enforces exact
+bound external-session identity and owns all vendor-specific qualification —
+and each pulse advances ``last_qualifying_activity_at`` monotonically with
+database time while the attempt is running through the coalescing conditional
+write. An absent, failing, or late subscription changes nothing; late
+callbacks cannot write finalized history. No watchdog, scheduler, second
+telemetry pipeline, or adapter-independent observation framework is built
+here, and no RuntimeRequest approval routing, abort engine, or retry engine
+is installed.
 """
 
 from __future__ import annotations
@@ -94,7 +97,6 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
-from openorc.adapters.cline.activity import ClineActivityKind, ClineActivityObservation
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
@@ -147,6 +149,7 @@ __all__ = [
     "ActivitySubscriptionFactory",
     "AuthorizedImplementationExecution",
     "ProducerRuntimeAttachmentFactory",
+    "QualifyingActivityPulse",
     "execute_authorized_implementation",
 ]
 
@@ -160,30 +163,26 @@ _EXECUTE_SPAN_NAME: Final[str] = "task_authorized_implementation_execution.execu
 _AUTHORITY_STALE_FAILURE_KIND: Final[str] = "authority_stale"
 _RUNTIME_PRE_EFFECT_FAILURE_KIND: Final[str] = "runtime_pre_effect"
 
-# The qualifying-activity vocabulary (issue #81, consumed by F5 #90):
-# genuine implementation activity only. Passive runtime status/idle/ended
-# notices, usage snapshots, and synthetic connection heartbeats never
-# advance the marker.
-_QUALIFYING_ACTIVITY_KINDS: Final[frozenset[ClineActivityKind]] = frozenset(
-    {
-        ClineActivityKind.THINKING_STARTED,
-        ClineActivityKind.THINKING_ENDED,
-        ClineActivityKind.COMMENTARY,
-        ClineActivityKind.TOOL_STARTED,
-        ClineActivityKind.TOOL_PROGRESS,
-        ClineActivityKind.TOOL_COMPLETED,
-        ClineActivityKind.TOOL_FAILED,
-        ClineActivityKind.ITERATION_STARTED,
-        ClineActivityKind.ITERATION_ENDED,
-    }
-)
+# The qualifying-pulse marker write (issue #246) coalesces bursts of
+# content-free runtime-neutral pulses into a bounded write rate; the pulse
+# itself carries nothing, and the supplying runtime adapter owns the
+# vendor-specific qualification and exact-session enforcement.
 _ACTIVITY_WRITE_MIN_INTERVAL_SECONDS: Final[float] = 2.0
 
 # --- typed seams and outcomes -----------------------------------------------------
 
+# The runtime-neutral qualifying-activity pulse (issue #246): the smallest
+# content-free notification the shared service consumes from any runtime's
+# optional local observation capability. The pulse carries nothing — no
+# payload, text, event kind, or detail — and the supplying adapter enforces
+# exact bound external-session identity and all vendor-specific
+# qualification before firing it. The service owns only the coalesced,
+# conditional, RUNNING-only advisory marker write.
+QualifyingActivityPulse = Callable[[], None]
+
 ProducerRuntimeAttachmentFactory = Callable[[], AbstractContextManager[AgentRuntimeAdapter]]
 ActivitySubscriptionFactory = Callable[
-    [AgentRuntimeAdapter, str, Callable[[ClineActivityObservation], None]],
+    [AgentRuntimeAdapter, str, QualifyingActivityPulse],
     AbstractContextManager[None],
 ]
 
@@ -223,24 +222,22 @@ class _ReservedAttempt:
 class _QualifyingActivityHeartbeat:
     """The coalescing F5 marker listener for one running attempt.
 
-    Qualifying exact-session observations advance the Execution's
-    ``last_qualifying_activity_at`` through a short conditional write;
-    passive kinds, other sessions, and late callbacks after finalization
-    are dropped. Every failure — subscription, observation, or write — is
-    advisory and must never alter workflow authority or break the attempt.
+    Runtime-neutral qualifying-activity pulses (issue #246) advance the
+    Execution's ``last_qualifying_activity_at`` through a short conditional
+    write. The pulse carries nothing: exact bound external-session identity
+    and vendor-specific qualification are enforced by the supplying adapter
+    before the pulse fires, so the listener only coalesces and writes. Late
+    callbacks after finalization are dropped by the conditional write.
+    Every failure — subscription, observation, or write — is advisory and
+    must never alter workflow authority or break the attempt.
     """
 
-    def __init__(self, pool: DatabasePool, *, execution_id: UUID, external_session_id: str) -> None:
+    def __init__(self, pool: DatabasePool, *, execution_id: UUID) -> None:
         self._pool = pool
         self._execution_id = execution_id
-        self._external_session_id = external_session_id
         self._last_write_monotonic: float | None = None
 
-    def __call__(self, observation: ClineActivityObservation) -> None:
-        if observation.session_id != self._external_session_id:
-            return
-        if observation.kind not in _QUALIFYING_ACTIVITY_KINDS:
-            return
+    def __call__(self) -> None:
         now = time.monotonic()
         if (
             self._last_write_monotonic is not None
@@ -277,7 +274,7 @@ def _require_producer_factory(value: object) -> ProducerRuntimeAttachmentFactory
 
 
 def _require_activity_factory(value: object) -> ActivitySubscriptionFactory | None:
-    """Require the optional D6c activity subscription factory dependency."""
+    """Require the optional runtime-neutral qualifying-activity subscription factory."""
     if value is None:
         return None
     if not callable(value):
@@ -715,11 +712,7 @@ def _send_and_finalize(
     activity_factory: ActivitySubscriptionFactory | None,
 ) -> AuthorizedImplementationExecution:
     """The subscription, R2, the one send, and the one-shot finalize."""
-    heartbeat = _QualifyingActivityHeartbeat(
-        pool,
-        execution_id=reserved.execution.id,
-        external_session_id=producer_external_session_id,
-    )
+    heartbeat = _QualifyingActivityHeartbeat(pool, execution_id=reserved.execution.id)
     with ExitStack() as subscription_stack:
         if activity_factory is not None:
             try:

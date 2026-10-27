@@ -22,15 +22,15 @@ is the same durable invariant this replay proves; the row-lock serialization
 itself is Postgres-native. The scripted deterministic suite owns
 classification and no-write refusal coverage; this suite owns only the new
 durable invariants and uses the deterministic fake Agent Runtime and a
-scripted D6c activity subscription for the service path (no live runtime,
-GitHub, or Supabase access). The suite consumes the explicitly supplied
+scripted runtime-neutral qualifying-pulse subscription for the service path
+(no live runtime, GitHub, or Supabase access). The suite consumes the explicitly supplied
 non-production branch database per ``tests/integration/conftest.py``.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any, cast
 
@@ -39,7 +39,6 @@ from psycopg import Connection
 from psycopg.errors import IntegrityError
 
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
-from openorc.adapters.cline.activity import ClineActivityKind, ClineActivityObservation
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import ExecutionDomainError, ExecutionStatus
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewOutcome
@@ -329,24 +328,24 @@ class _ProducerAttachment:
 
 
 class _ScriptedActivitySubscription:
-    """Delivers scripted observations to the listener on establishment."""
+    """Delivers scripted zero-argument qualifying pulses on establishment."""
 
-    def __init__(self, observations: Sequence[ClineActivityObservation] = ()) -> None:
-        self._observations = list(observations)
-        self.listeners: list[Callable[[ClineActivityObservation], None]] = []
+    def __init__(self, pulses: int = 0) -> None:
+        self._pulse_count = pulses
+        self.pulses: list[Callable[[], None]] = []
 
     def __call__(
         self,
         _runtime: Any,  # noqa: ANN401
         _session_id: str,
-        listener: Callable[[ClineActivityObservation], None],
+        pulse: Callable[[], None],
     ) -> AbstractContextManager[None]:
-        self.listeners.append(listener)
+        self.pulses.append(pulse)
         return self
 
     def __enter__(self) -> None:
-        for observation in self._observations:
-            self.listeners[-1](observation)
+        for _ in range(self._pulse_count):
+            self.pulses[-1]()
         return None
 
     def __exit__(self, *_exc: object) -> bool:
@@ -399,13 +398,7 @@ def test_the_authorized_execution_round_trips_result_and_marker_end_to_end(
     audit, and leaves the Task/gate/plan authority untouched for E7."""
     facts = _authorized_fixture(conn)
     pool = facts["pool"]
-    subscription = _ScriptedActivitySubscription(
-        [
-            ClineActivityObservation(
-                session_id=_EXTERNAL_SESSION_ID, kind=ClineActivityKind.THINKING_STARTED
-            )
-        ]
-    )
+    subscription = _ScriptedActivitySubscription(pulses=1)
     runtime = _prepared_runtime(facts)
 
     outcome = _execute_call(
