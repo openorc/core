@@ -136,9 +136,8 @@ def _insert_producer_session(conn: Connection[Any], workspace_id: Any, task_id: 
     conn.execute(
         "insert into openorc.task_agent_sessions "
         "(id, workspace_id, task_id, role, connection_id, external_session_id, "
-        "lifecycle_status, initialization_protocol_version, "
-        "effective_config_snapshot, initialized_at) "
-        "values (%s, %s, %s, 'producer', %s, %s, 'ready', '1', %s, now())",
+        "lifecycle_status, effective_config_snapshot, initialized_at) "
+        "values (%s, %s, %s, 'producer', %s, %s, 'ready', %s, now())",
         (
             session_id,
             workspace_id,
