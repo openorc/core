@@ -230,6 +230,36 @@ _ITERATION_INSERT = _sql_has("insert into openorc.review_iterations")
 _RESULT_UPDATE = _sql_has("update openorc.review_iterations")
 _GATES_LIST = _sql_has("from openorc.owner_gates where task_id")
 _GATE_READ = _sql_has("from openorc.owner_gates where id")
+_CLAIM_PRECHECK = _sql_has("from openorc.task_runtime_send_claims", "task_id = %s and kind = %s")
+_CLAIM_INSERT = _sql_has("insert into openorc.task_runtime_send_claims")
+_CLAIM_SETTLE = _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()")
+_CLAIM_ID = uuid.uuid4()
+
+
+def _claim_row(
+    *,
+    review_iteration_id: Any = _ITERATION_2_ID,
+    status: str = "claimed",
+    settled: bool = False,
+) -> tuple[Any, ...]:
+    settled_at = _OBSERVED if settled or status != "claimed" else None
+    return (
+        _CLAIM_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "planning_revise_dispatch",
+        _PRODUCER_SESSION_ID,
+        review_iteration_id,
+        None,
+        None,
+        status,
+        {},
+        _OBSERVED,
+        settled_at,
+        _OBSERVED,
+    )
+
+
 _GATE_INSERT = _sql_has("insert into openorc.owner_gates")
 _GATE_UPDATE = _sql_has("update openorc.owner_gates")
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
@@ -662,7 +692,7 @@ def _script_handoff(
     # conditional pointer/status/token update.
     conn.on(_TASK_READ_LOCKED, supersession_task_row or t_waiting)
     conn.on(_TASK_GATE_WRITE, t_planning)
-    # --- E2 revision production (entry + finalize), in call order. ---
+    # --- E2 revision production (entry + claim + finalize), in call order. ---
     rev2 = _revision_row(revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT)
     t_pointer = _task_row(
         status="planning", state_token=_TOKEN_3, current_plan_revision_id=_REVISION_2_ID
@@ -671,10 +701,20 @@ def _script_handoff(
     conn.on(_TASK_READ_LOCKED, t_planning)  # E2 Task lock
     conn.on(_TASK_READ, t_planning)  # E2 entry currentness
     conn.on(_ITERATION_READ, it2)
+    # The F2 dispatch claim (issue #87): the locked subject reproof rides the
+    # repeating loop/iteration-list reads, then the exact-subject pre-check
+    # and the committed claim row — strictly before the send.
+    conn.on(_ITERATION_READ, it2)
+    conn.on(_ITERATION_READ, it2)  # the finalize's supersession recheck
+    conn.on(_CLAIM_PRECHECK, None)
+    conn.on(_CLAIM_INSERT, _claim_row())
     conn.on(_REVISIONS_HISTORY, [rev1])
     conn.on(_TASK_READ, t_planning)  # E2 finalize currentness
     conn.on(_REVISION_INSERT, rev2)
     conn.on(_POINTER_UPDATE, t_pointer)
+    # The validated plan_result settles the claim exactly once with the
+    # atomic resolution (issue #87).
+    conn.on(_CLAIM_SETTLE, _claim_row(status="settled", settled=True))
 
 
 def _script_handoff_entry(

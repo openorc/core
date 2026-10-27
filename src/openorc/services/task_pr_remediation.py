@@ -73,6 +73,8 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeProtocolFailureError,
+    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
@@ -622,6 +624,13 @@ def _send_remediation_revision(
     claimed attempt conservatively running (the potentially-dispatched
     record), and a known runtime failure finalizes it truthfully as a
     pre-effect known failure — never resent, never fabricated.
+
+    The pre-effect classification is narrowed to the positively proven
+    classes (issue #87): ``AgentRuntimeTransportError`` and
+    ``AgentRuntimeProtocolFailureError`` can arise only after a send has done
+    work, so they are unresolved outcomes that keep the claimed attempt on
+    its potentially-dispatched ``RUNNING`` record — never a proven
+    non-delivery and never a safe retry.
     """
     subject = PrReviewSubject(
         repository_full_name=repository_full_name,
@@ -646,7 +655,20 @@ def _send_remediation_revision(
             "the outcome of the agent runtime pr remediation interaction is unknown; "
             "the attempt remains potentially dispatched and is never resent"
         ) from error
+    except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+        logger.warning(
+            "pr remediation ended with a post-send runtime failure; the claimed "
+            "attempt remains potentially dispatched"
+        )
+        raise ExternalOperationUncertainError(
+            "the pr remediation send may have been delivered but its response could "
+            "not be interpreted; the attempt remains potentially dispatched and is "
+            "never resent"
+        ) from error
     except AgentRuntimeError as error:
+        # The remaining normalized taxonomy classes (configuration rejection,
+        # runtime unavailability, and a not-live addressed session) are
+        # positively proven to precede any effect.
         raise ExternalOperationFailedError(
             "the agent runtime pr remediation interaction failed as a known "
             "non-delivery; the attempt is finalized truthfully and never resent"

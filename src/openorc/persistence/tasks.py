@@ -33,7 +33,14 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from openorc.domain.tasks import Task, TaskDomainError, TaskStatus, TaskTerminalCause
+from openorc.domain.tasks import (
+    Task,
+    TaskDomainError,
+    TaskPlanningBootstrapEvidence,
+    TaskPlanningBootstrapStage,
+    TaskStatus,
+    TaskTerminalCause,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
@@ -48,11 +55,13 @@ __all__ = [
     "get_task",
     "get_task_for_update",
     "get_task_planning_bootstrap_claim",
+    "get_task_planning_bootstrap_evidence",
     "list_issue_attempts",
     "list_current_repository_tasks",
     "list_queued_tasks",
     "list_workspace_tasks",
     "lock_workspace_task_arbitration",
+    "record_planning_bootstrap_stage",
     "set_current_plan_revision",
     "set_current_owner_gate",
     "update_task_status",
@@ -221,6 +230,7 @@ def claim_task_planning_bootstrap(
         row = conn.execute(
             "update openorc.tasks "
             "set planning_bootstrap_claim_token = %s, "
+            "planning_bootstrap_claimed_at = now(), "
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             "and planning_bootstrap_claim_token is null "
@@ -228,6 +238,85 @@ def claim_task_planning_bootstrap(
             (claim_token, task_id, expected_state_token),
         ).fetchone()
     return None if row is None else row[0]
+
+
+def get_task_planning_bootstrap_evidence(
+    pool: DatabasePool, *, task_id: UUID
+) -> TaskPlanningBootstrapEvidence | None:
+    """Return the Task's bootstrap claim and stage evidence, or ``None``.
+
+    The focused read of the E1b replay-safety fact (issue #203) plus the F2
+    stage/settlement evidence (issue #87): ``None`` means the Task's
+    bootstrap establishment has never been claimed (or the Task is absent —
+    the calling service resolves subject existence first). A non-``None``
+    evidence carries the exactly-once claim token, its database-stamped
+    claim instant (``None`` is residue claimed before the instant evidence
+    existed), the forward-only settled stage, and that stage's settlement
+    instant. Representation only: classifying the facts into workflow
+    outcomes is a service-layer concern.
+    """
+    if not isinstance(task_id, UUID):
+        raise TaskDomainError("task_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select planning_bootstrap_claim_token, planning_bootstrap_claimed_at, "
+            "planning_bootstrap_stage, planning_bootstrap_stage_settled_at "
+            "from openorc.tasks where id = %s",
+            (task_id,),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return TaskPlanningBootstrapEvidence(
+        claim_token=row[0],
+        claimed_at=None if row[1] is None else normalize_utc(row[1]),
+        stage=None if row[2] is None else TaskPlanningBootstrapStage(row[2]),
+        stage_settled_at=None if row[3] is None else normalize_utc(row[3]),
+    )
+
+
+def record_planning_bootstrap_stage(
+    pool: DatabasePool,
+    *,
+    task_id: UUID,
+    claim_token: UUID,
+    stage: TaskPlanningBootstrapStage,
+) -> bool:
+    """Advance the bootstrap stage evidence forward-only, exactly once per stage.
+
+    The F2 stage/settlement write (issue #87): observational evidence only,
+    never authoritative workflow state — the write does not rotate
+    ``state_token`` and composes no workflow transition. It applies only
+    while the row is current (non-archived), claimed by the exact
+    ``claim_token``, and still at the required prior stage (``None`` for
+    ``prepared``; ``prepared`` for ``ready_for_planning``), so a raced or
+    stale write is a rejected no-op (``False``) and stage history never
+    regresses. ``None`` means the caller classifies the rejection.
+    """
+    if not isinstance(task_id, UUID):
+        raise TaskDomainError("task_id must be a UUID")
+    if not isinstance(claim_token, UUID):
+        raise TaskDomainError("claim_token must be a UUID")
+    if not isinstance(stage, TaskPlanningBootstrapStage):
+        raise TaskDomainError("stage must be a TaskPlanningBootstrapStage")
+    expected_prior_stage: str | None
+    if stage is TaskPlanningBootstrapStage.PREPARED:
+        expected_prior_stage = None
+    elif stage is TaskPlanningBootstrapStage.READY_FOR_PLANNING:
+        expected_prior_stage = TaskPlanningBootstrapStage.PREPARED.value
+    else:
+        raise TaskDomainError(f"unknown planning bootstrap stage: {stage!r}")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set planning_bootstrap_stage = %s, "
+            "planning_bootstrap_stage_settled_at = now(), updated_at = now() "
+            "where id = %s and planning_bootstrap_claim_token = %s "
+            "and archived_at is null "
+            "and planning_bootstrap_stage is not distinct from %s "
+            "returning planning_bootstrap_stage",
+            (stage.value, task_id, claim_token, expected_prior_stage),
+        ).fetchone()
+    return row is not None
 
 
 def list_workspace_tasks(

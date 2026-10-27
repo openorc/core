@@ -29,7 +29,10 @@ from typing import Any, cast
 import pytest
 from psycopg.errors import UniqueViolation
 
-from openorc.adapters.agent_runtime.errors import AgentRuntimeUncertainOutcomeError
+from openorc.adapters.agent_runtime.errors import (
+    AgentRuntimeTransportError,
+    AgentRuntimeUncertainOutcomeError,
+)
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.github import GitHubPullRequestObservation
 from openorc.domain.connections import WorkflowRole
@@ -548,6 +551,42 @@ def test_an_uncertain_send_leaves_the_claimed_attempt_running(
 
     # The potentially-dispatched record: the attempt is never finalized and
     # the single possibly-delivered send is never resent.
+    assert _count(conn, _COMPLETE_UPDATE) == 0
+    assert len(adapter.realized_controls()) == 1
+    assert dispatch_calls == []
+
+
+def test_a_transport_failure_is_never_marked_a_known_pre_effect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F2 misclassification fix (issue #87): a transport/protocol failure
+    after a possible dispatch is never positively proven to precede the
+    effect — the claimed attempt stays unresolved and the send claim is
+    never settled with a known non-delivery."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_claim(conn)
+    # R1 revalidation runs; the realization fails at the transport layer.
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_REPOSITORY_ROW_READ, _repository_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_SESSION_READ, _producer_session_row())
+    conn.on(_PR_READ, _pr_row())
+    adapter = _prepared_producer_adapter(
+        fake_pool,
+        producer_outcomes=[AgentRuntimeTransportError("the transport dropped mid-send")],
+    )
+    github = _GitHubClient(fake_pool)
+    dispatch_calls = _stub_dispatch(monkeypatch)
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _remediation_call(pool, adapter, github.as_client())
+
+    # The conservative outcome: no truthful finalize of the attempt, no
+    # known-non-delivery claim settlement, and the single send is never
+    # replayed.
     assert _count(conn, _COMPLETE_UPDATE) == 0
     assert len(adapter.realized_controls()) == 1
     assert dispatch_calls == []

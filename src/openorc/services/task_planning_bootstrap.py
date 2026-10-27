@@ -89,11 +89,17 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeProtocolFailureError,
+    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
-from openorc.domain.tasks import Task, TaskStatus
+from openorc.domain.tasks import (
+    Task,
+    TaskPlanningBootstrapStage,
+    TaskStatus,
+)
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
 from openorc.persistence.ownership import get_repository
@@ -104,6 +110,7 @@ from openorc.persistence.tasks import (
     get_task,
     get_task_planning_bootstrap_claim,
     lock_workspace_task_arbitration,
+    record_planning_bootstrap_stage,
 )
 from openorc.protocol.interaction import PrepareWorkspaceInteraction
 from openorc.protocol.models import (
@@ -485,6 +492,33 @@ def _recheck_bootstrap_subject(
     return task
 
 
+def _record_bootstrap_stage_or_fail(
+    pool: DatabasePool,
+    *,
+    task_id: UUID,
+    claim_token: UUID,
+    stage: TaskPlanningBootstrapStage,
+) -> None:
+    """Record one forward-only bootstrap stage settlement, or fail closed.
+
+    The F2 stage evidence (issue #87) is observational, never authoritative
+    workflow state: the write never rotates the Task ``state_token`` and
+    composes no workflow transition. A rejected write means the Task moved
+    on (archived, a foreign claim identity, or an earlier stage still
+    unsettled), so the continuation fails closed truthfully — it never
+    manufactures stage history. A process death before the write simply
+    leaves the stage conservatively unsettled, which is exactly the
+    outstanding-work fact the pending-interaction projection reads.
+    """
+    recorded = record_planning_bootstrap_stage(
+        pool, task_id=task_id, claim_token=claim_token, stage=stage
+    )
+    if not recorded:
+        raise StaleOperationError(
+            "the planning bootstrap moved on during preparation; the stage evidence is stale"
+        )
+
+
 def prepare_task_for_planning(
     pool: DatabasePool,
     runtime: TaskBootstrapRuntimeComposition,
@@ -720,12 +754,31 @@ def prepare_task_for_planning(
                     "nothing is retried and the bootstrap stops with its partial "
                     "facts retained"
                 ) from error
+            except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+                logger.warning(
+                    "the workspace preparation control ended with a post-send "
+                    "runtime failure; the bootstrap stage stays unsettled"
+                )
+                raise ExternalOperationUncertainError(
+                    "the workspace preparation control's send may have been "
+                    "delivered but its response could not be interpreted; nothing "
+                    "is retried and the bootstrap stops with its partial facts "
+                    "retained"
+                ) from error
             except AgentRuntimeError as error:
                 raise ExternalOperationFailedError(
                     "the workspace preparation control failed before completion; "
                     "the bootstrap stops with its partial facts retained"
                 ) from error
         _require_prepared_workspace_result(result)
+
+        # --- F2 stage evidence: the PREPARE control settled (issue #87). ---
+        _record_bootstrap_stage_or_fail(
+            pool,
+            task_id=task_id,
+            claim_token=claim_token,
+            stage=TaskPlanningBootstrapStage.PREPARED,
+        )
 
         # --- Phase 5: post-PREPARE recheck (one short transaction). ---
         _recheck_bootstrap_subject(
@@ -760,11 +813,31 @@ def prepare_task_for_planning(
                 "nothing is retried and the bootstrap stops with its partial "
                 "facts retained"
             ) from error
+        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+            logger.warning(
+                "the planning-context transition ended with a post-send runtime "
+                "failure; the bootstrap stage stays unsettled"
+            )
+            raise ExternalOperationUncertainError(
+                "the planning-context transition's send may have been delivered "
+                "but its response could not be interpreted; nothing is retried "
+                "and the bootstrap stops with its partial facts retained"
+            ) from error
         except AgentRuntimeError as error:
             raise ExternalOperationFailedError(
                 "the planning-context transition failed; the bootstrap stops "
                 "with its partial facts retained"
             ) from error
+
+        # --- F2 stage evidence: the planning-context transition settled
+        # (issue #87) — a continuation now waiting for the first PLAN
+        # dispatch. ---
+        _record_bootstrap_stage_or_fail(
+            pool,
+            task_id=task_id,
+            claim_token=claim_token,
+            stage=TaskPlanningBootstrapStage.READY_FOR_PLANNING,
+        )
 
         # --- Phase 7: final recheck (one short transaction) and the
         # prepared-for-planning outcome. ---

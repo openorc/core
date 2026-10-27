@@ -229,6 +229,36 @@ _LOOP_GUARD_LOCKED = _sql_has("select status, purpose from openorc.review_loops"
 _LOOP_CLOSE = _sql_has("update openorc.review_loops")
 _ITERATION_READ = _sql_has("from openorc.review_iterations where id")
 _ITERATIONS_LIST = _sql_has("review_iterations where review_loop_id")
+_CLAIM_PRECHECK = _sql_has("from openorc.task_runtime_send_claims", "task_id = %s and kind = %s")
+_CLAIM_INSERT = _sql_has("insert into openorc.task_runtime_send_claims")
+_CLAIM_SETTLE = _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()")
+_CLAIM_ID = uuid.uuid4()
+
+
+def _claim_row(
+    *,
+    review_iteration_id: Any = _ITERATION_2_ID,
+    status: str = "claimed",
+    settled: bool = False,
+) -> tuple[Any, ...]:
+    settled_at = _OBSERVED if settled or status != "claimed" else None
+    return (
+        _CLAIM_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "planning_revise_dispatch",
+        _PRODUCER_SESSION_ID,
+        review_iteration_id,
+        None,
+        None,
+        status,
+        {},
+        _OBSERVED,
+        settled_at,
+        _OBSERVED,
+    )
+
+
 _ITERATION_INSERT = _sql_has("insert into openorc.review_iterations")
 _RESULT_UPDATE = _sql_has("update openorc.review_iterations")
 _GATE_READ = _sql_has("from openorc.owner_gates where id")
@@ -827,10 +857,20 @@ def _script_settlement_flow(conn: ScriptedConnection, *, accepted: bool) -> None
     conn.on(_TASK_READ_LOCKED, t_planning)  # E2 Task lock
     conn.on(_TASK_READ, t_planning)  # E2 entry currentness
     conn.on(_ITERATION_READ, it2)
+    # The F2 dispatch claim (issue #87): the locked Task reproof rides the
+    # "E2 Task lock" registration, the locked subject reproof re-reads the
+    # routed iteration, then the exact-subject pre-check and the committed
+    # claim row — strictly before the send.
+    conn.on(_ITERATION_READ, it2)
+    conn.on(_CLAIM_PRECHECK, None)
+    conn.on(_CLAIM_INSERT, _claim_row())
     conn.on(_REVISIONS_HISTORY, [rev1])
     conn.on(_TASK_READ, t_planning)  # E2 finalize currentness
     conn.on(_REVISION_INSERT, rev2)
     conn.on(_POINTER_UPDATE, t_pointer)
+    # The validated plan_result settles the claim exactly once with the
+    # atomic resolution (issue #87).
+    conn.on(_CLAIM_SETTLE, _claim_row(status="settled", settled=True))
 
 
 def _discussion_call(
@@ -1862,10 +1902,20 @@ def _script_gate_change_flow(conn: ScriptedConnection, *, complete: bool = True)
     conn.on(_TASK_READ_LOCKED, t_planning)  # E2 Task lock
     conn.on(_TASK_READ, t_planning)  # E2 entry currentness
     conn.on(_ITERATION_READ, it2)
+    # The F2 dispatch claim (issue #87): the locked Task reproof rides the
+    # "E2 Task lock" registration, the locked subject reproof re-reads the
+    # routed iteration, then the exact-subject pre-check and the committed
+    # claim row — strictly before the send.
+    conn.on(_ITERATION_READ, it2)
+    conn.on(_CLAIM_PRECHECK, None)
+    conn.on(_CLAIM_INSERT, _claim_row())
     conn.on(_REVISIONS_HISTORY, [rev1])
     conn.on(_TASK_READ, t_planning)  # E2 finalize currentness
     conn.on(_REVISION_INSERT, rev2)
     conn.on(_POINTER_UPDATE, t_pointer)
+    # The validated plan_result settles the claim exactly once with the
+    # atomic resolution (issue #87).
+    conn.on(_CLAIM_SETTLE, _claim_row(status="settled", settled=True))
 
 
 def test_ordinary_discussion_at_the_implementation_gate_stays_advisory() -> None:

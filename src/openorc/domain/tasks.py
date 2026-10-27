@@ -63,6 +63,8 @@ __all__ = [
     "TERMINAL_STATUSES",
     "Task",
     "TaskDomainError",
+    "TaskPlanningBootstrapEvidence",
+    "TaskPlanningBootstrapStage",
     "TaskStatus",
     "TaskTerminalCause",
     "task_field_names",
@@ -101,6 +103,25 @@ class TaskStatus(StrEnum):
 
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLED, TaskStatus.COMPLETED})
+
+
+class TaskPlanningBootstrapStage(StrEnum):
+    """The forward-only settlement stages of the claimed planning bootstrap.
+
+    The minimal durable stage/settlement evidence (issue #87) beside the E1b
+    one-shot ``planning_bootstrap_claim_token`` (issue #203): a claimed
+    bootstrap whose stage is still ``None`` has an outstanding PREPARE/control
+    (or an unresolved establishment); ``prepared`` records the validated
+    ``workspace_result`` settlement of the PREPARE control; and
+    ``ready_for_planning`` records the settled planning-context transition —
+    a continuation waiting for the first PLAN dispatch. The stages are
+    observational evidence, never authoritative workflow state: they never
+    rotate ``state_token`` and never admit a second bootstrap.
+    """
+
+    PREPARED = "prepared"
+    READY_FOR_PLANNING = "ready_for_planning"
+
 
 # Statuses that may carry no frozen source requirements baseline (issue #233):
 # a Task that has never successfully started. `cancelled` is included because
@@ -294,3 +315,40 @@ def task_field_names() -> frozenset[str]:
     review outcomes, and no singular current-Execution pointer.
     """
     return frozenset(field.name for field in fields(Task))
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningBootstrapEvidence:
+    """The Task's durable planning-bootstrap claim and stage evidence.
+
+    The focused read of the E1b replay-safety fact (issue #203) plus the F2
+    stage/settlement evidence (issue #87): the exactly-once claim token,
+    its database-stamped claim instant (``None`` is honest residue claimed
+    before the instant evidence existed), the forward-only settled stage,
+    and that stage's settlement instant. Presence of the claim token is the
+    replay-safety gate; the stages distinguish an outstanding
+    PREPARE/control from completed preparation or a continuation waiting
+    for the first PLAN dispatch. Representation only: classifying the
+    facts into workflow outcomes is a service-layer concern.
+    """
+
+    claim_token: UUID
+    claimed_at: datetime | None
+    stage: TaskPlanningBootstrapStage | None
+    stage_settled_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.claim_token, UUID):
+            raise TaskDomainError("claim_token must be a UUID")
+        if self.claimed_at is not None:
+            if not isinstance(self.claimed_at, datetime):
+                raise TaskDomainError("claimed_at must be None or a datetime")
+            if self.claimed_at.tzinfo is None:
+                raise TaskDomainError("claimed_at must be timezone-aware")
+        if self.stage is not None and not isinstance(self.stage, TaskPlanningBootstrapStage):
+            raise TaskDomainError("stage must be None or a TaskPlanningBootstrapStage")
+        if self.stage_settled_at is not None:
+            if not isinstance(self.stage_settled_at, datetime):
+                raise TaskDomainError("stage_settled_at must be None or a datetime")
+            if self.stage_settled_at.tzinfo is None:
+                raise TaskDomainError("stage_settled_at must be timezone-aware")

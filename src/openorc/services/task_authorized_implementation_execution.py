@@ -90,6 +90,8 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeProtocolFailureError,
+    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.cline.activity import ClineActivityKind, ClineActivityObservation
@@ -655,7 +657,25 @@ def _execute_external_phase(
                 "the outcome of the native ACT reconstruction is unknown; the implementation "
                 "attempt remains unresolved and nothing is resent"
             ) from error
+        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+            # A transport or protocol failure can arise only after the ACT
+            # handoff has done work (issue #87): the send was delivered, so
+            # implementation work may have begun. The claimed attempt stays
+            # conservatively running — never a proven non-delivery, never a
+            # safe retry.
+            logger.warning(
+                "the native ACT reconstruction ended with a post-send runtime "
+                "failure; the claimed attempt remains potentially dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the native ACT handoff was delivered but its response could not "
+                "be interpreted; the implementation attempt remains potentially "
+                "dispatched and is never resent"
+            ) from error
         except AgentRuntimeError as error:
+            # The remaining normalized taxonomy classes (configuration
+            # rejection, runtime unavailability, and a not-live addressed
+            # session) are positively proven to precede any effect.
             _finalize_pre_effect_failure(
                 pool,
                 workspace_id=workspace_id,
