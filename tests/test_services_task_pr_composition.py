@@ -644,6 +644,59 @@ def _runtime_factory(
 # --- scripted sequences (in service call order) --------------------------------------
 
 
+_CLAIM_ID = uuid.uuid4()
+_CLAIM_AT = datetime(2026, 10, 26, 9, 30, 0, tzinfo=UTC)
+
+_CLAIM_PRECHECK = _sql_has("from openorc.task_runtime_send_claims", "task_id = %s and kind = %s")
+_CLAIM_INSERT = _sql_has("insert into openorc.task_runtime_send_claims")
+_CLAIM_SETTLE = _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()")
+
+
+def _claim_row(
+    *,
+    kind: str = "pr_compose_dispatch",
+    status: str = "claimed",
+    outcome: Any = None,
+    settled: bool = False,
+    claim_id: Any = _CLAIM_ID,
+) -> tuple[Any, ...]:
+    settled_at = _CLAIM_AT if settled or status != "claimed" else None
+    return (
+        claim_id,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        kind,
+        _SESSION_ID,
+        None,
+        _PR_GATE_ID,
+        _HEAD_SHA,
+        status,
+        {} if outcome is None else outcome,
+        _CLAIM_AT,
+        settled_at,
+        _CLAIM_AT,
+    )
+
+
+def _script_pr_compose_claim(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...] | None = None,
+    pr_read: Any = None,
+    existing_claim: tuple[Any, ...] | None = None,
+) -> None:
+    """The PR_COMPOSE claim transaction's canned sequence, in call order.
+
+    The locked Task re-read, the canonical-PR reproof read (still absent on
+    the fresh path), the gate/Producer-binding reproofs (the gate and
+    session reads ride the repeating reads), the exact-subject pre-check
+    (``None`` means unclaimed), and the committed claim row (issue #87)."""
+    conn.on(_TASK_READ_LOCKED, task_row if task_row is not None else _task_row())
+    conn.on(_PR_READ, pr_read)
+    conn.on(_CLAIM_PRECHECK, existing_claim)
+    conn.on(_CLAIM_INSERT, _claim_row())
+
+
 def _script_repeating_reads(
     conn: ScriptedConnection,
     *,
@@ -694,6 +747,11 @@ def _script_fresh_publication(
     prs = pr_reads if pr_reads is not None else [None for _ in range(passes)]
     for index in range(passes):
         _script_admission_pass(conn, task_row=rows[index], pr_read=prs[index])
+        if index == 0:
+            # The F2 pre-send dispatch claim commits after the first
+            # admission pass and strictly before the PR_COMPOSE send
+            # (issue #87).
+            _script_pr_compose_claim(conn)
     final = final_task_row if final_task_row is not None else _task_row()
     conn.on(_TASK_READ, final)
     conn.on(_TASK_READ_LOCKED, final)
@@ -703,6 +761,10 @@ def _script_fresh_publication(
         conn.on(_EVENT_INSERT, RuntimeError("forced late event failure"))
     conn.on(_STATUS_UPDATE, _task_row(status="reviewing", state_token=_ROTATED_TOKEN))
     conn.on_repeat(_EVENT_INSERT, _event_row())
+    # The validated pr_result settles the send claim exactly once inside the
+    # post-interaction revalidation transaction — before publication, and
+    # without pretending GitHub publication has completed (issue #87).
+    conn.on(_CLAIM_SETTLE, _claim_row(status="settled"))
 
 
 def _script_continuation(
@@ -1136,6 +1198,34 @@ def test_a_stale_token_or_moved_status_refuses_before_any_external_call(
     assert _event_types(conn) == []
 
 
+def test_a_committed_duplicate_claim_refuses_before_any_external_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F2 one-shot claim (issue #87): a raced or replayed PR_COMPOSE
+    production for an already-claimed gate raises the typed stale error
+    strictly before the send — the durable claim fact is the backstop."""
+    github = _FakeGitHub(pool=FakePool(ScriptedConnection()))
+    _publication_fake(monkeypatch)
+    adapter = _prepared_adapter()
+
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    fresh = _task_row()
+    conn.on(_TASK_READ, fresh)
+    conn.on(_TASK_READ_LOCKED, fresh)
+    conn.on(_TASK_READ, fresh)
+    conn.on(_PR_READ, None)
+    conn.on(_TASK_READ, fresh)
+    # The F2 dispatch claim's own locked Task reproof (issue #87).
+    conn.on(_TASK_READ_LOCKED, fresh)
+    _script_pr_compose_claim(conn, existing_claim=_claim_row())
+    with pytest.raises(StaleOperationError):
+        _compose_call(_pool(conn), github, _FakeResolver(), _runtime_factory(adapter))
+
+    assert adapter.realized_controls() == ()
+    assert not any(_CLAIM_INSERT(sql, None) for sql, _ in conn.executed)
+
+
 def test_an_unoperational_account_refuses_the_whole_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1465,25 +1555,39 @@ def test_uncertain_and_failed_runtime_outcomes_never_resend_or_publish(
         _compose_call(_pool(conn), github, _FakeResolver(), _runtime_factory(adapter))
     assert len(adapter.submitted_sends(_EXTERNAL_SESSION_ID)) == 1
     assert _event_types(conn) == []
+    # The committed claim stays conservatively claimed through uncertainty
+    # (issue #87): never reclassified, never settled.
+    claim_inserts = [sql for sql, _ in conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
 
-    # A protocol failure (no valid pr_result) is a known composition failure.
+    # A protocol failure (no valid pr_result) arises only after the send did
+    # work: an unresolved outcome, never a proven non-delivery (issue #87).
     conn = ScriptedConnection()
     _script_fresh_publication(conn)
     adapter = _prepared_adapter(
         send_outcomes=(AgentRuntimeProtocolFailureError("the reply was not a valid pr_result"),)
     )
-    with pytest.raises(ExternalOperationFailedError):
+    with pytest.raises(ExternalOperationUncertainError):
         _compose_call(_pool(conn), github, _FakeResolver(), _runtime_factory(adapter))
+    assert len(adapter.submitted_sends(_EXTERNAL_SESSION_ID)) == 1
     assert _event_types(conn) == []
+    claim_inserts = [sql for sql, _ in conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
 
-    # A native-only realization carries no formal result: known failure.
+    # A native-only realization carries no formal result after possible
+    # composition work: an unresolved outcome, never a proven non-delivery.
     conn = ScriptedConnection()
     _script_fresh_publication(conn)
     adapter = _prepared_adapter()
     adapter.script_realization(_EXTERNAL_SESSION_ID, ControlRealization.NATIVE_ONLY)
-    with pytest.raises(ExternalOperationFailedError):
+    with pytest.raises(ExternalOperationUncertainError):
         _compose_call(_pool(conn), github, _FakeResolver(), _runtime_factory(adapter))
     assert _event_types(conn) == []
+    claim_inserts = [sql for sql, _ in conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
 
 
 def test_stale_subjects_after_the_interaction_never_publish(

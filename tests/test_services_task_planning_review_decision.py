@@ -246,6 +246,36 @@ _LOOP_INSERT = _sql_has("insert into openorc.review_loops")
 _LOOP_CLOSE = _sql_has("update openorc.review_loops")
 _ITERATION_READ = _sql_has("from openorc.review_iterations where id")
 _ITERATIONS_LIST = _sql_has("review_iterations where review_loop_id")
+_CLAIM_PRECHECK = _sql_has("from openorc.task_runtime_send_claims", "task_id = %s and kind = %s")
+_CLAIM_INSERT = _sql_has("insert into openorc.task_runtime_send_claims")
+_CLAIM_SETTLE = _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()")
+_CLAIM_ID = uuid.uuid4()
+
+
+def _claim_row(
+    *,
+    review_iteration_id: Any,
+    status: str = "claimed",
+    settled: bool = False,
+) -> tuple[Any, ...]:
+    settled_at = _OBSERVED if settled or status != "claimed" else None
+    return (
+        _CLAIM_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "planning_revise_dispatch",
+        _PRODUCER_SESSION_ID,
+        review_iteration_id,
+        None,
+        None,
+        status,
+        {},
+        _OBSERVED,
+        settled_at,
+        _OBSERVED,
+    )
+
+
 _ITERATION_INSERT = _sql_has("insert into openorc.review_iterations")
 _RESULT_UPDATE = _sql_has("update openorc.review_iterations")
 _GATES_LIST = _sql_has("from openorc.owner_gates where task_id")
@@ -713,16 +743,32 @@ def _script_revise_phase(
     revision_insert_row: tuple[Any, ...],
     pointer_row: tuple[Any, ...],
 ) -> None:
-    """One merged E2 revision production (entry + finalize), in call order."""
+    """One merged E2 revision production (entry + claim + finalize), in call
+    order."""
     conn.on(_REVISION_READ, prior_revision_row)
     conn.on(_ITERATION_READ, routed_iteration_row)
     conn.on(_ITERATIONS_LIST, loop_iterations)
+    # The F2 dispatch claim (issue #87): the locked Task reproof rides the
+    # top-level per-round locked reads and the repeating session/loop reads;
+    # the locked subject reproof re-reads the routed iteration and its
+    # numbering history, then the exact-subject pre-check and the committed
+    # claim row — strictly before the send.
+    conn.on(_ITERATION_READ, routed_iteration_row)
+    conn.on(_ITERATIONS_LIST, loop_iterations)
+    conn.on(_CLAIM_PRECHECK, None)
+    conn.on(_CLAIM_INSERT, _claim_row(review_iteration_id=routed_iteration_row[0]))
     conn.on(_REVISION_READ, prior_revision_row)
     conn.on(_ITERATIONS_LIST, loop_iterations)
     conn.on(_REVISIONS_HISTORY, history)
     conn.on(_REVISION_INSERT, revision_insert_row)
     conn.on(_POINTER_UPDATE, pointer_row)
     conn.on(_EVENT_INSERT, _event_row())
+    # The validated plan_result settles the claim exactly once with the
+    # atomic resolution (issue #87).
+    conn.on(
+        _CLAIM_SETTLE,
+        _claim_row(review_iteration_id=routed_iteration_row[0], status="settled", settled=True),
+    )
 
 
 def _cr_row(iteration_id: Any, number: int, plan_revision_id: Any) -> tuple[Any, ...]:
@@ -794,15 +840,16 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         gate_id=_GATE_1_ID,
     )
 
-    # Ordered Task reads: 7 unlocked + 2 locked per routed round at that
-    # round's token; 4 + 2 for the exhausting round.
+    # Ordered Task reads: 7 unlocked + 3 locked per routed round at that
+    # round's token (the F2 dispatch claim adds one locked reproof, issue
+    # #87); 4 + 2 for the exhausting round.
     for _ in range(7):
         conn.on(_TASK_READ, t0)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t0)
     for _ in range(7):
         conn.on(_TASK_READ, t1)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t1)
     for _ in range(4):
         conn.on(_TASK_READ, t2)
@@ -812,20 +859,24 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
     for row in (rev1, rev1, rev1, rev1, rev2, rev2, rev2, rev2, rev3, rev3):
         conn.on(_REVISION_READ, row)
     # Ordered iteration-history reads: dispatch, attempt recheck, budget
-    # recheck, revise supersession, revise revalidation, per round.
+    # recheck, revise supersession, the F2 claim's numbering recheck
+    # (issue #87), revise revalidation, per round.
     for rows in (
         [],
         [it1_unfin],
         [it1_cr],
         [it1_cr],
+        [it1_cr],  # the round-1 claim's numbering recheck
         [it1_cr],
         [it1_cr],
         [it1_cr, it2_unfin],
         [it1_cr, it2_cr],
         [it1_cr, it2_cr],
+        [it1_cr, it2_cr],  # the round-2 claim's numbering recheck
         [it1_cr, it2_cr],
         [it1_cr, it2_cr],
         [it1_cr, it2_cr, it3_unfin],
+        [it1_cr, it2_cr, it3_cr],
         [it1_cr, it2_cr, it3_cr],
     ):
         conn.on(_ITERATIONS_LIST, rows)
@@ -1554,7 +1605,7 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
     it1_cr = _cr_row(_ITERATION_1_ID, 1, _REVISION_1_ID)
     for _ in range(6):
         conn.on(_TASK_READ, t0)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t0)
     for _ in range(4):
         conn.on(_REVISION_READ, rev1)
@@ -1562,11 +1613,17 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
     conn.on(_LOOP_INSERT, _loop_row(limit=2))
     conn.on(_ITERATION_INSERT, it1_unfin)
     conn.on(_ITERATION_READ, it1_cr)
+    conn.on(_ITERATION_READ, it1_cr)  # the F2 claim's locked subject reproof
     conn.on(_ITERATIONS_LIST, [])
     conn.on(_ITERATIONS_LIST, [it1_unfin])
     conn.on(_ITERATIONS_LIST, [it1_cr])
     conn.on(_ITERATIONS_LIST, [it1_cr])
     conn.on(_ITERATIONS_LIST, [it1_cr])
+    conn.on(_ITERATIONS_LIST, [it1_cr])  # the F2 claim's numbering recheck
+    # The F2 dispatch claim (issue #87) commits strictly before the send;
+    # the uncertain outcome leaves it conservatively claimed.
+    conn.on(_CLAIM_PRECHECK, None)
+    conn.on(_CLAIM_INSERT, _claim_row(review_iteration_id=_ITERATION_1_ID))
     _script_finalize_result(conn, finalized_row=it1_cr, iterations_after=[it1_cr], gates=[])
     adapter = _prepared_adapter(
         fake_pool,
@@ -1603,6 +1660,10 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
     assert _count(conn, _POINTER_UPDATE) == 0
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 1
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 1
+    # The committed claim stays conservatively claimed through the
+    # uncertainty (issue #87): never reclassified, never settled.
+    assert _count(conn, _CLAIM_INSERT) == 1
+    assert _count(conn, _CLAIM_SETTLE) == 0
 
 
 def test_implementation_gate_history_immediately_reopens_resolution() -> None:

@@ -44,14 +44,20 @@ Phase composition (both operations):
    authenticated GitHub repository and default-branch reads with NO database
    transaction open; an inaccessible or missing base observation fails
    closed before any Producer dispatch;
-3. the ONE interaction send — the established #129 interaction (PLAN renders
+3. the durable pre-send dispatch claim (issue #87) — one short transaction
+   under the Task row lock commits the exact subject (the one initial PLAN
+   per Task/Producer session, or the planning REVISE per exact finalized
+   ``CHANGES_REQUESTED`` planning ReviewIteration) with locked
+   currentness/binding revalidation and NO token rotation; a replayed or
+   previously claimed continuation never dispatches again;
+4. the ONE interaction send — the established #129 interaction (PLAN renders
    the canonical ``controls/plan.md`` with optional subordinate Workspace
    guidance; REVISE routes the persisted validated ``review_result`` as the
    substantive Producer message with structural serialization only), sent
    once to the exact bound Producer through the #67
    ``realize_control(..., expected_family=PLAN_RESULT_FAMILY)`` funnel, with
    NO database transaction open;
-4. atomic finalize — one short ``composed_transaction``: lock/recheck the
+5. atomic finalize — one short ``composed_transaction``: lock/recheck the
    exact Task subject, the exact expected session bindings (still READY and
    identity-matched — session loss and explicit ends do not rotate the Task
    token), and, for revisions, that the prior revision is still exactly
@@ -89,6 +95,8 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeProtocolFailureError,
+    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import (
@@ -109,6 +117,7 @@ from openorc.domain.reviews import (
     ReviewLoopStatus,
     ReviewOutcome,
 )
+from openorc.domain.send_claims import TaskRuntimeSendClaim
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
@@ -148,6 +157,13 @@ from openorc.services.github_installation_route import (
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
+from openorc.services.task_runtime_send_claims import (
+    RUNTIME_PRE_EFFECT_FAILURE_KIND,
+    claim_initial_plan_send,
+    claim_planning_revise_send,
+    record_send_claim_known_non_delivery,
+    settle_send_claim_for_plan_revision,
+)
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
@@ -393,7 +409,10 @@ def _realize_plan_control(
     The #67 shared funnel performs the formal validation; the service never
     adds an E-specific parser, inspects plan semantics, or manages runtime
     PLAN/ACT transitions. Known failure and uncertain outcome stay distinct,
-    and neither is ever retried or resent here.
+    and neither is ever retried or resent here: a transport or protocol
+    failure can arise only after the send has done work, so it is an
+    unresolved outcome (issue #87) — never a proven non-delivery and never a
+    safe retry.
     """
     try:
         outcome = runtime.realize_control(
@@ -407,15 +426,33 @@ def _realize_plan_control(
             "the outcome of the agent runtime plan interaction is unknown; "
             "no plan revision is published"
         ) from error
+    except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+        logger.warning(
+            "plan production ended with a post-send runtime failure; the "
+            "dispatch claim stays unresolved"
+        )
+        raise ExternalOperationUncertainError(
+            "the plan interaction's send may have been delivered but its response "
+            "could not be interpreted; no plan revision is published and the send "
+            "is never resent"
+        ) from error
     except AgentRuntimeError as error:
+        # The remaining normalized taxonomy classes (configuration rejection,
+        # runtime unavailability, and a not-live addressed session) are
+        # positively proven to precede any effect.
         raise ExternalOperationFailedError(
-            "the agent runtime plan interaction failed; no plan revision is published"
+            "the agent runtime plan interaction failed as a known non-delivery; "
+            "no plan revision is published"
         ) from error
     if not isinstance(outcome, PlanResult):
         # A formal send with an expected family returns a typed formal
-        # result or raises; anything else is a known non-answer.
-        raise ExternalOperationFailedError(
-            "the agent runtime did not return a typed plan result; no plan revision is published"
+        # result or raises; anything else means the send may have done work
+        # without producing a usable answer — an unresolved outcome, never a
+        # proven non-delivery.
+        raise ExternalOperationUncertainError(
+            "the agent runtime ended without a validated plan result after "
+            "possible dispatch work; no plan revision is published and the "
+            "send is never resent"
         )
     return outcome
 
@@ -532,6 +569,7 @@ def _commit_new_plan_revision(
     expected_review_iteration: ReviewIteration | None,
     expected_producer_session: TaskAgentSession,
     expected_reviewer_session: TaskAgentSession | None,
+    send_claim: TaskRuntimeSendClaim,
 ) -> TaskPlanProductionOutcome:
     """Insert the immutable revision, install the pointer, and record the event.
 
@@ -649,6 +687,17 @@ def _commit_new_plan_revision(
                 plan_revision_id=revision.id,
                 actor=actor,
             )
+        # The F2 claim settles exactly once with the atomic resolution: the
+        # validated formal result completed the operation. A rejected
+        # settlement rolls the whole composition back, leaving the claim
+        # conservatively claimed.
+        settle_send_claim_for_plan_revision(
+            transaction_pool,
+            claim=send_claim,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_revision_id=revision.id,
+        )
     return TaskPlanProductionOutcome(plan_revision=revision, task=updated)
 
 
@@ -736,16 +785,42 @@ def produce_initial_task_plan(
         # --- Phase 2: authoritative repository-base audit observation. ---
         repository_observation, base_sha = _observe_repository_base(github, route)
 
-        # --- Phase 3: the ONE canonical PLAN send. ---
-        plan_result = _send_initial_plan(
-            runtime_adapter,
-            producer.external_session_id or "",
-            task=task,
-            workspace=workspace,
-            repository_observation=repository_observation,
+        # --- Phase 3: the durable pre-send dispatch claim (database only). ---
+        # Committed strictly before any runtime effect for the one canonical
+        # PLAN subject: a replayed or raced continuation never dispatches
+        # again, whatever the prior attempt's outcome.
+        send_claim = claim_initial_plan_send(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=task.state_token,
+            producer=producer,
         )
 
-        # --- Phase 4: atomic finalize (both prepared sessions rechecked). ---
+        # --- Phase 4: the ONE canonical PLAN send. ---
+        try:
+            plan_result = _send_initial_plan(
+                runtime_adapter,
+                producer.external_session_id or "",
+                task=task,
+                workspace=workspace,
+                repository_observation=repository_observation,
+            )
+        except ExternalOperationFailedError:
+            # A positively proven pre-effect failure: the claim records the
+            # truthful known non-delivery, then the error propagates. Every
+            # uncertain or post-effect-capable outcome leaves the claim
+            # conservatively claimed.
+            record_send_claim_known_non_delivery(
+                pool,
+                claim=send_claim,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+
+        # --- Phase 5: atomic finalize (both prepared sessions rechecked). ---
         return _commit_new_plan_revision(
             pool,
             workspace_id=workspace_id,
@@ -759,6 +834,7 @@ def produce_initial_task_plan(
             expected_review_iteration=None,
             expected_producer_session=producer,
             expected_reviewer_session=reviewer,
+            send_claim=send_claim,
         )
 
 
@@ -848,17 +924,44 @@ def revise_task_plan(
         # --- Phase 2: authoritative repository-base audit observation. ---
         repository_observation, base_sha = _observe_repository_base(github, route)
 
-        # --- Phase 3: the REVISE send to the same Producer session. ---
-        plan_result = _send_revision_plan(
-            runtime_adapter,
-            producer.external_session_id or "",
-            task=task,
-            prior_revision=prior_revision,
-            review_result=_review_result_from_iteration(iteration),
-            repository_observation=repository_observation,
+        # --- Phase 3: the durable pre-send dispatch claim (database only). ---
+        # Committed strictly before any runtime effect for the exact routed
+        # change request: a replayed or raced continuation never dispatches
+        # again, whatever the prior attempt's outcome.
+        send_claim = claim_planning_revise_send(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=task.state_token,
+            producer=producer,
+            review_iteration=iteration,
         )
 
-        # --- Phase 4: atomic finalize (the exact Producer session rechecked). ---
+        # --- Phase 4: the REVISE send to the same Producer session. ---
+        try:
+            plan_result = _send_revision_plan(
+                runtime_adapter,
+                producer.external_session_id or "",
+                task=task,
+                prior_revision=prior_revision,
+                review_result=_review_result_from_iteration(iteration),
+                repository_observation=repository_observation,
+            )
+        except ExternalOperationFailedError:
+            # A positively proven pre-effect failure: the claim records the
+            # truthful known non-delivery, then the error propagates. Every
+            # uncertain or post-effect-capable outcome leaves the claim
+            # conservatively claimed.
+            record_send_claim_known_non_delivery(
+                pool,
+                claim=send_claim,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+
+        # --- Phase 5: atomic finalize (the exact Producer session rechecked). ---
         return _commit_new_plan_revision(
             pool,
             workspace_id=workspace_id,
@@ -872,6 +975,7 @@ def revise_task_plan(
             expected_review_iteration=iteration,
             expected_producer_session=producer,
             expected_reviewer_session=None,
+            send_claim=send_claim,
         )
 
 

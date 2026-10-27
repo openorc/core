@@ -71,6 +71,7 @@ content, tokens, prompts, or provider bodies.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
@@ -81,6 +82,8 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeProtocolFailureError,
+    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
@@ -89,6 +92,7 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEvent, WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
+from openorc.domain.send_claims import TaskRuntimeSendClaim
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
@@ -123,6 +127,12 @@ from openorc.services.github_installation_route import (
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
+from openorc.services.task_runtime_send_claims import (
+    RUNTIME_PRE_EFFECT_FAILURE_KIND,
+    claim_pr_compose_send,
+    record_send_claim_known_non_delivery,
+    settle_pr_compose_send_claim,
+)
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -135,6 +145,8 @@ __all__ = [
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_composition"
 _COMPOSE_SPAN_NAME = "task_pr_composition.compose_and_publish_task_pr"
+
+logger = logging.getLogger(__name__)
 
 # The presentation and its audit are OpenOrc continuations, never an Owner
 # approval: publication provenance is OPENORC with no actor identity.
@@ -874,6 +886,7 @@ def _compose_pr_with_producer(
     runtime_factory: ProducerRuntimeAttachmentFactory,
     *,
     admitted: _PublicationSubjects,
+    send_claim: TaskRuntimeSendClaim,
     workspace_id: UUID,
     task_id: UUID,
     owner_gate_id: UUID,
@@ -884,9 +897,13 @@ def _compose_pr_with_producer(
     The deferred attachment seam is entered, the same publication subjects
     are revalidated after acquisition and before realization (R1), and one
     ``realize_control`` sends the rendered ``pr_compose`` prose expecting the
-    ``pr_result`` family through the shared #67 → #65 formal funnel. Uncertain
-    outcomes are never resent; known runtime/protocol failures are distinct
-    and never reclassified. No durable effect exists on any failure.
+    ``pr_result`` family through the shared #67 → #65 formal funnel. The
+    exact subject was durably claimed before this effect (issue #87):
+    uncertain outcomes are never resent; a transport or protocol failure can
+    arise only after the send has done work, so it is an unresolved outcome
+    — never a proven non-delivery; a positively proven pre-effect failure
+    records the truthful known non-delivery on the claim and never
+    reclassifies. No durable effect exists on any failure.
     """
     session = admitted.producer_session
     if session is None or session.external_session_id is None:
@@ -927,13 +944,34 @@ def _compose_pr_with_producer(
                 "the outcome of the pr composition is unknown; the compose "
                 "request may have been delivered and is never resent"
             ) from error
+        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+            logger.warning(
+                "the pr composition ended with a post-send runtime failure; the "
+                "compose dispatch claim stays unresolved"
+            )
+            raise ExternalOperationUncertainError(
+                "the pr composition's send may have been delivered but its response "
+                "could not be interpreted; the compose dispatch is never resent"
+            ) from error
         except AgentRuntimeError as error:
+            # The remaining normalized taxonomy classes (configuration
+            # rejection, runtime unavailability, and a not-live addressed
+            # session) are positively proven to precede any effect: the claim
+            # records the truthful known non-delivery first.
+            record_send_claim_known_non_delivery(
+                pool,
+                claim=send_claim,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
             raise ExternalOperationFailedError(
-                "the pr composition failed as a known runtime or protocol condition"
+                "the pr composition failed as a known non-delivery before any effect"
             ) from error
         if not isinstance(realized, PrResult):
-            raise ExternalOperationFailedError(
-                "the pr composition did not produce a validated pr_result"
+            raise ExternalOperationUncertainError(
+                "the pr composition ended without a validated pr_result after "
+                "possible composition work; the compose dispatch is never resent"
             )
         return realized
 
@@ -1011,23 +1049,47 @@ def compose_and_publish_task_pr(
                 expected_state_token=expected_state_token,
             )
 
-        # --- the one PR_COMPOSE interaction (external, no transaction) ---
+        # --- the durable pre-send dispatch claim (database only) ---
         approved_head_sha = subjects.gate.subject_head_sha
         if approved_head_sha is None:
             # Narrowed by admission; kept explicit for fail-closed safety.
             raise ConflictError(
                 "the pr authorization gate does not carry the exact head-sha subject"
             )
+        producer_session = subjects.producer_session
+        if producer_session is None:
+            # Narrowed by admission (the fresh path always carries the
+            # exact READY Producer binding); kept explicit for fail-closed
+            # safety.
+            raise ConflictError("the fresh pr composition carries no producer session binding")
+        # Committed strictly before any runtime effect on the fresh
+        # composition path for the exact approved gate/head: a replayed or
+        # raced continuation never composes again, whatever the prior
+        # attempt's outcome. The interrupted-publication continuation never
+        # reaches this claim.
+        send_claim = claim_pr_compose_send(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            owner_gate=subjects.gate,
+            producer=producer_session,
+        )
+        # --- the one PR_COMPOSE interaction (external, no transaction) ---
         pr_result = _compose_pr_with_producer(
             pool,
             runtime_factory,
             admitted=subjects,
+            send_claim=send_claim,
             workspace_id=workspace_id,
             task_id=task_id,
             owner_gate_id=owner_gate_id,
             expected_state_token=expected_state_token,
         )
-        # --- post-interaction revalidation before any publication ---
+        # --- post-interaction revalidation + claim settlement before any
+        # publication: the validated pr_result completed the composition, so
+        # the send claim settles exactly once in the same short transaction —
+        # without pretending GitHub publication has completed. ---
         with composed_transaction(pool) as transaction_pool:
             _require_unchanged_publication_subjects(
                 transaction_pool,
@@ -1036,6 +1098,13 @@ def compose_and_publish_task_pr(
                 task_id=task_id,
                 owner_gate_id=owner_gate_id,
                 expected_state_token=expected_state_token,
+            )
+            settle_pr_compose_send_claim(
+                transaction_pool,
+                claim=send_claim,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                subject_head_sha=approved_head_sha,
             )
         # --- deterministic closing reference + the one B8 invocation ---
         command = pull_request_publication.PublicationCommand(

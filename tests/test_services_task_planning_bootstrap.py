@@ -591,12 +591,20 @@ class _Bootstrap:
                 self.connection_row,
                 self.repository_row,
             ),
+            # The F2 stage evidence (issue #87): the PREPARE control's
+            # validated result settles the forward-only ``prepared`` stage,
+            # and the settled planning-context transition settles
+            # ``ready_for_planning`` — two observational writes between the
+            # base observation and the post-PREPARE recheck, and between the
+            # context transition and the final recheck.
+            True,
             *_recheck_results(
                 self.post_claim_task_row,
                 _claim_token_from_written_claims,
                 self.producer_ready_row,
                 self.reviewer_ready_row,
             ),
+            True,
             *_recheck_results(
                 self.post_claim_task_row,
                 _claim_token_from_written_claims,
@@ -648,13 +656,27 @@ def test_successful_bootstrap_claims_once_establishes_prepares_and_transitions()
     assert outcome.reviewer_session.lifecycle_status is TaskSessionLifecycleStatus.READY
     assert outcome.producer_checkout_directory == env.checkout_directory
 
-    # The one-shot claim is written exactly once, before any runtime effect.
-    claim_updates = _statement_indices(conn, "planning_bootstrap_claim_token = %s")
+    # The one-shot claim is written exactly once, before any runtime effect;
+    # the F2 stage-evidence writes (issue #87) bind to the same claim token in
+    # their WHERE clause and are counted separately below.
+    claim_updates = _statement_indices(conn, "set planning_bootstrap_claim_token = %s")
     assert len(claim_updates) == 1
     establish_workspace_reads = _statement_indices(conn, "from openorc.workspaces")
     # The entry transaction's ownership read precedes the claim; the
     # establishment phase's own workspace reads follow it.
     assert establish_workspace_reads[1] > claim_updates[0]
+
+    # The two forward-only stage settlements (issue #87): ``prepared`` after
+    # the validated workspace result, ``ready_for_planning`` after the
+    # planning-context transition — bound to the exact claim identity, and
+    # never a state-token rotation or a second claim.
+    stage_writes = [
+        index
+        for index, (sql, _params) in enumerate(conn.executed)
+        if "planning_bootstrap_stage = %s" in sql
+    ]
+    assert len(stage_writes) == 2
+    assert claim_updates[0] < stage_writes[0] < stage_writes[1]
 
     # Exactly the two role-session READY finalizations, and no other
     # session write.

@@ -392,6 +392,97 @@ def _event_row(event_type: str, subject_id: Any) -> tuple[Any, ...]:
     )
 
 
+_CLAIM_ID = uuid.uuid4()
+_CLAIM_AT = datetime(2026, 10, 26, 9, 30, 0, tzinfo=UTC)
+
+_CLAIM_PRECHECK = _sql_has("from openorc.task_runtime_send_claims", "task_id = %s and kind = %s")
+_CLAIM_INSERT = _sql_has("insert into openorc.task_runtime_send_claims")
+_CLAIM_SETTLE = _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()")
+
+
+def _claim_row(
+    *,
+    kind: str = "initial_plan_dispatch",
+    status: str = "claimed",
+    outcome: Any = None,
+    review_iteration_id: Any = None,
+    owner_gate_id: Any = None,
+    subject_head_sha: Any = None,
+    settled: bool = False,
+    claim_id: Any = _CLAIM_ID,
+) -> tuple[Any, ...]:
+    settled_at = _CLAIM_AT if settled or status != "claimed" else None
+    return (
+        claim_id,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        kind,
+        _PRODUCER_SESSION_ID,
+        review_iteration_id,
+        owner_gate_id,
+        subject_head_sha,
+        status,
+        {} if outcome is None else outcome,
+        _CLAIM_AT,
+        settled_at,
+        _CLAIM_AT,
+    )
+
+
+def _script_initial_claim(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...],
+    producer_row: tuple[Any, ...],
+    existing_claim: tuple[Any, ...] | None = None,
+) -> None:
+    """The initial-PLAN claim transaction's canned sequence, in call order.
+
+    The locked Task re-read, the Producer binding reproof, the exact-subject
+    pre-check (``None`` means unclaimed), and the committed claim row."""
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_role_is(_sql_has("from openorc.task_agent_sessions"), "producer"), producer_row)
+    conn.on(_CLAIM_PRECHECK, existing_claim)
+    conn.on(_CLAIM_INSERT, _claim_row())
+
+
+def _script_revise_claim(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...],
+    producer_row: tuple[Any, ...],
+    iteration_row: tuple[Any, ...] | None = None,
+    loop_row: tuple[Any, ...] | None = None,
+    loop_iterations: list[tuple[Any, ...]] | None = None,
+    existing_claim: tuple[Any, ...] | None = None,
+) -> None:
+    """The planning-REVISE claim transaction's canned sequence, in call order.
+
+    The locked Task re-read, the Producer binding reproof, the locked
+    subject reproof (the routed iteration still addressing the current
+    revision as its latest-numbered one), the exact-subject pre-check, and
+    the committed claim row."""
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_role_is(_sql_has("from openorc.task_agent_sessions"), "producer"), producer_row)
+    conn.on(
+        _sql_has("from openorc.review_iterations where id"),
+        iteration_row if iteration_row is not None else _iteration_row(),
+    )
+    conn.on(
+        _sql_has("from openorc.review_loops where id"),
+        loop_row if loop_row is not None else _loop_row(),
+    )
+    conn.on(
+        _sql_has("review_iterations where review_loop_id"),
+        loop_iterations if loop_iterations is not None else [_iteration_row()],
+    )
+    conn.on(_CLAIM_PRECHECK, existing_claim)
+    conn.on(
+        _CLAIM_INSERT,
+        _claim_row(kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID),
+    )
+
+
 def _task_domain(
     *,
     status: TaskStatus = TaskStatus.PLANNING,
@@ -633,6 +724,8 @@ def _script_initial_finalize(
     conn.on(_REVISION_INSERT, revision_row)
     conn.on(_POINTER_UPDATE, pointer_row)
     conn.on(_EVENT_INSERT, _event_row("plan_revision_created", revision_row[0]))
+    # The F2 claim settles exactly once with the atomic resolution (issue #87).
+    conn.on(_CLAIM_SETTLE, _claim_row(status="settled"))
 
 
 def _script_revise_entry(
@@ -698,6 +791,15 @@ def _script_revise_finalize(
     conn.on(_REVISION_INSERT, revision_row)
     conn.on(_POINTER_UPDATE, pointer_row)
     conn.on(_EVENT_INSERT, _event_row("plan_revision_revised", revision_row[0]))
+    # The F2 claim settles exactly once with the atomic resolution (issue #87).
+    conn.on(
+        _CLAIM_SETTLE,
+        _claim_row(
+            status="settled",
+            kind="planning_revise_dispatch",
+            review_iteration_id=_ITERATION_ID,
+        ),
+    )
 
 
 _UNSET_PREPARATION = object()
@@ -785,6 +887,7 @@ def test_initial_production_sends_one_canonical_plan_and_creates_revision_one() 
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -849,6 +952,7 @@ def test_initial_production_composes_workspace_guidance_subordinately() -> None:
         reviewer_row=_review_ready_row(),
         guidance=_GUIDANCE,
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -875,6 +979,7 @@ def test_initial_production_with_blank_guidance_sends_no_guidance_section() -> N
         reviewer_row=_review_ready_row(),
         guidance="   ",
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -1107,14 +1212,23 @@ def test_invalid_formal_result_refuses_the_consequential_write(
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     adapter = _prepared_producer_adapter([bad_candidate])
 
-    with pytest.raises(ExternalOperationFailedError):
+    # A schema-invalid or wrong-family formal reply happens after the send
+    # did work: an unresolved outcome, never a proven non-delivery (issue
+    # #87).
+    with pytest.raises(ExternalOperationUncertainError):
         env.run_initial(adapter=adapter)
 
     # Exactly one send attempt was made and never repeated.
     assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
     _assert_no_consequential_write(env.conn)
+    # The committed claim stays conservatively claimed: the send may have
+    # been delivered, so nothing settles it and nothing is resent.
+    claim_inserts = [sql for sql, _ in env.conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
 
 
 def test_known_runtime_failure_refuses_the_consequential_write() -> None:
@@ -1125,6 +1239,10 @@ def test_known_runtime_failure_refuses_the_consequential_write() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
+    # The positively proven pre-effect failure settles the claim to its
+    # truthful known non-delivery record (issue #87).
+    env.conn.on(_CLAIM_SETTLE, _claim_row(status="known_nondelivery"))
     adapter = _prepared_producer_adapter([AgentRuntimeUnavailableError("runtime unavailable")])
 
     with pytest.raises(ExternalOperationFailedError):
@@ -1132,6 +1250,17 @@ def test_known_runtime_failure_refuses_the_consequential_write() -> None:
 
     assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
     _assert_no_consequential_write(env.conn)
+    # The positively proven pre-effect failure records the truthful known
+    # non-delivery on the exact claim (issue #87) — and never a rewrite of
+    # possibly-dispatched history.
+    (settle_params,) = [
+        params
+        for sql, params in env.conn.executed
+        if _CLAIM_SETTLE(sql, None) and params is not None
+    ]
+    assert settle_params[0] == "known_nondelivery"
+    assert settle_params[1].obj == {"failure_kind": "runtime_pre_effect"}
+    assert settle_params[2:] == (_CLAIM_ID, _TASK_ID, _WORKSPACE_ID)
 
 
 def test_uncertain_runtime_outcome_never_resent_or_published() -> None:
@@ -1142,6 +1271,7 @@ def test_uncertain_runtime_outcome_never_resent_or_published() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     adapter = _prepared_producer_adapter([AgentRuntimeDeliveryUncertainError("delivery lost")])
 
     with pytest.raises(ExternalOperationUncertainError):
@@ -1150,6 +1280,11 @@ def test_uncertain_runtime_outcome_never_resent_or_published() -> None:
     # Uncertainty is not permission to resend: exactly the one attempt.
     assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
     _assert_no_consequential_write(env.conn)
+    # The claim stays conservatively claimed through the uncertainty (issue
+    # #87): never reclassified, never settled, never replayed.
+    claim_inserts = [sql for sql, _ in env.conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
 
 
 def test_revision_production_routes_findings_verbatim_and_creates_revision_two() -> None:
@@ -1160,6 +1295,11 @@ def test_revision_production_routes_findings_verbatim_and_creates_revision_two()
         revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
         iteration_row=_iteration_row(),
         loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
         producer_row=_production_ready_row(),
     )
     _script_revise_finalize(
@@ -1227,6 +1367,11 @@ def test_revision_entry_needs_no_bootstrap_outcome_or_reviewer_interaction() -> 
         revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
         iteration_row=_iteration_row(),
         loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
         producer_row=_production_ready_row(),
     )
     _script_revise_finalize(
@@ -1299,6 +1444,66 @@ def test_revision_with_prior_revision_no_longer_current_refuses() -> None:
         env.run_revise(adapter=adapter)
 
     assert adapter.submitted_sends() == ()
+    _assert_no_consequential_write(env.conn)
+
+
+def test_initial_production_refuses_a_committed_duplicate_claim() -> None:
+    """The F2 one-shot claim (issue #87): a raced or replayed initial-PLAN
+    production for an already-claimed Task raises the typed stale error
+    strictly before the send — the durable claim fact is the backstop."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_initial_claim(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        existing_claim=_claim_row(),
+    )
+    adapter = _prepared_producer_adapter([_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_initial(adapter=adapter)
+
+    # Zero effects: no send, no claim insert, no settlement.
+    assert adapter.submitted_sends(_PRODUCER_EXTERNAL_ID) == ()
+    assert not any(_CLAIM_INSERT(sql, None) for sql, _ in env.conn.executed)
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
+    _assert_no_consequential_write(env.conn)
+
+
+def test_revise_production_refuses_a_committed_duplicate_claim() -> None:
+    """A replayed planning-REVISE production for an already-claimed routed
+    iteration refuses with the typed stale error, before any send (issue
+    #87): the partial unique index's pre-check owns the decision."""
+    env = _Production()
+    _script_revise_entry(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iteration_row=_iteration_row(),
+        loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        producer_row=_production_ready_row(),
+        existing_claim=_claim_row(
+            kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID
+        ),
+    )
+    adapter = _prepared_producer_adapter([_revised_plan_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run_revise(adapter=adapter)
+
+    assert adapter.submitted_sends(_PRODUCER_EXTERNAL_ID) == ()
+    assert not any(_CLAIM_INSERT(sql, None) for sql, _ in env.conn.executed)
     _assert_no_consequential_write(env.conn)
 
 
@@ -1482,6 +1687,16 @@ def test_revision_routes_the_latest_change_request_on_the_same_plan() -> None:
             _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
         ],
     )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        producer_row=_production_ready_row(),
+        iteration_row=_iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        loop_iterations=[
+            _iteration_row(),
+            _iteration_row(iteration_id=_ITERATION_2_ID, number=2),
+        ],
+    )
     _script_revise_finalize(
         env.conn,
         task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
@@ -1525,6 +1740,13 @@ def test_superseding_result_finalized_during_the_send_is_never_published() -> No
         loop_row=_loop_row(),
         producer_row=_production_ready_row(),
     )
+    # The claim commits before the send: at claim time the routed change
+    # request is still the latest-numbered one on the plan.
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
+        producer_row=_production_ready_row(),
+    )
     _script_revise_finalize(
         env.conn,
         task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
@@ -1554,6 +1776,11 @@ def test_superseding_result_finalized_during_the_send_is_never_published() -> No
         "for update" in sql and "from openorc.review_loops where id" in sql
         for sql, _ in env.conn.executed
     )
+    # The committed claim stays conservatively claimed: a superseded routed
+    # subject never publishes, and the claim is never rewritten (issue #87).
+    claim_inserts = [sql for sql, _ in env.conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
 
 
 def test_revision_with_non_ready_producer_refuses() -> None:
@@ -1584,6 +1811,7 @@ def test_rotated_token_after_reply_is_never_published() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     # The post-send finalize recheck observes a Task that moved on while the
     # Producer was working: the answer can never become authoritative.
     env.conn.on(_TASK_READ, _task_row(state_token=_ROTATED_TOKEN))
@@ -1596,6 +1824,9 @@ def test_rotated_token_after_reply_is_never_published() -> None:
     assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
     _assert_no_consequential_write(env.conn)
     assert env.pool.active_connections == 0
+    # The claim stays conservatively claimed (issue #87): a failed
+    # finalization never rewrites possibly-dispatched history.
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
 
 
 def test_superseded_current_plan_after_reply_is_never_published() -> None:
@@ -1606,6 +1837,7 @@ def test_superseded_current_plan_after_reply_is_never_published() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     env.conn.on(_TASK_READ, _task_row(current_plan_revision_id=_REVISION_1_ID))
     env.conn.on(
         _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
@@ -1632,6 +1864,11 @@ def test_revision_superseded_after_reply_is_never_published() -> None:
         revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
         iteration_row=_iteration_row(),
         loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
         producer_row=_production_ready_row(),
     )
     # Post-send: the prior revision is no longer the current pointer.
@@ -1661,6 +1898,7 @@ def test_competing_finalization_proves_exactly_one_outcome() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     env.conn.on(_TASK_READ, _task_row())
     env.conn.on(
         _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
@@ -1695,6 +1933,7 @@ def test_rejected_pointer_write_classifies_stale_and_writes_no_event() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     env.conn.on(_TASK_READ, _task_row())
     env.conn.on(
         _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
@@ -1728,6 +1967,7 @@ def test_producer_session_lost_after_reply_never_publishes() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -1763,6 +2003,7 @@ def test_reviewer_session_lost_after_reply_never_publishes() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -1795,6 +2036,11 @@ def test_revision_with_producer_session_lost_after_reply_never_publishes() -> No
         revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
         iteration_row=_iteration_row(),
         loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_revise_claim(
+        env.conn,
+        task_row=_task_row(current_plan_revision_id=_REVISION_1_ID),
         producer_row=_production_ready_row(),
     )
     _script_revise_finalize(
@@ -1830,6 +2076,7 @@ def test_statement_order_proves_no_transaction_around_external_calls() -> None:
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
@@ -1844,18 +2091,31 @@ def test_statement_order_proves_no_transaction_around_external_calls() -> None:
     (installation_index,) = _statement_indices(
         env.conn, _sql_has("from openorc.github_installations where id")
     )
+    (claim_insert_index,) = _statement_indices(env.conn, _CLAIM_INSERT)
     (insert_index,) = _statement_indices(env.conn, _REVISION_INSERT)
     (update_index,) = _statement_indices(env.conn, _POINTER_UPDATE)
     (event_index,) = _statement_indices(env.conn, _EVENT_INSERT)
+    (settle_index,) = _statement_indices(env.conn, _CLAIM_SETTLE)
     finalize_task_reads = [
         index
         for index, (sql, _params) in enumerate(env.conn.executed)
         if _TASK_READ(" ".join(sql.split()).lower(), None) and index > installation_index
     ]
-    # The finalize transaction's reads and writes all follow the external
-    # phases, and the composition is task recheck -> insert -> pointer -> event.
+    # The claim commits after the observation and before the send; the
+    # finalize transaction's reads and writes all follow the external
+    # phases, the composition is task recheck -> insert -> pointer -> event
+    # -> claim settle, and nothing holds a transaction across the external
+    # phases.
     assert finalize_task_reads and min(finalize_task_reads) > installation_index
-    assert installation_index < min(finalize_task_reads) < insert_index < update_index < event_index
+    assert installation_index < claim_insert_index < min(finalize_task_reads)
+    assert (
+        installation_index
+        < min(finalize_task_reads)
+        < insert_index
+        < update_index
+        < event_index
+        < settle_index
+    )
     # The external phases ran with no connection checked out (asserted
     # inside the GitHub fake), and the pool is fully returned afterwards.
     assert env.pool.active_connections == 0
@@ -1873,6 +2133,7 @@ def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() ->
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_initial_finalize(
         env.conn,
         task_row=_task_row(),
