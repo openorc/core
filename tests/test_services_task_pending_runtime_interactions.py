@@ -566,19 +566,12 @@ def test_reviewer_review_and_running_execution_are_outstanding() -> None:
             ),
             _iteration_row(iteration_id=_ITERATION_ID, number=2, plan_revision_id=current_revision),
         ],
-        executions=[_execution_row(status="running")],
         reviewer_session=_session_row("reviewer", _REVIEWER_SESSION_ID),
     )
-    interactions = list_pending_task_runtime_interactions(
+    (review,) = list_pending_task_runtime_interactions(
         _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
     )
-    # Deterministic ordering: committed start instant, then operation, then
-    # subject identity.
-    assert [interaction.operation for interaction in interactions] == [
-        PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
-        PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
-    ]
-    review = interactions[1]
+    assert review.operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
     assert review.role is WorkflowRole.REVIEWER
     assert review.task_agent_session_id == _REVIEWER_SESSION_ID
     assert review.subject == {
@@ -588,6 +581,21 @@ def test_reviewer_review_and_running_execution_are_outstanding() -> None:
         "purpose": "planning",
         "plan_revision_id": str(current_revision),
     }
+
+    # A RUNNING authorized-implementation attempt is current work in its own
+    # active phase (IMPLEMENTING), with the deterministic ordering by start
+    # instant, then operation, then subject identity.
+    conn2 = ScriptedConnection()
+    _script_projection(
+        conn2,
+        task=_task_row(status="implementing", current_plan_revision_id=current_revision),
+        executions=[_execution_row(status="running")],
+    )
+    (execution,) = list_pending_task_runtime_interactions(
+        _pool(conn2), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+    assert execution.operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    assert execution.started_at == _OBSERVED
 
 
 def test_a_superseded_unfinalized_attempt_is_never_listed() -> None:
@@ -758,6 +766,117 @@ def test_a_current_pr_review_attempt_is_listed_and_a_moved_on_one_is_not() -> No
         )
         == []
     )
+
+
+def test_a_blocked_task_retains_its_claims_but_lists_no_active_work() -> None:
+    """Issue #87 review fix: an Owner-blocked Task's unresolved durable
+    claims are preserved untouched for later recovery (F4b) — but they are
+    never returned as eligible active work. The concrete scenario: the
+    Owner aborts the Task after the initial PLAN send was claimed but
+    before its formal result settles; the claim row stays ``claimed`` in
+    persistence (the persistence layer lists the whole claim history,
+    claimed rows included — proven against real Postgres by the
+    integration suite), while the projection reports nothing."""
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="blocked"),
+        claims=[_claim_row(kind="initial_plan_dispatch")],
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+
+def test_phase_ineligible_operations_are_never_listed() -> None:
+    """Issue #87 review fix: every projected operation must sit in the
+    active phase its dispatch service requires — the unresolved durable
+    facts stay claimed, but a moved-on phase is never reported as active
+    work."""
+    # The bootstrap interaction only projects on a PLANNING Task.
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="reviewing", current_plan_revision_id=uuid4()),
+        evidence=(_STATE_TOKEN, _OBSERVED, None, None),
+        producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # A claimed initial PLAN on a Task that has moved past PLANNING.
+    conn2 = ScriptedConnection()
+    _script_projection(
+        conn2,
+        task=_task_row(status="implementing", current_plan_revision_id=uuid4()),
+        claims=[_claim_row(kind="initial_plan_dispatch")],
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn2), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # A claimed planning REVISE on a Task that has moved past PLANNING.
+    conn3 = ScriptedConnection()
+    _script_projection(
+        conn3,
+        task=_task_row(status="waiting_for_owner", current_plan_revision_id=uuid4()),
+        claims=[_claim_row(kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID)],
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn3), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # A RUNNING authorized-implementation attempt only projects on an
+    # IMPLEMENTING Task; its remediation counterpart only on a REVIEWING
+    # Task — and vice versa.
+    conn4 = ScriptedConnection()
+    _script_projection(
+        conn4,
+        task=_task_row(status="reviewing", current_plan_revision_id=uuid4()),
+        executions=[_execution_row(status="running")],
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn4), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+    conn5 = ScriptedConnection()
+    _script_projection(
+        conn5,
+        task=_task_row(status="implementing", current_plan_revision_id=uuid4()),
+        executions=[_execution_row(status="running", review_iteration_id=_ITERATION_ID)],
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn5), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+    # ...while the remediation attempt on a REVIEWING Task is eligible.
+    conn6 = ScriptedConnection()
+    _script_projection(
+        conn6,
+        task=_task_row(status="reviewing", current_plan_revision_id=uuid4()),
+        executions=[_execution_row(status="running", review_iteration_id=_ITERATION_ID)],
+    )
+    (remediation,) = list_pending_task_runtime_interactions(
+        _pool(conn6), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+    assert remediation.operation is PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION
 
 
 def test_archived_and_terminal_tasks_never_list_history() -> None:

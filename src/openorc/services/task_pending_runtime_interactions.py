@@ -18,9 +18,10 @@ identities plus the F2 runtime-send claims:
 
 Eligibility is deliberately conservative and current-work-only: an
 operation is listed only while its exact subject is still the Task's
-current work on a non-archived, non-terminal Task — a settled or
-known-non-delivered claim, a superseded or resolved attempt, a moved-on
-plan pointer, or a READY session merely waiting for an Owner approval or
+current work on a non-archived, non-terminal, non-``BLOCKED`` Task, in the
+active phase its dispatch service requires — a settled or known-non-delivered
+claim, a superseded or resolved attempt, a moved-on plan pointer, an
+Owner-gated Task, or a READY session merely waiting for an Owner approval or
 another workflow step is never listed. The projection makes no
 runtime-status probe, decides no block, and normalizes no activity
 observation: ``WORKING``/``NOT_WORKING``/``UNKNOWN`` classification is
@@ -80,7 +81,8 @@ def _bootstrap_interaction(
     """The outstanding planning-bootstrap interaction, if still current.
 
     Exactly one of three forward-only shapes, read off the settled stage
-    evidence (issue #87):
+    evidence (issue #87), and only in the active phase the bootstrap
+    service itself requires (``PLANNING``):
 
     - no settled stage and no published plan revision: the formal PREPARE
       control's validated workspace result is still outstanding — the
@@ -104,6 +106,8 @@ def _bootstrap_interaction(
     """
     evidence = task_records.get_task_planning_bootstrap_evidence(pool, task_id=task.id)
     if evidence is None:
+        return None
+    if task.status is not TaskStatus.PLANNING:
         return None
     if task.current_plan_revision_id is not None:
         return None
@@ -153,14 +157,22 @@ def _send_claim_interaction(
     A claimed send whose subject moved on — a published plan revision, a
     superseded routed iteration, or an already-created canonical PR — is a
     resolved or superseded attempt, never current work: the finalize or
-    continuation that owns the subject records the resolution. The safe
-    subject identity and the committed claim instant travel on the row.
+    continuation that owns the subject records the resolution. Each kind is
+    also listed only in the active phase its dispatch service requires —
+    ``PLANNING`` for the plan dispatches, ``WAITING_FOR_OWNER`` for the PR
+    compose — so an operation whose phase has moved on is never reported
+    even while its claim stays conservatively claimed. The safe subject
+    identity and the committed claim instant travel on the row.
     """
     if claim.kind is TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH:
+        if task.status is not TaskStatus.PLANNING:
+            return None
         if task.current_plan_revision_id is not None:
             return None
         subject: dict[str, object] = {"send_claim_id": str(claim.id)}
     elif claim.kind is TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH:
+        if task.status is not TaskStatus.PLANNING:
+            return None
         if claim.review_iteration_id is None or task.current_plan_revision_id is None:
             return None
         iteration = review_records.get_review_iteration(
@@ -293,20 +305,29 @@ def _execution_interactions(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
-    task_id: UUID,
+    task: Task,
 ) -> list[PendingTaskRuntimeInteraction]:
     """The outstanding implementation/remediation attempts.
 
     A ``RUNNING`` Execution is the E6/E9 potentially-dispatched claim record:
-    it is current work by definition until it is truthfully finalized. Every
-    other status (queued residue, paused-for-approval waits, terminal
-    outcomes) is not an outstanding runtime interaction.
+    it is current work by definition until it is truthfully finalized — and
+    only in the active phase its dispatch service requires: ``IMPLEMENTING``
+    for an authorized implementation attempt, ``REVIEWING`` for a PR
+    remediation attempt. Every other execution status (queued residue,
+    paused-for-approval waits, terminal outcomes) and every moved-on phase
+    is not an outstanding runtime interaction; the durable Execution row is
+    untouched and remains available to later recovery.
     """
     interactions: list[PendingTaskRuntimeInteraction] = []
-    for execution in list_task_executions(pool, task_id=task_id):
+    for execution in list_task_executions(pool, task_id=task.id):
         if execution.status is not ExecutionStatus.RUNNING:
             continue
         remediation = execution.review_iteration_id is not None
+        if remediation:
+            if task.status is not TaskStatus.REVIEWING:
+                continue
+        elif task.status is not TaskStatus.IMPLEMENTING:
+            continue
         subject: dict[str, object] = {
             "execution_id": str(execution.id),
             "execution_number": execution.execution_number,
@@ -321,7 +342,7 @@ def _execution_interactions(
                     else PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
                 ),
                 workspace_id=workspace_id,
-                task_id=task_id,
+                task_id=task.id,
                 role=WorkflowRole.PRODUCER,
                 task_agent_session_id=execution.producer_session_id,
                 subject=subject,
@@ -341,18 +362,25 @@ def list_pending_task_runtime_interactions(
 
     The exact-Task-bound read: the addressed Task UUID must name a Task in
     the addressed Workspace (uniformly ``NotFoundError`` otherwise). An
-    archived or terminal Task has no eligible active operations and lists
-    empty — the projection never resurrects historical work. The result is
-    deterministically ordered by committed start instant, then operation,
-    then subject identity; rows whose start instant is honestly unknown
-    order last, after every row with a known instant.
+    archived, terminal, or Owner-``BLOCKED`` Task has no eligible active
+    operations and lists empty — the projection never resurrects historical
+    work, while the durable claim rows themselves are untouched and remain
+    available to later recovery (F4b). Every listed operation must
+    additionally sit in the active phase its dispatch service requires
+    (mirroring the admission guards), so an operation whose phase has moved
+    on is never reported. The result is deterministically ordered by
+    committed start instant, then operation, then subject identity; rows
+    whose start instant is honestly unknown order last, after every row
+    with a known instant.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     task = task_records.get_task(pool, task_id)
     if task is None or task.workspace_id != workspace_id:
         raise NotFoundError("the requested task is not available in this workspace")
-    if task.archived_at is not None or task.status.is_terminal:
+    if task.archived_at is not None or task.status is TaskStatus.BLOCKED:
+        return []
+    if task.status.is_terminal:
         return []
     # One short database-only composition: the projection is a consistent
     # snapshot of the claim facts, with no transaction open at return.
@@ -390,7 +418,7 @@ def list_pending_task_runtime_interactions(
             _review_dispatch_interactions(transaction_pool, workspace_id=workspace_id, task=task)
         )
         interactions.extend(
-            _execution_interactions(transaction_pool, workspace_id=workspace_id, task_id=task_id)
+            _execution_interactions(transaction_pool, workspace_id=workspace_id, task=task)
         )
     interactions.sort(
         key=lambda interaction: (
