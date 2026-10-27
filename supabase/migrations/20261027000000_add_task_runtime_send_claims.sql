@@ -112,6 +112,29 @@ create table openorc.task_runtime_send_claims (
     )
 );
 
+-- The F2 bootstrap stage evidence (issue #87): forward-only observational
+-- facts about the E1b planning-bootstrap claim's progress, added here
+-- because the F2 persistence layer reads them together with the claim
+-- token that issue #203 added. ``planning_bootstrap_claimed_at`` is the
+-- database-stamped claim instant written atomically with the claim token
+-- going forward; it stays nullable because Task rows claimed before this
+-- migration legitimately carry a token with no stamped instant (residue
+-- whose start instant is honestly unknown). The settled stage and its
+-- settlement instant are written together by the forward-only stage
+-- advance and never regress, so they are coherent-or-both-null by
+-- construction and by CHECK.
+alter table openorc.tasks
+    add column planning_bootstrap_claimed_at timestamptz,
+    add column planning_bootstrap_stage text,
+    add column planning_bootstrap_stage_settled_at timestamptz,
+    add constraint tasks_planning_bootstrap_stage_vocab check (
+        planning_bootstrap_stage is null
+        or planning_bootstrap_stage in ('prepared', 'ready_for_planning')
+    ),
+    add constraint tasks_planning_bootstrap_stage_coherence check (
+        (planning_bootstrap_stage is null) = (planning_bootstrap_stage_settled_at is null)
+    );
+
 -- The durable one-shot backstops: at most one claim per logical workflow
 -- subject per kind, independent of any Task state token. A replayed or raced
 -- second claim for the same subject can never commit a second row.

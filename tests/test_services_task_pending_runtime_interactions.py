@@ -40,6 +40,8 @@ _CLAIM_ID = uuid4()
 _LOOP_ID = uuid4()
 _ITERATION_ID = uuid4()
 _EXECUTION_ID = uuid4()
+_PR_ID = uuid4()
+_HEAD_SHA = "1" * 40
 
 
 class _Predicate:
@@ -144,6 +146,7 @@ def _task_row(
     status: str = "planning",
     state_token: Any = _STATE_TOKEN,
     current_plan_revision_id: Any = None,
+    gate_id: Any = None,
     archived: bool = False,
 ) -> tuple[Any, ...]:
     return (
@@ -157,7 +160,7 @@ def _task_row(
         None,
         state_token,
         current_plan_revision_id,
-        None,
+        gate_id,
         "a" * 64,
         None,
         _OBSERVED,
@@ -215,8 +218,8 @@ def _claim_row(
     )
 
 
-def _loop_row(*, status: str = "open") -> tuple[Any, ...]:
-    return (_LOOP_ID, _WORKSPACE_ID, _TASK_ID, "planning", 3, status, None, _OBSERVED)
+def _loop_row(*, status: str = "open", purpose: str = "planning") -> tuple[Any, ...]:
+    return (_LOOP_ID, _WORKSPACE_ID, _TASK_ID, purpose, 3, status, None, _OBSERVED)
 
 
 def _iteration_row(
@@ -224,6 +227,8 @@ def _iteration_row(
     iteration_id: Any = _ITERATION_ID,
     number: int = 1,
     plan_revision_id: Any = None,
+    task_pull_request_id: Any = None,
+    reviewed_head_sha: Any = None,
     outcome: Any = None,
 ) -> tuple[Any, ...]:
     finalized = outcome is not None
@@ -234,12 +239,30 @@ def _iteration_row(
         _LOOP_ID,
         number,
         plan_revision_id,
-        None,
-        None,
+        task_pull_request_id,
+        reviewed_head_sha,
         outcome,
         "Needs work" if finalized else None,
         (("clarify",),) if finalized else None,
         _OBSERVED if finalized else None,
+        _OBSERVED,
+    )
+
+
+def _pr_row(*, pr_id: Any = None, head_sha: Any = None, state: str = "open") -> tuple[Any, ...]:
+    return (
+        pr_id if pr_id is not None else _PR_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _REPOSITORY_ID,
+        7001,
+        5,
+        "openorc/task-branch",
+        "main",
+        head_sha if head_sha is not None else _HEAD_SHA,
+        state,
+        None,
+        _OBSERVED,
         _OBSERVED,
     )
 
@@ -444,7 +467,10 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
         interaction.operation is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE
     )
     assert interaction.started_at == _OBSERVED
-    assert interaction.subject == {"planning_bootstrap_claim_token": str(_STATE_TOKEN)}
+    assert interaction.subject == {
+        "planning_bootstrap_claim_token": str(_STATE_TOKEN),
+        "formal_result_outstanding": True,
+    }
 
     # Residue claimed before the instant evidence existed carries None.
     conn2 = ScriptedConnection()
@@ -459,11 +485,11 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
     )
     assert residue.started_at is None
 
-    # A settled stage resolves the bootstrap out of the projection.
+    # A published plan revision resolves the bootstrap at any stage.
     conn3 = ScriptedConnection()
     _script_projection(
         conn3,
-        task=_task_row(status="planning", current_plan_revision_id=None),
+        task=_task_row(status="planning", current_plan_revision_id=uuid4()),
         evidence=(_STATE_TOKEN, _OBSERVED, "prepared", _OBSERVED),
     )
     assert (
@@ -474,12 +500,62 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
     )
 
 
+def test_prepared_stage_reports_the_outstanding_context_transition() -> None:
+    """Issue #87 review fix: a settled ``prepared`` stage is NOT completion
+    of the bootstrap — the effectful planning-context transition it
+    authorized is still potentially unfinished and must be projected, or
+    F2a could never observe a stall between the stage settlement and the
+    transition."""
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="planning", current_plan_revision_id=None),
+        evidence=(_STATE_TOKEN, _OBSERVED, "prepared", _OBSERVED),
+        producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+    )
+    (interaction,) = list_pending_task_runtime_interactions(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+    assert (
+        interaction.operation
+        is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION
+    )
+    assert interaction.role is WorkflowRole.PRODUCER
+    # The exact Producer binding and the existing bootstrap claim identity.
+    assert interaction.task_agent_session_id == _PRODUCER_SESSION_ID
+    assert interaction.subject == {
+        "planning_bootstrap_claim_token": str(_STATE_TOKEN),
+        # No formal result is outstanding: the PREPARE result already
+        # validated; the transition itself is the unsettled effect.
+        "formal_result_outstanding": False,
+    }
+    # The committed start evidence: the stage settlement instant is the
+    # instant the validated PREPARE result started the transition.
+    assert interaction.started_at == _OBSERVED
+
+
+def test_ready_for_planning_stage_is_never_an_outstanding_bootstrap() -> None:
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="planning", current_plan_revision_id=None),
+        evidence=(_STATE_TOKEN, _OBSERVED, "ready_for_planning", _OBSERVED),
+        producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+
 def test_reviewer_review_and_running_execution_are_outstanding() -> None:
     current_revision = uuid4()
     conn = ScriptedConnection()
     _script_projection(
         conn,
-        task=_task_row(status="implementing", current_plan_revision_id=current_revision),
+        task=_task_row(status="planning", current_plan_revision_id=current_revision),
         loops=[_loop_row()],
         iterations=[
             _iteration_row(
@@ -514,7 +590,178 @@ def test_reviewer_review_and_running_execution_are_outstanding() -> None:
     }
 
 
+def test_a_superseded_unfinalized_attempt_is_never_listed() -> None:
+    """Issue #87 review fix: a newer iteration — finalized or not —
+    supersedes an older unfinalized attempt; the projection lists the latest
+    iteration of the loop overall, never a superseded one."""
+    conn = ScriptedConnection()
+    current_revision = uuid4()
+    _script_projection(
+        conn,
+        task=_task_row(status="planning", current_plan_revision_id=current_revision),
+        loops=[_loop_row()],
+        iterations=[
+            _iteration_row(
+                iteration_id=_ITERATION_ID,
+                number=1,
+                plan_revision_id=current_revision,
+            ),
+            _iteration_row(
+                iteration_id=uuid4(),
+                number=2,
+                plan_revision_id=current_revision,
+                outcome="changes_requested",
+            ),
+        ],
+        reviewer_session=_session_row("reviewer", _REVIEWER_SESSION_ID),
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+
+def test_a_review_off_the_current_phase_or_subject_is_never_listed() -> None:
+    """Issue #87 review fix: the outstanding REVIEW projection mirrors the
+    dispatch services' currentness proofs — the eligible active phase and
+    the exact current workflow subject."""
+    current_revision = uuid4()
+    stale_revision = uuid4()
+    reviewer = _session_row("reviewer", _REVIEWER_SESSION_ID)
+
+    # An implementing Task's planning loop is not a live review.
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="implementing", current_plan_revision_id=current_revision),
+        loops=[_loop_row()],
+        iterations=[
+            _iteration_row(iteration_id=_ITERATION_ID, number=1, plan_revision_id=current_revision)
+        ],
+        reviewer_session=reviewer,
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # An Owner-gated waiting Task has no live review either.
+    conn2 = ScriptedConnection()
+    _script_projection(
+        conn2,
+        task=_task_row(
+            status="waiting_for_owner",
+            current_plan_revision_id=current_revision,
+            gate_id=uuid4(),
+        ),
+        loops=[_loop_row()],
+        iterations=[
+            _iteration_row(iteration_id=_ITERATION_ID, number=1, plan_revision_id=current_revision)
+        ],
+        reviewer_session=reviewer,
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn2), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # A planning attempt addressing a revision that is no longer current.
+    conn3 = ScriptedConnection()
+    _script_projection(
+        conn3,
+        task=_task_row(status="planning", current_plan_revision_id=current_revision),
+        loops=[_loop_row()],
+        iterations=[
+            _iteration_row(iteration_id=_ITERATION_ID, number=1, plan_revision_id=stale_revision)
+        ],
+        reviewer_session=reviewer,
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn3), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+
+def test_a_current_pr_review_attempt_is_listed_and_a_moved_on_one_is_not() -> None:
+    """Issue #87 review fix: a PR-review attempt is current work only while
+    the Task is REVIEWING with no current Owner gate, the canonical PR is
+    exactly the addressed one, and the reviewed head is still the PR's
+    head."""
+    reviewer = _session_row("reviewer", _REVIEWER_SESSION_ID)
+    pr_iteration = _iteration_row(
+        iteration_id=_ITERATION_ID,
+        number=1,
+        task_pull_request_id=_PR_ID,
+        reviewed_head_sha=_HEAD_SHA,
+    )
+
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="reviewing"),
+        loops=[_loop_row(purpose="pr_review")],
+        iterations=[pr_iteration],
+        pr_row=_pr_row(),
+        reviewer_session=reviewer,
+    )
+    (interaction,) = list_pending_task_runtime_interactions(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+    assert interaction.operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
+    assert interaction.subject == {
+        "review_loop_id": str(_LOOP_ID),
+        "review_iteration_id": str(_ITERATION_ID),
+        "iteration_number": 1,
+        "purpose": "pr_review",
+        "task_pull_request_id": str(_PR_ID),
+        "reviewed_head_sha": _HEAD_SHA,
+    }
+
+    # The reviewed head is no longer the PR's head: a stale attempt.
+    conn2 = ScriptedConnection()
+    _script_projection(
+        conn2,
+        task=_task_row(status="reviewing"),
+        loops=[_loop_row(purpose="pr_review")],
+        iterations=[pr_iteration],
+        pr_row=_pr_row(head_sha="2" * 40),
+        reviewer_session=reviewer,
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn2), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+    # A current Owner gate suspends the review dispatch.
+    conn3 = ScriptedConnection()
+    _script_projection(
+        conn3,
+        task=_task_row(status="reviewing", gate_id=uuid4()),
+        loops=[_loop_row(purpose="pr_review")],
+        iterations=[pr_iteration],
+        pr_row=_pr_row(),
+        reviewer_session=reviewer,
+    )
+    assert (
+        list_pending_task_runtime_interactions(
+            _pool(conn3), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        == []
+    )
+
+
 def test_archived_and_terminal_tasks_never_list_history() -> None:
+    conn = ScriptedConnection()
     for task_row in (
         _task_row(status="cancelled", archived=True),
         _task_row(status="completed", archived=True),

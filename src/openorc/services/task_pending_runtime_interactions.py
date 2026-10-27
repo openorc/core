@@ -7,8 +7,8 @@ runtime-status probe. The projection composes *existing* durable claim
 identities plus the F2 runtime-send claims:
 
 - the E1b planning-bootstrap claim with its F2 stage evidence (an
-  outstanding PREPARE/control vs completed preparation vs a continuation
-  waiting for E2);
+  outstanding PREPARE/control, an outstanding planning-context transition
+  after the validated PREPARE result, vs a continuation waiting for E2);
 - the F2 pre-send claims (initial PLAN, planning REVISE, PR_COMPOSE) still
   in their claimed state;
 - the E3a reserved unfinalized ReviewIteration (the outstanding REVIEW
@@ -39,13 +39,13 @@ from openorc.domain.pending_interactions import (
     PendingTaskRuntimeInteraction,
     PendingTaskRuntimeInteractionOperation,
 )
-from openorc.domain.reviews import ReviewLoopStatus
+from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.send_claims import (
     TaskRuntimeSendClaim,
     TaskRuntimeSendClaimKind,
     TaskRuntimeSendClaimStatus,
 )
-from openorc.domain.tasks import Task, TaskStatus
+from openorc.domain.tasks import Task, TaskPlanningBootstrapStage, TaskStatus
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
@@ -77,29 +77,65 @@ def _bootstrap_interaction(
     workspace_id: UUID,
     task: Task,
 ) -> PendingTaskRuntimeInteraction | None:
-    """The outstanding planning-bootstrap PREPARE/control, if still current.
+    """The outstanding planning-bootstrap interaction, if still current.
 
-    A claimed bootstrap with no settled stage evidence and no current plan
-    revision is the conservatively outstanding establishment/preparation
-    work; a settled stage or a published plan revision means the bootstrap
-    resolved into its later continuations (the send claims cover those) and
-    the bootstrap itself is never listed again. ``started_at`` is the
-    database-stamped claim instant; residue claimed before that evidence
-    existed carries ``None`` honestly.
+    Exactly one of three forward-only shapes, read off the settled stage
+    evidence (issue #87):
+
+    - no settled stage and no published plan revision: the formal PREPARE
+      control's validated workspace result is still outstanding — the
+      conservatively outstanding establishment/preparation work;
+    - stage ``prepared``: the PREPARE result already validated, but the
+      separate effectful planning-context transition it authorizes has not
+      settled — the outstanding ``planning_bootstrap_transition`` work. A
+      settled ``prepared`` stage is never completion of the whole bootstrap
+      interaction: the process can die or the runtime can stall between the
+      stage settlement and the transition;
+    - stage ``ready_for_planning``: the bootstrap resolved into its later
+      continuations (the F2 send claims cover those) and the bootstrap
+      itself is never listed again.
+
+    A published plan revision means the bootstrap resolved at any stage and
+    the bootstrap interaction is never listed. ``started_at`` is the
+    database-stamped claim instant (for the outstanding PREPARE) or the
+    stage settlement instant (for the outstanding transition — the instant
+    the validated PREPARE result started the transition); residue claimed
+    before the instant evidence existed carries ``None`` honestly.
     """
     evidence = task_records.get_task_planning_bootstrap_evidence(pool, task_id=task.id)
     if evidence is None:
         return None
-    if evidence.stage is not None or task.current_plan_revision_id is not None:
+    if task.current_plan_revision_id is not None:
+        return None
+    if evidence.stage is TaskPlanningBootstrapStage.READY_FOR_PLANNING:
         return None
     producer = get_task_agent_session(pool, task_id=task.id, role=WorkflowRole.PRODUCER)
+    if evidence.stage is TaskPlanningBootstrapStage.PREPARED:
+        # The formal PREPARE result was validated; the effectful
+        # planning-context transition it authorized is still unsettled.
+        return PendingTaskRuntimeInteraction(
+            operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
+            workspace_id=workspace_id,
+            task_id=task.id,
+            role=WorkflowRole.PRODUCER,
+            task_agent_session_id=None if producer is None else producer.id,
+            subject={
+                "planning_bootstrap_claim_token": str(evidence.claim_token),
+                "formal_result_outstanding": False,
+            },
+            started_at=evidence.stage_settled_at,
+        )
+    # No settled stage: the formal PREPARE control itself is outstanding.
     return PendingTaskRuntimeInteraction(
         operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
         workspace_id=workspace_id,
         task_id=task.id,
         role=WorkflowRole.PRODUCER,
         task_agent_session_id=None if producer is None else producer.id,
-        subject={"planning_bootstrap_claim_token": str(evidence.claim_token)},
+        subject={
+            "planning_bootstrap_claim_token": str(evidence.claim_token),
+            "formal_result_outstanding": True,
+        },
         started_at=evidence.claimed_at,
     )
 
@@ -171,30 +207,62 @@ def _review_dispatch_interactions(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
-    task_id: UUID,
+    task: Task,
 ) -> list[PendingTaskRuntimeInteraction]:
     """The outstanding REVIEW dispatches on the Task's open loops.
 
-    An unfinalized iteration is the E3a reserved attempt whose REVIEW send
-    already happened (or whose formal result is still outstanding): only the
-    latest-numbered unfinalized iteration per OPEN loop is current work — an
-    older unfinalized attempt is superseded history, never listed.
+    An unfinalized iteration is the E3a/E3b reserved attempt whose REVIEW
+    send already happened (or whose formal result is still outstanding).
+    The projection is strictly current-work-only: an attempt is listed only
+    while it is simultaneously
+
+    - the latest-numbered iteration of its loop overall — any newer
+      iteration, finalized or not, supersedes the older unfinalized attempt;
+    - addressed to the Task's exact current workflow subject — a planning
+      attempt must address the Task's current plan revision, a PR-review
+      attempt must address the Task's current canonical PR at exactly the
+      reviewed head — and
+    - in the eligible active phase for that subject — ``PLANNING`` for a
+      planning loop, ``REVIEWING`` with no current Owner gate for a PR
+      review loop (mirroring the dispatch services' own currentness proofs).
+
+    Anything else is superseded history, moved-on work, or Owner-gated
+    waiting — never listed.
     """
     interactions: list[PendingTaskRuntimeInteraction] = []
-    reviewer = get_task_agent_session(pool, task_id=task_id, role=WorkflowRole.REVIEWER)
+    reviewer = get_task_agent_session(pool, task_id=task.id, role=WorkflowRole.REVIEWER)
     for loop in review_records.list_task_review_loops(
-        pool, task_id=task_id, status=ReviewLoopStatus.OPEN
+        pool, task_id=task.id, status=ReviewLoopStatus.OPEN
     ):
-        unfinalized = [
-            iteration
-            for iteration in review_records.list_review_loop_iterations(
-                pool, review_loop_id=loop.id
-            )
-            if iteration.outcome is None
-        ]
+        iterations = review_records.list_review_loop_iterations(pool, review_loop_id=loop.id)
+        unfinalized = [iteration for iteration in iterations if iteration.outcome is None]
         if not unfinalized:
             continue
         latest = max(unfinalized, key=lambda iteration: iteration.iteration_number)
+        latest_overall = max(iterations, key=lambda iteration: iteration.iteration_number)
+        if latest_overall.id != latest.id:
+            # A newer attempt — finalized or not — has superseded this one.
+            continue
+        if loop.purpose is ReviewLoopPurpose.PLANNING:
+            if task.status is not TaskStatus.PLANNING:
+                continue
+            if (
+                latest.plan_revision_id is None
+                or latest.plan_revision_id != task.current_plan_revision_id
+            ):
+                continue
+        else:
+            if task.status is not TaskStatus.REVIEWING:
+                continue
+            if task.current_owner_gate_id is not None:
+                continue
+            pull_request = get_task_pull_request_for_task(pool, task_id=task.id)
+            if (
+                pull_request is None
+                or pull_request.id != latest.task_pull_request_id
+                or pull_request.head_sha != latest.reviewed_head_sha
+            ):
+                continue
         subject: dict[str, object] = {
             "review_loop_id": str(loop.id),
             "review_iteration_id": str(latest.id),
@@ -211,7 +279,7 @@ def _review_dispatch_interactions(
             PendingTaskRuntimeInteraction(
                 operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
                 workspace_id=workspace_id,
-                task_id=task_id,
+                task_id=task.id,
                 role=WorkflowRole.REVIEWER,
                 task_agent_session_id=None if reviewer is None else reviewer.id,
                 subject=subject,
@@ -319,9 +387,7 @@ def list_pending_task_runtime_interactions(
             if interaction is not None:
                 interactions.append(interaction)
         interactions.extend(
-            _review_dispatch_interactions(
-                transaction_pool, workspace_id=workspace_id, task_id=task_id
-            )
+            _review_dispatch_interactions(transaction_pool, workspace_id=workspace_id, task=task)
         )
         interactions.extend(
             _execution_interactions(transaction_pool, workspace_id=workspace_id, task_id=task_id)

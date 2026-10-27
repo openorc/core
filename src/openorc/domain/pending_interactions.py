@@ -48,10 +48,16 @@ class PendingTaskRuntimeInteractionOperation(StrEnum):
     Exactly the automated workflow's claimed consequential interactions that
     can still be unfinished on an eligible active Task. The three
     ``*_dispatch`` operations mirror the F2 runtime-send claim kinds; the
-    others enumerate the existing durable claim identities.
+    others enumerate the existing durable claim identities. The bootstrap
+    pair separates the outstanding formal PREPARE control (its validated
+    workspace result is still outstanding) from the outstanding effectful
+    planning-context transition (the PREPARE result already validated, the
+    checkout transition itself still unsettled) — a settled ``prepared``
+    stage is never completion of the whole bootstrap interaction.
     """
 
     PLANNING_BOOTSTRAP_PREPARE = "planning_bootstrap_prepare"
+    PLANNING_BOOTSTRAP_TRANSITION = "planning_bootstrap_transition"
     INITIAL_PLAN_DISPATCH = "initial_plan_dispatch"
     PLANNING_REVISE_DISPATCH = "planning_revise_dispatch"
     REVIEWER_REVIEW = "reviewer_review"
