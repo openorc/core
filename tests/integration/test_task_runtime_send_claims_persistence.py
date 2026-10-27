@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 from psycopg import Connection
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
+from psycopg.types.json import Jsonb
 
 from openorc.domain.reviews import ReviewLoopPurpose
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind
@@ -144,7 +145,10 @@ def _insert_producer_session(conn: Connection[Any], workspace_id: Any, task_id: 
             task_id,
             connection_id,
             "ext-" + str(session_id)[:8],
-            {"adapter": "cline"},
+            # The jsonb column needs the explicit psycopg JSONB adapter; a
+            # plain dict is not adaptable (the Owner-run --testdb suite's
+            # ProgrammingError).
+            Jsonb({"adapter": "cline"}),
         ),
     )
     return session_id
