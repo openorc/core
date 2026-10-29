@@ -55,12 +55,19 @@ pytestmark = pytest.mark.integration
 _OWNER_PROFILE = uuid.uuid4()
 
 
-def _event_types(conn: Connection[Any], task_id: uuid.UUID) -> list[str]:
+def _event_counts(conn: Connection[Any], task_id: uuid.UUID) -> dict[str, int]:
+    """The Task's audit-event type counts, order-insensitive.
+
+    Every statement in the fixture transaction shares one transaction
+    timestamp, so (created_at, id) ordering is not deterministic between
+    same-transaction events; counts prove the truthful audit stream.
+    """
     rows = conn.execute(
-        "select event_type from openorc.workflow_events where task_id = %s order by created_at, id",
+        "select event_type, count(*) from openorc.workflow_events where task_id = %s "
+        "group by event_type",
         (task_id,),
     ).fetchall()
-    return [str(row[0]) for row in rows]
+    return {str(row[0]): int(row[1]) for row in rows}
 
 
 def _task_fixture(conn: Connection[Any], *, status: TaskStatus) -> dict[str, Any]:
@@ -140,7 +147,10 @@ def test_the_installation_commits_atomically_from_an_active_task(
     assert task.state_token != facts["state_token"]
     assert task.state_token == result.task.state_token
     # Exactly the two truthful audit events committed with the composition.
-    assert _event_types(conn, facts["task_id"]) == ["task_blocked", "owner_gate_created"]
+    assert _event_counts(conn, facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+    }
 
 
 def test_the_queued_timestamp_clears_when_a_queued_task_is_blocked(
@@ -201,7 +211,10 @@ def test_a_prior_current_pending_gate_is_superseded_without_a_false_outcome(
     assert prior.status is OwnerGateStatus.PENDING
     assert prior.decided_at is None
     # Exactly the two truthful events: no fictitious owner_gate_resolved.
-    assert _event_types(conn, facts["task_id"]) == ["task_blocked", "owner_gate_created"]
+    assert _event_counts(conn, facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+    }
     assert len(list_task_owner_gates(pool, task_id=facts["task_id"])) == 2
 
 
@@ -209,8 +222,23 @@ def test_the_task_block_subject_fk_refuses_a_cross_task_block(
     conn: Connection[Any],
 ) -> None:
     facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
-    other_task_id = _insert_task(
-        conn, workspace_id=facts["workspace_id"], repository_id=facts["repository_id"]
+    # A second current Task of the same Repository needs its own GitHub issue
+    # identity: the (repository_id, github_issue_id) current-attempt unique
+    # index refuses a duplicate of the fixture's fixed issue identity.
+    other_task_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.tasks "
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, %s, %s, 'planning', %s)",
+        (
+            other_task_id,
+            facts["workspace_id"],
+            facts["repository_id"],
+            7703,
+            43,
+            "a" * 64,
+        ),
     )
     other_block_id = uuid.uuid4()
     conn.execute(
@@ -219,17 +247,24 @@ def test_the_task_block_subject_fk_refuses_a_cross_task_block(
         (other_block_id, facts["workspace_id"], other_task_id),
     )
 
-    # The gate's TaskBlock subject must be the same Task and Workspace.
-    with pytest.raises(ForeignKeyViolation):
+    # The gate's TaskBlock subject must be the same Task and Workspace. The
+    # linkage foreign key is DEFERRABLE INITIALLY DEFERRED (issue #258
+    # within-Task-aggregate linkage classification), so the pending check is
+    # forced at the assertion point inside a savepoint: the savepoint rolls
+    # the rejected attempt back and the surrounding fixture transaction
+    # stays usable.
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
         conn.execute(
             "insert into openorc.owner_gates "
             "(id, workspace_id, task_id, gate_type, status, task_block_id) "
             "values (%s, %s, %s, 'block_resolution', 'pending', %s)",
             (uuid.uuid4(), facts["workspace_id"], facts["task_id"], other_block_id),
         )
+        conn.execute("set constraints openorc.owner_gates_task_block_fk immediate")
 
-    # An ordinary gate never carries a TaskBlock subject.
-    with pytest.raises(CheckViolation):
+    # An ordinary gate never carries a TaskBlock subject: the subject
+    # coherence CHECK is immediate and refuses the mixed subject form.
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(
             "insert into openorc.owner_gates "
             "(id, workspace_id, task_id, gate_type, status, plan_revision_id, task_block_id) "
@@ -272,4 +307,7 @@ def test_a_stale_or_replayed_installation_applies_nothing(conn: Connection[Any])
     assert task.status is TaskStatus.BLOCKED
     assert task.current_owner_gate_id == first.owner_gate.id
     assert task.state_token == first.task.state_token
-    assert _event_types(conn, facts["task_id"]) == ["task_blocked", "owner_gate_created"]
+    assert _event_counts(conn, facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+    }
