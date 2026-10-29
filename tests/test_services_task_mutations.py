@@ -175,6 +175,7 @@ def _gate_row(
         None,
         "a" * 40,
         None,
+        None,
         decided_at,
         _OBSERVED,
     )

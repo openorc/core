@@ -392,6 +392,7 @@ def _approved_pr_authorization_gate_row() -> tuple[Any, ...]:
         None,
         _HEAD_SHA,
         None,
+        None,
         _OBSERVED,
         _OBSERVED,
     )

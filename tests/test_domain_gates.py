@@ -1,11 +1,13 @@
-"""Domain tests for OwnerGate (issue #24).
+"""Domain tests for OwnerGate (issues #24, #258).
 
 Ordinary deterministic tests: no database, no network. These prove the
 human-authority invariants later persistence and workflow-service behavior
-inherit: the settled four-type and five-status vocabularies, the per-type
-exact-subject binding, resolution coherence (one terminal stamp), and the
-exact field set (no Task status, no optimistic-concurrency token, and no
-updated_at — a resolved gate is immutable history with no update path).
+inherit: the settled seven-type and five-status vocabularies, the per-type
+exact-subject binding (TaskBlock-only subjects for the three exceptional
+types), the fixed exceptional action vocabulary, resolution coherence
+(one terminal stamp), and the exact field set (no Task status, no
+optimistic-concurrency token, and no updated_at — a resolved gate is
+immutable history with no update path).
 """
 
 from __future__ import annotations
@@ -17,10 +19,12 @@ from uuid import uuid4
 import pytest
 
 from openorc.domain.gates import (
+    ExceptionalOwnerGateAction,
     OwnerGate,
     OwnerGateDomainError,
     OwnerGateStatus,
     OwnerGateType,
+    exceptional_owner_gate_actions,
     owner_gate_field_names,
 )
 
@@ -39,6 +43,7 @@ def _gate(**overrides: Any) -> OwnerGate:
         "plan_revision_id": uuid4(),
         "subject_head_sha": None,
         "task_pull_request_id": None,
+        "task_block_id": None,
         "decided_at": None,
         "created_at": _CREATED_AT,
     }
@@ -46,12 +51,15 @@ def _gate(**overrides: Any) -> OwnerGate:
     return OwnerGate(**values)
 
 
-def test_gate_type_vocabulary_is_exactly_the_four_settled_decisions() -> None:
+def test_gate_type_vocabulary_is_exactly_the_seven_settled_decisions() -> None:
     assert {member.value for member in OwnerGateType} == {
         "implementation_authorization",
         "pr_authorization",
         "merge_decision",
         "review_resolution",
+        "block_resolution",
+        "github_issue_change",
+        "github_state_mismatch",
     }
 
 
@@ -84,6 +92,12 @@ def test_implementation_authorization_binds_exactly_the_plan_revision() -> None:
         _gate(
             gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
             subject_head_sha="0123456789abcdef",
+        )
+    # An ordinary gate never binds a TaskBlock subject (issue #258).
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+            task_block_id=uuid4(),
         )
 
 
@@ -120,6 +134,14 @@ def test_pr_authorization_binds_exactly_the_head_sha_without_pr_binding() -> Non
             subject_head_sha="0123456789abcdef0123456789abcdef01234567",
             task_pull_request_id=uuid4(),
         )
+    # An ordinary gate never binds a TaskBlock subject (issue #258).
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            plan_revision_id=None,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_block_id=uuid4(),
+        )
 
 
 def test_merge_decision_binds_exactly_the_pr_plus_exact_head_sha() -> None:
@@ -148,6 +170,15 @@ def test_merge_decision_binds_exactly_the_pr_plus_exact_head_sha() -> None:
             plan_revision_id=uuid4(),
             subject_head_sha=None,
             task_pull_request_id=pr_id,
+        )
+    # An ordinary gate never binds a TaskBlock subject (issue #258).
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.MERGE_DECISION,
+            plan_revision_id=None,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=pr_id,
+            task_block_id=uuid4(),
         )
 
 
@@ -200,6 +231,21 @@ def test_review_resolution_binds_exactly_one_subject() -> None:
             plan_revision_id=None,
             subject_head_sha=None,
         )
+    # An ordinary gate never binds a TaskBlock subject (issue #258).
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=uuid4(),
+            task_block_id=uuid4(),
+        )
+    with pytest.raises(OwnerGateDomainError):
+        _gate(
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=None,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=pr_id,
+            task_block_id=uuid4(),
+        )
 
 
 def test_review_resolution_rejects_wrong_type_subject_ids() -> None:
@@ -223,6 +269,109 @@ def test_review_resolution_rejects_wrong_type_subject_ids() -> None:
         )
 
 
+def test_exceptional_gates_bind_exactly_one_task_block_subject() -> None:
+    # The three exceptional types (issue #258) bind exactly one unresolved
+    # TaskBlock as their only subject: task_block_id is required and every
+    # other subject form is NULL.
+    block_id = uuid4()
+    for gate_type in (
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+    ):
+        gate = _gate(
+            gate_type=gate_type,
+            plan_revision_id=None,
+            subject_head_sha=None,
+            task_pull_request_id=None,
+            task_block_id=block_id,
+        )
+        assert gate.task_block_id == block_id
+        assert gate.plan_revision_id is None
+        assert gate.subject_head_sha is None
+        assert gate.task_pull_request_id is None
+
+
+def test_exceptional_gates_reject_mixed_or_empty_subjects() -> None:
+    # Invalid mixed subjects and the empty subject are all domain errors.
+    for gate_type in (
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+    ):
+        # No subject at all: an exceptional gate is always block-bound.
+        with pytest.raises(OwnerGateDomainError):
+            _gate(
+                gate_type=gate_type,
+                plan_revision_id=None,
+                subject_head_sha=None,
+                task_pull_request_id=None,
+                task_block_id=None,
+            )
+        # A TaskBlock subject mixed with any other subject form.
+        with pytest.raises(OwnerGateDomainError):
+            _gate(
+                gate_type=gate_type,
+                plan_revision_id=uuid4(),
+                task_block_id=uuid4(),
+            )
+        with pytest.raises(OwnerGateDomainError):
+            _gate(
+                gate_type=gate_type,
+                subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+                task_block_id=uuid4(),
+            )
+        with pytest.raises(OwnerGateDomainError):
+            _gate(
+                gate_type=gate_type,
+                task_pull_request_id=uuid4(),
+                task_block_id=uuid4(),
+            )
+        # A wrong-type task_block_id can never masquerade as an absent
+        # subject that silently selects an ordinary subject form.
+        with pytest.raises(OwnerGateDomainError):
+            _gate(
+                gate_type=gate_type,
+                plan_revision_id=None,
+                task_block_id="not-a-uuid",  # type: ignore[arg-type]
+            )
+
+
+def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
+    # The fixed per-type action mapping (issue #49 §14.1): not a dynamic
+    # registry and not an action-execution engine.
+    assert exceptional_owner_gate_actions(OwnerGateType.BLOCK_RESOLUTION) == (
+        ExceptionalOwnerGateAction.RETRY,
+        ExceptionalOwnerGateAction.DISCUSS,
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
+    assert exceptional_owner_gate_actions(OwnerGateType.GITHUB_ISSUE_CHANGE) == (
+        ExceptionalOwnerGateAction.IGNORE,
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
+    assert exceptional_owner_gate_actions(OwnerGateType.GITHUB_STATE_MISMATCH) == (
+        ExceptionalOwnerGateAction.RETRY,
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
+    assert {member.value for member in ExceptionalOwnerGateAction} == {
+        "retry",
+        "discuss",
+        "cancel_task",
+        "ignore",
+    }
+    # Ordinary gate types carry no exceptional action vocabulary.
+    for gate_type in (
+        OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+        OwnerGateType.PR_AUTHORIZATION,
+        OwnerGateType.MERGE_DECISION,
+        OwnerGateType.REVIEW_RESOLUTION,
+    ):
+        with pytest.raises(OwnerGateDomainError):
+            exceptional_owner_gate_actions(gate_type)
+    with pytest.raises(OwnerGateDomainError):
+        exceptional_owner_gate_actions("chat_decision")  # type: ignore[arg-type]
+
+
 def test_gate_requires_uuid_identity_fields() -> None:
     with pytest.raises(OwnerGateDomainError):
         _gate(id="not-a-uuid")  # type: ignore[arg-type]
@@ -234,6 +383,8 @@ def test_gate_requires_uuid_identity_fields() -> None:
         _gate(plan_revision_id="not-a-uuid")  # type: ignore[arg-type]
     with pytest.raises(OwnerGateDomainError):
         _gate(task_pull_request_id="not-a-uuid")  # type: ignore[arg-type]
+    with pytest.raises(OwnerGateDomainError):
+        _gate(task_block_id="not-a-uuid")  # type: ignore[arg-type]
 
 
 def test_pending_gate_carries_no_decided_at_stamp() -> None:
@@ -303,6 +454,7 @@ def test_field_set_carries_only_authority_record_facts() -> None:
             "plan_revision_id",
             "subject_head_sha",
             "task_pull_request_id",
+            "task_block_id",
             "decided_at",
             "created_at",
         }

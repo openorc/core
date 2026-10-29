@@ -390,6 +390,7 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             None,
             None,
             None,
+            None,
             _OBSERVED,
         ),
         "execution": (

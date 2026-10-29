@@ -26,6 +26,7 @@ from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import (
     archive_task,
     bind_canonical_branch,
+    block_task_with_exceptional_gate,
     claim_task_planning_bootstrap,
     create_task,
     find_current_task_by_branch,
@@ -905,3 +906,168 @@ def test_lock_workspace_task_arbitration_takes_the_transaction_scoped_lock() -> 
     sql, params = fake_conn.executed[0]
     assert "pg_advisory_xact_lock" in sql
     assert params == (workspace_id.int & ((1 << 63) - 1),)
+
+
+def test_block_task_with_exceptional_gate_installs_gate_and_blocks_atomically() -> None:
+    # The F3 guarded blocking mutation (issue #258): the pending gate
+    # becomes current, the Task moves to blocked, and the token rotates —
+    # all in one statement.
+    row = _task_row(status="implementing")
+    gate_id = uuid.uuid4()
+    updated = _task_row(
+        id=row[0],
+        status="blocked",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=gate_id,
+    )
+    fake_conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = block_task_with_exceptional_gate(
+        pool,
+        row[0],
+        expected_state_token=row[8],
+        expected_status=TaskStatus.IMPLEMENTING,
+        expected_current_owner_gate_id=None,
+        owner_gate_id=gate_id,
+    )
+
+    assert task is not None
+    assert task.status is TaskStatus.BLOCKED
+    assert task.current_owner_gate_id == gate_id
+    assert task.state_token != row[8]
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.tasks" in sql
+    assert "status = 'blocked'" in sql
+    # The queue-entry timestamp clears when the Task leaves queued.
+    assert "queued_at = case when status = 'queued' then null else queued_at end" in sql
+    # One token rotation, no second statement.
+    assert sql.count("gen_random_uuid()") == 1
+    assert params == (gate_id, row[0], row[8], "implementing", None, gate_id)
+    assert len(fake_conn.executed) == 1
+
+
+def test_block_task_with_exceptional_gate_clears_queued_at_when_leaving_queued() -> None:
+    row = _task_row(status="queued", queued_at=_observed_at())
+    gate_id = uuid.uuid4()
+    updated = _task_row(
+        id=row[0],
+        status="blocked",
+        queued_at=None,
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=gate_id,
+    )
+    fake_conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = block_task_with_exceptional_gate(
+        pool,
+        row[0],
+        expected_state_token=row[8],
+        expected_status=TaskStatus.QUEUED,
+        expected_current_owner_gate_id=None,
+        owner_gate_id=gate_id,
+    )
+
+    assert task is not None
+    assert task.status is TaskStatus.BLOCKED
+    assert task.queued_at is None
+    sql, params = fake_conn.executed[0]
+    assert params == (gate_id, row[0], row[8], "queued", None, gate_id)
+
+
+def test_block_task_with_exceptional_gate_supersedes_the_prior_current_gate() -> None:
+    # A prior current pending gate loses currency without any terminal
+    # stamp: it stays pending history, and the new gate becomes current.
+    prior_gate_id = uuid.uuid4()
+    row = _task_row(status="waiting_for_owner", current_owner_gate_id=prior_gate_id)
+    new_gate_id = uuid.uuid4()
+    updated = _task_row(
+        id=row[0],
+        status="blocked",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=new_gate_id,
+    )
+    fake_conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = block_task_with_exceptional_gate(
+        pool,
+        row[0],
+        expected_state_token=row[8],
+        expected_status=TaskStatus.WAITING_FOR_OWNER,
+        expected_current_owner_gate_id=prior_gate_id,
+        owner_gate_id=new_gate_id,
+    )
+
+    assert task is not None
+    assert task.status is TaskStatus.BLOCKED
+    assert task.current_owner_gate_id == new_gate_id
+    sql, params = fake_conn.executed[0]
+    assert "current_owner_gate_id is not distinct from %s" in sql
+    assert params == (new_gate_id, row[0], row[8], "waiting_for_owner", prior_gate_id, new_gate_id)
+
+
+def test_block_task_with_exceptional_gate_returns_none_when_stale() -> None:
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    assert (
+        block_task_with_exceptional_gate(
+            pool,
+            uuid.uuid4(),
+            expected_state_token=uuid.uuid4(),
+            expected_status=TaskStatus.IMPLEMENTING,
+            expected_current_owner_gate_id=None,
+            owner_gate_id=uuid.uuid4(),
+        )
+        is None
+    )
+    assert fake_conn.executed != []  # the guarded statement ran and matched nothing
+
+
+def test_block_task_with_exceptional_gate_validates_arguments_before_sql() -> None:
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    task_id = uuid.uuid4()
+    token = uuid.uuid4()
+    gate_id = uuid.uuid4()
+    # Terminal statuses are not blocking-mutation sources.
+    for status in (TaskStatus.CANCELLED, TaskStatus.COMPLETED):
+        with pytest.raises(TaskDomainError, match="nonterminal"):
+            block_task_with_exceptional_gate(
+                pool,
+                task_id,
+                expected_state_token=token,
+                expected_status=status,
+                expected_current_owner_gate_id=None,
+                owner_gate_id=gate_id,
+            )
+    with pytest.raises(TaskDomainError, match="UUID"):
+        block_task_with_exceptional_gate(
+            pool,
+            task_id,
+            expected_state_token="not-a-uuid",  # type: ignore[arg-type]
+            expected_status=TaskStatus.IMPLEMENTING,
+            expected_current_owner_gate_id=None,
+            owner_gate_id=gate_id,
+        )
+    with pytest.raises(TaskDomainError, match="UUID"):
+        block_task_with_exceptional_gate(
+            pool,
+            task_id,
+            expected_state_token=token,
+            expected_status=TaskStatus.IMPLEMENTING,
+            expected_current_owner_gate_id="not-a-uuid",  # type: ignore[arg-type]
+            owner_gate_id=gate_id,
+        )
+    with pytest.raises(TaskDomainError, match="UUID"):
+        block_task_with_exceptional_gate(
+            pool,
+            task_id,
+            expected_state_token=token,
+            expected_status=TaskStatus.IMPLEMENTING,
+            expected_current_owner_gate_id=None,
+            owner_gate_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+    assert fake_conn.executed == []

@@ -116,6 +116,7 @@ def _gate_row(**overrides: Any) -> tuple[Any, ...]:
         "plan_revision_id": uuid.uuid4(),
         "subject_head_sha": None,
         "task_pull_request_id": None,
+        "task_block_id": None,
         "decided_at": None,
         "created_at": _observed_at(),
     }
@@ -129,6 +130,7 @@ def _gate_row(**overrides: Any) -> tuple[Any, ...]:
         values["plan_revision_id"],
         values["subject_head_sha"],
         values["task_pull_request_id"],
+        values["task_block_id"],
         values["decided_at"],
         values["created_at"],
     )
@@ -196,6 +198,7 @@ def test_create_owner_gate_inserts_and_maps_the_pending_row() -> None:
     assert gate.plan_revision_id == row[5]
     assert gate.subject_head_sha is None
     assert gate.task_pull_request_id is None
+    assert gate.task_block_id is None
     assert gate.decided_at is None
     assert gate.created_at == _utc_observed_at()
     assert gate.created_at.utcoffset() == timedelta(0)
@@ -212,6 +215,7 @@ def test_create_owner_gate_inserts_and_maps_the_pending_row() -> None:
         "implementation_authorization",
         "pending",
         row[5],
+        None,
         None,
         None,
     )
@@ -246,9 +250,10 @@ def test_merge_decision_binds_the_task_pull_request_plus_head_sha() -> None:
     assert gate.task_pull_request_id == pr_id
     assert gate.subject_head_sha == head
     assert gate.plan_revision_id is None
+    assert gate.task_block_id is None
     sql, params = fake_conn.executed[0]
-    assert "subject_head_sha, task_pull_request_id)" in sql
-    assert params == (row[1], row[2], "merge_decision", "pending", None, head, pr_id)
+    assert "subject_head_sha, task_pull_request_id, task_block_id)" in sql
+    assert params == (row[1], row[2], "merge_decision", "pending", None, head, pr_id, None)
 
 
 def test_pr_subject_gate_shapes_are_validated_before_sql() -> None:
@@ -286,6 +291,129 @@ def test_pr_subject_gate_shapes_are_validated_before_sql() -> None:
             gate_type=OwnerGateType.PR_AUTHORIZATION,
             subject_head_sha="0123456789abcdef0123456789abcdef01234567",
             task_pull_request_id=uuid.uuid4(),
+            **base,
+        )
+    # An ordinary gate never binds a TaskBlock subject (issue #258).
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.REVIEW_RESOLUTION,
+            plan_revision_id=uuid.uuid4(),
+            task_block_id=uuid.uuid4(),
+            **base,
+        )
+    assert fake_conn.executed == []
+
+
+def test_exceptional_gates_bind_exactly_the_task_block_subject() -> None:
+    # The three exceptional types (issue #258) bind exactly one unresolved
+    # TaskBlock as their only subject, persisted as the durable subject.
+    block_id = uuid.uuid4()
+    for gate_type in (
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+    ):
+        row = _gate_row(
+            gate_type=gate_type.value,
+            plan_revision_id=None,
+            subject_head_sha=None,
+            task_pull_request_id=None,
+            task_block_id=block_id,
+        )
+        fake_conn = FakeConnection(row)
+        pool = cast(DatabasePool, FakePool(fake_conn))
+        gate = create_owner_gate(
+            pool,
+            workspace_id=row[1],
+            task_id=row[2],
+            gate_type=gate_type,
+            task_block_id=block_id,
+        )
+        assert gate.gate_type is gate_type
+        assert gate.status is OwnerGateStatus.PENDING
+        assert gate.task_block_id == block_id
+        assert gate.plan_revision_id is None
+        assert gate.subject_head_sha is None
+        assert gate.task_pull_request_id is None
+        sql, params = fake_conn.executed[0]
+        assert "subject_head_sha, task_pull_request_id, task_block_id)" in sql
+        assert params == (row[1], row[2], gate_type.value, "pending", None, None, None, block_id)
+
+
+def test_exceptional_gate_subjects_are_validated_before_sql() -> None:
+    # Subject-shape caller errors never reach SQL (issue #258): the
+    # exceptional types require exactly the TaskBlock subject (no missing
+    # or mixed subject forms), and ordinary types refuse a TaskBlock
+    # subject.
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    base: dict[str, Any] = {"workspace_id": uuid.uuid4(), "task_id": uuid.uuid4()}
+    for gate_type in (
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+    ):
+        # No subject at all.
+        with pytest.raises(OwnerGateDomainError):
+            create_owner_gate(pool, gate_type=gate_type, **base)
+        # Mixed subject forms.
+        with pytest.raises(OwnerGateDomainError):
+            create_owner_gate(
+                pool,
+                gate_type=gate_type,
+                task_block_id=uuid.uuid4(),
+                plan_revision_id=uuid.uuid4(),
+                **base,
+            )
+        with pytest.raises(OwnerGateDomainError):
+            create_owner_gate(
+                pool,
+                gate_type=gate_type,
+                task_block_id=uuid.uuid4(),
+                subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+                **base,
+            )
+        with pytest.raises(OwnerGateDomainError):
+            create_owner_gate(
+                pool,
+                gate_type=gate_type,
+                task_block_id=uuid.uuid4(),
+                task_pull_request_id=uuid.uuid4(),
+                **base,
+            )
+        # A wrong-type task_block_id is a caller error.
+        with pytest.raises(OwnerGateDomainError):
+            create_owner_gate(
+                pool,
+                gate_type=gate_type,
+                task_block_id="not-a-uuid",  # type: ignore[arg-type]
+                **base,
+            )
+    # Ordinary types refuse a TaskBlock subject before any SQL runs.
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+            plan_revision_id=uuid.uuid4(),
+            task_block_id=uuid.uuid4(),
+            **base,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_block_id=uuid.uuid4(),
+            **base,
+        )
+    with pytest.raises(OwnerGateDomainError):
+        create_owner_gate(
+            pool,
+            gate_type=OwnerGateType.MERGE_DECISION,
+            subject_head_sha="0123456789abcdef0123456789abcdef01234567",
+            task_pull_request_id=uuid.uuid4(),
+            task_block_id=uuid.uuid4(),
             **base,
         )
     assert fake_conn.executed == []
@@ -444,7 +572,7 @@ def test_the_module_surface_carries_the_resolution_contract() -> None:
 def _resolved_gate_row(base: tuple[Any, ...], outcome: OwnerGateStatus) -> tuple[Any, ...]:
     row = list(base)
     row[4] = outcome.value
-    row[8] = _observed_at()
+    row[9] = _observed_at()
     return tuple(row)
 
 
