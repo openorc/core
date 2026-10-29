@@ -137,6 +137,7 @@ def _gate_row(
         None,
         head_sha,
         pr_id,
+        None,
         _OBSERVED if status != "pending" else None,
         _OBSERVED,
     )

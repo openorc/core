@@ -305,6 +305,7 @@ def _gate_row(
         plan_revision_id,
         None,
         None,
+        None,
         _OBSERVED if status != "pending" else None,
         _OBSERVED,
     )

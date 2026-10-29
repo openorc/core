@@ -414,6 +414,7 @@ def _gate_row(
         plan_revision_id,
         head_sha,
         pr_id,
+        None,
         _OBSERVED if status != "pending" else None,
         _OBSERVED,
     )

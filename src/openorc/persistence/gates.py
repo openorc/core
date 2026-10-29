@@ -37,7 +37,11 @@ PlanRevision for implementation authorization, the exact head SHA (with
 no PR binding) for the pre-PR authorization gate, the exact
 TaskPullRequest plus the exact head SHA for merge decision, exactly one
 subject for REVIEW_RESOLUTION (planning PlanRevision, or PR subject as
-TaskPullRequest plus exact head SHA).
+TaskPullRequest plus exact head SHA), and — for the three exceptional
+types (issue #258: block_resolution, github_issue_change,
+github_state_mismatch) — exactly the unresolved TaskBlock, with every
+other subject form NULL and ordinary types never carrying a TaskBlock
+subject.
 """
 
 from __future__ import annotations
@@ -75,7 +79,7 @@ __all__ = [
 
 _OWNER_GATE_COLUMNS = (
     "id, workspace_id, task_id, gate_type, status, plan_revision_id, "
-    "subject_head_sha, task_pull_request_id, decided_at, created_at"
+    "subject_head_sha, task_pull_request_id, task_block_id, decided_at, created_at"
 )
 
 
@@ -110,7 +114,7 @@ class OwnerGateResolution:
 
 
 def _owner_gate_from_row(row: Sequence[Any]) -> OwnerGate:
-    decided_at = row[8]
+    decided_at = row[9]
     return OwnerGate(
         id=row[0],
         workspace_id=row[1],
@@ -120,8 +124,9 @@ def _owner_gate_from_row(row: Sequence[Any]) -> OwnerGate:
         plan_revision_id=row[5],
         subject_head_sha=row[6],
         task_pull_request_id=row[7],
+        task_block_id=row[8],
         decided_at=None if decided_at is None else normalize_utc(decided_at),
-        created_at=normalize_utc(row[9]),
+        created_at=normalize_utc(row[10]),
     )
 
 
@@ -130,19 +135,23 @@ def _require_subject(
     plan_revision_id: UUID | None,
     subject_head_sha: str | None,
     task_pull_request_id: UUID | None,
+    task_block_id: UUID | None,
 ) -> None:
     """Mirror the per-type exact-subject coherence at this boundary.
 
     ``pr_authorization`` is the pre-PR exact-head gate (no PR binding:
     it happens before the canonical PR exists); ``merge_decision`` and the
     PR form of ``review_resolution`` bind the canonical TaskPullRequest
-    plus the exact head SHA.
+    plus the exact head SHA. The three exceptional types (issue #258) bind
+    exactly one unresolved TaskBlock as their only subject; the ordinary
+    types never carry a TaskBlock subject.
     """
     if gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
         if (
             not isinstance(plan_revision_id, UUID)
             or subject_head_sha is not None
             or task_pull_request_id is not None
+            or task_block_id is not None
         ):
             raise OwnerGateDomainError(
                 "an implementation_authorization gate requires the exact "
@@ -154,6 +163,7 @@ def _require_subject(
             or not isinstance(subject_head_sha, str)
             or not subject_head_sha.strip()
             or task_pull_request_id is not None
+            or task_block_id is not None
         ):
             raise OwnerGateDomainError(
                 "a pr_authorization gate requires the exact head-SHA subject "
@@ -166,12 +176,13 @@ def _require_subject(
             or not isinstance(subject_head_sha, str)
             or not subject_head_sha.strip()
             or not isinstance(task_pull_request_id, UUID)
+            or task_block_id is not None
         ):
             raise OwnerGateDomainError(
                 "a merge_decision gate requires the exact TaskPullRequest plus "
                 "the exact head SHA and no PlanRevision"
             )
-    else:  # REVIEW_RESOLUTION: exactly one subject form.
+    elif gate_type is OwnerGateType.REVIEW_RESOLUTION:  # exactly one subject form.
         # Nullable subject ids are validated independently of subject-form
         # selection: a wrong-type non-NULL id is a caller error before any
         # SQL runs and can never masquerade as an absent subject that
@@ -184,6 +195,8 @@ def _require_subject(
             raise OwnerGateDomainError(
                 "create_owner_gate requires a UUID task_pull_request_id (or None)"
             )
+        if task_block_id is not None:
+            raise OwnerGateDomainError("a review_resolution gate never binds a TaskBlock subject")
         if plan_revision_id is not None:
             # Planning-exhaustion form: the PlanRevision only.
             if subject_head_sha is not None or task_pull_request_id is not None:
@@ -205,6 +218,21 @@ def _require_subject(
                     "a review_resolution gate on the PR-review subject binds "
                     "exactly the TaskPullRequest plus the exact head SHA"
                 )
+    else:  # The three exceptional types: the unresolved TaskBlock only.
+        if not isinstance(task_block_id, UUID):
+            raise OwnerGateDomainError(
+                f"an {gate_type.value} gate requires the exact unresolved "
+                "TaskBlock subject (task_block_id)"
+            )
+        if (
+            plan_revision_id is not None
+            or subject_head_sha is not None
+            or task_pull_request_id is not None
+        ):
+            raise OwnerGateDomainError(
+                f"an {gate_type.value} gate binds exactly the unresolved "
+                "TaskBlock subject: no PlanRevision, head SHA, or PR binding"
+            )
 
 
 def create_owner_gate(
@@ -216,6 +244,7 @@ def create_owner_gate(
     plan_revision_id: UUID | None = None,
     subject_head_sha: str | None = None,
     task_pull_request_id: UUID | None = None,
+    task_block_id: UUID | None = None,
 ) -> OwnerGate:
     """Insert one pending OwnerGate decision record for a Task.
 
@@ -226,25 +255,31 @@ def create_owner_gate(
     gates are immutable history and are never recycled. The per-type
     exact-subject coherence is validated here (mirroring the domain and the
     database CHECK) so a transaction cannot commit a subject shape the
-    domain rejects; the plan-revision and TaskPullRequest subjects must
-    additionally belong to the same Task and Workspace
-    (``ForeignKeyViolation`` is the durable backstop). Installation as the
-    Task's current gate is a separate authoritative Task mutation
+    domain rejects; the plan-revision, TaskPullRequest, and (issue #258)
+    TaskBlock subjects must additionally belong to the same Task and
+    Workspace (``ForeignKeyViolation`` is the durable backstop). The
+    exceptional gate types bind exactly one TaskBlock subject — the
+    composed installer verifies the block is unresolved, since the foreign
+    key establishes identity and scope only. Installation as the Task's
+    current gate is a separate authoritative Task mutation
     (:func:`openorc.persistence.tasks.set_current_owner_gate`).
     """
     if not isinstance(gate_type, OwnerGateType):
         raise OwnerGateDomainError(
             "create_owner_gate requires an OwnerGateType "
             "(implementation_authorization, pr_authorization, merge_decision, "
-            "or review_resolution)"
+            "review_resolution, block_resolution, github_issue_change, or "
+            "github_state_mismatch)"
         )
-    _require_subject(gate_type, plan_revision_id, subject_head_sha, task_pull_request_id)
+    _require_subject(
+        gate_type, plan_revision_id, subject_head_sha, task_pull_request_id, task_block_id
+    )
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.owner_gates "
             "(workspace_id, task_id, gate_type, status, plan_revision_id, "
-            "subject_head_sha, task_pull_request_id) "
-            "values (%s, %s, %s, %s, %s, %s, %s) "
+            "subject_head_sha, task_pull_request_id, task_block_id) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s) "
             f"returning {_OWNER_GATE_COLUMNS}",
             (
                 workspace_id,
@@ -254,6 +289,7 @@ def create_owner_gate(
                 plan_revision_id,
                 subject_head_sha,
                 task_pull_request_id,
+                task_block_id,
             ),
         ).fetchone()
     assert row is not None

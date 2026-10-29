@@ -304,6 +304,7 @@ def _gate_row(
         plan_revision_id,
         subject_head_sha,
         None,
+        None,
         _OBSERVED if status != "pending" else None,
         _OBSERVED,
     )
@@ -1096,6 +1097,7 @@ def test_a_gate_from_another_task_is_uniformly_not_found(
             "approved",
             None,
             _HEAD_SHA,
+            None,
             None,
             _OBSERVED,
             _OBSERVED,

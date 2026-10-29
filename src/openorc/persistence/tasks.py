@@ -48,6 +48,7 @@ from openorc.persistence.transactions import transaction
 __all__ = [
     "archive_task",
     "bind_canonical_branch",
+    "block_task_with_exceptional_gate",
     "create_task",
     "claim_task_planning_bootstrap",
     "find_current_task_by_branch",
@@ -756,5 +757,79 @@ def set_current_owner_gate(
             "and g.workspace_id = tasks.workspace_id and g.status = 'pending') "
             f"returning {_TASK_COLUMNS}",
             (owner_gate_id, task_id, expected_state_token, owner_gate_id),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def block_task_with_exceptional_gate(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    expected_status: TaskStatus,
+    expected_current_owner_gate_id: UUID | None,
+    owner_gate_id: UUID,
+) -> Task | None:
+    """Install a pending exceptional gate and block the Task atomically.
+
+    The F3 exceptional-blocking foundation's one guarded Task mutation
+    (issue #258): the addressed pending same-Task/Workspace OwnerGate
+    becomes the Task's current gate, the Task moves to ``blocked``, the
+    queue-entry timestamp clears when the Task leaves ``queued``, and
+    ``state_token`` rotates exactly once — all in this single statement.
+
+    Unlike :func:`set_current_owner_gate` (which refuses to replace an
+    existing current gate) this mutation may supersede a prior current
+    pending gate: the replaced gate is untouched and remains pending
+    history with no manufactured outcome — only the current pointer makes
+    a gate actionable. Unlike :func:`update_task_status`, the pointer
+    replacement and the status transition cannot be composed as two
+    rotations; they are one atomic effect here. The caller (the composed
+    installation service) has already verified the expected status,
+    currentness, and the prior gate's pending identity under the Task row
+    lock; this statement's conditions are the durable backstop.
+
+    The update is conditional on the exact expected ``state_token``, the
+    exact expected prior status, the NULL-safe expected current-gate
+    pointer, and non-archived currentness. Returns the updated Task, or
+    ``None`` when any guard no longer matches (a stale operation that must
+    not be retried blindly; the composed caller rolls back every effect).
+    """
+    if not isinstance(expected_state_token, UUID):
+        raise TaskDomainError("expected_state_token must be a UUID")
+    if not isinstance(expected_status, TaskStatus) or expected_status.is_terminal:
+        raise TaskDomainError("expected_status must be a nonterminal TaskStatus")
+    if expected_current_owner_gate_id is not None and not isinstance(
+        expected_current_owner_gate_id, UUID
+    ):
+        raise TaskDomainError("expected_current_owner_gate_id must be None or a UUID")
+    if not isinstance(owner_gate_id, UUID):
+        raise TaskDomainError("owner_gate_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set current_owner_gate_id = %s, "
+            "status = 'blocked', "
+            # The durable queue-entry timestamp (issue #76): cleared when
+            # the Task leaves queued by any later authorized path; the
+            # iff-QUEUED CHECK is the durable backstop.
+            "queued_at = case when status = 'queued' then null else queued_at end, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and status = %s "
+            "and current_owner_gate_id is not distinct from %s "
+            "and exists ("
+            "select 1 from openorc.owner_gates g "
+            "where g.id = %s and g.task_id = tasks.id "
+            "and g.workspace_id = tasks.workspace_id and g.status = 'pending') "
+            f"returning {_TASK_COLUMNS}",
+            (
+                owner_gate_id,
+                task_id,
+                expected_state_token,
+                expected_status.value,
+                expected_current_owner_gate_id,
+                owner_gate_id,
+            ),
         ).fetchone()
     return None if row is None else _task_from_row(row)
