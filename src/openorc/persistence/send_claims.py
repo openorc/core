@@ -55,6 +55,7 @@ __all__ = [
     "create_task_runtime_send_claim",
     "get_task_runtime_send_claim",
     "get_task_runtime_send_claim_for_subject",
+    "get_task_runtime_send_claim_for_update",
     "list_task_runtime_send_claims",
     "record_task_runtime_send_claim_known_non_delivery",
     "settle_task_runtime_send_claim",
@@ -180,6 +181,30 @@ def get_task_runtime_send_claim(
     with transaction(pool) as conn:
         row = conn.execute(
             f"select {_CLAIM_COLUMNS} from openorc.task_runtime_send_claims where id = %s",
+            (claim_id,),
+        ).fetchone()
+    return None if row is None else _claim_from_row(row)
+
+
+def get_task_runtime_send_claim_for_update(
+    pool: DatabasePool, *, claim_id: UUID
+) -> TaskRuntimeSendClaim | None:
+    """Read one send-claim row under an exclusive row lock.
+
+    Serves the Level 2 triage's evidence serialization (issue #251): the
+    claim settles through conditional updates (``settled``,
+    ``known_nondelivery``) that never rotate the Task state token, so the
+    disposition decision must observe the settled state under the same row
+    lock the conditional writers take. Composed inside a service
+    composition, the lock is held on the transaction-scoped connection;
+    outside one, only for this function's own short transaction.
+    Translation into typed application outcomes is a service-layer concern.
+    """
+    _require_uuid(claim_id, "claim_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_CLAIM_COLUMNS} from openorc.task_runtime_send_claims "
+            "where id = %s for update",
             (claim_id,),
         ).fetchone()
     return None if row is None else _claim_from_row(row)

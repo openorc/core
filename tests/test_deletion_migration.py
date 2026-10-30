@@ -58,6 +58,8 @@ OWNERSHIP_CASCADE_CONSTRAINTS = (
     "prompt_template_overrides_workspace_id_fkey",
     "workflow_events_workspace_id_fkey",
     "github_user_authorizations_profile_id_fkey",
+    "operational_failure_episodes_task_id_workspace_id_fkey",
+    "operational_failure_attempts_episode_id_task_id_workspace_id_fkey",
 )
 
 # Restrictive edges: direct Workspace scope-consistency facts of Task-owned
@@ -89,6 +91,7 @@ DEFERRED_RESTRICTIVE_CONSTRAINTS = (
     "runtime_requests_producer_session_id_task_id_workspace_id_fkey",
     "tasks_current_plan_revision_fk",
     "tasks_current_owner_gate_fk",
+    "operational_failure_episodes_escalated_task_block_fk",
 )
 
 # The historical/config cross-references that must never cascade through

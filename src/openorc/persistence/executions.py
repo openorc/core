@@ -70,6 +70,7 @@ __all__ = [
     "complete_execution_with_result",
     "create_execution",
     "get_execution",
+    "get_execution_for_update",
     "list_task_executions",
     "record_execution_activity",
     "update_execution_status",
@@ -170,6 +171,25 @@ def get_execution(pool: DatabasePool, *, execution_id: UUID) -> Execution | None
     with transaction(pool) as conn:
         row = conn.execute(
             f"select {_EXECUTION_COLUMNS} from openorc.executions where id = %s",
+            (execution_id,),
+        ).fetchone()
+    return None if row is None else _execution_from_row(row)
+
+
+def get_execution_for_update(pool: DatabasePool, *, execution_id: UUID) -> Execution | None:
+    """Read one Execution row under an exclusive row lock.
+
+    Serves the Level 2 triage's evidence serialization (issue #251): the
+    row can settle through conditional updates that never rotate the Task
+    state token, so the disposition decision must observe the settled state
+    under the same locks the conditional writers use. Composed inside a
+    service composition, the lock is held on the transaction-scoped
+    connection; outside one, only for this function's own short transaction.
+    Translation into typed application outcomes is a service-layer concern.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_EXECUTION_COLUMNS} from openorc.executions where id = %s for update",
             (execution_id,),
         ).fetchone()
     return None if row is None else _execution_from_row(row)
