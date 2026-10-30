@@ -110,6 +110,7 @@ def _task_fixture(conn: Connection[Any], *, status: TaskStatus) -> dict[str, Any
         "pool": pool,
         "conn": conn,
         "workspace_id": workspace_id,
+        "repository_id": repository_id,
         "task_id": task_id,
         "profile_id": profile_id,
         "state_token": moved.state_token,
@@ -490,37 +491,46 @@ def test_the_settlement_serializes_against_the_locked_triage_evidence_read(
     )
     task_lock_sql = "select state_token from openorc.tasks where id = %s for update"
     claim_lock_sql = "select status from openorc.task_runtime_send_claims where id = %s for update"
-    # Autocommit sessions with explicit transaction blocks: the lock_timeout
-    # SETs apply session-wide, and each blocked waiter raises
-    # LockNotAvailable deterministically instead of hanging the suite.
+    # Autocommit sessions with explicit transaction blocks. The lock_timeout
+    # is applied with SET LOCAL inside each transaction: a session-level SET
+    # does not survive a transaction pooler, and without a bound wait a
+    # blocked waiter hangs until the statement timeout cancels it. With the
+    # bound wait, each blocked waiter raises LockNotAvailable
+    # deterministically. The triage-lock-first ordering runs first because it
+    # commits nothing; the settlement-first ordering then commits the
+    # known_nondelivery outcome, which the final locked re-read observes.
     with (
         connect(migrated_database, autocommit=True) as settlement,
         connect(migrated_database, autocommit=True) as triage,
     ):
-        triage.execute("set lock_timeout = '200ms'")
-        settlement.execute("set lock_timeout = '200ms'")
-        # Ordering 1: the settlement holds the claim row lock; the triage's
+        # Ordering 1: the triage holds the Task lock and the claim lock; the
+        # settlement waits behind them instead of proceeding on a stale read.
+        with triage.transaction():
+            triage.execute("set local lock_timeout = '200ms'")
+            triage.execute(task_lock_sql, (facts["task_id"],))
+            triage.execute(claim_lock_sql, (claim_id,))
+            with pytest.raises(LockNotAvailable), settlement.transaction():
+                settlement.execute("set local lock_timeout = '200ms'")
+                settlement.execute(
+                    settlement_sql, (claim_id, facts["task_id"], facts["workspace_id"])
+                )
+        # Nothing committed: the claim is still claimed for the next ordering.
+
+        # Ordering 2: the settlement holds the claim row lock; the triage's
         # locked evidence read waits behind it.
         with settlement.transaction():
+            settlement.execute("set local lock_timeout = '200ms'")
             settlement.execute(settlement_sql, (claim_id, facts["task_id"], facts["workspace_id"]))
             with pytest.raises(LockNotAvailable), triage.transaction():
+                triage.execute("set local lock_timeout = '200ms'")
                 triage.execute(task_lock_sql, (facts["task_id"],))
                 triage.execute(claim_lock_sql, (claim_id,))
         # The settlement commits; the triage's locked re-read observes the
         # settled truth - never a torn claimed read.
         with triage.transaction():
+            triage.execute("set local lock_timeout = '200ms'")
             status_row = triage.execute(claim_lock_sql, (claim_id,)).fetchone()
             assert status_row is not None and status_row[0] == "known_nondelivery"
-
-        # Ordering 2: the triage holds the Task lock and the claim lock; the
-        # settlement waits behind them instead of proceeding on a stale read.
-        with triage.transaction():
-            triage.execute(task_lock_sql, (facts["task_id"],))
-            triage.execute(claim_lock_sql, (claim_id,))
-            with pytest.raises(LockNotAvailable), settlement.transaction():
-                settlement.execute(
-                    settlement_sql, (claim_id, facts["task_id"], facts["workspace_id"])
-                )
 
     # The committed fixture rows are removed so the branch database stays
     # clean for the rest of the session.
@@ -573,39 +583,11 @@ def test_the_retry_binding_is_set_once_and_scope_exact(conn: Connection[Any]) ->
             ),
         ),
     )
-    bound = failure_repositories.bind_retry_attempt_execution(
-        facts["pool"],
-        attempt_id=attempt.id,
-        task_id=task_id,
-        workspace_id=workspace_id,
-        resulting_execution_id=execution_id,
-    )
-    assert bound is not None and bound.resulting_execution_id == execution_id
-    # Set-once: any later binding attempt is a rejected no-op, whatever the
-    # proposed Execution.
-    assert (
-        failure_repositories.bind_retry_attempt_execution(
-            facts["pool"],
-            attempt_id=attempt.id,
-            task_id=task_id,
-            workspace_id=workspace_id,
-            resulting_execution_id=execution_id,
-        )
-        is None
-    )
-    assert (
-        failure_repositories.bind_retry_attempt_execution(
-            facts["pool"],
-            attempt_id=attempt.id,
-            task_id=task_id,
-            workspace_id=workspace_id,
-            resulting_execution_id=uuid.uuid4(),
-        )
-        is None
-    )
     # The binding is a same-Task/Workspace linkage: a cross-Task Execution
-    # reference is refused (the composite FK is deferred, so the pending
-    # check is forced inside a savepoint).
+    # reference is refused while the authorization is still unbound (the
+    # composite FK is deferred, so the pending check is forced inside a
+    # savepoint; once bound, the set-once guard rejects the update with zero
+    # rows and the foreign key is never reached).
     other_task_id = uuid.uuid4()
     conn.execute(
         "insert into openorc.tasks "
@@ -644,3 +626,41 @@ def test_the_retry_binding_is_set_once_and_scope_exact(conn: Connection[Any]) ->
         conn.execute(
             "set constraints openorc.operational_failure_attempts_resulting_execution_fk immediate"
         )
+    # The legitimate binding: the exact same-Task/Workspace Execution.
+    bound = failure_repositories.bind_retry_attempt_execution(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        resulting_execution_id=execution_id,
+    )
+    assert bound is not None and bound.resulting_execution_id == execution_id
+    # Set-once: any later binding attempt is a rejected no-op, whatever the
+    # proposed Execution (the set-once guard rejects the update with zero
+    # rows before any foreign-key check).
+    assert (
+        failure_repositories.bind_retry_attempt_execution(
+            facts["pool"],
+            attempt_id=attempt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=execution_id,
+        )
+        is None
+    )
+    assert (
+        failure_repositories.bind_retry_attempt_execution(
+            facts["pool"],
+            attempt_id=attempt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=other_execution_id,
+        )
+        is None
+    )
+    # The binding is durable on the attempt row itself.
+    bound_row = conn.execute(
+        "select resulting_execution_id from openorc.operational_failure_attempts where id = %s",
+        (attempt.id,),
+    ).fetchone()
+    assert bound_row is not None and bound_row[0] == execution_id
