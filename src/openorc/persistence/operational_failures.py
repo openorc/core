@@ -55,6 +55,7 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "bind_retry_attempt_execution",
     "create_operational_failure_attempt",
     "create_operational_failure_episode",
     "get_operational_failure_attempt",
@@ -72,7 +73,7 @@ _EPISODE_COLUMNS = (
 
 _ATTEMPT_COLUMNS = (
     "id, workspace_id, task_id, episode_id, ordinal, source_kind, "
-    "source_attempt_id, error_code, not_before, created_at"
+    "source_attempt_id, error_code, not_before, resulting_execution_id, created_at"
 )
 
 
@@ -106,7 +107,8 @@ def _attempt_from_row(row: Sequence[Any]) -> OperationalFailureAttempt:
         source_attempt_id=row[6],
         error_code=OperationalFailureCode(row[7]),
         not_before=normalize_utc(row[8]),
-        created_at=normalize_utc(row[9]),
+        resulting_execution_id=row[9],
+        created_at=normalize_utc(row[10]),
     )
 
 
@@ -276,6 +278,41 @@ def create_operational_failure_attempt(
         ).fetchone()
     assert row is not None
     return _attempt_from_row(row)
+
+
+def bind_retry_attempt_execution(
+    pool: DatabasePool,
+    *,
+    attempt_id: UUID,
+    task_id: UUID,
+    workspace_id: UUID,
+    resulting_execution_id: UUID,
+) -> OperationalFailureAttempt | None:
+    """Bind one consumed authorization to its resulting Execution exactly once.
+
+    The narrow, durable association a subsequent failure report must match:
+    the conditional update applies only while the attempt is in the
+    addressed Task/Workspace scope and still unbound
+    (``resulting_execution_id IS NULL``), writing the exact Execution the
+    executing seam created from it. ``None`` means the attempt is missing,
+    out of scope, or already bound to a different Execution (a conflict the
+    calling service fails closed on). Rebinding the same Execution is an
+    idempotent success. The binding is never cleared or rewritten.
+    """
+    _require_uuid(attempt_id, "attempt_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(resulting_execution_id, "resulting_execution_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.operational_failure_attempts "
+            "set resulting_execution_id = %s "
+            "where id = %s and task_id = %s and workspace_id = %s "
+            "and resulting_execution_id is null "
+            f"returning {_ATTEMPT_COLUMNS}",
+            (resulting_execution_id, attempt_id, task_id, workspace_id),
+        ).fetchone()
+    return None if row is None else _attempt_from_row(row)
 
 
 def mark_episode_escalated(

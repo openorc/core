@@ -308,11 +308,13 @@ class OperationalFailureAttempt:
     source_attempt_id: UUID
     error_code: OperationalFailureCode
     not_before: datetime
+    resulting_execution_id: UUID | None
     created_at: datetime
 
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "episode_id", "source_attempt_id"):
             _require_uuid(getattr(self, name), name)
+        _require_uuid(self.resulting_execution_id, "resulting_execution_id", nullable=True)
         if (
             isinstance(self.ordinal, bool)
             or not isinstance(self.ordinal, int)

@@ -60,6 +60,7 @@ def _attempt(**overrides: object) -> OperationalFailureAttempt:
         "source_attempt_id": uuid4(),
         "error_code": OperationalFailureCode.RUNTIME_UNAVAILABLE,
         "not_before": _OBSERVED,
+        "resulting_execution_id": uuid4(),
         "created_at": _OBSERVED,
     }
     values.update(overrides)
@@ -118,6 +119,7 @@ def test_the_attempt_carries_exactly_its_own_facts() -> None:
             "source_attempt_id",
             "error_code",
             "not_before",
+            "resulting_execution_id",
             "created_at",
         }
     )
@@ -132,6 +134,12 @@ def test_an_attempt_ordinal_must_be_between_one_and_three() -> None:
 def test_attempt_instants_must_be_timezone_aware() -> None:
     with pytest.raises(OperationalFailureDomainError):
         _attempt(not_before=datetime(2026, 10, 30, 12, 0, 0))
+
+
+def test_the_resulting_execution_binding_is_a_nullable_exact_uuid() -> None:
+    assert _attempt(resulting_execution_id=None).resulting_execution_id is None
+    with pytest.raises(OperationalFailureDomainError):
+        _attempt(resulting_execution_id="not-a-uuid")
 
 
 def test_the_episode_subject_is_canonicalized_and_validated() -> None:

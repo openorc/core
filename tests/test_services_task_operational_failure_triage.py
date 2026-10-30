@@ -43,24 +43,34 @@ from openorc.domain.operational_failures import (
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
-from openorc.services.errors import InvalidCommandError, NotFoundError
+from openorc.services.errors import (
+    ConflictError,
+    InvalidCommandError,
+    NotFoundError,
+    StaleOperationError,
+)
 from openorc.services.event_coordination import WorkflowActorContext
 from openorc.services.task_operational_failure_triage import (
     DispositionKind,
     NoOpReason,
     OperationalFailureOperation,
     OperationalFailureReport,
+    bind_retry_attempt_execution,
     triage_operational_failure,
 )
 from tests.test_services_task_pr_review_decision import _event_returned_row
 from tests.test_services_task_pr_review_dispatch import (
+    _HEAD_SHA,
+    _NEW_HEAD_SHA,
     _OBSERVED,
+    _PR_ID,
     _STATE_TOKEN,
     _TASK_ID,
     _WORKSPACE_ID,
     ScriptedConnection,
     _count,
     _pool,
+    _pr_row,
     _session_row,
     _sql_has,
     _sql_lacks,
@@ -96,6 +106,10 @@ _OPENORC_ACTOR = WorkflowActorContext(WorkflowEventActor.OPENORC, None)
 
 _TASK_LOCKED = _sql_has("from openorc.tasks where id", "for update")
 _TASK_PLAIN = _sql_lacks(_sql_has("from openorc.tasks where id"), "for update")
+_EPISODE_READ = _sql_has("from openorc.operational_failure_episodes where id")
+_ATTEMPT_READ = _sql_has("from openorc.operational_failure_attempts where id")
+_ATTEMPT_BIND = _sql_has("update openorc.operational_failure_attempts", "resulting_execution_id")
+_PR_READ = _sql_has("from openorc.task_pull_requests where task_id")
 _EPISODE_BY_ORIGINAL = _sql_has(
     "from openorc.operational_failure_episodes where original_attempt_kind"
 )
@@ -246,6 +260,24 @@ def _planning_iteration_row(*, outcome: str | None = "changes_requested") -> tup
     )
 
 
+def _pr_iteration_row(*, outcome: str | None = "changes_requested") -> tuple[Any, ...]:
+    return (
+        _ITERATION_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _LOOP_ID,
+        1,
+        None,
+        _PR_ID,
+        _HEAD_SHA,
+        outcome,
+        "summary" if outcome else None,
+        ["resolve the failing step"] if outcome else None,
+        _OBSERVED if outcome else None,
+        _OBSERVED,
+    )
+
+
 def _failed_event_row(*, failure_kind: str = "runtime_pre_effect") -> tuple[Any, ...]:
     return (
         uuid4(),
@@ -282,6 +314,7 @@ def _attempt_row(
     source_kind: str = "original",
     source_attempt_id: Any = _EXECUTION_ID,
     not_before: Any = None,
+    resulting_execution_id: Any = _RETRY_EFFECT_ID,
 ) -> tuple[Any, ...]:
     return (
         attempt_id,
@@ -293,6 +326,7 @@ def _attempt_row(
         source_attempt_id,
         "runtime_unavailable",
         not_before if not_before is not None else _NOW,
+        resulting_execution_id,
         _OBSERVED,
     )
 
@@ -484,7 +518,7 @@ def test_the_budget_advances_with_4_and_8_second_backoff_and_the_fourth_escalate
     _script_execution_retry(
         conn,
         episode_row=_episode_row(),
-        attempts_rows=[_attempt_row()],
+        attempts_rows=[_attempt_row(resulting_execution_id=_RETRY_EFFECT_ID)],
         execution_row=_execution(execution_id=_RETRY_EFFECT_ID),
         event_rows=[_failed_event_row()],
         attempt_return=_attempt_row(
@@ -845,23 +879,25 @@ def test_an_unrecognized_code_escalates_with_its_stable_fallback_and_diagnostics
     assert context["diagnostics"] == {"classification": "unrecognized-provider-code"}
 
 
-def test_the_one_shot_remediation_claim_escalates_even_on_proven_pre_effect_failure() -> None:
+def test_a_current_pr_remediation_failure_escalates_through_its_own_subject() -> None:
     conn = ScriptedConnection()
     _script_escalation(
         conn,
-        task_row=_task(status="implementing", plan_revision=_REVISION_ID),
-        execution_row=_execution(review_iteration_id=_ITERATION_ID),
+        task_row=_task(status="reviewing"),
+        execution_row=_execution(
+            execution_id=_REMEDIATION_EXECUTION_ID, review_iteration_id=_ITERATION_ID
+        ),
         extra_setup=lambda c: (
-            c.on(_ITERATION_READ, _planning_iteration_row()),
-            c.on(_LOOP_READ, _loop_row()),
-            c.on(_ITERATIONS_LIST, [_planning_iteration_row()]),
-            c.on(_REVISION_READ, _revision_row()),
-            c.on(_GATES_LIST, [_impl_gate_row()]),
+            c.on(_ITERATION_READ, _pr_iteration_row()),
+            c.on(_LOOP_READ, _loop_row(status="open", purpose="pr_review")),
+            c.on(_ITERATIONS_LIST, [_pr_iteration_row()]),
+            c.on(_PR_READ, _pr_row(head_sha=_HEAD_SHA)),
             c.on(_SESSION_LOCKED, _session_row("producer", _PRODUCER_SESSION_ID, "fake-session-0")),
         ),
     )
     result = _triage(
         conn,
+        status=TaskStatus.REVIEWING,
         operation=_operation(
             family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
             original_id=_REMEDIATION_EXECUTION_ID,
@@ -870,6 +906,36 @@ def test_the_one_shot_remediation_claim_escalates_even_on_proven_pre_effect_fail
     )
     assert result.kind is DispositionKind.BLOCKED
     assert _count(conn, _ATTEMPT_INSERT) == 0
+    block_params = next(params for sql, params in conn.executed if _BLOCK_INSERT(sql, None))
+    assert block_params is not None
+    assert block_params[2] == "connection_unavailable"
+
+
+def test_a_moved_pr_head_supersedes_a_remediation_failure_report() -> None:
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="reviewing"))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _EXECUTION_LOCKED,
+        _execution(execution_id=_REMEDIATION_EXECUTION_ID, review_iteration_id=_ITERATION_ID),
+    )
+    conn.on(_ITERATION_READ, _pr_iteration_row())
+    conn.on(_LOOP_READ, _loop_row(status="open", purpose="pr_review"))
+    conn.on(_ITERATIONS_LIST, [_pr_iteration_row()])
+    conn.on(_PR_READ, _pr_row(head_sha=_NEW_HEAD_SHA))
+    result = _triage(
+        conn,
+        status=TaskStatus.REVIEWING,
+        operation=_operation(
+            family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+            original_id=_REMEDIATION_EXECUTION_ID,
+        ),
+        report=_report(reporting_id=_REMEDIATION_EXECUTION_ID),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+    assert _count(conn, _BLOCK_INSERT) == 0
 
 
 def test_a_current_gate_after_approval_supersedes_the_execution_report() -> None:
@@ -963,3 +1029,135 @@ def test_a_bounded_diagnostic_context_survives_and_an_unbounded_one_is_rejected(
             report=_report(diagnostics={"big": "x" * 5000}),
         )
     assert conn.executed == []
+
+
+def test_an_original_report_must_corroborate_its_exact_original_execution() -> None:
+    conn = ScriptedConnection()
+    with pytest.raises(InvalidCommandError):
+        _triage(conn, report=_report(effect=uuid4()))
+    assert conn.executed == []
+
+
+def test_an_unbound_authorized_attempt_report_is_stale() -> None:
+    # The authorization was never executed (no durable resulting-Execution
+    # binding): a failure report about it addresses nothing that ran.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_EPISODE_BY_ORIGINAL, _episode_row())
+    conn.on(_ATTEMPTS_LIST, [_attempt_row(resulting_execution_id=None)])
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_EXECUTION_LOCKED, _execution(execution_id=_RETRY_EFFECT_ID))
+    result = _triage(
+        conn,
+        report=_report(
+            reporting_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_id=_ATTEMPT_1_ID,
+            effect=_RETRY_EFFECT_ID,
+        ),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+    assert _count(conn, _ATTEMPT_INSERT) == 0
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_a_mismatched_effect_binding_is_stale() -> None:
+    # The authorization is durably bound to one exact Execution; a report
+    # naming a different failed_transient Execution of the same Task must
+    # never authorize another retry against the wrong evidence.
+    other_execution_id = uuid4()
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_EPISODE_BY_ORIGINAL, _episode_row())
+    conn.on(_ATTEMPTS_LIST, [_attempt_row()])
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_EXECUTION_LOCKED, _execution(execution_id=other_execution_id))
+    result = _triage(
+        conn,
+        report=_report(
+            reporting_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_id=_ATTEMPT_1_ID,
+            effect=other_execution_id,
+        ),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+    assert _count(conn, _ATTEMPT_INSERT) == 0
+
+
+def test_the_binding_service_binds_consumed_authorizations_exactly_once() -> None:
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_ATTEMPT_READ, _attempt_row(resulting_execution_id=None))
+    conn.on(_EPISODE_READ, _episode_row())
+    conn.on(_EXECUTION_LOCKED, _execution(execution_id=_RETRY_EFFECT_ID))
+    conn.on(
+        _ATTEMPT_BIND,
+        _attempt_row(resulting_execution_id=_RETRY_EFFECT_ID),
+    )
+    bound = bind_retry_attempt_execution(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        retry_attempt_id=_ATTEMPT_1_ID,
+        resulting_execution_id=_RETRY_EFFECT_ID,
+    )
+    assert bound.resulting_execution_id == _RETRY_EFFECT_ID
+    bind_params = next(params for sql, params in conn.executed if _ATTEMPT_BIND(sql, None))
+    assert bind_params is not None
+    assert bind_params[0] == _RETRY_EFFECT_ID
+    assert bind_params[1] == _ATTEMPT_1_ID
+
+    # Rebinding the same Execution is an idempotent success with no write.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_ATTEMPT_READ, _attempt_row(resulting_execution_id=_RETRY_EFFECT_ID))
+    conn.on(_EPISODE_READ, _episode_row())
+    conn.on(_EXECUTION_LOCKED, _execution(execution_id=_RETRY_EFFECT_ID))
+    bound = bind_retry_attempt_execution(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        retry_attempt_id=_ATTEMPT_1_ID,
+        resulting_execution_id=_RETRY_EFFECT_ID,
+    )
+    assert bound.resulting_execution_id == _RETRY_EFFECT_ID
+    assert _count(conn, _ATTEMPT_BIND) == 0
+
+
+def test_the_binding_service_fails_closed_on_conflicts_and_stale_state() -> None:
+    base = dict(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        retry_attempt_id=_ATTEMPT_1_ID,
+        resulting_execution_id=_RETRY_EFFECT_ID,
+    )
+    # A different Execution for an already-bound authorization is a conflict.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_ATTEMPT_READ, _attempt_row(resulting_execution_id=_EXECUTION_ID))
+    conn.on(_EPISODE_READ, _episode_row())
+    conn.on(_EXECUTION_LOCKED, _execution(execution_id=_RETRY_EFFECT_ID))
+    with pytest.raises(ConflictError):
+        bind_retry_attempt_execution(_pool(conn), **base)
+    # A terminally disposed episode can no longer execute its authorizations.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_ATTEMPT_READ, _attempt_row(resulting_execution_id=None))
+    conn.on(_EPISODE_READ, _episode_row(escalated=_BLOCK_ID))
+    with pytest.raises(ConflictError):
+        bind_retry_attempt_execution(_pool(conn), **base)
+    # A stale token is a stale operation that applies nothing.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(state_token=uuid4()))
+    with pytest.raises(StaleOperationError):
+        bind_retry_attempt_execution(_pool(conn), **base)
+    # A missing authorization is the uniform not-found vocabulary.
+    conn = ScriptedConnection()
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_ATTEMPT_READ, None)
+    with pytest.raises(NotFoundError):
+        bind_retry_attempt_execution(_pool(conn), **base)

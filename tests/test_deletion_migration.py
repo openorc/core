@@ -92,6 +92,7 @@ DEFERRED_RESTRICTIVE_CONSTRAINTS = (
     "tasks_current_plan_revision_fk",
     "tasks_current_owner_gate_fk",
     "operational_failure_episodes_escalated_task_block_fk",
+    "operational_failure_attempts_resulting_execution_fk",
 )
 
 # The historical/config cross-references that must never cascade through

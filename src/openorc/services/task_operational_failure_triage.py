@@ -79,7 +79,12 @@ from openorc.domain.operational_failures import (
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
-from openorc.domain.reviews import ReviewIteration, ReviewLoopStatus, ReviewOutcome
+from openorc.domain.reviews import (
+    ReviewIteration,
+    ReviewLoopPurpose,
+    ReviewLoopStatus,
+    ReviewOutcome,
+)
 from openorc.domain.send_claims import (
     TaskRuntimeSendClaimKind,
     TaskRuntimeSendClaimStatus,
@@ -91,12 +96,18 @@ from openorc.persistence import events as event_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import operational_failures as failure_records
+from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
-from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
+from openorc.services.errors import (
+    ConflictError,
+    InvalidCommandError,
+    NotFoundError,
+    StaleOperationError,
+)
 from openorc.services.event_coordination import WorkflowActorContext
 from openorc.services.task_exceptional_blocking import (
     ExceptionalBlockInstallation,
@@ -111,6 +122,7 @@ __all__ = [
     "OperationalFailureDisposition",
     "OperationalFailureOperation",
     "OperationalFailureReport",
+    "bind_retry_attempt_execution",
     "triage_operational_failure",
 ]
 
@@ -413,13 +425,21 @@ def triage_operational_failure(
             "an original-attempt report must address the operation's original attempt identity"
         )
     if (
+        report.reporting_attempt_kind is OperationalFailureSourceKind.ORIGINAL
+        and report.effect_attempt_id is not None
+        and report.effect_attempt_id != operation.original_attempt_id
+    ):
+        raise InvalidCommandError(
+            "an original-attempt report must corroborate its exact original "
+            "attempt identity, never a different effect row"
+        )
+    if (
         report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
-        and operation.family in _RETRY_ELIGIBLE_FAMILIES
         and report.effect_attempt_id is None
     ):
         raise InvalidCommandError(
-            "an authorized-attempt report for a retry-eligible family must "
-            "reference the durable effect row its execution produced"
+            "an authorized-attempt report must reference the durable effect "
+            "row its execution produced"
         )
     try:
         canonical_bounded_failure_context(report.diagnostic_context)
@@ -450,6 +470,86 @@ def triage_operational_failure(
                 report=report,
                 now=now,
             )
+
+
+def bind_retry_attempt_execution(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    retry_attempt_id: UUID,
+    resulting_execution_id: UUID,
+) -> OperationalFailureAttempt:
+    """Bind one consumed retry authorization to its resulting Execution.
+
+    The executing seam (the Level 1/F5 invocation that consumed the
+    authorization) records the exact durable Execution it created from the
+    authorized attempt: one short composition under the Task row lock, the
+    authorization's episode not terminally disposed, the Execution in the
+    same Task/Workspace scope, and a set-once conditional write. Rebinding
+    the same Execution is an idempotent success; binding a different one is
+    a conflict that fails closed. A later failure report about the
+    authorization must address exactly this Execution.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    _require_uuid_command(retry_attempt_id, "retry_attempt_id")
+    _require_uuid_command(resulting_execution_id, "resulting_execution_id")
+    with composed_transaction(pool) as transaction_pool:
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = locked
+        if task.archived_at is not None:
+            raise StaleOperationError("the task has already been archived; the operation is stale")
+        if task.state_token != expected_state_token:
+            raise StaleOperationError(
+                "the task state has moved on since this operation was prepared; "
+                "the operation is stale"
+            )
+        attempt = failure_records.get_operational_failure_attempt(
+            transaction_pool, attempt_id=retry_attempt_id
+        )
+        if attempt is None or attempt.workspace_id != workspace_id or attempt.task_id != task_id:
+            raise NotFoundError("the requested retry attempt is not available for this task")
+        episode = failure_records.get_operational_failure_episode(
+            transaction_pool, episode_id=attempt.episode_id
+        )
+        if episode is None or episode.escalated_task_block_id is not None:
+            raise ConflictError(
+                "the retry attempt's failure episode is terminally disposed; "
+                "the authorization can no longer be executed"
+            )
+        execution = execution_records.get_execution_for_update(
+            transaction_pool, execution_id=resulting_execution_id
+        )
+        if (
+            execution is None
+            or execution.workspace_id != workspace_id
+            or execution.task_id != task_id
+        ):
+            raise NotFoundError("the requested resulting execution is not available for this task")
+        if attempt.resulting_execution_id is not None:
+            if attempt.resulting_execution_id == resulting_execution_id:
+                return attempt
+            raise ConflictError(
+                "the retry attempt is already bound to a different resulting execution"
+            )
+        bound = failure_records.bind_retry_attempt_execution(
+            transaction_pool,
+            attempt_id=retry_attempt_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=resulting_execution_id,
+        )
+        if bound is None:
+            raise ConflictError(
+                "the retry attempt could not record its resulting execution; "
+                "the binding composition is stale"
+            )
+        return bound
 
 
 def _triage_locked(
@@ -527,11 +627,19 @@ def _triage_locked(
         )
 
     # A prior-authorized report must address an existing authorized attempt
-    # of exactly this episode.
+    # of exactly this episode whose consumed authorization was actually
+    # executed — and whose durable resulting-Execution binding matches the
+    # reported effect row exactly. An unbound or mismatched effect never
+    # authorizes another retry.
     reported_attempt: OperationalFailureAttempt | None = None
     if report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED:
         reported_attempt = next((a for a in attempts if a.id == report.reporting_attempt_id), None)
-        if reported_attempt is None or episode is None:
+        if (
+            reported_attempt is None
+            or episode is None
+            or reported_attempt.resulting_execution_id is None
+            or reported_attempt.resulting_execution_id != report.effect_attempt_id
+        ):
             return _stale_no_op()
 
     # Per-family verification under the evidence locks: exact subject
@@ -924,13 +1032,17 @@ def _verify_execution_family(
     """Verify one execution family's attempt, subject currency, and binding.
 
     The execution row is locked because it finalizes through conditional
-    updates that never rotate the Task token. The post-approval subject
-    contract mirrors the Level 1 authorized-execution seam: an
-    IMPLEMENTING Task with no current gate, the exact current plan
-    revision, and the historical APPROVED IMPLEMENTATION_AUTHORIZATION gate
-    bound to that revision (the remediation variant instead requires its
-    claimed CHANGES_REQUESTED iteration to still be the loop's current
-    routed one). A succeeded attempt contradicts any failure report.
+    updates that never rotate the Task token. Each family mirrors its own
+    Level 1 service's subject contract:
+
+    - implementation execution: an ``IMPLEMENTING`` Task with no current
+      gate, the exact current plan revision, and the historical APPROVED
+      IMPLEMENTATION_AUTHORIZATION gate bound to that revision;
+    - PR remediation execution: a ``REVIEWING`` Task whose canonical
+      TaskPullRequest still carries exactly the claimed CHANGES_REQUESTED
+      ReviewIteration's reviewed head — the head is the remediation subject.
+
+    A succeeded attempt contradicts any failure report.
     """
     effect_execution_id = (
         report.effect_attempt_id
@@ -947,6 +1059,21 @@ def _verify_execution_family(
     if operation.family is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION:
         if execution.review_iteration_id is not None:
             return _stale_no_op()
+        if task.status is not TaskStatus.IMPLEMENTING or task.current_owner_gate_id is not None:
+            return _stale_no_op()
+        if task.current_plan_revision_id is None:
+            return _stale_no_op()
+        revision = require_current_plan_revision(
+            transaction_pool, task=task, plan_revision_id=task.current_plan_revision_id
+        )
+        gate = _resolve_approved_implementation_gate(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            revision_id=revision.id,
+        )
+        if gate is None:
+            return _stale_no_op()
     else:
         if execution.review_iteration_id is None:
             return _stale_no_op()
@@ -960,26 +1087,51 @@ def _verify_execution_family(
             or iteration.outcome is not ReviewOutcome.CHANGES_REQUESTED
         ):
             return _stale_no_op()
-        stale = _review_iteration_superseded(
-            transaction_pool, workspace_id=workspace_id, iteration=iteration
+        loop = review_records.get_review_loop(
+            transaction_pool, review_loop_id=iteration.review_loop_id
         )
-        if stale is not None:
-            return stale
-    if task.status is not TaskStatus.IMPLEMENTING or task.current_owner_gate_id is not None:
-        return _stale_no_op()
-    if task.current_plan_revision_id is None:
-        return _stale_no_op()
-    revision = require_current_plan_revision(
-        transaction_pool, task=task, plan_revision_id=task.current_plan_revision_id
-    )
-    gate = _resolve_approved_implementation_gate(
-        transaction_pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        revision_id=revision.id,
-    )
-    if gate is None:
-        return _stale_no_op()
+        if (
+            loop is None
+            or loop.workspace_id != workspace_id
+            or loop.task_id != task_id
+            or loop.purpose is not ReviewLoopPurpose.PR_REVIEW
+            or loop.status is not ReviewLoopStatus.OPEN
+        ):
+            return _stale_no_op()
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if any(other.iteration_number > iteration.iteration_number for other in iterations):
+            # A later routed iteration means this remediation already resolved.
+            return _stale_no_op()
+        if task.status is not TaskStatus.REVIEWING:
+            return _stale_no_op()
+        # The remediation subject is the exact current PR head: the canonical
+        # TaskPullRequest must still carry exactly the addressed iteration's
+        # reviewed head, and the iteration must still be the last finalized
+        # result on that head — the E2 supersession rule the Level 1
+        # remediation service proves before any dispatch. A moved head or a
+        # newer same-head result supersedes the reported attempt.
+        pull_request = pull_request_records.get_task_pull_request_for_task(
+            transaction_pool, task_id=task_id
+        )
+        if (
+            pull_request is None
+            or pull_request.workspace_id != workspace_id
+            or pull_request.task_id != task_id
+            or pull_request.head_sha != iteration.reviewed_head_sha
+            or pull_request.id != iteration.task_pull_request_id
+        ):
+            return _stale_no_op()
+        finalized_on_head = [
+            other
+            for other in iterations
+            if other.outcome is not None
+            and other.task_pull_request_id == pull_request.id
+            and other.reviewed_head_sha == pull_request.head_sha
+        ]
+        if not finalized_on_head or finalized_on_head[-1].id != iteration.id:
+            return _stale_no_op()
     return _require_applicable_binding(
         transaction_pool,
         task_id=task_id,

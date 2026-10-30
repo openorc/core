@@ -136,3 +136,32 @@ def test_the_migration_grants_no_new_privileges() -> None:
     assert "grant " not in text
     assert "create policy" not in text
     assert "alter table openorc.tasks" not in text
+
+
+def test_every_statement_is_terminated_and_paren_balanced() -> None:
+    # A deployability guard the database itself would enforce only at apply
+    # time: every statement in the committed migration is closed, no CREATE
+    # TABLE swallows the next statement, and no stray closer trails the file.
+    raw = _migration_text_raw()
+    assert raw.rstrip().endswith(";")
+    statements = [statement for statement in raw.split(";") if statement.strip()]
+    assert len(statements) >= 10
+    for statement in statements:
+        stripped = re.sub(r"--[^\n]*", "", statement)
+        assert stripped.count("(") == stripped.count(")"), statement[:80]
+        assert "create table" not in stripped or stripped.rstrip().endswith(")")
+
+
+def test_the_attempt_binds_its_resulting_execution_exactly_once() -> None:
+    raw = _collapsed(_migration_text_raw())
+    assert "resulting_execution_id uuid" in raw
+    assert (
+        "alter table openorc.executions add constraint "
+        "executions_id_task_id_workspace_id_uniq unique (id, task_id, workspace_id)"
+    ) in raw
+    assert (
+        "add constraint operational_failure_attempts_resulting_execution_fk "
+        "foreign key (resulting_execution_id, task_id, workspace_id) "
+        "references openorc.executions (id, task_id, workspace_id) "
+        "deferrable initially deferred"
+    ) in raw

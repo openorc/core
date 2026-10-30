@@ -12,6 +12,9 @@ The focused real-Postgres checks the F4 seam owns:
 - an escalation commits the F3 block/gate/BLOCKED/audit composition and the
   episode's set-once terminal TaskBlock reference together, and a repeated
   report is a no-op that names the exact disposed TaskBlock;
+- a consumed authorization binds its resulting Execution exactly once and
+  exactly within the same Task/Workspace scope (the composite linkage FK
+  refuses a cross-Task effect);
 - a settlement that never touches the Task row (the claim's
   ``known_nondelivery`` conditional update) serializes against the triage's
   locked evidence read in both orderings: the locked read blocks behind the
@@ -31,7 +34,12 @@ from typing import Any, cast
 
 import pytest
 from psycopg import Connection, connect
-from psycopg.errors import CheckViolation, LockNotAvailable, UniqueViolation
+from psycopg.errors import (
+    CheckViolation,
+    ForeignKeyViolation,
+    LockNotAvailable,
+    UniqueViolation,
+)
 
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.operational_failures import (
@@ -519,3 +527,120 @@ def test_the_settlement_serializes_against_the_locked_triage_evidence_read(
     conn.execute("delete from openorc.workspaces where id = %s", (facts["workspace_id"],))
     conn.execute("delete from auth.users where id = %s", (facts["profile_id"],))
     conn.commit()
+
+
+def test_the_retry_binding_is_set_once_and_scope_exact(conn: Connection[Any]) -> None:
+    facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
+    workspace_id = facts["workspace_id"]
+    task_id = facts["task_id"]
+    original_id = uuid.uuid4()
+    episode = failure_repositories.create_operational_failure_episode(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        operation_family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        original_attempt_kind=OriginalAttemptKind.EXECUTION,
+        original_attempt_id=original_id,
+        subject={"execution_id": str(original_id)},
+    )
+    attempt = failure_repositories.create_operational_failure_attempt(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        episode_id=episode.id,
+        ordinal=1,
+        source_kind=OperationalFailureSourceKind.ORIGINAL,
+        source_attempt_id=original_id,
+        error_code=OperationalFailureCode.RUNTIME_UNAVAILABLE,
+        not_before=_NOW + timedelta(seconds=2),
+    )
+    execution_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.executions "
+        "(id, workspace_id, task_id, producer_session_id, execution_number, status) "
+        "values (%s, %s, %s, %s, 1, 'queued')",
+        (
+            execution_id,
+            workspace_id,
+            task_id,
+            _insert_ready_session(
+                conn,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                connection_id=_insert_connection(conn, workspace_id=workspace_id),
+                role="producer",
+                external_session_id="fake-producer-bind",
+            ),
+        ),
+    )
+    bound = failure_repositories.bind_retry_attempt_execution(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        resulting_execution_id=execution_id,
+    )
+    assert bound is not None and bound.resulting_execution_id == execution_id
+    # Set-once: any later binding attempt is a rejected no-op, whatever the
+    # proposed Execution.
+    assert (
+        failure_repositories.bind_retry_attempt_execution(
+            facts["pool"],
+            attempt_id=attempt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=execution_id,
+        )
+        is None
+    )
+    assert (
+        failure_repositories.bind_retry_attempt_execution(
+            facts["pool"],
+            attempt_id=attempt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=uuid.uuid4(),
+        )
+        is None
+    )
+    # The binding is a same-Task/Workspace linkage: a cross-Task Execution
+    # reference is refused (the composite FK is deferred, so the pending
+    # check is forced inside a savepoint).
+    other_task_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.tasks "
+        "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
+        "source_requirements_fingerprint) "
+        "values (%s, %s, %s, 7704, 44, 'planning', %s)",
+        (other_task_id, workspace_id, facts["repository_id"], "a" * 64),
+    )
+    other_execution_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.executions "
+        "(id, workspace_id, task_id, producer_session_id, execution_number, status) "
+        "values (%s, %s, %s, %s, 1, 'queued')",
+        (
+            other_execution_id,
+            workspace_id,
+            other_task_id,
+            _insert_ready_session(
+                conn,
+                workspace_id=workspace_id,
+                task_id=other_task_id,
+                connection_id=_insert_connection(conn, workspace_id=workspace_id),
+                role="producer",
+                external_session_id="fake-producer-bind-2",
+            ),
+        ),
+    )
+    with pytest.raises(ForeignKeyViolation), conn.transaction():
+        failure_repositories.bind_retry_attempt_execution(
+            facts["pool"],
+            attempt_id=attempt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            resulting_execution_id=other_execution_id,
+        )
+        conn.execute(
+            "set constraints openorc.operational_failure_attempts_resulting_execution_fk immediate"
+        )
