@@ -81,6 +81,7 @@ __all__ = [
     "count_active_task_agent_sessions_by_connection",
     "ensure_task_agent_session",
     "get_task_agent_session",
+    "get_task_agent_session_for_update",
     "initialize_task_agent_session",
     "list_active_task_agent_sessions",
     "list_task_agent_sessions",
@@ -198,6 +199,30 @@ def get_task_agent_session(
         row = conn.execute(
             f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
             "where task_id = %s and role = %s",
+            (task_id, role.value),
+        ).fetchone()
+    return None if row is None else _session_from_row(row)
+
+
+def get_task_agent_session_for_update(
+    pool: DatabasePool, *, task_id: UUID, role: WorkflowRole
+) -> TaskAgentSession | None:
+    """Read one Task role's session binding under an exclusive row lock.
+
+    Serves the Level 2 triage's evidence serialization (issue #251): the
+    binding's lifecycle status moves through conditional updates (``lost``,
+    ``ended``) that never rotate the Task state token, so a disposition
+    decision that depends on the binding's applicability must observe it
+    under the same row lock the lifecycle writers take. Composed inside a
+    service composition, the lock is held on the transaction-scoped
+    connection; outside one, only for this function's own short transaction.
+    Translation into typed application outcomes is a service-layer concern.
+    """
+    _require_role(role)
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
+            "where task_id = %s and role = %s for update",
             (task_id, role.value),
         ).fetchone()
     return None if row is None else _session_from_row(row)

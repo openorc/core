@@ -340,6 +340,7 @@ def test_the_module_surface_is_history_shaped() -> None:
         "complete_execution_with_result",
         "create_execution",
         "get_execution",
+        "get_execution_for_update",
         "list_task_executions",
         "record_execution_activity",
         "update_execution_status",
