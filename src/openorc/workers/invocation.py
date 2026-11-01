@@ -644,6 +644,19 @@ class OperationInvocation:
             raise InvalidInvocationError(
                 f"the payload type does not match the operation kind {self.kind.value!r}"
             )
+        # Construction-time role correspondence (issue #253): a Task-workflow
+        # payload whose consuming role does not match its kind is rejected at
+        # construction — the same fail-closed validation the strict decoder
+        # applies on the wire — so directly constructed regular-mode
+        # invocations can never bypass it.
+        expected_role = _TASK_KIND_ROLES.get(self.kind)
+        if expected_role is not None:
+            task_scope = getattr(self.payload, "task", None)
+            if not isinstance(task_scope, TaskScope) or task_scope.role is not expected_role:
+                raise InvalidInvocationError(
+                    "the invocation field 'role' does not match the operation kind "
+                    f"{self.kind.value!r}"
+                )
 
     def encode(self) -> str:
         """Encode to the stable JSON wire form."""

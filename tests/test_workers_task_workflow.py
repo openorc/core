@@ -29,6 +29,7 @@ from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_review_decision import PlanningReviewDecision
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pr_review_decision import PrReviewDecision
+from openorc.services.task_start import TaskStartStatus
 from openorc.workers import task_workflow
 from openorc.workers.invocation import (
     ExecutionModeDependencyError,
@@ -39,6 +40,7 @@ from openorc.workers.invocation import (
     OperationPayload,
     OperationSubmitter,
     RQQueueOperationSubmission,
+    SubmissionOutcome,
     SubmissionRefusalReason,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
@@ -1140,3 +1142,118 @@ def test_entrypoint_delivers_task_operations_through_the_production_table(
     assert len(delivered) == 1
     assert delivered[0].kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION
     assert delivered[0].payload == payload
+
+
+# --- explicit workflow entry continuations (review remediations) --------------
+
+
+def _fake_start_outcome(status: Any, state_token: UUID) -> Any:
+    return SimpleNamespace(
+        status=status,
+        task=SimpleNamespace(id=_TASK_ID, workspace_id=_WORKSPACE_ID, state_token=state_token),
+    )
+
+
+def test_start_continuation_submits_the_exact_bootstrap_invocation() -> None:
+    dependencies, submitter = make_dependencies()
+
+    result = task_workflow.submit_planning_bootstrap_after_start(
+        cast(Any, _fake_start_outcome(TaskStartStatus.PLANNING, _STATE_TOKEN)),
+        profile_id=_PROFILE_ID,
+        dependencies=dependencies,
+    )
+
+    assert result is not None
+    assert result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    assert isinstance(submitted.payload, TaskPlanningBootstrapAndInitialPlanPayload)
+    # The exact post-start token and the starting Owner's accountable Profile.
+    assert submitted.payload.task == _TASK_SCOPE_PRODUCER
+    assert submitted.payload.profile_id == str(_PROFILE_ID)
+    assert submitted.payload.expected_state_token == str(_STATE_TOKEN)
+
+
+def test_queued_start_has_no_bootstrap_continuation() -> None:
+    dependencies, submitter = make_dependencies()
+
+    result = task_workflow.submit_planning_bootstrap_after_start(
+        cast(Any, _fake_start_outcome(TaskStartStatus.QUEUED, _STATE_TOKEN)),
+        profile_id=_PROFILE_ID,
+        dependencies=dependencies,
+    )
+
+    assert result is None
+    assert submitter.submissions == []
+
+
+def test_implementation_approval_continuation_submits_the_exact_invocation() -> None:
+    dependencies, submitter = make_dependencies()
+    authorization = cast(
+        Any,
+        SimpleNamespace(
+            task=SimpleNamespace(id=_TASK_ID, workspace_id=_WORKSPACE_ID, state_token=_NEXT_TOKEN),
+            owner_gate=SimpleNamespace(id=_OWNER_GATE_ID),
+        ),
+    )
+
+    result = task_workflow.submit_authorized_implementation_after_approval(
+        authorization, profile_id=_PROFILE_ID, dependencies=dependencies
+    )
+
+    assert result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION
+    assert isinstance(submitted.payload, TaskAuthorizedImplementationPayload)
+    assert submitted.payload.task == _TASK_SCOPE_PRODUCER
+    assert submitted.payload.profile_id == str(_PROFILE_ID)
+    assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
+    # The approved gate is re-derived by the executing service and is never
+    # carried on the implementation wire.
+    assert not hasattr(submitted.payload, "owner_gate_id")
+
+
+def test_pr_authorization_approval_continuation_submits_the_exact_invocation() -> None:
+    dependencies, submitter = make_dependencies()
+    authorization = cast(
+        Any,
+        SimpleNamespace(
+            task=SimpleNamespace(id=_TASK_ID, workspace_id=_WORKSPACE_ID, state_token=_NEXT_TOKEN),
+            owner_gate=SimpleNamespace(id=_OWNER_GATE_ID),
+        ),
+    )
+
+    result = task_workflow.submit_pr_composition_after_approval(
+        authorization, profile_id=_PROFILE_ID, dependencies=dependencies
+    )
+
+    assert result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_PR_COMPOSITION
+    assert isinstance(submitted.payload, TaskPrCompositionPayload)
+    assert submitted.payload.task == _TASK_SCOPE_PRODUCER
+    # The exact approved gate identity and post-approval token.
+    assert submitted.payload.owner_gate_id == str(_OWNER_GATE_ID)
+    assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_directly_constructed_invocation_rejects_a_mismatched_role() -> None:
+    # Regular mode executes directly constructed invocations without the wire
+    # decoder; the construction-time role correspondence keeps the same
+    # fail-closed validation in every mode (issue #253).
+    with pytest.raises(InvalidInvocationError, match="role"):
+        OperationInvocation(
+            kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
+            payload=TaskAuthorizedImplementationPayload(
+                task=TaskScope(
+                    workspace_id=str(_WORKSPACE_ID),
+                    task_id=str(_TASK_ID),
+                    role=WorkflowRoleRef.REVIEWER,
+                ),
+                profile_id=str(_PROFILE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        )

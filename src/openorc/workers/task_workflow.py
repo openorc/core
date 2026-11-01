@@ -64,7 +64,10 @@ from openorc.services.task_authorized_implementation_execution import (
     ProducerRuntimeAttachmentFactory,
     execute_authorized_implementation,
 )
-from openorc.services.task_implementation_authorization import open_implementation_authorization
+from openorc.services.task_implementation_authorization import (
+    ImplementationAuthorization,
+    open_implementation_authorization,
+)
 from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
     produce_initial_task_plan,
@@ -79,7 +82,7 @@ from openorc.services.task_planning_review_decision import (
     finalize_planning_review_decision,
 )
 from openorc.services.task_planning_review_dispatch import dispatch_planning_review
-from openorc.services.task_pr_authorization import open_pr_authorization
+from openorc.services.task_pr_authorization import ApprovedPrAuthorization, open_pr_authorization
 from openorc.services.task_pr_composition import TaskPrPublished, compose_and_publish_task_pr
 from openorc.services.task_pr_remediation import TaskPrRemediationOutcome
 from openorc.services.task_pr_review_decision import finalize_pr_review_decision
@@ -87,6 +90,7 @@ from openorc.services.task_pr_review_dispatch import (
     ReviewerRuntimeAttachmentFactory,
     dispatch_pr_review,
 )
+from openorc.services.task_start import TaskStartOutcome, TaskStartStatus
 from openorc.services.task_subject_guards import (
     require_canonical_task_pull_request,
     require_current_plan_revision,
@@ -99,6 +103,7 @@ from openorc.workers.invocation import (
     OperationInvocation,
     OperationKind,
     SubmissionOutcome,
+    SubmissionResult,
     TaskAuthorizedImplementationPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
@@ -111,6 +116,9 @@ from openorc.workers.invocation import (
 __all__ = [
     "build_task_workflow_handlers",
     "execute_task_workflow_operation",
+    "submit_authorized_implementation_after_approval",
+    "submit_planning_bootstrap_after_start",
+    "submit_pr_composition_after_approval",
 ]
 
 logger = logging.getLogger(__name__)
@@ -301,7 +309,7 @@ def _reload_published_subjects(
 
 def _submit_continuation(
     dependencies: OperationDependencies, invocation: OperationInvocation
-) -> None:
+) -> SubmissionResult:
     """Submit one authorized continuation for delivery in the executing process.
 
     Regular mode admits the follow-up into the serving process's own bounded
@@ -320,6 +328,120 @@ def _submit_continuation(
             result.outcome.value,
             result.refusal_reason.value if result.refusal_reason is not None else "none",
         )
+    return result
+
+
+# --- explicit workflow entry continuations -----------------------------------
+
+
+def submit_planning_bootstrap_after_start(
+    outcome: TaskStartOutcome,
+    *,
+    profile_id: UUID,
+    dependencies: OperationDependencies,
+) -> SubmissionResult | None:
+    """Submit the planning bootstrap after one successful Task start (E1a to E1b).
+
+    The explicitly invoked application continuation of the E1a start
+    outcome: a ``PLANNING`` start carries the post-write Task with its
+    rotated ``state_token`` and both admitted role bindings — the #203
+    handoff — so this helper constructs the exact typed bootstrap invocation
+    from that outcome and submits it for delivery. A ``QUEUED`` start has no
+    continuation (``None``). The accountable Owner Profile is the starting
+    caller's own identity, supplied explicitly and re-proven by the
+    executing service. The returned submission outcome is transport
+    information only, never Task truth: a known refusal or uncertain
+    submission never fails the already-completed start and is never retried
+    here.
+    """
+    if outcome.status is not TaskStartStatus.PLANNING:
+        return None
+    return _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
+            payload=TaskPlanningBootstrapAndInitialPlanPayload(
+                task=TaskScope(
+                    workspace_id=str(outcome.task.workspace_id),
+                    task_id=str(outcome.task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(profile_id),
+                expected_state_token=str(outcome.task.state_token),
+            ),
+        ),
+    )
+
+
+def submit_authorized_implementation_after_approval(
+    authorization: ImplementationAuthorization,
+    *,
+    profile_id: UUID,
+    dependencies: OperationDependencies,
+) -> SubmissionResult:
+    """Submit the authorized implementation after one E5 approval (E5 to E6).
+
+    The explicitly invoked application continuation of the Owner's
+    implementation approval: the ``ImplementationAuthorization`` carries the
+    post-write ``implementing`` Task with its rotated ``state_token`` — the
+    durable handoff E6 addresses — so this helper constructs the exact typed
+    invocation from that outcome and submits it for delivery. The approved
+    gate and its exact-plan subject are re-derived by the executing service
+    and are never carried on the wire. The accountable Owner Profile is the
+    approving caller's own identity, supplied explicitly and re-proven by
+    the executing service. The returned submission outcome is transport
+    information only, never Task truth.
+    """
+    return _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
+            payload=TaskAuthorizedImplementationPayload(
+                task=TaskScope(
+                    workspace_id=str(authorization.task.workspace_id),
+                    task_id=str(authorization.task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(profile_id),
+                expected_state_token=str(authorization.task.state_token),
+            ),
+        ),
+    )
+
+
+def submit_pr_composition_after_approval(
+    authorization: ApprovedPrAuthorization,
+    *,
+    profile_id: UUID,
+    dependencies: OperationDependencies,
+) -> SubmissionResult:
+    """Submit PR composition/publish after one E7 approval (E7 to E8).
+
+    The explicitly invoked application continuation of the Owner's
+    publication approval: the ``ApprovedPrAuthorization`` carries the
+    post-write Task with its rotated ``state_token`` and the exact approved
+    ``PR_AUTHORIZATION`` gate, so this helper constructs the exact typed
+    invocation from that outcome and submits it for delivery. The
+    accountable Owner Profile is the approving caller's own identity,
+    supplied explicitly and re-proven by the executing service. The returned
+    submission outcome is transport information only, never Task truth.
+    """
+    return _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PR_COMPOSITION,
+            payload=TaskPrCompositionPayload(
+                task=TaskScope(
+                    workspace_id=str(authorization.task.workspace_id),
+                    task_id=str(authorization.task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(profile_id),
+                owner_gate_id=str(authorization.owner_gate.id),
+                expected_state_token=str(authorization.task.state_token),
+            ),
+        ),
+    )
 
 
 # --- per-kind compositions ---------------------------------------------------
