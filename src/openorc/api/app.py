@@ -54,12 +54,17 @@ def _serving_lifespan(
         initialize_observability(settings, ObservabilitySurface.API)
         executor: BoundedLocalExecutor | None = None
         if settings.execution_mode is ExecutionMode.REGULAR:
+            dependencies = build_default_operation_dependencies(settings)
             executor = BoundedLocalExecutor(
                 workers=settings.local_executor_workers,
                 pending=settings.local_executor_pending,
                 handlers=build_production_handlers(),
-                dependencies=build_default_operation_dependencies(settings),
+                dependencies=dependencies,
             )
+            # The serving process's own executor is the regular-mode
+            # continuation submitter: authorized follow-up operations are
+            # admitted back into the same bounded executor (issue #253).
+            dependencies.bind_regular_process_submitter(executor)
         app.state.operation_executor = executor
         app.state.operation_submitter = build_operation_submitter(settings, local_executor=executor)
         try:

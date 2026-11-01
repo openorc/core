@@ -41,6 +41,10 @@ uv is the dependency/build tool, not a runtime dependency: environments that rec
 - **`regular` (default):** the API process executes operations through one bounded local executor per serving process (`OPENORC_LOCAL_EXECUTOR_WORKERS`, default 2, minimum 1; `OPENORC_LOCAL_EXECUTOR_PENDING`, default 8, minimum 1 — both running and waiting work are bounded). No RQ worker and no queue backend are required, started, or contacted. The RQ worker refuses to start in regular mode.
 - **`queue` (opt-in):** operations are delivered through RQ/Valkey to independently deployed workers. This mode requires an explicitly supplied `VALKEY_URL` and fails configuration/startup without one; no implicit localhost backend is ever selected.
 
+### Runtime workspaces
+
+`OPENORC_REVIEWER_NEUTRAL_DIRECTORY` names the deployment's existing runtime-side neutral non-repository directory the Reviewer session is constructed in (issue #253). The planning bootstrap establishes the Reviewer session there, and the workflow's Reviewer attachments reconstruct in it; it is required (fail-fast) when a Task-workflow operation executes without it and is deployment configuration, never Workspace state.
+
 ### Queue backend (queue mode only)
 
 In queue mode, the worker connects to any Redis-compatible backend selected through the explicitly supplied `VALKEY_URL`.

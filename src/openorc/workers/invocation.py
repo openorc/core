@@ -9,7 +9,7 @@ mechanism — determines whether anything remains current or authorized.
 Boundary rules enforced by this module:
 
 - The operation-kind discriminator is closed (:class:`OperationKind`). New
-  kinds are added explicitly by later leaves (F3a/F3b); there are no
+  kinds are added explicitly by later leaves; there are no
   arbitrary module/function names, executable callables, pickled domain
   objects, unvalidated ``**kwargs``, or open-ended authority dictionaries
   in a wire payload.
@@ -20,10 +20,12 @@ Boundary rules enforced by this module:
   service-result DTOs. UUIDs and enums use stable JSON-safe representations.
 - Strict decoding rejects unknown kinds, unexpected fields, malformed
   types, and missing required fields before any service/runtime effect.
-- Dispatch fails closed when a kind has no registered handler. F1 registers
-  no production handlers: F3a adds the typed Task-workflow handlers and F3b
-  registers the GitHub delivery/reconciliation handlers that invoke the
-  existing application services directly with process-local dependencies.
+- Dispatch fails closed when a kind has no registered handler. The
+  production handler table registers the F5a Task-workflow handlers
+  (``openorc.workers.task_workflow``), which invoke the existing E-series
+  application services directly with process-local dependencies; the two
+  GitHub delivery/reconciliation kinds remain deliberately unregistered
+  until F9 (issue #255).
 - Submission distinguishes accepted-for-delivery, known refusal/failure,
   and uncertain queue submission. Acceptance is never completion, external
   effect, or retry authorization; queue/job IDs are never operation
@@ -39,7 +41,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 import rq
@@ -54,6 +56,10 @@ from openorc.persistence.pool import DatabasePool, get_database_pool
 from openorc.services.errors import InvalidCommandError
 from openorc.workers.bootstrap import create_redis_client
 from openorc.workers.queues import queue_name
+
+if TYPE_CHECKING:
+    from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
+    from openorc.services.task_planning_bootstrap import TaskBootstrapRuntimeComposition
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +98,18 @@ class OperationKind(StrEnum):
 
     GITHUB_WEBHOOK_DELIVERY_DISPATCH = "github_webhook_delivery_dispatch"
     GITHUB_RECONCILIATION_SWEEP = "github_reconciliation_sweep"
+
+    # The F5a Task-workflow operation catalog (issue #253): the minimal
+    # existing authorized workflow operations, each composed by
+    # openorc.workers.task_workflow over the existing E-series services.
+    # Tightly coupled in-process sequences stay within one logical
+    # invocation; no speculative session operations, RuntimeRequest
+    # framework kinds, or generalized orchestration graph members.
+    TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN = "task_planning_bootstrap_and_initial_plan"
+    TASK_PLANNING_REVIEW = "task_planning_review"
+    TASK_AUTHORIZED_IMPLEMENTATION = "task_authorized_implementation"
+    TASK_PR_COMPOSITION = "task_pr_composition"
+    TASK_PR_REVIEW = "task_pr_review"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -150,10 +168,10 @@ class TaskScope:
     The Task-scoped identity a Task-based operation payload carries: the
     existing durable Workspace and Task units of work plus the consuming
     workflow role. This component is the strictly validated, JSON-safe
-    envelope machinery later leaves (F3a) compose into concrete Task-workflow
-    operation kinds; F1 registers no Task-workflow kinds and wires no
-    workflow behavior. Identifiers are canonical UUID strings and the role
-    is a closed enum value — never credentials, live handles, or content.
+    envelope machinery the F5a Task-workflow payloads (issue #253) compose
+    into concrete Task-workflow operation kinds. Identifiers are canonical
+    UUID strings and the role is a closed enum value — never credentials,
+    live handles, or content.
     """
 
     workspace_id: str
@@ -189,6 +207,176 @@ class TaskScope:
             workspace_id=_require_canonical_uuid(fields["workspace_id"], "workspace_id"),
             task_id=_require_canonical_uuid(fields["task_id"], "task_id"),
             role=WorkflowRoleRef(raw_role),
+        )
+
+
+# --- F5a Task-workflow operation payloads (issue #253) ----------------------
+
+# The per-kind consuming workflow role a Task-workflow payload must carry:
+# the wire vocabulary stays self-describing, and a payload whose role does
+# not match its kind is rejected before any effect.
+_TASK_KIND_ROLES: Mapping[OperationKind, WorkflowRoleRef] = {
+    OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: WorkflowRoleRef.PRODUCER,
+    OperationKind.TASK_PLANNING_REVIEW: WorkflowRoleRef.REVIEWER,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: WorkflowRoleRef.PRODUCER,
+    OperationKind.TASK_PR_COMPOSITION: WorkflowRoleRef.PRODUCER,
+    OperationKind.TASK_PR_REVIEW: WorkflowRoleRef.REVIEWER,
+}
+
+
+def _decode_task_scope_for_kind(raw: object, kind: OperationKind) -> TaskScope:
+    """Strictly decode the Task-scope component, pinned to the kind's role."""
+    scope = TaskScope.decode(raw)
+    if scope.role is not _TASK_KIND_ROLES[kind]:
+        raise InvalidInvocationError(
+            f"the invocation field 'role' does not match the operation kind {kind.value!r}"
+        )
+    return scope
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningBootstrapAndInitialPlanPayload:
+    """The planning bootstrap + initial PLAN operation payload (F5a, issue #253).
+
+    The exact durable Workspace/Task units with the consuming Producer role,
+    the accountable Owner Profile identity, and the exact post-start
+    ``state_token`` the bootstrap continuation re-proves. The tightly
+    coupled E1b→E2 preparation→initial-PLAN sequence executes within this
+    one logical invocation. No prompts, plan results, directories,
+    credentials, SDK handles, or service-result DTOs are carried.
+    """
+
+    task: TaskScope
+    profile_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningReviewPayload:
+    """The planning REVIEW dispatch/decision operation payload (F5a).
+
+    The exact durable Workspace/Task units with the consuming Reviewer
+    role, the accountable Owner Profile identity, and the exact Task
+    ``state_token`` authorizing this review round (the post-plan token for
+    the first round, the post-revise token for a later round). The round's
+    E3a dispatch→E3b decision sequence executes within this one logical
+    invocation; the reviewed PlanRevision and reserved ReviewIteration are
+    re-derived from durable state, never wire-carried.
+    """
+
+    task: TaskScope
+    profile_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAuthorizedImplementationPayload:
+    """The E5-authorized initial implementation operation payload (F5a).
+
+    The exact durable Workspace/Task units with the consuming Producer
+    role, the accountable Owner Profile identity, and the exact post-E5
+    approval ``state_token``. The approved IMPLEMENTATION_AUTHORIZATION
+    gate and its exact-plan subject are re-derived from durable state by
+    the executing service (never caller-supplied); the payload carries no
+    gate resolution, plan text, review content, or runtime handles.
+    """
+
+    task: TaskScope
+    profile_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPrCompositionPayload:
+    """The E8 PR composition/publish operation payload (F5a).
+
+    The exact durable Workspace/Task units with the consuming Producer
+    role, the accountable Owner Profile identity (the approving Profile
+    whose user authorization publishes — never substituted), the exact
+    current PR_AUTHORIZATION OwnerGate, and the exact post-E7 approval
+    ``state_token``. No PR presentation, head SHA, or publication result
+    is carried; the canonical PR is created from durable facts.
+    """
+
+    task: TaskScope
+    profile_id: str
+    owner_gate_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self, "owner_gate_id", _require_canonical_uuid(self.owner_gate_id, "owner_gate_id")
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPrReviewPayload:
+    """The PR REVIEW dispatch/decision operation payload (F5a).
+
+    The exact durable Workspace/Task units with the consuming Reviewer
+    role, the accountable Owner Profile identity, the exact canonical
+    ``TaskPullRequest`` record the dispatch addresses, and the exact
+    post-publication ``state_token``. The reconciled head SHA is resolved
+    authoritatively by the executing service; the remediation continuation
+    stays within this one logical invocation.
+    """
+
+    task: TaskScope
+    profile_id: str
+    task_pull_request_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "task_pull_request_id",
+            _require_canonical_uuid(self.task_pull_request_id, "task_pull_request_id"),
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
         )
 
 
@@ -232,11 +420,32 @@ class ReconciliationSweepPayload:
             )
 
 
-OperationPayload = WebhookDeliveryDispatchPayload | ReconciliationSweepPayload
+OperationPayload = (
+    WebhookDeliveryDispatchPayload
+    | ReconciliationSweepPayload
+    | TaskPlanningBootstrapAndInitialPlanPayload
+    | TaskPlanningReviewPayload
+    | TaskAuthorizedImplementationPayload
+    | TaskPrCompositionPayload
+    | TaskPrReviewPayload
+)
 
 _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: frozenset({"delivery_guid"}),
     OperationKind.GITHUB_RECONCILIATION_SWEEP: frozenset({"sweep_tick"}),
+    OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: frozenset(
+        {"task", "profile_id", "expected_state_token"}
+    ),
+    OperationKind.TASK_PLANNING_REVIEW: frozenset({"task", "profile_id", "expected_state_token"}),
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: frozenset(
+        {"task", "profile_id", "expected_state_token"}
+    ),
+    OperationKind.TASK_PR_COMPOSITION: frozenset(
+        {"task", "profile_id", "owner_gate_id", "expected_state_token"}
+    ),
+    OperationKind.TASK_PR_REVIEW: frozenset(
+        {"task", "profile_id", "task_pull_request_id", "expected_state_token"}
+    ),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -245,6 +454,13 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
 _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: WebhookDeliveryDispatchPayload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: ReconciliationSweepPayload,
+    OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: (
+        TaskPlanningBootstrapAndInitialPlanPayload
+    ),
+    OperationKind.TASK_PLANNING_REVIEW: TaskPlanningReviewPayload,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskAuthorizedImplementationPayload,
+    OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
+    OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
 }
 
 
@@ -271,9 +487,82 @@ def _decode_reconciliation_sweep_payload(raw: object) -> ReconciliationSweepPayl
     return ReconciliationSweepPayload(sweep_tick=tick)
 
 
+def _decode_task_planning_bootstrap_payload(
+    raw: object,
+) -> TaskPlanningBootstrapAndInitialPlanPayload:
+    kind = OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskPlanningBootstrapAndInitialPlanPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
+def _decode_task_planning_review_payload(raw: object) -> TaskPlanningReviewPayload:
+    kind = OperationKind.TASK_PLANNING_REVIEW
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskPlanningReviewPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
+def _decode_task_authorized_implementation_payload(
+    raw: object,
+) -> TaskAuthorizedImplementationPayload:
+    kind = OperationKind.TASK_AUTHORIZED_IMPLEMENTATION
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskAuthorizedImplementationPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
+def _decode_task_pr_composition_payload(raw: object) -> TaskPrCompositionPayload:
+    kind = OperationKind.TASK_PR_COMPOSITION
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskPrCompositionPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        owner_gate_id=_require_canonical_uuid(fields["owner_gate_id"], "owner_gate_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
+def _decode_task_pr_review_payload(raw: object) -> TaskPrReviewPayload:
+    kind = OperationKind.TASK_PR_REVIEW
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskPrReviewPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        task_pull_request_id=_require_canonical_uuid(
+            fields["task_pull_request_id"], "task_pull_request_id"
+        ),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
 _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: _decode_webhook_delivery_dispatch_payload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: _decode_reconciliation_sweep_payload,
+    OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: _decode_task_planning_bootstrap_payload,
+    OperationKind.TASK_PLANNING_REVIEW: _decode_task_planning_review_payload,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: _decode_task_authorized_implementation_payload,
+    OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
+    OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
 }
 
 
@@ -287,6 +576,46 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         kind is OperationKind.GITHUB_RECONCILIATION_SWEEP
     ):
         return {"sweep_tick": payload.sweep_tick}
+    if isinstance(payload, TaskPlanningBootstrapAndInitialPlanPayload) and (
+        kind is OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskPlanningReviewPayload) and (
+        kind is OperationKind.TASK_PLANNING_REVIEW
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskAuthorizedImplementationPayload) and (
+        kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskPrCompositionPayload) and (
+        kind is OperationKind.TASK_PR_COMPOSITION
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "owner_gate_id": payload.owner_gate_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskPrReviewPayload) and kind is OperationKind.TASK_PR_REVIEW:
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "task_pull_request_id": payload.task_pull_request_id,
+            "expected_state_token": payload.expected_state_token,
+        }
     raise InvalidInvocationError(
         f"the payload type does not match the operation kind {kind.value!r}"
     )
@@ -366,6 +695,37 @@ def decode_operation_invocation(raw: str | bytes | Mapping[str, object]) -> Oper
 
 DatabasePoolProvider = Callable[[Settings], DatabasePool]
 GitHubClientProvider = Callable[[Settings], GitHubAppClient]
+BootstrapRuntimeCompositionProvider = Callable[[Settings], "TaskBootstrapRuntimeComposition"]
+UserTokenResolverProvider = Callable[[Settings], "ProfileUserAccessTokenResolver"]
+ReviewerNeutralDirectoryProvider = Callable[[Settings], str]
+ContinuationSubmitterProvider = Callable[[Settings], "OperationSubmitter"]
+
+
+class LateBoundProcessSubmitter:
+    """The late-bound regular-mode continuation-submitter provider.
+
+    Regular-mode continuation submission admits follow-up work into the
+    serving process's own bounded local executor. That executor is
+    constructed with the very dependencies object that resolves the
+    submitter, so the provider binds the executor explicitly after
+    construction (the serving lifespan owns exactly one executor per
+    process, issue #86). Until bound, resolution fails closed; the binding
+    carries no credentials, live handles, or workflow authority.
+    """
+
+    def __init__(self) -> None:
+        self._submitter: OperationSubmitter | None = None
+
+    def bind(self, submitter: OperationSubmitter) -> None:
+        """Bind the process's own bounded local executor."""
+        self._submitter = submitter
+
+    def __call__(self, settings: Settings) -> OperationSubmitter:
+        if self._submitter is None:
+            raise ExecutionModeDependencyError(
+                "no process-local operation submitter is bound for continuation submission"
+            )
+        return self._submitter
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,15 +735,24 @@ class OperationDependencies:
     Providers resolve lazily, inside the executing process, when a handler
     requests them: the database pool is the PID-scoped process-local pool
     boundary and the GitHub client is built from deployment configuration at
-    the point of use. Later leaves extend this object (for example the
-    admitted Cline connection attachment required by Task-workflow
-    handlers); tests inject recording fakes. Dependencies carry no
-    credentials, live handles, or customer content.
+    the point of use. The F5a Task-workflow providers (issue #253) extend
+    this object the same way: the bootstrap runtime composition, the
+    Owner-accountable Profile user-token resolver, the deployment's
+    reviewer-neutral directory, and the continuation submitter are all
+    resolved only inside the executing process — never before an RQ fork
+    and never in a submitting HTTP request. Tests inject recording fakes
+    through the provider fields. Dependencies carry no credentials, live
+    handles, or customer content, and no universal service locator exists:
+    every provider is an explicitly named seam.
     """
 
     settings: Settings
     database_pool_provider: DatabasePoolProvider | None = None
     github_client_provider: GitHubClientProvider | None = None
+    bootstrap_runtime_composition_provider: BootstrapRuntimeCompositionProvider | None = None
+    user_token_resolver_provider: UserTokenResolverProvider | None = None
+    reviewer_neutral_directory_provider: ReviewerNeutralDirectoryProvider | None = None
+    continuation_submitter_provider: ContinuationSubmitterProvider | None = None
 
     def database_pool(self) -> DatabasePool:
         """Resolve the executing process's database pool."""
@@ -401,13 +770,82 @@ class OperationDependencies:
             )
         return self.github_client_provider(self.settings)
 
+    def task_bootstrap_runtime_composition(self) -> TaskBootstrapRuntimeComposition:
+        """Resolve the executing process's bootstrap runtime composition."""
+        if self.bootstrap_runtime_composition_provider is None:
+            raise ExecutionModeDependencyError(
+                "no bootstrap runtime composition provider is configured for operation dependencies"
+            )
+        return self.bootstrap_runtime_composition_provider(self.settings)
+
+    def user_token_resolver(self) -> ProfileUserAccessTokenResolver:
+        """Resolve the executing process's Profile user-token resolver."""
+        if self.user_token_resolver_provider is None:
+            raise ExecutionModeDependencyError(
+                "no user token resolver provider is configured for operation dependencies"
+            )
+        return self.user_token_resolver_provider(self.settings)
+
+    def reviewer_neutral_directory(self) -> str:
+        """Resolve the executing process's reviewer-neutral directory."""
+        if self.reviewer_neutral_directory_provider is None:
+            raise ExecutionModeDependencyError(
+                "no reviewer-neutral directory provider is configured for operation dependencies"
+            )
+        return self.reviewer_neutral_directory_provider(self.settings)
+
+    def continuation_submitter(self) -> OperationSubmitter:
+        """Resolve the executing process's continuation-operation submitter."""
+        if self.continuation_submitter_provider is None:
+            raise ExecutionModeDependencyError(
+                "no continuation submitter provider is configured for operation dependencies"
+            )
+        return self.continuation_submitter_provider(self.settings)
+
+    def bind_regular_process_submitter(self, submitter: OperationSubmitter) -> None:
+        """Bind the serving process's own executor as the continuation submitter.
+
+        Regular-mode wiring only: the serving lifespan binds the one bounded
+        local executor it constructed after the dependencies object exists.
+        A provider that is not the late-bound process seam is a wiring error.
+        """
+        provider = self.continuation_submitter_provider
+        if not isinstance(provider, LateBoundProcessSubmitter):
+            raise ExecutionModeDependencyError(
+                "operation dependencies are not wired with the late-bound "
+                "regular-mode process submitter"
+            )
+        provider.bind(submitter)
+
 
 def build_default_operation_dependencies(settings: Settings) -> OperationDependencies:
-    """Wire the real process-local providers for an executing process."""
+    """Wire the real process-local providers for an executing process.
+
+    The Task-workflow providers come from the F5a composition module; the
+    import is deferred because that module imports this one. In regular
+    mode the continuation submitter is the late-bound process seam the
+    serving lifespan binds to its executor; in queue mode each continuation
+    enqueues through the canonical queue seam.
+    """
+    from openorc.workers.task_workflow import (
+        default_bootstrap_runtime_composition_provider,
+        default_reviewer_neutral_directory_provider,
+        default_user_token_resolver_provider,
+    )
+
+    continuation_provider: ContinuationSubmitterProvider
+    if settings.execution_mode is ExecutionMode.REGULAR:
+        continuation_provider = LateBoundProcessSubmitter()
+    else:
+        continuation_provider = RQQueueOperationSubmission
     return OperationDependencies(
         settings=settings,
         database_pool_provider=get_database_pool,
         github_client_provider=HttpGitHubAppClient.from_settings,
+        bootstrap_runtime_composition_provider=default_bootstrap_runtime_composition_provider,
+        user_token_resolver_provider=default_user_token_resolver_provider,
+        reviewer_neutral_directory_provider=default_reviewer_neutral_directory_provider,
+        continuation_submitter_provider=continuation_provider,
     )
 
 
@@ -427,13 +865,17 @@ class OperationHandler(Protocol):
 def build_production_handlers() -> Mapping[OperationKind, OperationHandler]:
     """The explicit kind-to-handler table for production executing processes.
 
-    F1 registers no production handlers: the table stays fail-closed until
-    F3a adds the typed Task-workflow handlers and F3b registers the GitHub
-    delivery/reconciliation handlers that invoke the existing application
-    services directly with process-local dependencies. The existing RQ job
-    entrypoints are separate transports and remain unchanged.
+    F5a (issue #253) registers the Task-workflow handlers, which invoke the
+    existing application services directly with process-local dependencies
+    through the single composition seam in ``openorc.workers.task_workflow``.
+    The two GitHub delivery/reconciliation kinds remain deliberately
+    unregistered until F9 (issue #255), so dispatch still fails closed for
+    them. The existing RQ job entrypoints are separate transports and
+    remain unchanged.
     """
-    return {}
+    from openorc.workers.task_workflow import build_task_workflow_handlers
+
+    return build_task_workflow_handlers()
 
 
 def invoke_operation(

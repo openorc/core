@@ -95,6 +95,7 @@ EXECUTION_MODE_QUEUE = "queue"
 # per serving process. Both running and waiting work must stay bounded.
 LOCAL_EXECUTOR_WORKERS_VAR = "OPENORC_LOCAL_EXECUTOR_WORKERS"
 LOCAL_EXECUTOR_PENDING_VAR = "OPENORC_LOCAL_EXECUTOR_PENDING"
+REVIEWER_NEUTRAL_DIRECTORY_VAR = "OPENORC_REVIEWER_NEUTRAL_DIRECTORY"
 
 DEFAULT_ENVIRONMENT = "development"
 PRODUCTION_ENVIRONMENT = "production"
@@ -319,6 +320,13 @@ class Settings:
     # capacity so both running and waiting work stay bounded.
     local_executor_workers: int = DEFAULT_LOCAL_EXECUTOR_WORKERS
     local_executor_pending: int = DEFAULT_LOCAL_EXECUTOR_PENDING
+    # The existing runtime-side neutral non-repository directory the Reviewer
+    # session is constructed in (issue #253): supplied to the planning
+    # bootstrap's fresh Reviewer attachment and reconstructed in by the
+    # workflow's Reviewer attachments. Deployment configuration, never
+    # Workspace state; required (fail-fast) when a Task-workflow operation
+    # executes without it.
+    reviewer_neutral_directory: str | None = None
     otlp_endpoint: str | None = None
 
     @classmethod
@@ -512,6 +520,17 @@ class Settings:
             default=DEFAULT_LOCAL_EXECUTOR_PENDING,
         )
 
+        # The reviewer-neutral directory (issue #253). Optional deployment
+        # configuration: the Task-workflow provider that consumes it fails
+        # fast at the point of use when it is absent. A supplied-but-blank
+        # value is a configuration error, never silently unset.
+        reviewer_neutral_directory = _read(source, REVIEWER_NEUTRAL_DIRECTORY_VAR)
+        if reviewer_neutral_directory is not None and not reviewer_neutral_directory.strip():
+            raise ConfigurationError(
+                f"{REVIEWER_NEUTRAL_DIRECTORY_VAR} must be a non-empty runtime-side "
+                "directory path when supplied"
+            )
+
         # Application observability export boundary (issue #108). An unset
         # endpoint means unconfigured telemetry: the process runs without an
         # OpenTelemetry export runtime. Malformed supplied values fail in
@@ -547,5 +566,6 @@ class Settings:
             github_reconciliation_sweep_partitions=github_reconciliation_sweep_partitions,
             local_executor_workers=local_executor_workers,
             local_executor_pending=local_executor_pending,
+            reviewer_neutral_directory=reviewer_neutral_directory,
             otlp_endpoint=otlp_endpoint,
         )
