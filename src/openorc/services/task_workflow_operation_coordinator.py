@@ -71,7 +71,7 @@ inventory keys off this):
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -91,6 +91,7 @@ from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     OperationalFailureCode,
     OperationalFailureSourceKind,
+    canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
@@ -242,9 +243,18 @@ def _is_applicable_operational_failure(error: BaseException) -> bool:
     return not isinstance(error, ApplicationError)
 
 
-def _canonical_subject(**identifiers: object) -> dict[str, object]:
-    """Build the canonical safe-identifier subject mapping for one family."""
-    return {key: str(value) for key, value in identifiers.items() if value is not None}
+def _canonical_operation_subject(identifiers: dict[str, object]) -> Mapping[str, object]:
+    """Build one family subject through F4's own canonicalization contract.
+
+    Every identifier is normalized to its canonical JSON representation (a
+    UUID is never a JSON-representable value) and the mapping passes the
+    domain canonicalizer the triage service validates against, so a subject
+    that could not reach F4 fails here — inside the coordinator's
+    best-effort handoff boundary — instead of inside the disposition
+    service.
+    """
+    normalized = {key: str(value) for key, value in identifiers.items() if value is not None}
+    return canonical_failure_subject(normalized)
 
 
 def _diagnostic_context(
@@ -316,7 +326,7 @@ def _resolve_bootstrap_report(
         family=identity.family,
         original_attempt_kind=identity.original_attempt_kind,
         original_attempt_id=identity.original_attempt_id,
-        subject=_canonical_subject(workspace_id=workspace_id, task_id=task_id),
+        subject=_canonical_operation_subject({"workspace_id": workspace_id, "task_id": task_id}),
     )
     return _ResolvedFailureReport(
         operation=operation,
@@ -380,7 +390,7 @@ def _resolve_send_claim_report(
         family=identity.family,
         original_attempt_kind=identity.original_attempt_kind,
         original_attempt_id=identity.original_attempt_id,
-        subject=subject_identifiers,
+        subject=_canonical_operation_subject(subject_identifiers),
     )
     return _ResolvedFailureReport(
         operation=operation,
@@ -430,7 +440,7 @@ def _resolve_review_iteration_report(
         family=identity.family,
         original_attempt_kind=identity.original_attempt_kind,
         original_attempt_id=identity.original_attempt_id,
-        subject=subject_identifiers,
+        subject=_canonical_operation_subject(subject_identifiers),
     )
     return _ResolvedFailureReport(
         operation=operation,
@@ -535,7 +545,7 @@ def _resolve_execution_report(
             family=identity.family,
             original_attempt_kind=identity.original_attempt_kind,
             original_attempt_id=identity.original_attempt_id,
-            subject=subject_identifiers,
+            subject=_canonical_operation_subject(subject_identifiers),
         )
         reporting_kind = OperationalFailureSourceKind.ORIGINAL
         reporting_attempt_id = identity.original_attempt_id
@@ -660,25 +670,38 @@ def coordinate_task_workflow_operation(
                 workspace_id=str(workspace_id),
                 task_id=str(task_id),
             )
-            resolved = _resolve_failure_report(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                identity=identity,
-                error=error,
-            )
-            if resolved is None:
-                # The recorded identity does not verify against its committed
-                # durable row (foreign scope, settled, succeeded, finalized,
-                # or moved past the reported family): fail closed without
-                # triaging.
-                logger.warning(
-                    "task-workflow operation's recorded attempt identity did not "
-                    "verify against durable state; the failure is not triaged "
-                    "(family=%s, error type %s)",
-                    identity.family.value,
-                    type(error).__name__,
+            resolved: _ResolvedFailureReport | None = None
+            try:
+                resolved = _resolve_failure_report(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    identity=identity,
+                    error=error,
                 )
+            except Exception as resolution_error:  # noqa: BLE001 - best-effort handoff
+                # Evidence resolution never replaces the original Level 1
+                # failure: without verified evidence nothing is triaged, and
+                # the original exception propagates unchanged below.
+                logger.warning(
+                    "the attempt-evidence resolution did not complete; "
+                    "the failure is not triaged (error type %s)",
+                    type(resolution_error).__name__,
+                )
+            else:
+                if resolved is None:
+                    # The recorded identity does not verify against its
+                    # committed durable row (foreign scope, settled,
+                    # succeeded, finalized, or moved past the reported
+                    # family): fail closed without triaging.
+                    logger.warning(
+                        "task-workflow operation's recorded attempt identity did not "
+                        "verify against durable state; the failure is not triaged "
+                        "(family=%s, error type %s)",
+                        identity.family.value,
+                        type(error).__name__,
+                    )
+            if resolved is None:
                 raise
             disposition: OperationalFailureDisposition | None = None
             try:

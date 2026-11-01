@@ -31,6 +31,7 @@ from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     OperationalFailureCode,
     OriginalAttemptKind,
+    canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
@@ -444,11 +445,12 @@ def test_a_prepare_phase_failure_reaches_triage_with_the_post_claim_token(
     assert operation.family is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE
     assert operation.original_attempt_kind is OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM
     assert operation.original_attempt_id is _CLAIM_TOKEN
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
     report = call["report"]
     assert report.error_code is OperationalFailureCode.RUNTIME_UNAVAILABLE
     assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
     assert excinfo.value is error
-    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
     assert excinfo.value is error
 
 
@@ -524,6 +526,9 @@ def test_an_initial_plan_dispatch_failure_after_bootstrap_reports_the_send_claim
     operation = triage.calls[0]["operation"]
     assert operation.family is PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH
     assert operation.original_attempt_id is _CLAIM_ID
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
+    assert operation.subject["workspace_id"] == str(_WORKSPACE_ID)
     assert triage.calls[0]["expected_state_token"] is _POST_CLAIM_TOKEN
     report = triage.calls[0]["report"]
     assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
@@ -747,6 +752,9 @@ def test_an_unbound_execution_failure_reports_the_original_identity(
     assert triage.call_count == 1
     operation = triage.calls[0]["operation"]
     assert operation.original_attempt_id is _EXECUTION_ID
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
+    assert operation.subject["task_id"] == str(_TASK_ID)
     report = triage.calls[0]["report"]
     assert report.reporting_attempt_kind.value == "original"
     assert report.effect_attempt_id is None
@@ -809,3 +817,71 @@ def test_a_known_failed_execution_without_pre_effect_proof_stays_known_failed(
     report = triage.calls[0]["report"]
     assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
     assert excinfo.value is error
+    assert triage.call_count == 1
+    report = triage.calls[0]["report"]
+    assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+    assert excinfo.value is error
+
+
+def test_a_review_iteration_failure_reports_the_iteration_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_persistence(monkeypatch, iteration=_fake_iteration(), with_iteration=True)
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+            original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+            original_attempt_id=_ITERATION_ID,
+            phase="planning_review_dispatch",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage, expected_status=TaskStatus.PLANNING)
+
+    assert triage.call_count == 1
+    operation = triage.calls[0]["operation"]
+    assert operation.family is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
+    assert operation.original_attempt_kind is OriginalAttemptKind.REVIEW_ITERATION
+    assert operation.original_attempt_id is _ITERATION_ID
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
+    assert operation.subject["review_iteration_id"] == str(_ITERATION_ID)
+    assert triage.calls[0]["expected_status"] is TaskStatus.PLANNING
+    report = triage.calls[0]["report"]
+    assert report.error_code is OperationalFailureCode.RUNTIME_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    assert excinfo.value is error
+
+
+def test_an_evidence_resolution_failure_never_replaces_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_persistence(monkeypatch, execution=_fake_execution(), with_execution=True)
+
+    def failing_read(_pool: Any, *, execution_id: UUID) -> None:
+        raise RuntimeError("the evidence read failed")
+
+    monkeypatch.setattr(coordinator.execution_records, "get_execution", failing_read)
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage)
+
+    # The original Level 1 exception object propagates unchanged and F4 is
+    # never called without verified evidence.
+    assert excinfo.value is error
+    assert triage.call_count == 0
