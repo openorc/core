@@ -25,6 +25,7 @@ from openorc.config import ConfigurationError, ExecutionMode, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import StaleOperationError
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_review_decision import PlanningReviewDecision
 from openorc.services.task_pr_composition import TaskPrPublished
@@ -91,7 +92,12 @@ class RecordingService:
     results: list[Any] | None = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append({"args": args, "kwargs": kwargs})
+        # The F5b coordinator's attempt-evidence collector is coordinator
+        # plumbing the real services accept optionally (issue #262); it is
+        # accepted here and excluded from recorded comparisons — its
+        # threading is covered by the dedicated coordinator tests.
+        recorded_kwargs = {key: value for key, value in kwargs.items() if key != "attempt_evidence"}
+        self.calls.append({"args": args, "kwargs": recorded_kwargs})
         if self.results is not None:
             index = min(len(self.calls) - 1, len(self.results) - 1)
             outcome = self.results[index]
@@ -434,7 +440,12 @@ def test_seam_dispatches_the_registered_composition(monkeypatch: pytest.MonkeyPa
     dependencies, submitter = make_dependencies()
     recorded: list[OperationInvocation] = []
 
-    def composition(payload: OperationPayload, *, dependencies: OperationDependencies) -> None:
+    def composition(
+        payload: OperationPayload,
+        *,
+        dependencies: OperationDependencies,
+        attempt_evidence: InvocationAttemptEvidence | None = None,
+    ) -> None:
         recorded.append(OperationInvocation(kind=OperationKind.TASK_PR_REVIEW, payload=payload))
 
     monkeypatch.setitem(
@@ -1122,7 +1133,12 @@ def test_entrypoint_delivers_task_operations_through_the_production_table(
     )
     delivered: list[OperationInvocation] = []
 
-    def fake_seam(invocation: OperationInvocation, *, dependencies: OperationDependencies) -> None:
+    def fake_seam(
+        invocation: OperationInvocation,
+        *,
+        dependencies: OperationDependencies,
+        attempt_evidence: InvocationAttemptEvidence | None = None,
+    ) -> None:
         delivered.append(invocation)
 
     monkeypatch.setattr(Settings, "from_env", classmethod(lambda cls: settings))

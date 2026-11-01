@@ -164,6 +164,7 @@ def _stub_remediation(monkeypatch: pytest.MonkeyPatch, *, sentinel: str = "remed
         expected_state_token: Any,
         review_result: Any,
         addressed_iteration: Any,
+        attempt_evidence: Any = None,
     ):
         calls.append(
             {

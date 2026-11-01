@@ -13,6 +13,7 @@ Logical operations cross process surfaces only through the strictly typed invoca
 - Both execution modes use the same kind/handler mapping: regular mode through the bounded API-local executor owned by the serving process, queue mode through the canonical default queue and this worker process.
 - The RQ worker process must be explicitly in queue execution mode and refuses regular-mode startup; mode selection alone never makes in-flight work safe to replay.
 - The envelope and executor make no Task-state, currentness, or authorization decisions; that judgment belongs to the application services handlers invoke with process-local dependencies.
+- The Task-workflow handlers delegate to the transport-neutral application coordinator (`openorc.services.task_workflow_operation_coordinator`), which invokes Level 1 through the single composition seam, preserves ordinary success, and on an applicable operational failure reports the invocation's own Level 1-produced attempt identity and currentness to the Level 2 triage service. Handlers never choose recovery, retry, or blocking, and Level 2's dispositions are authoritative over this surface; the coordinator re-raises the original exception so this process's sanitized, unchained worker-error report stays intact.
 
 ## Replay and durability rules
 

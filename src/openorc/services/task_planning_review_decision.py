@@ -111,6 +111,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_plan_production import TaskPlanProductionOutcome, revise_task_plan
 from openorc.services.task_planning_review_dispatch import TaskPlanningReviewDispatchOutcome
@@ -702,6 +703,7 @@ def finalize_planning_review_decision(
     task_id: UUID,
     expected_state_token: UUID,
     dispatch: TaskPlanningReviewDispatchOutcome,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanningReviewDecisionOutcome:
     """Finalize one reserved planning review and commit its durable decision.
 
@@ -760,6 +762,7 @@ def finalize_planning_review_decision(
                 expected_state_token=expected_state_token,
                 prior_plan_revision_id=finalization.reviewed_revision.id,
                 review_iteration_id=finalization.finalized_iteration.id,
+                attempt_evidence=attempt_evidence,
             )
             return TaskPlanningReviewDecisionOutcome(
                 decision=PlanningReviewDecision.REVISION_ROUTED,

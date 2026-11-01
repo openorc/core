@@ -131,6 +131,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_pr_remediation import (
     ReviewerRuntimeAttachmentFactory,
@@ -686,6 +687,7 @@ def finalize_pr_review_decision(
     task_id: UUID,
     expected_state_token: UUID,
     dispatch: TaskPrReviewDispatchOutcome,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPrReviewDecisionOutcome:
     """Record the bounded PR review decision atomically and commit its effect.
 
@@ -757,6 +759,7 @@ def finalize_pr_review_decision(
                 expected_state_token=expected_state_token,
                 review_result=dispatch.review_result,
                 addressed_iteration=finalized,
+                attempt_evidence=attempt_evidence,
             )
 
         return TaskPrReviewDecisionOutcome(

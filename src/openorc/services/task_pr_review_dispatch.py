@@ -87,7 +87,9 @@ from openorc.adapters.agent_runtime.errors import (
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
+from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Repository
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import (
     ReviewIteration,
@@ -122,6 +124,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pull_request_reconciliation import (
@@ -764,6 +767,7 @@ def dispatch_pr_review(
     task_id: UUID,
     expected_state_token: UUID,
     published: TaskPrPublished,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPrReviewDispatchOutcome:
     """Dispatch the canonical PR's ordinary review to the admitted Reviewer.
 
@@ -940,6 +944,16 @@ def dispatch_pr_review(
                 iterations=iterations,
                 task_pull_request_id=pull_request.id,
                 reviewed_head_sha=head_sha,
+            )
+
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # reserved PR/head review iteration identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.id,
+                phase="pr_review_dispatch",
             )
 
         # --- Phases C and D: the ONE send, with NO database transaction open. ---
