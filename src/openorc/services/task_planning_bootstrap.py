@@ -94,6 +94,8 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import (
     Task,
@@ -126,6 +128,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.session_runtime import establish_task_agent_session
 from openorc.services.task_subject_guards import require_current_task
@@ -528,6 +531,7 @@ def prepare_task_for_planning(
     profile_id: UUID,
     expected_state_token: UUID,
     reviewer_neutral_directory: str,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanningPreparationOutcome:
     """Run the one logical planning-bootstrap continuation for the Task.
 
@@ -655,6 +659,18 @@ def prepare_task_for_planning(
             if task is None:
                 raise NotFoundError("the requested task is not available in this workspace")
 
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff facts: the post-claim token this
+            # invocation established (the claim rotates the Task token) and
+            # the claimed bootstrap identity in its PREPARE phase (#262).
+            attempt_evidence.record_task_token(post_claim_token)
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+                original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+                original_attempt_id=claim_token,
+                phase="planning_bootstrap_prepare",
+            )
+
         bindings: dict[WorkflowRole, TaskAgentSession] = {
             WorkflowRole.PRODUCER: producer,
             WorkflowRole.REVIEWER: reviewer,
@@ -779,6 +795,17 @@ def prepare_task_for_planning(
             claim_token=claim_token,
             stage=TaskPlanningBootstrapStage.PREPARED,
         )
+
+        if attempt_evidence is not None:
+            # The same claim identity advances to its transition phase: the
+            # coordinator reports the phase the failing invocation reached
+            # (issue #262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
+                original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+                original_attempt_id=claim_token,
+                phase="planning_bootstrap_transition",
+            )
 
         # --- Phase 5: post-PREPARE recheck (one short transaction). ---
         _recheck_bootstrap_subject(

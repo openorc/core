@@ -80,6 +80,8 @@ from openorc.adapters.agent_runtime.errors import (
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import Execution
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import (
     ReviewIteration,
@@ -115,6 +117,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_pr_composition import TaskPrPublished
@@ -805,6 +808,7 @@ def route_pr_remediation(
     expected_state_token: UUID,
     review_result: ReviewResult,
     addressed_iteration: ReviewIteration,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPrRemediationOutcome:
     """Claim, dispatch, record, and continue one Producer PR-remediation round.
 
@@ -851,6 +855,15 @@ def route_pr_remediation(
             expected_state_token=expected_state_token,
             addressed_iteration=addressed,
         )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's reserved
+            # remediation Execution identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=claimed.id,
+                phase="pr_remediation_execution",
+            )
         execution_id = claimed.id
         head_sha = addressed.reviewed_head_sha or ""
 

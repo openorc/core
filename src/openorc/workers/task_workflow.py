@@ -51,6 +51,7 @@ from openorc.adapters.github import HttpGitHubUserTokenClient
 from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskAgentSession
+from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
@@ -60,6 +61,7 @@ from openorc.services.github_user_authorization import (
     GitHubUserAccessTokenResolver,
     ProfileUserAccessTokenResolver,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_authorized_implementation_execution import (
     ProducerRuntimeAttachmentFactory,
     execute_authorized_implementation,
@@ -95,6 +97,9 @@ from openorc.services.task_subject_guards import (
     require_canonical_task_pull_request,
     require_current_plan_revision,
     require_current_task,
+)
+from openorc.services.task_workflow_operation_coordinator import (
+    coordinate_task_workflow_operation,
 )
 from openorc.workers.invocation import (
     InvalidInvocationError,
@@ -448,7 +453,10 @@ def submit_pr_composition_after_approval(
 
 
 def _compose_task_planning_bootstrap_and_initial_plan(
-    payload: TaskPlanningBootstrapAndInitialPlanPayload, *, dependencies: OperationDependencies
+    payload: TaskPlanningBootstrapAndInitialPlanPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """Run the planning bootstrap and produce the initial PLAN in one process.
 
@@ -475,6 +483,7 @@ def _compose_task_planning_bootstrap_and_initial_plan(
         profile_id=profile_id,
         expected_state_token=expected_state_token,
         reviewer_neutral_directory=reviewer_neutral_directory,
+        attempt_evidence=attempt_evidence,
     )
     # The initial PLAN is produced in the prepared Producer session's
     # planning checkout, using the same logical invocation's preparation
@@ -496,6 +505,7 @@ def _compose_task_planning_bootstrap_and_initial_plan(
             task_id=task_id,
             profile_id=profile_id,
             preparation=preparation,
+            attempt_evidence=attempt_evidence,
         )
     _submit_continuation(
         dependencies,
@@ -515,7 +525,10 @@ def _compose_task_planning_bootstrap_and_initial_plan(
 
 
 def _compose_task_planning_review(
-    payload: TaskPlanningReviewPayload, *, dependencies: OperationDependencies
+    payload: TaskPlanningReviewPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """Run one planning review round: E3a dispatch → E3b decision in-process.
 
@@ -556,6 +569,7 @@ def _compose_task_planning_review(
             workspace_id=workspace_id,
             task_id=task_id,
             plan_production=production,
+            attempt_evidence=attempt_evidence,
         )
     # The decision may route an in-budget revision to the merged E2 revise:
     # the Producer session continues that revision in its planning checkout.
@@ -581,6 +595,7 @@ def _compose_task_planning_review(
             task_id=task_id,
             expected_state_token=production.task.state_token,
             dispatch=dispatch_outcome,
+            attempt_evidence=attempt_evidence,
         )
     if decision.decision is PlanningReviewDecision.REVISION_ROUTED:
         routed_production = decision.revision_production
@@ -623,7 +638,10 @@ def _compose_task_planning_review(
 
 
 def _compose_task_authorized_implementation(
-    payload: TaskAuthorizedImplementationPayload, *, dependencies: OperationDependencies
+    payload: TaskAuthorizedImplementationPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """Execute the E5-authorized initial implementation and present the PR gate.
 
@@ -653,6 +671,7 @@ def _compose_task_authorized_implementation(
         producer_runtime_factory=_producer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
         ),
+        attempt_evidence=attempt_evidence,
     )
     open_pr_authorization(
         pool,
@@ -666,7 +685,10 @@ def _compose_task_authorized_implementation(
 
 
 def _compose_task_pr_composition(
-    payload: TaskPrCompositionPayload, *, dependencies: OperationDependencies
+    payload: TaskPrCompositionPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """Compose and publish the canonical PR under the approving Profile.
 
@@ -700,6 +722,7 @@ def _compose_task_pr_composition(
         task_id=task_id,
         owner_gate_id=owner_gate_id,
         expected_state_token=expected_state_token,
+        attempt_evidence=attempt_evidence,
     )
     _submit_continuation(
         dependencies,
@@ -720,7 +743,10 @@ def _compose_task_pr_composition(
 
 
 def _compose_task_pr_review(
-    payload: TaskPrReviewPayload, *, dependencies: OperationDependencies
+    payload: TaskPrReviewPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """Run the PR review: E9 dispatch → decision, with remediation in-process.
 
@@ -760,6 +786,7 @@ def _compose_task_pr_review(
         task_id=task_id,
         expected_state_token=published.task.state_token,
         published=published,
+        attempt_evidence=attempt_evidence,
     )
     while True:
         # The decision may route remediation: the Producer session continues
@@ -787,6 +814,7 @@ def _compose_task_pr_review(
                 task_id=task_id,
                 expected_state_token=dispatch_outcome.task.state_token,
                 dispatch=dispatch_outcome,
+                attempt_evidence=attempt_evidence,
             )
         remediation = decision.remediation
         if remediation is None:
@@ -818,7 +846,10 @@ _TASK_WORKFLOW_COMPOSITIONS: Mapping[OperationKind, TaskWorkflowComposition] = {
 
 
 def execute_task_workflow_operation(
-    invocation: OperationInvocation, *, dependencies: OperationDependencies
+    invocation: OperationInvocation,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
     """The single application composition seam for the F5a Task operations.
 
@@ -827,7 +858,9 @@ def execute_task_workflow_operation(
     E-series services with process-local dependencies. The seam contains no
     Task-state, currentness, or authorization judgment of its own, and no
     operational retry/block/disposition logic: the F5b coordinator
-    (issue #262) wraps this one seam with the typed failure handoff.
+    (issue #262) wraps this one seam with the typed failure handoff, and the
+    compositions thread the coordinator's attempt-evidence collector into
+    the services that produce durable identities.
     """
     composition = _TASK_WORKFLOW_COMPOSITIONS.get(invocation.kind)
     if composition is None:
@@ -838,17 +871,45 @@ def execute_task_workflow_operation(
             "no Task-workflow composition is registered for operation kind "
             f"{invocation.kind.value!r}"
         )
-    composition(invocation.payload, dependencies=dependencies)
+    composition(invocation.payload, dependencies=dependencies, attempt_evidence=attempt_evidence)
+
+
+# The per-kind coarse Task status the operation addresses: the expected
+# currentness input the F5b coordinator supplies to the Level 2 triage
+# service (issue #262).
+_TASK_KIND_EXPECTED_STATUS: Mapping[OperationKind, TaskStatus] = {
+    OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: TaskStatus.PLANNING,
+    OperationKind.TASK_PLANNING_REVIEW: TaskStatus.PLANNING,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskStatus.IMPLEMENTING,
+    OperationKind.TASK_PR_COMPOSITION: TaskStatus.WAITING_FOR_OWNER,
+    OperationKind.TASK_PR_REVIEW: TaskStatus.REVIEWING,
+}
 
 
 def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
     """Build the kind's registered handler around the single composition seam."""
 
     def handler(payload: Any, *, dependencies: OperationDependencies) -> None:
-        # Reconstructing the invocation re-proves the construction-time
-        # kind/payload correspondence before any composition runs.
-        execute_task_workflow_operation(
-            OperationInvocation(kind=kind, payload=payload), dependencies=dependencies
+        # The F5b coordinator (issue #262) owns the typed failure handoff:
+        # it invokes Level 1 through the single composition seam, preserves
+        # ordinary success, and reports applicable operational failures to
+        # the Level 2 triage service with the invocation's own Level 1
+        # attempt identity and Level 1-established currentness. The handler
+        # itself only decodes and delegates.
+        coordinate_task_workflow_operation(
+            dependencies.database_pool(),
+            expected_status=_TASK_KIND_EXPECTED_STATUS[kind],
+            workspace_id=UUID(payload.task.workspace_id),
+            task_id=UUID(payload.task.task_id),
+            profile_id=UUID(payload.profile_id),
+            expected_state_token=UUID(payload.expected_state_token),
+            invoke_level_one=lambda evidence: execute_task_workflow_operation(
+                # Reconstructing the invocation re-proves the construction-time
+                # kind/payload correspondence before any composition runs.
+                OperationInvocation(kind=kind, payload=payload),
+                dependencies=dependencies,
+                attempt_evidence=evidence,
+            ),
         )
 
     return handler

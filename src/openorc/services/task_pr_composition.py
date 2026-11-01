@@ -91,6 +91,8 @@ from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEvent, WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.send_claims import TaskRuntimeSendClaim
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
@@ -125,6 +127,7 @@ from openorc.services.github_installation_route import (
     resolve_system_repository_installation_route,
 )
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
 from openorc.services.task_runtime_send_claims import (
@@ -990,6 +993,7 @@ def compose_and_publish_task_pr(
     task_id: UUID,
     owner_gate_id: UUID,
     expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPrPublished:
     """Compose the Producer's PR presentation and publish the canonical PR.
 
@@ -1076,6 +1080,15 @@ def compose_and_publish_task_pr(
             producer=producer_session,
         )
         # --- the one PR_COMPOSE interaction (external, no transaction) ---
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # PR_COMPOSE dispatch claim identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                phase="pr_compose_dispatch",
+            )
         pr_result = _compose_pr_with_producer(
             pool,
             runtime_factory,

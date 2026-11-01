@@ -92,7 +92,9 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Repository
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.planning import PlanRevision
 from openorc.domain.reviews import (
     ReviewIteration,
@@ -118,6 +120,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_subject_guards import (
@@ -482,6 +485,7 @@ def dispatch_planning_review(
     workspace_id: UUID,
     task_id: UUID,
     plan_production: TaskPlanProductionOutcome,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanningReviewDispatchOutcome:
     """Reserve one exact-plan REVIEW attempt and send it to the Reviewer.
 
@@ -577,6 +581,16 @@ def dispatch_planning_review(
                 loop=loop,
                 iterations=iterations,
                 plan_revision_id=persisted_revision.id,
+            )
+
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # reserved review iteration identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.id,
+                phase="planning_review_dispatch",
             )
 
         # --- Phase 2: the ONE REVIEW send, with NO database transaction open. ---

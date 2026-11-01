@@ -110,7 +110,9 @@ from openorc.adapters.github import (
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Workspace
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.reviews import (
     ReviewIteration,
     ReviewLoopPurpose,
@@ -154,6 +156,7 @@ from openorc.services.github_installation_route import (
     ResolvedRepositoryInstallationRoute,
     resolve_system_repository_installation_route,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
@@ -710,6 +713,7 @@ def produce_initial_task_plan(
     task_id: UUID,
     profile_id: UUID,
     preparation: TaskPlanningPreparationOutcome,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanProductionOutcome:
     """Send the first canonical PLAN to the prepared Producer and persist it.
 
@@ -796,6 +800,15 @@ def produce_initial_task_plan(
             expected_state_token=task.state_token,
             producer=producer,
         )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # initial-PLAN dispatch claim identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                phase="initial_plan_dispatch",
+            )
 
         # --- Phase 4: the ONE canonical PLAN send. ---
         try:
@@ -849,6 +862,7 @@ def revise_task_plan(
     expected_state_token: UUID,
     prior_plan_revision_id: UUID,
     review_iteration_id: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanProductionOutcome:
     """Route a finalized planning change request to the Producer and persist it.
 
@@ -936,6 +950,15 @@ def revise_task_plan(
             producer=producer,
             review_iteration=iteration,
         )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # planning-REVISE dispatch claim identity (#262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                phase="planning_revise_dispatch",
+            )
 
         # --- Phase 4: the REVISE send to the same Producer session. ---
         try:

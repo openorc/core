@@ -58,6 +58,7 @@ __all__ = [
     "bind_retry_attempt_execution",
     "create_operational_failure_attempt",
     "create_operational_failure_episode",
+    "find_operational_failure_attempt_by_resulting_execution",
     "get_operational_failure_attempt",
     "get_operational_failure_attempt_by_source",
     "get_operational_failure_episode",
@@ -230,6 +231,28 @@ def get_operational_failure_attempt_by_source(
             f"select {_ATTEMPT_COLUMNS} from openorc.operational_failure_attempts "
             "where source_kind = %s and source_attempt_id = %s",
             (source_kind.value, source_attempt_id),
+        ).fetchone()
+    return None if row is None else _attempt_from_row(row)
+
+
+def find_operational_failure_attempt_by_resulting_execution(
+    pool: DatabasePool,
+    *,
+    resulting_execution_id: UUID,
+) -> OperationalFailureAttempt | None:
+    """Return the authorized attempt bound to one resulting Execution, or ``None``.
+
+    The read-side of ``bind_retry_attempt_execution``'s set-once binding: the
+    failure-reporting seam resolves whether a failing Execution is a durably
+    authorized retry's effect row. A binding is unique per Execution; nothing
+    is written here.
+    """
+    _require_uuid(resulting_execution_id, "resulting_execution_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_ATTEMPT_COLUMNS} from openorc.operational_failure_attempts "
+            "where resulting_execution_id = %s",
+            (resulting_execution_id,),
         ).fetchone()
     return None if row is None else _attempt_from_row(row)
 
