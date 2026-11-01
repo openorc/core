@@ -291,8 +291,41 @@ def test_invoke_operation_fails_closed_for_an_unregistered_kind(
     assert handler.calls == []
 
 
-def test_production_handler_table_stays_fail_closed_until_f3a_f3b() -> None:
-    assert invocation.build_production_handlers() == {}
+def test_production_handler_table_registers_exactly_the_task_kinds() -> None:
+    # F5a (issue #253) registers the Task-workflow handlers; the two GitHub
+    # delivery/reconciliation kinds stay unregistered until F9 (issue #255),
+    # so dispatch keeps failing closed for them.
+    handlers = invocation.build_production_handlers()
+    assert set(handlers) == {
+        invocation.OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
+        invocation.OperationKind.TASK_PLANNING_REVIEW,
+        invocation.OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
+        invocation.OperationKind.TASK_PR_COMPOSITION,
+        invocation.OperationKind.TASK_PR_REVIEW,
+    }
+
+
+def test_production_dispatch_still_fails_closed_for_the_github_kinds(
+    settings_factory: Any,
+) -> None:
+    handlers = invocation.build_production_handlers()
+    dependencies = invocation.OperationDependencies(settings=settings_factory())
+    for kind, payload in (
+        (
+            invocation.OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH,
+            invocation.WebhookDeliveryDispatchPayload(delivery_guid="guid"),
+        ),
+        (
+            invocation.OperationKind.GITHUB_RECONCILIATION_SWEEP,
+            invocation.ReconciliationSweepPayload(sweep_tick=None),
+        ),
+    ):
+        with pytest.raises(invocation.InvalidInvocationError, match="no handler"):
+            invocation.invoke_operation(
+                invocation.OperationInvocation(kind=kind, payload=payload),
+                handlers=handlers,
+                dependencies=dependencies,
+            )
 
 
 # --- submission seams ---
