@@ -45,6 +45,7 @@ from openorc.workers.invocation import (
     SubmissionRefusalReason,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
+    TaskAuthorizedImplementationRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
     TaskPrCompositionPayload,
@@ -162,6 +163,7 @@ def patched_workflow_environment(
     finalize_planning: RecordingService | None = None,
     open_implementation: RecordingService | None = None,
     execute_implementation: RecordingService | None = None,
+    execute_implementation_retry: RecordingService | None = None,
     open_pr: RecordingService | None = None,
     compose_pr: RecordingService | None = None,
     dispatch_pr: RecordingService | None = None,
@@ -221,6 +223,7 @@ def patched_workflow_environment(
         "finalize_planning_review_decision": finalize_planning,
         "open_implementation_authorization": open_implementation,
         "execute_authorized_implementation": execute_implementation,
+        "execute_authorized_implementation_retry": execute_implementation_retry,
         "open_pr_authorization": open_pr,
         "compose_and_publish_task_pr": compose_pr,
         "dispatch_pr_review": dispatch_pr,
@@ -332,6 +335,15 @@ def fake_pr_decision(remediation: Any) -> Any:
             ),
         ),
         (
+            OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
+            TaskAuthorizedImplementationRetryPayload(
+                task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                retry_attempt_id=str(_OWNER_GATE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+        (
             OperationKind.TASK_PR_COMPOSITION,
             TaskPrCompositionPayload(
                 task=_TASK_SCOPE_PRODUCER,
@@ -411,6 +423,45 @@ def test_task_payload_rejects_malformed_uuid_fields_before_any_effect() -> None:
 
     with pytest.raises(InvalidInvocationError, match="profile_id"):
         decode_operation_invocation({"kind": "task_authorized_implementation", "payload": raw})
+
+
+def test_authorized_implementation_retry_payload_decodes_strictly() -> None:
+    base = {
+        "task": {
+            "workspace_id": str(_WORKSPACE_ID),
+            "task_id": str(_TASK_ID),
+            "role": WorkflowRoleRef.PRODUCER.value,
+        },
+        "profile_id": str(_PROFILE_ID),
+        "retry_attempt_id": str(_OWNER_GATE_ID),
+        "expected_state_token": str(_STATE_TOKEN),
+    }
+    # The strict decoder accepts exactly the retry payload's field set.
+    decoded = decode_operation_invocation(
+        {"kind": "task_authorized_implementation_retry", "payload": base}
+    )
+    assert decoded.kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY
+    retry_payload = cast(TaskAuthorizedImplementationRetryPayload, decoded.payload)
+    assert retry_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+    # A `retryable`-style free authority flag is never carried: unexpected
+    # fields are refused before any effect.
+    with_extra = {**base, "retryable": True}
+    with pytest.raises(InvalidInvocationError, match="unexpected fields"):
+        decode_operation_invocation(
+            {"kind": "task_authorized_implementation_retry", "payload": with_extra}
+        )
+    # A malformed retry-attempt UUID is rejected before any effect.
+    malformed = {**base, "retry_attempt_id": "not-a-uuid"}
+    with pytest.raises(InvalidInvocationError, match="retry_attempt_id"):
+        decode_operation_invocation(
+            {"kind": "task_authorized_implementation_retry", "payload": malformed}
+        )
+    # A Reviewer-role scope does not match the retry kind's consuming role.
+    reviewer_role = {**base, "task": {**base["task"], "role": WorkflowRoleRef.REVIEWER.value}}
+    with pytest.raises(InvalidInvocationError, match="role"):
+        decode_operation_invocation(
+            {"kind": "task_authorized_implementation_retry", "payload": reviewer_role}
+        )
 
 
 def test_task_invocation_rejects_a_payload_of_another_kind() -> None:
@@ -697,6 +748,54 @@ def test_authorized_implementation_composition_presents_the_pr_gate(
         }
         # Presenting the gate launches no publication; E7 approval is an
         # explicit Owner command.
+        assert submitter.submissions == []
+
+
+def test_authorized_implementation_retry_composition_consumes_and_presents_the_pr_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies()
+    execution = fake_execution()
+    execute_retry = RecordingService(result=execution)
+    open_pr = RecordingService(
+        result=SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
+    )
+    with patched_workflow_environment(
+        monkeypatch, execute_implementation_retry=execute_retry, open_pr=open_pr
+    ):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
+                payload=TaskAuthorizedImplementationRetryPayload(
+                    task=_TASK_SCOPE_PRODUCER,
+                    profile_id=str(_PROFILE_ID),
+                    retry_attempt_id=str(_OWNER_GATE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+        # The F5c service received the exact subjects, the exact F4 retry
+        # attempt identity, and the zero-arg Producer attachment factory.
+        assert execute_retry.call_count == 1
+        retry_kwargs = execute_retry.calls[0]["kwargs"]
+        assert retry_kwargs["profile_id"] == _PROFILE_ID
+        assert retry_kwargs["workspace_id"] == _WORKSPACE_ID
+        assert retry_kwargs["task_id"] == _TASK_ID
+        assert retry_kwargs["expected_state_token"] == _STATE_TOKEN
+        assert retry_kwargs["retry_attempt_id"] == _OWNER_GATE_ID
+        assert callable(retry_kwargs["producer_runtime_factory"])
+        # The exact-head PR_AUTHORIZATION gate was presented with the exact
+        # post-execution token and the NEW Execution identity.
+        assert open_pr.call_count == 1
+        assert open_pr.calls[0]["kwargs"] == {
+            "profile_id": _PROFILE_ID,
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "expected_state_token": execution.task.state_token,
+            "execution_id": _EXECUTION_ID,
+        }
         assert submitter.submissions == []
 
 

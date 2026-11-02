@@ -108,6 +108,7 @@ class OperationKind(StrEnum):
     TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN = "task_planning_bootstrap_and_initial_plan"
     TASK_PLANNING_REVIEW = "task_planning_review"
     TASK_AUTHORIZED_IMPLEMENTATION = "task_authorized_implementation"
+    TASK_AUTHORIZED_IMPLEMENTATION_RETRY = "task_authorized_implementation_retry"
     TASK_PR_COMPOSITION = "task_pr_composition"
     TASK_PR_REVIEW = "task_pr_review"
 
@@ -219,6 +220,7 @@ _TASK_KIND_ROLES: Mapping[OperationKind, WorkflowRoleRef] = {
     OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PLANNING_REVIEW: WorkflowRoleRef.REVIEWER,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: WorkflowRoleRef.PRODUCER,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_COMPOSITION: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_REVIEW: WorkflowRoleRef.REVIEWER,
 }
@@ -308,6 +310,42 @@ class TaskAuthorizedImplementationPayload:
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAuthorizedImplementationRetryPayload:
+    """The F4-authorized implementation-retry operation payload (F5a/F5c).
+
+    The exact durable Workspace/Task units with the consuming Producer role,
+    the accountable Owner Profile identity the E6 discipline requires, the
+    exact expected Task ``state_token``, and the existing F4 retry-attempt
+    UUID whose authorization this invocation consumes. The F4 attempt, its
+    episode, the predecessor proof, the approved gate/plan handoff, and the
+    original Producer binding are all re-derived from committed state by the
+    executing service (never caller-supplied); the payload carries no
+    PlanRevision/result, message body, ``retryable`` flag, or runtime
+    handle, and no new Owner approval or Agent session is involved.
+    """
+
+    task: TaskScope
+    profile_id: str
+    retry_attempt_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "retry_attempt_id",
+            _require_canonical_uuid(self.retry_attempt_id, "retry_attempt_id"),
         )
         object.__setattr__(
             self,
@@ -426,6 +464,7 @@ OperationPayload = (
     | TaskPlanningBootstrapAndInitialPlanPayload
     | TaskPlanningReviewPayload
     | TaskAuthorizedImplementationPayload
+    | TaskAuthorizedImplementationRetryPayload
     | TaskPrCompositionPayload
     | TaskPrReviewPayload
 )
@@ -439,6 +478,9 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.TASK_PLANNING_REVIEW: frozenset({"task", "profile_id", "expected_state_token"}),
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: frozenset(
         {"task", "profile_id", "expected_state_token"}
+    ),
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: frozenset(
+        {"task", "profile_id", "retry_attempt_id", "expected_state_token"}
     ),
     OperationKind.TASK_PR_COMPOSITION: frozenset(
         {"task", "profile_id", "owner_gate_id", "expected_state_token"}
@@ -459,6 +501,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     ),
     OperationKind.TASK_PLANNING_REVIEW: TaskPlanningReviewPayload,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskAuthorizedImplementationPayload,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: TaskAuthorizedImplementationRetryPayload,
     OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
 }
@@ -527,6 +570,21 @@ def _decode_task_authorized_implementation_payload(
     )
 
 
+def _decode_task_authorized_implementation_retry_payload(
+    raw: object,
+) -> TaskAuthorizedImplementationRetryPayload:
+    kind = OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskAuthorizedImplementationRetryPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        retry_attempt_id=_require_canonical_uuid(fields["retry_attempt_id"], "retry_attempt_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
 def _decode_task_pr_composition_payload(raw: object) -> TaskPrCompositionPayload:
     kind = OperationKind.TASK_PR_COMPOSITION
     fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
@@ -561,6 +619,9 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: _decode_task_planning_bootstrap_payload,
     OperationKind.TASK_PLANNING_REVIEW: _decode_task_planning_review_payload,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: _decode_task_authorized_implementation_payload,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: (
+        _decode_task_authorized_implementation_retry_payload
+    ),
     OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
 }
@@ -598,6 +659,15 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         return {
             "task": payload.task.encode(),
             "profile_id": payload.profile_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskAuthorizedImplementationRetryPayload) and (
+        kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "retry_attempt_id": payload.retry_attempt_id,
             "expected_state_token": payload.expected_state_token,
         }
     if isinstance(payload, TaskPrCompositionPayload) and (

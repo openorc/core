@@ -1,6 +1,6 @@
 """F5a Task-workflow operation composition (issue #253).
 
-The production handlers for the five Task-workflow operation kinds and the
+The production handlers for the six Task-workflow operation kinds and the
 single application composition seam that owns their in-process sequencing.
 Every handler invokes the existing E-series application services with
 process-local dependencies — the handler never decides Task-state,
@@ -66,6 +66,9 @@ from openorc.services.task_authorized_implementation_execution import (
     ProducerRuntimeAttachmentFactory,
     execute_authorized_implementation,
 )
+from openorc.services.task_authorized_implementation_retry import (
+    execute_authorized_implementation_retry,
+)
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
@@ -110,6 +113,7 @@ from openorc.workers.invocation import (
     SubmissionOutcome,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
+    TaskAuthorizedImplementationRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
     TaskPrCompositionPayload,
@@ -684,6 +688,55 @@ def _compose_task_authorized_implementation(
     )
 
 
+def _compose_task_authorized_implementation_retry(
+    payload: TaskAuthorizedImplementationRetryPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> None:
+    """Execute the one F4-authorized implementation retry and present the PR gate.
+
+    The F5c retry service atomically consumes the exact durably authorized
+    F4 attempt for one new Execution (reserved, claimed, audited, and bound
+    set-once before any external effect), then reuses the shared E6 external
+    mechanics on the original Producer session. On the successful finalized
+    execution, the ordinary authorized continuation presents the exact-head
+    PR_AUTHORIZATION gate with the exact post-execution token and the NEW
+    Execution identity — the same application path as the initial
+    composition, with no new Owner approval or recovery policy here. A
+    failed retry is reported to F4 by the F5b coordinator's existing durable
+    binding lookup, never by this module.
+    """
+    pool = dependencies.database_pool()
+    github = dependencies.github_client()
+    workspace_id = UUID(payload.task.workspace_id)
+    task_id = UUID(payload.task.task_id)
+    profile_id = UUID(payload.profile_id)
+    expected_state_token = UUID(payload.expected_state_token)
+
+    execution = execute_authorized_implementation_retry(
+        pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        producer_runtime_factory=_producer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        attempt_evidence=attempt_evidence,
+    )
+    open_pr_authorization(
+        pool,
+        github,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=execution.task.state_token,
+        execution_id=execution.execution.id,
+    )
+
+
 def _compose_task_pr_composition(
     payload: TaskPrCompositionPayload,
     *,
@@ -840,6 +893,9 @@ _TASK_WORKFLOW_COMPOSITIONS: Mapping[OperationKind, TaskWorkflowComposition] = {
     ),
     OperationKind.TASK_PLANNING_REVIEW: _compose_task_planning_review,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: _compose_task_authorized_implementation,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: (
+        _compose_task_authorized_implementation_retry
+    ),
     OperationKind.TASK_PR_COMPOSITION: _compose_task_pr_composition,
     OperationKind.TASK_PR_REVIEW: _compose_task_pr_review,
 }
@@ -881,6 +937,7 @@ _TASK_KIND_EXPECTED_STATUS: Mapping[OperationKind, TaskStatus] = {
     OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: TaskStatus.PLANNING,
     OperationKind.TASK_PLANNING_REVIEW: TaskStatus.PLANNING,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskStatus.IMPLEMENTING,
+    OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: TaskStatus.IMPLEMENTING,
     OperationKind.TASK_PR_COMPOSITION: TaskStatus.WAITING_FOR_OWNER,
     OperationKind.TASK_PR_REVIEW: TaskStatus.REVIEWING,
 }
