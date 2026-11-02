@@ -314,13 +314,13 @@ def bind_retry_attempt_execution(
     """Bind one consumed authorization to its resulting Execution exactly once.
 
     The narrow, durable association a subsequent failure report must match:
-    the conditional update applies only while the attempt is in the
-    addressed Task/Workspace scope and still unbound
-    (``resulting_execution_id IS NULL``), writing the exact Execution the
-    executing seam created from it. ``None`` means the attempt is missing,
-    out of scope, or already bound to a different Execution (a conflict the
-    calling service fails closed on). Rebinding the same Execution is an
-    idempotent success. The binding is never cleared or rewritten.
+    one atomic conditional update applies while the attempt is in the
+    addressed Task/Workspace scope and either still unbound
+    (``resulting_execution_id IS NULL``) or already bound to exactly the
+    proposed Execution (the documented idempotent rebind). A different
+    already-bound Execution leaves zero rows: the set-once guard refuses the
+    second identity before any foreign-key check, and the calling service
+    fails closed on ``None``. The binding is never cleared or rewritten.
     """
     _require_uuid(attempt_id, "attempt_id")
     _require_uuid(task_id, "task_id")
@@ -331,9 +331,15 @@ def bind_retry_attempt_execution(
             "update openorc.operational_failure_attempts "
             "set resulting_execution_id = %s "
             "where id = %s and task_id = %s and workspace_id = %s "
-            "and resulting_execution_id is null "
+            "and (resulting_execution_id is null or resulting_execution_id = %s) "
             f"returning {_ATTEMPT_COLUMNS}",
-            (resulting_execution_id, attempt_id, task_id, workspace_id),
+            (
+                resulting_execution_id,
+                attempt_id,
+                task_id,
+                workspace_id,
+                resulting_execution_id,
+            ),
         ).fetchone()
     return None if row is None else _attempt_from_row(row)
 

@@ -635,19 +635,20 @@ def test_the_retry_binding_is_set_once_and_scope_exact(conn: Connection[Any]) ->
         resulting_execution_id=execution_id,
     )
     assert bound is not None and bound.resulting_execution_id == execution_id
-    # Set-once: any later binding attempt is a rejected no-op, whatever the
-    # proposed Execution (the set-once guard rejects the update with zero
-    # rows before any foreign-key check).
-    assert (
-        failure_repositories.bind_retry_attempt_execution(
-            facts["pool"],
-            attempt_id=attempt.id,
-            task_id=task_id,
-            workspace_id=workspace_id,
-            resulting_execution_id=execution_id,
-        )
-        is None
+    # Rebinding the same Execution is the documented idempotent success: the
+    # atomic conditional update matches the already-bound same identity and
+    # returns the row unchanged.
+    rebound = failure_repositories.bind_retry_attempt_execution(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        resulting_execution_id=execution_id,
     )
+    assert rebound is not None and rebound.resulting_execution_id == execution_id
+    # Set-once: a different already-bound Execution is a rejected no-op (the
+    # atomic guard rejects the update with zero rows before any foreign-key
+    # check).
     assert (
         failure_repositories.bind_retry_attempt_execution(
             facts["pool"],

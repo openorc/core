@@ -511,6 +511,34 @@ def test_a_proven_safe_supported_network_failure_authorizes_one_durable_retry() 
     assert attempt_params[7] == _NOW + timedelta(seconds=2)
 
 
+def test_the_pre_effect_corroboration_finds_the_failure_event_when_timestamps_tie() -> None:
+    """Tied audit commit timestamps make the newest-first subject-event
+    ordering ambiguous, so the corroboration must find the exact
+    ``execution_failed`` event even when the started event sits above it in
+    the ordered window — and a disagreeing failure event still fails closed.
+    """
+    started_row = (
+        uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "execution_started",
+        "producer",
+        str(_PRODUCER_SESSION_ID),
+        "execution",
+        _EXECUTION_ID,
+        {},
+        _OBSERVED,
+    )
+
+    # Tie: both audit rows carry the same created_at, so the ordered window
+    # may return the started event first. The corroboration scans past it.
+    conn = ScriptedConnection()
+    _script_execution_retry(conn, event_rows=[started_row, _failed_event_row()])
+    result = _triage(conn)
+    assert result.kind is DispositionKind.RETRY_AUTHORIZED
+    assert result.retry_attempt is not None
+
+
 def test_the_budget_advances_with_4_and_8_second_backoff_and_the_fourth_escalates() -> None:
     # Second authorized attempt: the prior-authorized report carries the
     # fresh effect row its execution produced, and the due time is 4 s.
@@ -802,9 +830,10 @@ def test_uncertain_evidence_escalates_and_never_authorizes_a_retry() -> None:
 
 
 def test_a_bare_finalized_status_without_agreeing_audit_evidence_never_retries() -> None:
-    # The execution finalized failed_transient, but the newest execution
-    # event disagrees with the claimed pre-effect network classification:
-    # the retry fails closed and the current failure escalates.
+    # The execution finalized failed_transient, but the execution_failed
+    # audit event disagrees with the claimed pre-effect network
+    # classification: the retry fails closed and the current failure
+    # escalates.
     conn = ScriptedConnection()
     _script_escalation(
         conn,

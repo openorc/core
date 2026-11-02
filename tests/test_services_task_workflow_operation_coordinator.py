@@ -36,6 +36,7 @@ from openorc.domain.operational_failures import (
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
+from openorc.services import task_operational_failure_triage as triage_module
 from openorc.services import task_workflow_operation_coordinator as coordinator
 from openorc.services.errors import (
     ConflictError,
@@ -177,7 +178,7 @@ def _patch_persistence(
         lambda _pool, *, episode_id: episode,
     )
     monkeypatch.setattr(
-        coordinator.event_records,
+        triage_module.event_records,
         "find_events_by_subject",
         lambda _pool, **_kwargs: list(events or []),
     )
@@ -255,6 +256,12 @@ def _fake_failed_event() -> Any:
         event_type=WorkflowEventType.EXECUTION_FAILED,
         context={"failure_kind": "runtime_pre_effect"},
     )
+
+
+def _fake_started_event() -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(event_type=WorkflowEventType.EXECUTION_STARTED, context={})
 
 
 def _fake_attempt() -> Any:
@@ -817,9 +824,42 @@ def test_a_known_failed_execution_without_pre_effect_proof_stays_known_failed(
     report = triage.calls[0]["report"]
     assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
     assert excinfo.value is error
+
+
+def test_the_pre_effect_evidence_survives_tied_audit_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tied audit commit timestamps make the newest-first subject-event
+    ordering ambiguous: the evidence lookup scans the attempt's bounded
+    window and finds the exact ``execution_failed`` event even when the
+    started event sits above it."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_persistence(
+        monkeypatch,
+        execution=_fake_execution(),
+        with_execution=True,
+        events=[
+            _fake_started_event(),
+            _fake_failed_event(),
+        ],
+    )
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage)
+
     assert triage.call_count == 1
     report = triage.calls[0]["report"]
-    assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
     assert excinfo.value is error
 
 
