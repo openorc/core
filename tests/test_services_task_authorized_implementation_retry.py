@@ -836,6 +836,7 @@ def test_the_authorized_due_retry_reserves_binds_and_completes_exactly_once() ->
         _ATTEMPT_ID,
         _TASK_ID,
         _WORKSPACE_ID,
+        _RETRY_EXECUTION_ID,
     )
     (complete_params,) = [params for sql, params in conn.executed if _EXECUTION_COMPLETE(sql, None)]
     assert complete_params is not None

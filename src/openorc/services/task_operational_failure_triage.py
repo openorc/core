@@ -123,6 +123,7 @@ __all__ = [
     "OperationalFailureOperation",
     "OperationalFailureReport",
     "bind_retry_attempt_execution",
+    "execution_failure_audit_kind",
     "triage_operational_failure",
 ]
 
@@ -136,6 +137,13 @@ _EXECUTION_SUBJECT_TYPE = "execution"
 # proven pre-effect runtime failure (task_runtime_send_claims and the
 # authorized-implementation-execution service).
 _RUNTIME_PRE_EFFECT_FAILURE_KIND = "runtime_pre_effect"
+# The bounded audit window for one Execution subject's events: the
+# subject's history is a small bounded family (the started event plus its
+# one terminal outcome), but the corroboration must never assume the
+# newest event is the failure, so the scan reads the whole bounded window
+# (the same bounded audit-lookup discipline as the PR publication
+# identity's gate-resolution read).
+_EXECUTION_FAILURE_EVENT_LIMIT = 50
 
 
 class DispositionKind(StrEnum):
@@ -1140,6 +1148,35 @@ def _verify_execution_family(
     )
 
 
+def execution_failure_audit_kind(
+    pool: DatabasePool, *, workspace_id: UUID, execution_id: UUID
+) -> str | None:
+    """The ``execution_failed`` audit kind of one Execution's attempt, or ``None``.
+
+    The exact attempt's audit history is a small bounded family, but the
+    newest event addressing the subject is not necessarily the failure:
+    tied commit timestamps make the newest-first ordering ambiguous, and
+    later audit additions can sit above the failure. Any
+    newest-event-is-the-failure assumption is therefore unsound. The lookup
+    scans a bounded window for the exact ``execution_failed`` event and
+    returns its safe machine ``failure_kind``; no matching event is the
+    fail-closed ``None`` (never a retry permission, never a guess).
+    """
+    events = event_records.find_events_by_subject(
+        pool,
+        workspace_id=workspace_id,
+        subject_type=_EXECUTION_SUBJECT_TYPE,
+        subject_id=execution_id,
+        limit=_EXECUTION_FAILURE_EVENT_LIMIT,
+    )
+    for event in events:
+        if event.event_type is not WorkflowEventType.EXECUTION_FAILED:
+            continue
+        kind = event.context.get("failure_kind")
+        return kind if isinstance(kind, str) else None
+    return None
+
+
 def _corroborate_pre_effect_execution_failure(
     transaction_pool: DatabasePool,
     *,
@@ -1149,26 +1186,19 @@ def _corroborate_pre_effect_execution_failure(
     """Whether durable audit evidence agrees with a claimed pre-effect failure.
 
     The retry branch requires positive proof beyond the caller's
-    classification: the ``execution_failed`` audit event of the exact
+    classification: an ``execution_failed`` audit event of the exact
     reported attempt must exist and carry the safe machine failure-kind the
     Level 1 seams record for a positively proven pre-effect runtime failure.
     The audit history is used as historical evidence for a finalized
     attempt, never as current-workflow-state reconstruction. Missing or
     disagreeing evidence fails closed (never a retry).
     """
-    events = event_records.find_events_by_subject(
-        transaction_pool,
-        workspace_id=workspace_id,
-        subject_type=_EXECUTION_SUBJECT_TYPE,
-        subject_id=execution_id,
-        limit=1,
+    return (
+        execution_failure_audit_kind(
+            transaction_pool, workspace_id=workspace_id, execution_id=execution_id
+        )
+        == _RUNTIME_PRE_EFFECT_FAILURE_KIND
     )
-    for event in events:
-        if event.event_type is not WorkflowEventType.EXECUTION_FAILED:
-            continue
-        kind = event.context.get("failure_kind")
-        return isinstance(kind, str) and kind == _RUNTIME_PRE_EFFECT_FAILURE_KIND
-    return False
 
 
 def _escalate(

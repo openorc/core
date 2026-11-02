@@ -85,7 +85,6 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
 )
-from openorc.domain.events import WorkflowEventType
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
@@ -97,7 +96,6 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import events as event_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import reviews as review_records
@@ -120,6 +118,7 @@ from openorc.services.task_operational_failure_triage import (
     OperationalFailureDisposition,
     OperationalFailureOperation,
     OperationalFailureReport,
+    execution_failure_audit_kind,
     triage_operational_failure,
 )
 
@@ -461,24 +460,18 @@ def _execution_effect_evidence(
 
     The ``execution_failed`` audit event of the exact attempt carrying the
     Level 1 runtime-pre-effect label is the positive durable fact for the
-    pre-effect class; a conservatively running attempt stays
-    effect-uncertain; any other finalized non-success is a known failure
-    without positive pre-effect proof.
+    pre-effect class — found by scanning the attempt's bounded audit window
+    (the shared ``execution_failure_audit_kind`` lookup), never by assuming
+    the newest subject event is the failure; a conservatively running
+    attempt stays effect-uncertain; any other finalized non-success is a
+    known failure without positive pre-effect proof.
     """
     if status is ExecutionStatus.FAILED_TRANSIENT:
-        events = event_records.find_events_by_subject(
-            pool,
-            workspace_id=workspace_id,
-            subject_type="execution",
-            subject_id=execution_id,
-            limit=1,
+        kind = execution_failure_audit_kind(
+            pool, workspace_id=workspace_id, execution_id=execution_id
         )
-        for event in events:
-            if event.event_type is not WorkflowEventType.EXECUTION_FAILED:
-                continue
-            kind = event.context.get("failure_kind")
-            if kind == _RUNTIME_PRE_EFFECT_FAILURE_KIND:
-                return FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+        if kind == _RUNTIME_PRE_EFFECT_FAILURE_KIND:
+            return FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
         return FailureEffectEvidence.KNOWN_FAILED
     if status is ExecutionStatus.RUNNING:
         return FailureEffectEvidence.EFFECT_UNCLASSIFIED

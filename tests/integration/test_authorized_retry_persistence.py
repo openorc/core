@@ -12,6 +12,9 @@ The focused real-Postgres checks the new seam owns:
 - F4's bound ``resulting_execution_id`` is the consumption identity on real
   rows: the binding lookup the F5b coordinator uses resolves the exact
   attempt, and a replayed consumption refuses with no second Execution;
+- the pre-effect corroboration survives tied audit commit timestamps: the
+  F4 authorization still happens when the ordered subject-event window
+  returns the started event above the failure event;
 - a premature wakeup (before the persisted ``not_before``) refuses before
   any effect and leaves the authorization consumable when due;
 - the durable backstops enforce the single consumption: the set-once
@@ -19,11 +22,20 @@ The focused real-Postgres checks the new seam owns:
   idempotently), and the per-Task execution-number uniqueness rejects a
   duplicate attempt number.
 
-Ordinary classification and refusal coverage lives in the scripted
-deterministic suite; the Task-row-lock serialization itself is
-Postgres-native. The suite consumes the explicitly supplied non-production
-branch database per ``tests/integration/conftest.py`` and uses the
-deterministic fake Agent Runtime (no live runtime, GitHub, or Supabase).
+The service-flow tests model production's commit boundaries deliberately:
+the fixture commits first, and every service phase below it (the E6
+admission, the E6 failure finalization, the F4 triage authorization, and
+the F5c admission/consumption) runs as its own committed transaction
+exactly as production sequences them — then the committed rows are removed
+so the branch database stays clean for the rest of the session (the same
+committed-fixture cleanup discipline as the operational-failure suite's
+race test). The repository-backstop test stays inside the per-test
+rolled-back transaction like the other suites' ordinary tests. Ordinary
+classification and refusal coverage lives in the scripted deterministic
+suite; the Task-row-lock serialization itself is Postgres-native. The
+suite consumes the explicitly supplied non-production branch database per
+``tests/integration/conftest.py`` and uses the deterministic fake Agent
+Runtime (no live runtime, GitHub, or Supabase access).
 """
 
 from __future__ import annotations
@@ -410,7 +422,6 @@ def _authorize_one_retry(
     assert disposition.retry_attempt is not None
     assert disposition.retry_attempt.ordinal == 1
     assert disposition.retry_attempt.not_before == _BASE_TIME + timedelta(seconds=2)
-    conn.commit()  # settle the authorized attempt for the retry invocation
     return disposition.retry_attempt
 
 
@@ -452,8 +463,16 @@ def _failing_initial_attempt(conn: Connection[Any], facts: dict[str, Any]) -> An
     history = execution_repositories.list_task_executions(pool, task_id=task.id)
     assert len(history) == 1
     assert history[0].status is ExecutionStatus.FAILED_TRANSIENT
-    conn.commit()  # settle the failed initial attempt before the triage
     return history[0]
+
+
+def _remove_committed_rows(conn: Connection[Any], facts: dict[str, Any]) -> None:
+    """The committed rows are removed so the branch database stays clean for
+    the rest of the session (the same committed-fixture cleanup discipline
+    as the operational-failure suite's race test)."""
+    conn.execute("delete from openorc.workspaces where id = %s", (facts["workspace_id"],))
+    conn.execute("delete from auth.users where id = %s", (facts["profile_id"],))
+    conn.commit()
 
 
 def test_the_authorized_retry_round_trips_and_binds_set_once_end_to_end(
@@ -465,6 +484,11 @@ def test_the_authorized_retry_round_trips_and_binds_set_once_end_to_end(
     new row only; the binding lookup resolves the exact attempt and a replay
     refuses without minting anything."""
     facts = _authorized_fixture(conn)
+    # The committed multi-transaction flow: the fixture commits first, then
+    # every service phase below runs as its own committed transaction (the
+    # same commit boundaries production exercises), and the committed rows
+    # are removed at the end.
+    conn.commit()
     failed_execution = _failing_initial_attempt(conn, facts)
     retry_attempt = _authorize_one_retry(
         conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
@@ -539,6 +563,7 @@ def test_the_authorized_retry_round_trips_and_binds_set_once_end_to_end(
         )
         == 2
     )
+    _remove_committed_rows(conn, facts)
 
 
 def test_a_premature_wakeup_refuses_and_leaves_the_authorization_consumable(
@@ -548,6 +573,7 @@ def test_a_premature_wakeup_refuses_and_leaves_the_authorization_consumable(
     invocation refuses before any effect, and the same authorization still
     executes exactly once when due."""
     facts = _authorized_fixture(conn)
+    conn.commit()  # the committed multi-transaction flow, as in production
     failed_execution = _failing_initial_attempt(conn, facts)
     retry_attempt = _authorize_one_retry(
         conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
@@ -584,6 +610,39 @@ def test_a_premature_wakeup_refuses_and_leaves_the_authorization_consumable(
     )
     assert outcome.execution.execution_number == 2
     assert outcome.execution.status is ExecutionStatus.SUCCEEDED
+    _remove_committed_rows(conn, facts)
+
+
+def test_the_pre_effect_corroboration_survives_tied_event_timestamps(
+    conn: Connection[Any],
+) -> None:
+    """Tied audit commit timestamps make the newest-first subject-event
+    ordering ambiguous: the F4 corroboration must still find the exact
+    ``execution_failed`` event of the failed attempt when the started event
+    sits above it in the ordered window, so the real triage authorizes the
+    retry instead of failing closed."""
+    facts = _authorized_fixture(conn)
+    conn.commit()  # the committed multi-transaction flow, as in production
+    failed_execution = _failing_initial_attempt(conn, facts)
+
+    # Tie both audit events of the failed attempt to one exact instant: the
+    # ordered window may return either row first, and the corroboration must
+    # find the failure event regardless.
+    conn.execute(
+        "update openorc.workflow_events set created_at = %s "
+        "where task_id = %s and subject_type = 'execution' and subject_id = %s",
+        (_BASE_TIME, facts["task_id"], failed_execution.id),
+    )
+    conn.commit()
+
+    retry_attempt = _authorize_one_retry(
+        conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
+    )
+    attempt = failure_repositories.get_operational_failure_attempt(
+        cast(DatabasePool, facts["pool"]), attempt_id=retry_attempt.id
+    )
+    assert attempt is not None and attempt.resulting_execution_id is None
+    _remove_committed_rows(conn, facts)
 
 
 def test_the_set_once_binding_and_number_backstops_enforce_the_single_consumption(
