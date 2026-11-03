@@ -282,6 +282,13 @@ class _Harness:
 
         monkeypatch.setattr(service, "composed_transaction", fake_composed_transaction)
 
+    def _repatch_reconcile(self) -> None:
+        """Re-point the service's reconciliation seam at the current stub."""
+        monkeypatch_free = self._service
+        monkeypatch_free.task_pull_request_reconciliation = SimpleNamespace(
+            reconcile_task_pull_request=self.reconcile
+        )
+
     def _confirmed_merged(self, pull_request: Any) -> bool:
         return (
             pull_request.state is TaskPullRequestState.CLOSED and pull_request.merged_at is not None
@@ -823,3 +830,133 @@ def _recording_error(error: Exception) -> Any:
 
     stub.calls = calls  # type: ignore[attr-defined]
     return stub
+
+
+def _merged_pull_request() -> Any:
+    return SimpleNamespace(
+        id=_PR_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        state=TaskPullRequestState.CLOSED,
+        head_sha=_HEAD_SHA,
+        merged_at=_OBSERVED,
+    )
+
+
+def _rewire_reconcile(harness: _Harness, *results: Any) -> None:
+    harness.reconcile = _recording(*results)
+    harness._repatch_reconcile()
+
+
+def test_the_send_uncertainty_with_a_fresh_merged_reconciliation_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1 (retry path): the send's unknown outcome is grounded in one
+    fresh authoritative post-send reconciliation — a confirmed merged PR
+    takes the completion seam and never resends, never retries, never
+    propagates."""
+    harness = _Harness(monkeypatch)
+    harness.merge = _recording_error(_merge_send_uncertain())
+    monkeypatch.setattr(pull_request_merge, "request_pull_request_merge", harness.merge)
+    _rewire_reconcile(
+        harness,
+        SimpleNamespace(pull_request=_domain_pull_request()),  # the Stage 2 preflight
+        SimpleNamespace(pull_request=_merged_pull_request()),  # the post-send read
+    )
+    outcome = harness.run()
+    assert outcome.kind is TaskMergeOutcomeKind.COMPLETED
+    # The send was attempted (consumed) but the known success always wins.
+    assert len(harness.merge.calls) == 1
+    assert len(harness.consume.calls) == 1
+    assert len(harness.complete.calls) == 1
+    # No Level 2 report and no staleness consequence.
+    assert len(harness.triage.calls) == 0
+    assert len(harness.stale_classification.calls) == 0
+
+
+def test_the_send_uncertainty_with_a_reconciled_changed_head_routes_through_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2 (retry path): the reconciled changed head routes through the
+    existing guarded merge-staleness consequence — never a retry, never the
+    changed SHA, never a Level 2 report."""
+    harness = _Harness(monkeypatch)
+    harness.merge = _recording_error(_merge_send_uncertain())
+    monkeypatch.setattr(pull_request_merge, "request_pull_request_merge", harness.merge)
+    moved = _domain_pull_request(head_sha="b" * 40)
+    _rewire_reconcile(
+        harness,
+        SimpleNamespace(pull_request=_domain_pull_request()),  # the Stage 2 preflight
+        SimpleNamespace(pull_request=moved),  # the post-send read
+    )
+    outcome = harness.run()
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
+    assert len(harness.stale_classification.calls) == 1
+    classified = harness.stale_classification.calls[0]["kwargs"]
+    assert classified["owner_gate_id"] == _GATE_ID
+    assert classified["subject_head_sha"] == _HEAD_SHA
+    assert classified["task_pull_request_id"] == _PR_ID
+    assert len(harness.triage.calls) == 0
+    assert len(harness.merge.calls) == 1
+    assert len(harness.consume.calls) == 1
+
+
+def test_the_send_uncertainty_with_an_unavailable_read_escalates_never_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1 (retry path): an unavailable/inconclusive post-send read can
+    never ground a successor — the consumed attempt's failure is reported
+    truthfully with the unsupported-uncertainty code (never the transport
+    code) and F4's escalation owns the disposition, without propagation."""
+    harness = _Harness(monkeypatch)
+    harness.merge = _recording_error(_merge_send_uncertain())
+    monkeypatch.setattr(pull_request_merge, "request_pull_request_merge", harness.merge)
+    _rewire_reconcile(
+        harness,
+        SimpleNamespace(pull_request=_domain_pull_request()),  # the Stage 2 preflight
+        ExternalOperationUncertainError("the post-send read is unavailable"),
+    )
+    installation = _installation(harness.task)
+    harness.triage = _recording(
+        OperationalFailureDisposition(kind=DispositionKind.BLOCKED, installation=installation)
+    )
+    monkeypatch.setattr(harness._service, "triage_operational_failure", harness.triage)
+    outcome = harness.run()
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
+    assert outcome.task_block is installation.task_block
+    assert len(harness.triage.calls) == 1
+    report = harness.triage.calls[0]["kwargs"]["report"]
+    operation = harness.triage.calls[0]["kwargs"]["operation"]
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _ATTEMPT_ID
+    assert report.effect_attempt_id == _ATTEMPT_ID
+    # The unavailable read can never carry the retry-eligible transport code.
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    diagnostics = dict(report.diagnostic_context)
+    assert diagnostics["merge_mutation_attempted"] is True
+    assert diagnostics["phase"] == "merge_retry_send"
+    assert operation.original_attempt_id == _GATE_ID
+    # The bounded accounting is preserved; nothing propagated.
+    assert len(harness.consume.calls) == 1
+    assert len(harness.complete.calls) == 0
+
+
+def test_the_send_uncertainty_with_a_fresh_open_head_propagates_for_level_2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a fresh reconciled open/unmerged same-head observation lets the
+    send's unknown outcome reach the F5b coordinator's typed handoff."""
+    harness = _Harness(monkeypatch)
+    harness.merge = _recording_error(_merge_send_uncertain())
+    monkeypatch.setattr(pull_request_merge, "request_pull_request_merge", harness.merge)
+    _rewire_reconcile(
+        harness,
+        SimpleNamespace(pull_request=_domain_pull_request()),  # the Stage 2 preflight
+        SimpleNamespace(pull_request=_domain_pull_request()),  # the fresh post-send read
+    )
+    with pytest.raises(MergeRequestSendUncertainError):
+        harness.run()
+    assert len(harness.triage.calls) == 0
+    assert len(harness.stale_classification.calls) == 0
+    assert len(harness.consume.calls) == 1

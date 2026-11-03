@@ -76,6 +76,11 @@ inventory keys off this):
   primitive's send-phase subclass and the recognized transient transport
   cause in its chain, verified by F4 under its Task lock; a plain uncertain
   error is a pre-send condition and can never produce the transport code.
+  The reporting service propagates a send uncertainty only after a
+  successful fresh authoritative post-send reconciliation grounded the
+  open/unmerged same-head observation — freshness of that observation is the
+  reporting caller's binding obligation; an unavailable post-send read or a
+  reconciled changed head is settled in-service and never reported here.
 """
 
 from __future__ import annotations
@@ -621,13 +626,17 @@ def _resolve_merge_retry_report(
     The recorded identity is the F5d retry execution's own consumed F4 merge
     attempt: its one-shot ``consumed_at`` stamp is the durable binding a
     report must prove (the merge family has no resulting Execution), and the
-    recorded effect identity must be the attempt's own UUID. The report
-    addresses the episode's original identity — the approved ``MERGE_DECISION``
-    gate UUID — with ``PRIOR_AUTHORIZED``; the triage service re-proves the
-    consumption, the episode's budget, and the merge subject's durable
-    authority under its Task lock. Any incoherent recorded identity (foreign
-    scope, wrong family/kind, unconsumed attempt, mismatched effect) fails
-    closed without triaging.
+    recorded effect identity must be the attempt's own UUID. The reporting
+    service reaches this handoff only after a successful fresh authoritative
+    post-send reconciliation grounded the open/unmerged same-head observation
+    (an unavailable read or a changed head is settled in-service, never
+    reported) — so a retry-eligible code here stands on that fresh
+    observation. The report addresses the episode's original identity — the
+    approved ``MERGE_DECISION`` gate UUID — with ``PRIOR_AUTHORIZED``; the
+    triage service re-proves the consumption, the episode's budget, and the
+    merge subject's durable authority under its Task lock. Any incoherent
+    recorded identity (foreign scope, wrong family/kind, unconsumed attempt,
+    mismatched effect) fails closed without triaging.
     """
     if (
         identity.original_attempt_kind is not OriginalAttemptKind.MERGE_DECISION_GATE

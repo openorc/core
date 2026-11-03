@@ -62,7 +62,14 @@ transaction ever spans a GitHub call):
    pre-send transaction re-proving the durable one-shot claim through the
    same ``claim_revalidation`` hook E10a uses. The merge send's OWN unknown
    outcome (the primitive's send-phase ``MergeRequestSendUncertainError``)
-   propagates unchanged for the F5b coordinator's typed Level 2 handoff —
+   is FIRST grounded in one fresh authoritative post-send reconciliation: a
+   confirmed merged PR completes through the shared seam and never resends;
+   a reconciled changed head or closed-unmerged PR routes through the
+   existing guarded merge-staleness consequence (never a retry, never the
+   changed SHA); an unavailable/inconclusive read is reported truthfully
+   with the unsupported-uncertainty code and F4 escalates; ONLY a fresh
+   open/unmerged same-head observation lets the send's own unknown outcome
+   propagate unchanged for the F5b coordinator's typed Level 2 handoff —
    eligibility is F4's, and only the failure of this consumed attempt is
    reportable to the episode. Every other outcome keeps its existing E10a
    semantics: a known-success merge completes through the shared completion
@@ -552,20 +559,108 @@ def _preflight_before_consumption(
     return None
 
 
-def _settle_presend_uncertainty(
+def _classify_send_uncertainty_for_retry(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    error: pull_request_merge.MergeRequestSendUncertainError,
+    admission: _MergeRetryAdmission,
+    profile_id: UUID,
+    expected_state_token: UUID,
+) -> TaskMergeOutcome:
+    """Ground the consumed send's unknown outcome before any Level 2 report.
+
+    One fresh authoritative post-send reconciliation of the exact canonical
+    PR (a read, safe after any send, never held across a database
+    transaction) is the observation every successor authorization stands on:
+    a GitHub-confirmed merged PR takes the shared completion seam and never
+    resends; a reconciled changed head or a closed-unmerged PR routes through
+    the existing guarded merge-staleness consequence — never a retry
+    authorization, never the changed SHA; an unavailable/inconclusive read is
+    reported truthfully with the unsupported-uncertainty code (never
+    retry-eligible) and F4 escalates; only a fresh open/unmerged same-head
+    observation re-raises the original send error unchanged so the F5b
+    coordinator's typed handoff reaches the Level 2 disposition with the
+    consumed attempt's own evidence.
+    """
+    try:
+        reconciliation = task_pull_request_reconciliation.reconcile_task_pull_request(
+            pool,
+            github,
+            workspace_id=admission.task.workspace_id,
+            task_id=admission.task.id,
+        )
+    except ApplicationError:
+        reconciliation = None
+    if reconciliation is not None and _is_confirmed_merged(reconciliation.pull_request):
+        # A known merged result always takes the authoritative completion
+        # seam — the unknown send outcome never masks it and never retries.
+        completion = complete_confirmed_task_merge(
+            pool, workspace_id=admission.task.workspace_id, task_id=admission.task.id
+        )
+        return TaskMergeOutcome(
+            kind=TaskMergeOutcomeKind.COMPLETED,
+            task=completion.task,
+            pull_request=completion.pull_request,
+            merge_commit_sha=None,
+        )
+    if reconciliation is not None and (
+        reconciliation.pull_request.state is TaskPullRequestState.CLOSED
+        or reconciliation.pull_request.head_sha != admission.subject_head_sha
+    ):
+        # The reconciled GitHub state moved past the exact approved subject:
+        # the existing guarded merge-staleness consequence owns the
+        # classification (issue #227) — never a retry, never the changed SHA.
+        return _classify_after_stale_merge_request(
+            pool,
+            github,
+            profile_id=profile_id,
+            workspace_id=admission.task.workspace_id,
+            task_id=admission.task.id,
+            owner_gate_id=admission.episode.original_attempt_id,
+            expected_state_token=expected_state_token,
+            task_pull_request_id=admission.task_pull_request_id,
+            subject_head_sha=admission.subject_head_sha,
+        )
+    if reconciliation is None:
+        # The post-send read is unavailable/inconclusive: it can never ground
+        # a successor, so the report carries the unsupported-uncertainty code
+        # and F4 escalates (fail closed). The bounded accounting is preserved.
+        return _report_consumed_uncertainty(
+            pool,
+            admission=admission,
+            expected_state_token=expected_state_token,
+            mutation_attempted=True,
+            phase=_PHASE_SEND,
+        )
+    # Fresh open/unmerged same-head observation: the typed handoff may reach
+    # the Level 2 disposition. The original exception propagates unchanged —
+    # only this consumed attempt's failure is reportable, eligibility is F4's,
+    # and the coordinator's report is grounded in this fresh observation.
+    raise error
+
+
+def _report_consumed_uncertainty(
     pool: DatabasePool,
     *,
     admission: _MergeRetryAdmission,
     expected_state_token: UUID,
+    mutation_attempted: bool,
+    phase: str,
 ) -> TaskMergeOutcome:
-    """Report the consumed attempt's pre-send uncertainty to F4 and settle.
+    """Report the consumed attempt's uncertainty to F4 and settle truthfully.
 
-    The consumed attempt's execution failed BEFORE the merge mutation was
-    attempted (a pre-send read/credential condition inside the primitive):
-    the episode receives the truthful ``PRIOR_AUTHORIZED`` report with the
-    ``merge_mutation_attempted: false`` marker, and the merge family's
-    eligibility can never admit it — F4 escalates through its safe F3
-    installation, which is the Task's actionable recovery surface.
+    The consumed attempt's execution failed without a retry-eligible
+    classification — BEFORE the merge mutation was attempted (a pre-send
+    read/credential condition inside the primitive), or after it with an
+    unavailable/inconclusive post-send reconciliation read that can never
+    ground a successor. The episode receives the truthful ``PRIOR_AUTHORIZED``
+    report with the ``merge_mutation_attempted`` marker and the failing
+    phase, always carrying the unsupported-uncertainty code the merge
+    family's eligibility can never admit — F4 escalates through its safe F3
+    installation, which is the Task's actionable recovery surface. The
+    bounded accounting (one episode, set-once terminal disposition) is
+    preserved; the authorization is never re-consumed or replayed.
     """
     operation = OperationalFailureOperation(
         family=GitHubMergeOperation.EXACT_HEAD_MERGE,
@@ -580,8 +675,8 @@ def _settle_presend_uncertainty(
         effect_evidence=FailureEffectEvidence.EFFECT_UNCLASSIFIED,
         effect_attempt_id=admission.attempt.id,
         diagnostic_context={
-            "merge_mutation_attempted": False,
-            "phase": _PHASE_PREFLIGHT,
+            "merge_mutation_attempted": mutation_attempted,
+            "phase": phase,
         },
     )
     disposition = triage_operational_failure(
@@ -791,21 +886,38 @@ def execute_authorized_merge_retry(
                 expected_head_sha=consumed_admission.subject_head_sha,
                 merge_commit_sha=error.merge_commit_sha,
             )
-        except pull_request_merge.MergeRequestSendUncertainError:
-            # The merge mutation send's OWN unknown outcome (F5d): the F5b
-            # coordinator's typed handoff owns the PRIOR_AUTHORIZED report —
-            # only this consumed attempt's failure is reportable, eligibility
-            # is F4's, and the original exception always propagates unchanged.
-            raise
+        except pull_request_merge.MergeRequestSendUncertainError as error:
+            # The merge mutation send's OWN unknown outcome (F5d): ground it
+            # in one fresh authoritative post-send reconciliation BEFORE any
+            # Level 2 report. A confirmed merged PR takes the completion seam
+            # and never resends; a changed head or a closed-unmerged PR routes
+            # through the existing guarded merge-staleness consequence (never
+            # a retry, never the changed SHA); an unavailable/inconclusive
+            # read reports the consumed attempt truthfully with the
+            # unsupported-uncertainty code (never retry-eligible) and F4
+            # escalates; ONLY a fresh reconciled open/unmerged same-head PR
+            # lets the typed handoff reach the F5b coordinator — the original
+            # exception propagates unchanged, and only this consumed attempt's
+            # failure is reportable to the episode.
+            return _classify_send_uncertainty_for_retry(
+                pool,
+                github,
+                error=error,
+                admission=consumed_admission,
+                profile_id=profile_id,
+                expected_state_token=expected_state_token,
+            )
         except ExternalOperationUncertainError:
             # A plain uncertain outcome from the primitive is a pre-send
             # read/credential condition, never merge-send evidence: the
             # consumed attempt's failure is reported truthfully to the
             # episode, which escalates (fail closed).
-            return _settle_presend_uncertainty(
+            return _report_consumed_uncertainty(
                 pool,
                 admission=consumed_admission,
                 expected_state_token=expected_state_token,
+                mutation_attempted=False,
+                phase=_PHASE_PREFLIGHT,
             )
         except ExternalOperationRejectedError:
             # A GitHub-owned definitive refusal keeps E10a's exact semantics:

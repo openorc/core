@@ -948,13 +948,18 @@ def _verify_merge_family(
     The episode roots at the approved ``MERGE_DECISION`` gate; the report
     stays current only while the durable approved gate still binds the exact
     canonical TaskPullRequest and its Reviewer-accepted head SHA, and the
-    durable canonical PR row is still the open PR at exactly that head (the
-    authoritative reconciliation the reporting caller ran updates this row
-    before reporting). A merged or closed-unmerged durable PR row means the
-    subject settled — the report is stale, and the known merged result always
-    takes the shared completion seam instead of a retry. An Owner merge
-    command has no runtime session: the merge family has no role/session
-    binding to verify, so session loss is never its blocking fact.
+    durable canonical PR row is still the open PR at exactly that head — the
+    row the reporting caller's authoritative reconciliation just updated.
+    Freshness of that post-send observation is the reporting caller's binding
+    obligation: a retry-eligible code may be supplied only after a successful
+    fresh authoritative reconciliation grounded the open/unmerged same-head
+    observation (the service layer owns external-outcome classification),
+    and F4's durable check re-proves the recorded subject state under its
+    Task lock. A merged or closed-unmerged durable PR row means the subject
+    settled — the report is stale, and the known merged result always takes
+    the shared completion seam instead of a retry. An Owner merge command has
+    no runtime session: the merge family has no role/session binding to
+    verify, so session loss is never its blocking fact.
     """
     if operation.original_attempt_kind is not OriginalAttemptKind.MERGE_DECISION_GATE:
         return _stale_no_op()

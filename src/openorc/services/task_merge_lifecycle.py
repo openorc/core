@@ -26,12 +26,14 @@ consequences strictly outside, every exact subject re-proven under the lock):
   NEW pending exact-head ``MERGE_DECISION`` gate requires fresh Owner
   authorization; an expected-head mismatch blocks ``STALE_OPERATION``; and
   (F5d, issue #267) the merge mutation send's OWN unknown outcome is
-  classified after one authoritative reconciliation and handed to the Level
-  2 operational-failure disposition — the classified transient transport
-  failure over a reconciled open/unmerged same-head PR may receive one
-  bounded F4 retry authorization, everything else escalates through F4's
-  safe F3 installation with truthful context, and the mutation is never
-  blindly repeated. A ``MergeConfirmedReconciliationPendingError``
+  classified after one authoritative reconciliation — the fresh post-send
+  read grounds every decision: a reconciled changed head or closed-unmerged
+  PR keeps the guarded merge-staleness consequence (never a retry), and only
+  the classified transient transport failure over a reconciled
+  open/unmerged same-head PR may receive one bounded F4 retry
+  authorization; an unavailable read and every unsupported classification
+  escalate through F4's safe F3 installation with truthful context, and the
+  mutation is never blindly repeated. A ``MergeConfirmedReconciliationPendingError``
   (GitHub already answered ``MERGED``) and every plain uncertain pre-send
   condition keep the existing known-success/uncertain block semantics and
   are never eligible for an F4 resend.
@@ -991,30 +993,30 @@ def _classify_after_uncertain_merge_send(
 ) -> TaskMergeOutcome:
     """Classify the merge mutation send's own unknown outcome (F5d, issue #267).
 
-    The send's chained GitHub adapter cause is classified type-only —
-    ``GitHubTransportUncertainError`` is the recognized transient transport
-    failure code; every other uncertain cause is the unsupported-uncertainty
-    code; no provider prose, HTTP-status guessing, or caller flag is ever
-    consulted. One authoritative reconciliation of the exact canonical PR (a
-    read, safe after any send, never held across a database transaction)
-    grounds the outcome: a GitHub-confirmed merged canonical PR takes the
-    shared completion seam and never resends; a durable open/unmerged
-    same-head PR plus current Owner/Task/issue authority — re-proven by the
-    Level 2 verification under its Task lock — may receive ONE bounded F4
-    retry authorization for the classified transient transport failure; an
-    unavailable/inconclusive reconciliation read and every unsupported
-    classification escalate through the Level 2 disposition's safe F3
-    installation with truthful ``merge_mutation_attempted`` context. This
-    seam never applies another merge mutation itself and never invents a
+    One authoritative reconciliation of the exact canonical PR (a read, safe
+    after any send, never held across a database transaction) grounds EVERY
+    decision and is the fresh post-send observation any retry authorization
+    stands on: a GitHub-confirmed merged canonical PR takes the shared
+    completion seam and never resends; a reconciled changed head or a
+    closed-unmerged PR routes through the existing guarded merge-staleness
+    consequence (issue #227) — never a retry authorization, never the changed
+    SHA; an unavailable/inconclusive read and every unsupported
+    classification reach the Level 2 disposition with the
+    unsupported-uncertainty code (never retry-eligible) and escalate through
+    its safe F3 installation with truthful ``merge_mutation_attempted``
+    context. ONLY a fresh reconciled open/unmerged same-head PR plus current
+    Owner/Task/issue authority — re-proven by the Level 2 verification under
+    its Task lock — may receive ONE bounded F4 retry authorization, and only
+    for the send's chained ``GitHubTransportUncertainError`` cause classified
+    type-only (no provider prose, HTTP-status guessing, or caller flag).
+    This seam never applies another merge mutation itself and never invents a
     disposition: F4's decision is authoritative, and the due-time wakeup
     scheduling belongs to F11, not here.
     """
-    error_code = (
-        OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
-        if isinstance(adapter_cause, GitHubTransportUncertainError)
-        else OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
-    )
-    # One authoritative reconciliation read (external, no transaction open).
+    # One authoritative reconciliation read (external, no transaction open)
+    # grounds EVERY subsequent decision: it is the fresh post-send
+    # observation a retry authorization may stand on, and its absence or an
+    # unusable answer is the fail-closed path.
     try:
         reconciliation = task_pull_request_reconciliation.reconcile_task_pull_request(
             pool, github, workspace_id=workspace_id, task_id=task_id
@@ -1031,6 +1033,35 @@ def _classify_after_uncertain_merge_send(
             pull_request=completion.pull_request,
             merge_commit_sha=None,
         )
+    if reconciliation is not None and (
+        reconciliation.pull_request.state is TaskPullRequestState.CLOSED
+        or reconciliation.pull_request.head_sha != expected_head_sha
+    ):
+        # The reconciled GitHub state moved past the exact approved subject —
+        # a changed head or a closed-unmerged PR. The existing guarded
+        # merge-staleness consequence owns this classification (issue #227):
+        # never a retry authorization, never the changed SHA, and the Level 2
+        # disposition is never consulted for a subject that already moved.
+        return _classify_after_stale_merge_request(
+            pool,
+            github,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            task_pull_request_id=task_pull_request_id,
+            subject_head_sha=expected_head_sha,
+        )
+    # The retry-eligible transient-transport classification REQUIRES the
+    # successful fresh reconciliation above: an unavailable/inconclusive
+    # post-send read is never merge-send evidence for a successor and can
+    # never carry the retry-eligible code (issue #267 fail-closed rule).
+    error_code = (
+        OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+        if reconciliation is not None and isinstance(adapter_cause, GitHubTransportUncertainError)
+        else OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    )
     # The Level 2 disposition owns the decision: ONE typed ORIGINAL report
     # rooted at the approved merge-decision gate UUID — the original durable
     # merge-operation identity. The approval, its ``MERGE_REQUESTED`` Owner

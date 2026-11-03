@@ -1478,3 +1478,166 @@ def test_send_unsupported_uncertainty_escalates_through_f3_installation(
     assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
     assert len(merge.calls) == 1
     assert _count(conn, _GATE_INSERT) == 0
+
+
+def test_send_uncertainty_with_unavailable_reconciliation_escalates_never_authorizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1: a retry-eligible classification REQUIRES the successful fresh
+    post-send reconciliation. An unavailable/inconclusive read reports the
+    unsupported-uncertainty code — never the transport code — and F4's safe
+    escalation owns the disposition; no successor is authorized."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    # Phase B read (1): open/same-head. The post-send classification read (2):
+    # unavailable. The outcome's classified-PR fallback read follows.
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        ExternalOperationUncertainError("the reconciliation read is unavailable"),
+    )
+    merge = _MergePrimitiveStub(
+        _send_uncertain(GitHubTransportUncertainError("the transport failed transiently"))
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+    conn.on(_PR_READ, _pr_row_values())
+    installation = cast(
+        ExceptionalBlockInstallation,
+        SimpleNamespace(
+            task_block=SimpleNamespace(id=uuid4()),
+            owner_gate=SimpleNamespace(id=uuid4()),
+            task=SimpleNamespace(
+                id=_TASK_ID,
+                workspace_id=_WORKSPACE_ID,
+                status=TaskStatus.BLOCKED,
+                state_token=_BLOCKED_TOKEN,
+                current_owner_gate_id=None,
+            ),
+        ),
+    )
+    triaged: list[tuple[Any, Any]] = []
+
+    def fake_triage(pool: Any, **kwargs: Any) -> OperationalFailureDisposition:
+        triaged.append((pool, kwargs))
+        return OperationalFailureDisposition(
+            kind=DispositionKind.BLOCKED, installation=installation
+        )
+
+    monkeypatch.setattr(task_merge_lifecycle, "triage_operational_failure", fake_triage)
+
+    outcome = request_task_merge(
+        pool,
+        _guard(issues=[_issue_observation()], repository=_repository_observation()),
+        _token_resolver(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_RETRY_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
+    # The report can NEVER carry the retry-eligible transport code without
+    # the fresh reconciliation: the unsupported-uncertainty code escalates.
+    assert len(triaged) == 1
+    report = triaged[0][1]["report"]
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    assert len(merge.calls) == 1
+    assert _count(conn, _GATE_INSERT) == 0
+    # No E10a-owned block/audit: F4's (faked) escalation owns the disposition.
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_send_uncertainty_with_a_changed_head_routes_through_the_staleness_consequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2: the reconciled changed head is classified BEFORE F4 and routes
+    through the existing guarded merge-staleness consequence — never a retry
+    authorization, never the changed SHA, never a Level 2 report."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    _script_block(conn, token=_POST_APPROVAL_TOKEN, reason="stale_operation")
+    # Phase B (1): open/same-head. The post-send classification read (2): the
+    # head moved. The staleness classifier's own fresh read (3): moved again.
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        _reconciled(pull_request=_domain_pull_request(head_sha=_NEW_HEAD_SHA)),
+        _reconciled(pull_request=_domain_pull_request(head_sha=_NEW_HEAD_SHA)),
+    )
+    merge = _MergePrimitiveStub(
+        _send_uncertain(GitHubTransportUncertainError("the transport failed transiently"))
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+    triaged: list[tuple[Any, Any]] = []
+
+    def fake_triage(pool: Any, **kwargs: Any) -> OperationalFailureDisposition:
+        triaged.append((pool, kwargs))
+        raise AssertionError("the Level 2 disposition is never consulted for a moved subject")
+
+    monkeypatch.setattr(task_merge_lifecycle, "triage_operational_failure", fake_triage)
+
+    outcome = request_task_merge(
+        pool,
+        _guard(issues=[_issue_observation()], repository=_repository_observation()),
+        _token_resolver(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_RETRY_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
+    assert outcome.task.status is TaskStatus.BLOCKED
+    assert len(triaged) == 0
+    block_inserts = [
+        params for sql, params in conn.executed if params is not None and _BLOCK_INSERT(sql, params)
+    ]
+    assert len(block_inserts) == 1
+    block_context = block_inserts[0][3].obj
+    assert block_context["observed_head_sha"] == _NEW_HEAD_SHA
+    assert block_context["expected_head_sha"] == _HEAD_SHA
+    # No retry gate is minted and no Reviewer acceptance transfers.
+    assert _count(conn, _GATE_INSERT) == 0
+    assert len(merge.calls) == 1
+
+
+def test_send_uncertainty_with_a_closed_unmerged_pr_routes_through_the_staleness_consequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        _reconciled(
+            pull_request=_domain_pull_request(state=TaskPullRequestState.CLOSED, merged_at=None)
+        ),
+        _reconciled(
+            pull_request=_domain_pull_request(state=TaskPullRequestState.CLOSED, merged_at=None)
+        ),
+    )
+    merge = _MergePrimitiveStub(
+        _send_uncertain(GitHubTransportUncertainError("the transport failed transiently"))
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+
+    with pytest.raises(ConflictError):
+        request_task_merge(
+            pool,
+            _guard(issues=[_issue_observation()], repository=_repository_observation()),
+            _token_resolver(),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_RETRY_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+        )
