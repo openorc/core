@@ -1,10 +1,10 @@
 # OpenOrc
 
-**OpenOrc is a headless control plane for governed AI software engineering.**
+**Turn Cline into a persistent, governed software factory.**
 
-Give OpenOrc a GitHub issue and it coordinates the engineering work from planning to merge: a Producer proposes and implements, an independent Reviewer evaluates, and a human Owner authorizes consequential steps. OpenOrc keeps the workflow, decisions, and recovery state durable instead of leaving them scattered across agent conversations and ad hoc handoffs.
+OpenOrc coordinates Cline-powered engineering work from GitHub issue through planning, independent review, implementation, and human approval to a reviewed pull request and Owner-controlled merge. It handles the handoffs, durable workflow state, and recovery so you can delegate substantial work without manually managing the Producer/Reviewer loop.
 
-**OpenOrc coordinates agents; it does not replace them.** Cline remains the v1 coding runtime, including its model choices, tools, and working environment. GitHub remains the system of record for issues, code, pull requests, checks, and merges. OpenOrc owns the workflow between them.
+**Keep your runtime, models, and tools.** Cline remains the coding runtime and owns model/provider configuration, credentials, tools, and execution. GitHub remains the durable engineering record. OpenOrc governs the workflow between them. It is Cline-first in v1, with runtime-neutral architecture boundaries for future integrations.
 
 ## From issue to merge
 
@@ -35,6 +35,13 @@ GitHub confirms merge
 Producer and Reviewer are **separate logical roles with persistent, Task-scoped sessions**. They may share one Cline Hub while keeping independent session context and role configuration. The workflow uses bounded review loops, exact plan/commit review subjects, explicit Owner authority, and safe handling of retries, stale operations, and uncertain external outcomes.
 
 The goal is to automate coordination *between* human decisions, not to automate away the human's responsibility for them.
+
+## Your Cline environment, two ways
+
+- **Bring your own Cline Hub:** connect an externally managed Cline runtime and keep operating its environment, providers, credentials, and tools yourself. The full self-hosted OpenOrc Core workflow does not depend on OpenOrc Cloud.
+- **Managed ClineBox (planned OpenOrc Cloud option):** use a persistent, Workspace-scoped development environment running Cline, with repositories, installed toolchains, dependencies, caches, and native runtime configuration retained across Tasks. Eligible idle environments can be hibernated and restored instead of being rebuilt for every task.
+
+**The environment persists; Task conversations do not cross Task boundaries.** Each new Task creates its own isolated Producer and Reviewer sessions and working contexts. Within a Task, those sessions persist across planning, implementation, and review. OpenOrc Cloud manages the ClineBox host lifecycle; Cline remains the owner of its provider credentials and native configuration.
 
 ## Headless by design
 
@@ -84,7 +91,7 @@ Both modes submit the same typed operation invocations through one shared dispat
 
 **Phase 2: headless backend control plane, in progress.**
 
-OpenOrc is under active development and is not yet a complete end-to-end product. The repository contains the source-available Core implementation, including its domain and persistence foundations, GitHub integration, and Cline runtime integration. Other client interfaces and workflow capabilities continue to evolve.
+OpenOrc is under active development and is not yet a complete end-to-end product. The repository contains the source-available Core implementation, including its domain and persistence foundations, GitHub integration, and Cline runtime integration. Other client interfaces and workflow capabilities continue to evolve. The managed ClineBox option is not yet generally available.
 
 ## Development
 
