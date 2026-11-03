@@ -46,6 +46,7 @@ from openorc.workers.invocation import (
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
     TaskAuthorizedImplementationRetryPayload,
+    TaskAuthorizedMergeRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
     TaskPrCompositionPayload,
@@ -164,6 +165,7 @@ def patched_workflow_environment(
     open_implementation: RecordingService | None = None,
     execute_implementation: RecordingService | None = None,
     execute_implementation_retry: RecordingService | None = None,
+    execute_merge_retry: RecordingService | None = None,
     open_pr: RecordingService | None = None,
     compose_pr: RecordingService | None = None,
     dispatch_pr: RecordingService | None = None,
@@ -224,6 +226,7 @@ def patched_workflow_environment(
         "open_implementation_authorization": open_implementation,
         "execute_authorized_implementation": execute_implementation,
         "execute_authorized_implementation_retry": execute_implementation_retry,
+        "execute_authorized_merge_retry": execute_merge_retry,
         "open_pr_authorization": open_pr,
         "compose_and_publish_task_pr": compose_pr,
         "dispatch_pr_review": dispatch_pr,
@@ -338,6 +341,15 @@ def fake_pr_decision(remediation: Any) -> Any:
             OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
             TaskAuthorizedImplementationRetryPayload(
                 task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                retry_attempt_id=str(_OWNER_GATE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+        (
+            OperationKind.TASK_AUTHORIZED_MERGE_RETRY,
+            TaskAuthorizedMergeRetryPayload(
+                task=_TASK_SCOPE_REVIEWER,
                 profile_id=str(_PROFILE_ID),
                 retry_attempt_id=str(_OWNER_GATE_ID),
                 expected_state_token=str(_STATE_TOKEN),
@@ -1372,3 +1384,73 @@ def test_directly_constructed_invocation_rejects_a_mismatched_role() -> None:
                 expected_state_token=str(_STATE_TOKEN),
             ),
         )
+
+
+def test_authorized_merge_retry_payload_decodes_strictly() -> None:
+    """The F5d merge-retry payload (issue #267) decodes with the strict field set."""
+    base = {
+        "task": {
+            "workspace_id": str(_WORKSPACE_ID),
+            "task_id": str(_TASK_ID),
+            "role": WorkflowRoleRef.REVIEWER.value,
+        },
+        "profile_id": str(_PROFILE_ID),
+        "retry_attempt_id": str(_OWNER_GATE_ID),
+        "expected_state_token": str(_STATE_TOKEN),
+    }
+    decoded = decode_operation_invocation({"kind": "task_authorized_merge_retry", "payload": base})
+    assert decoded.kind is OperationKind.TASK_AUTHORIZED_MERGE_RETRY
+    merge_payload = cast(TaskAuthorizedMergeRetryPayload, decoded.payload)
+    assert merge_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+    # Unexpected fields are refused before any effect: no `retryable`-style
+    # free authority flag is ever carried.
+    with_extra = {**base, "retryable": True}
+    with pytest.raises(InvalidInvocationError, match="unexpected fields"):
+        decode_operation_invocation({"kind": "task_authorized_merge_retry", "payload": with_extra})
+    malformed = {**base, "retry_attempt_id": "not-a-uuid"}
+    with pytest.raises(InvalidInvocationError, match="retry_attempt_id"):
+        decode_operation_invocation({"kind": "task_authorized_merge_retry", "payload": malformed})
+    # A Producer-role scope does not match the merge kind's review-context role.
+    producer_role = {**base, "task": {**base["task"], "role": WorkflowRoleRef.PRODUCER.value}}
+    with pytest.raises(InvalidInvocationError, match="role"):
+        decode_operation_invocation(
+            {"kind": "task_authorized_merge_retry", "payload": producer_role}
+        )
+
+
+def test_authorized_merge_retry_composition_consumes_and_sends_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F5d composition delegates to the merge-retry execution service."""
+    dependencies, submitter = make_dependencies()
+    merge_retry = RecordingService(result=None)
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_AUTHORIZED_MERGE_RETRY,
+                payload=TaskAuthorizedMergeRetryPayload(
+                    task=_TASK_SCOPE_REVIEWER,
+                    profile_id=str(_PROFILE_ID),
+                    retry_attempt_id=str(_OWNER_GATE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+        # The F5d service received the exact subjects, the exact F4 retry
+        # attempt identity, the accountable Profile, and the invocation's
+        # attempt-evidence collector; the GitHub client and the Profile
+        # user-token resolver resolve process-locally.
+        assert merge_retry.call_count == 1
+        retry_kwargs = merge_retry.calls[0]["kwargs"]
+        assert retry_kwargs["profile_id"] == _PROFILE_ID
+        assert retry_kwargs["workspace_id"] == _WORKSPACE_ID
+        assert retry_kwargs["task_id"] == _TASK_ID
+        assert retry_kwargs["expected_state_token"] == _STATE_TOKEN
+        assert retry_kwargs["retry_attempt_id"] == _OWNER_GATE_ID
+        # (The attempt-evidence collector is coordinator plumbing, excluded
+        # from recorded comparisons and threaded by the coordinator tests.)
+        # No continuation submission exists for the merge retry: the outcome
+        # stays at its committed durable state and F11 owns any wakeup.
+        assert submitter.submissions == []

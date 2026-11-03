@@ -23,12 +23,16 @@ exceptional TaskBlock (#258) that blocked the Task.
 - ``OriginalAttemptKind`` names the existing durable identity family a
   failure episode roots at (an F2 runtime-send claim, the E1b planning
   bootstrap claim token, the E3a reserved ReviewIteration, the E6/E9
-  Execution row, or an owner-control intent). A Task state token or mutable
-  phase is never an episode root.
+  Execution row, an owner-control intent, or — F5d (issue #267) — the
+  approved exact-head ``MERGE_DECISION`` OwnerGate, whose UUID is the
+  original durable merge-operation identity). A Task state token, a mutable
+  phase, or a bare PR number is never an episode root.
 - Operation families reuse the F2 pending-interaction operation vocabulary
   (the closed set of the automated workflow's claimed consequential
-  interactions); a dedicated parallel vocabulary is deliberately not
-  introduced.
+  interactions) plus — from F5d (issue #267) — the one explicit exact-head
+  GitHub merge family (:class:`GitHubMergeOperation`). A merge is never
+  mislabeled as a pending agent-runtime interaction, and no further parallel
+  vocabulary exists.
 - ``OperationalFailureEpisode`` carries the episode's scope, family, original
   identity, canonical safe subject, and its terminal escalation disposition:
   ``escalated_task_block_id`` references the exact unresolved TaskBlock the
@@ -38,8 +42,11 @@ exceptional TaskBlock (#258) that blocked the Task.
 - ``OperationalFailureAttempt`` is one durably authorized automatic
   additional attempt: its own UUID, the 1..3 ordinal within its episode,
   the exact failed attempt it succeeds, the classified error code, and the
-  persisted UTC ``not_before`` instant. Attempts are forward-only history
-  for replay prevention and later consumption; they are never rewritten.
+  persisted UTC ``not_before`` instant. ``consumed_at`` (F5d) is the set-once
+  consumption stamp an execution seam writes atomically before an outbound
+  effect that is not an Execution — only the failure of a consumed attempt
+  may be reported to its episode. Attempts are forward-only history for
+  replay prevention and later consumption; they are never rewritten.
 
 This module carries transport-independent validation only. It performs no
 disposition decisions, no retry policy, and no Task state transitions.
@@ -60,16 +67,19 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 
 __all__ = [
     "FailureEffectEvidence",
+    "GitHubMergeOperation",
     "OperationalFailureAttempt",
     "OperationalFailureCode",
     "OperationalFailureDomainError",
     "OperationalFailureEpisode",
+    "OperationalFailureFamily",
     "OperationalFailureSourceKind",
     "OriginalAttemptKind",
     "canonical_bounded_failure_context",
     "canonical_failure_subject",
     "operational_failure_attempt_field_names",
     "operational_failure_episode_field_names",
+    "operational_failure_family_from_value",
 ]
 
 
@@ -96,6 +106,13 @@ class OperationalFailureCode(StrEnum):
     EXTERNAL_OPERATION_FAILED = "external_operation_failed"
     EXTERNAL_OPERATION_UNCERTAIN = "external_operation_uncertain"
     EXTERNAL_OPERATION_REJECTED = "external_operation_rejected"
+    # F5d (issue #267): the classified transient network/transport failure of
+    # an external mutation — derived type-only from the concrete adapter
+    # taxonomy's recognized transient transport subtype, never from provider
+    # prose, HTTP status guessing, or a caller-supplied retryable flag. It is
+    # the one retry-eligible code of the exact-head merge family; every other
+    # code escalates unless a family's explicit eligibility admits it.
+    EXTERNAL_TRANSPORT_UNAVAILABLE = "external_transport_unavailable"
     UNKNOWN = "unknown"
 
 
@@ -140,6 +157,50 @@ class OriginalAttemptKind(StrEnum):
     REVIEW_ITERATION = "review_iteration"
     EXECUTION = "execution"
     OWNER_CONTROL_INTENT = "owner_control_intent"
+    # F5d (issue #267): the existing approved exact-head MERGE_DECISION
+    # OwnerGate — its UUID is the original durable merge-operation identity
+    # one merge episode roots at. The gate is resolved history at merge time;
+    # the episode never re-approves, mutates, or replaces it.
+    MERGE_DECISION_GATE = "merge_decision_gate"
+
+
+class GitHubMergeOperation(StrEnum):
+    """The closed vocabulary of exact-head GitHub merge operation families (F5d).
+
+    A deliberate, single-member extension of the Level 2 operation families:
+    the Owner-authorized exact-head merge request over one canonical
+    TaskPullRequest. It is deliberately NOT a member of the F2
+    pending-interaction runtime vocabulary — a merge is an Owner-accountable
+    GitHub mutation, not an outstanding runtime interaction — and it carries
+    its own original durable identity kind (the approved ``MERGE_DECISION``
+    gate UUID). The Level 2 repeat-safety proof is structural: the merge
+    request is guarded by GitHub's documented expected-head parameter and the
+    canonical PR's single merged state, so a reconciled open/unmerged
+    same-head observation plus a classified transient transport failure is
+    the one retry-eligible classification this family admits.
+    """
+
+    EXACT_HEAD_MERGE = "exact_head_merge"
+
+
+OperationalFailureFamily = PendingTaskRuntimeInteractionOperation | GitHubMergeOperation
+"""The closed union of Level 2 operation-family vocabularies (F5d, issue #267)."""
+
+
+def operational_failure_family_from_value(
+    value: str,
+) -> PendingTaskRuntimeInteractionOperation | GitHubMergeOperation:
+    """Resolve one stored operation-family value to its closed-vocabulary member."""
+    try:
+        return PendingTaskRuntimeInteractionOperation(value)
+    except ValueError:
+        pass
+    try:
+        return GitHubMergeOperation(value)
+    except ValueError as error:
+        raise OperationalFailureDomainError(
+            "the operation family value is not a member of the closed vocabulary"
+        ) from error
 
 
 # The bounded diagnostic context: a canonical JSON object (string keys at
@@ -238,7 +299,9 @@ def _require_uuid(value: object, name: str, *, nullable: bool = False) -> None:
         raise OperationalFailureDomainError(f"operational-failure {name} must be a UUID")
 
 
-def _require_instant(value: object, name: str) -> None:
+def _require_instant(value: object, name: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise OperationalFailureDomainError(
             f"operational-failure {name} must be a timezone-aware datetime"
@@ -260,7 +323,7 @@ class OperationalFailureEpisode:
     id: UUID
     workspace_id: UUID
     task_id: UUID
-    operation_family: PendingTaskRuntimeInteractionOperation
+    operation_family: PendingTaskRuntimeInteractionOperation | GitHubMergeOperation
     original_attempt_kind: OriginalAttemptKind
     original_attempt_id: UUID
     subject: Mapping[str, object]
@@ -271,10 +334,13 @@ class OperationalFailureEpisode:
         for name in ("id", "workspace_id", "task_id", "original_attempt_id"):
             _require_uuid(getattr(self, name), name)
         _require_uuid(self.escalated_task_block_id, "escalated_task_block_id", nullable=True)
-        if not isinstance(self.operation_family, PendingTaskRuntimeInteractionOperation):
+        if not isinstance(
+            self.operation_family,
+            (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation),
+        ):
             raise OperationalFailureDomainError(
                 "OperationalFailureEpisode.operation_family must be a "
-                "PendingTaskRuntimeInteractionOperation"
+                "PendingTaskRuntimeInteractionOperation or a GitHubMergeOperation"
             )
         if not isinstance(self.original_attempt_kind, OriginalAttemptKind):
             raise OperationalFailureDomainError(
@@ -297,6 +363,9 @@ class OperationalFailureAttempt:
     computed at authorization. The ``source`` pair names the exact failed
     attempt this row succeeds — the episode's original identity for the
     first additional attempt, or a prior authorized attempt row afterwards.
+    ``consumed_at`` (F5d) is the set-once instant an execution seam stamped
+    atomically before the outbound effect it ran; ``NULL`` means the
+    authorization has not been executed.
     """
 
     id: UUID
@@ -309,12 +378,14 @@ class OperationalFailureAttempt:
     error_code: OperationalFailureCode
     not_before: datetime
     resulting_execution_id: UUID | None
+    consumed_at: datetime | None
     created_at: datetime
 
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "episode_id", "source_attempt_id"):
             _require_uuid(getattr(self, name), name)
         _require_uuid(self.resulting_execution_id, "resulting_execution_id", nullable=True)
+        _require_instant(self.consumed_at, "consumed_at", nullable=True)
         if (
             isinstance(self.ordinal, bool)
             or not isinstance(self.ordinal, int)

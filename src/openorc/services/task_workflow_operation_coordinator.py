@@ -66,6 +66,21 @@ inventory keys off this):
   positive pre-effect proof; a running attempt stays unclassified). A
   durably authorized retry's Execution reports the episode's original
   identity with ``PRIOR_AUTHORIZED`` and the bound attempt/effect row.
+- EXACT_HEAD_MERGE (F5d, issue #267) — original identity: the episode's
+  approved ``MERGE_DECISION`` gate UUID; the reported invocation identity is
+  the F5d retry execution's own consumed attempt (its one-shot ``consumed_at``
+  stamp is the durable binding — the merge family has no resulting
+  Execution); effect evidence: conservatively unclassified
+  (``EFFECT_UNCLASSIFIED`` — an unknown merge-send outcome never proves
+  non-delivery). Retry eligibility is additionally gated on the merge
+  primitive's send-phase subclass and the recognized transient transport
+  cause in its chain, verified by F4 under its Task lock; a plain uncertain
+  error is a pre-send condition and can never produce the transport code.
+  The reporting service propagates a send uncertainty only after a
+  successful fresh authoritative post-send reconciliation grounded the
+  open/unmerged same-head observation — freshness of that observation is the
+  reporting caller's binding obligation; an unavailable post-send read or a
+  reconciled changed head is settled in-service and never reported here.
 """
 
 from __future__ import annotations
@@ -85,11 +100,18 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
 )
+from openorc.adapters.github import (
+    GitHubOutcomeUncertainError,
+    GitHubTransportUncertainError,
+)
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureCode,
+    OperationalFailureFamily,
     OperationalFailureSourceKind,
+    OriginalAttemptKind,
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -114,6 +136,7 @@ from openorc.services.operation_attempt_evidence import (
     InvocationAttemptEvidence,
     ProducedAttemptIdentity,
 )
+from openorc.services.pull_request_merge import MergeRequestSendUncertainError
 from openorc.services.task_operational_failure_triage import (
     OperationalFailureDisposition,
     OperationalFailureOperation,
@@ -163,8 +186,10 @@ _PROVEN_PRE_EFFECT_RUNTIME_TYPES = (
 )
 
 # The F2 send-claim kind each dispatch family's original identity resolves to
-# (mirrors the triage service's own family/claim-kind pairing).
-_FAMILY_CLAIM_KINDS = {
+# (mirrors the triage service's own family/claim-kind pairing). The keys are
+# runtime families only; the widened annotation is the Level 2 family union
+# so the resolution reads against the closed union type.
+_FAMILY_CLAIM_KINDS: Mapping[OperationalFailureFamily, TaskRuntimeSendClaimKind] = {
     PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: (
         TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH
     ),
@@ -562,6 +587,102 @@ def _resolve_execution_report(
     )
 
 
+def _merge_retry_failure_code(error: BaseException) -> OperationalFailureCode:
+    """The merge family's send-phase error code, classified type-only (F5d).
+
+    The recognized transient transport subtype in the send error's bounded
+    cause chain is the retry-eligible code; every other uncertain send
+    outcome is the unsupported-uncertainty code. Only the merge primitive's
+    send-phase subclass can reach the transport classification: a plain
+    uncertain error is a pre-send read/credential condition and is never
+    merge-send evidence. Non-uncertain applicable failures (unexpected
+    exceptions, the ``unknown`` fallback) keep the generic type-only
+    classification.
+    """
+    if not isinstance(error, ExternalOperationUncertainError):
+        return _classify_failure_code(error)
+    current: BaseException | None = error
+    for _ in range(_MAX_CAUSE_CHAIN_NODES + 1):
+        if current is None:
+            break
+        if isinstance(current, GitHubTransportUncertainError):
+            return OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+        if isinstance(current, GitHubOutcomeUncertainError):
+            return OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+        current = current.__cause__
+    return OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+
+
+def _resolve_merge_retry_report(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    identity: ProducedAttemptIdentity,
+    error: BaseException,
+) -> _ResolvedFailureReport | None:
+    """Resolve the F5d merge-retry invocation's consumed-attempt identity.
+
+    The recorded identity is the F5d retry execution's own consumed F4 merge
+    attempt: its one-shot ``consumed_at`` stamp is the durable binding a
+    report must prove (the merge family has no resulting Execution), and the
+    recorded effect identity must be the attempt's own UUID. The reporting
+    service reaches this handoff only after a successful fresh authoritative
+    post-send reconciliation grounded the open/unmerged same-head observation
+    (an unavailable read or a changed head is settled in-service, never
+    reported) — so a retry-eligible code here stands on that fresh
+    observation. The report addresses the episode's original identity — the
+    approved ``MERGE_DECISION`` gate UUID — with ``PRIOR_AUTHORIZED``; the
+    triage service re-proves the consumption, the episode's budget, and the
+    merge subject's durable authority under its Task lock. Any incoherent
+    recorded identity (foreign scope, wrong family/kind, unconsumed attempt,
+    mismatched effect) fails closed without triaging.
+    """
+    if (
+        identity.original_attempt_kind is not OriginalAttemptKind.MERGE_DECISION_GATE
+        or identity.effect_attempt_id is None
+        or identity.effect_attempt_id != identity.original_attempt_id
+    ):
+        return None
+    attempt = failure_records.get_operational_failure_attempt(
+        pool, attempt_id=identity.original_attempt_id
+    )
+    if attempt is None or attempt.workspace_id != workspace_id or attempt.task_id != task_id:
+        return None
+    if attempt.consumed_at is None:
+        # Only the failure of an actually consumed attempt is reportable.
+        return None
+    episode = failure_records.get_operational_failure_episode(pool, episode_id=attempt.episode_id)
+    if (
+        episode is None
+        or episode.workspace_id != workspace_id
+        or episode.task_id != task_id
+        or episode.operation_family is not GitHubMergeOperation.EXACT_HEAD_MERGE
+        or episode.original_attempt_kind is not OriginalAttemptKind.MERGE_DECISION_GATE
+    ):
+        return None
+    return _ResolvedFailureReport(
+        operation=OperationalFailureOperation(
+            family=episode.operation_family,
+            original_attempt_kind=episode.original_attempt_kind,
+            original_attempt_id=episode.original_attempt_id,
+            subject=episode.subject,
+        ),
+        report=OperationalFailureReport(
+            reporting_attempt_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_attempt_id=attempt.id,
+            error_code=_merge_retry_failure_code(error),
+            effect_evidence=FailureEffectEvidence.EFFECT_UNCLASSIFIED,
+            effect_attempt_id=attempt.id,
+            diagnostic_context={
+                "error_type": type(error).__name__,
+                "phase": identity.phase,
+                "merge_mutation_attempted": isinstance(error, MergeRequestSendUncertainError),
+            },
+        ),
+    )
+
+
 def _resolve_failure_report(
     pool: DatabasePool,
     *,
@@ -596,6 +717,10 @@ def _resolve_failure_report(
         PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
     ):
         return _resolve_execution_report(
+            pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
+        )
+    if family is GitHubMergeOperation.EXACT_HEAD_MERGE:
+        return _resolve_merge_retry_report(
             pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
         )
     # The recorded identity names no supported v1 family: fail closed.

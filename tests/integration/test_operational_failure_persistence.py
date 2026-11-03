@@ -44,6 +44,7 @@ from psycopg.errors import (
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
@@ -665,3 +666,154 @@ def test_the_retry_binding_is_set_once_and_scope_exact(conn: Connection[Any]) ->
         (attempt.id,),
     ).fetchone()
     assert bound_row is not None and bound_row[0] == execution_id
+
+
+# --- F5d (issue #267): the exact-head merge family's durable state. ----------
+
+
+def test_the_merge_family_episode_attempt_and_consumption_backstops_hold(
+    conn: Connection[Any],
+) -> None:
+    """The merge family's durable facts: one episode per approved merge
+    decision gate, one successor per failed attempt, and the set-once
+    consumption stamp that refuses a second consumption outright."""
+    facts = _task_fixture(conn, status=TaskStatus.WAITING_FOR_OWNER)
+    workspace_id = facts["workspace_id"]
+    task_id = facts["task_id"]
+    gate_id = uuid.uuid4()
+
+    episode = failure_repositories.create_operational_failure_episode(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+        original_attempt_id=gate_id,
+        subject={"owner_gate_id": str(gate_id)},
+    )
+    assert episode.operation_family is GitHubMergeOperation.EXACT_HEAD_MERGE
+    # Exactly one episode per approved merge decision gate.
+    with pytest.raises(UniqueViolation), conn.transaction():
+        failure_repositories.create_operational_failure_episode(
+            facts["pool"],
+            workspace_id=workspace_id,
+            task_id=task_id,
+            operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=gate_id,
+            subject={"owner_gate_id": str(gate_id)},
+        )
+
+    attempt = failure_repositories.create_operational_failure_attempt(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        episode_id=episode.id,
+        ordinal=1,
+        source_kind=OperationalFailureSourceKind.ORIGINAL,
+        source_attempt_id=gate_id,
+        error_code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+        not_before=_NOW + timedelta(seconds=2),
+    )
+    assert attempt.consumed_at is None
+    # At most one successor per failed attempt across the whole history.
+    with pytest.raises(UniqueViolation), conn.transaction():
+        failure_repositories.create_operational_failure_attempt(
+            facts["pool"],
+            workspace_id=workspace_id,
+            task_id=task_id,
+            episode_id=episode.id,
+            ordinal=2,
+            source_kind=OperationalFailureSourceKind.ORIGINAL,
+            source_attempt_id=gate_id,
+            error_code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            not_before=_NOW + timedelta(seconds=4),
+        )
+
+    # The set-once consumption stamp: the first consumption wins, the second
+    # is refused outright, and the stamp is never cleared.
+    consumed_at = _NOW + timedelta(seconds=5)
+    consumed = failure_repositories.consume_operational_failure_attempt(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        consumed_at=consumed_at,
+    )
+    assert consumed is not None
+    assert consumed.consumed_at is not None
+    refused = failure_repositories.consume_operational_failure_attempt(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        consumed_at=_NOW + timedelta(seconds=6),
+    )
+    assert refused is None
+    reread = failure_repositories.get_operational_failure_attempt(
+        facts["pool"], attempt_id=attempt.id
+    )
+    assert reread is not None
+    assert reread.consumed_at == consumed_at
+
+    # A foreign-scope consumption is refused by the conditional update's
+    # scope guard, never applied.
+    foreign = failure_repositories.consume_operational_failure_attempt(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=uuid.uuid4(),
+        consumed_at=_NOW + timedelta(seconds=7),
+    )
+    assert foreign is None
+
+
+def test_the_merge_family_check_vocabularies_refuse_unknown_values(
+    conn: Connection[Any],
+) -> None:
+    """The extended CHECK vocabularies stay closed at the database level."""
+    facts = _task_fixture(conn, status=TaskStatus.WAITING_FOR_OWNER)
+    workspace_id = facts["workspace_id"]
+    task_id = facts["task_id"]
+    gate_id = uuid.uuid4()
+
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.operational_failure_episodes "
+            "(workspace_id, task_id, operation_family, original_attempt_kind, "
+            "original_attempt_id, subject) "
+            "values (%s, %s, 'merge', 'merge_decision_gate', %s, '{}'::jsonb)",
+            (workspace_id, task_id, gate_id),
+        )
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.operational_failure_episodes "
+            "(workspace_id, task_id, operation_family, original_attempt_kind, "
+            "original_attempt_id, subject) "
+            "values (%s, %s, 'exact_head_merge', 'gate', %s, '{}'::jsonb)",
+            (workspace_id, task_id, gate_id),
+        )
+
+    episode = failure_repositories.create_operational_failure_episode(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+        original_attempt_id=gate_id,
+        subject={"owner_gate_id": str(gate_id)},
+    )
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.operational_failure_attempts "
+            "(workspace_id, task_id, episode_id, ordinal, source_kind, "
+            "source_attempt_id, error_code, not_before) "
+            "values (%s, %s, %s, 1, 'original', %s, 'transport', %s)",
+            (
+                workspace_id,
+                task_id,
+                episode.id,
+                gate_id,
+                _NOW + timedelta(seconds=2),
+            ),
+        )

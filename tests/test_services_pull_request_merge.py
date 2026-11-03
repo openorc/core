@@ -35,6 +35,7 @@ from openorc.adapters.github import (
     GitHubPullRequestObservation,
     GitHubRateLimitedError,
     GitHubRepositoryObservation,
+    GitHubTransportUncertainError,
     GitHubUserAccessToken,
 )
 from openorc.domain.pull_requests import TaskPullRequestState
@@ -1182,3 +1183,91 @@ def test_a_merge_401_whose_recovery_re_proof_is_rejected_fails_closed_without_a_
     assert resolver.evict_calls == [_PROFILE_ID]
     assert resolver.resolve_calls == [_PROFILE_ID, _PROFILE_ID]
     assert len(github.validation_calls) == 2
+
+
+def test_a_transient_access_read_failure_stays_the_plain_uncertain_error() -> None:
+    """The F5d phase distinction: a pre-send read is never send evidence."""
+    conn = ScriptedConnection()
+    conn.on("from openorc.profiles", _guard_row())
+    conn.on("from openorc.workspaces", _workspace_row())
+    conn.on("from openorc.tasks", _task_row())
+    conn.on("from openorc.task_pull_requests where task_id", _pull_request_row())
+    conn.on("from openorc.repositories where id", _repository_row())
+    conn.on("from openorc.github_installations", _installation_row())
+    read_uncertain = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        error=GitHubTransportUncertainError("the access read failed transiently"),
+    )
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            read_uncertain,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    assert type(excinfo.value) is ExternalOperationUncertainError
+    assert not isinstance(excinfo.value, pull_request_merge.MergeRequestSendUncertainError)
+    # The merge mutation was never attempted after the failed pre-send read.
+    assert read_uncertain.merge_calls == []
+
+
+def test_the_merge_send_uncertain_outcome_carries_the_send_subtype() -> None:
+    """Only the merge-mutation send raises the send-phase uncertain subtype."""
+    conn = ScriptedConnection()
+    _merge_success_scripts(conn)
+    send_uncertain = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        pull_request_observation=_pr_observation(),
+        merge_error=GitHubTransportUncertainError("the merge send failed transiently"),
+    )
+
+    with pytest.raises(pull_request_merge.MergeRequestSendUncertainError) as excinfo:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            send_uncertain,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The send's own adapter cause stays chained for the caller's type-only
+    # classification.
+    assert isinstance(excinfo.value.__cause__, GitHubTransportUncertainError)
+    assert len(send_uncertain.merge_calls) == 1
+
+
+def test_a_plain_send_uncertain_outcome_also_carries_the_send_subtype() -> None:
+    conn = ScriptedConnection()
+    _merge_success_scripts(conn)
+    send_uncertain = FakeGitHubAppClient(
+        pool=FakePool(conn),
+        repository_observation=_repository_observation(),
+        pull_request_observation=_pr_observation(),
+        merge_error=GitHubOutcomeUncertainError("the outcome is unknown (status 503)"),
+    )
+
+    with pytest.raises(pull_request_merge.MergeRequestSendUncertainError) as excinfo:
+        pull_request_merge.request_pull_request_merge(
+            _pool(conn),
+            send_uncertain,
+            _resolver(conn),
+            profile_id=_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_head_sha=_HEAD_SHA,
+        )
+
+    # The send phase is the distinction, not the transport subtype: a 5xx-class
+    # send outcome is still send evidence (eligible for F4's escalation path,
+    # never the retry-eligible transport code).
+    assert isinstance(excinfo.value.__cause__, GitHubOutcomeUncertainError)
+    assert not isinstance(excinfo.value.__cause__, GitHubTransportUncertainError)

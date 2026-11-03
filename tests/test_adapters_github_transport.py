@@ -16,6 +16,9 @@ facts on the classified error boundary.
 
 from __future__ import annotations
 
+import http.client
+import socket
+import ssl
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -30,6 +33,7 @@ from openorc.adapters.github.errors import (
     GitHubOutcomeUncertainError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+    GitHubTransportUncertainError,
 )
 from openorc.adapters.github.transport import (
     DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS,
@@ -780,3 +784,73 @@ def test_a_rate_limited_request_performs_exactly_one_fetch_call() -> None:
         _client(fetch).request("/x", method="GET", authorization="Bearer t")
 
     assert len(fetch.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("timed out"),
+        ConnectionRefusedError("connection refused"),
+        ConnectionResetError("connection reset"),
+        BrokenPipeError("broken pipe"),
+        ConnectionAbortedError("connection aborted"),
+    ],
+)
+def test_recognized_transient_transport_failures_carry_the_transport_subtype(
+    transport_error: Exception,
+) -> None:
+    # F5d (issue #267): the closed recognized set of genuinely transient
+    # connection/timeout-class failures is the trusted typed evidence —
+    # never exception text, never a caller-supplied flag.
+    fetch = FakeFetcher([transport_error])
+
+    with pytest.raises(GitHubTransportUncertainError) as excinfo:
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+    # The unknown-outcome discipline is unchanged: the raw error is chained.
+    assert excinfo.value.__cause__ is transport_error
+
+
+def test_a_urled_error_with_a_transient_reason_carries_the_transport_subtype() -> None:
+    fetch = FakeFetcher([urllib.error.URLError(ConnectionResetError("reset"))])
+
+    with pytest.raises(GitHubTransportUncertainError):
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        ssl.SSLCertVerificationError("certificate verify failed"),
+        ssl.SSLError("handshake failed"),
+        OSError("gaierror"),
+        socket.gaierror("name resolution failed"),
+        ValueError("unexpected integration error"),
+        RuntimeError("programming error"),
+        http.client.BadStatusLine("x"),
+    ],
+)
+def test_non_transient_transport_failures_stay_the_plain_conservative_classification(
+    transport_error: Exception,
+) -> None:
+    # TLS/certificate failures, DNS-resolution failures, non-OSError protocol
+    # errors, and programming errors are identity/configuration conditions or
+    # answered-wire conditions — never recognized transient transport
+    # failures, and never retry-eligible evidence.
+    fetch = FakeFetcher([transport_error])
+
+    with pytest.raises(GitHubOutcomeUncertainError) as excinfo:
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+    assert type(excinfo.value) is GitHubOutcomeUncertainError
+    assert not isinstance(excinfo.value, GitHubTransportUncertainError)
+
+
+def test_a_urled_error_with_a_non_transient_reason_stays_the_base_classification() -> None:
+    fetch = FakeFetcher([urllib.error.URLError(ssl.SSLCertVerificationError("verify failed"))])
+
+    with pytest.raises(GitHubOutcomeUncertainError) as excinfo:
+        _client(fetch).request("/x", method="GET", authorization="Bearer t")
+
+    assert type(excinfo.value) is GitHubOutcomeUncertainError
+    assert not isinstance(excinfo.value, GitHubTransportUncertainError)

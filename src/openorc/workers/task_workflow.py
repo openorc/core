@@ -69,6 +69,9 @@ from openorc.services.task_authorized_implementation_execution import (
 from openorc.services.task_authorized_implementation_retry import (
     execute_authorized_implementation_retry,
 )
+from openorc.services.task_authorized_merge_retry import (
+    execute_authorized_merge_retry,
+)
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
@@ -114,6 +117,7 @@ from openorc.workers.invocation import (
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
     TaskAuthorizedImplementationRetryPayload,
+    TaskAuthorizedMergeRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
     TaskPrCompositionPayload,
@@ -737,6 +741,36 @@ def _compose_task_authorized_implementation_retry(
     )
 
 
+def _compose_task_authorized_merge_retry(
+    payload: TaskAuthorizedMergeRetryPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> None:
+    """Execute the one F4-authorized exact-head merge retry (F5d).
+
+    The merge-retry service atomically consumes the exact durably authorized
+    F4 attempt before its single outbound merge, settles every pre-send and
+    post-send condition truthfully through the existing E10a semantics or the
+    guarded F3/F4 escalation, and lets the merge send's own unknown outcome
+    propagate for the F5b coordinator's typed Level 2 handoff. A successful
+    merge completes the Task through the shared completion seam; no Owner
+    approval, gate presentation, or wakeup scheduling exists here (F11 owns
+    the due-time wakeups).
+    """
+    execute_authorized_merge_retry(
+        dependencies.database_pool(),
+        dependencies.github_client(),
+        dependencies.user_token_resolver(),
+        profile_id=UUID(payload.profile_id),
+        workspace_id=UUID(payload.task.workspace_id),
+        task_id=UUID(payload.task.task_id),
+        expected_state_token=UUID(payload.expected_state_token),
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        attempt_evidence=attempt_evidence,
+    )
+
+
 def _compose_task_pr_composition(
     payload: TaskPrCompositionPayload,
     *,
@@ -896,6 +930,7 @@ _TASK_WORKFLOW_COMPOSITIONS: Mapping[OperationKind, TaskWorkflowComposition] = {
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: (
         _compose_task_authorized_implementation_retry
     ),
+    OperationKind.TASK_AUTHORIZED_MERGE_RETRY: _compose_task_authorized_merge_retry,
     OperationKind.TASK_PR_COMPOSITION: _compose_task_pr_composition,
     OperationKind.TASK_PR_REVIEW: _compose_task_pr_review,
 }
@@ -938,6 +973,7 @@ _TASK_KIND_EXPECTED_STATUS: Mapping[OperationKind, TaskStatus] = {
     OperationKind.TASK_PLANNING_REVIEW: TaskStatus.PLANNING,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskStatus.IMPLEMENTING,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: TaskStatus.IMPLEMENTING,
+    OperationKind.TASK_AUTHORIZED_MERGE_RETRY: TaskStatus.WAITING_FOR_OWNER,
     OperationKind.TASK_PR_COMPOSITION: TaskStatus.WAITING_FOR_OWNER,
     OperationKind.TASK_PR_REVIEW: TaskStatus.REVIEWING,
 }

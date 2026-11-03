@@ -37,6 +37,7 @@ import pytest
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
@@ -293,14 +294,21 @@ def _failed_event_row(*, failure_kind: str = "runtime_pre_effect") -> tuple[Any,
     )
 
 
-def _episode_row(*, escalated: Any = None, episode_id: Any = _EPISODE_ID) -> tuple[Any, ...]:
+def _episode_row(
+    *,
+    escalated: Any = None,
+    episode_id: Any = _EPISODE_ID,
+    family: str = "implementation_execution",
+    kind: str = "execution",
+    original_id: Any = _EXECUTION_ID,
+) -> tuple[Any, ...]:
     return (
         episode_id,
         _WORKSPACE_ID,
         _TASK_ID,
-        "implementation_execution",
-        "execution",
-        _EXECUTION_ID,
+        family,
+        kind,
+        original_id,
         {"execution_id": str(_EXECUTION_ID)},
         escalated,
         _OBSERVED,
@@ -315,6 +323,8 @@ def _attempt_row(
     source_attempt_id: Any = _EXECUTION_ID,
     not_before: Any = None,
     resulting_execution_id: Any = _RETRY_EFFECT_ID,
+    consumed_at: Any = None,
+    error_code: str = "runtime_unavailable",
 ) -> tuple[Any, ...]:
     return (
         attempt_id,
@@ -324,9 +334,10 @@ def _attempt_row(
         ordinal,
         source_kind,
         source_attempt_id,
-        "runtime_unavailable",
+        error_code,
         not_before if not_before is not None else _NOW,
         resulting_execution_id,
+        consumed_at,
         _OBSERVED,
     )
 
@@ -1190,3 +1201,393 @@ def test_the_binding_service_fails_closed_on_conflicts_and_stale_state() -> None
     conn.on(_ATTEMPT_READ, None)
     with pytest.raises(NotFoundError):
         bind_retry_attempt_execution(_pool(conn), **base)
+
+
+# F5d (issue #267) merge-family fixtures: the approved MERGE_DECISION gate is
+# the episode's original durable merge-operation identity.
+_GATE_ID = uuid4()
+_OWNER_PROFILE_ID = uuid4()
+
+_MERGE_PR_BY_ID = _sql_has("from openorc.task_pull_requests where id")
+
+
+def _merge_gate_row(*, status: str = "approved", pr_id: Any = _PR_ID) -> tuple[Any, ...]:
+    return (
+        _GATE_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "merge_decision",
+        status,
+        None,
+        _HEAD_SHA,
+        pr_id,
+        None,
+        _OBSERVED if status != "pending" else None,
+        _OBSERVED,
+    )
+
+
+def _merge_pr_row(
+    *, state: str = "open", merged_at: Any = None, head_sha: str = _HEAD_SHA
+) -> tuple[Any, ...]:
+    return (
+        _PR_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        uuid4(),
+        555,
+        42,
+        "openorc/task-1",
+        "main",
+        head_sha,
+        state,
+        merged_at,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _merge_requested_event_row(*, gate_id: Any = _GATE_ID, actor: str = "owner") -> tuple[Any, ...]:
+    return (
+        uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "merge_requested",
+        actor,
+        str(_OWNER_PROFILE_ID) if actor == "owner" else None,
+        "task_pull_request",
+        _PR_ID,
+        {"owner_gate_id": str(gate_id)},
+        _OBSERVED,
+    )
+
+
+def _merge_operation(
+    *,
+    family: Any = GitHubMergeOperation.EXACT_HEAD_MERGE,
+    kind: Any = OriginalAttemptKind.MERGE_DECISION_GATE,
+) -> OperationalFailureOperation:
+    return OperationalFailureOperation(
+        family=family,
+        original_attempt_kind=kind,
+        original_attempt_id=_GATE_ID,
+        subject={
+            "owner_gate_id": str(_GATE_ID),
+            "task_pull_request_id": str(_PR_ID),
+            "expected_head_sha": _HEAD_SHA,
+        },
+    )
+
+
+def _merge_report(
+    *,
+    code: OperationalFailureCode = OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+    evidence: FailureEffectEvidence = FailureEffectEvidence.EFFECT_UNCLASSIFIED,
+    reporting_kind: OperationalFailureSourceKind = OperationalFailureSourceKind.ORIGINAL,
+    reporting_id: Any = None,
+    effect: Any = None,
+) -> OperationalFailureReport:
+    return OperationalFailureReport(
+        reporting_attempt_kind=reporting_kind,
+        reporting_attempt_id=_GATE_ID if reporting_id is None else reporting_id,
+        error_code=code,
+        effect_evidence=evidence,
+        effect_attempt_id=effect,
+        diagnostic_context={"merge_mutation_attempted": True},
+    )
+
+
+def _merge_attempt_rows(*, consumed: bool = True, count: int = 1) -> list[tuple[Any, ...]]:
+    rows = []
+    for index in range(count):
+        rows.append(
+            _attempt_row(
+                attempt_id=_ATTEMPT_1_ID if count == 1 else uuid4(),
+                ordinal=index + 1,
+                source_kind="original" if index == 0 else "prior_authorized",
+                error_code="external_transport_unavailable",
+                consumed_at=_OBSERVED if consumed else None,
+            )
+        )
+    rows[-1] = _attempt_row(
+        attempt_id=_ATTEMPT_1_ID if count == 1 else uuid4(),
+        ordinal=count,
+        source_kind="original" if count == 1 else "prior_authorized",
+        error_code="external_transport_unavailable",
+        consumed_at=_OBSERVED if consumed else None,
+    )
+    return rows
+
+
+def _script_merge_retry(
+    conn: ScriptedConnection,
+    *,
+    episode_row: Any | None = None,
+    attempts_rows: list[Any] | None = None,
+    gate_row: Any | None = None,
+    pr_row: Any | None = None,
+    event_rows: list[Any] | None = None,
+    attempt_return: Any | None = None,
+) -> None:
+    """Script the full locked flow of one merge-family disposition."""
+    conn.on(_TASK_LOCKED, _task(status="waiting_for_owner"))
+    conn.on(
+        _EPISODE_BY_ORIGINAL,
+        episode_row
+        if episode_row is not None
+        else _episode_row(
+            family="exact_head_merge", kind="merge_decision_gate", original_id=_GATE_ID
+        ),
+    )
+    conn.on(
+        _ATTEMPTS_LIST,
+        attempts_rows if attempts_rows is not None else _merge_attempt_rows(),
+    )
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_GATE_READ, gate_row if gate_row is not None else _merge_gate_row())
+    conn.on(_MERGE_PR_BY_ID, pr_row if pr_row is not None else _merge_pr_row())
+    conn.on(_GATE_READ, gate_row if gate_row is not None else _merge_gate_row())
+    conn.on(_EVENTS_FIND, event_rows if event_rows is not None else [_merge_requested_event_row()])
+    if episode_row is None:
+        conn.on(
+            _EPISODE_INSERT,
+            _episode_row(
+                family="exact_head_merge", kind="merge_decision_gate", original_id=_GATE_ID
+            ),
+        )
+    conn.on(
+        _ATTEMPT_INSERT,
+        attempt_return
+        if attempt_return is not None
+        else _attempt_row(error_code="external_transport_unavailable", resulting_execution_id=None),
+    )
+
+
+def test_the_merge_family_pairs_only_with_the_gate_identity() -> None:
+    conn = ScriptedConnection()
+    with pytest.raises(InvalidCommandError):
+        _triage(
+            conn,
+            status=TaskStatus.WAITING_FOR_OWNER,
+            operation=_merge_operation(kind=OriginalAttemptKind.EXECUTION),
+        )
+
+
+def test_a_merge_transport_failure_over_a_reconciled_open_head_is_authorized() -> None:
+    conn = ScriptedConnection()
+    _script_merge_retry(
+        conn,
+        attempt_return=_attempt_row(
+            error_code="external_transport_unavailable",
+            resulting_execution_id=None,
+            not_before=_NOW + timedelta(seconds=2),
+            source_attempt_id=_GATE_ID,
+        ),
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(),
+    )
+    assert result.kind is DispositionKind.RETRY_AUTHORIZED
+    assert result.retry_attempt is not None
+    assert result.retry_attempt.error_code.value == "external_transport_unavailable"
+    assert result.retry_attempt.not_before == _NOW + timedelta(seconds=2)
+
+
+def test_a_merge_unsupported_uncertainty_escalates_through_f3() -> None:
+    conn = ScriptedConnection()
+    _script_escalation_merge(conn)
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(code=OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def _script_escalation_merge(
+    conn: ScriptedConnection, *, consumed: bool = True, event_rows: list[Any] | None = None
+) -> None:
+    """The merge family's escalation flow: F3 install + the episode stamp."""
+    task_row = _task(status="waiting_for_owner")
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(
+        _EPISODE_BY_ORIGINAL,
+        _episode_row(family="exact_head_merge", kind="merge_decision_gate", original_id=_GATE_ID),
+    )
+    conn.on(_ATTEMPTS_LIST, _merge_attempt_rows(consumed=consumed))
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_GATE_READ, _merge_gate_row())
+    conn.on(_MERGE_PR_BY_ID, _merge_pr_row())
+    conn.on(_GATE_READ, _merge_gate_row())
+    conn.on(_EVENTS_FIND, event_rows if event_rows is not None else [_merge_requested_event_row()])
+    conn.on(
+        _EPISODE_INSERT,
+        _episode_row(family="exact_head_merge", kind="merge_decision_gate", original_id=_GATE_ID),
+    )
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_TASK_PLAIN, task_row)
+    conn.on(
+        _BLOCK_INSERT,
+        (_BLOCK_ID, _WORKSPACE_ID, _TASK_ID, "external_operation_uncertain", {}, None, _OBSERVED),
+    )
+    conn.on(
+        _GATE_INSERT,
+        (
+            _NEW_GATE_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            "block_resolution",
+            "pending",
+            None,
+            None,
+            None,
+            _BLOCK_ID,
+            None,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _TASK_BLOCK_UPDATE,
+        _task(status="blocked", state_token=_ROTATED_TOKEN, current_gate=_NEW_GATE_ID),
+    )
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
+    conn.on(
+        _EPISODE_ESCALATE,
+        _episode_row(
+            family="exact_head_merge",
+            kind="merge_decision_gate",
+            original_id=_GATE_ID,
+            escalated=_BLOCK_ID,
+        ),
+    )
+
+
+def test_a_merge_prior_authorized_report_requires_the_consumption_stamp() -> None:
+    conn = ScriptedConnection()
+    _script_merge_retry(
+        conn,
+        episode_row=_episode_row(
+            family="exact_head_merge", kind="merge_decision_gate", original_id=_GATE_ID
+        ),
+        attempts_rows=_merge_attempt_rows(consumed=False),
+        attempt_return=None,
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(
+            reporting_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_id=_ATTEMPT_1_ID,
+            effect=_ATTEMPT_1_ID,
+        ),
+    )
+    # The unconsumed attempt's failure is unreportable: a typed no-op that
+    # applies nothing.
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_a_merge_report_on_a_merged_durable_pr_is_stale() -> None:
+    conn = ScriptedConnection()
+    _script_merge_retry(
+        conn,
+        pr_row=_merge_pr_row(state="closed", merged_at=_OBSERVED),
+        attempt_return=None,
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_a_merge_report_without_the_owner_claim_escalates() -> None:
+    conn = ScriptedConnection()
+    _script_escalation_merge(
+        conn,
+        event_rows=[_merge_requested_event_row(gate_id=uuid4())],  # a different gate's claim
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(),
+    )
+    # The one-shot MERGE_REQUESTED Owner claim is the positive corroboration;
+    # a missing/mismatched claim fails closed into the escalation.
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+
+
+def test_a_merge_known_failed_evidence_escalates() -> None:
+    conn = ScriptedConnection()
+    _script_escalation_merge(conn)
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(evidence=FailureEffectEvidence.KNOWN_FAILED),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+
+
+def test_a_merge_report_with_a_crossed_runtime_code_escalates() -> None:
+    """F4's matrix permits exact (family, code) pairs only: a merge report
+    carrying the runtime transient-network code lacks the required classified
+    GitHub merge-send transport failure and can never authorize another merge
+    — it escalates through the safe F3 installation."""
+    conn = ScriptedConnection()
+    _script_escalation_merge(conn)
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(code=OperationalFailureCode.RUNTIME_UNAVAILABLE),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def test_an_implementation_report_with_a_crossed_transport_code_escalates() -> None:
+    """The crossed pairing in the other direction: an implementation-execution
+    report carrying the GitHub-specific external-transport code lacks the
+    classified runtime transient-network failure and escalates — never a
+    merge-shaped authorization, never a wrong-family code path."""
+    conn = ScriptedConnection()
+    _script_escalation(
+        conn,
+        task_row=_task(status="implementing", plan_revision=_REVISION_ID),
+        execution_row=_execution(),
+        event_rows=[_failed_event_row()],
+        extra_setup=lambda c: (
+            c.on(_REVISION_READ, _revision_row()),
+            c.on(_GATES_LIST, [_impl_gate_row()]),
+            c.on(
+                _SESSION_LOCKED,
+                _session_row("producer", _PRODUCER_SESSION_ID, "fake-session-0"),
+            ),
+        ),
+    )
+    result = _triage(
+        conn,
+        report=_report(
+            code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+        ),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID

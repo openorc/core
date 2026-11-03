@@ -18,6 +18,7 @@ import pytest
 
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureDomainError,
@@ -27,6 +28,7 @@ from openorc.domain.operational_failures import (
     canonical_bounded_failure_context,
     operational_failure_attempt_field_names,
     operational_failure_episode_field_names,
+    operational_failure_family_from_value,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 
@@ -61,6 +63,7 @@ def _attempt(**overrides: object) -> OperationalFailureAttempt:
         "error_code": OperationalFailureCode.RUNTIME_UNAVAILABLE,
         "not_before": _OBSERVED,
         "resulting_execution_id": uuid4(),
+        "consumed_at": None,
         "created_at": _OBSERVED,
     }
     values.update(overrides)
@@ -79,6 +82,7 @@ def test_the_error_code_vocabulary_is_the_closed_taxonomy_set_with_fallback() ->
         "external_operation_failed",
         "external_operation_uncertain",
         "external_operation_rejected",
+        "external_transport_unavailable",
         "unknown",
     }
 
@@ -120,6 +124,7 @@ def test_the_attempt_carries_exactly_its_own_facts() -> None:
             "error_code",
             "not_before",
             "resulting_execution_id",
+            "consumed_at",
             "created_at",
         }
     )
@@ -163,3 +168,54 @@ def test_the_bounded_context_canonicalizes_and_enforces_bounds() -> None:
         canonical_bounded_failure_context(deep)
     with pytest.raises(OperationalFailureDomainError):
         canonical_bounded_failure_context({"big": "x" * 5000})
+
+
+def test_the_merge_operation_family_is_the_single_exact_head_member() -> None:
+    assert {family.value for family in GitHubMergeOperation} == {"exact_head_merge"}
+    assert not set(GitHubMergeOperation) & set(PendingTaskRuntimeInteractionOperation)
+    episode = _episode(
+        operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+    )
+    assert episode.operation_family is GitHubMergeOperation.EXACT_HEAD_MERGE
+    with pytest.raises(OperationalFailureDomainError):
+        _episode(operation_family="exact_head_merge")
+    # The family/identity-kind pairing is the triage service's command-shape
+    # check (its _FAMILY_IDENTITY_KINDS map), not a domain invariant.
+
+
+def test_the_original_attempt_vocabulary_carries_the_merge_decision_gate() -> None:
+    assert OriginalAttemptKind.MERGE_DECISION_GATE.value == "merge_decision_gate"
+    episode = _episode(
+        operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+    )
+    assert episode.original_attempt_kind is OriginalAttemptKind.MERGE_DECISION_GATE
+
+
+def test_the_family_value_resolver_resolves_both_vocabularies_and_fails_closed() -> None:
+    assert (
+        operational_failure_family_from_value("implementation_execution")
+        is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    )
+    assert (
+        operational_failure_family_from_value("exact_head_merge")
+        is GitHubMergeOperation.EXACT_HEAD_MERGE
+    )
+    with pytest.raises(OperationalFailureDomainError):
+        operational_failure_family_from_value("not_a_family")
+
+
+def test_the_code_vocabulary_carries_the_transient_transport_code() -> None:
+    assert OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE.value == (
+        "external_transport_unavailable"
+    )
+
+
+def test_the_consumed_at_stamp_is_a_nullable_timezone_aware_instant() -> None:
+    assert _attempt(consumed_at=None).consumed_at is None
+    assert _attempt(consumed_at=_OBSERVED).consumed_at == _OBSERVED
+    with pytest.raises(OperationalFailureDomainError):
+        _attempt(consumed_at=datetime(2026, 10, 30, 12, 0, 0))
+    with pytest.raises(OperationalFailureDomainError):
+        _attempt(consumed_at="not an instant")

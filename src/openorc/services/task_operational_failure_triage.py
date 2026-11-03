@@ -28,12 +28,23 @@ family; mutable evidence that can settle without rotating the Task token
 ``FOR UPDATE`` reads in Task-lock-first order.
 
 Retry eligibility is one explicit small matrix: the family must support a
-distinct logical-attempt path (v1: only the implementation-execution
-family, whose existing durable identity is the fresh per-Task Execution
-row), the code must be the classified transient network failure, the
-evidence must be positively pre-effect, durable corroboration must agree
-(the ``execution_failed`` audit event's safe failure-kind for the exact
-attempt), and the episode's three-additional-attempt budget must have room.
+distinct logical-attempt path (the implementation-execution family, whose
+durable identity is the fresh per-Task Execution row, and — F5d (#267) —
+the exact-head GitHub merge family, whose durable identity is the approved
+``MERGE_DECISION`` gate UUID and whose one-shot consumption evidence is the
+attempt's own ``consumed_at`` stamp), the code must be the classified
+transient failure of that family, the evidence must pass the family-scoped
+rule (positive pre-effect proof for runtime families; for the merge family
+classified uncertainty additionally admits retry because its repeat-safety
+proof is structural — GitHub's documented expected-head guard and the
+canonical PR's single merged state — never provider prose and never a
+caller-supplied flag), durable corroboration must agree (the
+``execution_failed`` audit event's safe failure-kind for the exact
+Execution, or the merge family's one-shot ``MERGE_REQUESTED`` Owner claim
+on the consumed gate), and the episode's three-additional-attempt budget
+must have room, and the (family, code) pairing is exact — a crossed
+combination (a merge report carrying a runtime code, or an implementation
+report carrying the external-transport code) is never retry-eligible.
 Everything else escalates: the F2 one-shot claim families have no legitimate
 new-attempt path and always escalate, even on proven pre-effect network
 failures. The authorized attempt is persisted with its ordinal and
@@ -64,21 +75,24 @@ from uuid import UUID
 
 from openorc.domain.blocks import TaskBlockReason, canonical_task_block_context
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.events import WorkflowEventType
+from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureDomainError,
     OperationalFailureEpisode,
+    OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
     canonical_bounded_failure_context,
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.domain.reviews import (
     ReviewIteration,
     ReviewLoopPurpose,
@@ -130,9 +144,10 @@ __all__ = [
 _TRACER_SCOPE = "openorc.services.task_operational_failure_triage"
 _TRIAGE_SPAN_NAME = "task_operational_failure_triage.triage_operational_failure"
 
-# The audit-event subject discriminator for Execution-scoped events (the
-# open validated-text vocabulary of event_coordination).
+# The audit-event subject discriminators (the open validated-text vocabulary
+# of event_coordination).
 _EXECUTION_SUBJECT_TYPE = "execution"
+_TASK_PULL_REQUEST_SUBJECT_TYPE = "task_pull_request"
 # The safe machine classification the Level 1 seams record for a positively
 # proven pre-effect runtime failure (task_runtime_send_claims and the
 # authorized-implementation-execution service).
@@ -175,13 +190,14 @@ class NoOpReason(StrEnum):
 class OperationalFailureOperation:
     """The typed identity of the logical operation whose failure is reported.
 
-    ``family`` is the closed pending-interaction operation vocabulary; the
-    ``original_attempt`` pair names the existing durable claim/attempt
-    identity the failure episode roots at; ``subject`` is the canonical
-    safe-identifier mapping of the exact workflow subject.
+    ``family`` is the closed Level 2 operation-family vocabulary — the F2
+    pending-interaction operations plus, from F5d (#267), the exact-head
+    GitHub merge family; the ``original_attempt`` pair names the existing
+    durable claim/attempt identity the failure episode roots at; ``subject``
+    is the canonical safe-identifier mapping of the exact workflow subject.
     """
 
-    family: PendingTaskRuntimeInteractionOperation
+    family: OperationalFailureFamily
     original_attempt_kind: OriginalAttemptKind
     original_attempt_id: UUID
     subject: Mapping[str, object]
@@ -227,21 +243,41 @@ class OperationalFailureDisposition:
     existing_attempt_id: UUID | None = None
 
 
-# The v1 retry-eligibility matrix: the explicit, small classification the
-# service owns. Only the implementation-execution family has a supported
-# distinct logical-attempt path (a fresh per-Task Execution row is the
-# existing durable attempt identity); every F2 one-shot send claim, the
-# bootstrap claim, the E3a iteration reservation, and the one-shot E9
-# remediation claim have no legitimate new-attempt path and always escalate,
-# even when the network failure was positively pre-effect. Only the
-# classified transient-network pre-effect code is retry-eligible; uncertain
-# evidence, every other code, and the fallback escalate (v1 has no
-# idempotent/read-only workflow operation family).
-_RETRY_ELIGIBLE_FAMILIES: frozenset[PendingTaskRuntimeInteractionOperation] = frozenset(
-    {PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION}
-)
-_RETRY_ELIGIBLE_CODES: frozenset[OperationalFailureCode] = frozenset(
-    {OperationalFailureCode.RUNTIME_UNAVAILABLE}
+# The retry-eligibility matrix: the explicit, small classification the
+# service owns. Only families with a supported distinct logical-attempt path
+# are eligible, and ONLY with their own exact classified transient-failure
+# code — the permitted (family, code) pairs, never the two vocabularies
+# independently:
+#
+# - the implementation-execution family (a fresh per-Task Execution row is
+#   the existing durable attempt identity) with the classified runtime
+#   transient-network failure; and
+# - the exact-head GitHub merge family (F5d, issue #267; its distinct
+#   attempts are the F4 authorizations themselves, rooted at the approved
+#   MERGE_DECISION gate UUID) with the classified transient external-
+#   transport failure of a GitHub merge send.
+#
+# A crossed family/code combination is never retry-eligible: a merge report
+# carrying a runtime code lacks the required classified GitHub merge-send
+# transport failure, and an implementation report carrying the external-
+# transport code lacks the classified runtime failure. Every F2 one-shot
+# send claim, the bootstrap claim, the E3a iteration reservation, and the
+# one-shot E9 remediation claim have no legitimate new-attempt path and
+# always escalate, even when the network failure was positively pre-effect.
+# Uncertain evidence, every other code, and the fallback escalate.
+_RETRY_ELIGIBLE_PAIRS: frozenset[tuple[OperationalFailureFamily, OperationalFailureCode]] = (
+    frozenset(
+        {
+            (
+                PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+                OperationalFailureCode.RUNTIME_UNAVAILABLE,
+            ),
+            (
+                GitHubMergeOperation.EXACT_HEAD_MERGE,
+                OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            ),
+        }
+    )
 )
 
 # The exponential backoff due-time policy: 2 s, 4 s, 8 s for the three
@@ -271,6 +307,11 @@ _ESCALATION_REASONS: Mapping[OperationalFailureCode, TaskBlockReason] = MappingP
         OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN: (
             TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN
         ),
+        # F5d (issue #267): the classified transient transport failure's
+        # coarse blocking reason when the merge family's escalation runs.
+        OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE: (
+            TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN
+        ),
         OperationalFailureCode.EXTERNAL_OPERATION_FAILED: TaskBlockReason.UNKNOWN,
         OperationalFailureCode.EXTERNAL_OPERATION_REJECTED: TaskBlockReason.UNKNOWN,
         OperationalFailureCode.UNKNOWN: TaskBlockReason.UNKNOWN,
@@ -280,52 +321,59 @@ _ESCALATION_REASONS: Mapping[OperationalFailureCode, TaskBlockReason] = MappingP
 # Which durable original-identity kinds can root each operation family; an
 # incoherent pair is a malformed command. ``owner_control_intent`` pairs with
 # no v1 family yet and therefore fails closed as a command shape error.
-_FAMILY_IDENTITY_KINDS: Mapping[
-    PendingTaskRuntimeInteractionOperation, frozenset[OriginalAttemptKind]
-] = MappingProxyType(
-    {
-        PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE: frozenset(
-            {OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM}
-        ),
-        PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION: frozenset(
-            {OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM}
-        ),
-        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: frozenset(
-            {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
-        ),
-        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: frozenset(
-            {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
-        ),
-        PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW: frozenset(
-            {OriginalAttemptKind.REVIEW_ITERATION}
-        ),
-        PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: frozenset(
-            {OriginalAttemptKind.EXECUTION}
-        ),
-        PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION: frozenset(
-            {OriginalAttemptKind.EXECUTION}
-        ),
-        PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: frozenset(
-            {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
-        ),
-    }
-)
-
-# The F2 send-claim kind each dispatch family's original identity resolves to.
-_FAMILY_CLAIM_KINDS: Mapping[PendingTaskRuntimeInteractionOperation, TaskRuntimeSendClaimKind] = (
+_FAMILY_IDENTITY_KINDS: Mapping[OperationalFailureFamily, frozenset[OriginalAttemptKind]] = (
     MappingProxyType(
         {
-            PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: (
-                TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH
+            PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE: frozenset(
+                {OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM}
             ),
-            PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: (
-                TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH
+            PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION: frozenset(
+                {OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM}
             ),
-            PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: (
-                TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH
+            PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: frozenset(
+                {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
+            ),
+            PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: frozenset(
+                {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
+            ),
+            PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW: frozenset(
+                {OriginalAttemptKind.REVIEW_ITERATION}
+            ),
+            PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: frozenset(
+                {OriginalAttemptKind.EXECUTION}
+            ),
+            PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION: frozenset(
+                {OriginalAttemptKind.EXECUTION}
+            ),
+            PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: frozenset(
+                {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
+            ),
+            # F5d (issue #267): the merge family roots at the approved
+            # MERGE_DECISION gate UUID — the original durable merge-operation
+            # identity. A Task token, raw caller UUID, or PR number alone is not
+            # an original attempt.
+            GitHubMergeOperation.EXACT_HEAD_MERGE: frozenset(
+                {OriginalAttemptKind.MERGE_DECISION_GATE}
             ),
         }
     )
+)
+
+# The F2 send-claim kind each dispatch family's original identity resolves to.
+# The keys are runtime families only; the widened annotation is the Level 2
+# family union so the dispatch reads against the closed union type.
+_FAMILY_CLAIM_KINDS: Mapping[OperationalFailureFamily, TaskRuntimeSendClaimKind] = MappingProxyType(
+    {
+        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: (
+            TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH
+        ),
+        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: (
+            TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH
+        ),
+        PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: (
+            TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH
+        ),
+    }
 )
 
 
@@ -395,8 +443,14 @@ def triage_operational_failure(
         raise InvalidCommandError("actor must be a WorkflowActorContext")
     if not isinstance(operation, OperationalFailureOperation):
         raise InvalidCommandError("operation must be an OperationalFailureOperation")
-    if not isinstance(operation.family, PendingTaskRuntimeInteractionOperation):
-        raise InvalidCommandError("operation.family must be a pending-interaction operation")
+    if not isinstance(
+        operation.family,
+        (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation),
+    ):
+        raise InvalidCommandError(
+            "operation.family must be a pending-interaction operation or the "
+            "exact-head GitHub merge family"
+        )
     if not isinstance(operation.original_attempt_kind, OriginalAttemptKind):
         raise InvalidCommandError("operation.original_attempt_kind must be an OriginalAttemptKind")
     _require_uuid_command(operation.original_attempt_id, "operation.original_attempt_id")
@@ -642,10 +696,21 @@ def _triage_locked(
     reported_attempt: OperationalFailureAttempt | None = None
     if report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED:
         reported_attempt = next((a for a in attempts if a.id == report.reporting_attempt_id), None)
-        if (
-            reported_attempt is None
-            or episode is None
-            or reported_attempt.resulting_execution_id is None
+        if reported_attempt is None or episode is None:
+            return _stale_no_op()
+        if operation.family is GitHubMergeOperation.EXACT_HEAD_MERGE:
+            # F5d (issue #267): the merge family's one-shot
+            # consumed-merge-attempt evidence replaces the resulting-Execution
+            # binding — the report must address the consumed attempt's own
+            # identity and prove its set-once consumption stamp. Only the
+            # failure of an actually consumed attempt is reportable.
+            if (
+                reported_attempt.consumed_at is None
+                or report.effect_attempt_id != reported_attempt.id
+            ):
+                return _stale_no_op()
+        elif (
+            reported_attempt.resulting_execution_id is None
             or reported_attempt.resulting_execution_id != report.effect_attempt_id
         ):
             return _stale_no_op()
@@ -672,20 +737,30 @@ def _triage_locked(
     )
     next_ordinal = reported_attempt.ordinal + 1 if reported_attempt is not None else 1
     retry_eligible = (
-        operation.family in _RETRY_ELIGIBLE_FAMILIES
-        and report.error_code in _RETRY_ELIGIBLE_CODES
-        and report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+        (operation.family, report.error_code) in _RETRY_ELIGIBLE_PAIRS
+        and _effect_evidence_eligible(operation.family, report.effect_evidence)
         and next_ordinal <= 3
         and not verified.session_lost
     )
     if retry_eligible:
         # Positive durable corroboration is part of the proof: a bare
         # finalized status or a caller classification alone never authorizes.
-        retry_eligible = _corroborate_pre_effect_execution_failure(
-            transaction_pool,
-            workspace_id=workspace_id,
-            execution_id=effect_execution_id,
-        )
+        if operation.family is GitHubMergeOperation.EXACT_HEAD_MERGE:
+            # F5d (issue #267): the merge family's durable corroboration is
+            # the one-shot MERGE_REQUESTED Owner claim on the consumed gate —
+            # never an execution-failure audit, and never provider prose.
+            retry_eligible = _corroborate_merge_requested_claim(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=operation.original_attempt_id,
+            )
+        else:
+            retry_eligible = _corroborate_pre_effect_execution_failure(
+                transaction_pool,
+                workspace_id=workspace_id,
+                execution_id=effect_execution_id,
+            )
     if retry_eligible:
         if episode is None:
             episode = failure_records.create_operational_failure_episode(
@@ -767,6 +842,14 @@ def _verify_family(
             task_id=task_id,
             operation=operation,
         )
+    if family is GitHubMergeOperation.EXACT_HEAD_MERGE:
+        return _verify_merge_family(
+            transaction_pool,
+            task=task,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            operation=operation,
+        )
     return _verify_execution_family(
         transaction_pool,
         task=task,
@@ -840,6 +923,131 @@ def _review_iteration_superseded(
     if later:
         return _stale_no_op()
     return None
+
+
+def _effect_evidence_eligible(
+    family: OperationalFailureFamily,
+    evidence: FailureEffectEvidence,
+) -> bool:
+    """The family-scoped effect-evidence rule of the eligibility matrix.
+
+    Runtime families demand positive pre-effect proof — the only evidence
+    that can support a safe retry of an operation whose effect is unknown.
+    The exact-head merge family (F5d, issue #267) additionally admits
+    classified uncertainty: an unknown merge-send outcome never proves
+    non-delivery, and this family's repeat-safety proof is structural —
+    GitHub's documented expected-head guard plus the canonical PR's single
+    merged state — so the caller's independently reconciled open/unmerged
+    same-head observation may support a bounded retry. ``KNOWN_FAILED``
+    never supports a retry for any family.
+    """
+    if evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED:
+        return True
+    return (
+        family is GitHubMergeOperation.EXACT_HEAD_MERGE
+        and evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    )
+
+
+def _verify_merge_family(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    workspace_id: UUID,
+    task_id: UUID,
+    operation: OperationalFailureOperation,
+) -> _VerifiedFailure | OperationalFailureDisposition:
+    """Verify one exact-head merge family report against durable authority (F5d).
+
+    The episode roots at the approved ``MERGE_DECISION`` gate; the report
+    stays current only while the durable approved gate still binds the exact
+    canonical TaskPullRequest and its Reviewer-accepted head SHA, and the
+    durable canonical PR row is still the open PR at exactly that head — the
+    row the reporting caller's authoritative reconciliation just updated.
+    Freshness of that post-send observation is the reporting caller's binding
+    obligation: a retry-eligible code may be supplied only after a successful
+    fresh authoritative reconciliation grounded the open/unmerged same-head
+    observation (the service layer owns external-outcome classification),
+    and F4's durable check re-proves the recorded subject state under its
+    Task lock. A merged or closed-unmerged durable PR row means the subject
+    settled — the report is stale, and the known merged result always takes
+    the shared completion seam instead of a retry. An Owner merge command has
+    no runtime session: the merge family has no role/session binding to
+    verify, so session loss is never its blocking fact.
+    """
+    if operation.original_attempt_kind is not OriginalAttemptKind.MERGE_DECISION_GATE:
+        return _stale_no_op()
+    gate = gate_records.get_owner_gate(
+        transaction_pool, owner_gate_id=operation.original_attempt_id
+    )
+    if (
+        gate is None
+        or gate.workspace_id != workspace_id
+        or gate.task_id != task_id
+        or gate.gate_type is not OwnerGateType.MERGE_DECISION
+        or gate.status is not OwnerGateStatus.APPROVED
+        or gate.task_pull_request_id is None
+        or gate.subject_head_sha is None
+    ):
+        return _stale_no_op()
+    pull_request = pull_request_records.get_task_pull_request(
+        transaction_pool, task_pull_request_id=gate.task_pull_request_id
+    )
+    if (
+        pull_request is None
+        or pull_request.workspace_id != workspace_id
+        or pull_request.task_id != task_id
+        or pull_request.state is not TaskPullRequestState.OPEN
+        or pull_request.head_sha != gate.subject_head_sha
+    ):
+        return _stale_no_op()
+    return _VerifiedFailure(session_lost=False)
+
+
+def _corroborate_merge_requested_claim(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+) -> bool:
+    """The merge family's durable corroboration: the one-shot Owner claim (F5d).
+
+    Positive proof the reported merge attempt actually flowed from the
+    episode's approved ``MERGE_DECISION`` gate: the canonical PR subject's
+    audit history must carry the ``MERGE_REQUESTED`` event recorded with the
+    Owner actor and referencing exactly this gate. The subject's history is a
+    small bounded family, but the scan never assumes the newest event is the
+    claim (the same bounded audit-lookup discipline as the Execution
+    corroboration). No matching Owner claim is the fail-closed ``False`` —
+    never a retry permission, never a guess.
+    """
+    gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=owner_gate_id)
+    if (
+        gate is None
+        or gate.workspace_id != workspace_id
+        or gate.task_id != task_id
+        or gate.gate_type is not OwnerGateType.MERGE_DECISION
+        or gate.status is not OwnerGateStatus.APPROVED
+        or gate.task_pull_request_id is None
+    ):
+        return False
+    events = event_records.find_events_by_subject(
+        transaction_pool,
+        workspace_id=workspace_id,
+        subject_type=_TASK_PULL_REQUEST_SUBJECT_TYPE,
+        subject_id=gate.task_pull_request_id,
+        limit=_EXECUTION_FAILURE_EVENT_LIMIT,
+    )
+    for event in events:
+        if event.event_type is not WorkflowEventType.MERGE_REQUESTED:
+            continue
+        if event.actor_type is not WorkflowEventActor.OWNER:
+            continue
+        claimed = event.context.get("owner_gate_id")
+        if claimed == str(owner_gate_id):
+            return True
+    return False
 
 
 def _verify_send_claim_family(
