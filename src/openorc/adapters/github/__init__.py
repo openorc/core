@@ -69,6 +69,7 @@ from openorc.adapters.github.errors import (
     GitHubPullRequestExistsError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+    GitHubTransportUncertainError,
     GitHubUserTokenRefreshCapabilityMissingError,
     GitHubUserTokenRejectedError,
 )
@@ -195,6 +196,7 @@ __all__ = [
     "GitHubPullRequestExistsError",
     "GitHubRateLimitedError",
     "GitHubRequestRejectedError",
+    "GitHubTransportUncertainError",
     "GitHubUserTokenRefreshCapabilityMissingError",
     "GitHubUserTokenRejectedError",
     "map_installation_permissions",

@@ -31,6 +31,34 @@ Outcome classification (the discipline the services rely on):
   safe redirect policy refuses to follow (cross-origin, malformed, loop,
   excess, or a non-read method), 5xx, or an otherwise uninterpretable
   response. The outcome is neither success nor known failure; callers
+- ``GitHubRequestRejectedError`` — any other definitive non-success answer.
+- ``GitHubOutcomeUncertainError`` — timeout, connection loss, a redirect the
+  safe redirect policy refuses to follow (cross-origin, malformed, loop,
+  excess, or a non-read method), 5xx, or an otherwise uninterpretable
+  response. The outcome is neither success nor known failure; callers
+  reconcile, they do not blindly replay.
+- ``GitHubTransportUncertainError`` — the narrow subclass of the uncertain
+  outcome where no HTTP answer could be exchanged AND the transport failure
+  is a recognized, plausibly-ephemeral connection/timeout-class condition
+  (issue #267): a bounded timeout, a refused/reset/aborted connection, a
+__all__ = [
+    "GitHubAuthenticationRejectedError",
+    "GitHubAuthorizationRejectedError",
+    "GitHubOutcomeUncertainError",
+    "GitHubPullRequestExistsError",
+    "GitHubRateLimitedError",
+    "GitHubRequestRejectedError",
+    "GitHubTransportUncertainError",
+    "GitHubUserTokenRefreshCapabilityMissingError",
+    "GitHubUserTokenRejectedError",
+]
+  broken pipe, or a ``URLError`` wrapping exactly one of those. Deliberately
+  narrower than the base class — TLS/certificate failures, DNS-resolution
+  failures, non-OSError protocol errors, 5xx answers, and refused redirects
+  stay the plain base classification — so only genuinely transient,
+  retry-plausible transport conditions carry the subtype. The subtype is
+  trusted typed evidence only: no application caller may treat any other
+  uncertain outcome as transient, and no caller-supplied flag can mint it.
   reconcile, they do not blindly replay.
 
 Error messages are deliberately safe by authoring: they never contain the App
@@ -170,4 +198,26 @@ class GitHubOutcomeUncertainError(Exception):
     5xx answers, or an uninterpretable response leave the result neither
     known success nor known failure. Callers reconcile; uncertain outcomes
     are never silently replayed by this adapter.
+    """
+
+
+class GitHubTransportUncertainError(GitHubOutcomeUncertainError):
+    """The transport failed with a recognized transient condition (issue #267).
+
+    No HTTP answer could be exchanged AND the transport-level failure is a
+    recognized, plausibly-ephemeral connection/timeout-class condition: the
+    bounded request timeout, a refused/reset/aborted connection, a broken
+    pipe, or a ``URLError`` wrapping exactly one of those. Every other
+    uncertain outcome — TLS/certificate failures, DNS-resolution failures,
+    non-OSError protocol errors, 5xx answers, refused redirects,
+    uninterpretable responses — stays the plain
+    :class:`GitHubOutcomeUncertainError`.
+
+    The subtype is trusted typed evidence, never provider prose and never a
+    caller-supplied assertion: only this adapter's transport classification
+    raises it, and whether it may support a bounded automatic retry is
+    workflow meaning decided strictly above the adapter (the exact-head
+    merge-send classification is the one F5d consumer). The subtype does NOT
+    prove the mutation was not applied — an unknown-outcome discipline
+    applies exactly as for the base class.
     """

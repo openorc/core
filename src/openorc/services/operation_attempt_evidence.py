@@ -38,7 +38,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.operational_failures import (
+    GitHubMergeOperation,
+    OperationalFailureFamily,
+    OriginalAttemptKind,
+)
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 
 __all__ = ["InvocationAttemptEvidence", "ProducedAttemptIdentity"]
@@ -48,15 +52,17 @@ __all__ = ["InvocationAttemptEvidence", "ProducedAttemptIdentity"]
 class ProducedAttemptIdentity:
     """One Level 1-produced durable attempt identity of the failing invocation.
 
-    ``family`` is the closed pending-interaction operation family the attempt
-    belongs to; ``original_attempt_kind``/``original_attempt_id`` name the
-    exact durable claim/iteration/execution row the service committed;
-    ``effect_attempt_id`` is the effect row when it differs from the original
-    identity (a durably authorized retry's resulting Execution); ``phase`` is
-    a safe machine label of the service phase that produced it.
+    ``family`` is the closed Level 2 operation family the attempt belongs to
+    (the pending-interaction vocabulary plus, F5d #267, the exact-head GitHub
+    merge family); ``original_attempt_kind``/``original_attempt_id`` name the
+    exact durable claim/iteration/execution/attempt row the service
+    committed; ``effect_attempt_id`` is the effect row when it differs from
+    the original identity (a durably authorized retry's resulting Execution,
+    or the merge retry's own consumed attempt); ``phase`` is a safe machine
+    label of the service phase that produced it.
     """
 
-    family: PendingTaskRuntimeInteractionOperation
+    family: OperationalFailureFamily
     original_attempt_kind: OriginalAttemptKind
     original_attempt_id: UUID
     effect_attempt_id: UUID | None
@@ -80,15 +86,18 @@ class InvocationAttemptEvidence:
     def record_attempt(
         self,
         *,
-        family: PendingTaskRuntimeInteractionOperation,
+        family: OperationalFailureFamily,
         original_attempt_kind: OriginalAttemptKind,
         original_attempt_id: UUID,
         effect_attempt_id: UUID | None = None,
         phase: str,
     ) -> None:
         """Record one Level 1-produced durable attempt identity."""
-        if not isinstance(family, PendingTaskRuntimeInteractionOperation):
-            raise TypeError("attempt family must be a PendingTaskRuntimeInteractionOperation")
+        if not isinstance(family, (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation)):
+            raise TypeError(
+                "attempt family must be a PendingTaskRuntimeInteractionOperation "
+                "or a GitHubMergeOperation"
+            )
         if not isinstance(original_attempt_kind, OriginalAttemptKind):
             raise TypeError("attempt kind must be an OriginalAttemptKind")
         if not isinstance(original_attempt_id, UUID):

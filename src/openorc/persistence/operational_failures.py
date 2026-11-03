@@ -45,17 +45,19 @@ from openorc.domain.operational_failures import (
     OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureEpisode,
+    OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
     canonical_failure_subject,
+    operational_failure_family_from_value,
 )
-from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
     "bind_retry_attempt_execution",
+    "consume_operational_failure_attempt",
     "create_operational_failure_attempt",
     "create_operational_failure_episode",
     "find_operational_failure_attempt_by_resulting_execution",
@@ -74,7 +76,8 @@ _EPISODE_COLUMNS = (
 
 _ATTEMPT_COLUMNS = (
     "id, workspace_id, task_id, episode_id, ordinal, source_kind, "
-    "source_attempt_id, error_code, not_before, resulting_execution_id, created_at"
+    "source_attempt_id, error_code, not_before, resulting_execution_id, "
+    "consumed_at, created_at"
 )
 
 
@@ -88,7 +91,7 @@ def _episode_from_row(row: Sequence[Any]) -> OperationalFailureEpisode:
         id=row[0],
         workspace_id=row[1],
         task_id=row[2],
-        operation_family=PendingTaskRuntimeInteractionOperation(row[3]),
+        operation_family=operational_failure_family_from_value(row[3]),
         original_attempt_kind=OriginalAttemptKind(row[4]),
         original_attempt_id=row[5],
         subject=row[6],
@@ -109,7 +112,8 @@ def _attempt_from_row(row: Sequence[Any]) -> OperationalFailureAttempt:
         error_code=OperationalFailureCode(row[7]),
         not_before=normalize_utc(row[8]),
         resulting_execution_id=row[9],
-        created_at=normalize_utc(row[10]),
+        consumed_at=None if row[10] is None else normalize_utc(row[10]),
+        created_at=normalize_utc(row[11]),
     )
 
 
@@ -148,7 +152,7 @@ def create_operational_failure_episode(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    operation_family: PendingTaskRuntimeInteractionOperation,
+    operation_family: OperationalFailureFamily,
     original_attempt_kind: OriginalAttemptKind,
     original_attempt_id: UUID,
     subject: Any,
@@ -340,6 +344,41 @@ def bind_retry_attempt_execution(
                 workspace_id,
                 resulting_execution_id,
             ),
+        ).fetchone()
+    return None if row is None else _attempt_from_row(row)
+
+
+def consume_operational_failure_attempt(
+    pool: DatabasePool,
+    *,
+    attempt_id: UUID,
+    task_id: UUID,
+    workspace_id: UUID,
+    consumed_at: Any,
+) -> OperationalFailureAttempt | None:
+    """Consume one authorized merge attempt exactly once (F5d, issue #267).
+
+    The set-once consumption stamp the executing seam writes atomically
+    BEFORE the outbound merge it runs — the minimum durable claim/consumption
+    and subsequent-failure evidence for a merge attempt, without a fake
+    resulting Execution. One atomic conditional update applies while the
+    attempt is in the addressed Task/Workspace scope and still unconsumed
+    (``consumed_at IS NULL``); a consumed, out-of-scope, or missing attempt
+    leaves zero rows and the calling service fails closed on ``None`` — a
+    duplicate or replayed execution can never re-consume the authorization
+    or resend the mutation. The stamp is never cleared or rewritten.
+    """
+    _require_uuid(attempt_id, "attempt_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(workspace_id, "workspace_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.operational_failure_attempts "
+            "set consumed_at = %s "
+            "where id = %s and task_id = %s and workspace_id = %s "
+            "and consumed_at is null "
+            f"returning {_ATTEMPT_COLUMNS}",
+            (consumed_at, attempt_id, task_id, workspace_id),
         ).fetchone()
     return None if row is None else _attempt_from_row(row)
 

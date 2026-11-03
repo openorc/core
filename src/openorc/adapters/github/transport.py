@@ -62,6 +62,7 @@ from openorc.adapters.github.errors import (
     GitHubOutcomeUncertainError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+    GitHubTransportUncertainError,
 )
 from openorc.config import ConfigurationError
 
@@ -333,6 +334,37 @@ def github_repository_api_address(*, owner_login: str, repository_name: str) -> 
     )
 
 
+# The closed recognized set of genuinely transient connection/timeout-class
+# transport failures (issue #267): a failure where no HTTP answer could be
+# exchanged and the condition is plausibly ephemeral — the bounded request
+# timeout, a refused/reset/aborted connection, or a broken pipe. Deliberately
+# narrower than every OSError: TLS/certificate failures (``ssl.SSLError``),
+# DNS-resolution failures (``gaierror``), and other OS-level errors are
+# identity/configuration conditions retrying cannot fix, and non-OSError
+# ``http.client`` protocol errors mean the wire answered something — all of
+# those stay the plain conservative uncertain classification. Type-only:
+# never exception text, never a caller-supplied assertion.
+_TRANSIENT_TRANSPORT_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    ConnectionError,
+)
+
+
+def _is_transient_transport_failure(error: BaseException) -> bool:
+    """Whether the transport-level exception is a recognized transient failure.
+
+    ``urllib`` wraps connection-level OS errors in ``URLError`` with the
+    original error as its ``reason``; only a ``URLError``'s reason is
+    inspected, and only against the same closed type set. ``socket.timeout``
+    is ``TimeoutError`` on every supported Python version.
+    """
+    if isinstance(error, _TRANSIENT_TRANSPORT_EXCEPTION_TYPES):
+        return True
+    if isinstance(error, urllib.error.URLError):
+        return isinstance(error.reason, _TRANSIENT_TRANSPORT_EXCEPTION_TYPES)
+    return False
+
+
 class HttpGitHubRestClient:
     """Low-level GitHub REST transport with centralized outcome classification.
 
@@ -393,6 +425,14 @@ class HttpGitHubRestClient:
         except GitHubOutcomeUncertainError:
             raise
         except Exception as exc:  # transport-level failure: the outcome is unknown
+            if _is_transient_transport_failure(exc):
+                # The recognized transient connection/timeout-class subset
+                # (issue #267): trusted typed evidence, never exception text.
+                # It does not prove the request was not applied — the
+                # unknown-outcome discipline is unchanged.
+                raise GitHubTransportUncertainError(
+                    "the outcome of the GitHub request is unknown: the transport failed transiently"
+                ) from exc
             raise GitHubOutcomeUncertainError(
                 "the outcome of the GitHub request is unknown: the transport failed"
             ) from exc

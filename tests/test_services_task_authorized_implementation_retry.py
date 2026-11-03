@@ -428,6 +428,7 @@ def _attempt_row(
     source_attempt_id: Any = _EXECUTION_ID,
     not_before: Any = _DUE,
     resulting_execution_id: Any = None,
+    consumed_at: Any = None,
 ) -> tuple[Any, ...]:
     return (
         attempt_id,
@@ -440,6 +441,7 @@ def _attempt_row(
         "runtime_unavailable",
         not_before,
         resulting_execution_id,
+        consumed_at,
         _OBSERVED,
     )
 

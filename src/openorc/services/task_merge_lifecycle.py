@@ -24,9 +24,17 @@ consequences strictly outside, every exact subject re-proven under the lock):
   primitive's machine-readable error subtype (only the former records
   ``MERGE_REJECTED_BY_GITHUB``), and after an authoritative no-merge proof a
   NEW pending exact-head ``MERGE_DECISION`` gate requires fresh Owner
-  authorization; an expected-head mismatch blocks ``STALE_OPERATION``; an
-  uncertain or unconfirmable outcome blocks ``EXTERNAL_OPERATION_UNCERTAIN``
-  and is never repeated.
+  authorization; an expected-head mismatch blocks ``STALE_OPERATION``; and
+  (F5d, issue #267) the merge mutation send's OWN unknown outcome is
+  classified after one authoritative reconciliation and handed to the Level
+  2 operational-failure disposition — the classified transient transport
+  failure over a reconciled open/unmerged same-head PR may receive one
+  bounded F4 retry authorization, everything else escalates through F4's
+  safe F3 installation with truthful context, and the mutation is never
+  blindly repeated. A ``MergeConfirmedReconciliationPendingError``
+  (GitHub already answered ``MERGED``) and every plain uncertain pre-send
+  condition keep the existing known-success/uncertain block semantics and
+  are never eligible for an F4 resend.
 
 - ``complete_confirmed_task_merge`` is the ONE GitHub-authoritative completion
   seam, shared by the Owner-initiated path and the B6 reconciliation
@@ -65,10 +73,19 @@ from openorc.adapters.github import (
     GitHubOutcomeUncertainError,
     GitHubRateLimitedError,
     GitHubRequestRejectedError,
+    GitHubTransportUncertainError,
 )
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
+from openorc.domain.operational_failures import (
+    FailureEffectEvidence,
+    GitHubMergeOperation,
+    OperationalFailureAttempt,
+    OperationalFailureCode,
+    OperationalFailureSourceKind,
+    OriginalAttemptKind,
+)
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.tasks import Task, TaskStatus
@@ -106,6 +123,12 @@ from openorc.services.github_owner_write_authorization import (
 )
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
+    OperationalFailureOperation,
+    OperationalFailureReport,
+    triage_operational_failure,
+)
 from openorc.services.task_subject_guards import (
     require_canonical_task_pull_request,
     require_current_owner_gate,
@@ -149,6 +172,13 @@ class TaskMergeOutcomeKind(StrEnum):
     RETRY_GATE_INSTALLED = "retry_gate_installed"
     BLOCKED_STALE_OPERATION = "blocked_stale_operation"
     BLOCKED_UNCERTAIN = "blocked_uncertain"
+    # F5d (issue #267): the merge mutation send's own classified transient
+    # transport failure received ONE durably authorized bounded Level 2 retry
+    # (the persisted OperationalFailureAttempt with its ordinal and due
+    # instant). No block applies; the Task stays ``waiting_for_owner`` with
+    # no current gate, and the due-time wakeup scheduling belongs to F11 —
+    # not to this seam.
+    RETRY_AUTHORIZED = "retry_authorized"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +199,7 @@ class TaskMergeOutcome:
     retry_gate: OwnerGate | None = None
     task_block: TaskBlock | None = None
     merge_commit_sha: str | None = None
+    retry_attempt: OperationalFailureAttempt | None = None
 
 
 class TaskMergeCompletionKind(StrEnum):
@@ -792,7 +823,28 @@ def request_task_merge(
                 expected_head_sha=reconciled.head_sha,
                 merge_commit_sha=error.merge_commit_sha,
             )
+        except pull_request_merge.MergeRequestSendUncertainError as error:
+            # F5d (issue #267): the merge mutation send's OWN unknown outcome.
+            # Its chained adapter cause is classified type-only; a plain
+            # uncertain error (a pre-send read/credential condition) never
+            # reaches this path and keeps the existing block semantics below.
+            return _classify_after_uncertain_merge_send(
+                pool,
+                github,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+                expected_state_token=post_approval.state_token,
+                task_pull_request_id=pull_request.id,
+                expected_head_sha=reconciled.head_sha,
+                adapter_cause=error.__cause__,
+            )
+
         except ExternalOperationUncertainError:
+            # A plain uncertain outcome is a pre-send read/credential
+            # condition, never merge-send evidence: the existing block
+            # semantics apply and no retry is authorized.
             return _classify_after_unconfirmed_merge(
                 pool,
                 github,
@@ -922,6 +974,140 @@ def _apply_uncertain_merge_block(
             actor=_OPENORC_ACTOR,
         )
         return block, blocked
+
+
+def _classify_after_uncertain_merge_send(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+    task_pull_request_id: UUID,
+    expected_head_sha: str,
+    adapter_cause: BaseException | None,
+) -> TaskMergeOutcome:
+    """Classify the merge mutation send's own unknown outcome (F5d, issue #267).
+
+    The send's chained GitHub adapter cause is classified type-only —
+    ``GitHubTransportUncertainError`` is the recognized transient transport
+    failure code; every other uncertain cause is the unsupported-uncertainty
+    code; no provider prose, HTTP-status guessing, or caller flag is ever
+    consulted. One authoritative reconciliation of the exact canonical PR (a
+    read, safe after any send, never held across a database transaction)
+    grounds the outcome: a GitHub-confirmed merged canonical PR takes the
+    shared completion seam and never resends; a durable open/unmerged
+    same-head PR plus current Owner/Task/issue authority — re-proven by the
+    Level 2 verification under its Task lock — may receive ONE bounded F4
+    retry authorization for the classified transient transport failure; an
+    unavailable/inconclusive reconciliation read and every unsupported
+    classification escalate through the Level 2 disposition's safe F3
+    installation with truthful ``merge_mutation_attempted`` context. This
+    seam never applies another merge mutation itself and never invents a
+    disposition: F4's decision is authoritative, and the due-time wakeup
+    scheduling belongs to F11, not here.
+    """
+    error_code = (
+        OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+        if isinstance(adapter_cause, GitHubTransportUncertainError)
+        else OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    )
+    # One authoritative reconciliation read (external, no transaction open).
+    try:
+        reconciliation = task_pull_request_reconciliation.reconcile_task_pull_request(
+            pool, github, workspace_id=workspace_id, task_id=task_id
+        )
+    except ApplicationError:
+        reconciliation = None
+    if reconciliation is not None and _is_confirmed_merged(reconciliation.pull_request):
+        # A known merged result always takes the authoritative completion
+        # seam — never a retry, whatever the send's own answer was.
+        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        return TaskMergeOutcome(
+            kind=TaskMergeOutcomeKind.COMPLETED,
+            task=completion.task,
+            pull_request=completion.pull_request,
+            merge_commit_sha=None,
+        )
+    # The Level 2 disposition owns the decision: ONE typed ORIGINAL report
+    # rooted at the approved merge-decision gate UUID — the original durable
+    # merge-operation identity. The approval, its ``MERGE_REQUESTED`` Owner
+    # provenance, and the exact PR/head/issue guards are re-proven from
+    # authoritative rows inside F4's Task-locked verification.
+    operation = OperationalFailureOperation(
+        family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+        original_attempt_id=owner_gate_id,
+        subject={
+            "owner_gate_id": str(owner_gate_id),
+            "task_pull_request_id": str(task_pull_request_id),
+            "expected_head_sha": expected_head_sha,
+        },
+    )
+    report = OperationalFailureReport(
+        reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+        reporting_attempt_id=owner_gate_id,
+        error_code=error_code,
+        effect_evidence=FailureEffectEvidence.EFFECT_UNCLASSIFIED,
+        diagnostic_context={"merge_mutation_attempted": True},
+    )
+    disposition = triage_operational_failure(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        expected_status=TaskStatus.WAITING_FOR_OWNER,
+        expected_current_owner_gate_id=None,
+        actor=_OPENORC_ACTOR,
+        operation=operation,
+        report=report,
+    )
+    if reconciliation is not None:
+        classified_pull_request = reconciliation.pull_request
+    else:
+        classified_pull_request = get_task_pull_request(
+            pool, task_pull_request_id=task_pull_request_id
+        )
+        if classified_pull_request is None:
+            raise NotFoundError("the requested pull request record is not available for this task")
+    if disposition.kind is DispositionKind.RETRY_AUTHORIZED:
+        # The durably authorized bounded retry: no block applies, the Task
+        # stays ``waiting_for_owner`` with no current gate, and the persisted
+        # attempt (ordinal + due instant) is carried truthfully. F4's retry
+        # authorization never rotates the Task token, so the post-approval
+        # token still re-proves currentness here; a moved-on Task is a typed
+        # stale failure, never a silently swallowed disposition.
+        retry_attempt = disposition.retry_attempt
+        assert retry_attempt is not None
+        current = require_current_task(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        return TaskMergeOutcome(
+            kind=TaskMergeOutcomeKind.RETRY_AUTHORIZED,
+            task=current,
+            pull_request=classified_pull_request,
+            retry_attempt=retry_attempt,
+        )
+    if disposition.kind is DispositionKind.BLOCKED:
+        installation = disposition.installation
+        assert installation is not None
+        return TaskMergeOutcome(
+            kind=TaskMergeOutcomeKind.BLOCKED_UNCERTAIN,
+            task=installation.task,
+            pull_request=classified_pull_request,
+            task_block=installation.task_block,
+        )
+    # A no-op disposition after a genuine send uncertainty means the report
+    # no longer addresses current work (moved-on token/status/superseded
+    # subject): fail closed — never silently swallow a failed merge send.
+    raise StaleOperationError(
+        "the merge send failure report no longer addresses current task state"
+    )
 
 
 def _classify_after_unconfirmed_merge(

@@ -11,6 +11,7 @@ rather than re-run.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -25,11 +26,14 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
 )
+from openorc.adapters.github import GitHubTransportUncertainError
 from openorc.domain.events import WorkflowEventType
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    GitHubMergeOperation,
     OperationalFailureCode,
+    OperationalFailureSourceKind,
     OriginalAttemptKind,
     canonical_failure_subject,
 )
@@ -45,6 +49,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
+from openorc.services.pull_request_merge import MergeRequestSendUncertainError
 from openorc.services.task_operational_failure_triage import (
     DispositionKind,
     NoOpReason,
@@ -925,3 +930,214 @@ def test_an_evidence_resolution_failure_never_replaces_the_original_error(
     # never called without verified evidence.
     assert excinfo.value is error
     assert triage.call_count == 0
+
+
+# --- F5d (issue #267): the exact-head merge family's consumed-attempt handoff.
+
+_NOW = datetime(2026, 11, 3, 12, 0, 0, tzinfo=UTC)
+_OTHER_WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000ff")
+_MERGE_ATTEMPT_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000a1")
+_MERGE_EPISODE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000a2")
+_MERGE_GATE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000a3")
+_MERGE_PR_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000a4")
+
+
+def _merge_consumed_attempt(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _MERGE_ATTEMPT_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "episode_id": _MERGE_EPISODE_ID,
+        "ordinal": 1,
+        "consumed_at": _NOW,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _merge_episode() -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=_MERGE_EPISODE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+        original_attempt_id=_MERGE_GATE_ID,
+        subject={
+            "owner_gate_id": str(_MERGE_GATE_ID),
+            "task_pull_request_id": str(_MERGE_PR_ID),
+            "expected_head_sha": "a" * 40,
+        },
+        escalated_task_block_id=None,
+    )
+
+
+def _patch_merge_attempt(monkeypatch: pytest.MonkeyPatch, attempt: Any, episode: Any) -> None:
+    monkeypatch.setattr(
+        coordinator.failure_records,
+        "get_operational_failure_attempt",
+        lambda _pool, *, attempt_id: attempt if attempt_id == _MERGE_ATTEMPT_ID else None,
+    )
+    monkeypatch.setattr(
+        coordinator.failure_records,
+        "get_operational_failure_episode",
+        lambda _pool, *, episode_id: episode if episode_id == _MERGE_EPISODE_ID else None,
+    )
+
+
+def test_a_merge_retry_send_uncertainty_reports_the_consumed_attempt_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_merge_attempt(monkeypatch, _merge_consumed_attempt(), _merge_episode())
+    chained = GitHubTransportUncertainError("the transport failed transiently")
+    error = MergeRequestSendUncertainError("the outcome of the merge send is unknown")
+    error.__cause__ = chained
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=_MERGE_ATTEMPT_ID,
+            effect_attempt_id=_MERGE_ATTEMPT_ID,
+            phase="merge_retry_send",
+        )
+        raise error
+
+    with pytest.raises(MergeRequestSendUncertainError) as excinfo:
+        _coordinate(
+            level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
+        )
+
+    assert triage.call_count == 1
+    operation = triage.calls[0]["operation"]
+    report = triage.calls[0]["report"]
+    assert triage.calls[0]["expected_status"] is TaskStatus.WAITING_FOR_OWNER
+    assert operation.family is GitHubMergeOperation.EXACT_HEAD_MERGE
+    assert operation.original_attempt_kind is OriginalAttemptKind.MERGE_DECISION_GATE
+    assert operation.original_attempt_id == _MERGE_GATE_ID
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _MERGE_ATTEMPT_ID
+    assert report.effect_attempt_id == _MERGE_ATTEMPT_ID
+    assert report.error_code is OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    assert dict(report.diagnostic_context)["merge_mutation_attempted"] is True
+    assert excinfo.value is error
+
+
+def test_a_merge_retry_plain_uncertainty_never_produces_the_transport_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_merge_attempt(monkeypatch, _merge_consumed_attempt(), _merge_episode())
+    error = ExternalOperationUncertainError("a pre-send read condition")
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=_MERGE_ATTEMPT_ID,
+            effect_attempt_id=_MERGE_ATTEMPT_ID,
+            phase="merge_retry_preflight",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(
+            level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
+        )
+
+    assert triage.call_count == 1
+    report = triage.calls[0]["report"]
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    assert dict(report.diagnostic_context)["merge_mutation_attempted"] is False
+    assert excinfo.value is error
+
+
+def test_a_merge_retry_unexpected_exception_keeps_the_unknown_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_merge_attempt(monkeypatch, _merge_consumed_attempt(), _merge_episode())
+    error = RuntimeError("an unexpected durable-state invariant failure")
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=_MERGE_ATTEMPT_ID,
+            effect_attempt_id=_MERGE_ATTEMPT_ID,
+            phase="merge_retry_send",
+        )
+        raise error
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _coordinate(
+            level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
+        )
+
+    assert triage.call_count == 1
+    report = triage.calls[0]["report"]
+    assert report.error_code is OperationalFailureCode.UNKNOWN
+    assert excinfo.value is error
+
+
+def test_a_merge_retry_report_fails_closed_without_the_consumption_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_merge_attempt(monkeypatch, _merge_consumed_attempt(consumed_at=None), _merge_episode())
+    error = MergeRequestSendUncertainError("the outcome of the merge send is unknown")
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=_MERGE_ATTEMPT_ID,
+            effect_attempt_id=_MERGE_ATTEMPT_ID,
+            phase="merge_retry_send",
+        )
+        raise error
+
+    with pytest.raises(MergeRequestSendUncertainError) as excinfo:
+        _coordinate(
+            level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
+        )
+
+    # Only the failure of an actually consumed attempt is reportable.
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+def test_a_merge_retry_report_fails_closed_on_a_foreign_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_merge_attempt(
+        monkeypatch,
+        _merge_consumed_attempt(workspace_id=_OTHER_WORKSPACE_ID),
+        _merge_episode(),
+    )
+    error = MergeRequestSendUncertainError("the outcome of the merge send is unknown")
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            original_attempt_kind=OriginalAttemptKind.MERGE_DECISION_GATE,
+            original_attempt_id=_MERGE_ATTEMPT_ID,
+            effect_attempt_id=_MERGE_ATTEMPT_ID,
+            phase="merge_retry_send",
+        )
+        raise error
+
+    with pytest.raises(MergeRequestSendUncertainError) as excinfo:
+        _coordinate(
+            level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
+        )
+
+    assert triage.call_count == 0
+    assert excinfo.value is error

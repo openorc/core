@@ -43,12 +43,23 @@ import pytest
 from openorc.adapters.github import (
     GitHubAuthorizationRejectedError,
     GitHubIssueObservation,
+    GitHubOutcomeUncertainError,
     GitHubRepositoryObservation,
+    GitHubTransportUncertainError,
+)
+from openorc.domain.operational_failures import (
+    FailureEffectEvidence,
+    GitHubMergeOperation,
+    OperationalFailureAttempt,
+    OperationalFailureCode,
+    OperationalFailureSourceKind,
+    OriginalAttemptKind,
 )
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.tasks import TaskStatus
 from openorc.services import (
     pull_request_merge,
+    task_merge_lifecycle,
     task_pull_request_reconciliation,
 )
 from openorc.services.errors import (
@@ -62,11 +73,17 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.pull_request_merge import MergeRequestSendUncertainError
+from openorc.services.task_exceptional_blocking import ExceptionalBlockInstallation
 from openorc.services.task_merge_lifecycle import (
     TaskMergeCompletionKind,
     TaskMergeOutcomeKind,
     complete_confirmed_task_merge,
     request_task_merge,
+)
+from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
+    OperationalFailureDisposition,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
 from tests.test_services_task_pr_review_decision import (
@@ -1297,3 +1314,167 @@ def test_claim_revalidation_rejects_a_no_longer_open_canonical_pr(
 
     with pytest.raises(StaleOperationError):
         hook(_pool(hook_conn))
+
+
+def _send_uncertain(chained: Exception) -> MergeRequestSendUncertainError:
+    error = MergeRequestSendUncertainError(
+        "the outcome of the exact-head GitHub merge request is unknown"
+    )
+    error.__cause__ = chained
+    return error
+
+
+def _authorized_disposition() -> tuple[OperationalFailureDisposition, OperationalFailureAttempt]:
+    attempt = OperationalFailureAttempt(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        episode_id=uuid4(),
+        ordinal=1,
+        source_kind=OperationalFailureSourceKind.ORIGINAL,
+        source_attempt_id=_RETRY_GATE_ID,
+        error_code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+        not_before=_OBSERVED,
+        resulting_execution_id=None,
+        consumed_at=None,
+        created_at=_OBSERVED,
+    )
+    return (
+        OperationalFailureDisposition(kind=DispositionKind.RETRY_AUTHORIZED, retry_attempt=attempt),
+        attempt,
+    )
+
+
+def test_send_transport_uncertainty_receives_one_level_2_retry_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    # The F5d classification's post-send reconciliation read (open/unmerged
+    # same-head) and the outcome's post-authorization Task re-read.
+    conn.on(_PR_READ, _pr_row_values())
+    conn.on(
+        _TASK_READ,
+        _task_row(
+            status="waiting_for_owner", state_token=_POST_APPROVAL_TOKEN, current_gate_id=None
+        ),
+    )
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        _reconciled(pull_request=_domain_pull_request()),
+    )
+    merge = _MergePrimitiveStub(
+        _send_uncertain(GitHubTransportUncertainError("the transport failed transiently"))
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+    disposition, attempt = _authorized_disposition()
+    triaged: list[tuple[Any, Any]] = []
+
+    def fake_triage(pool: Any, **kwargs: Any) -> OperationalFailureDisposition:
+        triaged.append((pool, kwargs))
+        return disposition
+
+    monkeypatch.setattr(task_merge_lifecycle, "triage_operational_failure", fake_triage)
+
+    outcome = request_task_merge(
+        pool,
+        _guard(issues=[_issue_observation()], repository=_repository_observation()),
+        _token_resolver(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_RETRY_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert outcome.kind is TaskMergeOutcomeKind.RETRY_AUTHORIZED
+    assert outcome.retry_attempt is attempt
+    assert outcome.task.status is TaskStatus.WAITING_FOR_OWNER
+    # ONE typed ORIGINAL report rooted at the approved gate UUID, classified
+    # from the send's chained transport subtype.
+    assert len(triaged) == 1
+    operation = triaged[0][1]["operation"]
+    report = triaged[0][1]["report"]
+    assert operation.family is GitHubMergeOperation.EXACT_HEAD_MERGE
+    assert operation.original_attempt_kind is OriginalAttemptKind.MERGE_DECISION_GATE
+    assert operation.original_attempt_id == _RETRY_GATE_ID
+    assert dict(operation.subject)["owner_gate_id"] == str(_RETRY_GATE_ID)
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.ORIGINAL
+    assert report.reporting_attempt_id == _RETRY_GATE_ID
+    assert report.error_code is OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    assert dict(report.diagnostic_context)["merge_mutation_attempted"] is True
+    # The merge mutation is never repeated and no block applies.
+    assert len(merge.calls) == 1
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _GATE_INSERT) == 0
+    assert _event_types(conn) == ["owner_gate_resolved", "merge_requested"]
+
+
+def test_send_unsupported_uncertainty_escalates_through_f3_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_issue_guard(conn)
+    _script_phase_d(conn)
+    conn.on(_PR_READ, _pr_row_values())
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request()),
+        _reconciled(pull_request=_domain_pull_request()),
+    )
+    merge = _MergePrimitiveStub(
+        # A 5xx-class uncertain outcome: the adapter's broader uncertainty
+        # category, never the transport subtype — unsupported for a resend.
+        _send_uncertain(GitHubOutcomeUncertainError("the outcome is unknown (status 503)"))
+    )
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+    installation = cast(
+        ExceptionalBlockInstallation,
+        SimpleNamespace(
+            task_block=SimpleNamespace(id=uuid4()),
+            owner_gate=SimpleNamespace(id=uuid4()),
+            task=SimpleNamespace(
+                id=_TASK_ID,
+                workspace_id=_WORKSPACE_ID,
+                status=TaskStatus.BLOCKED,
+                state_token=_BLOCKED_TOKEN,
+                current_owner_gate_id=None,
+            ),
+        ),
+    )
+    triaged: list[tuple[Any, Any]] = []
+
+    def fake_triage(pool: Any, **kwargs: Any) -> OperationalFailureDisposition:
+        triaged.append((pool, kwargs))
+        return OperationalFailureDisposition(
+            kind=DispositionKind.BLOCKED, installation=installation
+        )
+
+    monkeypatch.setattr(task_merge_lifecycle, "triage_operational_failure", fake_triage)
+
+    outcome = request_task_merge(
+        pool,
+        _guard(issues=[_issue_observation()], repository=_repository_observation()),
+        _token_resolver(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_RETRY_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
+    assert outcome.task.status is TaskStatus.BLOCKED
+    # The unsupported classification reports the uncertainty code — never the
+    # retry-eligible transport code — and F4's escalation owns the block.
+    assert len(triaged) == 1
+    report = triaged[0][1]["report"]
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    assert report.effect_evidence is FailureEffectEvidence.EFFECT_UNCLASSIFIED
+    assert len(merge.calls) == 1
+    assert _count(conn, _GATE_INSERT) == 0

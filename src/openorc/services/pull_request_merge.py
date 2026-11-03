@@ -48,6 +48,12 @@ expected head SHA the later workflow service supplies:
   layer. A definitive 401-style non-delivery under the user credential
   performs only the single bounded recovery the #142 token lifecycle
   allows, then retries the merge exactly once.
+
+  Phase distinction (F5d, issue #267): only the merge-mutation send raises
+  the ``MergeRequestSendUncertainError`` subtype of the uncertain error —
+  pre-send reads and credential resolution never do — so a caller can
+  classify the mutation's own transport failure without mistaking a
+  preflight-read failure for send evidence.
 - The later workflow service decides the Task ``COMPLETED`` transition and
   the Owner merge-decision policy; nothing of either lives here.
 """
@@ -102,9 +108,28 @@ from openorc.services.task_subject_guards import require_task_pull_request_head
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
+    "MergeRequestSendUncertainError",
     "PullRequestMergeResult",
     "request_pull_request_merge",
 ]
+
+
+class MergeRequestSendUncertainError(ExternalOperationUncertainError):
+    """The outcome of the merge-mutation SEND itself is unknown (F5d, issue #267).
+
+    The trusted phase distinction of the exact-head merge primitive: ONLY the
+    ``github.merge_pull_request`` request — the mutation, including its single
+    bounded 401-recovery repeat — raises this subtype. Every uncertain
+    pre-send operation the primitive performs (the installation repository
+    access observation, credential resolution) and every other uncertain
+    conversion stays the plain :class:`ExternalOperationUncertainError`, so a
+    caller can never mistake a preflight-read transport failure for evidence
+    about the merge mutation's outcome. The subtype carries no claim about
+    whether the mutation was applied: the unknown-outcome discipline is
+    unchanged, and whether the classification may support a bounded automatic
+    retry is workflow meaning decided strictly above this primitive.
+    """
+
 
 _SERVICE_TRACER_SCOPE = "openorc.services.pull_request_merge"
 _MERGE_SPAN_NAME = "pull_request_merge.request_pull_request_merge"
@@ -364,7 +389,9 @@ def request_pull_request_merge(
                 expected_head_sha=expected_head_sha,
             )
         except GitHubOutcomeUncertainError as error:
-            raise ExternalOperationUncertainError(
+            # The merge-mutation send's own uncertain outcome (F5d phase
+            # distinction): the ONLY site that raises the send subtype.
+            raise MergeRequestSendUncertainError(
                 "the outcome of the exact-head GitHub merge request is unknown"
             ) from error
         except GitHubRequestRejectedError as error:
