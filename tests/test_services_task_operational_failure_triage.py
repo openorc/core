@@ -1541,3 +1541,53 @@ def test_a_merge_known_failed_evidence_escalates() -> None:
     )
     assert result.kind is DispositionKind.BLOCKED
     assert result.installation is not None
+
+
+def test_a_merge_report_with_a_crossed_runtime_code_escalates() -> None:
+    """F4's matrix permits exact (family, code) pairs only: a merge report
+    carrying the runtime transient-network code lacks the required classified
+    GitHub merge-send transport failure and can never authorize another merge
+    — it escalates through the safe F3 installation."""
+    conn = ScriptedConnection()
+    _script_escalation_merge(conn)
+    result = _triage(
+        conn,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        operation=_merge_operation(),
+        report=_merge_report(code=OperationalFailureCode.RUNTIME_UNAVAILABLE),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def test_an_implementation_report_with_a_crossed_transport_code_escalates() -> None:
+    """The crossed pairing in the other direction: an implementation-execution
+    report carrying the GitHub-specific external-transport code lacks the
+    classified runtime transient-network failure and escalates — never a
+    merge-shaped authorization, never a wrong-family code path."""
+    conn = ScriptedConnection()
+    _script_escalation(
+        conn,
+        task_row=_task(status="implementing", plan_revision=_REVISION_ID),
+        execution_row=_execution(),
+        event_rows=[_failed_event_row()],
+        extra_setup=lambda c: (
+            c.on(_REVISION_READ, _revision_row()),
+            c.on(_GATES_LIST, [_impl_gate_row()]),
+            c.on(
+                _SESSION_LOCKED,
+                _session_row("producer", _PRODUCER_SESSION_ID, "fake-session-0"),
+            ),
+        ),
+    )
+    result = _triage(
+        conn,
+        report=_report(
+            code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+        ),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID

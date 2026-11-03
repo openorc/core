@@ -42,7 +42,9 @@ caller-supplied flag), durable corroboration must agree (the
 ``execution_failed`` audit event's safe failure-kind for the exact
 Execution, or the merge family's one-shot ``MERGE_REQUESTED`` Owner claim
 on the consumed gate), and the episode's three-additional-attempt budget
-must have room.
+must have room, and the (family, code) pairing is exact — a crossed
+combination (a merge report carrying a runtime code, or an implementation
+report carrying the external-transport code) is never retry-eligible.
 Everything else escalates: the F2 one-shot claim families have no legitimate
 new-attempt path and always escalate, even on proven pre-effect network
 failures. The authorized attempt is persisted with its ordinal and
@@ -243,26 +245,39 @@ class OperationalFailureDisposition:
 
 # The retry-eligibility matrix: the explicit, small classification the
 # service owns. Only families with a supported distinct logical-attempt path
-# are eligible: the implementation-execution family (a fresh per-Task
-# Execution row is the existing durable attempt identity) and — F5d (#267) —
-# the exact-head GitHub merge family (its distinct attempts are the F4
-# authorizations themselves, rooted at the approved MERGE_DECISION gate
-# UUID). Every F2 one-shot send claim, the bootstrap claim, the E3a iteration
-# reservation, and the one-shot E9 remediation claim have no legitimate
-# new-attempt path and always escalate, even when the network failure was
-# positively pre-effect. The code must be the family's classified transient
-# failure; uncertain evidence, every other code, and the fallback escalate.
-_RETRY_ELIGIBLE_FAMILIES: frozenset[OperationalFailureFamily] = frozenset(
-    {
-        PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
-        GitHubMergeOperation.EXACT_HEAD_MERGE,
-    }
-)
-_RETRY_ELIGIBLE_CODES: frozenset[OperationalFailureCode] = frozenset(
-    {
-        OperationalFailureCode.RUNTIME_UNAVAILABLE,
-        OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
-    }
+# are eligible, and ONLY with their own exact classified transient-failure
+# code — the permitted (family, code) pairs, never the two vocabularies
+# independently:
+#
+# - the implementation-execution family (a fresh per-Task Execution row is
+#   the existing durable attempt identity) with the classified runtime
+#   transient-network failure; and
+# - the exact-head GitHub merge family (F5d, issue #267; its distinct
+#   attempts are the F4 authorizations themselves, rooted at the approved
+#   MERGE_DECISION gate UUID) with the classified transient external-
+#   transport failure of a GitHub merge send.
+#
+# A crossed family/code combination is never retry-eligible: a merge report
+# carrying a runtime code lacks the required classified GitHub merge-send
+# transport failure, and an implementation report carrying the external-
+# transport code lacks the classified runtime failure. Every F2 one-shot
+# send claim, the bootstrap claim, the E3a iteration reservation, and the
+# one-shot E9 remediation claim have no legitimate new-attempt path and
+# always escalate, even when the network failure was positively pre-effect.
+# Uncertain evidence, every other code, and the fallback escalate.
+_RETRY_ELIGIBLE_PAIRS: frozenset[tuple[OperationalFailureFamily, OperationalFailureCode]] = (
+    frozenset(
+        {
+            (
+                PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+                OperationalFailureCode.RUNTIME_UNAVAILABLE,
+            ),
+            (
+                GitHubMergeOperation.EXACT_HEAD_MERGE,
+                OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            ),
+        }
+    )
 )
 
 # The exponential backoff due-time policy: 2 s, 4 s, 8 s for the three
@@ -722,8 +737,7 @@ def _triage_locked(
     )
     next_ordinal = reported_attempt.ordinal + 1 if reported_attempt is not None else 1
     retry_eligible = (
-        operation.family in _RETRY_ELIGIBLE_FAMILIES
-        and report.error_code in _RETRY_ELIGIBLE_CODES
+        (operation.family, report.error_code) in _RETRY_ELIGIBLE_PAIRS
         and _effect_evidence_eligible(operation.family, report.effect_evidence)
         and next_ordinal <= 3
         and not verified.session_lost
