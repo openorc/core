@@ -613,6 +613,16 @@ def _prepared_adapter(
     return adapter
 
 
+def _deferred_reviewer_factory(adapter: Any) -> Any:
+    """The F5e deferred Reviewer attachment factory over one prepared adapter."""
+
+    @contextmanager
+    def factory(_session: TaskAgentSession) -> Iterator[Any]:
+        yield adapter
+
+    return factory
+
+
 class FakeGitHubClient:
     """Scripted GitHub observation fake recording call order; zero calls is
     assertable. Each call also proves no database transaction was open."""
@@ -841,23 +851,39 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         gate_id=_GATE_1_ID,
     )
 
-    # Ordered Task reads: 7 unlocked + 3 locked per routed round at that
+    # Ordered Task reads: 8 unlocked + 4 locked per routed round at that
     # round's token (the F2 dispatch claim adds one locked reproof, issue
-    # #87); 4 + 2 for the exhausting round.
-    for _ in range(7):
+    # #87, and the F5e post-attachment proof adds one of each, issue #268);
+    # 5 + 3 for the exhausting round.
+    for _ in range(8):
         conn.on(_TASK_READ, t0)
-    for _ in range(3):
-        conn.on(_TASK_READ_LOCKED, t0)
-    for _ in range(7):
-        conn.on(_TASK_READ, t1)
-    for _ in range(3):
-        conn.on(_TASK_READ_LOCKED, t1)
     for _ in range(4):
+        conn.on(_TASK_READ_LOCKED, t0)
+    for _ in range(8):
+        conn.on(_TASK_READ, t1)
+    for _ in range(4):
+        conn.on(_TASK_READ_LOCKED, t1)
+    for _ in range(5):
         conn.on(_TASK_READ, t2)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t2)
-    # Ordered revision reads: dispatch/finalize/revise per routed round.
-    for row in (rev1, rev1, rev1, rev1, rev2, rev2, rev2, rev2, rev3, rev3):
+    # Ordered revision reads: dispatch entry + post-attachment proof,
+    # finalize, and revise per routed round (issue #268 adds the proof read).
+    for row in (
+        rev1,
+        rev1,
+        rev1,
+        rev1,
+        rev1,
+        rev2,
+        rev2,
+        rev2,
+        rev2,
+        rev2,
+        rev3,
+        rev3,
+        rev3,
+    ):
         conn.on(_REVISION_READ, row)
     # Ordered iteration-history reads: dispatch, attempt recheck, budget
     # recheck, revise supersession, the F2 claim's numbering recheck
@@ -917,7 +943,7 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
     )
     dispatch1 = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -967,7 +993,7 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
     )
     dispatch2 = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1009,7 +1035,7 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
     )
     dispatch3 = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1181,10 +1207,11 @@ def test_accepted_clearance_keeps_the_loop_open_and_yields_the_plan_evidence() -
         findings=[],
         decided_at=_OBSERVED,
     )
-    for _ in range(4):
+    for _ in range(5):
         conn.on(_TASK_READ, t0)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t0)
+    conn.on(_REVISION_READ, rev1)
     conn.on(_REVISION_READ, rev1)
     conn.on(_REVISION_READ, rev1)
     conn.on(_LOOPS_LIST, [])
@@ -1203,7 +1230,7 @@ def test_accepted_clearance_keeps_the_loop_open_and_yields_the_plan_evidence() -
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1275,11 +1302,11 @@ def test_duplicate_finalization_applies_nothing() -> None:
         findings=[],
         decided_at=_OBSERVED,
     )
-    for _ in range(6):
+    for _ in range(7):
         conn.on(_TASK_READ, t0)
-    for _ in range(3):
+    for _ in range(4):
         conn.on(_TASK_READ_LOCKED, t0)
-    for _ in range(3):
+    for _ in range(4):
         conn.on(_REVISION_READ, rev1)
     conn.on(_LOOPS_LIST, [])
     conn.on(_LOOP_INSERT, _loop_row(limit=5))
@@ -1298,7 +1325,7 @@ def test_duplicate_finalization_applies_nothing() -> None:
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1512,10 +1539,11 @@ def test_owner_mediated_history_immediately_reopens_resolution() -> None:
         current_plan_revision_id=_REVISION_2_ID,
         gate_id=_GATE_2_ID,
     )
-    for _ in range(4):
+    for _ in range(5):
         conn.on(_TASK_READ, t1)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t1)
+    conn.on(_REVISION_READ, rev2)
     conn.on(_REVISION_READ, rev2)
     conn.on(_REVISION_READ, rev2)
     conn.on(_LOOPS_LIST, [_loop_row(limit=5)])
@@ -1540,7 +1568,7 @@ def test_owner_mediated_history_immediately_reopens_resolution() -> None:
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1604,11 +1632,11 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
         iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
     )
     it1_cr = _cr_row(_ITERATION_1_ID, 1, _REVISION_1_ID)
-    for _ in range(6):
+    for _ in range(7):
         conn.on(_TASK_READ, t0)
-    for _ in range(3):
-        conn.on(_TASK_READ_LOCKED, t0)
     for _ in range(4):
+        conn.on(_TASK_READ_LOCKED, t0)
+    for _ in range(5):
         conn.on(_REVISION_READ, rev1)
     conn.on(_LOOPS_LIST, [])
     conn.on(_LOOP_INSERT, _loop_row(limit=2))
@@ -1635,7 +1663,7 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -1710,10 +1738,11 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
         current_plan_revision_id=_REVISION_2_ID,
         gate_id=_GATE_2_ID,
     )
-    for _ in range(4):
+    for _ in range(5):
         conn.on(_TASK_READ, t1)
-    for _ in range(2):
+    for _ in range(3):
         conn.on(_TASK_READ_LOCKED, t1)
+    conn.on(_REVISION_READ, rev2)
     conn.on(_REVISION_READ, rev2)
     conn.on(_REVISION_READ, rev2)
     conn.on(_LOOPS_LIST, [_loop_row(limit=5)])
@@ -1738,7 +1767,7 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,

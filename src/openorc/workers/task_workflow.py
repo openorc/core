@@ -543,10 +543,15 @@ def _compose_task_planning_review(
     The dispatch and its decision finalization are one logical invocation —
     the reserved iteration's unfinalized ``ReviewResult`` is never durable
     and never serialized. The round's exact plan-production subject is
-    re-derived from committed state under the payload's exact token. On an
-    in-budget change request the merged E2 revise already ran inside the
-    decision, and the fresh post-revise token authorizes the next round; on
-    acceptance the exact-plan implementation gate is presented (never
+    re-derived from committed state under the payload's exact token. E3a
+    acquires the Reviewer runtime itself through the deferred session-
+    addressed attachment factory, strictly after its atomic ReviewIteration
+    reservation: an attachment failure is attributable to the exact reserved
+    iteration and reaches the Level 2 handoff with its own identity instead
+    of stranding the planning Task without a disposition (F5e, issue #268).
+    On an in-budget change request the merged E2 revise already ran inside
+    the decision, and the fresh post-revise token authorizes the next round;
+    on acceptance the exact-plan implementation gate is presented (never
     approved); on exhaustion the REVIEW_RESOLUTION gate already stands.
     """
     pool = dependencies.database_pool()
@@ -559,26 +564,17 @@ def _compose_task_planning_review(
     production = _reload_plan_production_outcome(
         pool, workspace_id=workspace_id, task_id=task_id, expected_state_token=expected_state_token
     )
-    with attach_cline_runtime(
+    dispatch_outcome = dispatch_planning_review(
         pool,
+        _reviewer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        profile_id=profile_id,
         workspace_id=workspace_id,
         task_id=task_id,
-        role=WorkflowRole.REVIEWER,
-        phase=ClineAttachmentPhase.BOUND,
-        external_session_id=_bound_session_external_id(
-            pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.REVIEWER
-        ),
-        working_directory=dependencies.reviewer_neutral_directory(),
-    ) as attached:
-        dispatch_outcome = dispatch_planning_review(
-            pool,
-            attached.adapter,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            plan_production=production,
-            attempt_evidence=attempt_evidence,
-        )
+        plan_production=production,
+        attempt_evidence=attempt_evidence,
+    )
     # The decision may route an in-budget revision to the merged E2 revise:
     # the Producer session continues that revision in its planning checkout.
     with attach_cline_runtime(

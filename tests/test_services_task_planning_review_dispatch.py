@@ -22,6 +22,12 @@ E3a contract on its critical path:
   transaction open, and only the validated typed ``ReviewResult`` is
   returned to E3b — E3a records no verdict, no iteration result, and no
   Task mutation;
+- the Reviewer attachment is acquired through the deferred session-addressed
+  factory strictly after the reservation commit and the attempt-evidence
+  recording (issue #268), the exact reserved subjects are re-proven after
+  acquisition and immediately before the send, and an attachment failure
+  leaves the reserved attempt unresolved while carrying the invocation's
+  own F5b handoff identity;
 - known failures and uncertain outcomes leave the reserved attempt
   unresolved and are never retried or resent here.
 
@@ -33,7 +39,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -50,6 +56,8 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.planning import PlanRevision
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
@@ -66,6 +74,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_review_dispatch import (
     TaskPlanningReviewDispatchOutcome,
@@ -478,6 +487,46 @@ def _prepared_reviewer_adapter(pool: FakePool, outcomes: Sequence[Any]) -> _Prob
     return adapter
 
 
+class _ReviewerAttachment:
+    """Deferred Reviewer attachment probe: counts acquisitions and disposals."""
+
+    def __init__(self, runtime: FakeAgentRuntimeAdapter, conn: ScriptedConnection) -> None:
+        self._runtime = runtime
+        self._conn = conn
+        self.acquisitions = 0
+        self.disposals = 0
+        self.bindings: list[Any] = []
+        self.statements_at_acquisition: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    def __call__(self, binding: Any) -> AbstractContextManager[FakeAgentRuntimeAdapter]:
+        self.bindings.append(binding)
+        self.statements_at_acquisition = list(self._conn.executed)
+        self.acquisitions += 1
+        return self
+
+    def __enter__(self) -> FakeAgentRuntimeAdapter:
+        return self._runtime
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.disposals += 1
+        return False
+
+
+class _FailingAttachment:
+    """Raises its typed error exactly when the attachment is acquired."""
+
+    def __init__(self, error: Exception, conn: ScriptedConnection) -> None:
+        self._error = error
+        self._conn = conn
+        self.bindings: list[Any] = []
+        self.statements_at_failure: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    def __call__(self, binding: Any) -> AbstractContextManager[FakeAgentRuntimeAdapter]:
+        self.bindings.append(binding)
+        self.statements_at_failure = list(self._conn.executed)
+        raise self._error
+
+
 def _script_account_and_workspace(
     conn: ScriptedConnection, *, workspace_row: tuple[Any, ...] | None = None
 ) -> None:
@@ -508,6 +557,20 @@ def _script_entry_prefix(
     conn.on(_REPO_READ, _repository_row())
 
 
+def _script_revalidation(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...],
+    revision_row: tuple[Any, ...],
+    reviewer_row: tuple[Any, ...] | None,
+) -> None:
+    """F5e: the post-attachment currentness proof's ordered reads."""
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_TASK_READ, task_row)
+    conn.on(_REVISION_READ, revision_row)
+    conn.on(_role_is(_SESSION_READ, "reviewer"), reviewer_row)
+
+
 def _script_first_review_entry(
     conn: ScriptedConnection,
     *,
@@ -517,12 +580,15 @@ def _script_first_review_entry(
     workspace_row: tuple[Any, ...] | None = None,
     loop_row: tuple[Any, ...] | None = None,
     iteration_row: tuple[Any, ...] | None = None,
+    revalidation_task_row: tuple[Any, ...] | None = None,
+    revalidation_reviewer_row: tuple[Any, ...] | None = None,
 ) -> None:
     """The first-review entry composition's canned sequence, in call order.
 
     No loop exists yet, so the composition establishes the OPEN planning
     loop (with the Workspace snapshot) and then locks/rechecks it before
-    reserving iteration 1 for the exact current plan.
+    reserving iteration 1 for the exact current plan. The post-attachment
+    currentness proof's reads follow the reservation (issue #268).
     """
     _script_entry_prefix(
         conn,
@@ -537,6 +603,14 @@ def _script_first_review_entry(
     conn.on(_ITERATIONS_LIST, [])
     conn.on(_LOOP_GUARD_LOCKED, ("open", "planning"))
     conn.on(_ITERATION_INSERT, iteration_row if iteration_row is not None else _iteration_row())
+    _script_revalidation(
+        conn,
+        task_row=revalidation_task_row if revalidation_task_row is not None else task_row,
+        revision_row=revision_row,
+        reviewer_row=(
+            revalidation_reviewer_row if revalidation_reviewer_row is not None else reviewer_row
+        ),
+    )
 
 
 def _script_reuse_entry(
@@ -550,6 +624,8 @@ def _script_reuse_entry(
     loop_iterations: list[tuple[Any, ...]],
     iteration_row: tuple[Any, ...],
     workspace_row: tuple[Any, ...] | None = None,
+    revalidation_task_row: tuple[Any, ...] | None = None,
+    revalidation_reviewer_row: tuple[Any, ...] | None = None,
 ) -> None:
     """The loop-reuse entry composition's canned sequence, in call order."""
     _script_entry_prefix(
@@ -564,6 +640,14 @@ def _script_reuse_entry(
     conn.on(_ITERATIONS_LIST, loop_iterations)
     conn.on(_LOOP_GUARD_LOCKED, ("open", "planning"))
     conn.on(_ITERATION_INSERT, iteration_row)
+    _script_revalidation(
+        conn,
+        task_row=revalidation_task_row if revalidation_task_row is not None else task_row,
+        revision_row=revision_row,
+        reviewer_row=(
+            revalidation_reviewer_row if revalidation_reviewer_row is not None else reviewer_row
+        ),
+    )
 
 
 def _assert_no_reservation(conn: ScriptedConnection) -> None:
@@ -585,6 +669,7 @@ class _Dispatch:
     def __init__(self) -> None:
         self.conn = ScriptedConnection()
         self.pool = FakePool(self.conn)
+        self.attachment: Any = None
 
     def prepared_reviewer_adapter(self, outcomes: Sequence[Any]) -> _ProbedAdapter:
         return _prepared_reviewer_adapter(self.pool, outcomes)
@@ -593,24 +678,34 @@ class _Dispatch:
         self,
         *,
         adapter: FakeAgentRuntimeAdapter | None = None,
+        reviewer_attachment: Any = None,
         plan_production: Any = None,
         workspace_id: Any = _WORKSPACE_ID,
         task_id: Any = _TASK_ID,
         profile_id: Any = _OWNER_PROFILE_ID,
+        attempt_evidence: Any = None,
     ) -> Any:
+        runtime = (
+            adapter
+            if adapter is not None
+            else self.prepared_reviewer_adapter([_review_candidate()])
+        )
+        attachment = (
+            reviewer_attachment
+            if reviewer_attachment is not None
+            else _ReviewerAttachment(runtime, self.conn)
+        )
+        self.attachment = attachment
         return dispatch_planning_review(
             cast(DatabasePool, self.pool),
-            (
-                adapter
-                if adapter is not None
-                else self.prepared_reviewer_adapter([_review_candidate()])
-            ),
+            attachment,
             workspace_id=workspace_id,
             task_id=task_id,
             profile_id=profile_id,
             plan_production=(
                 plan_production if plan_production is not None else _production_outcome()
             ),
+            attempt_evidence=attempt_evidence,
         )
 
 
@@ -953,6 +1048,10 @@ def test_non_owner_profile_refuses_dispatch() -> None:
     with pytest.raises(NotFoundError):
         env.run(adapter=adapter, profile_id=_OTHER_PROFILE_ID)
 
+    # No adapter is ever acquired before the authorization transaction
+    # commits (issue #268).
+    assert env.attachment is not None
+    assert env.attachment.acquisitions == 0
     _assert_no_reservation(env.conn)
     assert adapter.submitted_sends() == ()
 
@@ -1289,7 +1388,7 @@ def test_replaying_a_reviewed_revision_production_outcome_cannot_dispatch_again(
     with pytest.raises(ConflictError):
         dispatch_planning_review(
             _pool(conn),
-            adapter,
+            _ReviewerAttachment(adapter, conn),
             profile_id=_OWNER_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
@@ -1299,3 +1398,145 @@ def test_replaying_a_reviewed_revision_production_outcome_cannot_dispatch_again(
     _assert_no_reservation(conn)
     _assert_no_task_mutation(conn)
     assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
+
+
+def test_reservation_commits_before_the_reviewer_attachment_is_acquired() -> None:
+    """F5e: no adapter is ever acquired before the Phase-1 reservation has
+    committed — the acquisition observes the committed iteration insert and
+    receives exactly the Phase-1-resolved READY Reviewer binding."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+    )
+    adapter = env.prepared_reviewer_adapter([_review_candidate()])
+
+    outcome = env.run(adapter=adapter)
+
+    attachment = env.attachment
+    assert attachment is not None
+    assert attachment.acquisitions == 1
+    assert attachment.disposals == 1
+    # The acquisition happened after the reservation committed: the reserved
+    # iteration insert is already among the executed statements.
+    assert any(_ITERATION_INSERT(sql, None) for sql, _ in attachment.statements_at_acquisition)
+    (binding,) = attachment.bindings
+    assert binding.id == _REVIEWER_SESSION_ID
+    assert binding.lifecycle_status is TaskSessionLifecycleStatus.READY
+    assert isinstance(outcome, TaskPlanningReviewDispatchOutcome)
+    assert env.pool.active_connections == 0
+
+
+def test_attachment_failure_after_the_reservation_carries_the_reserved_identity() -> None:
+    """F5e acceptance: a Reviewer attachment failure after the committed
+    reservation raises the typed error with zero sends, leaves the reserved
+    iteration unfinalized, and carries the exact ReviewIteration identity in
+    the invocation's attempt evidence — recorded before the failing
+    acquisition — so F5b's family verification and F4's disposition consume
+    the Task instead of leaving it without a consumer."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+    )
+    adapter = env.prepared_reviewer_adapter([_review_candidate()])
+    evidence = InvocationAttemptEvidence()
+
+    with pytest.raises(ExternalOperationFailedError):
+        env.run(
+            adapter=adapter,
+            reviewer_attachment=_FailingAttachment(
+                ExternalOperationFailedError("the cline runtime attachment failed"),
+                env.conn,
+            ),
+            attempt_evidence=evidence,
+        )
+
+    # The reservation committed and the evidence was recorded before the
+    # failing acquisition: the identity is the exact reserved iteration.
+    identity = evidence.latest_identity
+    assert identity is not None
+    assert identity.family is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
+    assert identity.original_attempt_kind is OriginalAttemptKind.REVIEW_ITERATION
+    assert identity.original_attempt_id == _ITERATION_1_ID
+    assert identity.phase == "planning_review_dispatch"
+    failing = env.attachment
+    assert failing is not None
+    assert any(_ITERATION_INSERT(sql, None) for sql, _ in failing.statements_at_failure)
+    # The never-dispatched attempt: no send, no verdict, no Task mutation,
+    # and no database transaction held across the failure.
+    assert adapter.submitted_sends() == ()
+    assert len(adapter.realized_controls()) == 0
+    _assert_no_verdict_recorded(env.conn)
+    _assert_no_task_mutation(env.conn)
+    assert env.pool.active_connections == 0
+
+
+def test_a_subject_moved_during_attachment_refuses_without_sending() -> None:
+    """The post-attachment proof: a Task that moved on while the Reviewer
+    attachment was acquired refuses the dispatch without sending; the
+    reserved iteration stays unfinalized as an explicit recoverable dead
+    letter bound to the reserved subjects."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        # The Task moved on between the reservation and the post-attachment
+        # proof: a different token refuses the dispatch.
+        revalidation_task_row=_task_row(state_token=uuid.uuid4()),
+    )
+    adapter = env.prepared_reviewer_adapter([_review_candidate()])
+    evidence = InvocationAttemptEvidence()
+
+    with pytest.raises(StaleOperationError):
+        env.run(adapter=adapter, attempt_evidence=evidence)
+
+    # The reservation committed and its identity still reaches the F5b
+    # handoff facts; nothing was sent, recorded, or mutated.
+    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
+    identity = evidence.latest_identity
+    assert identity is not None
+    assert identity.original_attempt_id == _ITERATION_1_ID
+    assert adapter.submitted_sends() == ()
+    _assert_no_verdict_recorded(env.conn)
+    _assert_no_task_mutation(env.conn)
+    assert env.pool.active_connections == 0
+
+
+def test_a_moved_reviewer_binding_during_attachment_refuses_without_sending() -> None:
+    """The post-attachment proof: a Reviewer binding that moved on during
+    attachment acquisition refuses the dispatch without sending."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        revalidation_reviewer_row=_session_row(
+            "reviewer", session_id=uuid.uuid4(), external_id=_REVIEWER_EXTERNAL_ID
+        ),
+    )
+    adapter = env.prepared_reviewer_adapter([_review_candidate()])
+
+    with pytest.raises(StaleOperationError):
+        env.run(adapter=adapter)
+
+    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
+    assert adapter.submitted_sends() == ()
+    _assert_no_verdict_recorded(env.conn)
+    _assert_no_task_mutation(env.conn)
+    assert env.pool.active_connections == 0

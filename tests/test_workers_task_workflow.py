@@ -623,15 +623,31 @@ def test_planning_review_composition_runs_dispatch_and_decision_in_process(
         assert dispatch.call_count == 1
         assert dispatch.calls[0]["kwargs"]["plan_production"] is production
         assert dispatch.calls[0]["kwargs"]["profile_id"] == _PROFILE_ID
-        # The dispatch attachment was the BOUND Reviewer at the neutral
-        # directory; the decision attachment was the BOUND Producer at the
-        # prepared checkout (the merged E2 revise continues there).
-        assert environment["attachments"].acquisitions[0]["role"] is WorkflowRole.REVIEWER
-        assert environment["attachments"].acquisitions[0]["working_directory"] == _NEUTRAL_DIRECTORY
-        assert environment["attachments"].acquisitions[1]["role"] is WorkflowRole.PRODUCER
-        assert (
-            environment["attachments"].acquisitions[1]["working_directory"] == _CHECKOUT_DIRECTORY
-        )
+        # E3a receives the composed deferred Reviewer attachment factory
+        # (F5e): the Reviewer runtime is acquired inside the dispatch
+        # service, strictly after its reservation, so an attachment failure
+        # is attributable to the reserved iteration through the Level 2
+        # handoff instead of stranding the planning Task.
+        assert len(dispatch.calls[0]["args"]) == 2
+        factory = dispatch.calls[0]["args"][1]
+        # The composed factory binds the exact service-resolved Reviewer
+        # session at the reviewer-neutral directory as a BOUND attachment.
+        with factory(SimpleNamespace(external_session_id=_REVIEWER_EXTERNAL_SESSION_ID)):
+            pass
+        reviewer_acquisition = environment["attachments"].acquisitions[-1]
+        assert reviewer_acquisition["role"] is WorkflowRole.REVIEWER
+        assert reviewer_acquisition["phase"] is task_workflow.ClineAttachmentPhase.BOUND
+        assert reviewer_acquisition["external_session_id"] == _REVIEWER_EXTERNAL_SESSION_ID
+        assert reviewer_acquisition["working_directory"] == _NEUTRAL_DIRECTORY
+        # The decision attachment was the BOUND Producer at the prepared
+        # checkout (the merged E2 revise continues there).
+        producer_acquisitions = [
+            acquisition
+            for acquisition in environment["attachments"].acquisitions
+            if acquisition["role"] is WorkflowRole.PRODUCER
+        ]
+        assert len(producer_acquisitions) == 1
+        assert producer_acquisitions[0]["working_directory"] == _CHECKOUT_DIRECTORY
         assert finalize.calls[0]["kwargs"]["expected_state_token"] == production.task.state_token
         # The next review round is authorized by the fresh post-revise token.
         assert len(submitter.submissions) == 1

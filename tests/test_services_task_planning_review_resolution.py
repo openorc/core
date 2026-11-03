@@ -578,6 +578,16 @@ def _prepared_adapter(
     return adapter
 
 
+def _deferred_reviewer_factory(adapter: Any) -> Any:
+    """The F5e deferred Reviewer attachment factory over one prepared adapter."""
+
+    @contextmanager
+    def factory(_session: Any) -> Iterator[Any]:
+        yield adapter
+
+    return factory
+
+
 class FakeGitHubClient:
     """Scripted GitHub observation fake recording call order; zero calls is
     assertable. Each call also proves no database transaction was open."""
@@ -955,7 +965,7 @@ def test_a_settled_gate_keeps_owner_mediation_sticky() -> None:
 
     dispatch = dispatch_planning_review(
         pool,
-        adapter,
+        _deferred_reviewer_factory(adapter),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
