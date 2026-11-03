@@ -54,7 +54,24 @@ Phase composition (one operation):
      per-loop numbering and the loop-OPEN guard are the durable backstops,
      and no PR-head fields exist.
 
-2. the ONE interaction send — the established #129 ``ReviewInteraction``
+2. the deferred Reviewer attachment (issue #268) — strictly after the
+   reservation commit and the invocation's attempt-evidence recording, the
+   exact admitted READY Reviewer attachment is acquired through the
+   caller-supplied deferred factory bound to the Phase-1 resolved session
+   identity. An attachment failure is therefore attributable to the exact
+   reserved ReviewIteration and reaches the Level 2 operational-failure
+   handoff with its own identity, instead of stranding the planning Task
+   without a disposition. Immediately after acquisition, one short
+   database-only transaction re-proves the exact reserved subjects under
+   the Task row ``FOR UPDATE`` — the exact current ``planning`` Task at the
+   expected token with no current OwnerGate, the exact current PlanRevision,
+   and the exact READY Reviewer binding; any moved subject refuses the
+   dispatch as a never-dispatched dead letter bound to the reserved
+   subjects, leaving the reserved iteration unfinalized for recovery. The
+   transaction closes before the send; no database transaction spans the
+   attachment or the send;
+
+3. the ONE interaction send — the established #129 ``ReviewInteraction``
    with an exact ``PlanReviewSubject`` (the persisted revision id, the
    durable repository address, the Task's issue number, and the persisted
    plan content verbatim) is sent once to the exact Reviewer session
@@ -63,25 +80,28 @@ Phase composition (one operation):
    composed model-visible message of the same subject facts. There is no
    separate REVIEW Markdown, no semantic rubric, no protocol instruction
    prose, and no Cline-specific path; the message is composed inline by
-   this service (no new prompt template or control asset). External sends
-   occur outside short database transactions by construction: the exact
-   Task/token/current-plan/session checks above happen before dispatch and
-   are repeated by the E3b decision finalization;
+   this service (no new prompt template or control asset). The exact
+   Task/token/current-plan/session checks are proven in the reservation
+   transaction, re-proven immediately before the send, and repeated by the
+   E3b decision finalization;
 
-3. the internal continuation input — the reserved exact-subject attempt
+4. the internal continuation input — the reserved exact-subject attempt
    (loop, unfinalized iteration) plus the typed ``ReviewResult`` and the
-   resolved READY Reviewer binding. A known failure or an uncertain runtime
-   outcome raises a typed application error and leaves the reserved attempt
-   unresolved: no verdict is inferred, no replacement attempt is created,
-   and nothing is blindly resent. Only a schema-valid, exact-subject typed
-   ``ReviewResult`` is ever returned to E3b.
+   resolved READY Reviewer binding. A known failure, an attachment failure,
+   or an uncertain runtime outcome raises a typed application error and
+   leaves the reserved attempt unresolved: no verdict is inferred, no
+   replacement attempt is created, and nothing is blindly resent. Only a
+   schema-valid, exact-subject typed ``ReviewResult`` is ever returned to
+   E3b.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from typing import cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
@@ -131,6 +151,7 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "ReviewerRuntimeAttachmentFactory",
     "TaskPlanningReviewDispatchOutcome",
     "dispatch_planning_review",
 ]
@@ -139,6 +160,16 @@ _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_dispatch"
 _DISPATCH_SPAN_NAME = "task_planning_review_dispatch.dispatch_planning_review"
 
 logger = logging.getLogger(__name__)
+
+# The deferred Reviewer attachment seam (F5e, issue #268): the service decides
+# WHEN the adapter is acquired — strictly after the Phase-1 reservation
+# transaction has committed, so an attachment failure is attributable to the
+# exact reserved ReviewIteration — and the caller owns HOW the production
+# attachment is composed (the #190 BOUND ``attach_cline_runtime`` composition
+# bound to the exact resolved Reviewer session identity).
+ReviewerRuntimeAttachmentFactory = Callable[
+    [TaskAgentSession], AbstractContextManager[AgentRuntimeAdapter]
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,10 +203,13 @@ def _require_uuid_command(value: object, name: str) -> UUID:
     return value
 
 
-def _require_runtime(value: object) -> AgentRuntimeAdapter:
-    if not isinstance(value, AgentRuntimeAdapter):
-        raise InvalidCommandError("runtime must be an AgentRuntimeAdapter")
-    return value
+def _require_reviewer_factory(value: object) -> ReviewerRuntimeAttachmentFactory:
+    if not callable(value):
+        raise InvalidCommandError(
+            "reviewer_runtime_factory must be a callable returning one adapter "
+            "attachment context manager for the exact resolved Reviewer binding"
+        )
+    return cast(ReviewerRuntimeAttachmentFactory, value)
 
 
 def _require_plan_production(value: object) -> TaskPlanProductionOutcome:
@@ -477,9 +511,75 @@ def _realize_review_control(
 # --- the dispatch operation --------------------------------------------------
 
 
+def _revalidate_reserved_subjects(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    reserved_revision: PlanRevision,
+    reviewer_session: TaskAgentSession,
+) -> Task:
+    """The post-attachment currentness proof: database only, before the send.
+
+    Attachment acquisition takes wall-clock time, so the exact reserved
+    subjects are re-proven under the Task row ``FOR UPDATE`` after the
+    Reviewer attachment is acquired and immediately before the send: the
+    exact current non-archived ``PLANNING`` Task at the caller's expected
+    token with no current OwnerGate, the exact current PlanRevision still
+    the reserved one, and the exact admitted READY Reviewer binding.
+    Cancellation, a gate transition, a produced successor revision, or
+    Reviewer-session loss during acquisition refuses the dispatch as a
+    never-dispatched dead letter bound to the reserved subjects: no message
+    is sent, no verdict/event/gate exists, and the reserved iteration stays
+    unfinalized as an explicit recoverable blocked state — never silently
+    bypassed and never re-dispatched blind. The transaction closes before
+    the send; no runtime I/O occurs inside it.
+
+    The entire proof runs inside ONE composed transaction: the Task row lock
+    taken by ``get_task_for_update`` is held to the transaction's commit, so
+    the token/status, revision currency, and Reviewer-binding checks all read
+    one transaction-scoped connection and a concurrent Task transition can
+    never interleave between them.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        if task.status is not TaskStatus.PLANNING:
+            raise ConflictError(
+                "the addressed task is no longer planning; the dispatch is refused "
+                "without sending and the reserved attempt stays unfinalized for recovery"
+            )
+        if task.current_owner_gate_id is not None:
+            raise ConflictError(
+                "the task carries a current owner gate; the dispatch is refused without "
+                "sending and the reserved attempt stays unfinalized for recovery"
+            )
+        require_current_plan_revision(
+            transaction_pool, task=task, plan_revision_id=reserved_revision.id
+        )
+        reviewer = _require_ready_reviewer(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        if reviewer.id != reviewer_session.id:
+            raise StaleOperationError(
+                "the reviewer session binding has moved on after the review "
+                "reservation; the dispatch is refused without sending and the "
+                "reserved attempt stays unfinalized for recovery"
+            )
+        return task
+
+
 def dispatch_planning_review(
     pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
     *,
     profile_id: UUID,
     workspace_id: UUID,
@@ -487,7 +587,7 @@ def dispatch_planning_review(
     plan_production: TaskPlanProductionOutcome,
     attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanningReviewDispatchOutcome:
-    """Reserve one exact-plan REVIEW attempt and send it to the Reviewer.
+    """Reserve one exact-plan REVIEW attempt, attach the Reviewer, send it.
 
     Consumes the exact successful E2 plan-production outcome
     (:class:`TaskPlanProductionOutcome`): the post-update Task token
@@ -496,15 +596,17 @@ def dispatch_planning_review(
     the only dispatch target. On first review the OPEN planning ReviewLoop
     is established with the Workspace's current budget snapshot; the
     next-numbered unfinalized ReviewIteration is reserved atomically before
-    the external send, so a lost or uncertain send leaves a durable,
-    unresolved attempt instead of a silent hole. The typed ``ReviewResult``
-    is returned as E3b's continuation input — never finalized here.
+    the deferred Reviewer attachment and the external send, so an attachment
+    failure or a lost or uncertain send leaves a durable, unresolved attempt
+    carrying the invocation's own F5b handoff identity instead of a silent
+    hole (issue #268). The typed ``ReviewResult`` is returned as E3b's
+    continuation input — never finalized here.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
         _require_uuid_command(profile_id, "profile_id")
         _require_uuid_command(workspace_id, "workspace_id")
         _require_uuid_command(task_id, "task_id")
-        runtime_adapter = _require_runtime(runtime)
+        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
         production = _require_plan_production(plan_production)
         annotate_span(
             span,
@@ -585,7 +687,9 @@ def dispatch_planning_review(
 
         if attempt_evidence is not None:
             # The F5b coordinator's handoff fact: this invocation's committed
-            # reserved review iteration identity (#262).
+            # reserved review iteration identity (#262). Recorded immediately
+            # after the reservation commit, before anything below — the
+            # attachment acquisition included — can fail (issue #268).
             attempt_evidence.record_attempt(
                 family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
                 original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
@@ -593,7 +697,9 @@ def dispatch_planning_review(
                 phase="planning_review_dispatch",
             )
 
-        # --- Phase 2: the ONE REVIEW send, with NO database transaction open. ---
+        # --- Phases 2 and 3: the deferred Reviewer attachment, the
+        # post-attachment currentness proof, and the ONE REVIEW send — with
+        # NO database transaction open across the attachment or the send. ---
         repository_full_name = f"{repository.metadata.owner_login}/{repository.metadata.name}"
         subject = PlanReviewSubject(
             plan_revision_id=str(persisted_revision.id),
@@ -607,12 +713,26 @@ def dispatch_planning_review(
             issue_number=task.github_issue_number,
             revision=persisted_revision,
         )
-        review_result = _realize_review_control(
-            runtime_adapter,
-            reviewer.external_session_id or "",
-            interaction=interaction,
-            message=message,
-        )
+        with reviewer_factory(reviewer) as runtime_adapter:
+            # The attachment is acquired strictly after the reservation
+            # commit, so a failure here is attributable to the exact reserved
+            # ReviewIteration recorded above (issue #268). The post-attachment
+            # proof re-proves the reserved subjects under the Task row lock
+            # and closes before the send.
+            _revalidate_reserved_subjects(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=production.task.state_token,
+                reserved_revision=persisted_revision,
+                reviewer_session=reviewer,
+            )
+            review_result = _realize_review_control(
+                runtime_adapter,
+                reviewer.external_session_id or "",
+                interaction=interaction,
+                message=message,
+            )
 
         # --- Phase 3: the internal continuation input for E3b. ---
         # No verdict is recorded and no workflow consequence is applied here:
