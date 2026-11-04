@@ -53,6 +53,23 @@ Authority boundaries (continuing the merged E5/E6 contracts):
   transition as its own leaf. This module never calls
   ``publish_task_pull_request``, GitHub create-PR, Reviewer PR review, or
   merge, and never calls the Producer again.
+- **F5f: presentation failures attribute truthfully to E7 (issue #269).**
+  The Phase-A admission commit durably grounds the presentation attempt
+  BEFORE any GitHub I/O: the qualifying successful Execution UUID is the
+  episode identity (never labelled failed — the
+  ``exact_head_pr_authorization_presentation`` family carries the
+  presentation semantics) and the proven post-admission Task token is the
+  recorded currentness. On an operational failure at the B3/B7 reads, the
+  F5b coordinator verifies exactly this identity and token against durable
+  state — a still-current token structurally proves the single final
+  composed effect never applied — so a successful E6 followed by a failed
+  E7 presentation reaches F4's disposition through its own narrow family
+  instead of being rejected as contradictory E6 failure evidence. The
+  durably authorized retry (``execute_authorized_pr_authorization_retry``)
+  re-enters ONLY this guarded presentation; E6 is never rerun, the one-shot
+  branch bind and one-current-gate guards are unchanged, and a confirmed
+  requirements change stays the existing ``github_source_changed`` block
+  path — a workflow-semantic outcome that never reaches triage.
 
 No universal dispatcher, operation outbox, branch scheduler, generic gate
 engine, database transaction spanning GitHub/network I/O, or record of all
@@ -75,6 +92,10 @@ from openorc.domain.events import WorkflowEventActor
 from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.github_issues import GitHubIssueState
+from openorc.domain.operational_failures import (
+    OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
+)
 from openorc.domain.planning import PlanRevision
 from openorc.domain.reviews import (
     ReviewIteration,
@@ -105,6 +126,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.github_reconciliation import reconcile_repository_issue
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
 from openorc.services.task_subject_guards import (
@@ -132,6 +154,12 @@ _CANCEL_SPAN_NAME = "task_pr_authorization.cancel_pr_authorization"
 # The presentation and its audit are OpenOrc continuations, never an Owner
 # approval: gate-creation provenance is OPENORC with no actor identity.
 _OPENORC_ACTOR = event_coordination.WorkflowActorContext(WorkflowEventActor.OPENORC, None)
+
+# The safe machine phase label the presentation records into the invocation's
+# attempt evidence (F5f, issue #269): the Phase-A admission commit — the last
+# durable grounding before the failure-prone B3/B7 GitHub reads — is the
+# exact point the E7 attempt identity and currentness are established.
+_PRESENTATION_PHASE = "pr_authorization_presentation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,6 +750,7 @@ def open_pr_authorization(
     task_id: UUID,
     expected_state_token: UUID,
     execution_id: UUID | None = None,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> PrAuthorizationGateOpened:
     """Present the exact-head PR authorization gate for a completed implementation.
 
@@ -776,6 +805,22 @@ def open_pr_authorization(
                 task_id=task_id,
                 expected_state_token=expected_state_token,
                 execution_id=execution_id,
+            )
+        # F5f (issue #269): the Phase-A admission commit is the durable
+        # grounding of the E7 presentation attempt — established BEFORE any
+        # GitHub I/O. The recorded identity roots the failure episode at the
+        # qualifying successful Execution (never labelling it failed; the
+        # family carries the presentation semantics), and the recorded token
+        # is the exact post-admission currentness Level 1 established. A
+        # still-current token at report time later structurally proves the
+        # presentation's one durable effect never applied.
+        if attempt_evidence is not None:
+            attempt_evidence.record_task_token(claim.task.state_token)
+            attempt_evidence.record_attempt(
+                family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=claim.execution.id,
+                phase=_PRESENTATION_PHASE,
             )
         # --- Phase B: fresh GitHub reconciliation (no transaction open). ---
         _require_unmoved_canonical_branch(claim)

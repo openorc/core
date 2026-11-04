@@ -49,6 +49,7 @@ from openorc.workers.invocation import (
     TaskAuthorizedMergeRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
+    TaskPrAuthorizationRetryPayload,
     TaskPrCompositionPayload,
     TaskPrReviewPayload,
     TaskScope,
@@ -166,6 +167,7 @@ def patched_workflow_environment(
     execute_implementation: RecordingService | None = None,
     execute_implementation_retry: RecordingService | None = None,
     execute_merge_retry: RecordingService | None = None,
+    execute_pr_authorization_retry: RecordingService | None = None,
     open_pr: RecordingService | None = None,
     compose_pr: RecordingService | None = None,
     dispatch_pr: RecordingService | None = None,
@@ -227,6 +229,7 @@ def patched_workflow_environment(
         "execute_authorized_implementation": execute_implementation,
         "execute_authorized_implementation_retry": execute_implementation_retry,
         "execute_authorized_merge_retry": execute_merge_retry,
+        "execute_authorized_pr_authorization_retry": execute_pr_authorization_retry,
         "open_pr_authorization": open_pr,
         "compose_and_publish_task_pr": compose_pr,
         "dispatch_pr_review": dispatch_pr,
@@ -1470,3 +1473,131 @@ def test_authorized_merge_retry_composition_consumes_and_sends_exactly_once(
         # No continuation submission exists for the merge retry: the outcome
         # stays at its committed durable state and F11 owns any wakeup.
         assert submitter.submissions == []
+
+
+def test_pr_authorization_retry_payload_decodes_strictly() -> None:
+    """The F5f presentation-retry payload (issue #269) decodes with the
+    strict field set."""
+    base = {
+        "task": {
+            "workspace_id": str(_WORKSPACE_ID),
+            "task_id": str(_TASK_ID),
+            "role": WorkflowRoleRef.PRODUCER.value,
+        },
+        "profile_id": str(_PROFILE_ID),
+        "retry_attempt_id": str(_OWNER_GATE_ID),
+        "expected_state_token": str(_STATE_TOKEN),
+    }
+    decoded = decode_operation_invocation({"kind": "task_pr_authorization_retry", "payload": base})
+    assert decoded.kind is OperationKind.TASK_PR_AUTHORIZATION_RETRY
+    retry_payload = cast(TaskPrAuthorizationRetryPayload, decoded.payload)
+    assert retry_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+    # Unexpected fields are refused before any effect.
+    with_extra = {**base, "retryable": True}
+    with pytest.raises(InvalidInvocationError, match="unexpected fields"):
+        decode_operation_invocation({"kind": "task_pr_authorization_retry", "payload": with_extra})
+    malformed = {**base, "retry_attempt_id": "not-a-uuid"}
+    with pytest.raises(InvalidInvocationError, match="retry_attempt_id"):
+        decode_operation_invocation({"kind": "task_pr_authorization_retry", "payload": malformed})
+    # A Reviewer-role scope does not match the presentation-retry kind's
+    # implementation-phase role.
+    reviewer_role = {**base, "task": {**base["task"], "role": WorkflowRoleRef.REVIEWER.value}}
+    with pytest.raises(InvalidInvocationError, match="role"):
+        decode_operation_invocation(
+            {"kind": "task_pr_authorization_retry", "payload": reviewer_role}
+        )
+
+
+def test_pr_authorization_retry_composition_consumes_and_represents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F5f composition delegates to the presentation-retry execution
+    seam — the E7-only guarded re-presentation, never the implementation."""
+    dependencies, submitter = make_dependencies()
+    presentation_retry = RecordingService(result=None)
+    with patched_workflow_environment(
+        monkeypatch, execute_pr_authorization_retry=presentation_retry
+    ):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_PR_AUTHORIZATION_RETRY,
+                payload=TaskPrAuthorizationRetryPayload(
+                    task=_TASK_SCOPE_PRODUCER,
+                    profile_id=str(_PROFILE_ID),
+                    retry_attempt_id=str(_OWNER_GATE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+        assert presentation_retry.call_count == 1
+        retry_kwargs = presentation_retry.calls[0]["kwargs"]
+        assert retry_kwargs["profile_id"] == _PROFILE_ID
+        assert retry_kwargs["workspace_id"] == _WORKSPACE_ID
+        assert retry_kwargs["task_id"] == _TASK_ID
+        assert retry_kwargs["expected_state_token"] == _STATE_TOKEN
+        assert retry_kwargs["retry_attempt_id"] == _OWNER_GATE_ID
+        # (The attempt-evidence collector is coordinator plumbing, excluded
+        # from recorded comparisons and threaded by the dedicated test
+        # below.) No continuation submission exists for the presentation
+        # retry: the outcome stays at its committed durable state and F11
+        # owns any wakeup.
+        assert submitter.submissions == []
+
+
+def test_the_implementation_compositions_thread_the_attempt_evidence_collector_into_e7(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both implementation compositions (initial and F5c-authorized retry)
+    thread the invocation's attempt-evidence collector into the E7
+    presentation — the same application path, so an E7 failure after a
+    successful E6 attributes truthfully in either composition."""
+    dependencies, submitter = make_dependencies()
+    execution = fake_execution()
+    evidence = InvocationAttemptEvidence()
+    presentations: list[dict[str, Any]] = []
+
+    def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        return SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
+
+    cases = [
+        (
+            OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
+            TaskAuthorizedImplementationPayload(
+                task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+        (
+            OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
+            TaskAuthorizedImplementationRetryPayload(
+                task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                retry_attempt_id=str(_OWNER_GATE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+    ]
+    for kind, payload in cases:
+        presentations.clear()
+        execute = RecordingService(result=execution)
+        if kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION:
+            monkeypatch.setattr(task_workflow, "execute_authorized_implementation", execute)
+        else:
+            monkeypatch.setattr(task_workflow, "execute_authorized_implementation_retry", execute)
+        # The raw recording stub (not the comparison-filtering
+        # RecordingService) proves the collector threading itself.
+        monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr)
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(kind=kind, payload=payload),
+            dependencies=dependencies,
+            attempt_evidence=evidence,
+        )
+        assert len(presentations) == 1
+        assert presentations[0]["attempt_evidence"] is evidence
+        assert presentations[0]["expected_state_token"] == execution.task.state_token
+        assert presentations[0]["execution_id"] == _EXECUTION_ID
+    assert submitter.submissions == []

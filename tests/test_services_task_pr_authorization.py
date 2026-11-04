@@ -57,9 +57,14 @@ from openorc.adapters.github import (
     GitHubRateLimitedError,
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
+    GitHubTransportUncertainError,
 )
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.github_issues import github_issue_requirements_fingerprint
+from openorc.domain.operational_failures import (
+    OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
+)
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
@@ -71,6 +76,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_pr_authorization import (
     approve_pr_authorization,
     cancel_pr_authorization,
@@ -989,6 +995,7 @@ def _open_call(
     expected_state_token: Any = _STATE_TOKEN,
     execution_id: Any = None,
     workspace_id: Any = _WORKSPACE_ID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> Any:
     return open_pr_authorization(
         pool,
@@ -998,6 +1005,7 @@ def _open_call(
         task_id=_TASK_ID,
         expected_state_token=expected_state_token,
         execution_id=execution_id,
+        attempt_evidence=attempt_evidence,
     )
 
 
@@ -1725,3 +1733,102 @@ def test_only_the_current_pr_authorization_gate_cancels_through_this_seam() -> N
     assert _count(conn, _GATE_UPDATE) == 0
     assert _count(conn, _ARCHIVE_WRITE) == 0
     assert _event_types(conn) == []
+
+
+# --- F5f: the presentation attempt-evidence attribution (issue #269) ---------
+
+
+def test_a_successful_presentation_records_the_attempt_identity_at_admission() -> None:
+    """The Phase-A admission commit durably grounds the presentation attempt
+    BEFORE any GitHub I/O: the qualifying successful Execution UUID is the
+    episode identity and the proven post-admission Task token is the
+    recorded currentness."""
+    conn = ScriptedConnection()
+    _script_open_success(conn)
+    pool = _pool(conn)
+    github = _fake_github(cast(FakePool, pool))
+    evidence = InvocationAttemptEvidence()
+
+    _open_call(pool, github, attempt_evidence=evidence)
+
+    identity = evidence.latest_identity
+    assert identity is not None
+    assert (
+        identity.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert identity.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert identity.original_attempt_id == _EXECUTION_1_ID
+    assert identity.effect_attempt_id is None
+    assert identity.phase == "pr_authorization_presentation"
+    assert evidence.current_task_token == _STATE_TOKEN
+    # The successful presentation itself is unchanged.
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _BRANCH_BIND) == 1
+
+
+def test_a_github_transport_failure_still_carries_the_recorded_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful E6 followed by a GitHub transport failure in E7 leaves
+    the invocation's own truthful E7 evidence recorded (before the failing
+    I/O) — the F5b coordinator's family verification can consume it, and the
+    presentation applied no durable effect."""
+    conn = ScriptedConnection()
+    _script_open_success(conn)
+    pool = _pool(conn)
+    error = ExternalOperationUncertainError("the outcome of the GitHub issue read is unknown")
+    error.__cause__ = GitHubTransportUncertainError("the transport failed transiently")
+    github = _fake_github(cast(FakePool, pool), issue_error=error)
+    evidence = InvocationAttemptEvidence()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _open_call(pool, github, attempt_evidence=evidence)
+
+    assert excinfo.value is error
+    identity = evidence.latest_identity
+    assert identity is not None
+    assert (
+        identity.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert identity.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert identity.original_attempt_id == _EXECUTION_1_ID
+    assert evidence.current_task_token == _STATE_TOKEN
+    # No durable presentation effect was applied: no bind, no gate, no
+    # transition — the pre-gate implementing state is untouched.
+    assert _count(conn, _BRANCH_BIND) == 0
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _STATUS_UPDATE) == 0
+
+
+def test_the_drift_block_path_stays_a_workflow_semantic_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmed requirements change takes the existing atomic
+    ``github_source_changed`` block path and raises a workflow-semantic
+    typed error — never an operational failure that could reach triage —
+    while the recorded identity still truthfully names the attempted
+    presentation."""
+    conn = ScriptedConnection()
+    _script_drift_block(conn)
+    pool = _pool(conn)
+    github = _fake_github(
+        cast(FakePool, pool),
+        issue_observation=_issue_observation(title="Found a bug v2"),
+    )
+    evidence = InvocationAttemptEvidence()
+
+    with pytest.raises(ConflictError, match="requirements changed"):
+        _open_call(pool, github, attempt_evidence=evidence)
+
+    identity = evidence.latest_identity
+    assert identity is not None
+    assert (
+        identity.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    # The block path itself keeps its established semantics.
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _BRANCH_BIND) == 0

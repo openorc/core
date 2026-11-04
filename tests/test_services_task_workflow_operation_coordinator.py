@@ -26,7 +26,10 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
 )
-from openorc.adapters.github import GitHubTransportUncertainError
+from openorc.adapters.github import (
+    GitHubOutcomeUncertainError,
+    GitHubTransportUncertainError,
+)
 from openorc.domain.events import WorkflowEventType
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
@@ -35,6 +38,7 @@ from openorc.domain.operational_failures import (
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -1139,5 +1143,347 @@ def test_a_merge_retry_report_fails_closed_on_a_foreign_scope(
             level_one=level_one, triage=triage, expected_status=TaskStatus.WAITING_FOR_OWNER
         )
 
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+# --- F5f: the exact-head PR-authorization presentation family ------------------
+
+_PRESENTATION_EXECUTION_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000b1")
+_PRESENTATION_EPISODE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000b2")
+_PRESENTATION_ATTEMPT_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000b3")
+
+
+def _transport_uncertain_failure() -> Exception:
+    """A B3/B7 read uncertainty carrying the narrow transient-transport cause."""
+    error = ExternalOperationUncertainError("the outcome of the GitHub read is unknown")
+    error.__cause__ = GitHubTransportUncertainError("the transport failed transiently")
+    return error
+
+
+def _plain_uncertain_failure() -> Exception:
+    """A B3/B7 read uncertainty without a transient-transport cause (e.g. a 5xx)."""
+    error = ExternalOperationUncertainError("the outcome of the GitHub read is unknown")
+    error.__cause__ = GitHubOutcomeUncertainError("the response was not interpretable")
+    return error
+
+
+def _succeeded_execution(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _PRESENTATION_EXECUTION_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "status": ExecutionStatus.SUCCEEDED,
+        "review_iteration_id": None,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _pre_gate_task(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _TASK_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "status": TaskStatus.IMPLEMENTING,
+        "current_owner_gate_id": None,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _presentation_episode() -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=_PRESENTATION_EPISODE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation_family=(
+            PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+        ),
+        original_attempt_kind=OriginalAttemptKind.EXECUTION,
+        original_attempt_id=_PRESENTATION_EXECUTION_ID,
+        subject={
+            "workspace_id": str(_WORKSPACE_ID),
+            "task_id": str(_TASK_ID),
+            "execution_id": str(_PRESENTATION_EXECUTION_ID),
+        },
+        escalated_task_block_id=None,
+    )
+
+
+def _consumed_presentation_attempt(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _PRESENTATION_ATTEMPT_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "episode_id": _PRESENTATION_EPISODE_ID,
+        "ordinal": 1,
+        "consumed_at": _NOW,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _patch_presentation_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    execution: Any = None,
+    task: Any = None,
+    attempt: Any = None,
+    episode: Any = None,
+) -> None:
+    """Substitute the presentation resolver's focused durable reads with fakes."""
+    monkeypatch.setattr(
+        coordinator.execution_records,
+        "get_execution",
+        lambda _pool, *, execution_id: execution if execution_id == execution.id else None,
+    )
+    monkeypatch.setattr(
+        coordinator.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task is not None and task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        coordinator.failure_records,
+        "get_operational_failure_attempt",
+        lambda _pool, *, attempt_id: (
+            attempt if attempt is not None and attempt_id == attempt.id else None
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator.failure_records,
+        "get_operational_failure_episode",
+        lambda _pool, *, episode_id: (
+            episode if episode is not None and episode_id == episode.id else None
+        ),
+    )
+
+
+def _presentation_level_one(error: Exception) -> Any:
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_task_token(_PAYLOAD_TOKEN)
+        evidence.record_attempt(
+            family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_PRESENTATION_EXECUTION_ID,
+            phase="pr_authorization_presentation",
+        )
+        raise error
+
+    return level_one
+
+
+def test_a_presentation_failure_after_a_successful_execution_reaches_triage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful E6 followed by a GitHub transport failure in E7 reports
+    truthful E7 evidence through the presentation family — never a false E6
+    failure, never a stranded Task."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(monkeypatch, execution=_succeeded_execution(), task=_pre_gate_task())
+    error = _transport_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=_presentation_level_one(error), triage=triage)
+
+    assert triage.call_count == 1
+    call = triage.calls[0]
+    assert call["expected_state_token"] is _PAYLOAD_TOKEN
+    assert call["expected_status"] is TaskStatus.IMPLEMENTING
+    assert call["expected_current_owner_gate_id"] is None
+    operation = call["operation"]
+    assert (
+        operation.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert operation.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert operation.original_attempt_id == _PRESENTATION_EXECUTION_ID
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
+    report = call["report"]
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.ORIGINAL
+    assert report.reporting_attempt_id == _PRESENTATION_EXECUTION_ID
+    assert report.effect_attempt_id is None
+    assert report.error_code is OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+    assert excinfo.value is error
+
+
+def test_a_presentation_failure_with_plain_uncertainty_keeps_the_unsupported_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interpretable-response read uncertainty (e.g. a 5xx) never produces
+    the retry-eligible transport code; the report still reaches F4, which
+    escalates it."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(monkeypatch, execution=_succeeded_execution(), task=_pre_gate_task())
+    error = _plain_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _coordinate(level_one=_presentation_level_one(error), triage=triage)
+
+    assert triage.call_count == 1
+    report = triage.calls[0]["report"]
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+
+
+def test_a_presentation_failure_with_a_known_provider_failure_keeps_the_known_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A known provider failure at the B3/B7 reads is a triage-applicable
+    known-failure report whose code can never be retry-eligible."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(monkeypatch, execution=_succeeded_execution(), task=_pre_gate_task())
+    error = ExternalOperationFailedError("GitHub rejected the source read")
+
+    with pytest.raises(ExternalOperationFailedError):
+        _coordinate(level_one=_presentation_level_one(error), triage=triage)
+
+    assert triage.call_count == 1
+    report = triage.calls[0]["report"]
+    assert report.error_code is OperationalFailureCode.EXTERNAL_OPERATION_FAILED
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+
+
+def test_a_presentation_failure_after_the_effect_applied_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A moved-on Task (the gate installed) means the report no longer
+    addresses outstanding pre-gate work: no triage, no episode."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(
+        monkeypatch,
+        execution=_succeeded_execution(),
+        task=_pre_gate_task(status=TaskStatus.WAITING_FOR_OWNER),
+    )
+    error = _transport_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=_presentation_level_one(error), triage=triage)
+
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+def test_a_presentation_report_on_a_foreign_scope_execution_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(
+        monkeypatch,
+        execution=_succeeded_execution(workspace_id=_OTHER_WORKSPACE_ID),
+        task=_pre_gate_task(),
+    )
+    error = _transport_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=_presentation_level_one(error), triage=triage)
+
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+def test_an_e6_family_report_over_the_same_succeeded_execution_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The execution families' SUCCEEDED-contradiction check stays exactly
+    intact: the same successful Execution reported as an E6 failure is still
+    rejected, while the presentation family's report over it is accepted."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(monkeypatch, execution=_succeeded_execution(), task=_pre_gate_task())
+    error = _transport_uncertain_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_PRESENTATION_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage)
+
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+def _presentation_retry_level_one(error: Exception) -> Any:
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_PRESENTATION_ATTEMPT_ID,
+            effect_attempt_id=_PRESENTATION_ATTEMPT_ID,
+            phase="pr_authorization_retry_presentation",
+        )
+        raise error
+
+    return level_one
+
+
+def test_a_presentation_retry_failure_reports_the_consumed_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumed F4-authorized re-presentation's operational failure reports
+    the episode's original Execution identity with PRIOR_AUTHORIZED
+    provenance through the consumed attempt's own binding."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(
+        monkeypatch,
+        execution=_succeeded_execution(),
+        task=_pre_gate_task(),
+        attempt=_consumed_presentation_attempt(),
+        episode=_presentation_episode(),
+    )
+    error = _transport_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=_presentation_retry_level_one(error), triage=triage)
+
+    assert triage.call_count == 1
+    operation = triage.calls[0]["operation"]
+    report = triage.calls[0]["report"]
+    assert (
+        operation.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert operation.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert operation.original_attempt_id == _PRESENTATION_EXECUTION_ID
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _PRESENTATION_ATTEMPT_ID
+    assert report.effect_attempt_id == _PRESENTATION_ATTEMPT_ID
+    assert report.error_code is OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+    assert dict(report.diagnostic_context)["presentation_retry_attempt_consumed"] is True
+    assert excinfo.value is error
+
+
+def test_a_presentation_retry_failure_without_the_consumption_stamp_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_presentation_reads(
+        monkeypatch,
+        execution=_succeeded_execution(),
+        task=_pre_gate_task(),
+        attempt=_consumed_presentation_attempt(consumed_at=None),
+        episode=_presentation_episode(),
+    )
+    error = _transport_uncertain_failure()
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _coordinate(level_one=_presentation_retry_level_one(error), triage=triage)
+
+    # Only the failure of an actually consumed attempt is reportable.
     assert triage.call_count == 0
     assert excinfo.value is error

@@ -41,8 +41,12 @@ Level 1 itself established for the invocation (the collector's), never a
 post-failure Task snapshot.
 
 Direct Owner Abort, cost-limit stops, Cancel, ordinary gate outcomes, the
-E7/E8/E10a GitHub-authority consequences, and the legacy direct-block writers
-stay outside Level 2 here; #252 (F6) owns the Level 1 retrofit.
+E7/E8/E10a GitHub-authority consequences (the typed workflow-semantic
+refusals and the ``github_source_changed`` block — never the presentation's
+own operational failures, which F5f #269 reports through the
+``EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION`` family), and the legacy
+direct-block writers stay outside Level 2 here; #252 (F6) owns the Level 1
+retrofit.
 
 The supported v1 family map this coordinator hands to F4 (F6's retrofit
 inventory keys off this):
@@ -81,6 +85,21 @@ inventory keys off this):
   open/unmerged same-head observation — freshness of that observation is the
   reporting caller's binding obligation; an unavailable post-send read or a
   reconciled changed head is settled in-service and never reported here.
+- EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION (F5f, issue #269) — original
+  identity: the durably finalized SUCCESSFUL E6 Execution UUID (expected for
+  this family, never the execution families' SUCCEEDED contradiction, which
+  stays exactly intact); effect evidence: structurally proven
+  ``PRE_EFFECT_NOT_APPLIED`` — the presentation commits exactly one durable
+  effect (the guarded final composed transaction whose Task-token rotation
+  is observable), so the Task still implementing with no current gate
+  proves the effect never applied. The reported invocation identity of a
+  durably authorized re-presentation is its own consumed attempt (the
+  one-shot ``consumed_at`` stamp is the durable binding — the presentation
+  family has no resulting Execution), addressed to the episode's original
+  Execution identity with ``PRIOR_AUTHORIZED``. The retry-eligible code is
+  ONLY the recognized transient GitHub transport subclass in the B3/B7 read
+  error's bounded cause chain; every other uncertain outcome and every
+  known provider failure keeps its escalating code.
 """
 
 from __future__ import annotations
@@ -112,6 +131,7 @@ from openorc.domain.operational_failures import (
     OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -613,6 +633,32 @@ def _merge_retry_failure_code(error: BaseException) -> OperationalFailureCode:
     return OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
 
 
+def _pr_authorization_failure_code(error: BaseException) -> OperationalFailureCode:
+    """The presentation family's B3/B7 read-phase code, classified type-only (F5f).
+
+    ONLY the GitHub adapter's narrow transient-transport subclass in the
+    read error's bounded cause chain classifies as the retry-eligible
+    ``EXTERNAL_TRANSPORT_UNAVAILABLE`` code — a connection-level transport
+    loss provably applies no durable effect and is the one narrowly typed
+    transient-network classification this family admits. Every other
+    uncertain outcome (an interpretable-response ``GitHubOutcomeUncertainError``,
+    e.g. a 5xx read) keeps the unsupported-uncertainty code, and every known
+    provider failure keeps its coarse known-failure code: F4 escalates
+    both. Non-uncertain applicable failures keep the generic type-only
+    classification.
+    """
+    if not isinstance(error, ExternalOperationUncertainError):
+        return _classify_failure_code(error)
+    current: BaseException | None = error
+    for _ in range(_MAX_CAUSE_CHAIN_NODES + 1):
+        if current is None:
+            break
+        if isinstance(current, GitHubTransportUncertainError):
+            return OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+        current = current.__cause__
+    return OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN
+
+
 def _resolve_merge_retry_report(
     pool: DatabasePool,
     *,
@@ -683,6 +729,161 @@ def _resolve_merge_retry_report(
     )
 
 
+def _resolve_pr_authorization_presentation_report(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    identity: ProducedAttemptIdentity,
+    error: BaseException,
+) -> _ResolvedFailureReport | None:
+    """Verify and enrich one exact-head presentation report (F5f, issue #269).
+
+    The episode roots at the durably finalized SUCCESSFUL E6 Execution —
+    expected for this family and never the execution families' SUCCEEDED
+    contradiction, which stays exactly intact for them. Two report shapes:
+
+    - ORIGINAL (the initial or authorized-retry composition's failing
+      presentation): the recorded identity is the qualifying Execution; the
+      committed evidence is that Execution row (same scope, SUCCEEDED,
+      implementation-attempted) plus the Task still ``implementing`` with no
+      current gate. That state structurally proves
+      ``PRE_EFFECT_NOT_APPLIED``: the presentation commits exactly one
+      durable effect — the guarded final composed transaction whose Task
+      token rotates and whose gate becomes current — so the pre-gate state
+      proves the effect never applied.
+    - PRIOR_AUTHORIZED (a consumed F4-authorized re-presentation): the
+      recorded identity is the consumed attempt (its one-shot
+      ``consumed_at`` stamp is the durable binding — the presentation family
+      has no resulting Execution); the report addresses the episode's
+      original Execution identity with the consumed attempt as source, and
+      the same structural pre-effect proof is re-derived.
+
+    Any incoherent recorded identity (foreign scope, non-succeeded or
+    remediation execution, moved-on Task, current gate, unconsumed attempt,
+    mismatched effect) fails closed without triaging.
+    """
+    if identity.original_attempt_kind is not OriginalAttemptKind.EXECUTION:
+        return None
+    if (
+        identity.effect_attempt_id is not None
+        and identity.effect_attempt_id == identity.original_attempt_id
+    ):
+        # The consumed-attempt identity shape (mirrors the merge family):
+        # the identity names the F4-authorized re-presentation attempt itself.
+        return _resolve_pr_authorization_retry_report(
+            pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
+        )
+    execution = execution_records.get_execution(pool, execution_id=identity.original_attempt_id)
+    if execution is None or execution.workspace_id != workspace_id or execution.task_id != task_id:
+        return None
+    if execution.status is not ExecutionStatus.SUCCEEDED:
+        # A non-succeeded execution is the execution families' subject; a
+        # presentation report about it is incoherent and their SUCCEEDED
+        # contradiction check stays untouched by this family.
+        return None
+    if execution.review_iteration_id is not None:
+        # A PR-remediation execution never roots a presentation episode.
+        return None
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return None
+    if task.status is not TaskStatus.IMPLEMENTING or task.current_owner_gate_id is not None:
+        # The presentation effect applied, or the workflow moved on: the
+        # report no longer addresses outstanding pre-gate work.
+        return None
+    subject_identifiers: dict[str, object] = {
+        "workspace_id": workspace_id,
+        "task_id": task_id,
+        "execution_id": execution.id,
+    }
+    return _ResolvedFailureReport(
+        operation=OperationalFailureOperation(
+            family=identity.family,
+            original_attempt_kind=identity.original_attempt_kind,
+            original_attempt_id=identity.original_attempt_id,
+            subject=_canonical_operation_subject(subject_identifiers),
+        ),
+        report=OperationalFailureReport(
+            reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+            reporting_attempt_id=identity.original_attempt_id,
+            error_code=_pr_authorization_failure_code(error),
+            effect_evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+            effect_attempt_id=None,
+            diagnostic_context=_diagnostic_context(identity, error),
+        ),
+    )
+
+
+def _resolve_pr_authorization_retry_report(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    identity: ProducedAttemptIdentity,
+    error: BaseException,
+) -> _ResolvedFailureReport | None:
+    """Resolve the F5f re-presentation invocation's consumed-attempt identity.
+
+    The recorded identity is the F4-authorized presentation attempt: its
+    one-shot ``consumed_at`` stamp is the durable binding a report must
+    prove (the presentation family has no resulting Execution), and the
+    recorded effect identity must be the attempt's own UUID. The episode
+    must be this family rooted at a still-SUCCEEDED same-scope Execution,
+    and the Task must still be in the pre-gate ``implementing`` state with
+    no current gate — the structural pre-effect proof for the failed
+    re-presentation. Any incoherence fails closed without triaging.
+    """
+    attempt = failure_records.get_operational_failure_attempt(
+        pool, attempt_id=identity.original_attempt_id
+    )
+    if attempt is None or attempt.workspace_id != workspace_id or attempt.task_id != task_id:
+        return None
+    if attempt.consumed_at is None:
+        # Only the failure of an actually consumed attempt is reportable.
+        return None
+    episode = failure_records.get_operational_failure_episode(pool, episode_id=attempt.episode_id)
+    if (
+        episode is None
+        or episode.workspace_id != workspace_id
+        or episode.task_id != task_id
+        or episode.operation_family
+        is not PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+        or episode.original_attempt_kind is not OriginalAttemptKind.EXECUTION
+    ):
+        return None
+    execution = execution_records.get_execution(pool, execution_id=episode.original_attempt_id)
+    if execution is None or execution.workspace_id != workspace_id or execution.task_id != task_id:
+        return None
+    if execution.status is not ExecutionStatus.SUCCEEDED:
+        return None
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return None
+    if task.status is not TaskStatus.IMPLEMENTING or task.current_owner_gate_id is not None:
+        return None
+    return _ResolvedFailureReport(
+        operation=OperationalFailureOperation(
+            family=episode.operation_family,
+            original_attempt_kind=episode.original_attempt_kind,
+            original_attempt_id=episode.original_attempt_id,
+            subject=episode.subject,
+        ),
+        report=OperationalFailureReport(
+            reporting_attempt_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_attempt_id=attempt.id,
+            error_code=_pr_authorization_failure_code(error),
+            effect_evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+            effect_attempt_id=attempt.id,
+            diagnostic_context={
+                "error_type": type(error).__name__,
+                "phase": identity.phase,
+                "presentation_retry_attempt_consumed": True,
+            },
+        ),
+    )
+
+
 def _resolve_failure_report(
     pool: DatabasePool,
     *,
@@ -721,6 +922,10 @@ def _resolve_failure_report(
         )
     if family is GitHubMergeOperation.EXACT_HEAD_MERGE:
         return _resolve_merge_retry_report(
+            pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
+        )
+    if family is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION:
+        return _resolve_pr_authorization_presentation_report(
             pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
         )
     # The recorded identity names no supported v1 family: fail closed.

@@ -113,6 +113,11 @@ class OperationKind(StrEnum):
     # invokes the shared merge-retry execution service; the due-time wakeup
     # scheduling belongs to F11 (#257), not to this catalog.
     TASK_AUTHORIZED_MERGE_RETRY = "task_authorized_merge_retry"
+    # F5f (issue #269): the F4-authorized exact-head PR-authorization
+    # presentation retry. The handler invokes the shared presentation-retry
+    # execution seam, which re-enters ONLY the guarded E7 presentation; the
+    # due-time wakeup scheduling belongs to F11 (#257), not to this catalog.
+    TASK_PR_AUTHORIZATION_RETRY = "task_pr_authorization_retry"
     TASK_PR_COMPOSITION = "task_pr_composition"
     TASK_PR_REVIEW = "task_pr_review"
 
@@ -230,6 +235,12 @@ _TASK_KIND_ROLES: Mapping[OperationKind, WorkflowRoleRef] = {
     # identity only; the executing service re-derives every subject from
     # committed state.
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: WorkflowRoleRef.REVIEWER,
+    # F5f (issue #269): the presentation retry consumes no role session — the
+    # authorized re-presentation continues the implementation phase's
+    # authorized continuation, so the scope carries the implementation-phase
+    # (PRODUCER) role as envelope identity only; the executing service
+    # re-derives every subject from committed state.
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_COMPOSITION: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_REVIEW: WorkflowRoleRef.REVIEWER,
 }
@@ -400,6 +411,40 @@ class TaskAuthorizedMergeRetryPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPrAuthorizationRetryPayload:
+    """The F5f presentation-retry operation payload (issue #269).
+
+    The exact durable Workspace/Task units with the consuming Producer
+    role (the presentation continues the implementation phase's authorized
+    continuation — no runtime session is consumed), the accountable Owner
+    Profile identity, the exact F4-authorized retry attempt, and the exact
+    post-E6 ``state_token`` the failed presentation proved current. No gate,
+    head, or branch claim is carried; the guarded presentation re-derives
+    every subject from durable state.
+    """
+
+    task: TaskScope
+    profile_id: str
+    retry_attempt_id: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "retry_attempt_id",
+            _require_canonical_uuid(self.retry_attempt_id, "retry_attempt_id"),
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TaskPrCompositionPayload:
     """The E8 PR composition/publish operation payload (F5a).
 
@@ -511,6 +556,7 @@ OperationPayload = (
     | TaskAuthorizedImplementationPayload
     | TaskAuthorizedImplementationRetryPayload
     | TaskAuthorizedMergeRetryPayload
+    | TaskPrAuthorizationRetryPayload
     | TaskPrCompositionPayload
     | TaskPrReviewPayload
 )
@@ -529,6 +575,9 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
         {"task", "profile_id", "retry_attempt_id", "expected_state_token"}
     ),
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: frozenset(
+        {"task", "profile_id", "retry_attempt_id", "expected_state_token"}
+    ),
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: frozenset(
         {"task", "profile_id", "retry_attempt_id", "expected_state_token"}
     ),
     OperationKind.TASK_PR_COMPOSITION: frozenset(
@@ -552,6 +601,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskAuthorizedImplementationPayload,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: TaskAuthorizedImplementationRetryPayload,
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: TaskAuthorizedMergeRetryPayload,
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: TaskPrAuthorizationRetryPayload,
     OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
 }
@@ -650,6 +700,21 @@ def _decode_task_authorized_merge_retry_payload(
     )
 
 
+def _decode_task_pr_authorization_retry_payload(
+    raw: object,
+) -> TaskPrAuthorizationRetryPayload:
+    kind = OperationKind.TASK_PR_AUTHORIZATION_RETRY
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskPrAuthorizationRetryPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        retry_attempt_id=_require_canonical_uuid(fields["retry_attempt_id"], "retry_attempt_id"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
 def _decode_task_pr_composition_payload(raw: object) -> TaskPrCompositionPayload:
     kind = OperationKind.TASK_PR_COMPOSITION
     fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
@@ -688,6 +753,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
         _decode_task_authorized_implementation_retry_payload
     ),
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: _decode_task_authorized_merge_retry_payload,
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: _decode_task_pr_authorization_retry_payload,
     OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
 }
@@ -738,6 +804,15 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         }
     if isinstance(payload, TaskAuthorizedMergeRetryPayload) and (
         kind is OperationKind.TASK_AUTHORIZED_MERGE_RETRY
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "retry_attempt_id": payload.retry_attempt_id,
+            "expected_state_token": payload.expected_state_token,
+        }
+    if isinstance(payload, TaskPrAuthorizationRetryPayload) and (
+        kind is OperationKind.TASK_PR_AUTHORIZATION_RETRY
     ):
         return {
             "task": payload.task.encode(),

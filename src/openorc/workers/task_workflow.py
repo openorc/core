@@ -1,6 +1,6 @@
 """F5a Task-workflow operation composition (issue #253).
 
-The production handlers for the six Task-workflow operation kinds and the
+The production handlers for the seven Task-workflow operation kinds and the
 single application composition seam that owns their in-process sequencing.
 Every handler invokes the existing E-series application services with
 process-local dependencies — the handler never decides Task-state,
@@ -72,6 +72,9 @@ from openorc.services.task_authorized_implementation_retry import (
 from openorc.services.task_authorized_merge_retry import (
     execute_authorized_merge_retry,
 )
+from openorc.services.task_authorized_pr_authorization_retry import (
+    execute_authorized_pr_authorization_retry,
+)
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
@@ -120,6 +123,7 @@ from openorc.workers.invocation import (
     TaskAuthorizedMergeRetryPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
+    TaskPrAuthorizationRetryPayload,
     TaskPrCompositionPayload,
     TaskPrReviewPayload,
     TaskScope,
@@ -685,6 +689,7 @@ def _compose_task_authorized_implementation(
         task_id=task_id,
         expected_state_token=execution.task.state_token,
         execution_id=execution.execution.id,
+        attempt_evidence=attempt_evidence,
     )
 
 
@@ -734,6 +739,7 @@ def _compose_task_authorized_implementation_retry(
         task_id=task_id,
         expected_state_token=execution.task.state_token,
         execution_id=execution.execution.id,
+        attempt_evidence=attempt_evidence,
     )
 
 
@@ -758,6 +764,35 @@ def _compose_task_authorized_merge_retry(
         dependencies.database_pool(),
         dependencies.github_client(),
         dependencies.user_token_resolver(),
+        profile_id=UUID(payload.profile_id),
+        workspace_id=UUID(payload.task.workspace_id),
+        task_id=UUID(payload.task.task_id),
+        expected_state_token=UUID(payload.expected_state_token),
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        attempt_evidence=attempt_evidence,
+    )
+
+
+def _compose_task_pr_authorization_retry(
+    payload: TaskPrAuthorizationRetryPayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> None:
+    """Execute the one F4-authorized presentation retry (F5f, issue #269).
+
+    The presentation-retry seam atomically consumes the exact durably
+    authorized F4 attempt and re-enters ONLY the guarded E7
+    ``open_pr_authorization`` presentation — never the implementation effect,
+    never a new Execution, never a second branch bind or gate. A failing
+    re-presentation's operational error propagates for the F5b coordinator's
+    typed Level 2 handoff with the consumed attempt as the PRIOR_AUTHORIZED
+    reporting source; its workflow-semantic refusals are Level 1 outcomes.
+    No wakeup scheduling exists here (F11 owns the due-time wakeups).
+    """
+    execute_authorized_pr_authorization_retry(
+        dependencies.database_pool(),
+        dependencies.github_client(),
         profile_id=UUID(payload.profile_id),
         workspace_id=UUID(payload.task.workspace_id),
         task_id=UUID(payload.task.task_id),
@@ -927,6 +962,7 @@ _TASK_WORKFLOW_COMPOSITIONS: Mapping[OperationKind, TaskWorkflowComposition] = {
         _compose_task_authorized_implementation_retry
     ),
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: _compose_task_authorized_merge_retry,
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: _compose_task_pr_authorization_retry,
     OperationKind.TASK_PR_COMPOSITION: _compose_task_pr_composition,
     OperationKind.TASK_PR_REVIEW: _compose_task_pr_review,
 }
@@ -970,6 +1006,7 @@ _TASK_KIND_EXPECTED_STATUS: Mapping[OperationKind, TaskStatus] = {
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION: TaskStatus.IMPLEMENTING,
     OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY: TaskStatus.IMPLEMENTING,
     OperationKind.TASK_AUTHORIZED_MERGE_RETRY: TaskStatus.WAITING_FOR_OWNER,
+    OperationKind.TASK_PR_AUTHORIZATION_RETRY: TaskStatus.IMPLEMENTING,
     OperationKind.TASK_PR_COMPOSITION: TaskStatus.WAITING_FOR_OWNER,
     OperationKind.TASK_PR_REVIEW: TaskStatus.REVIEWING,
 }
