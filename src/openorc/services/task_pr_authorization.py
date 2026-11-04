@@ -107,7 +107,6 @@ from openorc.domain.reviews import (
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import github_issues as issue_records
@@ -129,6 +128,7 @@ from openorc.services.github_reconciliation import reconcile_repository_issue
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
+from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -441,12 +441,20 @@ def _block_source_requirements_drift(
     account-operational barrier FIRST (before any subject-row lock: the
     admission check does not remain authoritative across the intervening
     GitHub calls) and the durable drift evidence against the freshly
-    written projection under the Task row lock, then creates the
-    ``github_source_changed`` TaskBlock, moves the Task ``implementing →
-    blocked`` with a rotated token, and records the ``task_blocked`` audit —
-    commit or roll back together. The distinct blocked path creates no PR
-    gate; recovery from the blocked state belongs to later layers, not this
-    leaf.
+    written projection under the Task row lock, then the F3 exceptional
+    blocking foundation (#258) installs — atomically — the
+    ``github_source_changed`` TaskBlock with its exact GitHub issue
+    identity and expected/observed fingerprint evidence, its pending
+    ``GITHUB_ISSUE_CHANGE`` OwnerGate bound to it as the only subject, the
+    ``implementing → blocked`` transition with one rotated token, and the
+    ``task_blocked`` / ``owner_gate_created`` audits under the truthful
+    OPENORC actor — commit or roll back together. The pre-gate
+    implementing Task carries no current OwnerGate, so the NULL-safe
+    pointer expectation is the Task's locked (absent) pointer. A moved-on
+    Task applies nothing and is a typed stale operation. The distinct
+    blocked path creates no PR presentation and no canonical pull request
+    record; recovery from the blocked state belongs to later layers, not
+    this leaf.
     """
     with composed_transaction(pool) as transaction_pool:
         require_account_operational(transaction_pool, profile_id=profile_id)
@@ -475,35 +483,27 @@ def _block_source_requirements_drift(
                 "the durable source requirements no longer differ from the task's "
                 "baseline; the drift block is stale"
             )
-        block = block_records.create_task_block(
+        # The F3 exceptional blocking foundation (#258): one atomic block,
+        # gate, transition, token rotation, and audit pair. The installer's
+        # guarded currentness re-proof is the durable backstop; a raced or
+        # stale caller commits nothing at all.
+        installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
-            context={
+            expected_state_token=expected_state_token,
+            expected_status=task.status,
+            expected_current_owner_gate_id=task.current_owner_gate_id,
+            gate_type=OwnerGateType.GITHUB_ISSUE_CHANGE,
+            block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
+            block_context={
                 "github_issue_id": task.github_issue_id,
                 "expected_fingerprint": task.source_requirements_fingerprint,
                 "observed_fingerprint": projection.requirements_fingerprint,
             },
-        )
-        blocked = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=task.state_token,
-            status=TaskStatus.BLOCKED,
-        )
-        if blocked is None:
-            raise StaleOperationError(
-                "the task could not move to blocked; the drift block is stale"
-            )
-        event_coordination.record_task_blocked_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_block_id=block.id,
             actor=_OPENORC_ACTOR,
         )
-        return blocked
+        return installation.task
 
 
 # --- the authoritative GitHub source/branch verification phase ----------------------

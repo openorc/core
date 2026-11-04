@@ -251,6 +251,8 @@ _STATUS_UPDATE = _sql_has("update openorc.tasks set status", "queued_at = case")
 _ARCHIVE_UPDATE = _sql_has("update openorc.tasks set status", "archived_at = now()")
 _LOOPS_READ = _sql_has("from openorc.review_loops", "status = %s")
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
+_GATES_INSERT = _sql_has("insert into openorc.owner_gates")
+_TASK_GATE_WRITE = _sql_has("update openorc.tasks set current_owner_gate_id")
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
 
 
@@ -265,6 +267,7 @@ def _task_row(
     canonical_branch: Any = _BRANCH,
     archived_at: Any = None,
     terminal_cause: Any = None,
+    gate_id: Any = None,
 ) -> tuple[Any, ...]:
     return (
         _TASK_ID,
@@ -277,7 +280,7 @@ def _task_row(
         canonical_branch,
         state_token,
         None,
-        None,
+        gate_id,
         "a" * 64,
         None,
         _OBSERVED,
@@ -415,6 +418,24 @@ def _block_row(*, reason: str = "stale_operation") -> tuple[Any, ...]:
         None,
         _OBSERVED,
     )
+
+
+_STALE_GATE_ID = uuid.uuid4()
+
+
+def _stale_publication_gate_row() -> tuple[Any, ...]:
+    """The pending ``GITHUB_STATE_MISMATCH`` gate a stale publication installs."""
+    row = list(
+        _gate_row(
+            gate_id=_STALE_GATE_ID,
+            gate_type="github_state_mismatch",
+            status="pending",
+            plan_revision_id=None,
+            subject_head_sha=None,
+        )
+    )
+    row[8] = uuid.uuid4()  # the gate's fresh TaskBlock subject binding
+    return tuple(row)
 
 
 def _event_row() -> tuple[Any, ...]:
@@ -801,8 +822,14 @@ def _script_continuation(
     elif finalize == "block":
         conn.on(_TASK_READ_LOCKED, _task_row())
         conn.on(_TASK_READ, _task_row())
+        conn.on(_TASK_READ_LOCKED, _task_row())  # the installer's locked re-read
+        conn.on(_TASK_READ, _task_row())  # the installer's currentness re-proof
         conn.on(_BLOCK_INSERT, _block_row())
-        conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_ROTATED_TOKEN))
+        conn.on(_GATES_INSERT, _stale_publication_gate_row())
+        conn.on(
+            _TASK_GATE_WRITE,
+            _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+        )
     elif finalize == "cancel":
         # The trusted E10c cancellation composition (issue #229) replaces
         # the recoverable block: the workspace-derived account barrier and
@@ -982,8 +1009,14 @@ def test_workspace_guidance_is_composed_into_the_interaction(
     conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())  # the installer's locked re-read
+    conn.on(_TASK_READ, _task_row())  # the installer's currentness re-proof
     conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_ROTATED_TOKEN))
+    conn.on(_GATES_INSERT, _stale_publication_gate_row())
+    conn.on(
+        _TASK_GATE_WRITE,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
 
     with pytest.raises(StaleOperationError):
         _compose_call(
@@ -1339,8 +1372,23 @@ def test_an_ineligible_reconciled_record_blocks_recoverably(
     assert publication.commands == []
     assert adapter.realized_controls() == ()
     assert _count(conn, _BLOCK_INSERT) == 1
-    assert _count(conn, _STATUS_UPDATE) == 1
-    assert _event_types(conn) == ["task_blocked"]
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The base-ref mismatch block preserves the exact authorized head, the
+    # authorized publication base, the originating gate identity, and the
+    # reconciled PR evidence (issue #280).
+    (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    assert block_params is not None
+    assert block_params[2] == expected_reason
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["authorized_head_sha"] == _HEAD_SHA
+    assert block_context["authorized_base_ref"] == "main"
+    assert block_context["owner_gate_id"] == str(_PR_GATE_ID)
+    assert block_context["observed_base_ref"] == "develop"
+    assert block_context["observed_head_sha"] == _HEAD_SHA
+    assert block_context["github_pr_number"] == str(_PR_NUMBER)
+    uuid.UUID(str(block_context["pull_request_id"]))
 
 
 @pytest.mark.parametrize(
@@ -1438,19 +1486,50 @@ def test_preflight_stale_blocks_the_task_atomically_and_creates_no_pr(
             TaskPullRequestPublicationOutcome.PREFLIGHT_STALE, pull_request=None
         ),
     )
-    # The recoverable block composition after the primitive's classification.
+    # The recoverable block composition after the primitive's classification:
+    # the F3 installer's guarded composition in call order.
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())  # the installer's locked re-read
+    conn.on(_TASK_READ, _task_row())  # the installer's currentness re-proof
     conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_ROTATED_TOKEN))
+    conn.on(_GATES_INSERT, _stale_publication_gate_row())
+    conn.on(
+        _TASK_GATE_WRITE,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
 
     with pytest.raises(StaleOperationError):
         _compose_call(pool, github, _FakeResolver(), _runtime_factory(adapter))
 
     assert len(publication.commands) == 1
     assert _count(conn, _BLOCK_INSERT) == 1
-    assert _count(conn, _STATUS_UPDATE) == 1
-    assert _event_types(conn) == ["task_blocked"]
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    (write_params,) = [params for sql, params in conn.executed if _TASK_GATE_WRITE(sql, None)]
+    assert write_params is not None
+    # The guarded composition: the new gate pointer, the caller's expected
+    # token, the locked waiting_for_owner status, and the NULL-safe absent
+    # pointer (the publication gate is already approved).
+    assert write_params[0] == _STALE_GATE_ID
+    assert write_params[2] == _STATE_TOKEN
+    assert write_params[3] == "waiting_for_owner"
+    assert write_params[4] is None
+    # The PREFLIGHT_STALE block preserves the exact authorized head and the
+    # originating gate identity; no canonical PR record exists to cite.
+    (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    assert block_params is not None
+    assert block_params[2] == "stale_operation"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context == {
+        "authorized_head_sha": _HEAD_SHA,
+        "owner_gate_id": str(_PR_GATE_ID),
+    }
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None
+    assert gate_params[2] == "github_state_mismatch"
+    assert gate_params[3] == "pending"
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 
 def test_post_create_stale_preserves_the_record_and_blocks_or_refuses(
@@ -1472,8 +1551,14 @@ def test_post_create_stale_preserves_the_record_and_blocks_or_refuses(
     )
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())  # the installer's locked re-read
+    conn.on(_TASK_READ, _task_row())  # the installer's currentness re-proof
     conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_ROTATED_TOKEN))
+    conn.on(_GATES_INSERT, _stale_publication_gate_row())
+    conn.on(
+        _TASK_GATE_WRITE,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
     with pytest.raises(StaleOperationError):
         _compose_call(
             pool,
@@ -1484,7 +1569,22 @@ def test_post_create_stale_preserves_the_record_and_blocks_or_refuses(
             ),
         )
     assert _count(conn, _PR_UPDATE) == 0
-    assert _event_types(conn) == ["task_blocked"]
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The post-create block preserves the exact authorized head, the
+    # originating gate identity, the persisted canonical PR identity, and
+    # the created record's observed head (issue #280).
+    (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    assert block_params is not None
+    assert block_params[2] == "stale_operation"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["authorized_head_sha"] == _HEAD_SHA
+    assert block_context["owner_gate_id"] == str(_PR_GATE_ID)
+    assert block_context["observed_head_sha"] == _RACED_SHA
+    assert block_context["github_pr_number"] == str(_PR_NUMBER)
+    uuid.UUID(str(block_context["pull_request_id"]))
 
     # POST_CREATE_AUTHORITY_STALE with a moved-on Task: zero mutation.
     conn = ScriptedConnection()
@@ -1735,5 +1835,25 @@ def test_continuation_reconciliation_observing_a_changed_head_blocks_recoverably
     # the drift block never recreates or replaces the canonical PR.
     assert _count(conn, _PR_UPDATE) == 1
     assert _count(conn, _BLOCK_INSERT) == 1
-    assert _count(conn, _STATUS_UPDATE) == 1
-    assert _event_types(conn) == ["task_blocked"]
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The finalize head-SHA-drift block preserves the exact authorized head,
+    # the originating gate identity, the canonical PR identity, and the
+    # observed drifted head (issue #280).
+    (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    assert block_params is not None
+    assert block_params[2] == "stale_operation"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert set(block_context) == {
+        "pull_request_id",
+        "github_pr_number",
+        "authorized_head_sha",
+        "owner_gate_id",
+        "observed_head_sha",
+    }
+    assert block_context["github_pr_number"] == str(_PR_NUMBER)
+    assert block_context["authorized_head_sha"] == _HEAD_SHA
+    assert block_context["owner_gate_id"] == str(_PR_GATE_ID)
+    assert block_context["observed_head_sha"] == _RACED_SHA
+    uuid.UUID(str(block_context["pull_request_id"]))

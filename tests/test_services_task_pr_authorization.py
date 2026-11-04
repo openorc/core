@@ -509,6 +509,24 @@ def _block_row() -> tuple[Any, ...]:
     )
 
 
+_DRIFT_GATE_ID = uuid.uuid4()
+
+
+def _drift_exceptional_gate_row() -> tuple[Any, ...]:
+    """The pending ``GITHUB_ISSUE_CHANGE`` gate the drift block installs."""
+    row = list(
+        _gate_row(
+            gate_id=_DRIFT_GATE_ID,
+            gate_type="github_issue_change",
+            status="pending",
+            plan_revision_id=None,
+            subject_head_sha=None,
+        )
+    )
+    row[8] = uuid.uuid4()  # the gate's fresh TaskBlock subject binding
+    return tuple(row)
+
+
 def _repository_observation() -> GitHubRepositoryObservation:
     return GitHubRepositoryObservation(
         github_repository_id=_GITHUB_REPOSITORY_ID,
@@ -858,7 +876,14 @@ def _script_drift_block(
     account_barrier_outcomes: list[tuple[Any, ...]] | None = None,
     fail_status: bool = False,
 ) -> None:
-    """The atomic drift-block composition in call order (after the B3 update)."""
+    """The atomic drift-block composition in call order (after the B3 update).
+
+    The producer re-proves its currentness and drift evidence, then the F3
+    exceptional blocking foundation performs its own guarded composition in
+    the same transaction (nested savepoint): a second locked Task re-read
+    and currentness re-proof, the TaskBlock, the pending exceptional gate,
+    the guarded ``blocked`` transition, and the two audit events.
+    """
     _script_repeating_reads(conn, account_barrier_outcomes=account_barrier_outcomes)
     drifting_task = _task_row()
     _script_authority_reads(conn, task_row=drifting_task)
@@ -871,15 +896,18 @@ def _script_drift_block(
     conn.on(_TASK_READ, drifting_task)
     conn.on(_PR_READ, None)
     conn.on(_ISSUE_FIND, _issue_row(fingerprint=_DRIFTED_FINGERPRINT))
+    conn.on(_TASK_READ_LOCKED, drifting_task)  # the installer's locked re-read
+    conn.on(_TASK_READ, drifting_task)  # the installer's currentness re-proof
     conn.on(_BLOCK_INSERT, _block_row())
+    conn.on(_GATES_INSERT, _drift_exceptional_gate_row())
     if fail_status:
-        conn.on(_STATUS_UPDATE, RuntimeError("forced late block transition failure"))
+        conn.on(_TASK_GATE_WRITE, RuntimeError("forced late block transition failure"))
     else:
         conn.on(
-            _STATUS_UPDATE,
+            _TASK_GATE_WRITE,
             blocked_task_row
             if blocked_task_row is not None
-            else _task_row(status="blocked", state_token=_TOKEN_2),
+            else _task_row(status="blocked", state_token=_TOKEN_2, gate_id=_DRIFT_GATE_ID),
         )
 
 
@@ -1329,7 +1357,7 @@ def test_a_stable_identity_mismatch_refuses_without_drift() -> None:
     assert excinfo
 
 
-def test_confirmed_drift_blocks_atomically_and_creates_no_gate() -> None:
+def test_confirmed_drift_blocks_atomically_with_the_exceptional_issue_change_gate() -> None:
     conn = ScriptedConnection()
     _script_drift_block(conn)
     pool = _pool(conn)
@@ -1339,8 +1367,9 @@ def test_confirmed_drift_blocks_atomically_and_creates_no_gate() -> None:
     )
     with pytest.raises(ConflictError) as excinfo:
         _open_call(pool, github)
-    # The atomic drift-block composition: one TaskBlock, one BLOCKED
-    # transition, one audit event — and no PR gate, no branch bind.
+    # The atomic F7a drift-block composition: one TaskBlock, its one pending
+    # exceptional GITHUB_ISSUE_CHANGE gate, the guarded BLOCKED transition,
+    # and the two audits — and no PR presentation, no branch bind.
     assert _count(conn, _BLOCK_INSERT) == 1
     (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
     assert block_params is not None
@@ -1352,16 +1381,28 @@ def test_confirmed_drift_blocks_atomically_and_creates_no_gate() -> None:
         "expected_fingerprint": _FINGERPRINT,
         "observed_fingerprint": _DRIFTED_FINGERPRINT,
     }
-    assert _count(conn, _STATUS_UPDATE) == 1
-    (status_params,) = [params for sql, params in conn.executed if _STATUS_UPDATE(sql, None)]
-    assert status_params is not None
-    assert status_params[0] == "blocked"
-    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _GATES_INSERT) == 1
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None
+    assert gate_params[2] == "github_issue_change"
+    assert gate_params[3] == "pending"
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    (write_params,) = [params for sql, params in conn.executed if _TASK_GATE_WRITE(sql, None)]
+    assert write_params is not None
+    # The guarded composition: the new gate pointer, the caller's expected
+    # token, the locked implementing status, and the NULL-safe absent pointer.
+    assert write_params[0] == _DRIFT_GATE_ID
+    assert write_params[2] == _STATE_TOKEN
+    assert write_params[3] == "implementing"
+    assert write_params[4] is None
     assert _count(conn, _BRANCH_BIND) == 0
-    assert _event_types(conn) == ["task_blocked"]
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
     (block_event,) = _event_params_of_type(conn, "task_blocked")
     assert block_event[3] == "openorc" and block_event[4] is None
     assert block_event[5] == "task_block" and block_event[6]
+    (gate_event,) = _event_params_of_type(conn, "owner_gate_created")
+    assert gate_event[3] == "openorc" and gate_event[4] is None
+    assert gate_event[5] == "owner_gate" and gate_event[6]
     assert excinfo
 
 
@@ -1375,11 +1416,13 @@ def test_a_forced_late_drift_failure_aborts_the_block_composition() -> None:
     )
     with pytest.raises(RuntimeError):
         _open_call(pool, github)
-    # The failed transition aborts the composition before the audit event:
-    # nothing after the failure point was written (the real-Postgres
-    # integration suite proves the full rollback).
+    # The failed guarded transition aborts the composition before the audit
+    # events: nothing after the failure point was written. The block and the
+    # gate inserts were attempted before it (the real-Postgres integration
+    # suite proves the full rollback).
     assert _event_types(conn) == []
-    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
     assert _count(conn, _BRANCH_BIND) == 0
 
 
@@ -1443,7 +1486,7 @@ def test_account_deletion_active_after_admission_refuses_the_drift_block() -> No
         _open_call(pool, github)
     assert type(excinfo.value) is ConflictError
     assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
     assert _event_types(conn) == []
     assert _count(conn, _GATES_INSERT) == 0
     assert _count(conn, _BRANCH_BIND) == 0
@@ -1835,7 +1878,11 @@ def test_the_drift_block_path_stays_a_workflow_semantic_outcome(
         identity.family
         is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
     )
-    # The block path itself keeps its established semantics.
+    # The block path itself keeps its established semantics: the atomic
+    # block with its one exceptional GITHUB_ISSUE_CHANGE gate.
     assert _count(conn, _BLOCK_INSERT) == 1
-    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _GATES_INSERT) == 1
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None
+    assert gate_params[2] == "github_issue_change"
     assert _count(conn, _BRANCH_BIND) == 0
