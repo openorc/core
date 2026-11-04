@@ -65,6 +65,11 @@ QUEUE_MODE_VALKEY_URL = "redis://127.0.0.1:6379/2"
 BRANCH_DB_URL = (
     "postgresql://postgres.bbbbbbbb:branchsecret@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
 )
+# The --testdb test connection uses the same pooler host's session port
+# (issue #276).
+BRANCH_SESSION_DB_URL = (
+    "postgresql://postgres.bbbbbbbb:branchsecret@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+)
 BRANCH_DIRECT_DB_URL = "postgresql://postgres:branchsecret@db.bbbbbbbb.supabase.co:5432/postgres"
 BRANCH_API_URL = "https://bbbbbbbb.supabase.co"
 PUBLISHABLE_KEY = "sb_publishable_test-key"
@@ -1737,7 +1742,8 @@ def test_testdb_provisions_branch_runs_command_and_deletes_branch(tmp_path: Path
     assert child.argv == (".venv/bin/python", "-m", "pytest", "-m", "integration")
     assert child.inherit_stdin is True
     assert child.env is not None
-    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+    # The test connection uses the branch's session-pooler port (issue #276).
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_SESSION_DB_URL
     # Only the testdb contract variable is injected: the branch URL is never
     # mapped onto application DATABASE_URL or the stack service environment.
     assert "DATABASE_URL" not in child.env
@@ -1777,7 +1783,7 @@ def test_testdb_bare_form_runs_canonical_suite(tmp_path: Path) -> None:
     child = harness.runner.spawn_calls[0]
     assert child.argv == DEFAULT_TESTDB_COMMAND
     assert child.env is not None
-    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_SESSION_DB_URL
     assert len(harness.runner.delete_calls) == 1
 
 
@@ -1849,7 +1855,7 @@ def test_testdb_branch_url_overrides_existing_export(tmp_path: Path) -> None:
     child = harness.runner.spawn_calls[0]
     assert child.env is not None
     # The generated branch URL always wins for the child process.
-    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_DB_URL
+    assert child.env["OPENORC_TEST_DATABASE_URL"] == BRANCH_SESSION_DB_URL
 
 
 def test_testdb_logs_never_contain_credentials_or_full_database_url(tmp_path: Path) -> None:

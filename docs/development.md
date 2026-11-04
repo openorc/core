@@ -204,7 +204,7 @@ Supply a command after `--` to run something else against the same branch instea
 
 The built-in suite command targets the whole `tests/integration` directory and replaces the repository pytest marker defaults (`-o addopts=--strict-markers`) so the integration tests are actually selected while strict marker checking is preserved; ordinary runs keep excluding them and remain DB-free. Future integration modules are included by the directory automatically.
 
-The command receives `OPENORC_TEST_DATABASE_URL` (the branch database URL, injected into its environment only and never logged). Nothing else starts in this mode: no app, API, worker, queue backend, or ngrok. Surface-selection flags cannot be combined with `--testdb`; `--keep-supabase` keeps the branch after the run as the existing debug escape hatch. See `tests/README.md` for the integration-suite contract.
+The command receives `OPENORC_TEST_DATABASE_URL` (the branch database's session-pooler connection on port 5432 — the transaction pooler repeatedly severed the migration-heavy fixture's sessions — injected into its environment only and never logged). Nothing else starts in this mode: no app, API, worker, queue backend, or ngrok. Surface-selection flags cannot be combined with `--testdb`; `--keep-supabase` keeps the branch after the run as the existing debug escape hatch. See `tests/README.md` for the integration-suite contract.
 
 ## Agent context
 
