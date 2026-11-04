@@ -89,6 +89,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 - Executions are historical attempts anchored to the Producer session. Do not add a single-active-execution or current-execution persistence assumption.
 - RuntimeRequest correlation identity is full-history within the Producer session; resolution/expiry/cancellation is one-shot.
 - TaskBlocks retain reason/context after resolution; block resolution does not encode a universal next state.
+- Since the F7c cutover (issue #282), the universal BLOCKED invariant is durable: `task_blocks_task_unresolved_uniq` forbids two unresolved TaskBlocks per Task (multiples only — zero unresolved blocks on a non-BLOCKED Task is legitimate), and deferred constraint triggers validate at commit that every current BLOCKED Task carries exactly one unresolved TaskBlock plus one exact current pending exceptional gate bound to it. The shared assertion (`assert_blocked_task_gate_invariant`) runs through a no-argument trigger wrapper over Task, gate, and block mutations; archived Tasks and non-blocked Tasks assert nothing beyond the backstop, so historical pending exceptional gates and superseded ordinary gates remain legal.
 - TaskPullRequest is unique per Task for the Task lifetime. Observed head/base/state/merge data updates in place; exact review identity lives on ReviewIteration, not on the mutable current head.
 - Use only query-driven indexes and durable uniqueness constraints that serve demonstrated access/invariant needs.
 

@@ -1059,6 +1059,11 @@ def test_task_block_reasons_use_the_settled_vocabulary(conn: Connection[Any]) ->
         context={},
     )
     assert empty_context.context == {}
+    # The universal unresolved-block backstop (issue #282) permits at most
+    # one unresolved TaskBlock per Task: the first block is resolved exactly
+    # once so this vocabulary test's second block stays legal history.
+    resolved = block_repositories.resolve_task_block(pool, task_block_id=block.id)
+    assert resolved is not None
 
 
 def test_resolved_blocks_remain_historical_with_context(conn: Connection[Any]) -> None:

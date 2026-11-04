@@ -37,9 +37,19 @@ Task under its currentness guard:
   applicable operational and explicit-stop reasons, never
   ``github_source_changed`` and never the terminal ``pr_closed_unmerged``.
   No generic reason-to-recovery policy is decided here.
-- Existing direct ``BLOCKED`` producers are untouched: this service never
-  rewrites their flows, imposes the future universal invariant (#250), or
-  fabricates historical gates for already-blocked Tasks.
+- Since the F7c cutover (issue #282) the universal invariant is durably
+  enforced in PostgreSQL: a committed current BLOCKED Task carries exactly
+  one unresolved TaskBlock and one exact current pending exceptional
+  OwnerGate bound to it, validated at commit by DEFERRABLE INITIALLY
+  DEFERRED constraint triggers over Task, gate, and block mutations, with
+  at most one unresolved TaskBlock per Task as the universal backstop.
+  This composition's multitable sequence (block → gate → guarded Task
+  mutation → audits) validates as one committed whole; a losing caller
+  still commits nothing at all. The converse invariant is deliberately not
+  imposed: a pending exceptional gate retained as history after archival,
+  and a pending superseded ordinary gate, remain legal. Per the
+  Owner-approved cutover scope (issue #282), no historical rows exist to
+  convert — the enforced invariant governs every row from the start.
 
 Expected failures use the typed application-error vocabulary: malformed
 commands are ``InvalidCommandError`` (including ineligible source statuses
