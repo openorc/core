@@ -36,11 +36,17 @@ a GitHub call):
    evidence names the consumed attempt (its one-shot ``consumed_at`` stamp
    is the durable binding; the presentation family has no resulting
    Execution), addressed to the episode's original Execution identity with
-   ``PRIOR_AUTHORIZED``. Its workflow-semantic refusals (a stale subject, a
-   confirmed ``github_source_changed`` drift, a closed source issue) are
-   Level 1 outcomes, never triaged: the consumed authorization remains
-   forward-only consumed history, the workflow stays at its committed
-   durable state, and nothing is replayed or re-consumed.
+   ``PRIOR_AUTHORIZED``. E7's own Phase-A admission recording is directed
+   at a throwaway collector so it can never overwrite that consumed-attempt
+   handoff identity: the latest recorded identity of an authorized
+   re-presentation stays the consumed attempt for the whole invocation, and
+   F4 therefore advances the existing episode's attempt accounting (or
+   escalates when the budget is exhausted) instead of classifying the
+   failure as the already-disposed original report. Its workflow-semantic
+   refusals (a stale subject, a confirmed ``github_source_changed`` drift,
+   a closed source issue) are Level 1 outcomes, never triaged: the consumed
+   authorization remains forward-only consumed history, the workflow stays
+   at its committed durable state, and nothing is replayed or re-consumed.
 
 This seam never schedules wakeups (F11 #257 owns due-time submission), never
 reruns the implementation, never mutates the successful E6 Execution, and
@@ -252,12 +258,18 @@ def execute_authorized_pr_authorization_retry(
                 "the presentation retry authorization could not be consumed; "
                 "a competing execution consumed it first"
             )
-        # The consumed attempt identity is the invocation's own F5b handoff
-        # fact (the presentation family has no resulting Execution): a later
-        # operational failure of this re-presentation is reported to the
-        # episode with PRIOR_AUTHORIZED provenance through the consumed
-        # attempt's own binding.
+        # The invocation's reporting identity stays the consumed attempt for
+        # the whole authorized re-presentation: recording the post-consumption
+        # currentness (the loader proved the exact payload token current; the
+        # consumption never rotates it) and the consumed-attempt identity is
+        # the invocation's own F5b handoff fact — a later operational failure
+        # of this re-presentation must report PRIOR_AUTHORIZED against the
+        # consumed attempt, never a fresh ORIGINAL claim over the episode's
+        # root Execution (which F4 would classify as the already-disposed
+        # original report and strand the consumed retry without a
+        # disposition).
         if attempt_evidence is not None:
+            attempt_evidence.record_task_token(admission.task.state_token)
             attempt_evidence.record_attempt(
                 family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
                 original_attempt_kind=OriginalAttemptKind.EXECUTION,
@@ -265,6 +277,12 @@ def execute_authorized_pr_authorization_retry(
                 effect_attempt_id=consumed.id,
                 phase=_PHASE_PRESENTATION,
             )
+        # The guarded presentation's own Phase-A admission recording is
+        # directed at a throwaway collector: E7's unconditional admission
+        # identity (the root Execution UUID, no effect row) must never
+        # overwrite the invocation's consumed-attempt handoff identity
+        # above. The real handoff facts are already complete.
+        presentation_evidence = InvocationAttemptEvidence()
         # --- Stage 3: the guarded E7-only re-presentation. ---
         return open_pr_authorization(
             pool,
@@ -274,5 +292,5 @@ def execute_authorized_pr_authorization_retry(
             task_id=task_id,
             expected_state_token=expected_state_token,
             execution_id=admission.episode.original_attempt_id,
-            attempt_evidence=attempt_evidence,
+            attempt_evidence=presentation_evidence,
         )

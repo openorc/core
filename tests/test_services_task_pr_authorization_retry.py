@@ -33,6 +33,9 @@ import pytest
 from openorc.adapters.github import GitHubTransportUncertainError
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
+    FailureEffectEvidence,
+    OperationalFailureCode,
+    OperationalFailureSourceKind,
     OriginalAttemptKind,
     PRAuthorizationPresentationOperation,
 )
@@ -46,6 +49,53 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_authorized_pr_authorization_retry import (
     execute_authorized_pr_authorization_retry,
+)
+from openorc.services.task_operational_failure_triage import triage_operational_failure
+from openorc.services.task_workflow_operation_coordinator import coordinate_task_workflow_operation
+from tests.test_services_task_operational_failure_triage import (
+    _ATTEMPT_BY_SOURCE,
+    _ATTEMPT_INSERT,
+    _ATTEMPTS_LIST,
+    _EPISODE_BY_ORIGINAL,
+    _EPISODE_ESCALATE,
+    _EPISODE_INSERT,
+    _EXECUTION_LOCKED,
+    _TASK_BLOCK_UPDATE,
+)
+from tests.test_services_task_pr_authorization import (
+    _BLOCK_INSERT,
+    _GATES_INSERT,
+    _GATES_LIST,
+    _TASK_READ,
+    _TASK_READ_LOCKED,
+    FakePool,
+    ScriptedConnection,
+    _count,
+    _execution_row,
+    _fake_github,
+    _gate_row,
+    _pool,
+    _script_authority_reads,
+    _script_b3_reconciliation,
+    _script_repeating_reads,
+    _sql_has,
+    _sql_lacks,
+    _task_row,
+)
+from tests.test_services_task_pr_authorization import (
+    _EXECUTION_1_ID as _ROOT_EXECUTION_ID,
+)
+from tests.test_services_task_pr_authorization import (
+    _OWNER_PROFILE_ID as _FLOW_PROFILE_ID,
+)
+from tests.test_services_task_pr_authorization import (
+    _STATE_TOKEN as _FLOW_STATE_TOKEN,
+)
+from tests.test_services_task_pr_authorization import (
+    _TASK_ID as _FLOW_TASK_ID,
+)
+from tests.test_services_task_pr_authorization import (
+    _WORKSPACE_ID as _FLOW_WORKSPACE_ID,
 )
 
 _WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000c1")
@@ -208,6 +258,10 @@ def test_the_authorized_due_retry_consumes_and_represent_exactly_once(
     # The one-shot consumption happened first, on the exact attempt.
     assert len(harness.consume.calls) == 1
     assert harness.consume.calls[0]["kwargs"]["attempt_id"] == _ATTEMPT_ID
+    # The guarded presentation's admission recording is directed at a
+    # throwaway collector: E7's unconditional admission identity must never
+    # overwrite the invocation's consumed-attempt handoff identity.
+    assert harness.present.calls[0]["kwargs"]["attempt_evidence"] is not harness.evidence
     # The invocation's handoff identity names the consumed attempt with the
     # presentation family's no-resulting-Execution binding shape.
     identity = harness.evidence.latest_identity
@@ -315,3 +369,349 @@ def test_a_failed_guarded_presentation_propagates_with_the_consumption_exactly_o
     identity = harness.evidence.latest_identity
     assert identity is not None
     assert identity.effect_attempt_id == _ATTEMPT_ID
+
+
+# --- cross-boundary regression: the real retry-seam-to-E7 evidence sequence ---
+
+
+_FLOW_EPISODE_ID = uuid4()
+_FAILURE_ATTEMPT_ID = uuid4()
+_SECOND_ATTEMPT_ID = uuid4()
+_THIRD_ATTEMPT_ID = uuid4()
+_F4_BLOCK_ID = uuid4()
+_F4_GATE_ID = uuid4()
+_F4_ROTATED_TOKEN = uuid4()
+
+# The retry-seam's own reads and the F5b/F4 reads share SQL shapes with
+# different scripted outcomes in call order.
+_FAILURE_ATTEMPT_READ = _sql_has("from openorc.operational_failure_attempts where id")
+_FAILURE_EPISODE_READ = _sql_has("from openorc.operational_failure_episodes where id")
+_FAILURE_ATTEMPT_CONSUME = _sql_has("update openorc.operational_failure_attempts", "consumed_at")
+_EXECUTION_PLAIN = _sql_lacks(_sql_has("from openorc.executions where id"), "for update")
+
+
+def _failure_episode_row(*, escalated: Any = None) -> tuple[Any, ...]:
+    return (
+        _FLOW_EPISODE_ID,
+        _FLOW_WORKSPACE_ID,
+        _FLOW_TASK_ID,
+        "exact_head_pr_authorization_presentation",
+        "execution",
+        _ROOT_EXECUTION_ID,
+        {"execution_id": str(_ROOT_EXECUTION_ID)},
+        escalated,
+        _OBSERVED,
+    )
+
+
+def _failure_attempt_row(
+    *,
+    attempt_id: Any = _FAILURE_ATTEMPT_ID,
+    ordinal: int = 1,
+    source_kind: str = "original",
+    source_attempt_id: Any = _ROOT_EXECUTION_ID,
+    consumed_at: Any = None,
+    error_code: str = "external_transport_unavailable",
+) -> tuple[Any, ...]:
+    return (
+        attempt_id,
+        _FLOW_WORKSPACE_ID,
+        _FLOW_TASK_ID,
+        _FLOW_EPISODE_ID,
+        ordinal,
+        source_kind,
+        source_attempt_id,
+        error_code,
+        _OBSERVED,
+        None,
+        consumed_at,
+        _OBSERVED,
+    )
+
+
+def _escalation_block_row() -> tuple[Any, ...]:
+    return (
+        _F4_BLOCK_ID,
+        _FLOW_WORKSPACE_ID,
+        _FLOW_TASK_ID,
+        "external_operation_uncertain",
+        {},
+        None,
+        _OBSERVED,
+    )
+
+
+def _escalation_gate_row() -> tuple[Any, ...]:
+    return (
+        _F4_GATE_ID,
+        _FLOW_WORKSPACE_ID,
+        _FLOW_TASK_ID,
+        "block_resolution",
+        "pending",
+        None,
+        None,
+        None,
+        _F4_BLOCK_ID,
+        None,
+        _OBSERVED,
+    )
+
+
+def _consumed_variant(row: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The same attempt row with its set-once consumption stamp applied."""
+    return _failure_attempt_row(
+        attempt_id=row[0],
+        ordinal=row[4],
+        source_kind=row[5],
+        source_attempt_id=row[6],
+        error_code=row[7],
+        consumed_at=_OBSERVED,
+    )
+
+
+def _script_authorized_retry_failure_flow(
+    conn: ScriptedConnection,
+    *,
+    loader_attempts_rows: list[tuple[Any, ...]],
+    disposed_attempts_rows: list[tuple[Any, ...]],
+    escalate: bool = False,
+) -> None:
+    """The whole authorized-retry failure flow in call order: the retry
+    seam's admission + one-shot consumption, the REAL E7 admission/authority
+    reads, the failing B3 read, the F5b resolution reads, and F4's locked
+    disposition flow."""
+    task_row = _task_row()
+    latest_unconsumed = loader_attempts_rows[-1]
+    # --- retry-seam admission + one-shot consumption. ---
+    _script_repeating_reads(conn)
+    conn.on(_TASK_READ, task_row)  # require_workspace_task
+    conn.on(_TASK_READ_LOCKED, task_row)  # require_current_task
+    conn.on(_TASK_READ, task_row)  # require_current_task
+    conn.on(_FAILURE_ATTEMPT_READ, latest_unconsumed)
+    conn.on(_FAILURE_EPISODE_READ, _failure_episode_row())
+    conn.on(_ATTEMPTS_LIST, loader_attempts_rows)
+    conn.on(_EXECUTION_PLAIN, _execution_row())
+    conn.on(_FAILURE_ATTEMPT_CONSUME, _consumed_variant(latest_unconsumed))
+    # --- the REAL E7 Phase-A admission + authority derivation. ---
+    _script_repeating_reads(conn)
+    _script_authority_reads(conn, task_row=task_row)
+    # --- the failing B3 reconciliation (the fake raises at the issue read). ---
+    _script_b3_reconciliation(conn)
+    # --- the F5b coordinator's resolution reads. ---
+    conn.on(_EXECUTION_PLAIN, _execution_row())
+    conn.on(_TASK_READ, task_row)
+    conn.on(_FAILURE_ATTEMPT_READ, _consumed_variant(latest_unconsumed))
+    conn.on(_FAILURE_EPISODE_READ, _failure_episode_row())
+    # --- F4's locked disposition flow. ---
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_EPISODE_BY_ORIGINAL, _failure_episode_row())
+    conn.on(_ATTEMPTS_LIST, disposed_attempts_rows)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_EXECUTION_LOCKED, _execution_row())
+    conn.on(_GATES_LIST, [_gate_row()])
+    if escalate:
+        conn.on(_TASK_READ_LOCKED, task_row)
+        conn.on(_TASK_READ, task_row)
+        conn.on(_BLOCK_INSERT, _escalation_block_row())
+        conn.on(_GATES_INSERT, _escalation_gate_row())
+        conn.on(
+            _TASK_BLOCK_UPDATE,
+            _task_row(status="blocked", state_token=_F4_ROTATED_TOKEN, gate_id=_F4_GATE_ID),
+        )
+        conn.on(_EPISODE_ESCALATE, _failure_episode_row(escalated=_F4_BLOCK_ID))
+    else:
+        conn.on(_EXECUTION_LOCKED, _execution_row())
+        conn.on(_TASK_READ_LOCKED, task_row)
+        conn.on(
+            _ATTEMPT_INSERT,
+            _failure_attempt_row(
+                attempt_id=_SECOND_ATTEMPT_ID,
+                ordinal=2,
+                source_kind="prior_authorized",
+                source_attempt_id=_FAILURE_ATTEMPT_ID,
+                consumed_at=_OBSERVED,
+            ),
+        )
+
+
+def _transport_read_error() -> ExternalOperationUncertainError:
+    error = ExternalOperationUncertainError("the outcome of the GitHub issue read is unknown")
+    error.__cause__ = GitHubTransportUncertainError("the transport failed transiently")
+    return error
+
+
+def _run_retry_through_the_coordinator(
+    pool: Any,
+    github: Any,
+    recorded_triage_calls: list[dict[str, Any]],
+    collectors: list[InvocationAttemptEvidence],
+    *,
+    retry_attempt_id: Any = _FAILURE_ATTEMPT_ID,
+) -> None:
+    def recording_triage(pool_arg: Any, **kwargs: Any) -> Any:
+        recorded_triage_calls.append(kwargs)
+        return triage_operational_failure(pool_arg, **kwargs)
+
+    def level_one(collector: InvocationAttemptEvidence) -> None:
+        collectors.append(collector)
+        execute_authorized_pr_authorization_retry(
+            pool,
+            github,
+            profile_id=_FLOW_PROFILE_ID,
+            workspace_id=_FLOW_WORKSPACE_ID,
+            task_id=_FLOW_TASK_ID,
+            expected_state_token=_FLOW_STATE_TOKEN,
+            retry_attempt_id=retry_attempt_id,
+            attempt_evidence=collector,
+            clock=lambda: _OBSERVED,
+        )
+
+    return coordinate_task_workflow_operation(
+        pool,
+        expected_status=TaskStatus.IMPLEMENTING,
+        workspace_id=_FLOW_WORKSPACE_ID,
+        task_id=_FLOW_TASK_ID,
+        profile_id=_FLOW_PROFILE_ID,
+        expected_state_token=_FLOW_STATE_TOKEN,
+        invoke_level_one=level_one,
+        triage=recording_triage,
+    )
+
+
+def test_the_authorized_retry_failure_reports_prior_authorized_and_advances_the_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cross-boundary regression (review finding, issue #269): the REAL
+    retry seam calls the REAL E7 presentation, which records its admission
+    identity into a throwaway collector — the invocation's handoff identity
+    stays the consumed attempt, so a failing B3/B7 read reports
+    PRIOR_AUTHORIZED provenance to F4 and the existing episode's attempt
+    accounting advances (ordinal 2 authorized), never a duplicate
+    already-disposed original report."""
+    conn = ScriptedConnection()
+    _script_authorized_retry_failure_flow(
+        conn,
+        loader_attempts_rows=[_failure_attempt_row()],
+        disposed_attempts_rows=[_failure_attempt_row(consumed_at=_OBSERVED)],
+    )
+    pool = _pool(conn)
+    github = _fake_github(cast(FakePool, pool), issue_error=_transport_read_error())
+    collectors: list[InvocationAttemptEvidence] = []
+    recorded: list[dict[str, Any]] = []
+
+    with pytest.raises(ExternalOperationUncertainError) as excinfo:
+        _run_retry_through_the_coordinator(pool, github, recorded, collectors)
+
+    assert excinfo.value.__cause__ is not None
+    # The consumed attempt is STILL the invocation's latest reporting
+    # identity after the real E7 admission — not overwritten by the root
+    # Execution identity.
+    assert len(collectors) == 1
+    identity = collectors[0].latest_identity
+    assert identity is not None
+    assert (
+        identity.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert identity.original_attempt_id == _FAILURE_ATTEMPT_ID
+    assert identity.effect_attempt_id == _FAILURE_ATTEMPT_ID
+    assert collectors[0].current_task_token == _FLOW_STATE_TOKEN
+    # F4 received the PRIOR_AUTHORIZED report against the episode's original
+    # Execution identity with the retry-eligible transport code and the
+    # structurally proven pre-effect evidence.
+    assert len(recorded) == 1
+    kwargs = recorded[0]
+    assert kwargs["expected_state_token"] == _FLOW_STATE_TOKEN
+    assert kwargs["expected_status"] is TaskStatus.IMPLEMENTING
+    operation = kwargs["operation"]
+    assert (
+        operation.family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert operation.original_attempt_id == _ROOT_EXECUTION_ID
+    report = kwargs["report"]
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _FAILURE_ATTEMPT_ID
+    assert report.effect_attempt_id == _FAILURE_ATTEMPT_ID
+    assert report.error_code is OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+    # F4 advanced the EXISTING episode's attempt accounting: one ordinal-2
+    # prior-authorized successor, and no second episode was minted.
+    assert _count(conn, _ATTEMPT_INSERT) == 1
+    (attempt_params,) = [params for sql, params in conn.executed if _ATTEMPT_INSERT(sql, None)]
+    assert attempt_params is not None
+    assert attempt_params[3] == 2
+    assert attempt_params[4] == "prior_authorized"
+    assert attempt_params[5] == _FAILURE_ATTEMPT_ID
+    assert _count(conn, _EPISODE_INSERT) == 0
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_the_exhausted_presentation_budget_escalates_through_the_real_seams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same cross-boundary sequence with the three-attempt budget
+    exhausted: the consumed third attempt's transport failure still reports
+    PRIOR_AUTHORIZED provenance, F4 authorizes nothing, and the episode
+    escalates through the F3 BLOCK_RESOLUTION installation."""
+    first = _failure_attempt_row(
+        attempt_id=uuid4(),
+        ordinal=1,
+        source_kind="original",
+        source_attempt_id=_ROOT_EXECUTION_ID,
+        consumed_at=_OBSERVED,
+    )
+    second = _failure_attempt_row(
+        attempt_id=_SECOND_ATTEMPT_ID,
+        ordinal=2,
+        source_kind="prior_authorized",
+        source_attempt_id=_FAILURE_ATTEMPT_ID,
+        consumed_at=_OBSERVED,
+    )
+    third_unconsumed = _failure_attempt_row(
+        attempt_id=_THIRD_ATTEMPT_ID,
+        ordinal=3,
+        source_kind="prior_authorized",
+        source_attempt_id=_SECOND_ATTEMPT_ID,
+    )
+    third_consumed = _failure_attempt_row(
+        attempt_id=_THIRD_ATTEMPT_ID,
+        ordinal=3,
+        source_kind="prior_authorized",
+        source_attempt_id=_SECOND_ATTEMPT_ID,
+        consumed_at=_OBSERVED,
+    )
+    conn = ScriptedConnection()
+    _script_authorized_retry_failure_flow(
+        conn,
+        loader_attempts_rows=[first, second, third_unconsumed],
+        disposed_attempts_rows=[first, second, third_consumed],
+        escalate=True,
+    )
+    pool = _pool(conn)
+    github = _fake_github(cast(FakePool, pool), issue_error=_transport_read_error())
+    collectors: list[InvocationAttemptEvidence] = []
+    recorded: list[dict[str, Any]] = []
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _run_retry_through_the_coordinator(
+            pool, github, recorded, collectors, retry_attempt_id=_THIRD_ATTEMPT_ID
+        )
+
+    # The consumed third attempt is the reporting identity throughout.
+    assert len(collectors) == 1
+    identity = collectors[0].latest_identity
+    assert identity is not None
+    assert identity.original_attempt_id == _THIRD_ATTEMPT_ID
+    assert identity.effect_attempt_id == _THIRD_ATTEMPT_ID
+    assert len(recorded) == 1
+    report = recorded[0]["report"]
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _THIRD_ATTEMPT_ID
+    assert report.effect_attempt_id == _THIRD_ATTEMPT_ID
+    # F4 authorized nothing and escalated: the F3 block/gate/BLOCKED
+    # composition committed and the episode received its terminal stamp.
+    assert _count(conn, _ATTEMPT_INSERT) == 0
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _EPISODE_ESCALATE) == 1
