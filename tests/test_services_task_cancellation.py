@@ -50,13 +50,22 @@ from openorc.domain.intents import (
     TaskInterruptIntentStatus,
     TaskPullRequestCloseIntentStatus,
 )
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
+from openorc.domain.reviews import ReviewLoopPurpose
 from openorc.domain.runtime_requests import RuntimeRequestStatus
+from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskStatus, TaskTerminalCause
+from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
+from openorc.persistence import gates as gate_records
 from openorc.persistence import intents as intent_records
+from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import runtime_requests as runtime_request_records
+from openorc.persistence import send_claims as send_claim_records
+from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_cancellation, task_subject_guards
 from openorc.services.errors import (
@@ -69,6 +78,7 @@ from openorc.services.task_cancellation import (
     TaskCancellationOutcomeKind,
     TaskPrClosureOutcomeKind,
     cancel_task,
+    cancel_task_composition,
     cancel_task_for_confirmed_pr_closure,
 )
 from tests.test_services_task_pr_review_decision import (
@@ -102,8 +112,16 @@ from tests.test_services_task_pr_review_dispatch import (
 _OBSERVED = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
 _CANCELLED_TOKEN = uuid4()
 _GATE_ID = uuid4()
+_OTHER_GATE_ID = uuid4()
 _LOOP_ID = uuid4()
 _GITHUB_PR_ID = 555
+_REVISION_ID = uuid4()
+_LATER_REVISION_ID = uuid4()
+_ITERATION_ID = uuid4()
+_LATER_ITERATION_ID = uuid4()
+_BLOCK_ID = uuid4()
+_OTHER_BLOCK_ID = uuid4()
+_EPISODE_ID = uuid4()
 
 _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _GATE_UPDATE = _sql_has("update openorc.owner_gates")
@@ -122,6 +140,7 @@ def _task_values(
     queued: bool = False,
     fingerprint: Any = "a" * 64,
     cause: Any = None,
+    current_plan_revision: Any = None,
 ) -> tuple[Any, ...]:
     """One 17-column ``openorc.tasks`` row shaped like the durable model."""
     return (
@@ -134,7 +153,7 @@ def _task_values(
         _OBSERVED if archived else None,
         "openorc/task-42-implementation",
         state_token,
-        None,
+        current_plan_revision,
         current_gate_id,
         fingerprint,
         _OBSERVED if queued else None,
@@ -276,6 +295,14 @@ def _wire(
     executions: list[Any] | None = None,
     runtime_requests: list[Any] | None = None,
     loops: list[Any] | None = None,
+    send_claims: list[Any] | None = None,
+    bootstrap_evidence: Any = None,
+    loop_iterations: list[Any] | None = None,
+    review_iteration: Any = None,
+    episode: Any = None,
+    escalated_block: Any = None,
+    block: Any = None,
+    veto_gate: Any = None,
 ) -> None:
     if reconcile is not None:
         monkeypatch.setattr(task_cancellation, "reconcile_task_pull_request", reconcile)
@@ -306,6 +333,47 @@ def _wire(
         "list_task_review_loops",
         lambda pool, *, task_id, status: list(loops or []),
     )
+    monkeypatch.setattr(
+        send_claim_records,
+        "list_task_runtime_send_claims",
+        lambda pool, *, task_id: list(send_claims or []),
+    )
+    monkeypatch.setattr(
+        task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda pool, *, task_id: bootstrap_evidence,
+    )
+    monkeypatch.setattr(
+        review_records,
+        "get_review_iteration",
+        lambda pool, *, review_iteration_id: review_iteration,
+    )
+    monkeypatch.setattr(
+        review_records,
+        "list_review_loop_iterations",
+        lambda pool, *, review_loop_id: list(loop_iterations or []),
+    )
+    monkeypatch.setattr(
+        failure_records,
+        "get_operational_failure_episode_by_original_attempt",
+        lambda pool, *, original_attempt_kind, original_attempt_id: episode,
+    )
+    monkeypatch.setattr(
+        block_records,
+        "get_task_block",
+        lambda pool, *, task_block_id: escalated_block,
+    )
+    monkeypatch.setattr(
+        task_subject_guards,
+        "get_task_block",
+        lambda pool, *, task_block_id: block,
+    )
+    if veto_gate is not None:
+        # Only the veto's own current-gate read goes through the module
+        # attribute; the guard and the resolution keep their scripted reads.
+        monkeypatch.setattr(
+            gate_records, "get_owner_gate", lambda pool, *, owner_gate_id: veto_gate
+        )
 
     def _close(pool: Any, *, review_loop_id: Any) -> Any:
         for loop in loops or []:
@@ -885,6 +953,666 @@ def test_a_pending_runtime_request_vetoes_cancel(monkeypatch: pytest.MonkeyPatch
         _cancel_call(_pool(conn), _CloseGithub())
 
     assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+# --- F7-prep (issue #278): exceptional BLOCKED gates and the completed veto -------
+
+
+def _exceptional_blocked_gate_row(
+    *,
+    gate_id: Any = _GATE_ID,
+    gate_type: str = "block_resolution",
+    status: str = "pending",
+    task_block_id: Any = _BLOCK_ID,
+) -> tuple[Any, ...]:
+    row = list(
+        _gate_row(gate_id=gate_id, gate_type=gate_type, head_sha=None, pr_id=None, status=status)
+    )
+    row[8] = task_block_id  # the gate's TaskBlock subject
+    return tuple(row)
+
+
+def _script_exceptional_gate_resolution(
+    conn: ScriptedConnection,
+    *,
+    row: tuple[Any, ...],
+    gate_type: str = "block_resolution",
+) -> None:
+    """The blocked-gate resolution sequence inside the decision transaction."""
+    conn.on(  # require_current_owner_gate
+        _GATE_READ,
+        _exceptional_blocked_gate_row(gate_type=gate_type),
+    )
+    conn.on(  # the resolution gate read
+        _GATE_READ,
+        _exceptional_blocked_gate_row(gate_type=gate_type),
+    )
+    conn.on(_TASK_READ_LOCKED, row)  # the resolution Task row lock
+    conn.on(
+        _GATE_UPDATE,
+        _exceptional_blocked_gate_row(gate_type=gate_type, status="cancelled"),
+    )
+    conn.on(
+        _GATE_POINTER_CLEAR,
+        _task_values(status="blocked", state_token=uuid4(), current_gate_id=None),
+    )
+
+
+def _ordinary_subject_gate_row(gate_type: str) -> tuple[Any, ...]:
+    """One valid ordinary-subject gate row (no TaskBlock binding)."""
+    row = list(_gate_row(gate_id=_GATE_ID, gate_type=gate_type, head_sha=None, pr_id=None))
+    row[5] = _REVISION_ID  # the gate's PlanRevision subject
+    return tuple(row)
+
+
+def _unresolved_block(*, block_id: Any = _BLOCK_ID, resolved: bool = False) -> Any:
+    return SimpleNamespace(
+        id=block_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        reason="owner_action_required",
+        resolved_at=_OBSERVED if resolved else None,
+        context={},
+    )
+
+
+def _send_claim(
+    kind: TaskRuntimeSendClaimKind,
+    *,
+    status: TaskRuntimeSendClaimStatus = TaskRuntimeSendClaimStatus.CLAIMED,
+    review_iteration_id: Any | None = None,
+) -> Any:
+    return SimpleNamespace(
+        id=uuid4(),
+        kind=kind,
+        status=status,
+        review_iteration_id=review_iteration_id,
+    )
+
+
+def _review_iteration(
+    *,
+    iteration_id: Any = _ITERATION_ID,
+    iteration_number: int = 1,
+    outcome: Any = None,
+    plan_revision_id: Any | None = _REVISION_ID,
+    task_pull_request_id: Any | None = None,
+    reviewed_head_sha: str | None = None,
+) -> Any:
+    return SimpleNamespace(
+        id=iteration_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        review_loop_id=_LOOP_ID,
+        iteration_number=iteration_number,
+        plan_revision_id=plan_revision_id,
+        task_pull_request_id=task_pull_request_id,
+        reviewed_head_sha=reviewed_head_sha,
+        outcome=outcome,
+    )
+
+
+def _escalation_episode(*, escalated_block_id: Any | None = _BLOCK_ID) -> Any:
+    return SimpleNamespace(
+        id=_EPISODE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation_family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+        original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+        original_attempt_id=_ITERATION_ID,
+        escalated_task_block_id=escalated_block_id,
+    )
+
+
+def _escalated_block(
+    *,
+    block_id: Any = _BLOCK_ID,
+    effect_evidence: str = "pre_effect_not_applied",
+) -> Any:
+    return SimpleNamespace(
+        id=block_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        resolved_at=None,
+        context={
+            "failure_episode_id": str(_EPISODE_ID),
+            "operation_family": "reviewer_review",
+            "original_attempt_kind": "review_iteration",
+            "original_attempt_id": str(_ITERATION_ID),
+            "effect_evidence": effect_evidence,
+        },
+    )
+
+
+def _planning_loop() -> Any:
+    return SimpleNamespace(
+        id=_LOOP_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose=ReviewLoopPurpose.PLANNING,
+        iteration_limit=5,
+        status="open",
+        closed_at=None,
+        created_at=_OBSERVED,
+    )
+
+
+def _pr_review_loop() -> Any:
+    return SimpleNamespace(
+        id=_LOOP_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        iteration_limit=5,
+        status="open",
+        closed_at=None,
+        created_at=_OBSERVED,
+    )
+
+
+def test_cancel_resolves_each_current_exceptional_blocked_gate_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for gate_type in ("block_resolution", "github_issue_change", "github_state_mismatch"):
+        conn = ScriptedConnection()
+        blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+        _script_authorization(conn, row=blocked)
+        _script_authorization(conn, row=blocked)
+        _script_exceptional_gate_resolution(conn, row=blocked, gate_type=gate_type)
+        conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+        conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+        conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+        _wire(monkeypatch, block=_unresolved_block())
+
+        outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+        assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+        assert outcome.task.status is TaskStatus.CANCELLED
+        assert outcome.owner_gate is not None
+        gate_updates = [
+            params for sql, params in conn.executed if "update openorc.owner_gates" in sql
+        ]
+        assert len(gate_updates) == 1
+        assert gate_updates[0] is not None
+        assert gate_updates[0][0] == "cancelled"
+        assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+
+
+def test_a_wrong_kind_current_gate_on_a_blocked_task_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(
+        _GATE_READ,
+        _ordinary_subject_gate_row("implementation_authorization"),
+    )
+    _wire(monkeypatch)
+
+    with pytest.raises(ConflictError, match="exceptional blocked-task gate"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_blocked_gate_bound_to_a_resolved_block_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_GATE_READ, _exceptional_blocked_gate_row())
+    _wire(monkeypatch, block=_unresolved_block(resolved=True))
+
+    with pytest.raises(StaleOperationError, match="block subject has already resolved"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_blocked_gate_bound_to_a_missing_block_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_GATE_READ, _exceptional_blocked_gate_row())
+    _wire(monkeypatch)
+
+    with pytest.raises(NotFoundError, match="block subject is not available"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_superseded_blocked_gate_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    # The currentness guard reads a pending gate that is no longer the
+    # Task's current one: a superseded gate is never resolved as if the
+    # Owner cancelled through it.
+    conn.on(_GATE_READ, _exceptional_blocked_gate_row(gate_id=_OTHER_GATE_ID))
+    _wire(monkeypatch, block=_unresolved_block())
+
+    with pytest.raises(StaleOperationError, match="no longer the task's current gate"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_the_delegating_gate_composition_refuses_a_blocked_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The E5/E7 delegation seam stays WAITING_FOR_OWNER-only (issue #278).
+
+    A blocked Task with a current exceptional gate is refused at the
+    delegating entrypoint — rechecked under the Task lock — because that
+    seam records no canonical-PR close obligation and performs no
+    confirmed-merge preflight; the unified ``cancel_task`` command owns
+    those safeguards and is the only blocked-cancellation admission path.
+    """
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+    _wire(monkeypatch, block=_unresolved_block())
+
+    with pytest.raises(ConflictError, match="delegating gate-cancellation entrypoint"):
+        cancel_task_composition(
+            _pool(conn),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            owner_gate_id=_GATE_ID,
+        )
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_claimed_send_dispatch_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked"))
+    _wire(
+        monkeypatch,
+        send_claims=[_send_claim(TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH)],
+    )
+
+    with pytest.raises(ConflictError, match="unsettled runtime send claim"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_claimed_planning_revise_dispatch_on_its_current_subject_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    conn = ScriptedConnection()
+    _script_authorization(
+        conn, row=_task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    )
+    _wire(
+        monkeypatch,
+        send_claims=[
+            _send_claim(
+                TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH,
+                review_iteration_id=_ITERATION_ID,
+            )
+        ],
+        review_iteration=iteration,
+        loop_iterations=[iteration],
+    )
+
+    with pytest.raises(ConflictError, match="unsettled runtime send claim"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_superseded_planning_revise_claim_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration(iteration_id=_ITERATION_ID, iteration_number=1)
+    later = _review_iteration(iteration_id=_LATER_ITERATION_ID, iteration_number=2)
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        send_claims=[
+            _send_claim(
+                TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH,
+                review_iteration_id=_ITERATION_ID,
+            )
+        ],
+        review_iteration=iteration,
+        loop_iterations=[iteration, later],
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_a_claimed_pr_compose_dispatch_without_a_canonical_pr_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked"))
+    _wire(
+        monkeypatch,
+        send_claims=[_send_claim(TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH)],
+    )
+
+    with pytest.raises(ConflictError, match="unsettled runtime send claim"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_claimed_pr_compose_dispatch_with_a_canonical_pr_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked")
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        send_claims=[_send_claim(TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH)],
+        pull_request=_pull_request(),
+        reconcile=_ReconcileStub(
+            _reconciled(pull_request=_pull_request(state=TaskPullRequestState.CLOSED))
+        ),
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.close_intent is None
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_terminal_send_claims_permits_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked")
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        send_claims=[
+            _send_claim(
+                TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH,
+                status=TaskRuntimeSendClaimStatus.SETTLED,
+            ),
+            _send_claim(
+                TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH,
+                status=TaskRuntimeSendClaimStatus.KNOWN_NON_DELIVERY,
+            ),
+        ],
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_an_unsettled_planning_bootstrap_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked"))
+    _wire(monkeypatch, bootstrap_evidence=SimpleNamespace(stage=None, claim_token=uuid4()))
+
+    with pytest.raises(ConflictError, match="planning bootstrap is unsettled"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_published_plan_revision_resolves_the_bootstrap_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(monkeypatch, bootstrap_evidence=SimpleNamespace(stage=None, claim_token=uuid4()))
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_an_unfinalized_review_iteration_on_the_current_subject_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    conn = ScriptedConnection()
+    _script_authorization(
+        conn, row=_task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    )
+    _wire(monkeypatch, loops=[_planning_loop()], loop_iterations=[iteration])
+
+    with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_an_escalated_post_send_uncertain_review_failure_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    conn = ScriptedConnection()
+    _script_authorization(
+        conn, row=_task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    )
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[iteration],
+        episode=_escalation_episode(),
+        escalated_block=_escalated_block(effect_evidence="effect_unclassified"),
+    )
+
+    with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_an_escalated_known_failed_review_failure_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    conn = ScriptedConnection()
+    _script_authorization(
+        conn, row=_task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    )
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[iteration],
+        episode=_escalation_episode(),
+        escalated_block=_escalated_block(effect_evidence="known_failed"),
+    )
+
+    with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_an_escalated_review_failure_on_a_different_block_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    conn = ScriptedConnection()
+    _script_authorization(
+        conn,
+        row=_task_values(
+            status="blocked", current_gate_id=_GATE_ID, current_plan_revision=_REVISION_ID
+        ),
+    )
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[iteration],
+        episode=_escalation_episode(escalated_block_id=_OTHER_BLOCK_ID),
+        escalated_block=_escalated_block(
+            block_id=_OTHER_BLOCK_ID, effect_evidence="pre_effect_not_applied"
+        ),
+        veto_gate=SimpleNamespace(
+            id=_GATE_ID, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID, task_block_id=_BLOCK_ID
+        ),
+    )
+
+    with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_pr_review_iteration_on_the_current_head_vetoes_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration(
+        plan_revision_id=None, task_pull_request_id=_PR_ID, reviewed_head_sha=_HEAD_SHA
+    )
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked"))
+    _wire(
+        monkeypatch,
+        loops=[_pr_review_loop()],
+        loop_iterations=[iteration],
+        pull_request=_pull_request(),
+    )
+
+    with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+
+
+def test_a_positively_proven_pre_send_review_failure_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iteration = _review_iteration()
+    blocked = _task_values(
+        status="blocked", current_gate_id=_GATE_ID, current_plan_revision=_REVISION_ID
+    )
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    _script_exceptional_gate_resolution(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[iteration],
+        episode=_escalation_episode(),
+        escalated_block=_escalated_block(effect_evidence="pre_effect_not_applied"),
+        veto_gate=SimpleNamespace(
+            id=_GATE_ID, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID, task_block_id=_BLOCK_ID
+        ),
+        block=_unresolved_block(),
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.owner_gate is not None
+    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+
+
+def test_a_finalized_newer_iteration_supersedes_the_unfinalized_attempt_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unfinalized = _review_iteration(iteration_id=_ITERATION_ID, iteration_number=1)
+    finalized_newer = _review_iteration(
+        iteration_id=_LATER_ITERATION_ID, iteration_number=2, outcome="accepted"
+    )
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[unfinalized, finalized_newer],
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_a_finalized_review_iteration_permits_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[_review_iteration(outcome="accepted")],
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
+
+
+def test_a_review_iteration_on_a_moved_on_subject_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(
+        monkeypatch,
+        loops=[_planning_loop()],
+        loop_iterations=[_review_iteration(plan_revision_id=_LATER_REVISION_ID)],
+    )
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert _event_types(conn) == ["task_cancelled"]
 
 
 def test_cancel_is_inapplicable_during_autonomous_progression(
