@@ -507,9 +507,36 @@ class TestAtomicCostLimitBlock:
             (task_id,),
         ).fetchall()
         assert intent_row == [(owner_profile_id, "unsettled")]
+        # The F3 composition also committed the pending BLOCK_RESOLUTION
+        # gate bound to the block as its only subject, with its OWNER
+        # owner_gate_created audit, installed as the Task's current gate.
+        gate_row = conn.execute(
+            "select id, gate_type, status, task_block_id "
+            "from openorc.owner_gates where task_id = %s",
+            (task_id,),
+        ).fetchall()
+        assert len(gate_row) == 1
+        gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
+        assert gate_type == "block_resolution" and gate_status == "pending"
+        assert gate_block_id == (
+            _scalar(conn, "select id from openorc.task_blocks where task_id = %s", (task_id,))
+        )
+        # The installed gate is the Task's current OwnerGate pointer.
+        assert (
+            _scalar(
+                conn, "select current_owner_gate_id from openorc.tasks where id = %s", (task_id,)
+            )
+            == gate_id
+        )
+        gate_event_row = conn.execute(
+            "select actor_type, actor_id from openorc.workflow_events "
+            "where task_id = %s and event_type = 'owner_gate_created'",
+            (task_id,),
+        ).fetchall()
+        assert gate_event_row == [("owner", str(owner_profile_id))]
 
         # A replay (concurrent worker, restarted callback) never duplicates
-        # the block, the intent, or the audit.
+        # the block, the gate, the intent, or the audit.
         replay = establish_owner_authorized_cost_limit_block(
             pool, workspace_id=workspace_id, task_id=task_id
         )
@@ -528,10 +555,23 @@ class TestAtomicCostLimitBlock:
             == 1
         )
         assert (
+            _scalar(conn, "select count(*) from openorc.owner_gates where task_id = %s", (task_id,))
+            == 1
+        )
+        assert (
             _scalar(
                 conn,
                 "select count(*) from openorc.workflow_events where task_id = %s "
                 "and event_type = 'task_blocked'",
+                (task_id,),
+            )
+            == 1
+        )
+        assert (
+            _scalar(
+                conn,
+                "select count(*) from openorc.workflow_events where task_id = %s "
+                "and event_type = 'owner_gate_created'",
                 (task_id,),
             )
             == 1
@@ -579,6 +619,19 @@ class TestAtomicCostLimitBlock:
         assert (
             _scalar(conn, "select status from openorc.tasks where id = %s", (task_id,)) == "blocked"
         )
+        # The idle branch still installs the pending BLOCK_RESOLUTION gate.
+        assert (
+            _scalar(conn, "select count(*) from openorc.owner_gates where task_id = %s", (task_id,))
+            == 1
+        )
+        assert (
+            _scalar(
+                conn,
+                "select gate_type from openorc.owner_gates where task_id = %s",
+                (task_id,),
+            )
+            == "block_resolution"
+        )
 
     def test_a_forced_failure_rolls_back_the_whole_decision(
         self, conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
@@ -623,6 +676,10 @@ class TestAtomicCostLimitBlock:
                 "select count(*) from openorc.task_interrupt_intents where task_id = %s",
                 (task_id,),
             )
+            == 0
+        )
+        assert (
+            _scalar(conn, "select count(*) from openorc.owner_gates where task_id = %s", (task_id,))
             == 0
         )
         task_row = conn.execute(

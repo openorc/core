@@ -18,11 +18,14 @@ state and never by Cline's instantaneous busy/status field:
   Profile-owned Workspace/Task scope, takes the Task row lock, resolves the
   exact existing bound Producer/Reviewer ``TaskAgentSession`` targets the
   caller's admitted activity context names, refuses any already-outstanding
-  interruption, then atomically creates the ``owner_action_required``
-  TaskBlock (with the safe ``owner_abort`` context), moves the Task to
-  ``blocked`` under its token (a pending gate stays truthful pending
-  history, unusable while blocked), records the OWNER ``task_blocked``
-  audit, and registers the one-shot exact-session Interrupt intents. AFTER
+  interruption, then atomically installs the F3 exceptional blocking
+  foundation (issue #258) — the ``owner_action_required`` TaskBlock (with
+  the safe ``owner_abort`` context), its pending ``BLOCK_RESOLUTION``
+  OwnerGate bound to that block, the guarded current-gate pointer
+  installation with the ``blocked`` transition under the Task's token (a
+  superseded pending ordinary gate stays truthful pending history, unusable
+  while blocked), and the OWNER ``task_blocked`` / ``owner_gate_created``
+  audits — and registers the one-shot exact-session Interrupt intents. AFTER
   the commit — never inside a transaction — the existing
   ``ClineAdapter.abort_activity`` is invoked exactly once per exact target,
   and each safe outcome (acknowledged / definitively failed / uncertain) is
@@ -49,8 +52,9 @@ the one Owner-authorized cost-limit control:
 :func:`apply_owner_authorized_cost_limit_block` /
 :func:`establish_owner_authorized_cost_limit_block` compose the identical
 atomic blocking composition — one ``COST_LIMIT`` TaskBlock with the safe
-``owner_abort`` control context, the guarded ``blocked`` transition, the
-OWNER ``task_blocked`` audit, and the exact one-shot Interrupt intents —
+``owner_abort`` control context, its pending ``BLOCK_RESOLUTION``
+OwnerGate, the guarded ``blocked`` transition, the OWNER ``task_blocked``
+/ ``owner_gate_created`` audits, and the exact one-shot Interrupt intents —
 driven by the Task's persisted standing budget decision instead of a live
 Owner command. The accountable Owner Profile is derived from the durable
 Workspace row (never from a telemetry event), the threshold is re-verified
@@ -80,12 +84,12 @@ from openorc.adapters.cline import ClineAdapter, ClineSettlementRefusal
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import Execution, ExecutionStatus
+from openorc.domain.gates import OwnerGateType
 from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
 from openorc.domain.reviews import ReviewLoopStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
 from openorc.persistence import ownership as ownership_records
@@ -101,6 +105,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -470,35 +475,28 @@ def _apply_owner_authorized_block(
 
     The one shared composition of the interactive Owner Abort (issue #228)
     and the persisted standing cost-policy control (issue #240), inside the
-    caller's open composed transaction: one current TaskBlock with its
-    reason/recovery context, the guarded ``blocked`` transition under the
-    Task's exact state token, the OWNER ``task_blocked`` audit, and the
-    exact one-shot Interrupt intents for the resolved targets — created
-    BEFORE any Cline I/O and committed or rolled back together. Failure of
-    any step rolls back every blocking decision fact.
+    caller's open composed transaction. The F3 exceptional blocking
+    foundation (issue #258) applies its one atomic effect — one current
+    TaskBlock with its reason/recovery context, the pending
+    ``BLOCK_RESOLUTION`` OwnerGate bound to it as its only subject, the
+    guarded current-gate pointer installation with the ``blocked``
+    transition under the Task's exact state token, and the OWNER
+    ``task_blocked`` / ``owner_gate_created`` audits — and the exact
+    one-shot Interrupt intents for the resolved targets are registered in
+    the same outer composition, BEFORE any Cline I/O and committed or
+    rolled back together. A failing or stale installation rolls back every
+    blocking decision fact.
     """
-    block = block_records.create_task_block(
+    installation = install_exceptional_block_gate(
         transaction_pool,
         workspace_id=task.workspace_id,
         task_id=task.id,
-        reason=reason,
-        context=context,
-    )
-    blocked = task_records.update_task_status(
-        transaction_pool,
-        task.id,
         expected_state_token=task.state_token,
-        status=TaskStatus.BLOCKED,
-    )
-    if blocked is None:
-        raise StaleOperationError(
-            "the task could not move to blocked; the owner-authorized control is stale"
-        )
-    event_coordination.record_task_blocked_event(
-        transaction_pool,
-        workspace_id=task.workspace_id,
-        task_id=task.id,
-        task_block_id=block.id,
+        expected_status=task.status,
+        expected_current_owner_gate_id=task.current_owner_gate_id,
+        gate_type=OwnerGateType.BLOCK_RESOLUTION,
+        block_reason=reason,
+        block_context=context,
         actor=event_coordination.owner_actor(owner_profile_id),
     )
     intents = tuple(
@@ -516,7 +514,9 @@ def _apply_owner_authorized_block(
         )
         for target in targets
     )
-    return _DispatchPlan(task=blocked, task_block=block, targets=intents)
+    return _DispatchPlan(
+        task=installation.task, task_block=installation.task_block, targets=intents
+    )
 
 
 class CostLimitBlockOutcomeKind(StrEnum):
@@ -567,8 +567,9 @@ def _resolve_cost_limit_interrupt_targets(
     eligibility facts (:func:`_has_cost_limit_eligible_activity`).
     Sessions without eligible activity are never gratuitously interrupted:
     where the Task is idle (typically at a pending Owner gate), the block
-    composes with zero targets and the pending gate stays truthful pending
-    history for F4b.
+    composes with zero targets — the BLOCK_RESOLUTION installation
+    supersedes that pending ordinary gate truthfully (it stays pending
+    history, unusable while blocked) and no Interrupt exists, for F4b.
     """
     targets: list[_InterruptTarget] = []
     for session in session_records.list_task_agent_sessions(transaction_pool, task_id=task.id):
@@ -697,11 +698,12 @@ def establish_owner_authorized_cost_limit_block(
     The pre-dispatch seam for #88 F3a: one short composed transaction
     verifies the current Task/budget/threshold under the Task row lock and,
     exactly when the persisted standing decision applies, commits the
-    ``COST_LIMIT`` block, the guarded ``blocked`` transition, the OWNER
-    audit, and the exact one-shot Interrupt intents together. Returns the
-    typed outcome; dispatch obligations are handled strictly after the
-    commit through :func:`dispatch_registered_task_interrupt` — never
-    inside any transaction.
+    ``COST_LIMIT`` block with its pending ``BLOCK_RESOLUTION`` OwnerGate,
+    the guarded ``blocked`` transition, the OWNER ``task_blocked`` /
+    ``owner_gate_created`` audits, and the exact one-shot Interrupt intents
+    together. Returns the typed outcome; dispatch obligations are handled
+    strictly after the commit through :func:`dispatch_registered_task_interrupt`
+    — never inside any transaction.
     """
     with application_span(
         _SERVICE_TRACER_SCOPE, "task_abort.establish_owner_authorized_cost_limit_block"

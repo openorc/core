@@ -1715,12 +1715,6 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
         TaskInterruptSettlement as _TaskInterruptSettlement,
     )
     from tests.test_services_task_abort import (
-        _BLOCK_INSERT as _ABORT_BLOCK_INSERT,
-    )
-    from tests.test_services_task_abort import (
-        _EVENT_INSERT as _ABORT_EVENT_INSERT,
-    )
-    from tests.test_services_task_abort import (
         _INTENT_INSERT as _ABORT_INTENT_INSERT,
     )
     from tests.test_services_task_abort import (
@@ -1733,12 +1727,6 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
         _SESSION_ID as _ABORT_SESSION_ID,
     )
     from tests.test_services_task_abort import (
-        _STATUS_UPDATE as _ABORT_STATUS_UPDATE,
-    )
-    from tests.test_services_task_abort import (
-        _block_row as _abort_block_row,
-    )
-    from tests.test_services_task_abort import (
         _dispatch_call as _abort_dispatch_call,
     )
     from tests.test_services_task_abort import (
@@ -1749,6 +1737,9 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
     )
     from tests.test_services_task_abort import (
         _ready_session_row as _abort_ready_session_row,
+    )
+    from tests.test_services_task_abort import (
+        _script_block_composition as _abort_script_block_composition,
     )
     from tests.test_services_task_abort import (
         _script_dispatch_head as _abort_script_dispatch_head,
@@ -1794,9 +1785,7 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
     # --- Phase 1: the Abort dispatch over the IMPLEMENTING Task ---
     _abort_script_dispatch_head(conn, status="implementing", session=_abort_ready_session_row())
     conn.on(_ABORT_INTENTS_LIST, [])
-    conn.on(_ABORT_BLOCK_INSERT, _abort_block_row())
-    conn.on(_ABORT_STATUS_UPDATE, _task_values(status="blocked", state_token=_CANCELLED_TOKEN))
-    conn.on(_ABORT_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _abort_script_block_composition(conn, status="implementing")
     conn.on(_ABORT_INTENT_INSERT, _abort_intent_row())
     conn.on(_ABORT_INTENT_UPDATE, _abort_intent_row(outcome={"dispatch": "acknowledged"}))
     adapter = _FakeClineAdapter()

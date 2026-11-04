@@ -2,12 +2,13 @@
 
 The targeted real-Postgres checks the new Abort/Cancel seams own:
 
-- the Owner Abort composition commits atomically: the
-  ``owner_action_required`` TaskBlock with its safe ``owner_abort`` context,
-  the ``blocked`` transition under a rotated token, the OWNER
-  ``task_blocked`` audit, and the one-shot unsettled exact-session Interrupt
-  intent; a forced late audit failure rolls the whole composition back and
-  the runtime is never invoked;
+- the Owner Abort composition commits atomically: the F3 exceptional
+  blocking foundation — the ``owner_action_required`` TaskBlock with its
+  safe ``owner_abort`` context, its pending ``BLOCK_RESOLUTION`` OwnerGate
+  bound to it, the ``blocked`` transition under a rotated token, the OWNER
+  ``task_blocked`` / ``owner_gate_created`` audits — and the one-shot
+  unsettled exact-session Interrupt intent; a forced late audit failure
+  rolls the whole composition back and the runtime is never invoked;
 - the unified cancellation commits atomically: the exact current pending
   MERGE_DECISION gate resolves CANCELLED with OWNER provenance, the OPEN
   PR_REVIEW loop closes, the Task archives ``CANCELLED`` (releasing the
@@ -389,7 +390,27 @@ def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -
     assert intents[0].status is TaskInterruptIntentStatus.UNSETTLED
     assert intents[0].workflow_role.value == "producer"
     assert intents[0].external_session_id == _EXTERNAL_SESSION_ID
-    assert _event_counts(facts["conn"], facts["task_id"]) == {"task_blocked": 1}
+    # The F3 composition also committed the pending BLOCK_RESOLUTION gate
+    # bound to the block as its only subject, installed as the Task's
+    # current OwnerGate pointer.
+    gate_row = (
+        facts["conn"]
+        .execute(
+            "select id, gate_type, status, task_block_id "
+            "from openorc.owner_gates where task_id = %s",
+            (facts["task_id"],),
+        )
+        .fetchall()
+    )
+    assert len(gate_row) == 1
+    gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
+    assert gate_type == "block_resolution" and gate_status == "pending"
+    assert gate_block_id == blocks[0].id
+    assert task.current_owner_gate_id == gate_id
+    assert _event_counts(facts["conn"], facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+    }
     # The exact-session Interrupt dispatched after the commit.
     assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
 
@@ -423,6 +444,12 @@ def test_a_late_abort_failure_rolls_the_whole_composition_back(
     assert task.state_token == facts["state_token"]
     assert list_task_blocks(pool, task_id=facts["task_id"]) == []
     assert intent_repositories.list_task_interrupt_intents(pool, task_id=facts["task_id"]) == []
+    assert (
+        facts["conn"]
+        .execute("select count(*) from openorc.owner_gates where task_id = %s", (facts["task_id"],))
+        .fetchone()[0]
+        == 0
+    )
     assert _event_counts(facts["conn"], facts["task_id"]) == {}
     # The runtime is never invoked when the composition rolls back.
     assert adapter.abort_calls == []
