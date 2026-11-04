@@ -91,7 +91,6 @@ from tests.test_services_task_pr_review_decision import (
     _GATE_INSERT,
     _GATE_READ,
     _GATE_UPDATE,
-    _STATUS_UPDATE,
     _TASK_GATE_CLEAR,
     _TASK_GATE_INSTALL,
     _event_returned_row,
@@ -142,6 +141,8 @@ _RETRY_GATE_ID = uuid4()
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
 _LOOP_CLOSE = _sql_has("update openorc.review_loops")
 _ARCHIVE_UPDATE = _sql_has("update openorc.tasks", "archived_at = now()")
+
+_BLOCK_GATE_ID = uuid4()
 
 
 def _guard(*, issues: list[Any], repository: Any = None) -> Any:
@@ -413,18 +414,69 @@ def _script_completion(
 
 
 def _script_block(
-    conn: ScriptedConnection, *, token: Any = _STATE_TOKEN, reason: str = "stale_operation"
+    conn: ScriptedConnection,
+    *,
+    token: Any = _STATE_TOKEN,
+    reason: str = "stale_operation",
+    gate_type: str = "github_state_mismatch",
+    prior_gate_id: Any = None,
+    installer_token: Any = None,
 ) -> None:
+    """The owner-write authorization re-proof, then the F3 installer's
+    guarded composition (nested savepoint) in call order.
+
+    ``prior_gate_id`` scripts a Task whose current gate is still the named
+    pending ordinary gate (the pre-send merge-decision supersession shape);
+    the default None is the post-consumption pointer-less shape.
+    ``installer_token`` overrides the token on the installer's own locked
+    re-read and currentness re-proof rows — the raced-caller shape where
+    the Task moved on between the caller's observation and the
+    installation.
+    """
     conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
     conn.on(_WORKSPACE_READ, _ws_row())
-    conn.on(_TASK_READ, _task_row(status="waiting_for_owner", state_token=token))
-    conn.on(_TASK_READ, _task_row(status="waiting_for_owner", state_token=token))
-    conn.on(_BLOCK_INSERT, (uuid4(), _WORKSPACE_ID, _TASK_ID, reason, {}, None, _OBSERVED))
     conn.on(
-        _STATUS_UPDATE,
-        _task_row(status="blocked", state_token=_BLOCKED_TOKEN, current_gate_id=None),
+        _TASK_READ,
+        _task_row(status="waiting_for_owner", state_token=token, current_gate_id=prior_gate_id),
+    )
+    conn.on(
+        _TASK_READ,
+        _task_row(status="waiting_for_owner", state_token=token, current_gate_id=prior_gate_id),
+    )
+    installer_row_token = installer_token if installer_token is not None else token
+    conn.on(
+        _TASK_READ_LOCKED,
+        _task_row(
+            status="waiting_for_owner",
+            state_token=installer_row_token,
+            current_gate_id=prior_gate_id,
+        ),
+    )
+    conn.on(
+        _TASK_READ,
+        _task_row(
+            status="waiting_for_owner",
+            state_token=installer_row_token,
+            current_gate_id=prior_gate_id,
+        ),
+    )
+    if prior_gate_id is not None:
+        conn.on(
+            _GATE_READ,
+            _gate_row(gate_id=prior_gate_id, gate_type="merge_decision", head_sha=_HEAD_SHA),
+        )
+    conn.on(_BLOCK_INSERT, (uuid4(), _WORKSPACE_ID, _TASK_ID, reason, {}, None, _OBSERVED))
+    exceptional_gate = list(
+        _gate_row(gate_id=_BLOCK_GATE_ID, gate_type=gate_type, head_sha=None, pr_id=None)
+    )
+    exceptional_gate[8] = uuid4()  # the gate's fresh TaskBlock subject binding
+    conn.on(_GATE_INSERT, tuple(exceptional_gate))
+    conn.on(
+        _TASK_GATE_INSTALL,
+        _task_row(status="blocked", state_token=_BLOCKED_TOKEN, current_gate_id=_BLOCK_GATE_ID),
     )
     conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
 
 
 def _script_retry_gate(conn: ScriptedConnection) -> None:
@@ -692,7 +744,7 @@ def test_changed_head_blocks_stale_operation_where_current(
     conn = ScriptedConnection()
     pool = _pool(conn)
     _script_phase_a(conn)
-    _script_block(conn)
+    _script_block(conn, prior_gate_id=_RETRY_GATE_ID)
     reconcile = _ReconcileStub(
         _reconciled(pull_request=_domain_pull_request(head_sha=_NEW_HEAD_SHA))
     )
@@ -715,8 +767,72 @@ def test_changed_head_blocks_stale_operation_where_current(
     assert outcome.task_block is not None
     assert outcome.task_block.reason.value == "stale_operation"
     assert merge.calls == []
+    # The pre-send supersession: the still-current pending MERGE_DECISION
+    # gate is superseded by the exceptional GITHUB_STATE_MISMATCH gate as
+    # pending history — no manufactured Owner vote, no resolved event, and
+    # the prior gate row is never rewritten.
+    assert _count(conn, _GATE_READ) >= 1
     assert _count(conn, _GATE_UPDATE) == 0
-    assert _event_types(conn) == ["task_blocked"]
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None
+    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[3] == "pending"
+    (install_params,) = [params for sql, params in conn.executed if _TASK_GATE_INSTALL(sql, None)]
+    assert install_params is not None
+    assert install_params[0] == _BLOCK_GATE_ID
+    # The guarded composition: the caller's expected token, the locked
+    # waiting_for_owner status, and the exact prior current-gate pointer.
+    assert install_params[2] == _STATE_TOKEN
+    assert install_params[3] == "waiting_for_owner"
+    assert install_params[4] == _RETRY_GATE_ID
+    (block_insert,) = [
+        params for sql, params in conn.executed if params is not None and _BLOCK_INSERT(sql, params)
+    ]
+    assert block_insert is not None
+    block_context = block_insert[3].obj
+    assert block_context == {
+        "owner_gate_id": str(_RETRY_GATE_ID),
+        "task_pull_request_id": str(_PR_ID),
+        "expected_head_sha": _HEAD_SHA,
+        "observed_head_sha": _NEW_HEAD_SHA,
+    }
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+
+
+def test_a_raced_staleness_block_applies_nothing_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raced caller whose expected token no longer matches the locked Task
+    applies nothing at all: no TaskBlock, no exceptional gate, no guarded
+    transition, and no audit — the F3 foundation's stale-operation refusal
+    commits none of the block composition (issue #280)."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_phase_a(conn)
+    _script_block(conn, prior_gate_id=_RETRY_GATE_ID, installer_token=_BLOCKED_TOKEN)
+    reconcile = _ReconcileStub(
+        _reconciled(pull_request=_domain_pull_request(head_sha=_NEW_HEAD_SHA))
+    )
+    merge = _MergePrimitiveStub()
+    _wire(monkeypatch, reconcile=reconcile, merge=merge)
+
+    with pytest.raises(StaleOperationError):
+        request_task_merge(
+            pool,
+            _guard(issues=[_issue_observation()], repository=_repository_observation()),
+            _token_resolver(),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_RETRY_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+        )
+
+    assert merge.calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _GATE_INSERT) == 0
+    assert _count(conn, _TASK_GATE_INSTALL) == 0
+    assert _event_types(conn) == []
 
 
 def test_closed_source_issue_refuses_without_consuming_the_gate(
@@ -929,7 +1045,12 @@ def test_uncertain_outcome_blocks_and_is_never_repeated(
     _script_phase_a(conn)
     _script_issue_guard(conn)
     _script_phase_d(conn)
-    _script_block(conn, token=_POST_APPROVAL_TOKEN, reason="external_operation_uncertain")
+    _script_block(
+        conn,
+        token=_POST_APPROVAL_TOKEN,
+        reason="external_operation_uncertain",
+        gate_type="block_resolution",
+    )
     reconcile = _ReconcileStub(
         _reconciled(pull_request=_domain_pull_request()),
         _reconciled(pull_request=_domain_pull_request()),
@@ -952,10 +1073,20 @@ def test_uncertain_outcome_blocks_and_is_never_repeated(
     assert outcome.task.status is TaskStatus.BLOCKED
     assert outcome.task_block is not None
     assert outcome.task_block.reason.value == "external_operation_uncertain"
-    # An uncertain request is never repeated and never minted a retry gate.
+    # An uncertain request is never repeated; the F7a composition installs
+    # its one BLOCK_RESOLUTION gate (never a retry gate, never a merge
+    # request) with the two truthful audits.
     assert len(merge.calls) == 1
-    assert _count(conn, _GATE_INSERT) == 0
-    assert _event_types(conn) == ["owner_gate_resolved", "merge_requested", "task_blocked"]
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None
+    assert gate_insert[2] == "block_resolution"
+    assert gate_insert[3] == "pending"
+    assert _event_types(conn) == [
+        "owner_gate_resolved",
+        "merge_requested",
+        "task_blocked",
+        "owner_gate_created",
+    ]
 
 
 def test_confirmed_merge_with_failed_reconciliation_completes_without_repeating(
@@ -1013,7 +1144,12 @@ def test_confirmed_merge_with_unconfirmed_reconciliation_blocks_with_evidence(
     _script_phase_a(conn)
     _script_issue_guard(conn)
     _script_phase_d(conn)
-    _script_block(conn, token=_POST_APPROVAL_TOKEN, reason="external_operation_uncertain")
+    _script_block(
+        conn,
+        token=_POST_APPROVAL_TOKEN,
+        reason="external_operation_uncertain",
+        gate_type="block_resolution",
+    )
     reconcile = _ReconcileStub(
         _reconciled(pull_request=_domain_pull_request()),
         _reconciled(pull_request=_domain_pull_request()),
@@ -1043,8 +1179,9 @@ def test_confirmed_merge_with_unconfirmed_reconciliation_blocks_with_evidence(
     assert outcome.task_block is not None
     assert outcome.task_block.reason.value == "external_operation_uncertain"
     # The preserved confirmed-merge evidence rides the durable recovery
-    # context, and the confirmed merge is never repeated and never minted a
-    # retry gate.
+    # context, and the confirmed merge is never repeated; the F7a
+    # composition installs its one BLOCK_RESOLUTION gate with the two
+    # truthful audits.
     block_inserts = [
         params for sql, params in conn.executed if params is not None and _BLOCK_INSERT(sql, params)
     ]
@@ -1054,8 +1191,16 @@ def test_confirmed_merge_with_unconfirmed_reconciliation_blocks_with_evidence(
     assert block_context["expected_head_sha"] == _HEAD_SHA
     assert outcome.merge_commit_sha == _MERGE_COMMIT_SHA
     assert len(merge.calls) == 1
-    assert _count(conn, _GATE_INSERT) == 0
-    assert _event_types(conn) == ["owner_gate_resolved", "merge_requested", "task_blocked"]
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None
+    assert gate_insert[2] == "block_resolution"
+    assert gate_insert[3] == "pending"
+    assert _event_types(conn) == [
+        "owner_gate_resolved",
+        "merge_requested",
+        "task_blocked",
+        "owner_gate_created",
+    ]
 
 
 def test_stale_claim_pre_send_fails_closed_and_applies_nothing(
@@ -1102,7 +1247,7 @@ def test_head_mismatch_after_send_blocks_stale_operation(
     _script_phase_a(conn)
     _script_issue_guard(conn)
     _script_phase_d(conn)
-    _script_block(conn, token=_POST_APPROVAL_TOKEN)
+    _script_block(conn, prior_gate_id=_RETRY_GATE_ID)
     reconcile = _ReconcileStub(
         _reconciled(pull_request=_domain_pull_request(head_sha=_NEW_HEAD_SHA))
     )
@@ -1122,8 +1267,16 @@ def test_head_mismatch_after_send_blocks_stale_operation(
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
     assert outcome.task.status is TaskStatus.BLOCKED
-    # No Reviewer acceptance transfers to the unreviewed head: no retry gate.
-    assert _count(conn, _GATE_INSERT) == 0
+    # The F7a staleness block installs its one exceptional GITHUB_STATE_MISMATCH
+    # gate; no Reviewer acceptance transfers to the unreviewed head: no new
+    # merge-decision (retry) gate is ever minted.
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None
+    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[3] == "pending"
+    # The pre-send classification fires before the one-shot approval, so the
+    # only audits are the exceptional block's own truthful pair.
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 
 def test_completion_is_an_idempotent_noop_after_archival() -> None:
@@ -1603,8 +1756,13 @@ def test_send_uncertainty_with_a_changed_head_routes_through_the_staleness_conse
     block_context = block_inserts[0][3].obj
     assert block_context["observed_head_sha"] == _NEW_HEAD_SHA
     assert block_context["expected_head_sha"] == _HEAD_SHA
-    # No retry gate is minted and no Reviewer acceptance transfers.
-    assert _count(conn, _GATE_INSERT) == 0
+    # The staleness consequence installs its one exceptional
+    # GITHUB_STATE_MISMATCH gate; no retry gate is minted and no Reviewer
+    # acceptance transfers.
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None
+    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[3] == "pending"
     assert len(merge.calls) == 1
 
 

@@ -98,7 +98,6 @@ from openorc.domain.send_claims import TaskRuntimeSendClaim
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import blocks as block_records
 from openorc.persistence import events as event_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import ownership as ownership_records
@@ -130,6 +129,7 @@ from openorc.services.github_user_authorization import ProfileUserAccessTokenRes
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
+from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_runtime_send_claims import (
     RUNTIME_PRE_EFFECT_FAILURE_KIND,
     claim_pr_compose_send,
@@ -564,16 +564,26 @@ def _block_stale_publication(
 ) -> Task:
     """Atomically block the Task on stale publication authority.
 
-    One short composed transaction (the established E7 block shape): the
+    One short composed transaction (the established E8 block shape): the
     approving Profile's account-operational barrier is re-proved FIRST (the
     admission check does not remain authoritative across the intervening
     external calls), then the durable stale evidence against the freshly
-    locked Task: the ``reason`` TaskBlock, the ``waiting_for_owner →
-    blocked`` transition with a rotated token, and the ``task_blocked``
-    audit commit or roll back together. A Task that already moved on
-    applies nothing and raises ``StaleOperationError`` — no PR is created
-    here, no SHA is silently reauthorized, and no new Owner gate exists.
-    Recovery from the blocked state belongs to later layers (E10, #85).
+    locked Task is re-proved, and the F3 exceptional blocking foundation
+    (#258) installs — atomically — the ``reason`` TaskBlock, its pending
+    ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the only subject,
+    the ``waiting_for_owner → blocked`` transition with one rotated token,
+    and the ``task_blocked`` / ``owner_gate_created`` audits under the
+    truthful OPENORC actor — commit or roll back together. The publication
+    gate is already approved at every call site, so the NULL-safe
+    current-gate pointer expectation is the Task's locked (absent)
+    pointer. The caller's ``reason``/``context`` carry the exact
+    Owner-authorized head, the originating PR_AUTHORIZATION gate identity,
+    and every reconciled PR/head fact available at its site (issue #280) —
+    derived only from already-proven durable state, never manufactured. A
+    Task that already moved on applies nothing and raises
+    ``StaleOperationError`` — no PR is created here, no SHA is silently
+    reauthorized, and the block never duplicates itself. Recovery from the
+    blocked state belongs to later layers (E10, #85).
     """
     with composed_transaction(pool) as transaction_pool:
         require_account_operational(transaction_pool, profile_id=profile_id)
@@ -591,31 +601,23 @@ def _block_stale_publication(
                 "the addressed task is not waiting on its owner gate; the "
                 "stale publication block is stale"
             )
-        block = block_records.create_task_block(
+        # The F3 exceptional blocking foundation (#258): one atomic block,
+        # gate, transition, token rotation, and audit pair. The installer's
+        # guarded currentness re-proof is the durable backstop; a raced or
+        # stale caller commits nothing at all.
+        installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            reason=reason,
-            context=context,
-        )
-        blocked = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=task.state_token,
-            status=TaskStatus.BLOCKED,
-        )
-        if blocked is None:
-            raise StaleOperationError(
-                "the task could not move to blocked; the stale publication block is stale"
-            )
-        event_coordination.record_task_blocked_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_block_id=block.id,
+            expected_state_token=expected_state_token,
+            expected_status=task.status,
+            expected_current_owner_gate_id=task.current_owner_gate_id,
+            gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
+            block_reason=reason,
+            block_context=context,
             actor=_OPENORC_ACTOR,
         )
-        return blocked
+        return installation.task
 
 
 # --- the review-eligibility guard ----------------------------------------------------
@@ -626,6 +628,8 @@ def _require_review_eligible_pull_request(
     pull_request: TaskPullRequest,
     task: Task,
     base_ref: str,
+    authorized_head_sha: str,
+    owner_gate_id: UUID,
 ) -> None:
     """Require the persisted canonical PR to be eligible for owner review.
 
@@ -638,6 +642,14 @@ def _require_review_eligible_pull_request(
     exact approved head-SHA drift handling (issue #229): an externally
     established terminal PR state is never masked as a stale publication
     subject. Generalized closed-PR and merge recovery belongs to E10.
+
+    The stale-publication guard contexts carry the exact Owner-authorized
+    head and originating PR_AUTHORIZATION gate identity (both already
+    proven in the finalize composition) plus the reconciled PR evidence
+    available on the persisted row, so the F7a TaskBlock preserves the
+    authorization/mismatch facts later guarded recovery needs (issue
+    #280). The closed-unmerged terminal context is unchanged: it feeds
+    #229's cancellation, not a TaskBlock.
     """
     if pull_request.state is not TaskPullRequestState.OPEN:
         if pull_request.merged_at is None:
@@ -659,7 +671,10 @@ def _require_review_eligible_pull_request(
             context={
                 "pull_request_id": str(pull_request.id),
                 "github_pr_number": str(pull_request.github_pr_number),
+                "authorized_head_sha": authorized_head_sha,
+                "owner_gate_id": str(owner_gate_id),
                 "observed_head_ref": pull_request.head_ref,
+                "observed_head_sha": pull_request.head_sha,
             },
         )
     if pull_request.base_ref != base_ref:
@@ -668,6 +683,10 @@ def _require_review_eligible_pull_request(
             context={
                 "pull_request_id": str(pull_request.id),
                 "github_pr_number": str(pull_request.github_pr_number),
+                "authorized_head_sha": authorized_head_sha,
+                "authorized_base_ref": base_ref,
+                "owner_gate_id": str(owner_gate_id),
+                "observed_head_sha": pull_request.head_sha,
                 "observed_base_ref": pull_request.base_ref,
             },
         )
@@ -773,6 +792,8 @@ def _finalize_published_task_pr(
             pull_request=pull_request,
             task=task,
             base_ref=subjects.base_ref,
+            authorized_head_sha=approved_head_sha,
+            owner_gate_id=owner_gate_id,
         )
         if pull_request.head_sha != approved_head_sha:
             # Reconciled head-SHA drift — observed during the authoritative
@@ -785,11 +806,16 @@ def _finalize_published_task_pr(
             # deliberately precedes this check (issue #229): a confirmed
             # closed-unmerged canonical PR is the externally established
             # terminal condition and must never be masked as a stale
-            # publication subject.
+            # publication subject. The context preserves the exact
+            # Owner-authorized head, the originating gate identity, and the
+            # canonical PR identity (issue #280).
             raise _StalePublicationGuard(
                 reason=TaskBlockReason.STALE_OPERATION,
                 context={
+                    "pull_request_id": str(pull_request.id),
+                    "github_pr_number": str(pull_request.github_pr_number),
                     "authorized_head_sha": approved_head_sha,
+                    "owner_gate_id": str(owner_gate_id),
                     "observed_head_sha": pull_request.head_sha,
                 },
             )
@@ -1156,7 +1182,10 @@ def compose_and_publish_task_pr(
             )
         if publication.outcome is TaskPullRequestPublicationOutcome.PREFLIGHT_STALE:
             # No PR was created by this invocation; the approved head can no
-            # longer be published. No SHA is silently reauthorized.
+            # longer be published. No SHA is silently reauthorized, and no
+            # canonical PR record exists to cite — the block preserves the
+            # exact authorized head and the originating gate identity
+            # (issue #280) without manufacturing a PR identity.
             _block_stale_publication(
                 pool,
                 profile_id=subjects.approving_profile_id,
@@ -1164,7 +1193,10 @@ def compose_and_publish_task_pr(
                 task_id=task_id,
                 expected_state_token=expected_state_token,
                 reason=TaskBlockReason.STALE_OPERATION,
-                context={"authorized_head_sha": approved_head_sha},
+                context={
+                    "authorized_head_sha": approved_head_sha,
+                    "owner_gate_id": str(owner_gate_id),
+                },
             )
             raise StaleOperationError(
                 "the published head no longer matches the approved authorization; "
@@ -1184,7 +1216,10 @@ def compose_and_publish_task_pr(
         )
         # The created PR is an external fact that is never erased: where the
         # Task is still current the recoverable block records it, and where
-        # it already moved on the block composition applies nothing.
+        # it already moved on the block composition applies nothing. The
+        # context preserves the exact authorized head, the originating gate
+        # identity, and the persisted canonical PR identity alongside the
+        # outcome-specific observed evidence (issue #280).
         _block_stale_publication(
             pool,
             profile_id=subjects.approving_profile_id,
@@ -1192,7 +1227,13 @@ def compose_and_publish_task_pr(
             task_id=task_id,
             expected_state_token=expected_state_token,
             reason=TaskBlockReason.STALE_OPERATION,
-            context={"authorized_head_sha": approved_head_sha, **observed_head_context},
+            context={
+                "authorized_head_sha": approved_head_sha,
+                "owner_gate_id": str(owner_gate_id),
+                "pull_request_id": str(created.id),
+                "github_pr_number": str(created.github_pr_number),
+                **observed_head_context,
+            },
         )
         raise StaleOperationError(
             "the publication's durable authority moved on after creation; the "

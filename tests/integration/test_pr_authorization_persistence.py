@@ -8,13 +8,14 @@ commits atomically, and a forced late failure rolls the whole presentation
 back — the branch stays unbound, no gate row exists, the Task keeps its
 token and status, and no event is written. The reason-specific source
 classification: confirmed requirements drift takes the atomic
-``github_source_changed`` block path (TaskBlock + ``implementing → blocked``
-+ ``task_blocked`` audit, no gate) whose forced late failure also rolls back
-completely, while a closed source issue fails closed without fabricating a
-block. Owner approval resolves the exact gate APPROVED with the durable
-approving Profile and the exact head preserved for E8; Owner cancellation
-resolves the gate CANCELLED and archives the Task terminal ``cancelled`` in
-one composition.
+``github_source_changed`` block path (TaskBlock + its pending exceptional
+``GITHUB_ISSUE_CHANGE`` gate bound to it + ``implementing → blocked`` +
+the ``task_blocked``/``owner_gate_created`` audits, issue #280) whose
+forced late failure also rolls back completely, while a closed source
+issue fails closed without fabricating a block. Owner approval resolves
+the exact gate APPROVED with the durable approving Profile and the exact
+head preserved for E8; Owner cancellation resolves the gate CANCELLED and
+archives the Task terminal ``cancelled`` in one composition.
 
 The deterministic suite proves classification and no-write failures; no
 live GitHub, runtime, or Supabase access — the GitHub App client is a local
@@ -567,10 +568,14 @@ def test_a_late_presentation_failure_rolls_everything_back(
     assert _event_types(conn, facts["task_id"]) == []
 
 
-def test_confirmed_drift_blocks_atomically_and_creates_no_gate(conn: Connection[Any]) -> None:
-    """The confirmed fingerprint change takes the one atomic block path: the
-    TaskBlock, the implementing → blocked transition, and the task_blocked
-    audit commit together — and no PR gate exists afterwards."""
+def test_confirmed_drift_blocks_atomically_with_the_exceptional_issue_change_gate(
+    conn: Connection[Any],
+) -> None:
+    """The confirmed fingerprint change takes the one atomic F7a block path:
+    the TaskBlock, its pending exceptional ``GITHUB_ISSUE_CHANGE`` gate bound
+    to it as the only subject, the implementing → blocked transition with the
+    installed current-gate pointer, and the task_blocked/owner_gate_created
+    audits commit together — and no PR gate exists afterwards."""
     facts = _pr_authorization_fixture(conn)
     pool = facts["pool"]
     token_before = facts["state_token"]
@@ -589,12 +594,28 @@ def test_confirmed_drift_blocks_atomically_and_creates_no_gate(conn: Connection[
     assert task is not None
     assert task.status is TaskStatus.BLOCKED
     assert task.canonical_feature_branch is None
-    assert task.current_owner_gate_id is None
     assert task.state_token != token_before
     (block,) = _task_block_rows(conn, facts["task_id"])
     assert block[0] == TaskBlockReason.GITHUB_SOURCE_CHANGED.value
     assert block[1]["expected_fingerprint"] == _FINGERPRINT
     assert block[1]["observed_fingerprint"] == _DRIFTED_FINGERPRINT
+    # The one pending exceptional gate is the Task's current gate and binds
+    # the fresh TaskBlock as its only subject (issue #280).
+    block_id_row = conn.execute(
+        "select id from openorc.task_blocks where task_id = %s",
+        (facts["task_id"],),
+    ).fetchone()
+    assert block_id_row is not None
+    (block_id,) = block_id_row
+    gate_row = conn.execute(
+        "select id, task_block_id from openorc.owner_gates "
+        "where task_id = %s and gate_type = 'github_issue_change'",
+        (facts["task_id"],),
+    ).fetchone()
+    assert gate_row is not None
+    (gate_id, gate_block_id) = gate_row
+    assert gate_block_id == block_id
+    assert task.current_owner_gate_id == gate_id
     assert (
         _row_count(
             conn,
@@ -604,7 +625,10 @@ def test_confirmed_drift_blocks_atomically_and_creates_no_gate(conn: Connection[
         )
         == 0
     )
-    assert _event_types(conn, facts["task_id"]) == [("task_blocked", "openorc", None)]
+    assert _event_types(conn, facts["task_id"]) == [
+        ("owner_gate_created", "openorc", None),
+        ("task_blocked", "openorc", None),
+    ]
 
 
 def test_a_late_drift_block_failure_rolls_the_block_back(
@@ -613,7 +637,7 @@ def test_a_late_drift_block_failure_rolls_the_block_back(
 ) -> None:
     """A failure after the TaskBlock creation rolls the whole drift-block
     composition back: the Task stays implementing with its token and no
-    block row or event exists."""
+    block row, exceptional gate, or event exists."""
     facts = _pr_authorization_fixture(conn)
     pool = facts["pool"]
     token_before = facts["state_token"]
@@ -636,7 +660,17 @@ def test_a_late_drift_block_failure_rolls_the_block_back(
     assert task is not None
     assert task.status is TaskStatus.IMPLEMENTING
     assert task.state_token == token_before
+    assert task.current_owner_gate_id is None
     assert _task_block_rows(conn, facts["task_id"]) == []
+    assert (
+        _row_count(
+            conn,
+            "select count(*) from openorc.owner_gates "
+            "where task_id = %s and gate_type = 'github_issue_change'",
+            (facts["task_id"],),
+        )
+        == 0
+    )
     assert _event_types(conn, facts["task_id"]) == []
 
 

@@ -92,7 +92,6 @@ from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import blocks as block_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
@@ -125,6 +124,7 @@ from openorc.services.github_owner_write_authorization import (
 )
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_operational_failure_triage import (
     DispositionKind,
     OperationalFailureOperation,
@@ -417,11 +417,20 @@ def _apply_merge_staleness_block(
     One short composed transaction re-proves the account-operational barrier
     and the exact Profile's Owner authority FIRST (the admission check does
     not remain authoritative across the intervening GitHub calls), then —
-    under the Task row lock — creates the ``stale_operation`` TaskBlock with
-    the safe exact-subject recovery context, moves the Task to ``blocked``
-    with a rotated token, and records the ``task_blocked`` audit. A stale
-    subject applies nothing and raises. This is the E10a-specific use of the
-    existing TaskBlock/status/event primitives, not a second blocking engine.
+    under the Task row lock — the F3 exceptional blocking foundation (#258)
+    installs, atomically, the ``stale_operation`` TaskBlock with the safe
+    exact-subject recovery context (the addressed merge gate, the canonical
+    PR, the approved expected head, and the observed head), its pending
+    ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the only subject, the
+    guarded ``blocked`` transition with one rotated token, and the
+    ``task_blocked`` / ``owner_gate_created`` audits under the truthful
+    OPENORC actor. A stale subject applies nothing and raises. Where the
+    pending merge-decision gate is still the Task's current gate (the
+    pre-send phase) the installer supersedes it as pending superseded
+    history with no manufactured Owner outcome; where the gate was already
+    consumed the NULL-safe pointer expectation is the Task's locked (absent)
+    pointer. This is the E10a-specific use of the F3 foundation, not a
+    second blocking engine.
     """
     require_owner_write_authorization(
         pool, profile_id=profile_id, workspace_id=workspace_id, task_id=task_id
@@ -433,36 +442,24 @@ def _apply_merge_staleness_block(
             task_id=task_id,
             expected_state_token=expected_state_token,
         )
-        block = block_records.create_task_block(
+        installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            reason=TaskBlockReason.STALE_OPERATION,
-            context={
+            expected_state_token=expected_state_token,
+            expected_status=task.status,
+            expected_current_owner_gate_id=task.current_owner_gate_id,
+            gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
+            block_reason=TaskBlockReason.STALE_OPERATION,
+            block_context={
                 "owner_gate_id": str(owner_gate_id),
                 "task_pull_request_id": str(task_pull_request_id),
                 "expected_head_sha": expected_head_sha,
                 "observed_head_sha": observed_head_sha,
             },
-        )
-        blocked = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=task.state_token,
-            status=TaskStatus.BLOCKED,
-        )
-        if blocked is None:
-            raise StaleOperationError(
-                "the task could not move to blocked; the merge-staleness block is stale"
-            )
-        event_coordination.record_task_blocked_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_block_id=block.id,
             actor=_OPENORC_ACTOR,
         )
-        return block, blocked
+        return installation.task_block, installation.task
 
 
 def _install_retry_merge_gate(
@@ -926,13 +923,21 @@ def _apply_uncertain_merge_block(
 
     Same composed-transaction discipline as the merge-staleness block: the
     account-operational barrier and the exact Profile's Owner authority are
-    re-proven FIRST after the intervening GitHub calls, then — under the Task
-    row lock — the ``external_operation_uncertain`` TaskBlock is created with
-    durable safe context tied to the consumed gate, PR, and head (plus the
-    preserved confirmed merge commit where GitHub answered a known success),
-    the Task moves to ``blocked`` with a rotated token, and the
-    ``task_blocked`` audit records the condition. The uncertain merge request
-    is never repeated; recovery belongs to the later F2/F4/F4b layers.
+    re-proven FIRST after the intervening GitHub calls, then — under the
+    Task row lock — the F3 exceptional blocking foundation (#258) installs,
+    atomically, the ``external_operation_uncertain`` TaskBlock with durable
+    safe context tied to the consumed gate, PR, and head (plus the
+    preserved confirmed merge commit where GitHub answered a known
+    success), its pending ``BLOCK_RESOLUTION`` OwnerGate bound to it as the
+    only subject, the guarded ``blocked`` transition with one rotated
+    token, and the ``task_blocked`` / ``owner_gate_created`` audits under
+    the truthful OPENORC actor. The merge gate was already consumed by the
+    one-shot approval, so the NULL-safe pointer expectation is the Task's
+    locked (absent) pointer. This is the distinct pre-send/reconciliation
+    uncertainty classification (issue #280): never a
+    ``GITHUB_STATE_MISMATCH``, and #267's separate uncertain merge-SEND
+    handling through Level 2 is untouched. The uncertain merge request is
+    never repeated; recovery belongs to the later F2/F4/F4b layers.
     """
     require_owner_write_authorization(
         pool, profile_id=profile_id, workspace_id=workspace_id, task_id=task_id
@@ -951,31 +956,19 @@ def _apply_uncertain_merge_block(
             task_id=task_id,
             expected_state_token=expected_state_token,
         )
-        block = block_records.create_task_block(
+        installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            reason=TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN,
-            context=block_context,
-        )
-        blocked = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=task.state_token,
-            status=TaskStatus.BLOCKED,
-        )
-        if blocked is None:
-            raise StaleOperationError(
-                "the task could not move to blocked; the uncertain-merge block is stale"
-            )
-        event_coordination.record_task_blocked_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_block_id=block.id,
+            expected_state_token=expected_state_token,
+            expected_status=task.status,
+            expected_current_owner_gate_id=task.current_owner_gate_id,
+            gate_type=OwnerGateType.BLOCK_RESOLUTION,
+            block_reason=TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN,
+            block_context=block_context,
             actor=_OPENORC_ACTOR,
         )
-        return block, blocked
+        return installation.task_block, installation.task
 
 
 def _classify_after_uncertain_merge_send(
