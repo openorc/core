@@ -13,14 +13,20 @@ Eligibility is rechecked on every invocation from durable state, never from
 a caller-supplied claim: the exact current non-archived Task under the
 caller's ``state_token``, in one of the safely inactive states —
 ``ready_to_plan``, ``queued``, ``waiting_for_owner`` at its exact current
-pending OwnerGate of any type, or ``blocked`` with every activity
-interruption positively settled. Autonomous progression
-(``planning``/``implementing``/``reviewing``) is inapplicable — the Owner
-uses Abort first — and an outstanding runtime work fact (an unsettled or
-unresolved Interrupt intent, an open Execution, a pending RuntimeRequest)
-vetoes Cancel. The veto composes the durable outstanding-work facts
-available in v1; per-send durable dispatch identity arrives with F2
-(#87/#89).
+pending OwnerGate of any type, or ``blocked`` with every durable
+outstanding runtime work fact accounted (issue #278: a ``blocked`` Task
+whose current gate is one of the three F3 exceptional kinds cancels
+through the same command and resolves that exact gate, while a gate-less
+``blocked`` Task keeps the legacy gate-less archival). Autonomous
+progression (``planning``/``implementing``/``reviewing``) is inapplicable —
+the Owner uses Abort first — and an outstanding runtime work fact (an
+unsettled or unresolved Interrupt intent, an open Execution, a pending
+RuntimeRequest, an F2 send claim still conservatively claimed on its
+current subject, an unsettled planning bootstrap, or a reserved
+unfinalized ReviewIteration still addressing the current subject without
+positively proven non-delivery evidence) vetoes Cancel. The veto composes
+every durable outstanding-work fact available in v1 (F2 #87 included);
+only truthfully superseded or positively accounted work permits Cancel.
 
 The command's ordering is load-bearing (issue #228 §4):
 
@@ -35,7 +41,10 @@ The command's ordering is load-bearing (issue #228 §4):
   gate-cancellation entrypoints): re-prove authorization, currentness,
   eligibility, and the accounted-runtime veto under the Task row lock;
   resolve the exact current pending gate ``CANCELLED`` with truthful OWNER
-  provenance (when one exists — no artificial gate is ever created);
+  provenance — the current gate of any type while ``WAITING_FOR_OWNER``,
+  and the exact current exceptional blocked-Task gate while ``BLOCKED``
+  (issue #278); no artificial gate is ever created and a gate-less blocked
+  or queued Task archives without one;
   close the OPEN ReviewLoops as actually present; archive ``CANCELLED``
   through the guarded archival primitive (which clears ``queued_at`` and
   the current-gate pointer and releases the issue mapping); commit the one
@@ -102,16 +111,35 @@ from openorc.domain.intents import (
     TaskPullRequestCloseIntent,
     TaskPullRequestCloseIntentStatus,
 )
+from openorc.domain.operational_failures import (
+    FailureEffectEvidence,
+    OriginalAttemptKind,
+)
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
-from openorc.domain.reviews import ReviewLoop, ReviewLoopStatus
+from openorc.domain.reviews import (
+    ReviewIteration,
+    ReviewLoop,
+    ReviewLoopPurpose,
+    ReviewLoopStatus,
+)
 from openorc.domain.runtime_requests import RuntimeRequestStatus
-from openorc.domain.tasks import Task, TaskStatus, TaskTerminalCause
+from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
+from openorc.domain.tasks import (
+    Task,
+    TaskPlanningBootstrapStage,
+    TaskStatus,
+    TaskTerminalCause,
+)
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import intents as intent_records
+from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import runtime_requests as runtime_request_records
+from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -142,6 +170,7 @@ from openorc.services.task_subject_guards import (
     require_canonical_task_pull_request_for_update,
     require_current_owner_gate,
     require_current_task,
+    require_owner_gate_unresolved_block_subject,
 )
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -184,6 +213,18 @@ _OPEN_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
         ExecutionStatus.RUNNING,
         ExecutionStatus.PAUSED,
         ExecutionStatus.PAUSED_FOR_APPROVAL,
+    }
+)
+
+# The three exceptional blocked-Task gate kinds (issue #258) whose exact
+# current gate the shared Owner cancellation resolves on a BLOCKED Task
+# (issue #278). Any other current gate kind on a blocked Task is an unsafe
+# gate fact and is rejected instead of resolved or silently dropped.
+_EXCEPTIONAL_BLOCKED_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
+    {
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
     }
 )
 
@@ -316,31 +357,259 @@ def _require_cancel_eligible_status(task: Task) -> None:
         )
 
 
-def _require_runtime_work_accounted(transaction_pool: DatabasePool, *, task_id: UUID) -> None:
+def _require_runtime_work_accounted(transaction_pool: DatabasePool, *, task: Task) -> None:
     """Veto cancellation while any durable runtime work fact is outstanding.
 
     The authoritative durable outstanding-work facts available in v1: an
     Interrupt intent that is not positively settled (unsettled, definitively
     failed — the interrupted work continues unaccounted — or unknown), an
-    open Execution, and a pending RuntimeRequest. Per-send durable dispatch
-    identity arrives with F2 (#87/#89).
+    open Execution, a pending RuntimeRequest, an F2 runtime-send claim still
+    conservatively claimed on its current subject, an unsettled planning
+    bootstrap, and a reserved unfinalized ReviewIteration still addressing
+    the Task's current subject. ``BLOCKED`` status, an Interrupt
+    acknowledgement, absence from the current-interaction display, and
+    missing evidence are never proof of quiescence: every family is
+    accounted from its own durable settlement/outcome facts, and only
+    truthfully superseded or positively accounted work permits Cancel.
     """
-    for intent in intent_records.list_task_interrupt_intents(transaction_pool, task_id=task_id):
+    pull_request = get_task_pull_request_for_task(transaction_pool, task_id=task.id)
+    for intent in intent_records.list_task_interrupt_intents(transaction_pool, task_id=task.id):
         if intent.status is not TaskInterruptIntentStatus.SETTLED:
             raise ConflictError(
                 "the task's activity interruption is not settled; the owner abort "
                 "settlement or reconciliation must account for it first"
             )
-    for execution in execution_records.list_task_executions(transaction_pool, task_id=task_id):
+    for execution in execution_records.list_task_executions(transaction_pool, task_id=task.id):
         if execution.status in _OPEN_EXECUTION_STATUSES:
             raise ConflictError("the task has an open execution; its runtime work is unaccounted")
     for request in runtime_request_records.list_task_runtime_requests(
-        transaction_pool, task_id=task_id
+        transaction_pool, task_id=task.id
     ):
         if request.status is RuntimeRequestStatus.PENDING:
             raise ConflictError(
                 "the task has a pending runtime request; a runtime turn is unaccounted"
             )
+    _require_send_claims_accounted(transaction_pool, task=task, pull_request=pull_request)
+    _require_bootstrap_accounted(transaction_pool, task=task)
+    _require_review_dispatches_accounted(transaction_pool, task=task, pull_request=pull_request)
+
+
+def _send_claim_subject_superseded(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    claim: send_claim_records.TaskRuntimeSendClaim,
+    pull_request: TaskPullRequest | None,
+) -> bool:
+    """Whether a claimed send's exact subject truthfully moved on.
+
+    The per-kind subject-currency semantics the F2 projection and the F4
+    triage verification encode: an initial PLAN dispatch has no superseded
+    form (a published plan revision settles the claim, so a claimed claim
+    is outstanding); a planning REVISE dispatch is superseded when its
+    routed iteration no longer addresses the Task's current plan revision
+    or a later-numbered iteration addressing the same revision exists; a
+    PR_COMPOSE dispatch settles at the composition finalize before
+    publication, so an existing canonical PR record proves its outcome
+    completed. A missing or unprovable subject is never superseded.
+    """
+    if claim.kind is TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH:
+        return False
+    if claim.kind is TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH:
+        return pull_request is not None
+    if claim.review_iteration_id is None or task.current_plan_revision_id is None:
+        return False
+    iteration = review_records.get_review_iteration(
+        transaction_pool, review_iteration_id=claim.review_iteration_id
+    )
+    if (
+        iteration is None
+        or iteration.task_id != task.id
+        or iteration.workspace_id != task.workspace_id
+    ):
+        return False
+    if iteration.plan_revision_id != task.current_plan_revision_id:
+        return True
+    for later in review_records.list_review_loop_iterations(
+        transaction_pool, review_loop_id=iteration.review_loop_id
+    ):
+        if (
+            later.iteration_number > iteration.iteration_number
+            and later.plan_revision_id == iteration.plan_revision_id
+        ):
+            return True
+    return False
+
+
+def _require_send_claims_accounted(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    pull_request: TaskPullRequest | None,
+) -> None:
+    """Veto while an F2 send claim is conservatively claimed on its subject.
+
+    A ``claimed`` claim is the committed pre-send identity whose formal
+    result is still outstanding; ``settled`` and ``known_nondelivery`` are
+    the positively accounted terminal forms. A claimed claim whose exact
+    subject truthfully moved on is superseded history and never vetoes;
+    anything else cannot be safely accounted for.
+    """
+    for claim in send_claim_records.list_task_runtime_send_claims(
+        transaction_pool, task_id=task.id
+    ):
+        if claim.status is not TaskRuntimeSendClaimStatus.CLAIMED:
+            continue
+        if _send_claim_subject_superseded(
+            transaction_pool, task=task, claim=claim, pull_request=pull_request
+        ):
+            continue
+        raise ConflictError(
+            "the task has an unsettled runtime send claim; its dispatch result "
+            "is outstanding and the cancellation is unsafe"
+        )
+
+
+def _require_bootstrap_accounted(transaction_pool: DatabasePool, *, task: Task) -> None:
+    """Veto while the claimed planning bootstrap interaction is unsettled.
+
+    The bootstrap's own stage/settlement evidence is its accounting fact: a
+    settled ``ready_for_planning`` stage or a published plan revision
+    resolves the interaction; an outstanding PREPARE control or an
+    unsettled prepared-stage transition on a Task with no published plan
+    revision is conservatively outstanding work.
+    """
+    evidence = task_records.get_task_planning_bootstrap_evidence(transaction_pool, task_id=task.id)
+    if evidence is None:
+        return
+    if evidence.stage is TaskPlanningBootstrapStage.READY_FOR_PLANNING:
+        return
+    if task.current_plan_revision_id is not None:
+        return
+    raise ConflictError(
+        "the task's planning bootstrap is unsettled; the planning establishment "
+        "is outstanding and the cancellation is unsafe"
+    )
+
+
+def _review_iteration_addresses_current_subject(
+    task: Task,
+    *,
+    loop: ReviewLoop,
+    iteration: ReviewIteration,
+    pull_request: TaskPullRequest | None,
+) -> bool:
+    """Whether the iteration still addresses the Task's current subject."""
+    if loop.purpose is ReviewLoopPurpose.PLANNING:
+        return (
+            iteration.plan_revision_id is not None
+            and iteration.plan_revision_id == task.current_plan_revision_id
+        )
+    return (
+        pull_request is not None
+        and iteration.task_pull_request_id == pull_request.id
+        and iteration.reviewed_head_sha == pull_request.head_sha
+    )
+
+
+def _review_iteration_positively_accounted(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    iteration: ReviewIteration,
+) -> bool:
+    """Whether the iteration's runtime work is positively accounted.
+
+    Escalation alone never settles a Reviewer interaction: F4 escalates
+    positively proven pre-effect failures and uncertain-effect failures
+    alike. The one positive accounting fact is an operational-failure
+    episode rooted at exactly this iteration, terminally escalated to
+    exactly the Task's current gate's bound TaskBlock, whose escalated
+    block context carries the positive pre-effect non-delivery evidence
+    (``pre_effect_not_applied``) with coherent identities. Missing,
+    uncertain, known-failed, or mismatched evidence is unsettled.
+    """
+    episode = failure_records.get_operational_failure_episode_by_original_attempt(
+        transaction_pool,
+        original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+        original_attempt_id=iteration.id,
+    )
+    if (
+        episode is None
+        or episode.workspace_id != task.workspace_id
+        or episode.task_id != task.id
+        or episode.operation_family is not PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
+        or episode.escalated_task_block_id is None
+    ):
+        return False
+    escalated_block = block_records.get_task_block(
+        transaction_pool, task_block_id=episode.escalated_task_block_id
+    )
+    if (
+        escalated_block is None
+        or escalated_block.workspace_id != task.workspace_id
+        or escalated_block.task_id != task.id
+    ):
+        return False
+    context = escalated_block.context
+    if (
+        context.get("failure_episode_id") != str(episode.id)
+        or context.get("operation_family")
+        != PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW.value
+        or context.get("original_attempt_kind") != OriginalAttemptKind.REVIEW_ITERATION.value
+        or context.get("original_attempt_id") != str(iteration.id)
+        or context.get("effect_evidence") != FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED.value
+    ):
+        return False
+    if task.current_owner_gate_id is None:
+        return False
+    gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=task.current_owner_gate_id)
+    return (
+        gate is not None
+        and gate.workspace_id == task.workspace_id
+        and gate.task_id == task.id
+        and gate.task_block_id == episode.escalated_task_block_id
+    )
+
+
+def _require_review_dispatches_accounted(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    pull_request: TaskPullRequest | None,
+) -> None:
+    """Veto while a reserved unfinalized ReviewIteration is current work.
+
+    The latest-numbered unfinalized iteration of an OPEN loop is the
+    E3a/E9a reserved attempt whose REVIEW send already happened or whose
+    formal result is still outstanding; a newer attempt supersedes it and
+    a subject that moved on is history. Only positively accounted work
+    (see :func:`_review_iteration_positively_accounted`) permits Cancel.
+    """
+    for loop in review_records.list_task_review_loops(
+        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
+    ):
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        unfinalized = [iteration for iteration in iterations if iteration.outcome is None]
+        if not unfinalized:
+            continue
+        latest = max(unfinalized, key=lambda iteration: iteration.iteration_number)
+        latest_overall = max(iterations, key=lambda iteration: iteration.iteration_number)
+        if latest_overall.id != latest.id:
+            # A newer attempt — finalized or not — superseded this one.
+            continue
+        if not _review_iteration_addresses_current_subject(
+            task, loop=loop, iteration=latest, pull_request=pull_request
+        ):
+            continue
+        if _review_iteration_positively_accounted(transaction_pool, task=task, iteration=latest):
+            continue
+        raise ConflictError(
+            "the task has an outstanding reviewer review dispatch; its formal "
+            "result is unaccounted and the cancellation is unsafe"
+        )
 
 
 def _resolve_close_obligation(
@@ -377,9 +646,11 @@ def _cancel_composition(
     Workspace/Task scope first, the Task row lock, the currentness re-proof
     under the caller's expected token, the eligibility classification and
     the accounted-runtime veto, then — atomically — the exact current
-    pending gate's ``CANCELLED`` resolution with truthful OWNER provenance
-    (only when one exists; no artificial gate is created for blocked/queue
-    states). The trusted GitHub-observation path (#229) derives the
+    pending gate's ``CANCELLED`` resolution with truthful OWNER provenance:
+    any-type current gate while ``WAITING_FOR_OWNER``, and the exceptional
+    blocked-Task gate while ``BLOCKED`` (issue #278); no artificial gate is
+    created for gate-less blocked/queue states. The trusted
+    GitHub-observation path (#229) derives the
     account-operational barrier from durable Workspace ownership, locks the
     Task, and proves the durable canonical PR closed-unmerged under the PR
     row lock held through the archival — no gate resolution, no runtime
@@ -473,7 +744,7 @@ def _cancel_composition(
                 expected_state_token=owner_expected_token,
             )
             _require_cancel_eligible_status(task)
-            _require_runtime_work_accounted(transaction_pool, task_id=task_id)
+            _require_runtime_work_accounted(transaction_pool, task=task)
             if preflight_pull_request_id is not None:
                 # The pre-decision canonical-PR facts are revalidated under
                 # the Task row lock BEFORE any mutation: B7 reconciliation
@@ -496,6 +767,7 @@ def _cancel_composition(
                     # the time the final Task lock was acquired: never an
                     # Owner CANCELLED claim — E10a's completion path applies.
                     raise _ConfirmedMergeAtDecision
+            gate: OwnerGate | None = None
             if task.status is TaskStatus.WAITING_FOR_OWNER:
                 gate_id = owner_gate_id if owner_gate_id is not None else task.current_owner_gate_id
                 if gate_id is None:
@@ -514,6 +786,31 @@ def _cancel_composition(
                         "only the current "
                         f"{expected_gate_type.value} gate cancels through this seam"
                     )
+            elif task.status is TaskStatus.BLOCKED and task.current_owner_gate_id is not None:
+                # F7-prep (issue #278): the one shared Owner Cancel path also
+                # resolves the exact current exceptional gate of a BLOCKED
+                # Task. The gate must be pending, current, one of the three
+                # exceptional kinds, and bound to its still-unresolved
+                # TaskBlock subject; missing, mismatched, superseded,
+                # wrong-kind, or otherwise unsafe gate facts are rejected
+                # rather than silently dropping gate authority. A gate-less
+                # BLOCKED Task keeps the legacy gate-less archival (F7 owns
+                # those rows' truthful migration).
+                gate_id = owner_gate_id if owner_gate_id is not None else task.current_owner_gate_id
+                gate = require_current_owner_gate(
+                    transaction_pool, task=task, owner_gate_id=gate_id
+                )
+                if gate.gate_type not in _EXCEPTIONAL_BLOCKED_GATE_TYPES:
+                    raise ConflictError(
+                        "only the current exceptional blocked-task gate cancels through this seam"
+                    )
+                if expected_gate_type is not None and gate.gate_type is not expected_gate_type:
+                    raise ConflictError(
+                        "only the current "
+                        f"{expected_gate_type.value} gate cancels through this seam"
+                    )
+                require_owner_gate_unresolved_block_subject(transaction_pool, task=task, gate=gate)
+            if gate is not None:
                 resolution = gate_records.resolve_owner_gate(
                     transaction_pool,
                     owner_gate_id=gate.id,
@@ -979,7 +1276,7 @@ def cancel_task(
                 expected_state_token=expected_state_token,
             )
             _require_cancel_eligible_status(task)
-            _require_runtime_work_accounted(transaction_pool, task_id=task_id)
+            _require_runtime_work_accounted(transaction_pool, task=task)
             pull_request = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
             if pull_request is not None and pull_request.workspace_id != task.workspace_id:
                 raise NotFoundError(

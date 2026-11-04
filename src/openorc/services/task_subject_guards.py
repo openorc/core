@@ -41,10 +41,12 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from openorc.domain.blocks import TaskBlock
 from openorc.domain.gates import OwnerGate, OwnerGateStatus
 from openorc.domain.planning import PlanRevision
 from openorc.domain.pull_requests import TaskPullRequest
 from openorc.domain.tasks import Task
+from openorc.persistence.blocks import get_task_block
 from openorc.persistence.gates import get_owner_gate
 from openorc.persistence.planning import get_plan_revision
 from openorc.persistence.pool import DatabasePool
@@ -61,6 +63,7 @@ __all__ = [
     "require_current_owner_gate",
     "require_current_plan_revision",
     "require_current_task",
+    "require_owner_gate_unresolved_block_subject",
     "require_pending_owner_gate_in_task",
     "require_plan_revision_in_task",
     "require_task_pull_request_head",
@@ -188,6 +191,32 @@ def require_current_owner_gate(pool: DatabasePool, *, task: Task, owner_gate_id:
             "the owner gate is no longer the task's current gate; the operation is stale"
         )
     return gate
+
+
+def require_owner_gate_unresolved_block_subject(
+    pool: DatabasePool, *, task: Task, gate: OwnerGate
+) -> TaskBlock:
+    """Prove an exceptional gate's exact unresolved TaskBlock subject.
+
+    The three exceptional blocked-Task gate kinds (issue #258) bind exactly
+    one unresolved TaskBlock as their only subject. A workflow consequence
+    that consumes such a gate must prove that subject is still the gate's
+    truthful, unresolved blocking condition before any effect: a gate with
+    no block binding, one bound to another Task or Workspace, or one whose
+    block has already resolved is not a safe subject. Missing, unbound, and
+    cross-scope subjects are uniformly ``NotFoundError``; an already-
+    resolved block is a moved-on subject and a ``StaleOperationError``.
+    """
+    if gate.task_block_id is None:
+        raise NotFoundError("the owner gate's block subject is not available for this task")
+    block = get_task_block(pool, task_block_id=gate.task_block_id)
+    if block is None or block.workspace_id != task.workspace_id or block.task_id != task.id:
+        raise NotFoundError("the owner gate's block subject is not available for this task")
+    if block.resolved_at is not None:
+        raise StaleOperationError(
+            "the owner gate's block subject has already resolved; the operation is stale"
+        )
+    return block
 
 
 def require_canonical_task_pull_request(pool: DatabasePool, *, task: Task) -> TaskPullRequest:

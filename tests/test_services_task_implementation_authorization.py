@@ -187,6 +187,9 @@ _LOOPS_LIST = _sql_has("from openorc.review_loops where task_id")
 _INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
 _EXECUTIONS_LIST = _sql_has("from openorc.executions where task_id")
 _RUNTIME_REQUESTS_LIST = _sql_has("from openorc.runtime_requests where task_id")
+_PR_READ = _sql_has("from openorc.task_pull_requests where task_id")
+_SEND_CLAIMS_LIST = _sql_has("from openorc.task_runtime_send_claims where task_id")
+_BOOTSTRAP_EVIDENCE_READ = _sql_has("planning_bootstrap_stage", "from openorc.tasks")
 _LOOP_READ_LOCKED = _sql_lacks(
     _sql_has("from openorc.review_loops where id", "for update"), "select status, purpose"
 )
@@ -470,6 +473,10 @@ def _script_cancellation(
     conn.on(_INTENTS_LIST, [])  # the accounted-runtime veto reads
     conn.on(_EXECUTIONS_LIST, [])
     conn.on(_RUNTIME_REQUESTS_LIST, [])
+    conn.on(_PR_READ, [])  # the veto's canonical-PR read: no pull request exists
+    conn.on(_SEND_CLAIMS_LIST, [])  # the veto's F2 send-claim read
+    conn.on(_BOOTSTRAP_EVIDENCE_READ, [])  # the veto's planning-bootstrap read
+    conn.on(_LOOPS_LIST, [])  # the veto's OPEN review-loop read
     conn.on(_GATE_READ, gate)  # require_current_owner_gate
     conn.on(_GATE_READ, gate)  # the resolution's gate read
     conn.on(_TASK_READ_LOCKED, waiting)  # the resolution's Task row lock
@@ -1083,6 +1090,10 @@ def test_cancel_refuses_a_gate_that_lost_currency() -> None:
     conn.on(_INTENTS_LIST, [])  # the accounted-runtime veto reads
     conn.on(_EXECUTIONS_LIST, [])
     conn.on(_RUNTIME_REQUESTS_LIST, [])
+    conn.on(_PR_READ, [])  # the veto's canonical-PR read: no pull request exists
+    conn.on(_SEND_CLAIMS_LIST, [])  # the veto's F2 send-claim read
+    conn.on(_BOOTSTRAP_EVIDENCE_READ, [])  # the veto's planning-bootstrap read
+    conn.on(_LOOPS_LIST, [])  # the veto's OPEN review-loop read
     conn.on(_GATE_READ, _gate_row())
 
     with pytest.raises(StaleOperationError, match="current gate"):
