@@ -40,7 +40,7 @@ Planned coverage layers include:
 
 `tests/integration/` holds suites that require real infrastructure. They are excluded from the ordinary deterministic baseline by the default pytest configuration and must be invoked explicitly.
 
-The Owner-run command for these suites is the devserver's `--testdb` mode. It reuses the canonical ephemeral Supabase branch lifecycle: provision a non-production branch, apply the committed migrations, run every persistence integration suite under `tests/integration` (or an explicitly supplied command) with `OPENORC_TEST_DATABASE_URL` pointing at the branch database, and delete the branch on exit:
+The Owner-run command for these suites is the devserver's `--testdb` mode. It reuses the canonical ephemeral Supabase branch lifecycle: provision a non-production branch, apply the committed migrations, run every persistence integration suite under `tests/integration` (or an explicitly supplied command) with `OPENORC_TEST_DATABASE_URL` pointing at the branch database's session-pooled connection (port 5432), and delete the branch on exit:
 
 ```bash
 ./scripts/devserver.sh --testdb

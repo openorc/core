@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from openorc.devtools.devserver.environment import _strip_quotes
 from openorc.devtools.devserver.errors import DevserverError
@@ -27,6 +28,11 @@ BRANCH_SETTLE_SECONDS_ENV = "OPENORC_SUPABASE_BRANCH_SETTLE_SECONDS"
 BRANCH_WAIT_MAX_ATTEMPTS_DEFAULT = 60
 BRANCH_WAIT_SLEEP_SECONDS_DEFAULT = 5.0
 BRANCH_SETTLE_SECONDS_DEFAULT = 10.0
+
+# Supabase publishes POSTGRES_URL as the transaction pooler (port 6543); the
+# same pooler host serves session mode on 5432 (issue #276).
+TRANSACTION_POOLER_PORT = 6543
+SESSION_POOLER_PORT = 5432
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +71,42 @@ class BranchEnvironment:
     def database_url(self) -> str:
         """Pooler URL preferred over the direct (non-pooling) URL."""
         return self.pooler_url or self.direct_url
+
+    @property
+    def testdb_database_url(self) -> str:
+        """Session-pooler connection URL for the --testdb test process (issue #276).
+
+        The migration-heavy integration fixture resets the schema and reapplies
+        migrations on this connection, and the transaction pooler repeatedly
+        severed those sessions (psycopg.errors.AdminShutdown), so the test
+        connection uses the same pooler host's session port (5432) instead.
+        Only the known Supabase pooler URL shape is converted; credentials,
+        hostname, database, and URL options are preserved. When no pooler URL
+        is published, the direct non-pooling URL is already a dedicated 5432
+        connection and is used as-is. Unexpected shapes fail closed rather
+        than guessing a conversion.
+        """
+        if not self.pooler_url:
+            return self.direct_url
+        parts = urlsplit(self.pooler_url)
+        host = parts.hostname or ""
+        if parts.scheme not in ("postgresql", "postgres") or not host.endswith(
+            ".pooler.supabase.com"
+        ):
+            raise DevserverError(
+                "Supabase branch pooler URL is not the known Supabase pooler shape; "
+                "refusing to derive a session-pooler test connection."
+            )
+        if parts.port in (None, SESSION_POOLER_PORT):
+            return self.pooler_url
+        if parts.port != TRANSACTION_POOLER_PORT:
+            raise DevserverError(
+                f"Unexpected Supabase branch pooler URL port {parts.port}; refusing "
+                "to derive a session-pooler test connection."
+            )
+        transaction_suffix = f":{TRANSACTION_POOLER_PORT}"
+        session_netloc = parts.netloc[: -len(transaction_suffix)] + f":{SESSION_POOLER_PORT}"
+        return urlunsplit(parts._replace(netloc=session_netloc))
 
     @property
     def runtime_overrides(self) -> dict[str, str]:

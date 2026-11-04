@@ -492,9 +492,10 @@ class Devserver:
         --testdb provisions the canonical ephemeral Supabase branch, applies
         the current checkout's committed migrations (seed data is not
         applied), runs the command supplied after '--' with
-        OPENORC_TEST_DATABASE_URL pointed at the branch database, and
-        deletes the branch on exit via the single cleanup path. Nothing
-        else is started: no app, API, worker, queue backend, or ngrok.
+        OPENORC_TEST_DATABASE_URL pointed at the branch's session-pooler
+        database connection (issue #276), and deletes the branch on exit via
+        the single cleanup path. Nothing else is started: no app, API,
+        worker, queue backend, or ngrok.
         """
         command = list(self._config.testdb_command or ())
         if not command:  # unreachable: parse_args enforces a non-empty command
@@ -505,12 +506,15 @@ class Devserver:
         branch_environment = self._provision_supabase_branch(manager)
         manager.apply_migrations()
 
-        database_url = branch_environment.database_url
+        database_url = branch_environment.testdb_database_url
         if not database_url:  # fail closed even though readiness implies it
             raise DevserverError("Supabase branch did not publish database credentials.")
         child_env = dict(self._env)
         # The integration contract is specifically OPENORC_TEST_DATABASE_URL;
         # the branch URL is never mapped onto application DATABASE_URL here.
+        # The test connection uses the branch's session-pooler port 5432
+        # (issue #276): the transaction pooler repeatedly severed the
+        # migration-heavy fixture's sessions (psycopg.errors.AdminShutdown).
         child_env["OPENORC_TEST_DATABASE_URL"] = database_url
         self._log.log(
             f"Running testdb command against branch '{manager.branch_name}' "
