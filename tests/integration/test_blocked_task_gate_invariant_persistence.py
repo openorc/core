@@ -174,9 +174,13 @@ def test_a_second_unresolved_block_is_unrepresentable(conn: Connection[Any]) -> 
 
 def test_the_bound_block_cannot_be_deleted_while_bound(conn: Connection[Any]) -> None:
     facts, result = _blocked_task(conn)
-    # The gate-subject linkage FK is NO ACTION DEFERRABLE INITIALLY DEFERRED:
-    # the deletion is refused at the committed-state boundary.
-    with pytest.raises(ForeignKeyViolation), conn.transaction():
+    # Deleting the bound block of a current blocked Task's current gate is
+    # refused at the committed-state boundary by whichever deferred check
+    # fires first — the invariant trigger (the blocked Task would lose its
+    # exact exceptional authority) or the NO ACTION DEFERRABLE INITIALLY
+    # DEFERRED gate-subject linkage FK. Either refusal proves the invalid
+    # deletion cannot persist.
+    with pytest.raises((ForeignKeyViolation, RaiseException)), conn.transaction():
         conn.execute(
             "delete from openorc.task_blocks where id = %s",
             (result.task_block.id,),
