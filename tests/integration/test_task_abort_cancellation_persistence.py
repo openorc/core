@@ -392,17 +392,21 @@ def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -
     assert intents[0].external_session_id == _EXTERNAL_SESSION_ID
     # The F3 composition also committed the pending BLOCK_RESOLUTION gate
     # bound to the block as its only subject, installed as the Task's
-    # current gate.
+    # current OwnerGate pointer.
     gate_row = (
         facts["conn"]
         .execute(
-            "select gate_type, status, task_block_id from openorc.owner_gates where task_id = %s",
+            "select id, gate_type, status, task_block_id "
+            "from openorc.owner_gates where task_id = %s",
             (facts["task_id"],),
         )
         .fetchall()
     )
-    assert gate_row == [("block_resolution", "pending", blocks[0].id)]
-    assert task.current_owner_gate_id == blocks[0].id
+    assert len(gate_row) == 1
+    gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
+    assert gate_type == "block_resolution" and gate_status == "pending"
+    assert gate_block_id == blocks[0].id
+    assert task.current_owner_gate_id == gate_id
     assert _event_counts(facts["conn"], facts["task_id"]) == {
         "task_blocked": 1,
         "owner_gate_created": 1,

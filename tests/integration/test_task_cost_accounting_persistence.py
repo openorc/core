@@ -511,16 +511,22 @@ class TestAtomicCostLimitBlock:
         # gate bound to the block as its only subject, with its OWNER
         # owner_gate_created audit, installed as the Task's current gate.
         gate_row = conn.execute(
-            "select gate_type, status, task_block_id from openorc.owner_gates where task_id = %s",
+            "select id, gate_type, status, task_block_id "
+            "from openorc.owner_gates where task_id = %s",
             (task_id,),
         ).fetchall()
         assert len(gate_row) == 1
-        assert gate_row[0][0] == "block_resolution" and gate_row[0][1] == "pending"
+        gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
+        assert gate_type == "block_resolution" and gate_status == "pending"
+        assert gate_block_id == (
+            _scalar(conn, "select id from openorc.task_blocks where task_id = %s", (task_id,))
+        )
+        # The installed gate is the Task's current OwnerGate pointer.
         assert (
             _scalar(
                 conn, "select current_owner_gate_id from openorc.tasks where id = %s", (task_id,)
             )
-            == gate_row[0][2]
+            == gate_id
         )
         gate_event_row = conn.execute(
             "select actor_type, actor_id from openorc.workflow_events "
