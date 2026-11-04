@@ -29,20 +29,26 @@ family; mutable evidence that can settle without rotating the Task token
 
 Retry eligibility is one explicit small matrix: the family must support a
 distinct logical-attempt path (the implementation-execution family, whose
-durable identity is the fresh per-Task Execution row, and — F5d (#267) —
-the exact-head GitHub merge family, whose durable identity is the approved
+durable identity is the fresh per-Task Execution row, — F5d (#267) — the
+exact-head GitHub merge family, whose durable identity is the approved
 ``MERGE_DECISION`` gate UUID and whose one-shot consumption evidence is the
-attempt's own ``consumed_at`` stamp), the code must be the classified
-transient failure of that family, the evidence must pass the family-scoped
-rule (positive pre-effect proof for runtime families; for the merge family
-classified uncertainty additionally admits retry because its repeat-safety
-proof is structural — GitHub's documented expected-head guard and the
-canonical PR's single merged state — never provider prose and never a
-caller-supplied flag), durable corroboration must agree (the
-``execution_failed`` audit event's safe failure-kind for the exact
-Execution, or the merge family's one-shot ``MERGE_REQUESTED`` Owner claim
-on the consumed gate), and the episode's three-additional-attempt budget
-must have room, and the (family, code) pairing is exact — a crossed
+attempt's own ``consumed_at`` stamp, and — F5f (#269) — the exact-head
+PR-authorization presentation family, whose durable identity is the
+SUCCESSFUL E6 Execution UUID and whose one-shot consumption evidence is
+likewise the attempt's own ``consumed_at`` stamp), the code must be the
+classified transient failure of that family, the evidence must pass the
+family-scoped rule (positive pre-effect proof for runtime families; for the
+merge family classified uncertainty additionally admits retry because its
+repeat-safety proof is structural — GitHub's documented expected-head guard
+and the canonical PR's single merged state — never provider prose and never
+a caller-supplied flag; the presentation family admits only positive
+pre-effect proof, which its single-durable-effect shape structurally
+provides), durable corroboration must agree (the ``execution_failed`` audit
+event's safe failure-kind for the exact Execution, the merge family's
+one-shot ``MERGE_REQUESTED`` Owner claim on the consumed gate, or the
+presentation family's still-SUCCEEDED root Execution under the still
+current pre-gate Task state), and the episode's three-additional-attempt
+budget must have room, and the (family, code) pairing is exact — a crossed
 combination (a merge report carrying a runtime code, or an implementation
 report carrying the external-transport code) is never retry-eligible.
 Everything else escalates: the F2 one-shot claim families have no legitimate
@@ -88,6 +94,7 @@ from openorc.domain.operational_failures import (
     OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
     canonical_bounded_failure_context,
     canonical_failure_subject,
 )
@@ -255,12 +262,21 @@ class OperationalFailureDisposition:
 # - the exact-head GitHub merge family (F5d, issue #267; its distinct
 #   attempts are the F4 authorizations themselves, rooted at the approved
 #   MERGE_DECISION gate UUID) with the classified transient external-
-#   transport failure of a GitHub merge send.
+#   transport failure of a GitHub merge send; and
+# - the exact-head PR-authorization presentation family (F5f, issue #269;
+#   its distinct attempts are the F4 authorizations themselves, rooted at
+#   the SUCCESSFUL E6 Execution UUID) with the classified transient
+#   external-transport failure of a GitHub read — ONLY the adapter's narrow
+#   transport-uncertain subclass in the read error's cause chain; a plain
+#   interpretable-response uncertainty (e.g. a 5xx read) and every known
+#   provider failure escalate.
 #
 # A crossed family/code combination is never retry-eligible: a merge report
 # carrying a runtime code lacks the required classified GitHub merge-send
-# transport failure, and an implementation report carrying the external-
-# transport code lacks the classified runtime failure. Every F2 one-shot
+# transport failure, an implementation report carrying the external-
+# transport code lacks the classified runtime failure, and a presentation
+# report carrying anything but the narrow transport code lacks the
+# classified transient GitHub read failure. Every F2 one-shot
 # send claim, the bootstrap claim, the E3a iteration reservation, and the
 # one-shot E9 remediation claim have no legitimate new-attempt path and
 # always escalate, even when the network failure was positively pre-effect.
@@ -274,6 +290,10 @@ _RETRY_ELIGIBLE_PAIRS: frozenset[tuple[OperationalFailureFamily, OperationalFail
             ),
             (
                 GitHubMergeOperation.EXACT_HEAD_MERGE,
+                OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+            ),
+            (
+                PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
                 OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
             ),
         }
@@ -354,6 +374,14 @@ _FAMILY_IDENTITY_KINDS: Mapping[OperationalFailureFamily, frozenset[OriginalAtte
             # an original attempt.
             GitHubMergeOperation.EXACT_HEAD_MERGE: frozenset(
                 {OriginalAttemptKind.MERGE_DECISION_GATE}
+            ),
+            # F5f (issue #269): the presentation family roots at the
+            # SUCCESSFUL E6 Execution UUID — the original durable
+            # implementation-attempt identity. The episode never labels that
+            # execution failed; the family carries the presentation
+            # semantics.
+            PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION: (
+                frozenset({OriginalAttemptKind.EXECUTION})
             ),
         }
     )
@@ -445,11 +473,16 @@ def triage_operational_failure(
         raise InvalidCommandError("operation must be an OperationalFailureOperation")
     if not isinstance(
         operation.family,
-        (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation),
+        (
+            PendingTaskRuntimeInteractionOperation,
+            GitHubMergeOperation,
+            PRAuthorizationPresentationOperation,
+        ),
     ):
         raise InvalidCommandError(
-            "operation.family must be a pending-interaction operation or the "
-            "exact-head GitHub merge family"
+            "operation.family must be a pending-interaction operation, the "
+            "exact-head GitHub merge family, or the exact-head PR-authorization "
+            "presentation family"
         )
     if not isinstance(operation.original_attempt_kind, OriginalAttemptKind):
         raise InvalidCommandError("operation.original_attempt_kind must be an OriginalAttemptKind")
@@ -710,6 +743,21 @@ def _triage_locked(
             ):
                 return _stale_no_op()
         elif (
+            operation.family
+            is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+        ):
+            # F5f (issue #269): the presentation family's one-shot
+            # consumed-attempt evidence replaces the resulting-Execution
+            # binding exactly like the merge family — an authorized
+            # re-presentation creates no Execution row; the report must
+            # address the consumed attempt's own identity and prove its
+            # set-once consumption stamp.
+            if (
+                reported_attempt.consumed_at is None
+                or report.effect_attempt_id != reported_attempt.id
+            ):
+                return _stale_no_op()
+        elif (
             reported_attempt.resulting_execution_id is None
             or reported_attempt.resulting_execution_id != report.effect_attempt_id
         ):
@@ -754,6 +802,21 @@ def _triage_locked(
                 workspace_id=workspace_id,
                 task_id=task_id,
                 owner_gate_id=operation.original_attempt_id,
+            )
+        elif (
+            operation.family
+            is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+        ):
+            # F5f (issue #269): the presentation family's durable
+            # corroboration is the structural subject proof — the episode's
+            # root Execution still durably SUCCEEDED under the still-current
+            # pre-gate Task state — never an execution-failure audit (the
+            # E6 execution succeeded) and never provider prose.
+            retry_eligible = _corroborate_pr_authorization_presentation(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=operation.original_attempt_id,
             )
         else:
             retry_eligible = _corroborate_pre_effect_execution_failure(
@@ -850,6 +913,14 @@ def _verify_family(
             task_id=task_id,
             operation=operation,
         )
+    if family is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION:
+        return _verify_pr_authorization_presentation_family(
+            transaction_pool,
+            task=task,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            operation=operation,
+        )
     return _verify_execution_family(
         transaction_pool,
         task=task,
@@ -933,7 +1004,10 @@ def _effect_evidence_eligible(
 
     Runtime families demand positive pre-effect proof — the only evidence
     that can support a safe retry of an operation whose effect is unknown.
-    The exact-head merge family (F5d, issue #267) additionally admits
+    The exact-head PR-authorization presentation family (F5f, issue #269)
+    likewise admits only positive pre-effect proof, which its
+    single-durable-effect shape structurally provides. The exact-head merge
+    family (F5d, issue #267) additionally admits
     classified uncertainty: an unknown merge-send outcome never proves
     non-delivery, and this family's repeat-safety proof is structural —
     GitHub's documented expected-head guard plus the canonical PR's single
@@ -1004,6 +1078,59 @@ def _verify_merge_family(
     return _VerifiedFailure(session_lost=False)
 
 
+def _verify_pr_authorization_presentation_family(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    workspace_id: UUID,
+    task_id: UUID,
+    operation: OperationalFailureOperation,
+) -> _VerifiedFailure | OperationalFailureDisposition:
+    """Verify one exact-head presentation family report against durable authority (F5f).
+
+    The episode roots at the durably finalized SUCCESSFUL E6 Execution —
+    expected for this family and the deliberate inverse of the execution
+    families' SUCCEEDED rejection, which stays exactly intact for them. The
+    report stays current only while that execution is still the Task's
+    successful implementation attempt (same scope, never a PR-remediation
+    execution), the Task is still in the pre-gate ``implementing`` state
+    with no current gate — the structural pre-effect proof, since the
+    presentation's single durable effect would have installed the gate and
+    rotated the token — and the approved implementation subject is still in
+    force: the exact current plan revision and its APPROVED
+    ``IMPLEMENTATION_AUTHORIZATION`` gate. The presentation performs no
+    runtime interaction: like the merge family, there is no role/session
+    binding to verify, so session loss is never its blocking fact.
+    """
+    if operation.original_attempt_kind is not OriginalAttemptKind.EXECUTION:
+        return _stale_no_op()
+    execution = execution_records.get_execution_for_update(
+        transaction_pool, execution_id=operation.original_attempt_id
+    )
+    if execution is None or execution.workspace_id != workspace_id or execution.task_id != task_id:
+        return _stale_no_op()
+    if execution.status is not ExecutionStatus.SUCCEEDED:
+        # The deliberate inverse of the execution families' contradiction
+        # check: a presentation episode only ever roots at the successful
+        # E6 attempt, never at a failed or still-running one.
+        return _stale_no_op()
+    if execution.review_iteration_id is not None:
+        return _stale_no_op()
+    if task.status is not TaskStatus.IMPLEMENTING or task.current_owner_gate_id is not None:
+        return _stale_no_op()
+    if task.current_plan_revision_id is None:
+        return _stale_no_op()
+    gate = _resolve_approved_implementation_gate(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        revision_id=task.current_plan_revision_id,
+    )
+    if gate is None:
+        return _stale_no_op()
+    return _VerifiedFailure(session_lost=False)
+
+
 def _corroborate_merge_requested_claim(
     transaction_pool: DatabasePool,
     *,
@@ -1048,6 +1175,40 @@ def _corroborate_merge_requested_claim(
         if claimed == str(owner_gate_id):
             return True
     return False
+
+
+def _corroborate_pr_authorization_presentation(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+) -> bool:
+    """The presentation family's durable corroboration: the structural facts (F5f).
+
+    Positive proof the reported attempt actually addresses this episode's
+    successful-implementation presentation subject: the exact episode-root
+    Execution must still be the same-scope durably SUCCEEDED implementation
+    attempt, and the Task must still be in the pre-gate ``implementing``
+    state with no current gate — the state the presentation's single durable
+    effect would have replaced. Any other state is the fail-closed
+    ``False`` — never a retry permission, never a guess.
+    """
+    execution = execution_records.get_execution_for_update(
+        transaction_pool, execution_id=execution_id
+    )
+    if (
+        execution is None
+        or execution.workspace_id != workspace_id
+        or execution.task_id != task_id
+        or execution.status is not ExecutionStatus.SUCCEEDED
+        or execution.review_iteration_id is not None
+    ):
+        return False
+    task = task_records.get_task_for_update(transaction_pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return False
+    return task.status is TaskStatus.IMPLEMENTING and task.current_owner_gate_id is None
 
 
 def _verify_send_claim_family(

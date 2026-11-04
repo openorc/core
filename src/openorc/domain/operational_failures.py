@@ -30,9 +30,15 @@ exceptional TaskBlock (#258) that blocked the Task.
 - Operation families reuse the F2 pending-interaction operation vocabulary
   (the closed set of the automated workflow's claimed consequential
   interactions) plus — from F5d (issue #267) — the one explicit exact-head
-  GitHub merge family (:class:`GitHubMergeOperation`). A merge is never
+  GitHub merge family (:class:`GitHubMergeOperation`) and — from F5f (issue
+  #269) — the one explicit exact-head PR-authorization presentation family
+  (:class:`PRAuthorizationPresentationOperation`). A merge is never
   mislabeled as a pending agent-runtime interaction, and no further parallel
-  vocabulary exists.
+  vocabulary exists. The presentation family roots its episodes at the
+  existing successful E6 ``Execution`` UUID (``OriginalAttemptKind.EXECUTION``)
+  — never labelling that execution failed; the execution is the durable
+  identity/currentness root and the family carries the presentation
+  semantics.
 - ``OperationalFailureEpisode`` carries the episode's scope, family, original
   identity, canonical safe subject, and its terminal escalation disposition:
   ``escalated_task_block_id`` references the exact unresolved TaskBlock the
@@ -75,6 +81,7 @@ __all__ = [
     "OperationalFailureFamily",
     "OperationalFailureSourceKind",
     "OriginalAttemptKind",
+    "PRAuthorizationPresentationOperation",
     "canonical_bounded_failure_context",
     "canonical_failure_subject",
     "operational_failure_attempt_field_names",
@@ -183,13 +190,46 @@ class GitHubMergeOperation(StrEnum):
     EXACT_HEAD_MERGE = "exact_head_merge"
 
 
-OperationalFailureFamily = PendingTaskRuntimeInteractionOperation | GitHubMergeOperation
-"""The closed union of Level 2 operation-family vocabularies (F5d, issue #267)."""
+class PRAuthorizationPresentationOperation(StrEnum):
+    """The closed vocabulary of exact-head PR-authorization presentation
+    operation families (F5f, issue #269).
+
+    A deliberate, single-member extension of the Level 2 operation families:
+    the OpenOrc-authorized presentation of the exact-head
+    ``PR_AUTHORIZATION`` OwnerGate after a durably finalized successful
+    implementation (E7). It is deliberately NOT a member of the F2
+    pending-interaction runtime vocabulary — the presentation performs no
+    agent-runtime interaction — and it carries its own durable identity root:
+    the episode roots at the existing successful E6 ``Execution`` UUID under
+    ``OriginalAttemptKind.EXECUTION``, never labelling that execution failed
+    (the execution-status disjointness — E6-family episodes root only at
+    FAILED executions, this family only at SUCCEEDED ones — keeps the
+    episode uniqueness collision-free). The Level 2 repeat-safety proof is
+    structural: the presentation commits exactly one durable effect (the
+    guarded final composed transaction whose Task-token rotation is
+    observable), so a still-current recorded token proves the effect never
+    applied, and the guarded re-presentation can never duplicate a branch
+    bind or a gate.
+    """
+
+    EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION = "exact_head_pr_authorization_presentation"
+
+
+OperationalFailureFamily = (
+    PendingTaskRuntimeInteractionOperation
+    | GitHubMergeOperation
+    | PRAuthorizationPresentationOperation
+)
+"""The closed union of Level 2 operation-family vocabularies (F5f, issue #269)."""
 
 
 def operational_failure_family_from_value(
     value: str,
-) -> PendingTaskRuntimeInteractionOperation | GitHubMergeOperation:
+) -> (
+    PendingTaskRuntimeInteractionOperation
+    | GitHubMergeOperation
+    | PRAuthorizationPresentationOperation
+):
     """Resolve one stored operation-family value to its closed-vocabulary member."""
     try:
         return PendingTaskRuntimeInteractionOperation(value)
@@ -197,6 +237,10 @@ def operational_failure_family_from_value(
         pass
     try:
         return GitHubMergeOperation(value)
+    except ValueError:
+        pass
+    try:
+        return PRAuthorizationPresentationOperation(value)
     except ValueError as error:
         raise OperationalFailureDomainError(
             "the operation family value is not a member of the closed vocabulary"
@@ -323,7 +367,11 @@ class OperationalFailureEpisode:
     id: UUID
     workspace_id: UUID
     task_id: UUID
-    operation_family: PendingTaskRuntimeInteractionOperation | GitHubMergeOperation
+    operation_family: (
+        PendingTaskRuntimeInteractionOperation
+        | GitHubMergeOperation
+        | PRAuthorizationPresentationOperation
+    )
     original_attempt_kind: OriginalAttemptKind
     original_attempt_id: UUID
     subject: Mapping[str, object]
@@ -336,11 +384,16 @@ class OperationalFailureEpisode:
         _require_uuid(self.escalated_task_block_id, "escalated_task_block_id", nullable=True)
         if not isinstance(
             self.operation_family,
-            (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation),
+            (
+                PendingTaskRuntimeInteractionOperation,
+                GitHubMergeOperation,
+                PRAuthorizationPresentationOperation,
+            ),
         ):
             raise OperationalFailureDomainError(
                 "OperationalFailureEpisode.operation_family must be a "
-                "PendingTaskRuntimeInteractionOperation or a GitHubMergeOperation"
+                "PendingTaskRuntimeInteractionOperation, a GitHubMergeOperation, "
+                "or a PRAuthorizationPresentationOperation"
             )
         if not isinstance(self.original_attempt_kind, OriginalAttemptKind):
             raise OperationalFailureDomainError(

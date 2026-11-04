@@ -39,8 +39,10 @@ from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
     OperationalFailureCode,
+    OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
@@ -344,7 +346,7 @@ def _attempt_row(
 
 def _operation(
     *,
-    family: PendingTaskRuntimeInteractionOperation = (
+    family: OperationalFailureFamily = (
         PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
     ),
     kind: OriginalAttemptKind = OriginalAttemptKind.EXECUTION,
@@ -1587,6 +1589,310 @@ def test_an_implementation_report_with_a_crossed_transport_code_escalates() -> N
             code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
             evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
         ),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+# --- F5f: the exact-head PR-authorization presentation family ------------------
+
+
+def _presentation_operation() -> OperationalFailureOperation:
+    return _operation(
+        family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+        kind=OriginalAttemptKind.EXECUTION,
+        original_id=_EXECUTION_ID,
+    )
+
+
+def _presentation_report(
+    *,
+    code: OperationalFailureCode = OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+    reporting_kind: OperationalFailureSourceKind = OperationalFailureSourceKind.ORIGINAL,
+    reporting_id: Any = None,
+    effect: Any = None,
+) -> OperationalFailureReport:
+    return _report(
+        code=code,
+        evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+        reporting_kind=reporting_kind,
+        reporting_id=reporting_id,
+        effect=effect,
+    )
+
+
+def _script_presentation_authorization(conn: ScriptedConnection, *, prior: bool = False) -> None:
+    """The locked flow of one authorized presentation retry: the structural
+    corroboration (root Execution SUCCEEDED, pre-gate Task) authorizes the
+    attempt under the exact transport-code pair."""
+    task_row = _task(status="implementing", plan_revision=_REVISION_ID)
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_EXECUTION_LOCKED, _execution(status="succeeded", execution_id=_EXECUTION_ID))
+    conn.on(_GATES_LIST, [_impl_gate_row()])
+    if prior:
+        conn.on(_ATTEMPTS_LIST, [_attempt_row()])
+    conn.on(_EXECUTION_LOCKED, _execution(status="succeeded", execution_id=_EXECUTION_ID))
+    conn.on(_TASK_LOCKED, task_row)
+    if not prior:
+        conn.on(
+            _EPISODE_INSERT,
+            _episode_row(
+                family="exact_head_pr_authorization_presentation",
+                kind="execution",
+                original_id=_EXECUTION_ID,
+            ),
+        )
+    conn.on(
+        _ATTEMPT_INSERT,
+        _attempt_row(
+            ordinal=2 if prior else 1,
+            source_kind="prior_authorized" if prior else "original",
+            source_attempt_id=_ATTEMPT_1_ID if prior else _EXECUTION_ID,
+            error_code="external_transport_unavailable",
+            resulting_execution_id=None,
+            not_before=_NOW + timedelta(seconds=2),
+        ),
+    )
+
+
+def test_a_presentation_transport_failure_is_authorized_on_the_structural_facts() -> None:
+    """The presentation family's one retry-eligible (family, code) pair: the
+    narrowly typed transient GitHub transport classification over positively
+    proven pre-effect evidence, corroborated by the still-SUCCEEDED root
+    Execution under the still-current pre-gate Task state."""
+    conn = ScriptedConnection()
+    _script_presentation_authorization(conn)
+    result = _triage(conn, operation=_presentation_operation(), report=_presentation_report())
+    assert result.kind is DispositionKind.RETRY_AUTHORIZED
+    assert result.retry_attempt is not None
+    assert result.retry_attempt.error_code.value == "external_transport_unavailable"
+    assert result.retry_attempt.resulting_execution_id is None
+    assert result.retry_attempt.not_before == _NOW + timedelta(seconds=2)
+
+
+def _script_presentation_stale(
+    conn: ScriptedConnection, *, execution_row: Any | None = None
+) -> None:
+    conn.on(_TASK_LOCKED, _task(status="implementing", plan_revision=_REVISION_ID))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _EXECUTION_LOCKED,
+        execution_row
+        if execution_row is not None
+        else _execution(status="succeeded", execution_id=_EXECUTION_ID),
+    )
+
+
+def test_a_presentation_report_over_a_failed_execution_is_stale() -> None:
+    """A presentation episode only ever roots at the successful E6 attempt: a
+    report whose root Execution is not SUCCEEDED is incoherent and stale —
+    the execution families' own contradiction checks stay untouched."""
+    conn = ScriptedConnection()
+    _script_presentation_stale(
+        conn, execution_row=_execution(status="failed_transient", execution_id=_EXECUTION_ID)
+    )
+    result = _triage(conn, operation=_presentation_operation(), report=_presentation_report())
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_an_implementation_report_over_a_succeeded_execution_is_stale() -> None:
+    """The E6 SUCCEEDED-contradiction check stays exactly intact: the same
+    successful Execution reported as an implementation failure is still
+    rejected as stale."""
+    conn = ScriptedConnection()
+    _script_presentation_stale(conn)
+    result = _triage(conn, operation=_operation(), report=_report())
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def _script_presentation_prior_authorized(
+    conn: ScriptedConnection, *, consumed: bool = True
+) -> None:
+    """The locked flow of one consumed re-presentation attempt's report."""
+    task_row = _task(status="implementing", plan_revision=_REVISION_ID)
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(
+        _EPISODE_BY_ORIGINAL,
+        _episode_row(
+            family="exact_head_pr_authorization_presentation",
+            kind="execution",
+            original_id=_EXECUTION_ID,
+        ),
+    )
+    conn.on(
+        _ATTEMPTS_LIST,
+        [
+            _attempt_row(
+                source_kind="prior_authorized",
+                source_attempt_id=_ATTEMPT_1_ID,
+                resulting_execution_id=None,
+                consumed_at=_OBSERVED if consumed else None,
+                error_code="external_transport_unavailable",
+            )
+        ],
+    )
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    if consumed:
+        conn.on(_EXECUTION_LOCKED, _execution(status="succeeded", execution_id=_EXECUTION_ID))
+        conn.on(_GATES_LIST, [_impl_gate_row()])
+        conn.on(_EXECUTION_LOCKED, _execution(status="succeeded", execution_id=_EXECUTION_ID))
+        conn.on(_TASK_LOCKED, task_row)
+        conn.on(
+            _ATTEMPT_INSERT,
+            _attempt_row(
+                attempt_id=_ATTEMPT_2_ID,
+                ordinal=2,
+                source_kind="prior_authorized",
+                source_attempt_id=_ATTEMPT_1_ID,
+                error_code="external_transport_unavailable",
+                resulting_execution_id=None,
+                not_before=_NOW + timedelta(seconds=4),
+            ),
+        )
+
+
+def test_a_presentation_prior_authorized_report_is_authorized_on_the_consumed_attempt() -> None:
+    """A consumed re-presentation attempt's transport failure reports the
+    episode's original Execution identity with PRIOR_AUTHORIZED provenance —
+    no resulting-Execution binding is required for this family."""
+    conn = ScriptedConnection()
+    _script_presentation_prior_authorized(conn)
+    result = _triage(
+        conn,
+        operation=_presentation_operation(),
+        report=_presentation_report(
+            reporting_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_id=_ATTEMPT_1_ID,
+            effect=_ATTEMPT_1_ID,
+        ),
+    )
+    assert result.kind is DispositionKind.RETRY_AUTHORIZED
+    assert result.retry_attempt is not None
+    assert result.retry_attempt.ordinal == 2
+    assert result.retry_attempt.not_before == _NOW + timedelta(seconds=4)
+
+
+def test_a_presentation_prior_authorized_report_requires_the_consumption_stamp() -> None:
+    conn = ScriptedConnection()
+    _script_presentation_prior_authorized(conn, consumed=False)
+    result = _triage(
+        conn,
+        operation=_presentation_operation(),
+        report=_presentation_report(
+            reporting_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+            reporting_id=_ATTEMPT_1_ID,
+            effect=_ATTEMPT_1_ID,
+        ),
+    )
+    # The unconsumed attempt's failure is unreportable: a typed no-op that
+    # applies nothing.
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def _script_presentation_escalation(
+    conn: ScriptedConnection, *, block_reason: str = "external_operation_uncertain"
+) -> None:
+    """The presentation family's escalation flow: F3 install + the episode stamp."""
+    task_row = _task(status="implementing", plan_revision=_REVISION_ID)
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_EXECUTION_LOCKED, _execution(status="succeeded", execution_id=_EXECUTION_ID))
+    conn.on(_GATES_LIST, [_impl_gate_row()])
+    conn.on(
+        _EPISODE_INSERT,
+        _episode_row(
+            family="exact_head_pr_authorization_presentation",
+            kind="execution",
+            original_id=_EXECUTION_ID,
+        ),
+    )
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_TASK_PLAIN, task_row)
+    conn.on(
+        _BLOCK_INSERT,
+        (_BLOCK_ID, _WORKSPACE_ID, _TASK_ID, block_reason, {}, None, _OBSERVED),
+    )
+    conn.on(
+        _GATE_INSERT,
+        (
+            _NEW_GATE_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            "block_resolution",
+            "pending",
+            None,
+            None,
+            None,
+            _BLOCK_ID,
+            None,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _TASK_BLOCK_UPDATE,
+        _task(status="blocked", state_token=_ROTATED_TOKEN, current_gate=_NEW_GATE_ID),
+    )
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
+    conn.on(
+        _EPISODE_ESCALATE,
+        _episode_row(
+            family="exact_head_pr_authorization_presentation",
+            kind="execution",
+            original_id=_EXECUTION_ID,
+            escalated=_BLOCK_ID,
+        ),
+    )
+
+
+def test_a_presentation_unsupported_uncertainty_escalates_through_f3() -> None:
+    """A plain interpretable-response read uncertainty never produces the
+    retry-eligible transport code: it escalates through the safe F3
+    installation and the Task gets a durable disposition."""
+    conn = ScriptedConnection()
+    _script_presentation_escalation(conn)
+    result = _triage(
+        conn,
+        operation=_presentation_operation(),
+        report=_presentation_report(code=OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def test_a_presentation_known_provider_failure_escalates_through_f3() -> None:
+    conn = ScriptedConnection()
+    _script_presentation_escalation(conn, block_reason="unknown")
+    result = _triage(
+        conn,
+        operation=_presentation_operation(),
+        report=_presentation_report(code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def test_a_presentation_report_with_a_crossed_runtime_code_escalates() -> None:
+    """F4's matrix permits exact (family, code) pairs only: a presentation
+    report carrying the runtime transient-network code lacks the required
+    classified GitHub read transport failure and can never authorize a
+    re-presentation — it escalates."""
+    conn = ScriptedConnection()
+    _script_presentation_escalation(conn, block_reason="connection_unavailable")
+    result = _triage(
+        conn,
+        operation=_presentation_operation(),
+        report=_presentation_report(code=OperationalFailureCode.RUNTIME_UNAVAILABLE),
     )
     assert result.kind is DispositionKind.BLOCKED
     assert result.installation is not None

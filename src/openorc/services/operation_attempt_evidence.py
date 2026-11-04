@@ -42,6 +42,7 @@ from openorc.domain.operational_failures import (
     GitHubMergeOperation,
     OperationalFailureFamily,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 
@@ -54,7 +55,8 @@ class ProducedAttemptIdentity:
 
     ``family`` is the closed Level 2 operation family the attempt belongs to
     (the pending-interaction vocabulary plus, F5d #267, the exact-head GitHub
-    merge family); ``original_attempt_kind``/``original_attempt_id`` name the
+    merge family and, F5f #269, the exact-head PR-authorization presentation
+    family); ``original_attempt_kind``/``original_attempt_id`` name the
     exact durable claim/iteration/execution/attempt row the service
     committed; ``effect_attempt_id`` is the effect row when it differs from
     the original identity (a durably authorized retry's resulting Execution,
@@ -93,10 +95,17 @@ class InvocationAttemptEvidence:
         phase: str,
     ) -> None:
         """Record one Level 1-produced durable attempt identity."""
-        if not isinstance(family, (PendingTaskRuntimeInteractionOperation, GitHubMergeOperation)):
+        if not isinstance(
+            family,
+            (
+                PendingTaskRuntimeInteractionOperation,
+                GitHubMergeOperation,
+                PRAuthorizationPresentationOperation,
+            ),
+        ):
             raise TypeError(
-                "attempt family must be a PendingTaskRuntimeInteractionOperation "
-                "or a GitHubMergeOperation"
+                "attempt family must be a PendingTaskRuntimeInteractionOperation, "
+                "a GitHubMergeOperation, or a PRAuthorizationPresentationOperation"
             )
         if not isinstance(original_attempt_kind, OriginalAttemptKind):
             raise TypeError("attempt kind must be an OriginalAttemptKind")

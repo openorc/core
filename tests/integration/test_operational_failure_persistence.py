@@ -48,6 +48,7 @@ from openorc.domain.operational_failures import (
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    PRAuthorizationPresentationOperation,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
@@ -816,4 +817,80 @@ def test_the_merge_family_check_vocabularies_refuse_unknown_values(
                 gate_id,
                 _NOW + timedelta(seconds=2),
             ),
+        )
+
+
+def test_the_presentation_family_episode_persists_and_unknown_values_refuse(
+    conn: Connection[Any],
+) -> None:
+    """The F5f presentation family persists through the same episode shape:
+    the closed operation-family CHECK admits the one new value rooted at the
+    existing execution identity kind and refuses unknown families; the
+    authorized re-presentation attempt carries the same set-once consumption
+    stamp with no resulting Execution."""
+    facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
+    workspace_id = facts["workspace_id"]
+    task_id = facts["task_id"]
+    execution_id = uuid.uuid4()
+
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.operational_failure_episodes "
+            "(workspace_id, task_id, operation_family, original_attempt_kind, "
+            "original_attempt_id, subject) "
+            "values (%s, %s, 'pr_authorization_presentation', 'execution', %s, '{}'::jsonb)",
+            (workspace_id, task_id, execution_id),
+        )
+
+    episode = failure_repositories.create_operational_failure_episode(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        operation_family=(
+            PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+        ),
+        original_attempt_kind=OriginalAttemptKind.EXECUTION,
+        original_attempt_id=execution_id,
+        subject={"execution_id": str(execution_id)},
+    )
+    loaded = failure_repositories.get_operational_failure_episode(
+        facts["pool"], episode_id=episode.id
+    )
+    assert loaded is not None
+    assert (
+        loaded.operation_family
+        is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
+    )
+    assert loaded.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert loaded.original_attempt_id == execution_id
+
+    attempt = failure_repositories.create_operational_failure_attempt(
+        facts["pool"],
+        workspace_id=workspace_id,
+        task_id=task_id,
+        episode_id=episode.id,
+        ordinal=1,
+        source_kind=OperationalFailureSourceKind.ORIGINAL,
+        source_attempt_id=execution_id,
+        error_code=OperationalFailureCode.EXTERNAL_TRANSPORT_UNAVAILABLE,
+        not_before=_NOW + timedelta(seconds=2),
+    )
+    consumed = failure_repositories.consume_operational_failure_attempt(
+        facts["pool"],
+        attempt_id=attempt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        consumed_at=_NOW,
+    )
+    assert consumed is not None
+    assert consumed.consumed_at is not None
+    assert consumed.resulting_execution_id is None
+
+    with pytest.raises(CheckViolation), conn.transaction():
+        conn.execute(
+            "insert into openorc.operational_failure_attempts "
+            "(workspace_id, task_id, episode_id, ordinal, source_kind, "
+            "source_attempt_id, error_code, not_before) "
+            "values (%s, %s, %s, 2, 'prior_authorized', %s, 'transport', %s)",
+            (workspace_id, task_id, episode.id, attempt.id, _NOW + timedelta(seconds=4)),
         )
