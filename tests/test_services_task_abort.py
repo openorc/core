@@ -4,12 +4,15 @@ Scripted SQL-connection seams and a fake Cline adapter prove the Owner
 activity-interruption command on its critical paths:
 
 - the dispatch phase proves the account/Owner/currentness/role guards before
-  any Cline I/O, then applies ONE atomic composition — the
-  ``owner_action_required`` TaskBlock with its safe ``owner_abort`` context,
-  the ``blocked`` transition under the rotated token, the OWNER
-  ``task_blocked`` audit, and the one-shot exact-session Interrupt intents —
-  and calls ``abort_activity`` exactly once per exact target, strictly after
-  the commit, never touching the gate or the session bindings;
+  any Cline I/O, then applies ONE atomic composition — the F3 exceptional
+  blocking foundation: the ``owner_action_required`` TaskBlock with its safe
+  ``owner_abort`` context, the pending ``BLOCK_RESOLUTION`` OwnerGate bound
+  to it, the guarded current-gate pointer installation with the ``blocked``
+  transition under the rotated token (a superseded pending ordinary gate
+  stays pending history, never rewritten), the OWNER ``task_blocked`` /
+  ``owner_gate_created`` audits, and the one-shot exact-session Interrupt
+  intents — and calls ``abort_activity`` exactly once per exact target,
+  strictly after the commit, never touching the session bindings;
 - the acknowledged-but-unsettled, definitively failed, and uncertain
   dispatch outcomes record their safe facts on the durable intent (an SDK
   acknowledgement is never quiescence);
@@ -61,6 +64,7 @@ from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
     _event_returned_row,
     _event_types,
+    _gate_row,
 )
 from tests.test_services_task_pr_review_dispatch import (
     _ACCOUNT_BARRIER,
@@ -87,13 +91,19 @@ _BLOCKED_TOKEN = uuid4()
 _SESSION_ID = uuid4()
 _EXTERNAL_SESSION_ID = "fake-session-1"
 _INTENT_ID = uuid4()
+_GATE_ID = uuid4()
+_PRIOR_GATE_ID = uuid4()
+_BLOCK_ID = uuid4()
 
 _INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
 _INTENT_INSERT = _sql_has("insert into openorc.task_interrupt_intents")
 _INTENT_UPDATE = _sql_has("update openorc.task_interrupt_intents")
 _SESSION_WRITE = _sql_has("update openorc.task_agent_sessions")
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
-_STATUS_UPDATE = _sql_has("update openorc.tasks", "queued_at = case")
+_TASK_BLOCK_UPDATE = _sql_has("update openorc.tasks", "status = 'blocked'")
+_GATE_READ = _sql_has("from openorc.owner_gates where id")
+_GATE_INSERT = _sql_has("insert into openorc.owner_gates")
+_GATE_UPDATE = _sql_has("update openorc.owner_gates")
 
 
 def _intent_row(
@@ -121,7 +131,7 @@ def _intent_row(
 
 def _block_row() -> tuple[Any, ...]:
     return (
-        uuid4(),
+        _BLOCK_ID,
         _WORKSPACE_ID,
         _TASK_ID,
         "owner_action_required",
@@ -287,12 +297,16 @@ def _script_dispatch_head(
     *,
     status: str = "planning",
     session: tuple[Any, ...] | None = None,
+    current_gate_id: Any | None = None,
 ) -> None:
     conn.on_repeat(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
     conn.on_repeat(_WORKSPACE_READ, _ws_row())
-    conn.on(_TASK_READ, _task_row(status=status, state_token=_STATE_TOKEN))
-    conn.on(_TASK_READ_LOCKED, _task_row(status=status, state_token=_STATE_TOKEN))
-    conn.on(_TASK_READ, _task_row(status=status, state_token=_STATE_TOKEN))
+    observed_row = _task_row(
+        status=status, state_token=_STATE_TOKEN, current_gate_id=current_gate_id
+    )
+    conn.on(_TASK_READ, observed_row)
+    conn.on(_TASK_READ_LOCKED, observed_row)
+    conn.on(_TASK_READ, observed_row)
     if session is not None:
         conn.on(_SESSION_READ, session)
 
@@ -304,6 +318,47 @@ def _script_dispatch_head_row(conn: ScriptedConnection, *, status: str) -> None:
     conn.on(_TASK_READ, row)
     conn.on(_TASK_READ_LOCKED, row)
     conn.on(_TASK_READ, row)
+
+
+def _exceptional_gate_row() -> tuple[Any, ...]:
+    row = list(_gate_row(gate_id=_GATE_ID, gate_type="block_resolution", head_sha=None, pr_id=None))
+    row[8] = _BLOCK_ID  # the gate's TaskBlock subject
+    return tuple(row)
+
+
+def _blocked_task_row() -> tuple[Any, ...]:
+    # The post-installation Task: blocked, rotated token, the exceptional
+    # gate installed as the current pointer.
+    return _task_row(status="blocked", state_token=_BLOCKED_TOKEN, current_gate_id=_GATE_ID)
+
+
+def _script_block_composition(
+    conn: ScriptedConnection,
+    *,
+    status: str,
+    prior_gate_id: Any | None = None,
+) -> None:
+    """Script the F3 exceptional blocking composition after the dispatch head.
+
+    The installer takes its own locked Task read and re-reads the current
+    row for classification, proves the caller-observed prior current gate
+    when one exists, then inserts the TaskBlock, the pending
+    ``BLOCK_RESOLUTION`` OwnerGate bound to it, the guarded blocked
+    transition, and the two truthful audit events.
+    """
+    observed_row = _task_row(status=status, state_token=_STATE_TOKEN, current_gate_id=prior_gate_id)
+    conn.on(_TASK_READ_LOCKED, observed_row)
+    conn.on(_TASK_READ, observed_row)
+    if prior_gate_id is not None:
+        conn.on(
+            _GATE_READ,
+            _gate_row(gate_id=prior_gate_id, gate_type="pr_authorization", pr_id=None),
+        )
+    conn.on(_BLOCK_INSERT, _block_row())
+    conn.on(_GATE_INSERT, _exceptional_gate_row())
+    conn.on(_TASK_BLOCK_UPDATE, _blocked_task_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
 
 
 def _dispatch_call(
@@ -350,9 +405,7 @@ def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit(
     _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
     _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="implementing")
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(_INTENT_UPDATE, _intent_row(outcome={"dispatch": "acknowledged"}))
     adapter = _FakeClineAdapter()
@@ -372,21 +425,36 @@ def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit(
     # unsettled (an SDK acknowledgement is never quiescence).
     assert outcome.interrupt_outcomes[0].detail == "acknowledged"
     assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.UNSETTLED
-    assert _event_types(conn) == ["task_blocked"]
+    # The F3 composition committed both truthful audits and installed the
+    # pending BLOCK_RESOLUTION gate bound to the block.
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    assert outcome.task.current_owner_gate_id == _GATE_ID
     # The session bindings were never rewritten.
     assert _count(conn, _SESSION_WRITE) == 0
 
 
-def test_abort_at_a_pending_gate_never_touches_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_abort_at_a_pending_gate_supersedes_it_with_the_block_resolution_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An admitted in-flight interaction at a pending ordinary gate aborts
+    # through the F3 composition: the new pending BLOCK_RESOLUTION gate
+    # becomes the Task's current gate while the superseded ordinary gate
+    # row is never rewritten — it stays truthful pending history with no
+    # manufactured owner_gate_resolved event.
     conn = ScriptedConnection()
-    _script_dispatch_head(conn, status="waiting_for_owner", session=_ready_session_row())
+    _script_dispatch_head(
+        conn,
+        status="waiting_for_owner",
+        session=_ready_session_row(),
+        current_gate_id=_PRIOR_GATE_ID,
+    )
     _wire_activity(
         monkeypatch, executions=[_open_execution(status=ExecutionStatus.PAUSED_FOR_APPROVAL)]
     )
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="waiting_for_owner", prior_gate_id=_PRIOR_GATE_ID)
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(_INTENT_UPDATE, _intent_row(outcome={"dispatch": "acknowledged"}))
     adapter = _FakeClineAdapter()
@@ -394,9 +462,20 @@ def test_abort_at_a_pending_gate_never_touches_the_gate(monkeypatch: pytest.Monk
     outcome = _dispatch_call(_pool(conn), adapter)
 
     assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
-    gate_update = _sql_has("update openorc.owner_gates")
-    assert _count(conn, gate_update) == 0
-    assert _event_types(conn) == ["task_blocked"]
+    assert outcome.task.current_owner_gate_id == _GATE_ID
+    assert _count(conn, _GATE_UPDATE) == 0
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    update_sql, update_params = next(
+        (sql, params) for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None)
+    )
+    assert update_params == (
+        _GATE_ID,
+        _TASK_ID,
+        _STATE_TOKEN,
+        "waiting_for_owner",
+        _PRIOR_GATE_ID,
+        _GATE_ID,
+    )
 
 
 def test_abort_records_a_definitive_dispatch_failure_on_the_intent(
@@ -406,9 +485,7 @@ def test_abort_records_a_definitive_dispatch_failure_on_the_intent(
     _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
     _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="implementing")
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(_INTENT_UPDATE, _intent_row(status="failed", outcome={"dispatch": "failed"}))
     adapter = _FakeClineAdapter(abort_results=(AgentRuntimeError("refused"),))
@@ -428,9 +505,7 @@ def test_abort_records_an_uncertain_dispatch_on_the_intent(
     _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
     _wire_activity(monkeypatch, executions=[_open_execution()])
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="implementing")
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(_INTENT_UPDATE, _intent_row(status="unknown", outcome={"dispatch": "uncertain"}))
     adapter = _FakeClineAdapter(
@@ -456,9 +531,7 @@ def test_abort_dispatches_each_exact_admitted_target_once(monkeypatch: pytest.Mo
     )
     conn.on(_SESSION_READ, reviewer_session)
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="reviewing")
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(
         _INTENT_INSERT,
@@ -518,7 +591,7 @@ def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting(
     assert len(outcome.accounted_executions) == 1
     assert outcome.accounted_executions[0].status is ExecutionStatus.CANCELLED
     assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
     assert _event_types(conn) == []
 
 
@@ -577,7 +650,7 @@ def test_an_abort_without_evidence_refuses_and_surfaces_the_unresolved_interrupt
     assert adapter.abort_calls == []
     assert adapter.settle_calls == []
     assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
 
 
 def test_a_blocked_task_with_no_outstanding_interruption_is_inapplicable() -> None:
@@ -595,7 +668,7 @@ def test_a_blocked_task_with_no_outstanding_interruption_is_inapplicable() -> No
         )
 
     assert adapter.abort_calls == []
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
 
 
 def test_an_outstanding_interruption_refuses_a_second_dispatch() -> None:
@@ -609,7 +682,7 @@ def test_an_outstanding_interruption_refuses_a_second_dispatch() -> None:
 
     assert adapter.abort_calls == []
     assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
     assert _event_types(conn) == []
 
 
@@ -636,7 +709,7 @@ def test_a_stale_token_applies_nothing() -> None:
 
     assert adapter.abort_calls == []
     assert _count(conn, _BLOCK_INSERT) == 0
-    assert _count(conn, _STATUS_UPDATE) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
     assert _event_types(conn) == []
 
 
@@ -666,9 +739,7 @@ def test_abort_eligibility_covers_the_autonomous_planning_phase(
     conn = ScriptedConnection()
     _script_dispatch_head(conn, status="planning", session=_ready_session_row())
     conn.on(_INTENTS_LIST, [])
-    conn.on(_BLOCK_INSERT, _block_row())
-    conn.on(_STATUS_UPDATE, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    _script_block_composition(conn, status="planning")
     conn.on(_INTENT_INSERT, _intent_row())
     conn.on(_INTENT_UPDATE, _intent_row(outcome={"dispatch": "acknowledged"}))
     adapter = _FakeClineAdapter()
@@ -677,7 +748,7 @@ def test_abort_eligibility_covers_the_autonomous_planning_phase(
 
     assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
     assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
-    assert _event_types(conn) == ["task_blocked"]
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 
 def test_settlement_recording_and_execution_accounting_commit_atomically(
@@ -806,5 +877,5 @@ def test_abort_rejects_an_idle_owner_gate_without_in_flight_activity(
 
         assert adapter.abort_calls == []
         assert _count(conn, _BLOCK_INSERT) == 0
-        assert _count(conn, _STATUS_UPDATE) == 0
+        assert _count(conn, _TASK_BLOCK_UPDATE) == 0
         assert _event_types(conn) == []

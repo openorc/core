@@ -4,8 +4,10 @@ The scripted seams prove the read/checkpoint/check contract: the
 exact-scope high-water checkpoint, the role-agnostic retained-cost
 aggregate, the budget evaluation under the Task row lock, and the atomic
 Owner-authorized ``COST_LIMIT`` block composed through the shared E10b
-machinery with DB-derived Owner attribution. Ordinary determinism: no live
-infrastructure, canned rows only.
+machinery and the F3 exceptional blocking foundation — one pending
+``BLOCK_RESOLUTION`` OwnerGate bound to the block — with DB-derived Owner
+attribution. Ordinary determinism: no live infrastructure, canned rows
+only.
 """
 
 from __future__ import annotations
@@ -32,16 +34,22 @@ from openorc.services.task_cost_accounting import (
     check_task_budget_before_dispatch,
     observe_session_usage,
 )
-from tests.test_services_task_pr_review_decision import _event_returned_row
+from tests.test_services_task_pr_review_decision import (
+    _event_returned_row,
+    _event_types,
+    _gate_row,
+)
 from tests.test_services_task_pr_review_dispatch import (
     _ACCOUNT_BARRIER,
     _ACCOUNT_OPERATIONAL_ROW,
     _CONNECTION_ID,
     _OWNER_PROFILE_ID,
     _TASK_ID,
+    _TASK_READ,
     _TASK_READ_LOCKED,
     _WORKSPACE_ID,
     ScriptedConnection,
+    _count,
     _pool,
     _session_row,
     _sql_has,
@@ -53,6 +61,10 @@ _OBSERVED = datetime(2026, 10, 26, 12, 0, 0, tzinfo=UTC)
 _SESSION_ID = uuid4()
 _EXTERNAL_SESSION_ID = "fake-session-1"
 _BUDGET = Decimal("25.00")
+_GATE_ID = uuid4()
+_PRIOR_GATE_ID = uuid4()
+_BLOCK_ID = uuid4()
+_ROTATED_TOKEN = uuid4()
 
 _CHECKPOINT = _sql_has(
     "update openorc.task_agent_sessions", "retained_cost_usd = %s", "cost_observed_at = now()"
@@ -62,7 +74,9 @@ _LIST_SESSIONS = _sql_has(
     "from openorc.task_agent_sessions", "where task_id = %s order by created_at, id"
 )
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
-_TASK_BLOCKED_UPDATE = _sql_has("update openorc.tasks set status")
+_TASK_BLOCK_UPDATE = _sql_has("update openorc.tasks", "status = 'blocked'")
+_GATE_READ = _sql_has("from openorc.owner_gates where id")
+_GATE_INSERT = _sql_has("insert into openorc.owner_gates")
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
 _INTENT_INSERT = _sql_has("insert into openorc.task_interrupt_intents")
 
@@ -79,7 +93,11 @@ def _queued_budgeted_task_row() -> tuple[Any, ...]:
 
 
 def _blocked_task_row() -> tuple[Any, ...]:
-    return _budgeted_task_row(status="blocked")
+    # The post-installation Task: blocked, rotated token, the exceptional
+    # gate installed as the current pointer.
+    row = _budgeted_task_row(status="blocked")
+    row = (*row[:8], _ROTATED_TOKEN, *row[9:])
+    return (*row[:10], _GATE_ID, *row[11:])
 
 
 def _ready_session_row() -> tuple[Any, ...]:
@@ -90,7 +108,7 @@ def _block_row() -> tuple[Any, ...]:
     # openorc.task_blocks: id, workspace_id, task_id, reason, context,
     # resolved_at, created_at.
     return (
-        uuid4(),
+        _BLOCK_ID,
         _WORKSPACE_ID,
         _TASK_ID,
         "cost_limit",
@@ -119,6 +137,12 @@ def _intent_row() -> tuple[Any, ...]:
     )
 
 
+def _exceptional_gate_row() -> tuple[Any, ...]:
+    row = list(_gate_row(gate_id=_GATE_ID, gate_type="block_resolution", head_sha=None, pr_id=None))
+    row[8] = _BLOCK_ID  # the gate's TaskBlock subject
+    return tuple(row)
+
+
 def _wire_budgeted_task(
     conn: ScriptedConnection,
     monkeypatch: pytest.MonkeyPatch,
@@ -131,14 +155,17 @@ def _wire_budgeted_task(
     checkpoint: Any = "session",
     sessions: list[tuple[Any, ...]] | None = None,
     executions: list[Any] | None = None,
+    prior_gate_id: Any | None = None,
 ) -> None:
     """Script the locked budgeted Task, its checkpoint target, and the aggregate.
 
     ``no_task`` scripts the locked read returning None (a foreign/absent
     subject); ``checkpoint`` overrides the checkpoint write result (``None``
-    means the conditional update matched no row). The durable in-flight
-    activity readers are patched at their module seams, exactly like the
-    E10b tests: no canned execution/review rows flow through SQL mapping.
+    means the conditional update matched no row). ``prior_gate_id`` scripts a
+    current pending ordinary gate on the Task for the idle supersession case.
+    The durable in-flight activity readers are patched at their module seams,
+    exactly like the E10b tests: no canned execution/review rows flow through
+    SQL mapping.
     """
     row = task_row if task_row is not None else _budgeted_task_row(status=status)
     conn.on_repeat(_TASK_READ_LOCKED, None if no_task else row)
@@ -161,8 +188,21 @@ def _wire_budgeted_task(
         "list_task_review_loops",
         lambda pool, *, task_id, status: [],
     )
+    # The F3 exceptional blocking composition (when reached): the installer's
+    # own locked/plain Task reads re-match the same row, a caller-observed
+    # prior current gate is proven when one exists, the pending
+    # BLOCK_RESOLUTION gate inserts bound to the block, and the guarded
+    # blocked transition returns the post-installation row. Both audit
+    # events answer the same insert matcher, in their committed order.
+    conn.on_repeat(_TASK_READ, row)
+    if prior_gate_id is not None:
+        conn.on_repeat(
+            _GATE_READ,
+            _gate_row(gate_id=prior_gate_id, gate_type="pr_authorization", pr_id=None),
+        )
     conn.on_repeat(_BLOCK_INSERT, _block_row())
-    conn.on_repeat(_TASK_BLOCKED_UPDATE, _blocked_task_row())
+    conn.on_repeat(_GATE_INSERT, _exceptional_gate_row())
+    conn.on_repeat(_TASK_BLOCK_UPDATE, _blocked_task_row())
     conn.on_repeat(_EVENT_INSERT, _event_returned_row("task_blocked"))
     conn.on_repeat(_INTENT_INSERT, _intent_row())
     conn.on_repeat(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
@@ -214,10 +254,11 @@ def test_checkpoint_below_threshold_retains_and_permits(monkeypatch: pytest.Monk
     assert "where id = %s and task_id = %s and workspace_id = %s" in checkpoint_sqls[0]
     assert "and connection_id = %s" in checkpoint_sqls[0]
     assert "(retained_cost_usd is null or retained_cost_usd < %s)" in checkpoint_sqls[0]
-    # No blocking decision below the threshold: no block insert, no status
-    # update, no audit, no interrupt intents.
+    # No blocking decision below the threshold: no block insert, no guarded
+    # blocked transition, no gate, no audit, no interrupt intents.
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
-    assert not _sql_of_kind(conn, lambda sql: "update openorc.tasks set status" in sql)
+    assert not _sql_of_kind(conn, lambda sql: _TASK_BLOCK_UPDATE(sql, None))
+    assert not _sql_of_kind(conn, lambda sql: _GATE_INSERT(sql, None))
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
 
 
@@ -261,18 +302,21 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
     intent, external_session_id = observation.interrupt_dispatches[0]
     assert external_session_id == _EXTERNAL_SESSION_ID
     assert intent.requested_by_profile_id == _OWNER_PROFILE_ID
-    # The block insert carries the additive reason.
+    # The block insert carries the additive reason, and the F3 composition
+    # installs its pending BLOCK_RESOLUTION gate bound to that block.
     block_params = next(
         params for sql, params in conn.executed if "insert into openorc.task_blocks" in sql
     )
     assert block_params is not None and block_params[2] == "cost_limit"
-    # The guarded blocked transition and the OWNER audit commit in the same
-    # composition.
-    status_params = next(
-        params for sql, params in conn.executed if "update openorc.tasks set status" in sql
-    )
-    assert status_params is not None and status_params[0] == "blocked"
-    assert _sql_of_kind(conn, lambda sql: "insert into openorc.workflow_events" in sql)
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    # The guarded blocked transition and the two OWNER audits commit in the
+    # same composition; the new gate becomes the Task's current pointer.
+    status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
+    assert status_params is not None
+    assert status_params[0] == _GATE_ID and status_params[5] == _GATE_ID
+    assert status_params[3] == "implementing" and status_params[4] is None
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
     # The interrupt intent is created inside the composition with the
     # DB-derived Workspace Owner Profile as the accountable requester.
     intent_params = next(
@@ -289,14 +333,19 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
 
 def test_idle_task_blocks_without_gratuitous_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     # A Task with no durably demonstrable in-flight runtime activity —
-    # typically idle at a pending Owner gate — enters BLOCKED with zero
-    # interrupt intents: no gratuitous Interrupt, and the pending gate
-    # stays truthful pending history for F4b.
+    # idle at its pending ordinary Owner gate — enters BLOCKED with zero
+    # interrupt intents: no gratuitous Interrupt, and the F3 composition
+    # supersedes that pending gate truthfully (its row is never rewritten,
+    # and no owner_gate_resolved event exists) for F4b.
     conn = ScriptedConnection()
+    idle_row = _budgeted_task_row(status="waiting_for_owner")
+    idle_row = (*idle_row[:10], _PRIOR_GATE_ID, *idle_row[11:])
     _wire_budgeted_task(
         conn,
         monkeypatch,
         status="waiting_for_owner",
+        task_row=idle_row,
+        prior_gate_id=_PRIOR_GATE_ID,
         sessions=[_ready_session_row()],
         executions=[],
     )
@@ -308,6 +357,13 @@ def test_idle_task_blocks_without_gratuitous_interrupt(monkeypatch: pytest.Monke
     assert observation.task_block.reason is TaskBlockReason.COST_LIMIT
     assert observation.interrupt_dispatches == ()
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
+    # The new pending BLOCK_RESOLUTION gate became current; the superseded
+    # ordinary gate row was never rewritten.
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    assert _count(conn, _sql_has("update openorc.owner_gates")) == 0
+    status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
+    assert status_params is not None
+    assert status_params[4] == _PRIOR_GATE_ID and status_params[5] == _GATE_ID
 
 
 def test_unknown_reading_is_unknown_and_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,7 +391,8 @@ def test_foreign_or_not_higher_observation_is_ignored(monkeypatch: pytest.Monkey
 
     assert observation.kind is SessionCostObservationKind.IGNORED_FOREIGN
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
-    assert not _sql_of_kind(conn, lambda sql: "update openorc.tasks set status" in sql)
+    assert not _sql_of_kind(conn, lambda sql: _TASK_BLOCK_UPDATE(sql, None))
+    assert not _sql_of_kind(conn, lambda sql: _GATE_INSERT(sql, None))
 
 
 def test_budget_disabled_task_checkpoints_without_enforcement(
@@ -544,10 +601,13 @@ def test_pre_dispatch_gate_blocks_at_the_threshold_atomically(
     assert decision.task_block is not None
     assert decision.task_block.reason is TaskBlockReason.COST_LIMIT
     assert decision.interrupt_dispatches != ()
-    status_params = next(
-        params for sql, params in conn.executed if "update openorc.tasks set status" in sql
-    )
-    assert status_params is not None and status_params[0] == "blocked"
+    # The F3 composition: the guarded blocked transition, the pending
+    # BLOCK_RESOLUTION gate, and the two OWNER audits.
+    status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
+    assert status_params is not None and status_params[5] == _GATE_ID
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 
 def test_pre_dispatch_gate_classifies_disabled_already_blocked_and_stale(
