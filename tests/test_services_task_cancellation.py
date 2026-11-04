@@ -78,6 +78,7 @@ from openorc.services.task_cancellation import (
     TaskCancellationOutcomeKind,
     TaskPrClosureOutcomeKind,
     cancel_task,
+    cancel_task_composition,
     cancel_task_for_confirmed_pr_closure,
 )
 from tests.test_services_task_pr_review_decision import (
@@ -1205,6 +1206,36 @@ def test_a_superseded_blocked_gate_refuses(monkeypatch: pytest.MonkeyPatch) -> N
         _cancel_call(_pool(conn), _CloseGithub())
 
     assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_the_delegating_gate_composition_refuses_a_blocked_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The E5/E7 delegation seam stays WAITING_FOR_OWNER-only (issue #278).
+
+    A blocked Task with a current exceptional gate is refused at the
+    delegating entrypoint — rechecked under the Task lock — because that
+    seam records no canonical-PR close obligation and performs no
+    confirmed-merge preflight; the unified ``cancel_task`` command owns
+    those safeguards and is the only blocked-cancellation admission path.
+    """
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+    _wire(monkeypatch, block=_unresolved_block())
+
+    with pytest.raises(ConflictError, match="delegating gate-cancellation entrypoint"):
+        cancel_task_composition(
+            _pool(conn),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            owner_gate_id=_GATE_ID,
+        )
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _GATE_UPDATE) == 0
     assert _event_types(conn) == []
 
 

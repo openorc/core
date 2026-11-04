@@ -637,6 +637,7 @@ def _cancel_composition(
     expected_gate_type: OwnerGateType | None = None,
     preflight_pull_request_id: UUID | None = None,
     trusted_pr_closure: bool = False,
+    waiting_for_owner_only: bool = False,
 ) -> _CancelComposition:
     """The ONE shared atomic cancellation composition (issues #228 §3, #229 §2).
 
@@ -744,6 +745,18 @@ def _cancel_composition(
                 expected_state_token=owner_expected_token,
             )
             _require_cancel_eligible_status(task)
+            if waiting_for_owner_only and task.status is not TaskStatus.WAITING_FOR_OWNER:
+                # The delegating E5/E7 gate-cancellation seam serves the
+                # gate-waiting state only (issue #278): a blocked Task with
+                # an exceptional gate cancels through the unified Owner
+                # command, which owns the canonical-PR preflight, the
+                # confirmed-merge precedence, and the durable close
+                # obligation this delegating entrypoint deliberately lacks.
+                raise ConflictError(
+                    "the delegating gate-cancellation entrypoint cancels only a "
+                    "waiting_for_owner task; blocked tasks cancel through the "
+                    "unified cancel command"
+                )
             _require_runtime_work_accounted(transaction_pool, task=task)
             if preflight_pull_request_id is not None:
                 # The pre-decision canonical-PR facts are revalidated under
@@ -922,10 +935,15 @@ def cancel_task_composition(
     The ONE implementation of the common cancellation composition (issue
     #228 §3): the delegating E5/E7 gate-cancellation entrypoints call this
     with their caller-addressed exact current pending gate (and, when their
-    contract requires it, the gate type their seam admits). It performs no
-    external call and records no PR-close obligation — those gate states
-    carry no canonical pull request in the v1 flow, and no GitHub artifact
-    is ever touched.
+    contract requires it, the gate type their seam admits). The seam is
+    deliberately ``WAITING_FOR_OWNER``-only — the restriction is rechecked
+    under the Task row lock (issue #278): exceptional ``BLOCKED`` gates
+    cancel through the unified ``cancel_task`` command, which owns the
+    canonical-PR preflight, the confirmed-merge precedence, and the durable
+    close obligation this delegating entrypoint deliberately lacks (it
+    performs no external call and records no PR-close obligation — those
+    gate states carry no canonical pull request in the v1 flow, and no
+    GitHub artifact is ever touched).
     """
     with application_span(_SERVICE_TRACER_SCOPE, _COMPOSITION_SPAN_NAME) as span:
         annotate_span(
@@ -943,6 +961,7 @@ def cancel_task_composition(
             owner_gate_id=owner_gate_id,
             close_obligation=_CloseObligation.NONE,
             expected_gate_type=expected_gate_type,
+            waiting_for_owner_only=True,
         )
         return TaskCancellationComposition(
             task=composition.task,
