@@ -56,6 +56,7 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
 - Services decide when consequential workflow facts deserve WorkflowEvents. Persistence only appends the record.
 - Canonical mutation and its promised WorkflowEvent commit atomically in the same composed transaction.
 - Failed/stale/no-op mutations emit no event.
+- Exceptional blocked-Task entries (one unresolved TaskBlock plus its pending exceptional OwnerGate) install only through the shared atomic blocking service (`task_exceptional_blocking`), and the installed exceptional gate case is selected only by the Level 3 blocking-case catalog (`classify_blocking_case`): originating blockers and Level 2 triage declare typed blocking conditions with sanitized evidence, and no caller hardcodes an exceptional gate type. Unsupported or insufficiently evidenced conditions fail closed to the Type B `BLOCK_RESOLUTION` diagnostic fallback.
 - WorkflowActorContext contains only safe logical actor identity. Event context is small, event-specific, and never contains credentials, raw request bodies, guidance prose, prompts/templates, or duplicated canonical state.
 
 ## External repository operations

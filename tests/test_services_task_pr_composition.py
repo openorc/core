@@ -1375,6 +1375,10 @@ def test_an_ineligible_reconciled_record_blocks_recoverably(
     assert _count(conn, _GATES_INSERT) == 1
     assert _count(conn, _TASK_GATE_WRITE) == 1
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The guard-path block classifies through the Level 3 catalog to the
+    # pending GITHUB_STATE_MISMATCH gate (F8b, issue #287).
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None and gate_params[2] == "github_state_mismatch"
     # The base-ref mismatch block preserves the exact authorized head, the
     # authorized publication base, the originating gate identity, and the
     # reconciled PR evidence (issue #280).
@@ -1573,6 +1577,10 @@ def test_post_create_stale_preserves_the_record_and_blocks_or_refuses(
     assert _count(conn, _GATES_INSERT) == 1
     assert _count(conn, _TASK_GATE_WRITE) == 1
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The post-create block classifies through the Level 3 catalog to the
+    # pending GITHUB_STATE_MISMATCH gate (F8b, issue #287).
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None and gate_params[2] == "github_state_mismatch"
     # The post-create block preserves the exact authorized head, the
     # originating gate identity, the persisted canonical PR identity, and
     # the created record's observed head (issue #280).

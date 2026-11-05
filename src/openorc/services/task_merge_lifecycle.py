@@ -77,6 +77,7 @@ from openorc.adapters.github import (
     GitHubRequestRejectedError,
     GitHubTransportUncertainError,
 )
+from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
@@ -125,6 +126,7 @@ from openorc.services.github_owner_write_authorization import (
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_operational_failure_triage import (
     DispositionKind,
     OperationalFailureOperation,
@@ -421,7 +423,8 @@ def _apply_merge_staleness_block(
     installs, atomically, the ``stale_operation`` TaskBlock with the safe
     exact-subject recovery context (the addressed merge gate, the canonical
     PR, the approved expected head, and the observed head), its pending
-    ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the only subject, the
+    Level 3-selected ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the
+    only subject (F8b, issue #287), the
     guarded ``blocked`` transition with one rotated token, and the
     ``task_blocked`` / ``owner_gate_created`` audits under the truthful
     OPENORC actor. A stale subject applies nothing and raises. Where the
@@ -442,6 +445,21 @@ def _apply_merge_staleness_block(
             task_id=task_id,
             expected_state_token=expected_state_token,
         )
+        block_context = {
+            "owner_gate_id": str(owner_gate_id),
+            "task_pull_request_id": str(task_pull_request_id),
+            "expected_head_sha": expected_head_sha,
+            "observed_head_sha": observed_head_sha,
+        }
+        # The proven merge-head authority mismatch is declared to the Level 3
+        # blocking-case catalog (F8b, issue #287) with its exact E10a
+        # evidence — the authoritative policy, never this caller, selects
+        # the exceptional OwnerGate case.
+        gate_type = classify_blocking_case(
+            Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH,
+            block_context,
+            TaskBlockReason.STALE_OPERATION,
+        )
         installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
@@ -449,14 +467,9 @@ def _apply_merge_staleness_block(
             expected_state_token=expected_state_token,
             expected_status=task.status,
             expected_current_owner_gate_id=task.current_owner_gate_id,
-            gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
+            gate_type=gate_type,
             block_reason=TaskBlockReason.STALE_OPERATION,
-            block_context={
-                "owner_gate_id": str(owner_gate_id),
-                "task_pull_request_id": str(task_pull_request_id),
-                "expected_head_sha": expected_head_sha,
-                "observed_head_sha": observed_head_sha,
-            },
+            block_context=block_context,
             actor=_OPENORC_ACTOR,
         )
         return installation.task_block, installation.task
@@ -928,8 +941,9 @@ def _apply_uncertain_merge_block(
     atomically, the ``external_operation_uncertain`` TaskBlock with durable
     safe context tied to the consumed gate, PR, and head (plus the
     preserved confirmed merge commit where GitHub answered a known
-    success), its pending ``BLOCK_RESOLUTION`` OwnerGate bound to it as the
-    only subject, the guarded ``blocked`` transition with one rotated
+    success), its pending ``BLOCK_RESOLUTION`` OwnerGate — the Level 3
+    Type B diagnostic fallback the catalog selects (F8b, issue #287) —
+    bound to it as the only subject, the guarded ``blocked`` transition with one rotated
     token, and the ``task_blocked`` / ``owner_gate_created`` audits under
     the truthful OPENORC actor. The merge gate was already consumed by the
     one-shot approval, so the NULL-safe pointer expectation is the Task's
@@ -956,6 +970,15 @@ def _apply_uncertain_merge_block(
             task_id=task_id,
             expected_state_token=expected_state_token,
         )
+        # F8b (issue #287): the uncertain merge outcome is not a supported
+        # v1 condition — it is declared to the authoritative Level 3 catalog
+        # with no condition, and the policy selects the Type B
+        # ``BLOCK_RESOLUTION`` diagnostic fallback.
+        gate_type = classify_blocking_case(
+            None,
+            block_context,
+            TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN,
+        )
         installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
@@ -963,7 +986,7 @@ def _apply_uncertain_merge_block(
             expected_state_token=expected_state_token,
             expected_status=task.status,
             expected_current_owner_gate_id=task.current_owner_gate_id,
-            gate_type=OwnerGateType.BLOCK_RESOLUTION,
+            gate_type=gate_type,
             block_reason=TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN,
             block_context=block_context,
             actor=_OPENORC_ACTOR,

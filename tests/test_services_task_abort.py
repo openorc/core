@@ -6,8 +6,9 @@ activity-interruption command on its critical paths:
 - the dispatch phase proves the account/Owner/currentness/role guards before
   any Cline I/O, then applies ONE atomic composition — the F3 exceptional
   blocking foundation: the ``owner_action_required`` TaskBlock with its safe
-  ``owner_abort`` context, the pending ``BLOCK_RESOLUTION`` OwnerGate bound
-  to it, the guarded current-gate pointer installation with the ``blocked``
+  ``owner_abort`` context, the pending ``OWNER_ABORT`` OwnerGate the Level 3
+  catalog selects (F8b, issue #287) bound to it, the guarded current-gate
+  pointer installation with the ``blocked``
   transition under the rotated token (a superseded pending ordinary gate
   stays pending history, never rewritten), the OWNER ``task_blocked`` /
   ``owner_gate_created`` audits, and the one-shot exact-session Interrupt
@@ -321,7 +322,7 @@ def _script_dispatch_head_row(conn: ScriptedConnection, *, status: str) -> None:
 
 
 def _exceptional_gate_row() -> tuple[Any, ...]:
-    row = list(_gate_row(gate_id=_GATE_ID, gate_type="block_resolution", head_sha=None, pr_id=None))
+    row = list(_gate_row(gate_id=_GATE_ID, gate_type="owner_abort", head_sha=None, pr_id=None))
     row[8] = _BLOCK_ID  # the gate's TaskBlock subject
     return tuple(row)
 
@@ -343,7 +344,7 @@ def _script_block_composition(
     The installer takes its own locked Task read and re-reads the current
     row for classification, proves the caller-observed prior current gate
     when one exists, then inserts the TaskBlock, the pending
-    ``BLOCK_RESOLUTION`` OwnerGate bound to it, the guarded blocked
+    ``OWNER_ABORT`` OwnerGate bound to it, the guarded blocked
     transition, and the two truthful audit events.
     """
     observed_row = _task_row(status=status, state_token=_STATE_TOKEN, current_gate_id=prior_gate_id)
@@ -426,10 +427,11 @@ def test_abort_blocks_the_task_and_interrupts_the_exact_session_after_commit(
     assert outcome.interrupt_outcomes[0].detail == "acknowledged"
     assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.UNSETTLED
     # The F3 composition committed both truthful audits and installed the
-    # pending BLOCK_RESOLUTION gate bound to the block.
+    # pending OWNER_ABORT gate the Level 3 catalog selects (F8b, issue
+    # #287) bound to the block.
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
-    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    assert gate_insert is not None and gate_insert[2] == "owner_abort"
     assert outcome.task.current_owner_gate_id == _GATE_ID
     # The session bindings were never rewritten.
     assert _count(conn, _SESSION_WRITE) == 0
@@ -439,7 +441,7 @@ def test_abort_at_a_pending_gate_supersedes_it_with_the_block_resolution_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An admitted in-flight interaction at a pending ordinary gate aborts
-    # through the F3 composition: the new pending BLOCK_RESOLUTION gate
+    # through the F3 composition: the new pending OWNER_ABORT gate
     # becomes the Task's current gate while the superseded ordinary gate
     # row is never rewritten — it stays truthful pending history with no
     # manufactured owner_gate_resolved event.

@@ -136,6 +136,7 @@ from openorc.services.github_owner_write_authorization import require_owner_writ
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_merge_lifecycle import (
     TaskMergeOutcome,
     TaskMergeOutcomeKind,
@@ -332,10 +333,19 @@ def _install_merge_retry_settlement_block(
     the pending ``BLOCK_RESOLUTION`` OwnerGate, the ``blocked`` transition,
     the token rotation, and the audit events compose in one short database
     transaction, so a pre-send operational condition never strands a waiting
-    Task without a decision surface. The context always records that the
+    Task without a decision surface. The pending ``BLOCK_RESOLUTION``
+    OwnerGate is the Type B diagnostic fallback the Level 3 catalog selects
+    (F8b, issue #287): the settlement declares no supported condition. The
+    context always records that the
     merge mutation was not attempted and that the F4 authorization remains
     unconsumed — the settlement never pretends a send happened.
     """
+    # F8b (issue #287): the settlement declares no Level 3 condition — a
+    # pre-consumption failure is not a supported v1 case — and the
+    # authoritative catalog selects the Type B ``BLOCK_RESOLUTION``
+    # diagnostic fallback.
+    settlement_context = canonical_task_block_context(context)
+    gate_type = classify_blocking_case(None, settlement_context, block_reason)
     installation = install_exceptional_block_gate(
         pool,
         workspace_id=admission.task.workspace_id,
@@ -343,9 +353,9 @@ def _install_merge_retry_settlement_block(
         expected_state_token=expected_state_token,
         expected_status=TaskStatus.WAITING_FOR_OWNER,
         expected_current_owner_gate_id=None,
-        gate_type=OwnerGateType.BLOCK_RESOLUTION,
+        gate_type=gate_type,
         block_reason=block_reason,
-        block_context=canonical_task_block_context(context),
+        block_context=settlement_context,
         actor=_OPENORC_ACTOR,
     )
     return TaskMergeOutcome(

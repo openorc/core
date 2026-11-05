@@ -507,9 +507,10 @@ class TestAtomicCostLimitBlock:
             (task_id,),
         ).fetchall()
         assert intent_row == [(owner_profile_id, "unsettled")]
-        # The F3 composition also committed the pending BLOCK_RESOLUTION
-        # gate bound to the block as its only subject, with its OWNER
-        # owner_gate_created audit, installed as the Task's current gate.
+        # The F3 composition also committed the pending Level 3-selected
+        # COST_LIMIT gate (F8b, issue #287) bound to the block as its only
+        # subject, with its OWNER owner_gate_created audit, installed as
+        # the Task's current gate.
         gate_row = conn.execute(
             "select id, gate_type, status, task_block_id "
             "from openorc.owner_gates where task_id = %s",
@@ -517,7 +518,7 @@ class TestAtomicCostLimitBlock:
         ).fetchall()
         assert len(gate_row) == 1
         gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
-        assert gate_type == "block_resolution" and gate_status == "pending"
+        assert gate_type == "cost_limit" and gate_status == "pending"
         assert gate_block_id == (
             _scalar(conn, "select id from openorc.task_blocks where task_id = %s", (task_id,))
         )
@@ -630,7 +631,7 @@ class TestAtomicCostLimitBlock:
                 "select gate_type from openorc.owner_gates where task_id = %s",
                 (task_id,),
             )
-            == "block_resolution"
+            == "cost_limit"
         )
 
     def test_a_forced_failure_rolls_back_the_whole_decision(

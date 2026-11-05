@@ -86,6 +86,7 @@ from uuid import UUID
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.github import GitHubAppClient
+from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor
@@ -129,6 +130,7 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -445,7 +447,8 @@ def _block_source_requirements_drift(
     blocking foundation (#258) installs — atomically — the
     ``github_source_changed`` TaskBlock with its exact GitHub issue
     identity and expected/observed fingerprint evidence, its pending
-    ``GITHUB_ISSUE_CHANGE`` OwnerGate bound to it as the only subject, the
+    Level 3-selected ``GITHUB_ISSUE_CHANGE`` OwnerGate bound to it as the
+    only subject (F8b, issue #287), the
     ``implementing → blocked`` transition with one rotated token, and the
     ``task_blocked`` / ``owner_gate_created`` audits under the truthful
     OPENORC actor — commit or roll back together. The pre-gate
@@ -484,9 +487,22 @@ def _block_source_requirements_drift(
                 "baseline; the drift block is stale"
             )
         # The F3 exceptional blocking foundation (#258): one atomic block,
-        # gate, transition, token rotation, and audit pair. The installer's
-        # guarded currentness re-proof is the durable backstop; a raced or
-        # stale caller commits nothing at all.
+        # gate, transition, token rotation, and audit pair. The proven drift
+        # is declared to the Level 3 blocking-case catalog (F8b, issue #287)
+        # with its exact evidence — the authoritative policy, never this
+        # caller, selects the exceptional OwnerGate case — and the
+        # installer's guarded currentness re-proof is the durable backstop;
+        # a raced or stale caller commits nothing at all.
+        block_context = {
+            "github_issue_id": task.github_issue_id,
+            "expected_fingerprint": task.source_requirements_fingerprint,
+            "observed_fingerprint": projection.requirements_fingerprint,
+        }
+        gate_type = classify_blocking_case(
+            Level3BlockingCondition.GITHUB_ISSUE_REQUIREMENTS_CHANGE,
+            block_context,
+            TaskBlockReason.GITHUB_SOURCE_CHANGED,
+        )
         installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
@@ -494,13 +510,9 @@ def _block_source_requirements_drift(
             expected_state_token=expected_state_token,
             expected_status=task.status,
             expected_current_owner_gate_id=task.current_owner_gate_id,
-            gate_type=OwnerGateType.GITHUB_ISSUE_CHANGE,
+            gate_type=gate_type,
             block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
-            block_context={
-                "github_issue_id": task.github_issue_id,
-                "expected_fingerprint": task.source_requirements_fingerprint,
-                "observed_fingerprint": projection.requirements_fingerprint,
-            },
+            block_context=block_context,
             actor=_OPENORC_ACTOR,
         )
         return installation.task
