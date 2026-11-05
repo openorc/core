@@ -29,14 +29,18 @@ Task under its currentness guard:
   terminal stamp: it stays pending history with no manufactured Owner
   choice and no ``decided_at``, and no fictitious ``owner_gate_resolved``
   event is recorded. Only the current pointer makes a gate actionable.
-- The gate/reason pairing is validated at this service boundary:
+- The gate/reason pairing is validated at this service boundary, kept
+  consistent with the F8a Level 3 catalog (issue #286):
   ``GITHUB_ISSUE_CHANGE`` requires ``github_source_changed``;
   ``GITHUB_STATE_MISMATCH`` requires ``stale_operation`` (a stale_operation
   reason by itself is never proof of a GitHub mismatch — the caller owns
-  its concrete origin/evidence); ``BLOCK_RESOLUTION`` accepts the
-  applicable operational and explicit-stop reasons, never
-  ``github_source_changed`` and never the terminal ``pr_closed_unmerged``.
-  No generic reason-to-recovery policy is decided here.
+  its concrete origin/evidence); ``COST_LIMIT`` requires ``cost_limit``;
+  ``OWNER_ABORT`` requires ``owner_action_required``;
+  ``BLOCK_RESOLUTION`` accepts every settled reason except the terminal
+  ``pr_closed_unmerged`` — including ``github_source_changed`` when the
+  Level 3 classification policy cannot establish the specific Type A
+  case and falls back to the Type B diagnostic gate. No generic
+  reason-to-recovery policy is decided here.
 - Since the F7c cutover (issue #282) the universal invariant is durably
   enforced in PostgreSQL: a committed current BLOCKED Task carries exactly
   one unresolved TaskBlock and one exact current pending exceptional
@@ -136,20 +140,22 @@ _ELIGIBLE_SOURCE_STATUSES: frozenset[TaskStatus] = frozenset(
 # The closed exceptional gate/reason pairing: the gate type constrains
 # which settled TaskBlock reasons may install it. The caller owns every
 # reason's concrete origin/evidence; the pairing is only the domain-level
-# coherence check, never a recovery-policy engine.
+# coherence check, never a recovery-policy engine. Since the F8a Level 3
+# catalog (issue #286), the pairing stays consistent with that catalog's
+# every selectable outcome: BLOCK_RESOLUTION accepts every settled reason
+# except the terminal closed-unmerged cancellation cause — including the
+# github_source_changed fact when the classification policy cannot
+# establish the specific GITHUB_ISSUE_CHANGE case and falls back to the
+# Type B diagnostic gate — and COST_LIMIT/OWNER_ABORT accept exactly their
+# own Owner-authorized stop reasons.
 _EXCEPTIONAL_GATE_REASONS: Mapping[OwnerGateType, frozenset[TaskBlockReason]] = MappingProxyType(
     {
         OwnerGateType.GITHUB_ISSUE_CHANGE: frozenset({TaskBlockReason.GITHUB_SOURCE_CHANGED}),
         OwnerGateType.GITHUB_STATE_MISMATCH: frozenset({TaskBlockReason.STALE_OPERATION}),
-        # Every settled reason except the GitHub source-change fact and
-        # the terminal closed-unmerged cancellation cause: the applicable
-        # operational failures and the explicit Owner/cost stops
-        # (including owner_action_required and cost_limit).
+        OwnerGateType.COST_LIMIT: frozenset({TaskBlockReason.COST_LIMIT}),
+        OwnerGateType.OWNER_ABORT: frozenset({TaskBlockReason.OWNER_ACTION_REQUIRED}),
         OwnerGateType.BLOCK_RESOLUTION: frozenset(
-            reason
-            for reason in TaskBlockReason
-            if reason
-            not in (TaskBlockReason.GITHUB_SOURCE_CHANGED, TaskBlockReason.PR_CLOSED_UNMERGED)
+            reason for reason in TaskBlockReason if reason is not TaskBlockReason.PR_CLOSED_UNMERGED
         ),
     }
 )
@@ -204,8 +210,8 @@ def install_exceptional_block_gate(
         if not isinstance(gate_type, OwnerGateType) or gate_type not in _EXCEPTIONAL_GATE_REASONS:
             raise InvalidCommandError(
                 "install_exceptional_block_gate requires an exceptional "
-                "OwnerGateType (block_resolution, github_issue_change, or "
-                "github_state_mismatch)"
+                "OwnerGateType (block_resolution, github_issue_change, "
+                "github_state_mismatch, cost_limit, or owner_abort)"
             )
         allowed_reasons = _EXCEPTIONAL_GATE_REASONS[gate_type]
         if not isinstance(block_reason, TaskBlockReason) or block_reason not in allowed_reasons:

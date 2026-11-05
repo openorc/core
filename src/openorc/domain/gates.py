@@ -6,10 +6,11 @@ merge decisions are explicit authority boundaries: the gate records the
 exact Owner decision bound to the exact subject it governs.
 
 - v1 gate types are exactly IMPLEMENTATION_AUTHORIZATION,
-  PR_AUTHORIZATION, MERGE_DECISION, REVIEW_RESOLUTION, and the three
+  PR_AUTHORIZATION, MERGE_DECISION, REVIEW_RESOLUTION, and the five
   exceptional types BLOCK_RESOLUTION, GITHUB_ISSUE_CHANGE, and
-  GITHUB_STATE_MISMATCH (issue #258). No speculative additional
-  human-authority decision type exists.
+  GITHUB_STATE_MISMATCH (issue #258) plus COST_LIMIT and OWNER_ABORT
+  (issue #286, the F8a Level 3 blocking-case vocabulary). No speculative
+  additional human-authority decision type exists.
 - Statuses are exactly PENDING, APPROVED, REJECTED, CANCELLED, and
   SETTLED. A gate is created PENDING; APPROVED, REJECTED, CANCELLED, and
   SETTLED are terminal and immutable once stamped with ``decided_at``.
@@ -33,16 +34,20 @@ exact Owner decision bound to the exact subject it governs.
   PR-subject gate is never representable as a bare head SHA. Stale
   workflow-changing operations must never be applied to newer subjects or
   gates, so the exact binding is validated wherever the gate is used.
-- Exceptional gates (issue #258) are the blocked-Task authority seam: each
-  binds exactly one unresolved TaskBlock as its only subject —
+- Exceptional gates (issues #258, #286) are the blocked-Task authority
+  seam: each binds exactly one unresolved TaskBlock as its only subject —
   ``task_block_id`` is required and every other subject form is NULL. Their
   possible Owner actions are a fixed domain vocabulary, never a
   per-Workspace or database-configured registry and never an action
   engine: BLOCK_RESOLUTION may be retried, discussed, or cancel the Task;
   GITHUB_ISSUE_CHANGE may be ignored or cancel the Task;
-  GITHUB_STATE_MISMATCH may be retried or cancel the Task. This module
-  does not execute any action; the action services independently enforce
-  their own identity, currentness, and effect safety (issue #254).
+  GITHUB_STATE_MISMATCH may be retried or cancel the Task. COST_LIMIT and
+  OWNER_ABORT (issue #286) join the blocked-Task vocabulary without action
+  menus yet — their fixed decision menus are completed in F8c (issue
+  #288), so no action vocabulary exists for them until then and this
+  module fails closed when asked. This module does not execute any action;
+  the action services independently enforce their own identity,
+  currentness, and effect safety (issue #254).
 - REVIEW_RESOLUTION approval is an explicit Owner override of an unresolved
   Reviewer objection. It is a separate durable fact and never rewrites the
   historical Reviewer result to ACCEPTED; plan-subject approval leads to a
@@ -93,9 +98,10 @@ class OwnerGateType(StrEnum):
     """The settled v1 OwnerGate type vocabulary.
 
     The four ordinary types carry the human-authority decisions of the
-    autonomous workflow; the three exceptional types (issue #258) are the
-    blocked-Task OwnerGate forms, each bound to exactly one unresolved
-    TaskBlock subject.
+    autonomous workflow; the exceptional types are the blocked-Task
+    OwnerGate forms, each bound to exactly one unresolved TaskBlock
+    subject: the three F3 foundation types (issue #258) plus the two F8a
+    Level 3 blocking-case types COST_LIMIT and OWNER_ABORT (issue #286).
     """
 
     IMPLEMENTATION_AUTHORIZATION = "implementation_authorization"
@@ -105,6 +111,8 @@ class OwnerGateType(StrEnum):
     BLOCK_RESOLUTION = "block_resolution"
     GITHUB_ISSUE_CHANGE = "github_issue_change"
     GITHUB_STATE_MISMATCH = "github_state_mismatch"
+    COST_LIMIT = "cost_limit"
+    OWNER_ABORT = "owner_abort"
 
 
 class OwnerGateStatus(StrEnum):
@@ -129,6 +137,21 @@ _TERMINAL_GATE_STATUSES: frozenset[OwnerGateStatus] = frozenset(
         OwnerGateStatus.REJECTED,
         OwnerGateStatus.CANCELLED,
         OwnerGateStatus.SETTLED,
+    }
+)
+
+# The exceptional blocked-Task gate types (issues #258, #286): each binds
+# exactly one unresolved TaskBlock as its only subject. This set is the
+# subject-coherence vocabulary, deliberately separate from the action-menu
+# mapping below: F8a (#286) introduces COST_LIMIT and OWNER_ABORT without
+# decision menus, and F8c (#288) completes their fixed menus.
+_EXCEPTIONAL_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
+    {
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+        OwnerGateType.COST_LIMIT,
+        OwnerGateType.OWNER_ABORT,
     }
 )
 
@@ -176,12 +199,16 @@ def exceptional_owner_gate_actions(
 
     Ordinary gate types carry no exceptional action vocabulary: their
     decisions are the settled APPROVED/REJECTED/CANCELLED/SETTLED outcomes.
+    COST_LIMIT and OWNER_ABORT (issue #286) carry none yet either — their
+    fixed decision menus are completed in F8c (issue #288) — so asking for
+    them fails closed rather than inventing an action.
     """
     if not isinstance(gate_type, OwnerGateType) or gate_type not in _EXCEPTIONAL_GATE_ACTIONS:
         raise OwnerGateDomainError(
-            "exceptional_owner_gate_actions requires an exceptional "
-            "OwnerGateType (block_resolution, github_issue_change, or "
-            "github_state_mismatch)"
+            "exceptional_owner_gate_actions requires an OwnerGateType with "
+            "a fixed decision menu (block_resolution, github_issue_change, "
+            "or github_state_mismatch); the cost_limit and owner_abort "
+            "menus are completed in F8c (issue #288)"
         )
     return _EXCEPTIONAL_GATE_ACTIONS[gate_type]
 
@@ -204,7 +231,7 @@ class OwnerGate:
     ``task_pull_request_id`` plus the exact ``subject_head_sha`` for the
     PR-subject forms (merge decision, PR-review resolution) — exactly one
     form per type, enforced in :meth:`__post_init__` to mirror the
-    database CHECK. The three exceptional types (issue #258) instead bind
+    database CHECK. The exceptional types (issues #258, #286) instead bind
     exactly one unresolved TaskBlock: ``task_block_id`` is their only
     subject and every other subject form is NULL. ``status`` moves from
     PENDING to exactly one terminal outcome, stamped with ``decided_at``;
@@ -232,7 +259,8 @@ class OwnerGate:
                 "OwnerGate.gate_type must be an OwnerGateType "
                 "(implementation_authorization, pr_authorization, "
                 "merge_decision, review_resolution, block_resolution, "
-                "github_issue_change, or github_state_mismatch)"
+                "github_issue_change, github_state_mismatch, cost_limit, "
+                "or owner_abort)"
             )
         if not isinstance(self.status, OwnerGateStatus):
             raise OwnerGateDomainError(
@@ -250,13 +278,13 @@ class OwnerGate:
             )
         # Exact-subject coherence per gate type, mirroring the database
         # CHECK: each gate binds exactly the authority subject it governs.
-        # The three exceptional types (issue #258) bind exactly one
+        # The exceptional types (issues #258, #286) bind exactly one
         # unresolved TaskBlock as their only subject. PR_AUTHORIZATION is
         # the pre-PR exact-head gate (no PR binding: it happens before the
         # canonical PR exists); MERGE_DECISION and the PR form of
         # REVIEW_RESOLUTION bind the canonical TaskPullRequest plus the
         # exact head SHA.
-        if self.gate_type in _EXCEPTIONAL_GATE_ACTIONS:
+        if self.gate_type in _EXCEPTIONAL_GATE_TYPES:
             if (
                 not isinstance(self.task_block_id, UUID)
                 or self.plan_revision_id is not None
@@ -264,7 +292,7 @@ class OwnerGate:
                 or self.task_pull_request_id is not None
             ):
                 raise OwnerGateDomainError(
-                    f"an {self.gate_type.value} gate binds exactly one "
+                    f"{self.gate_type.value} gates bind exactly one "
                     "unresolved TaskBlock subject (task_block_id; no "
                     "PlanRevision, head SHA, or PR binding)"
                 )

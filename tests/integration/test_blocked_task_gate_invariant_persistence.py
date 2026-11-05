@@ -97,6 +97,32 @@ def test_the_installer_composition_satisfies_the_committed_invariant(
     assert gate.gate_type is OwnerGateType.BLOCK_RESOLUTION
 
 
+def test_the_invariant_accepts_the_level3_blocking_case_gate_types(
+    conn: Connection[Any],
+) -> None:
+    # F8a (issue #286): a committed current BLOCKED Task whose current
+    # pending exceptional gate is cost_limit or owner_abort, bound to its
+    # sole unresolved block, satisfies the widened F7c invariant.
+    for gate_type, reason in (
+        (OwnerGateType.COST_LIMIT, TaskBlockReason.COST_LIMIT),
+        (OwnerGateType.OWNER_ABORT, TaskBlockReason.OWNER_ACTION_REQUIRED),
+    ):
+        facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
+        result = _install(facts["pool"], facts, gate_type=gate_type, block_reason=reason)
+        # The composition's own committed state passes the deferred
+        # triggers under the widened exceptional-type list.
+        _flush(conn)
+        task = task_repositories.get_task(facts["pool"], facts["task_id"])
+        assert task is not None
+        assert task.status is TaskStatus.BLOCKED
+        assert task.current_owner_gate_id == result.owner_gate.id
+        gate = get_owner_gate(facts["pool"], owner_gate_id=result.owner_gate.id)
+        assert gate is not None
+        assert gate.gate_type is gate_type
+        assert gate.status is OwnerGateStatus.PENDING
+        assert gate.task_block_id == result.task_block.id
+
+
 def test_the_blocked_pointer_cannot_be_cleared_while_blocked(
     conn: Connection[Any],
 ) -> None:

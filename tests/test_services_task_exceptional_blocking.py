@@ -495,8 +495,15 @@ def test_command_shape_is_validated_before_any_database_access() -> None:
     with pytest.raises(InvalidCommandError):
         _install(
             conn,
-            gate_type=OwnerGateType.BLOCK_RESOLUTION,
-            block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
+            gate_type=OwnerGateType.COST_LIMIT,
+            block_reason=TaskBlockReason.OWNER_ACTION_REQUIRED,
+            **base,
+        )
+    with pytest.raises(InvalidCommandError):
+        _install(
+            conn,
+            gate_type=OwnerGateType.OWNER_ABORT,
+            block_reason=TaskBlockReason.COST_LIMIT,
             **base,
         )
     with pytest.raises(InvalidCommandError):
@@ -534,15 +541,19 @@ def test_command_shape_is_validated_before_any_database_access() -> None:
 
 
 def test_the_block_reason_pairing_accepts_the_applicable_reasons() -> None:
-    # BLOCK_RESOLUTION accepts the operational and explicit-stop reasons
-    # (including owner_action_required and cost_limit, and a caller-proven
-    # stale_operation); GITHUB_ISSUE_CHANGE accepts exactly
+    # BLOCK_RESOLUTION accepts every settled reason except the terminal
+    # pr_closed_unmerged cause — including github_source_changed since the
+    # F8a Level 3 catalog (issue #286) falls back to the Type B diagnostic
+    # gate when it cannot establish the specific Type A case; the
+    # COST_LIMIT and OWNER_ABORT gate cases accept exactly their own
+    # Owner-authorized stop reasons; GITHUB_ISSUE_CHANGE accepts exactly
     # github_source_changed; GITHUB_STATE_MISMATCH accepts exactly
     # stale_operation.
     for reason in (
         TaskBlockReason.OWNER_ACTION_REQUIRED,
         TaskBlockReason.COST_LIMIT,
         TaskBlockReason.STALE_OPERATION,
+        TaskBlockReason.GITHUB_SOURCE_CHANGED,
         TaskBlockReason.RUNTIME_FAILURE,
         TaskBlockReason.AGENT_SESSION_LOST,
         TaskBlockReason.CONNECTION_UNAVAILABLE,
@@ -564,6 +575,8 @@ def test_the_block_reason_pairing_accepts_the_applicable_reasons() -> None:
     for gate_type, reason in (
         (OwnerGateType.GITHUB_ISSUE_CHANGE, TaskBlockReason.GITHUB_SOURCE_CHANGED),
         (OwnerGateType.GITHUB_STATE_MISMATCH, TaskBlockReason.STALE_OPERATION),
+        (OwnerGateType.COST_LIMIT, TaskBlockReason.COST_LIMIT),
+        (OwnerGateType.OWNER_ABORT, TaskBlockReason.OWNER_ACTION_REQUIRED),
     ):
         conn = ScriptedConnection()
         _script_success(conn, gate_type=gate_type.value)
