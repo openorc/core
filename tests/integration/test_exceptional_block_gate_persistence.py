@@ -311,3 +311,99 @@ def test_a_stale_or_replayed_installation_applies_nothing(conn: Connection[Any])
         "task_blocked": 1,
         "owner_gate_created": 1,
     }
+
+
+def test_the_level3_blocking_case_gate_types_install_with_their_task_block_subjects(
+    conn: Connection[Any],
+) -> None:
+    # F8a (issue #286): cost_limit and owner_abort join the exceptional
+    # blocked-Task vocabulary. Each installs with exactly its TaskBlock
+    # subject through the one shared atomic foundation, with the truthful
+    # audit pair and the guarded blocked transition.
+    for gate_type, reason, context in (
+        (
+            OwnerGateType.COST_LIMIT,
+            TaskBlockReason.COST_LIMIT,
+            {
+                "control": "owner_abort",
+                "reason_provenance": "owner_authorized_task_budget",
+                "observed_cost_usd": "12.50",
+                "authorized_budget_usd": "10.00",
+                "aggregate_includes_unobserved_sessions": False,
+                "target_roles": ["producer"],
+                "task_agent_session_ids": [str(uuid.uuid4())],
+            },
+        ),
+        (
+            OwnerGateType.OWNER_ABORT,
+            TaskBlockReason.OWNER_ACTION_REQUIRED,
+            {
+                "control": "owner_abort",
+                "target_roles": ["producer"],
+                "task_agent_session_ids": [str(uuid.uuid4())],
+            },
+        ),
+    ):
+        facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
+        result = _install(
+            facts["pool"],
+            facts,
+            gate_type=gate_type,
+            block_reason=reason,
+            block_context=context,
+        )
+        task = task_repositories.get_task(facts["pool"], facts["task_id"])
+        assert task is not None
+        assert task.status is TaskStatus.BLOCKED
+        assert task.current_owner_gate_id == result.owner_gate.id
+        gate = get_owner_gate(facts["pool"], owner_gate_id=result.owner_gate.id)
+        assert gate is not None
+        assert gate.gate_type is gate_type
+        assert gate.status is OwnerGateStatus.PENDING
+        # Exactly the TaskBlock subject: every other subject form NULL.
+        assert gate.task_block_id == result.task_block.id
+        assert gate.plan_revision_id is None
+        assert gate.subject_head_sha is None
+        assert gate.task_pull_request_id is None
+        assert _event_counts(conn, facts["task_id"]) == {
+            "task_blocked": 1,
+            "owner_gate_created": 1,
+        }
+
+
+def test_the_level3_gate_types_refuse_mixed_or_absent_task_block_subjects(
+    conn: Connection[Any],
+) -> None:
+    # The subject-coherence CHECK is immediate: the new exceptional types
+    # bind exactly the TaskBlock subject and refuse every mixed or absent
+    # subject form.
+    facts = _task_fixture(conn, status=TaskStatus.IMPLEMENTING)
+    for gate_type in ("cost_limit", "owner_abort"):
+        # A TaskBlock subject mixed with a head SHA.
+        with pytest.raises(CheckViolation), conn.transaction():
+            conn.execute(
+                "insert into openorc.owner_gates "
+                "(id, workspace_id, task_id, gate_type, status, subject_head_sha, task_block_id) "
+                "values (%s, %s, %s, %s, 'pending', %s, %s)",
+                (
+                    uuid.uuid4(),
+                    facts["workspace_id"],
+                    facts["task_id"],
+                    gate_type,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    uuid.uuid4(),
+                ),
+            )
+        # No TaskBlock subject at all.
+        with pytest.raises(CheckViolation), conn.transaction():
+            conn.execute(
+                "insert into openorc.owner_gates "
+                "(id, workspace_id, task_id, gate_type, status, task_block_id) "
+                "values (%s, %s, %s, %s, 'pending', null)",
+                (
+                    uuid.uuid4(),
+                    facts["workspace_id"],
+                    facts["task_id"],
+                    gate_type,
+                ),
+            )

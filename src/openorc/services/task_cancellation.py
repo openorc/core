@@ -216,15 +216,20 @@ _OPEN_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
     }
 )
 
-# The three exceptional blocked-Task gate kinds (issue #258) whose exact
+# The exceptional blocked-Task gate kinds (issues #258, #286) whose exact
 # current gate the shared Owner cancellation resolves on a BLOCKED Task
 # (issue #278). Any other current gate kind on a blocked Task is an unsafe
-# gate fact and is rejected instead of resolved or silently dropped.
+# gate fact and is rejected instead of resolved or silently dropped. The
+# F8a Level 3 blocking-case types cost_limit and owner_abort (issue #286)
+# join the vocabulary; Cancel remains the one universal decision, and the
+# F8c decision menus (issue #288) complete the other actions for them.
 _EXCEPTIONAL_BLOCKED_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
     {
         OwnerGateType.BLOCK_RESOLUTION,
         OwnerGateType.GITHUB_ISSUE_CHANGE,
         OwnerGateType.GITHUB_STATE_MISMATCH,
+        OwnerGateType.COST_LIMIT,
+        OwnerGateType.OWNER_ABORT,
     }
 )
 

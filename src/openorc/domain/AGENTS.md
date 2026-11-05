@@ -77,14 +77,25 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
 
 - TaskPullRequest is the one canonical PR record for a Task in v1. A closed-unmerged PR is not replaced automatically. Mutable observed GitHub state updates the same record.
 - OwnerGate types are IMPLEMENTATION_AUTHORIZATION, PR_AUTHORIZATION,
-  MERGE_DECISION, REVIEW_RESOLUTION, plus the three exceptional blocked-Task
+  MERGE_DECISION, REVIEW_RESOLUTION, plus the five exceptional blocked-Task
   types BLOCK_RESOLUTION, GITHUB_ISSUE_CHANGE, and GITHUB_STATE_MISMATCH
-  (issue #258). Statuses are PENDING, APPROVED, REJECTED, CANCELLED,
+  (issue #258) and COST_LIMIT and OWNER_ABORT (issue #286, the F8a Level 3
+  blocking-case types; their fixed Owner decision menus are completed in
+  F8c, issue #288, and until then no action vocabulary exists for them).
+  Statuses are PENDING, APPROVED, REJECTED, CANCELLED,
   SETTLED; SETTLED (issue #211) is the Reviewer-driven settlement outcome of
   a REVIEW_RESOLUTION gate, representable only for that gate type and
   reachable only through the settlement services — never an Owner-attributed
   resolution.
-- Gates bind exact subjects: implementation authorization → PlanRevision; PR authorization → exact committed Producer head; merge decision → TaskPullRequest + exact head; review resolution → exhausted PlanRevision or TaskPullRequest + exact head; the three exceptional types (issue #258) → exactly one unresolved TaskBlock as their only subject, installed atomically with the Task's `blocked` transition by the exceptional blocking service.
+- Gates bind exact subjects: implementation authorization → PlanRevision; PR authorization → exact committed Producer head; merge decision → TaskPullRequest + exact head; review resolution → exhausted PlanRevision or TaskPullRequest + exact head; the five exceptional types (issues #258, #286) → exactly one unresolved TaskBlock as their only subject, installed atomically with the Task's `blocked` transition by the exceptional blocking service.
+- The Level 3 blocking-case vocabulary (issue #286) is the fixed typed
+  condition set the authoritative classification policy recognizes, each
+  with its minimum positively-evidenced facts validated
+  transport-independently beside it. The policy — one fixed, fail-closed
+  application-service decision — alone selects the exceptional gate case
+  or the Type B `BLOCK_RESOLUTION` diagnostic fallback; callers never
+  choose exceptional gate types, and the policy performs no recovery and
+  executes no action.
 - Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed. Currency can also clear without any terminal stamp (issue #219): a Reviewer-triggered change request at an accepted-plan implementation gate supersedes the pending gate — pointer cleared, gate kept as pending history, never stamped with an Owner outcome or the REVIEW_RESOLUTION-only SETTLED status.
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.
 - RuntimeRequest remains a scoped Producer/runtime-originated ACTION_APPROVAL correlation only for adapter contracts that actually require OpenOrc participation. Cline v1 native tool approvals do not create RuntimeRequests. It is never free-form Owner ↔ Producer conversation.

@@ -1,11 +1,12 @@
-"""Domain tests for OwnerGate (issues #24, #258).
+"""Domain tests for OwnerGate (issues #24, #258, #286).
 
 Ordinary deterministic tests: no database, no network. These prove the
 human-authority invariants later persistence and workflow-service behavior
-inherit: the settled seven-type and five-status vocabularies, the per-type
-exact-subject binding (TaskBlock-only subjects for the three exceptional
-types), the fixed exceptional action vocabulary, resolution coherence
-(one terminal stamp), and the exact field set (no Task status, no
+inherit: the settled nine-type and five-status vocabularies, the per-type
+exact-subject binding (TaskBlock-only subjects for the five exceptional
+types), the fixed exceptional action vocabulary (the three menued types;
+the two F8a types fail closed until F8c), resolution coherence (one
+terminal stamp), and the exact field set (no Task status, no
 optimistic-concurrency token, and no updated_at — a resolved gate is
 immutable history with no update path).
 """
@@ -51,7 +52,7 @@ def _gate(**overrides: Any) -> OwnerGate:
     return OwnerGate(**values)
 
 
-def test_gate_type_vocabulary_is_exactly_the_seven_settled_decisions() -> None:
+def test_gate_type_vocabulary_is_exactly_the_nine_settled_decisions() -> None:
     assert {member.value for member in OwnerGateType} == {
         "implementation_authorization",
         "pr_authorization",
@@ -60,6 +61,8 @@ def test_gate_type_vocabulary_is_exactly_the_seven_settled_decisions() -> None:
         "block_resolution",
         "github_issue_change",
         "github_state_mismatch",
+        "cost_limit",
+        "owner_abort",
     }
 
 
@@ -270,7 +273,7 @@ def test_review_resolution_rejects_wrong_type_subject_ids() -> None:
 
 
 def test_exceptional_gates_bind_exactly_one_task_block_subject() -> None:
-    # The three exceptional types (issue #258) bind exactly one unresolved
+    # The exceptional types (issues #258, #286) bind exactly one unresolved
     # TaskBlock as their only subject: task_block_id is required and every
     # other subject form is NULL.
     block_id = uuid4()
@@ -278,6 +281,8 @@ def test_exceptional_gates_bind_exactly_one_task_block_subject() -> None:
         OwnerGateType.BLOCK_RESOLUTION,
         OwnerGateType.GITHUB_ISSUE_CHANGE,
         OwnerGateType.GITHUB_STATE_MISMATCH,
+        OwnerGateType.COST_LIMIT,
+        OwnerGateType.OWNER_ABORT,
     ):
         gate = _gate(
             gate_type=gate_type,
@@ -298,6 +303,8 @@ def test_exceptional_gates_reject_mixed_or_empty_subjects() -> None:
         OwnerGateType.BLOCK_RESOLUTION,
         OwnerGateType.GITHUB_ISSUE_CHANGE,
         OwnerGateType.GITHUB_STATE_MISMATCH,
+        OwnerGateType.COST_LIMIT,
+        OwnerGateType.OWNER_ABORT,
     ):
         # No subject at all: an exceptional gate is always block-bound.
         with pytest.raises(OwnerGateDomainError):
@@ -359,6 +366,13 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
         "cancel_task",
         "ignore",
     }
+    # COST_LIMIT and OWNER_ABORT (issue #286) join the blocked-Task
+    # vocabulary without action menus yet: their fixed decision menus are
+    # completed in F8c (issue #288), so asking for them fails closed
+    # rather than inventing an action.
+    for gate_type in (OwnerGateType.COST_LIMIT, OwnerGateType.OWNER_ABORT):
+        with pytest.raises(OwnerGateDomainError):
+            exceptional_owner_gate_actions(gate_type)
     # Ordinary gate types carry no exceptional action vocabulary.
     for gate_type in (
         OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
