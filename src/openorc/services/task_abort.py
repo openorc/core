@@ -20,8 +20,9 @@ state and never by Cline's instantaneous busy/status field:
   caller's admitted activity context names, refuses any already-outstanding
   interruption, then atomically installs the F3 exceptional blocking
   foundation (issue #258) — the ``owner_action_required`` TaskBlock (with
-  the safe ``owner_abort`` context), its pending ``BLOCK_RESOLUTION``
-  OwnerGate bound to that block, the guarded current-gate pointer
+  the safe ``owner_abort`` context), its pending ``OWNER_ABORT`` OwnerGate
+  selected by the Level 3 blocking-case catalog (F8b, issue #287) bound to
+  that block, the guarded current-gate pointer
   installation with the ``blocked`` transition under the Task's token (a
   superseded pending ordinary gate stays truthful pending history, unusable
   while blocked), and the OWNER ``task_blocked`` / ``owner_gate_created``
@@ -52,8 +53,9 @@ the one Owner-authorized cost-limit control:
 :func:`apply_owner_authorized_cost_limit_block` /
 :func:`establish_owner_authorized_cost_limit_block` compose the identical
 atomic blocking composition — one ``COST_LIMIT`` TaskBlock with the safe
-``owner_abort`` control context, its pending ``BLOCK_RESOLUTION``
-OwnerGate, the guarded ``blocked`` transition, the OWNER ``task_blocked``
+``owner_abort`` control context, its pending ``COST_LIMIT`` OwnerGate
+selected by the Level 3 blocking-case catalog (F8b, issue #287), the
+guarded ``blocked`` transition, the OWNER ``task_blocked``
 / ``owner_gate_created`` audits, and the exact one-shot Interrupt intents —
 driven by the Task's persisted standing budget decision instead of a live
 Owner command. The accountable Owner Profile is derived from the durable
@@ -81,10 +83,10 @@ from openorc.adapters.agent_runtime import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.cline import ClineAdapter, ClineSettlementRefusal
+from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import Execution, ExecutionStatus
-from openorc.domain.gates import OwnerGateType
 from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
 from openorc.domain.reviews import ReviewLoopStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
@@ -106,6 +108,7 @@ from openorc.services.errors import (
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -456,6 +459,7 @@ def _establish_abort_plan(
             transaction_pool,
             task=task,
             owner_profile_id=profile_id,
+            condition=Level3BlockingCondition.OWNER_ABORT_ISSUED,
             reason=TaskBlockReason.OWNER_ACTION_REQUIRED,
             context=_owner_abort_block_context(targets),
             targets=targets,
@@ -467,6 +471,7 @@ def _apply_owner_authorized_block(
     *,
     task: Task,
     owner_profile_id: UUID,
+    condition: Level3BlockingCondition,
     reason: TaskBlockReason,
     context: Mapping[str, object],
     targets: tuple[_InterruptTarget, ...],
@@ -475,10 +480,14 @@ def _apply_owner_authorized_block(
 
     The one shared composition of the interactive Owner Abort (issue #228)
     and the persisted standing cost-policy control (issue #240), inside the
-    caller's open composed transaction. The F3 exceptional blocking
-    foundation (issue #258) applies its one atomic effect — one current
-    TaskBlock with its reason/recovery context, the pending
-    ``BLOCK_RESOLUTION`` OwnerGate bound to it as its only subject, the
+    caller's open composed transaction. The caller declares the typed Level 3
+    blocking condition its already-proven facts establish, with the
+    reason-specific context doubling as the classification evidence; the
+    authoritative Level 3 catalog — never this composition or its callers —
+    selects the exceptional OwnerGate case (F8b, issue #287). The F3
+    exceptional blocking foundation (issue #258) applies its one atomic
+    effect — one current TaskBlock with its reason/recovery context, the
+    pending Level 3-selected OwnerGate bound to it as its only subject, the
     guarded current-gate pointer installation with the ``blocked``
     transition under the Task's exact state token, and the OWNER
     ``task_blocked`` / ``owner_gate_created`` audits — and the exact
@@ -487,6 +496,7 @@ def _apply_owner_authorized_block(
     rolled back together. A failing or stale installation rolls back every
     blocking decision fact.
     """
+    gate_type = classify_blocking_case(condition, context, reason)
     installation = install_exceptional_block_gate(
         transaction_pool,
         workspace_id=task.workspace_id,
@@ -494,7 +504,7 @@ def _apply_owner_authorized_block(
         expected_state_token=task.state_token,
         expected_status=task.status,
         expected_current_owner_gate_id=task.current_owner_gate_id,
-        gate_type=OwnerGateType.BLOCK_RESOLUTION,
+        gate_type=gate_type,
         block_reason=reason,
         block_context=context,
         actor=event_coordination.owner_actor(owner_profile_id),
@@ -567,8 +577,8 @@ def _resolve_cost_limit_interrupt_targets(
     eligibility facts (:func:`_has_cost_limit_eligible_activity`).
     Sessions without eligible activity are never gratuitously interrupted:
     where the Task is idle (typically at a pending Owner gate), the block
-    composes with zero targets — the BLOCK_RESOLUTION installation
-    supersedes that pending ordinary gate truthfully (it stays pending
+    composes with zero targets — the Level 3-selected ``COST_LIMIT``
+    installation supersedes that pending ordinary gate truthfully (it stays pending
     history, unusable while blocked) and no Interrupt exists, for F4b.
     """
     targets: list[_InterruptTarget] = []
@@ -667,6 +677,7 @@ def apply_owner_authorized_cost_limit_block(
         transaction_pool,
         task=locked,
         owner_profile_id=workspace.owner_profile_id,
+        condition=Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
         reason=TaskBlockReason.COST_LIMIT,
         context=_cost_limit_block_context(
             targets=targets,
@@ -698,8 +709,9 @@ def establish_owner_authorized_cost_limit_block(
     The pre-dispatch seam for #88 F3a: one short composed transaction
     verifies the current Task/budget/threshold under the Task row lock and,
     exactly when the persisted standing decision applies, commits the
-    ``COST_LIMIT`` block with its pending ``BLOCK_RESOLUTION`` OwnerGate,
-    the guarded ``blocked`` transition, the OWNER ``task_blocked`` /
+    ``COST_LIMIT`` block with its pending Level 3-selected ``COST_LIMIT``
+    OwnerGate (F8b, issue #287), the guarded ``blocked`` transition, the
+    OWNER ``task_blocked`` /
     ``owner_gate_created`` audits, and the exact one-shot Interrupt intents
     together. Returns the typed outcome; dispatch obligations are handled
     strictly after the commit through :func:`dispatch_registered_task_interrupt`

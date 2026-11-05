@@ -138,7 +138,7 @@ def _intent_row() -> tuple[Any, ...]:
 
 
 def _exceptional_gate_row() -> tuple[Any, ...]:
-    row = list(_gate_row(gate_id=_GATE_ID, gate_type="block_resolution", head_sha=None, pr_id=None))
+    row = list(_gate_row(gate_id=_GATE_ID, gate_type="cost_limit", head_sha=None, pr_id=None))
     row[8] = _BLOCK_ID  # the gate's TaskBlock subject
     return tuple(row)
 
@@ -303,13 +303,14 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
     assert external_session_id == _EXTERNAL_SESSION_ID
     assert intent.requested_by_profile_id == _OWNER_PROFILE_ID
     # The block insert carries the additive reason, and the F3 composition
-    # installs its pending BLOCK_RESOLUTION gate bound to that block.
+    # installs its pending Level 3-selected COST_LIMIT gate (F8b, issue
+    # #287) bound to that block.
     block_params = next(
         params for sql, params in conn.executed if "insert into openorc.task_blocks" in sql
     )
     assert block_params is not None and block_params[2] == "cost_limit"
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
-    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    assert gate_insert is not None and gate_insert[2] == "cost_limit"
     # The guarded blocked transition and the two OWNER audits commit in the
     # same composition; the new gate becomes the Task's current pointer.
     status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
@@ -500,6 +501,11 @@ def test_idle_waiting_for_owner_gate_still_blocks_without_interruption(
     assert observation.kind is SessionCostObservationKind.BLOCKED
     assert observation.interrupt_dispatches == ()
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
+    # The idle cost-limit block is the TASK_COST_LIMIT_REACHED condition's
+    # empty-target form: it classifies through the Level 3 catalog to the
+    # pending COST_LIMIT gate (F8b, issue #287) with no Interrupt.
+    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
+    assert gate_insert is not None and gate_insert[2] == "cost_limit"
 
 
 def _assert_barrier_precedes_task_lock(conn: ScriptedConnection) -> None:
@@ -602,11 +608,12 @@ def test_pre_dispatch_gate_blocks_at_the_threshold_atomically(
     assert decision.task_block.reason is TaskBlockReason.COST_LIMIT
     assert decision.interrupt_dispatches != ()
     # The F3 composition: the guarded blocked transition, the pending
-    # BLOCK_RESOLUTION gate, and the two OWNER audits.
+    # Level 3-selected COST_LIMIT gate (F8b, issue #287), and the two
+    # OWNER audits.
     status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
     assert status_params is not None and status_params[5] == _GATE_ID
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
-    assert gate_insert is not None and gate_insert[2] == "block_resolution"
+    assert gate_insert is not None and gate_insert[2] == "cost_limit"
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 

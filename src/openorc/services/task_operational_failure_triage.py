@@ -57,9 +57,11 @@ failures. The authorized attempt is persisted with its ordinal and
 exponential-backoff due time (2/4/8 s on an injectable clock) atomically
 with the failing attempt's disposition; the unique backstops make a
 duplicate or replayed triage return the same existing disposition or a
-no-op, never a second authorization or a budget reset. Escalation calls the
-F3 installation with ``BLOCK_RESOLUTION``, the code-mapped TaskBlock
-reason, and a sanitized bounded context in the same transaction; F3 owns
+no-op, never a second authorization or a budget reset. Escalation declares
+no Level 3 condition to the authoritative blocking-case catalog (F8b,
+issue #287): the policy selects the Type B ``BLOCK_RESOLUTION`` diagnostic
+gate, with the code-mapped TaskBlock reason and a sanitized bounded
+context in the same transaction; F3 owns
 the gate/status/token/audit writes in its nested savepoint, and the
 episode's terminal disposition — the exact TaskBlock id — is stamped
 set-once, so the disposition stays durably idempotent across restarts,
@@ -134,6 +136,7 @@ from openorc.services.task_exceptional_blocking import (
     ExceptionalBlockInstallation,
     install_exceptional_block_gate,
 )
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_subject_guards import require_current_plan_revision
 from openorc.services.transaction_composition import composed_transaction
 
@@ -1621,6 +1624,13 @@ def _escalate(
         if session_lost
         else _ESCALATION_REASONS[report.error_code]
     )
+    # F8b (issue #287): every blocking installation selects its exceptional
+    # OwnerGate case through the authoritative Level 3 catalog. An
+    # escalation is not a supported v1 condition: it is declared with no
+    # condition and classifies to the Type B ``BLOCK_RESOLUTION`` diagnostic
+    # fallback.
+    block_context = canonical_task_block_context(context)
+    gate_type = classify_blocking_case(None, block_context, block_reason)
     installation = install_exceptional_block_gate(
         transaction_pool,
         workspace_id=workspace_id,
@@ -1628,9 +1638,9 @@ def _escalate(
         expected_state_token=task.state_token,
         expected_status=task.status,
         expected_current_owner_gate_id=task.current_owner_gate_id,
-        gate_type=OwnerGateType.BLOCK_RESOLUTION,
+        gate_type=gate_type,
         block_reason=block_reason,
-        block_context=canonical_task_block_context(context),
+        block_context=block_context,
         actor=actor,
     )
     marked = failure_records.mark_episode_escalated(

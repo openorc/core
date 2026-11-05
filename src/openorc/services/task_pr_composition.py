@@ -87,6 +87,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
+from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEvent, WorkflowEventActor, WorkflowEventType
@@ -130,6 +131,7 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_runtime_send_claims import (
     RUNTIME_PRE_EFFECT_FAILURE_KIND,
     claim_pr_compose_send,
@@ -559,6 +561,7 @@ def _block_stale_publication(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    condition: Level3BlockingCondition,
     reason: TaskBlockReason,
     context: dict[str, str],
 ) -> Task:
@@ -570,7 +573,8 @@ def _block_stale_publication(
     external calls), then the durable stale evidence against the freshly
     locked Task is re-proved, and the F3 exceptional blocking foundation
     (#258) installs — atomically — the ``reason`` TaskBlock, its pending
-    ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the only subject,
+    Level 3-selected ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the
+    only subject (F8b, issue #287),
     the ``waiting_for_owner → blocked`` transition with one rotated token,
     and the ``task_blocked`` / ``owner_gate_created`` audits under the
     truthful OPENORC actor — commit or roll back together. The publication
@@ -602,9 +606,14 @@ def _block_stale_publication(
                 "stale publication block is stale"
             )
         # The F3 exceptional blocking foundation (#258): one atomic block,
-        # gate, transition, token rotation, and audit pair. The installer's
-        # guarded currentness re-proof is the durable backstop; a raced or
-        # stale caller commits nothing at all.
+        # gate, transition, token rotation, and audit pair. The stale
+        # publication authority is declared to the Level 3 blocking-case
+        # catalog (F8b, issue #287) with the site's proven evidence — the
+        # authoritative policy, never this caller, selects the exceptional
+        # OwnerGate case — and the installer's guarded currentness re-proof
+        # is the durable backstop; a raced or stale caller commits nothing
+        # at all.
+        gate_type = classify_blocking_case(condition, context, reason)
         installation = install_exceptional_block_gate(
             transaction_pool,
             workspace_id=workspace_id,
@@ -612,7 +621,7 @@ def _block_stale_publication(
             expected_state_token=expected_state_token,
             expected_status=task.status,
             expected_current_owner_gate_id=task.current_owner_gate_id,
-            gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
+            gate_type=gate_type,
             block_reason=reason,
             block_context=context,
             actor=_OPENORC_ACTOR,
@@ -898,6 +907,7 @@ def _finalize_or_block(
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            condition=Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
             reason=guard.reason,
             context=guard.context,
         )
@@ -1192,6 +1202,7 @@ def compose_and_publish_task_pr(
                 workspace_id=workspace_id,
                 task_id=task_id,
                 expected_state_token=expected_state_token,
+                condition=Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
                 reason=TaskBlockReason.STALE_OPERATION,
                 context={
                     "authorized_head_sha": approved_head_sha,
@@ -1226,6 +1237,7 @@ def compose_and_publish_task_pr(
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            condition=Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
             reason=TaskBlockReason.STALE_OPERATION,
             context={
                 "authorized_head_sha": approved_head_sha,
