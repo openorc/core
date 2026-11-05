@@ -345,11 +345,9 @@ def test_exceptional_gates_reject_mixed_or_empty_subjects() -> None:
 
 
 def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
-    # The fixed per-type action mapping (issue #49 §14.1): not a dynamic
-    # registry and not an action-execution engine.
+    # The fixed per-type action mapping (issues #49 §14.1, #288): not a
+    # dynamic registry and not an action-execution engine.
     assert exceptional_owner_gate_actions(OwnerGateType.BLOCK_RESOLUTION) == (
-        ExceptionalOwnerGateAction.RETRY,
-        ExceptionalOwnerGateAction.DISCUSS,
         ExceptionalOwnerGateAction.CANCEL_TASK,
     )
     assert exceptional_owner_gate_actions(OwnerGateType.GITHUB_ISSUE_CHANGE) == (
@@ -360,20 +358,24 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
         ExceptionalOwnerGateAction.RETRY,
         ExceptionalOwnerGateAction.CANCEL_TASK,
     )
+    assert exceptional_owner_gate_actions(OwnerGateType.COST_LIMIT) == (
+        ExceptionalOwnerGateAction.CONTINUE,
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
+    assert exceptional_owner_gate_actions(OwnerGateType.OWNER_ABORT) == (
+        ExceptionalOwnerGateAction.RESUME,
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
     assert {member.value for member in ExceptionalOwnerGateAction} == {
         "retry",
-        "discuss",
         "cancel_task",
         "ignore",
+        "continue",
+        "resume",
     }
-    # COST_LIMIT and OWNER_ABORT (issue #286) join the blocked-Task
-    # vocabulary without action menus yet: their fixed decision menus are
-    # completed in F8c (issue #288), so asking for them fails closed
-    # rather than inventing an action.
-    for gate_type in (OwnerGateType.COST_LIMIT, OwnerGateType.OWNER_ABORT):
-        with pytest.raises(OwnerGateDomainError):
-            exceptional_owner_gate_actions(gate_type)
-    # Ordinary gate types carry no exceptional action vocabulary.
+    # Ordinary gate types carry no exceptional action vocabulary: their
+    # decisions remain the settled APPROVED/REJECTED/CANCELLED/SETTLED
+    # outcomes, so asking for them fails closed.
     for gate_type in (
         OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
         OwnerGateType.PR_AUTHORIZATION,
@@ -384,6 +386,44 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
             exceptional_owner_gate_actions(gate_type)
     with pytest.raises(OwnerGateDomainError):
         exceptional_owner_gate_actions("chat_decision")  # type: ignore[arg-type]
+
+
+def test_exceptional_gate_menu_eligibility() -> None:
+    """Menu eligibility (issue #288): every exceptional type exposes its
+    fixed menu, Cancel Task is the one universal decision, and each
+    non-Cancel decision belongs to exactly one menu.
+    """
+    exceptional_types = (
+        OwnerGateType.BLOCK_RESOLUTION,
+        OwnerGateType.GITHUB_ISSUE_CHANGE,
+        OwnerGateType.GITHUB_STATE_MISMATCH,
+        OwnerGateType.COST_LIMIT,
+        OwnerGateType.OWNER_ABORT,
+    )
+    menus = {
+        gate_type: exceptional_owner_gate_actions(gate_type) for gate_type in exceptional_types
+    }
+    # Every menu is a fixed ordered tuple ending in exactly one Cancel
+    # Task — the one universal decision, matching the single shared
+    # cancellation service (issue #278).
+    for menu in menus.values():
+        assert isinstance(menu, tuple)
+        assert menu[-1] is ExceptionalOwnerGateAction.CANCEL_TASK
+        assert menu.count(ExceptionalOwnerGateAction.CANCEL_TASK) == 1
+    # Each non-Cancel decision is eligible in exactly one menu (issue
+    # #288): no universal Retry and no exceptional Discuss exists.
+    exclusive: tuple[tuple[ExceptionalOwnerGateAction, OwnerGateType], ...] = (
+        (ExceptionalOwnerGateAction.IGNORE, OwnerGateType.GITHUB_ISSUE_CHANGE),
+        (ExceptionalOwnerGateAction.RETRY, OwnerGateType.GITHUB_STATE_MISMATCH),
+        (ExceptionalOwnerGateAction.CONTINUE, OwnerGateType.COST_LIMIT),
+        (ExceptionalOwnerGateAction.RESUME, OwnerGateType.OWNER_ABORT),
+    )
+    for action, expected_type in exclusive:
+        holders = [gate_type for gate_type, menu in menus.items() if action in menu]
+        assert holders == [expected_type]
+    # The Type B diagnostic fallback offers Cancel Task only: its safe
+    # diagnostics live on the bound TaskBlock itself, never in the menu.
+    assert menus[OwnerGateType.BLOCK_RESOLUTION] == (ExceptionalOwnerGateAction.CANCEL_TASK,)
 
 
 def test_gate_requires_uuid_identity_fields() -> None:

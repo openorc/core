@@ -34,20 +34,24 @@ exact Owner decision bound to the exact subject it governs.
   PR-subject gate is never representable as a bare head SHA. Stale
   workflow-changing operations must never be applied to newer subjects or
   gates, so the exact binding is validated wherever the gate is used.
-- Exceptional gates (issues #258, #286) are the blocked-Task authority
+- Exceptional gates (issues #258, #286, #288) are the blocked-Task authority
   seam: each binds exactly one unresolved TaskBlock as its only subject —
-  ``task_block_id`` is required and every other subject form is NULL. Their
-  possible Owner actions are a fixed domain vocabulary, never a
+  ``task_block_id`` is required and every other subject form is NULL. Each
+  type carries a fixed decision menu — a fixed domain vocabulary, never a
   per-Workspace or database-configured registry and never an action
-  engine: BLOCK_RESOLUTION may be retried, discussed, or cancel the Task;
-  GITHUB_ISSUE_CHANGE may be ignored or cancel the Task;
-  GITHUB_STATE_MISMATCH may be retried or cancel the Task. COST_LIMIT and
-  OWNER_ABORT (issue #286) join the blocked-Task vocabulary without action
-  menus yet — their fixed decision menus are completed in F8c (issue
-  #288), so no action vocabulary exists for them until then and this
-  module fails closed when asked. This module does not execute any action;
-  the action services independently enforce their own identity,
-  currentness, and effect safety (issue #254).
+  engine: BLOCK_RESOLUTION (the Type B diagnostic fallback) offers Cancel
+  Task only, its safe diagnostics being the bound TaskBlock's own
+  sanitized content; GITHUB_ISSUE_CHANGE offers Ignore or Cancel Task;
+  GITHUB_STATE_MISMATCH offers Try Again (retry) or Cancel Task;
+  COST_LIMIT offers Continue or Cancel Task; OWNER_ABORT offers Resume or
+  Cancel Task. There is no exceptional Discuss and no universal Retry.
+  Only Cancel is executable today (the single shared cancellation
+  service, issue #278): the other actions are declared menu decisions
+  whose action services arrive in F8d–F8g (issues #289–#292), and until
+  then any non-Cancel decision must fail closed rather than falsely
+  resolve or unblock. This module does not execute any action; the
+  action services independently enforce their own identity, currentness,
+  and effect safety (issue #254).
 - REVIEW_RESOLUTION approval is an explicit Owner override of an unresolved
   Reviewer objection. It is a separate durable fact and never rewrites the
   historical Reviewer result to ACCEPTED; plan-subject approval leads to a
@@ -143,8 +147,8 @@ _TERMINAL_GATE_STATUSES: frozenset[OwnerGateStatus] = frozenset(
 # The exceptional blocked-Task gate types (issues #258, #286): each binds
 # exactly one unresolved TaskBlock as its only subject. This set is the
 # subject-coherence vocabulary, deliberately separate from the action-menu
-# mapping below: F8a (#286) introduces COST_LIMIT and OWNER_ABORT without
-# decision menus, and F8c (#288) completes their fixed menus.
+# mapping below: every exceptional type carries its fixed decision menu
+# since F8c (#288) completed the COST_LIMIT and OWNER_ABORT menus.
 _EXCEPTIONAL_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
     {
         OwnerGateType.BLOCK_RESOLUTION,
@@ -159,32 +163,48 @@ _EXCEPTIONAL_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
 class ExceptionalOwnerGateAction(StrEnum):
     """The fixed possible Owner actions for the exceptional gate types.
 
-    Fixed in the domain (issue #49 §14.1): never a per-Workspace or
+    Fixed in the domain (issues #49 §14.1, #288): never a per-Workspace or
     database-configured action registry, and never an action-execution
-    engine. The action services independently enforce identity,
-    currentness, claims, and effect safety (issue #254).
+    engine. The settled v1 menus are a decision surface only: Cancel Task
+    is the one executable decision today (the single shared cancellation
+    service, issue #278), while the other actions are declared menu
+    entries whose action services arrive with F8d–F8g (issues #289–#292)
+    and must fail closed until then. The action services independently
+    enforce identity, currentness, claims, and effect safety (issue #254).
     """
 
     RETRY = "retry"
-    DISCUSS = "discuss"
     CANCEL_TASK = "cancel_task"
     IGNORE = "ignore"
+    CONTINUE = "continue"
+    RESUME = "resume"
 
 
+# The fixed Level 3 decision menus (issue #288): one small, authoritative
+# menu per exceptional gate type, never configured and never extended by
+# callers. BLOCK_RESOLUTION is the Type B diagnostic fallback — its safe
+# diagnostics live on the bound TaskBlock itself, so its menu is Cancel
+# Task only. Every menu ends in Cancel Task, the one executable decision
+# (issue #278); the other actions stay inert until their leaves deliver
+# them (issues #289–#292).
 _EXCEPTIONAL_GATE_ACTIONS: Mapping[OwnerGateType, tuple[ExceptionalOwnerGateAction, ...]] = (
     MappingProxyType(
         {
-            OwnerGateType.BLOCK_RESOLUTION: (
-                ExceptionalOwnerGateAction.RETRY,
-                ExceptionalOwnerGateAction.DISCUSS,
-                ExceptionalOwnerGateAction.CANCEL_TASK,
-            ),
+            OwnerGateType.BLOCK_RESOLUTION: (ExceptionalOwnerGateAction.CANCEL_TASK,),
             OwnerGateType.GITHUB_ISSUE_CHANGE: (
                 ExceptionalOwnerGateAction.IGNORE,
                 ExceptionalOwnerGateAction.CANCEL_TASK,
             ),
             OwnerGateType.GITHUB_STATE_MISMATCH: (
                 ExceptionalOwnerGateAction.RETRY,
+                ExceptionalOwnerGateAction.CANCEL_TASK,
+            ),
+            OwnerGateType.COST_LIMIT: (
+                ExceptionalOwnerGateAction.CONTINUE,
+                ExceptionalOwnerGateAction.CANCEL_TASK,
+            ),
+            OwnerGateType.OWNER_ABORT: (
+                ExceptionalOwnerGateAction.RESUME,
                 ExceptionalOwnerGateAction.CANCEL_TASK,
             ),
         }
@@ -195,20 +215,21 @@ _EXCEPTIONAL_GATE_ACTIONS: Mapping[OwnerGateType, tuple[ExceptionalOwnerGateActi
 def exceptional_owner_gate_actions(
     gate_type: OwnerGateType,
 ) -> tuple[ExceptionalOwnerGateAction, ...]:
-    """Return the fixed possible Owner actions for an exceptional gate type.
+    """Return the fixed decision menu for an exceptional gate type.
 
-    Ordinary gate types carry no exceptional action vocabulary: their
-    decisions are the settled APPROVED/REJECTED/CANCELLED/SETTLED outcomes.
-    COST_LIMIT and OWNER_ABORT (issue #286) carry none yet either — their
-    fixed decision menus are completed in F8c (issue #288) — so asking for
+    The single authoritative menu lookup (issue #288): each exceptional
+    gate type exposes exactly its fixed v1 decisions, and nothing outside
+    those menus can mutate the Task, gate, or block. Ordinary gate types
+    carry no exceptional action vocabulary — their decisions are the
+    settled APPROVED/REJECTED/CANCELLED/SETTLED outcomes — so asking for
     them fails closed rather than inventing an action.
     """
     if not isinstance(gate_type, OwnerGateType) or gate_type not in _EXCEPTIONAL_GATE_ACTIONS:
         raise OwnerGateDomainError(
-            "exceptional_owner_gate_actions requires an OwnerGateType with "
-            "a fixed decision menu (block_resolution, github_issue_change, "
-            "or github_state_mismatch); the cost_limit and owner_abort "
-            "menus are completed in F8c (issue #288)"
+            "exceptional_owner_gate_actions requires an exceptional "
+            "OwnerGateType with a fixed decision menu (block_resolution, "
+            "github_issue_change, github_state_mismatch, cost_limit, or "
+            "owner_abort); ordinary gate types carry no exceptional menu"
         )
     return _EXCEPTIONAL_GATE_ACTIONS[gate_type]
 
