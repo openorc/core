@@ -22,9 +22,12 @@ never the caller — selects the exceptional OwnerGate case.
   PR identity and observed head/ref facts that path positively carries,
   including the preflight form, which carries neither a PR identity nor
   an observed SHA because none exists. No PR identity or observed SHA is
-  ever manufactured or required. The merge-head condition keeps its
-  distinct E10a contract (the approved MERGE_DECISION gate identity, the
-  canonical TaskPullRequest, and the exact expected vs observed head).
+  ever manufactured or required: the canonical PR identity is the
+  OpenOrc UUID, while GitHub's own pull-request identity is a positive
+  numeric value recorded as its decimal string. The merge-head condition
+  keeps its distinct E10a contract (the approved MERGE_DECISION gate
+  identity, the canonical TaskPullRequest, and the exact expected vs
+  observed head).
 - Evidence keys are closed: the catalog maps conditions to exact evidence
   shapes, not arbitrary diagnostic bags. A declared condition whose
   evidence carries unrecognized keys, malformed values, or a missing
@@ -77,9 +80,12 @@ class Level3BlockingCondition(StrEnum):
 # anchor is required; every other key is optional, positively-evidenced
 # corroboration that varies by publication path. The preflight form
 # carries only the anchor — no canonical PR exists to cite and no SHA was
-# observed, so neither is required or manufactured.
+# observed, so neither is required or manufactured. The OpenOrc-owned
+# canonical PR identity is a UUID; GitHub's own pull-request identity is
+# a positive numeric value recorded as its decimal string.
 _PUBLICATION_ANCHOR_KEYS = ("authorized_head_sha", "owner_gate_id")
-_PUBLICATION_IDENTITY_KEYS = ("pull_request_id", "github_pull_request_id")
+_PUBLICATION_UUID_KEYS = ("pull_request_id",)
+_PUBLICATION_NUMERIC_IDENTITY_KEYS = ("github_pull_request_id",)
 _PUBLICATION_OBSERVED_KEYS = (
     "github_pr_number",
     "observed_head_sha",
@@ -88,7 +94,12 @@ _PUBLICATION_OBSERVED_KEYS = (
     "authorized_base_ref",
 )
 _PUBLICATION_KNOWN_KEYS = frozenset(
-    (*_PUBLICATION_ANCHOR_KEYS, *_PUBLICATION_IDENTITY_KEYS, *_PUBLICATION_OBSERVED_KEYS)
+    (
+        *_PUBLICATION_ANCHOR_KEYS,
+        *_PUBLICATION_UUID_KEYS,
+        *_PUBLICATION_NUMERIC_IDENTITY_KEYS,
+        *_PUBLICATION_OBSERVED_KEYS,
+    )
 )
 
 _MERGE_MISMATCH_KEYS = (
@@ -141,9 +152,11 @@ def _require_fixed_value(evidence: Mapping[str, object], key: str, expected: str
         )
 
 
-def _require_str_list(evidence: Mapping[str, object], key: str) -> None:
+def _require_str_list(
+    evidence: Mapping[str, object], key: str, *, allow_empty: bool = False
+) -> None:
     value = evidence.get(key)
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list) or (not value and not allow_empty):
         raise BlockingCaseDomainError(
             f"the {key} blocking-case evidence must be a non-empty list of strings"
         )
@@ -151,6 +164,32 @@ def _require_str_list(evidence: Mapping[str, object], key: str) -> None:
         raise BlockingCaseDomainError(
             f"the {key} blocking-case evidence entries must be non-empty strings"
         )
+
+
+def _require_positive_numeric_identity(evidence: Mapping[str, object], key: str) -> None:
+    """A positive external numeric identity, recorded as its decimal string.
+
+    GitHub's own numeric identities (the stable pull-request ID) are
+    recorded in the E8 evidence as their decimal string form; they are
+    never OpenOrc UUIDs.
+    """
+    value = evidence.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value <= 0:
+            raise BlockingCaseDomainError(
+                f"the {key} blocking-case evidence must be a positive numeric identity"
+            )
+        return
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        if int(value) <= 0:
+            raise BlockingCaseDomainError(
+                f"the {key} blocking-case evidence must be a positive numeric identity"
+            )
+        return
+    raise BlockingCaseDomainError(
+        f"the {key} blocking-case evidence must be a positive numeric identity "
+        "(a positive integer or its decimal string form)"
+    )
 
 
 def _require_exact_keys(evidence: Mapping[str, object], keys: tuple[str, ...]) -> None:
@@ -207,10 +246,15 @@ def _validate_publication_mismatch_evidence(evidence: Mapping[str, object]) -> N
     _require_non_empty_str(evidence, "authorized_head_sha")
     _require_uuid_str(evidence, "owner_gate_id")
     # Optional corroboration is validated when present and never required:
-    # the preflight form legitimately carries none of it.
-    for key in _PUBLICATION_IDENTITY_KEYS:
+    # the preflight form legitimately carries none of it. The OpenOrc-owned
+    # canonical PR identity is a UUID; GitHub's own pull-request identity
+    # is a positive numeric identity (issue #280 post-create outcomes).
+    for key in _PUBLICATION_UUID_KEYS:
         if key in evidence:
             _require_uuid_str(evidence, key)
+    for key in _PUBLICATION_NUMERIC_IDENTITY_KEYS:
+        if key in evidence:
+            _require_positive_numeric_identity(evidence, key)
     for key in _PUBLICATION_OBSERVED_KEYS:
         if key in evidence:
             _require_non_empty_str(evidence, key)
@@ -234,13 +278,21 @@ def _validate_cost_limit_evidence(evidence: Mapping[str, object]) -> None:
         raise BlockingCaseDomainError(
             "the aggregate_includes_unobserved_sessions blocking-case evidence must be a boolean"
         )
-    _require_str_list(evidence, "target_roles")
-    _require_str_list(evidence, "task_agent_session_ids")
+    # The interrupted-activity facts may legitimately be empty: the
+    # cost-limit stop explicitly supports the idle form (BLOCKED_IDLE) where
+    # no runtime activity requires interruption, and the context then
+    # records empty role/session lists. Only their structure is enforced.
+    _require_str_list(evidence, "target_roles", allow_empty=True)
+    _require_str_list(evidence, "task_agent_session_ids", allow_empty=True)
 
 
 def _validate_owner_abort_evidence(evidence: Mapping[str, object]) -> None:
     _require_exact_keys(evidence, _OWNER_ABORT_KEYS)
     _require_fixed_value(evidence, "control", "owner_abort")
+    # The supported OWNER_ABORT origin is the specific Owner-issued Abort
+    # with its exact session/Interrupt context: non-empty target facts are
+    # part of that evidence (the idle cost-limit stop is the separate
+    # TASK_COST_LIMIT_REACHED condition above).
     _require_str_list(evidence, "target_roles")
     _require_str_list(evidence, "task_agent_session_ids")
 

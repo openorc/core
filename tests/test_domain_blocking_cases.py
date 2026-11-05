@@ -27,7 +27,10 @@ _SHA = "0123456789abcdef0123456789abcdef01234567"
 _OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 _GATE_ID = "1b234c67-8d90-4e1f-a234-56789abcdef0"
 _PR_ID = "2c345d78-9e01-4f2f-b345-67890abcdef0"
-_GITHUB_PR_ID = "3d456e89-af12-4a3f-c456-7890abcdef12"
+# GitHub's own pull-request identity is a positive numeric value recorded
+# as its decimal string in the E8 evidence (str(created.github_pr_id)) —
+# never an OpenOrc UUID.
+_GITHUB_PR_ID = "1770032834"
 _FINGERPRINT = "a" * 64
 _OTHER_FINGERPRINT = "b" * 64
 
@@ -166,14 +169,23 @@ def test_publication_mismatch_accepts_the_positively_evidenced_variants() -> Non
             observed_base_ref="renamed-base",
         ),
     )
-    # Post-create outcomes: the GitHub PR identity in place of an observed
-    # head, per the outcome-specific evidence.
+    # Post-create outcomes: GitHub's own numeric PR identity in place of an
+    # observed head, per the outcome-specific evidence — exactly the real
+    # E8 shape (str(created.github_pr_id), never a UUID).
     validate_blocking_case_evidence(
         Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
         _preflight_publication(
             pull_request_id=_PR_ID,
             github_pr_number="43",
             github_pull_request_id=_GITHUB_PR_ID,
+        ),
+    )
+    # The numeric identity is equally valid in its integer form.
+    validate_blocking_case_evidence(
+        Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
+        _preflight_publication(
+            pull_request_id=_PR_ID,
+            github_pull_request_id=1770032834,
         ),
     )
 
@@ -193,6 +205,17 @@ def test_publication_mismatch_rejects_unknown_keys_and_malformed_values() -> Non
         validate_blocking_case_evidence(
             Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
             _preflight_publication(pull_request_id="not-a-uuid"),
+        )
+    # GitHub's own numeric PR identity is never validated as a UUID.
+    with pytest.raises(BlockingCaseDomainError):
+        validate_blocking_case_evidence(
+            Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
+            _preflight_publication(github_pull_request_id="3d456e89-af12-4a3f-c456-7890abcdef12"),
+        )
+    with pytest.raises(BlockingCaseDomainError):
+        validate_blocking_case_evidence(
+            Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
+            _preflight_publication(github_pull_request_id="0"),
         )
     with pytest.raises(BlockingCaseDomainError):
         validate_blocking_case_evidence(
@@ -248,16 +271,34 @@ def test_cost_limit_evidence_carries_the_standing_budget_facts() -> None:
             Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
             _cost_limit(aggregate_includes_unobserved_sessions="no"),
         )
+    # The lists stay structurally validated: wrong types and non-string
+    # entries remain rejected, while emptiness is legitimate (the idle form).
     with pytest.raises(BlockingCaseDomainError):
         validate_blocking_case_evidence(
             Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
-            _cost_limit(target_roles=[]),
+            _cost_limit(target_roles="producer"),  # type: ignore[arg-type]
+        )
+    with pytest.raises(BlockingCaseDomainError):
+        validate_blocking_case_evidence(
+            Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
+            _cost_limit(task_agent_session_ids=[42]),  # type: ignore[list-item]
         )
     with pytest.raises(BlockingCaseDomainError):
         validate_blocking_case_evidence(
             Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
             _cost_limit(extra_key="nope"),
         )
+
+
+def test_idle_cost_limit_evidence_accepts_empty_interrupt_facts() -> None:
+    # The BLOCKED_IDLE cost-limit stop (issue #240) interrupts no runtime
+    # activity: the real context records empty role/session lists, and the
+    # condition must remain the Type A COST_LIMIT case, not the Type B
+    # fallback.
+    validate_blocking_case_evidence(
+        Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
+        _cost_limit(target_roles=[], task_agent_session_ids=[]),
+    )
 
 
 def test_owner_abort_evidence_carries_the_exact_session_context() -> None:

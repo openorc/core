@@ -161,6 +161,19 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
         )
         is OwnerGateType.GITHUB_STATE_MISMATCH
     )
+    # The real E8 post-create evidence shape: GitHub's own numeric PR
+    # identity (str(created.github_pr_id)) with no observed head.
+    assert (
+        classify_blocking_case(
+            Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
+            _publication(
+                pull_request_id=_PR_ID,
+                github_pull_request_id="1770032834",
+            ),
+            TaskBlockReason.STALE_OPERATION,
+        )
+        is OwnerGateType.GITHUB_STATE_MISMATCH
+    )
     # E10a: the proven merge-head authority mismatch (its distinct contract).
     assert (
         classify_blocking_case(
@@ -175,6 +188,16 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
         classify_blocking_case(
             Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
             _cost_limit(),
+            TaskBlockReason.COST_LIMIT,
+        )
+        is OwnerGateType.COST_LIMIT
+    )
+    # The idle cost-limit stop (BLOCKED_IDLE): empty interrupt facts are the
+    # legitimate standing-budget shape and keep the Type A case.
+    assert (
+        classify_blocking_case(
+            Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
+            _cost_limit(target_roles=[], task_agent_session_ids=[]),
             TaskBlockReason.COST_LIMIT,
         )
         is OwnerGateType.COST_LIMIT
