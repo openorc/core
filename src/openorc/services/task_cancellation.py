@@ -223,6 +223,8 @@ _OPEN_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
 # F8a Level 3 blocking-case types cost_limit and owner_abort (issue #286)
 # join the vocabulary; Cancel remains the one universal decision, and the
 # F8c decision menus (issue #288) complete the other actions for them.
+# The legacy github_state_mismatch type stays resolvable by Cancel since
+# F8e (issue #290) even though the Level 3 catalog never newly selects it.
 _EXCEPTIONAL_BLOCKED_GATE_TYPES: frozenset[OwnerGateType] = frozenset(
     {
         OwnerGateType.BLOCK_RESOLUTION,

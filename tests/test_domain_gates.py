@@ -4,9 +4,10 @@ Ordinary deterministic tests: no database, no network. These prove the
 human-authority invariants later persistence and workflow-service behavior
 inherit: the settled nine-type and five-status vocabularies, the per-type
 exact-subject binding (TaskBlock-only subjects for the five exceptional
-types), the fixed exceptional action vocabulary (the three menued types;
-the two F8a types fail closed until F8c), resolution coherence (one
-terminal stamp), and the exact field set (no Task status, no
+types), the fixed exceptional action vocabulary (Cancel Task only for
+BLOCK_RESOLUTION and the legacy GITHUB_STATE_MISMATCH; menued non-Cancel
+decisions for GITHUB_ISSUE_CHANGE, COST_LIMIT, and OWNER_ABORT),
+resolution coherence (one terminal stamp), and the exact field set (no Task status, no
 optimistic-concurrency token, and no updated_at — a resolved gate is
 immutable history with no update path).
 """
@@ -354,8 +355,9 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
         ExceptionalOwnerGateAction.IGNORE,
         ExceptionalOwnerGateAction.CANCEL_TASK,
     )
+    # The legacy GITHUB_STATE_MISMATCH gate (F8e, issue #290) exposes a
+    # Cancel-only menu: the retired Try Again decision is gone.
     assert exceptional_owner_gate_actions(OwnerGateType.GITHUB_STATE_MISMATCH) == (
-        ExceptionalOwnerGateAction.RETRY,
         ExceptionalOwnerGateAction.CANCEL_TASK,
     )
     assert exceptional_owner_gate_actions(OwnerGateType.COST_LIMIT) == (
@@ -366,8 +368,9 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
         ExceptionalOwnerGateAction.RESUME,
         ExceptionalOwnerGateAction.CANCEL_TASK,
     )
+    # The retired Try Again action (F8e, issue #290) is absent from the
+    # fixed vocabulary entirely: no active v1 gate advertises a retry.
     assert {member.value for member in ExceptionalOwnerGateAction} == {
-        "retry",
         "cancel_task",
         "ignore",
         "continue",
@@ -386,6 +389,25 @@ def test_exceptional_gate_actions_are_a_fixed_domain_vocabulary() -> None:
             exceptional_owner_gate_actions(gate_type)
     with pytest.raises(OwnerGateDomainError):
         exceptional_owner_gate_actions("chat_decision")  # type: ignore[arg-type]
+
+
+def test_the_legacy_github_state_mismatch_gate_advertises_no_retry() -> None:
+    # F8e (issue #290): the retired Try Again flow is gone. The legacy
+    # GITHUB_STATE_MISMATCH vocabulary stays valid for schema
+    # compatibility, but it exposes a Cancel-only menu, the retry action
+    # vocabulary no longer exists, and no menu advertises any retry.
+    assert exceptional_owner_gate_actions(OwnerGateType.GITHUB_STATE_MISMATCH) == (
+        ExceptionalOwnerGateAction.CANCEL_TASK,
+    )
+    assert {member.value for member in ExceptionalOwnerGateAction}.isdisjoint({"retry"})
+    for menu in (
+        exceptional_owner_gate_actions(OwnerGateType.BLOCK_RESOLUTION),
+        exceptional_owner_gate_actions(OwnerGateType.GITHUB_ISSUE_CHANGE),
+        exceptional_owner_gate_actions(OwnerGateType.GITHUB_STATE_MISMATCH),
+        exceptional_owner_gate_actions(OwnerGateType.COST_LIMIT),
+        exceptional_owner_gate_actions(OwnerGateType.OWNER_ABORT),
+    ):
+        assert all("retry" not in action.value for action in menu)
 
 
 def test_exceptional_gate_menu_eligibility() -> None:
@@ -410,11 +432,11 @@ def test_exceptional_gate_menu_eligibility() -> None:
         assert isinstance(menu, tuple)
         assert menu[-1] is ExceptionalOwnerGateAction.CANCEL_TASK
         assert menu.count(ExceptionalOwnerGateAction.CANCEL_TASK) == 1
-    # Each non-Cancel decision is eligible in exactly one menu (issue
-    # #288): no universal Retry and no exceptional Discuss exists.
+    # Each non-Cancel decision is eligible in exactly one menu (issues
+    # #288, #290): no universal Retry exists any more and no exceptional
+    # Discuss ever does.
     exclusive: tuple[tuple[ExceptionalOwnerGateAction, OwnerGateType], ...] = (
         (ExceptionalOwnerGateAction.IGNORE, OwnerGateType.GITHUB_ISSUE_CHANGE),
-        (ExceptionalOwnerGateAction.RETRY, OwnerGateType.GITHUB_STATE_MISMATCH),
         (ExceptionalOwnerGateAction.CONTINUE, OwnerGateType.COST_LIMIT),
         (ExceptionalOwnerGateAction.RESUME, OwnerGateType.OWNER_ABORT),
     )

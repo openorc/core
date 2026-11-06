@@ -423,8 +423,9 @@ def _apply_merge_staleness_block(
     installs, atomically, the ``stale_operation`` TaskBlock with the safe
     exact-subject recovery context (the addressed merge gate, the canonical
     PR, the approved expected head, and the observed head), its pending
-    Level 3-selected ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the
-    only subject (F8b, issue #287), the
+    Level 3-selected ``BLOCK_RESOLUTION`` OwnerGate (the Type B diagnostic
+    fallback since F8e, issue #290) bound to it as the only subject (F8b,
+    issue #287), the
     guarded ``blocked`` transition with one rotated token, and the
     ``task_blocked`` / ``owner_gate_created`` audits under the truthful
     OPENORC actor. A stale subject applies nothing and raises. Where the
@@ -948,8 +949,9 @@ def _apply_uncertain_merge_block(
     the truthful OPENORC actor. The merge gate was already consumed by the
     one-shot approval, so the NULL-safe pointer expectation is the Task's
     locked (absent) pointer. This is the distinct pre-send/reconciliation
-    uncertainty classification (issue #280): never a
-    ``GITHUB_STATE_MISMATCH``, and #267's separate uncertain merge-SEND
+    uncertainty classification (issue #280): always the Type B diagnostic
+    gate, never a mismatch retry — the GITHUB_STATE_MISMATCH flow is
+    retired (F8e, issue #290) — and #267's separate uncertain merge-SEND
     handling through Level 2 is untouched. The uncertain merge request is
     never repeated; recovery belongs to the later F2/F4/F4b layers.
     """

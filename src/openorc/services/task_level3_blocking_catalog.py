@@ -11,10 +11,15 @@ OwnerGate case, or into the Type B ``BLOCK_RESOLUTION`` diagnostic fallback.
   performs that caller cutover).
 - The condition → gate-case catalog is fixed in code and never configured:
   GITHUB_ISSUE_REQUIREMENTS_CHANGE → GITHUB_ISSUE_CHANGE;
-  PR_PUBLICATION_AUTHORITY_MISMATCH and MERGE_HEAD_AUTHORITY_MISMATCH →
-  GITHUB_STATE_MISMATCH (two distinct typed conditions over the one
-  settled gate type, with distinct evidence contracts);
   TASK_COST_LIMIT_REACHED → COST_LIMIT; OWNER_ABORT_ISSUED → OWNER_ABORT.
+  Since F8e (issue #290) the two proven GitHub authority-mismatch
+  conditions — PR_PUBLICATION_AUTHORITY_MISMATCH (its pre-create
+  anchor-only and post-create canonical evidence forms alike) and
+  MERGE_HEAD_AUTHORITY_MISMATCH — deliberately classify to the Type B
+  ``BLOCK_RESOLUTION`` diagnostic gate: the Try Again flow is retired, no
+  supported case selects the legacy ``GITHUB_STATE_MISMATCH`` type any
+  more, and the typed origin, exact authorized PR/head context, and
+  durable reason still ride the block unchanged.
 - Each condition carries its reason family: a declared condition whose
   durable TaskBlock reason is outside its family is not positively
   evidenced and classifies as the Type B fallback. A bare reason alone —
@@ -53,20 +58,19 @@ __all__ = [
     "classify_blocking_case",
 ]
 
-# The fixed condition → exceptional gate case catalog (issue #286). Never
-# configured, never extended by callers: new supported cases arrive as
-# deliberate vocabulary changes.
+# The fixed condition → exceptional gate case catalog (issues #286, #290).
+# Never configured, never extended by callers: new supported cases arrive
+# as deliberate vocabulary changes. Since F8e the two proven GitHub
+# authority-mismatch conditions classify to the Type B diagnostic
+# fallback; no supported case selects the legacy GITHUB_STATE_MISMATCH
+# type.
 LEVEL3_GATE_CASES: Mapping[Level3BlockingCondition, OwnerGateType] = MappingProxyType(
     {
         Level3BlockingCondition.GITHUB_ISSUE_REQUIREMENTS_CHANGE: (
             OwnerGateType.GITHUB_ISSUE_CHANGE
         ),
-        Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH: (
-            OwnerGateType.GITHUB_STATE_MISMATCH
-        ),
-        Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH: (
-            OwnerGateType.GITHUB_STATE_MISMATCH
-        ),
+        Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH: (OwnerGateType.BLOCK_RESOLUTION),
+        Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH: (OwnerGateType.BLOCK_RESOLUTION),
         Level3BlockingCondition.TASK_COST_LIMIT_REACHED: OwnerGateType.COST_LIMIT,
         Level3BlockingCondition.OWNER_ABORT_ISSUED: OwnerGateType.OWNER_ABORT,
     }

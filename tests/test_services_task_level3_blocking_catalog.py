@@ -5,8 +5,12 @@ consistency test drives the real installer against the scripted connection
 machinery of the F3 service tests). These prove the accepted F8a contract:
 
 - the fixed condition → gate-case catalog and reason families;
-- every representative supported path classifies to its designated Type A
-  case — including the preflight anchor-only publication form;
+- every representative supported path classifies to its designated case —
+  the proven GitHub issue-requirements change to its Type A case, and the
+  proven publication and merge-head authority mismatches (preflight
+  anchor-only and post-create forms alike) to the Type B
+  BLOCK_RESOLUTION diagnostic gate since F8e (issue #290): the retired
+  Try Again flow selects no gate any more;
 - ambiguous same-reason paths, out-of-family reasons, and insufficient or
   unrecognized evidence fail closed to the Type B BLOCK_RESOLUTION
   fallback;
@@ -100,16 +104,15 @@ def _owner_abort(**overrides: Any) -> dict[str, Any]:
 
 
 def test_the_catalog_maps_each_condition_to_its_settled_gate_case() -> None:
+    # F8e (issue #290): the two proven GitHub authority-mismatch
+    # conditions deliberately map to the Type B diagnostic fallback; no
+    # supported case selects the legacy GITHUB_STATE_MISMATCH type.
     assert dict(LEVEL3_GATE_CASES) == {
         Level3BlockingCondition.GITHUB_ISSUE_REQUIREMENTS_CHANGE: (
             OwnerGateType.GITHUB_ISSUE_CHANGE
         ),
-        Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH: (
-            OwnerGateType.GITHUB_STATE_MISMATCH
-        ),
-        Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH: (
-            OwnerGateType.GITHUB_STATE_MISMATCH
-        ),
+        Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH: (OwnerGateType.BLOCK_RESOLUTION),
+        Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH: (OwnerGateType.BLOCK_RESOLUTION),
         Level3BlockingCondition.TASK_COST_LIMIT_REACHED: OwnerGateType.COST_LIMIT,
         Level3BlockingCondition.OWNER_ABORT_ISSUED: OwnerGateType.OWNER_ABORT,
     }
@@ -144,14 +147,16 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
         is OwnerGateType.GITHUB_ISSUE_CHANGE
     )
     # E8: the proven publication authority mismatch — the preflight
-    # anchor-only form and the reconciled post-create form alike.
+    # anchor-only form and the reconciled post-create form alike —
+    # deliberately classifies to the Type B diagnostic gate (F8e, issue
+    # #290): the Try Again flow is retired.
     assert (
         classify_blocking_case(
             Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
             _publication(),
             TaskBlockReason.STALE_OPERATION,
         )
-        is OwnerGateType.GITHUB_STATE_MISMATCH
+        is OwnerGateType.BLOCK_RESOLUTION
     )
     assert (
         classify_blocking_case(
@@ -159,7 +164,7 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
             _publication(pull_request_id=_PR_ID, observed_head_sha=_OTHER_SHA),
             TaskBlockReason.STALE_OPERATION,
         )
-        is OwnerGateType.GITHUB_STATE_MISMATCH
+        is OwnerGateType.BLOCK_RESOLUTION
     )
     # The real E8 post-create evidence shape: GitHub's own numeric PR
     # identity (str(created.github_pr_id)) with no observed head.
@@ -172,16 +177,18 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
             ),
             TaskBlockReason.STALE_OPERATION,
         )
-        is OwnerGateType.GITHUB_STATE_MISMATCH
+        is OwnerGateType.BLOCK_RESOLUTION
     )
-    # E10a: the proven merge-head authority mismatch (its distinct contract).
+    # E10a: the proven merge-head authority mismatch (its distinct
+    # evidence contract) routes to the same Type B diagnostic gate (F8e,
+    # issue #290).
     assert (
         classify_blocking_case(
             Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH,
             _merge_mismatch(),
             TaskBlockReason.STALE_OPERATION,
         )
-        is OwnerGateType.GITHUB_STATE_MISMATCH
+        is OwnerGateType.BLOCK_RESOLUTION
     )
     # The Owner-authorized cost limit and the specific Owner abort.
     assert (
@@ -317,6 +324,31 @@ def test_the_type_b_fallback_for_github_source_changed_is_atomically_installable
         gate_type=selected,
         block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
         block_context={"github_issue_id": 7703, "expected_fingerprint": _FINGERPRINT},
+    )
+    assert result.owner_gate.gate_type is OwnerGateType.BLOCK_RESOLUTION
+    assert result.task.status.name == "BLOCKED"
+
+
+def test_the_authority_mismatch_type_b_routing_is_atomically_installable() -> None:
+    # F8e (issue #290): the proven E8 publication and E10a merge-head
+    # authority mismatches classify to the Type B diagnostic fallback, and
+    # the classification result pairs with the atomic installer's
+    # gate/reason validation — the exact stale_operation evidence rides
+    # the block unchanged.
+    selected = classify_blocking_case(
+        Level3BlockingCondition.MERGE_HEAD_AUTHORITY_MISMATCH,
+        _merge_mismatch(),
+        TaskBlockReason.STALE_OPERATION,
+    )
+    assert selected is OwnerGateType.BLOCK_RESOLUTION
+
+    conn = ScriptedConnection()
+    _script_success(conn, gate_type=selected.value)
+    result = _install(
+        conn,
+        gate_type=selected,
+        block_reason=TaskBlockReason.STALE_OPERATION,
+        block_context=_merge_mismatch(),
     )
     assert result.owner_gate.gate_type is OwnerGateType.BLOCK_RESOLUTION
     assert result.task.status.name == "BLOCKED"

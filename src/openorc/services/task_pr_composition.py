@@ -573,8 +573,9 @@ def _block_stale_publication(
     external calls), then the durable stale evidence against the freshly
     locked Task is re-proved, and the F3 exceptional blocking foundation
     (#258) installs — atomically — the ``reason`` TaskBlock, its pending
-    Level 3-selected ``GITHUB_STATE_MISMATCH`` OwnerGate bound to it as the
-    only subject (F8b, issue #287),
+    Level 3-selected ``BLOCK_RESOLUTION`` OwnerGate (the Type B diagnostic
+    fallback since F8e, issue #290) bound to it as the only subject (F8b,
+    issue #287),
     the ``waiting_for_owner → blocked`` transition with one rotated token,
     and the ``task_blocked`` / ``owner_gate_created`` audits under the
     truthful OPENORC actor — commit or roll back together. The publication

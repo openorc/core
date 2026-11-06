@@ -424,11 +424,11 @@ _STALE_GATE_ID = uuid.uuid4()
 
 
 def _stale_publication_gate_row() -> tuple[Any, ...]:
-    """The pending ``GITHUB_STATE_MISMATCH`` gate a stale publication installs."""
+    """The pending Type B ``BLOCK_RESOLUTION`` gate a stale publication installs."""
     row = list(
         _gate_row(
             gate_id=_STALE_GATE_ID,
-            gate_type="github_state_mismatch",
+            gate_type="block_resolution",
             status="pending",
             plan_revision_id=None,
             subject_head_sha=None,
@@ -1376,9 +1376,10 @@ def test_an_ineligible_reconciled_record_blocks_recoverably(
     assert _count(conn, _TASK_GATE_WRITE) == 1
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
     # The guard-path block classifies through the Level 3 catalog to the
-    # pending GITHUB_STATE_MISMATCH gate (F8b, issue #287).
+    # pending Type B BLOCK_RESOLUTION gate (F8b, issue #287; F8e, issue
+    # #290).
     (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
-    assert gate_params is not None and gate_params[2] == "github_state_mismatch"
+    assert gate_params is not None and gate_params[2] == "block_resolution"
     # The base-ref mismatch block preserves the exact authorized head, the
     # authorized publication base, the originating gate identity, and the
     # reconciled PR evidence (issue #280).
@@ -1531,7 +1532,7 @@ def test_preflight_stale_blocks_the_task_atomically_and_creates_no_pr(
     }
     (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
     assert gate_params is not None
-    assert gate_params[2] == "github_state_mismatch"
+    assert gate_params[2] == "block_resolution"
     assert gate_params[3] == "pending"
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
@@ -1578,9 +1579,10 @@ def test_post_create_stale_preserves_the_record_and_blocks_or_refuses(
     assert _count(conn, _TASK_GATE_WRITE) == 1
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
     # The post-create block classifies through the Level 3 catalog to the
-    # pending GITHUB_STATE_MISMATCH gate (F8b, issue #287).
+    # pending Type B BLOCK_RESOLUTION gate (F8b, issue #287; F8e, issue
+    # #290).
     (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
-    assert gate_params is not None and gate_params[2] == "github_state_mismatch"
+    assert gate_params is not None and gate_params[2] == "block_resolution"
     # The post-create block preserves the exact authorized head, the
     # originating gate identity, the persisted canonical PR identity, and
     # the created record's observed head (issue #280).
