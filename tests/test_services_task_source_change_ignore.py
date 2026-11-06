@@ -73,6 +73,7 @@ _EXECUTION_1_ID = uuid.uuid4()
 _BASE_SHA = "c" * 40
 _HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 _CLAIMED_BRANCH = "openorc/task-42-implementation"
+_OTHER_BRANCH = "other/task-42-branch"
 _EXTERNAL_INSTALLATION_ID = 12345678
 _GITHUB_REPOSITORY_ID = 987654321
 _GITHUB_ISSUE_ID = 503
@@ -905,6 +906,23 @@ def test_an_e7_interrupted_ignore_reaches_the_existing_pr_gate() -> None:
     assert gate_params is not None
     assert gate_params[2] == "pr_authorization"
     assert gate_params[5] == _HEAD_SHA  # the exact-head subject
+
+
+def test_a_mismatched_bound_branch_refuses_the_e7_ignore_without_any_write() -> None:
+    """The E7 continuation preserves the normal presentation's canonical-
+    branch authority guard: a bound canonical branch that differs from the
+    completed implementation's branch claim is an unsafe continuation —
+    the fresh exactness phase refuses before any head read and before any
+    write, leaving the original Ignore gate and its unresolved TaskBlock
+    exactly as they were (re-proven again inside the final atomic
+    composition's fresh claim derivation)."""
+    conn = ScriptedConnection()
+    _script_verify_reads_e7(conn, task_row=_task_row(canonical_branch=_OTHER_BRANCH))
+    _script_b3_reconciliation(conn)
+    with pytest.raises(ConflictError, match="already bound; remediation continues"):
+        _ignore_call(_pool(conn), FakeGitHubAppClient(pool=_pool(conn)))
+    _assert_no_writes(conn)
+    assert _event_types(conn) == []
 
 
 # --- the fail-closed seams -----------------------------------------------------------

@@ -81,6 +81,7 @@ from openorc.services.task_pr_authorization import (
     approve_pr_authorization,
     cancel_pr_authorization,
     open_pr_authorization,
+    present_pr_authorization_gate,
 )
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
@@ -1525,6 +1526,31 @@ def test_a_different_branch_claim_against_a_bound_task_is_impossible() -> None:
     assert github.issue_calls == [] and github.branch_calls == []
     assert not _write_predicates_fired(conn)
     assert excinfo
+
+
+def test_a_fresh_claim_presentation_refuses_a_mismatched_bound_branch() -> None:
+    """The Owner Ignore composition's claim-less E7 entry (issue #289) derives
+    the claim fresh and proves the canonical-branch authority guard inside
+    the atomic composition: a bound canonical branch differing from the
+    completed implementation's branch claim refuses with no write — the
+    exact contract the normal flow proves before its GitHub reads."""
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    bound = _task_row(canonical_branch="other/task-42-branch")
+    _script_authority_reads(conn, task_row=bound)
+    with pytest.raises(ConflictError, match="already bound; remediation continues"):
+        present_pr_authorization_gate(
+            _pool(conn),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            execution_id=None,
+            verified_head_sha=_HEAD_SHA,
+            observed_branch_name=_CLAIMED_BRANCH,
+        )
+    assert _count(conn, _BRANCH_BIND) == 0
+    assert _count(conn, _GATES_INSERT) == 0
 
 
 def test_a_bound_branch_continuation_reobserves_and_presents_without_rebinding() -> None:

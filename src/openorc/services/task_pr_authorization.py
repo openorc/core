@@ -146,6 +146,7 @@ __all__ = [
     "cancel_pr_authorization",
     "open_pr_authorization",
     "present_pr_authorization_gate",
+    "require_canonical_branch_authority",
     "resolve_pr_authorization_continuation",
 ]
 
@@ -476,16 +477,19 @@ def _verify_source_authority(
     )
 
 
-def _require_unmoved_canonical_branch(claim: _ImplementationClaim) -> None:
+def require_canonical_branch_authority(*, task: Task, claimed_branch: str) -> None:
     """Refuse a different-branch claim against an already-bound Task.
 
     Canonical branch ownership is a one-time fact: later remediation
     continues on the canonical branch rather than replacing it (the B7
     bind-once semantics), and the presentation re-observes the bound
-    branch's current committed head.
+    branch's current committed head. The normal E7 flow proves this before
+    its GitHub reads; the Owner Ignore composition's E7 continuation proves
+    it in its fresh-exactness phase and re-proves it inside its final
+    atomic composition (issue #289).
     """
-    bound_branch = claim.task.canonical_feature_branch
-    if bound_branch is not None and bound_branch != claim.claimed_branch:
+    bound_branch = task.canonical_feature_branch
+    if bound_branch is not None and bound_branch != claimed_branch:
         raise ConflictError(
             "the task's canonical feature branch is already bound; remediation "
             "continues on the canonical branch"
@@ -684,7 +688,8 @@ def present_pr_authorization_gate(
     the bind and gate commit; the Owner Ignore service calls this inside
     its own commit transaction without a claim, and the claim is then
     derived fresh from the restored durable state under the caller's
-    expected token. No external I/O occurs here.
+    expected token — including the canonical-branch authority proof
+    against the freshly derived claim. No external I/O occurs here.
     """
     with composed_transaction(pool) as transaction_pool:
         if claim is None:
@@ -696,6 +701,12 @@ def present_pr_authorization_gate(
                 expected_state_token=expected_state_token,
                 execution_id=execution_id,
             )
+            # A caller without a pre-proven Phase-A claim — the Owner Ignore
+            # composition (issue #289) — proves the restored Task's
+            # canonical-branch authority here, inside the atomic
+            # composition: the exact bound-branch/implementation-claim
+            # consistency the normal flow proves before its GitHub reads.
+            require_canonical_branch_authority(task=claim.task, claimed_branch=claim.claimed_branch)
         return _present_exact_head_gate_body(
             transaction_pool,
             claim=claim,
@@ -787,7 +798,7 @@ def open_pr_authorization(
                 phase=_PRESENTATION_PHASE,
             )
         # --- Phase B: fresh GitHub reconciliation (no transaction open). ---
-        _require_unmoved_canonical_branch(claim)
+        require_canonical_branch_authority(task=claim.task, claimed_branch=claim.claimed_branch)
         _verify_source_authority(pool, github, claim=claim)
         subject_branch = (
             claim.task.canonical_feature_branch

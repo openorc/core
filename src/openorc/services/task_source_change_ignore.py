@@ -30,8 +30,10 @@ write when a condition does not hold:
   freshly reconciles the authoritative GitHub issue, which must still be
   the same authorized source and carry exactly the block's observed
   fingerprint — a stale or moved-on observation changes nothing. The E7
-  boundary additionally observes the branch head through the shared B7
-  seam, the exact fact the interrupted presentation binds. Issue closure
+  boundary additionally proves the existing canonical-branch authority
+  guard (the bound branch must match the completed implementation's claim)
+  and then observes the branch head through the shared B7 seam, the exact
+  fact the interrupted presentation binds. Issue closure
   is deliberately not a refusal here: closure alone does not stop an
   active Task, and openness is checked where each boundary's own approval
   conditions place it.
@@ -98,6 +100,7 @@ from openorc.services.task_implementation_authorization import (
 from openorc.services.task_pr_authorization import (
     PrAuthorizationGateOpened,
     present_pr_authorization_gate,
+    require_canonical_branch_authority,
     resolve_pr_authorization_continuation,
 )
 from openorc.services.task_subject_guards import (
@@ -315,10 +318,13 @@ def _verify_fresh_exactness(
     issue: it must still be the same authorized source and carry exactly
     the block's observed fingerprint — the only value the Ignore may
     acknowledge — so a stale or moved-on observation changes nothing. The
-    E7 boundary additionally observes the branch head through the shared
-    B7 seam: the exact fact the interrupted presentation binds. Issue
-    closure is deliberately not a refusal: closure alone does not stop an
-    active Task, and openness is checked where each boundary's own
+    E7 boundary additionally proves the existing canonical-branch
+    authority guard — the bound canonical branch must match the completed
+    implementation's branch claim, the exact refusal the normal
+    presentation raises — before observing the branch head through the
+    shared B7 seam: the exact fact the interrupted presentation binds.
+    Issue closure is deliberately not a refusal: closure alone does not
+    stop an active Task, and openness is checked where each boundary's own
     approval conditions place it.
     """
     task = verified.task
@@ -341,15 +347,22 @@ def _verify_fresh_exactness(
         )
     if verified.boundary.kind is not IgnoredSourceChangeBoundary.PR_AUTHORIZATION:
         return _FreshExactness(head_sha=None, branch_name=None)
-    subject_branch = (
-        task.canonical_feature_branch
-        if task.canonical_feature_branch is not None
-        else verified.boundary.claimed_branch
-    )
-    if subject_branch is None:
+    claimed_branch = verified.boundary.claimed_branch
+    if claimed_branch is None:
         raise ConflictError(
             "the interrupted pr authorization boundary carries no branch claim to observe"
         )
+    # The existing E7 canonical-branch authority guard: a bound canonical
+    # branch that differs from the completed implementation's branch claim
+    # is an unsafe continuation — the exact typed refusal the normal
+    # presentation raises — proven here before any head read, and re-proven
+    # inside the final atomic composition's fresh claim derivation.
+    require_canonical_branch_authority(task=task, claimed_branch=claimed_branch)
+    subject_branch = (
+        task.canonical_feature_branch
+        if task.canonical_feature_branch is not None
+        else claimed_branch
+    )
     branch_observation = observe_routed_repository_branch(
         pool,
         github,
