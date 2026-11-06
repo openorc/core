@@ -34,24 +34,25 @@ exact Owner decision bound to the exact subject it governs.
   PR-subject gate is never representable as a bare head SHA. Stale
   workflow-changing operations must never be applied to newer subjects or
   gates, so the exact binding is validated wherever the gate is used.
-- Exceptional gates (issues #258, #286, #288) are the blocked-Task authority
-  seam: each binds exactly one unresolved TaskBlock as its only subject —
-  ``task_block_id`` is required and every other subject form is NULL. Each
-  type carries a fixed decision menu — a fixed domain vocabulary, never a
-  per-Workspace or database-configured registry and never an action
-  engine: BLOCK_RESOLUTION (the Type B diagnostic fallback) offers Cancel
-  Task only, its safe diagnostics being the bound TaskBlock's own
-  sanitized content; GITHUB_ISSUE_CHANGE offers Ignore or Cancel Task;
-  GITHUB_STATE_MISMATCH offers Try Again (retry) or Cancel Task;
-  COST_LIMIT offers Continue or Cancel Task; OWNER_ABORT offers Resume or
-  Cancel Task. There is no exceptional Discuss and no universal Retry.
-  Only Cancel is executable today (the single shared cancellation
-  service, issue #278): the other actions are declared menu decisions
-  whose action services arrive in F8d–F8g (issues #289–#292), and until
-  then any non-Cancel decision must fail closed rather than falsely
-  resolve or unblock. This module does not execute any action; the
-  action services independently enforce their own identity, currentness,
-  and effect safety (issue #254).
+- Exceptional gates (issues #258, #286, #288, #290) are the blocked-Task
+  authority seam: each binds exactly one unresolved TaskBlock as its only
+  subject — ``task_block_id`` is required and every other subject form is
+  NULL. Each type carries a fixed decision menu — a fixed domain
+  vocabulary, never a per-Workspace or database-configured registry and
+  never an action engine: BLOCK_RESOLUTION (the Type B diagnostic
+  fallback) offers Cancel Task only, its safe diagnostics being the bound
+  TaskBlock's own sanitized content; GITHUB_ISSUE_CHANGE offers Ignore or
+  Cancel Task; GITHUB_STATE_MISMATCH — legacy since F8e (issue #290):
+  never newly selected, retained for schema compatibility — offers Cancel
+  Task only; COST_LIMIT offers Continue or Cancel Task; OWNER_ABORT
+  offers Resume or Cancel Task. There is no exceptional Discuss and no
+  universal Retry. Only Cancel is executable today (the single shared
+  cancellation service, issue #278): the other actions are declared menu
+  decisions whose action services arrive with the remaining F8 leaves
+  (issues #289, #291, #292), and until then any non-Cancel decision must
+  fail closed rather than falsely resolve or unblock. This module does
+  not execute any action; the action services independently enforce
+  their own identity, currentness, and effect safety (issue #254).
 - REVIEW_RESOLUTION approval is an explicit Owner override of an unresolved
   Reviewer objection. It is a separate durable fact and never rewrites the
   historical Reviewer result to ACCEPTED; plan-subject approval leads to a
@@ -168,25 +169,30 @@ class ExceptionalOwnerGateAction(StrEnum):
     engine. The settled v1 menus are a decision surface only: Cancel Task
     is the one executable decision today (the single shared cancellation
     service, issue #278), while the other actions are declared menu
-    entries whose action services arrive with F8d–F8g (issues #289–#292)
-    and must fail closed until then. The action services independently
-    enforce identity, currentness, claims, and effect safety (issue #254).
+    entries whose action services arrive with the remaining F8 leaves
+    (issues #289, #291, #292) and must fail closed until then. The retired
+    Try Again action (F8e, issue #290) is deliberately absent: no active
+    v1 gate advertises or executes a retry. The action services
+    independently enforce identity, currentness, claims, and effect
+    safety (issue #254).
     """
 
-    RETRY = "retry"
     CANCEL_TASK = "cancel_task"
     IGNORE = "ignore"
     CONTINUE = "continue"
     RESUME = "resume"
 
 
-# The fixed Level 3 decision menus (issue #288): one small, authoritative
-# menu per exceptional gate type, never configured and never extended by
-# callers. BLOCK_RESOLUTION is the Type B diagnostic fallback — its safe
-# diagnostics live on the bound TaskBlock itself, so its menu is Cancel
-# Task only. Every menu ends in Cancel Task, the one executable decision
-# (issue #278); the other actions stay inert until their leaves deliver
-# them (issues #289–#292).
+# The fixed Level 3 decision menus (issues #288, #290): one small,
+# authoritative menu per exceptional gate type, never configured and never
+# extended by callers. BLOCK_RESOLUTION is the Type B diagnostic fallback —
+# its safe diagnostics live on the bound TaskBlock itself, so its menu is
+# Cancel Task only. GITHUB_STATE_MISMATCH is legacy vocabulary retained
+# for schema compatibility (issue #290): the Level 3 catalog never newly
+# selects it and its menu is Cancel Task only, so no gate advertises the
+# retired Try Again decision. Every menu ends in Cancel Task, the one
+# executable decision (issue #278); the other actions stay inert until
+# their leaves deliver them (issues #289, #291, #292).
 _EXCEPTIONAL_GATE_ACTIONS: Mapping[OwnerGateType, tuple[ExceptionalOwnerGateAction, ...]] = (
     MappingProxyType(
         {
@@ -195,10 +201,7 @@ _EXCEPTIONAL_GATE_ACTIONS: Mapping[OwnerGateType, tuple[ExceptionalOwnerGateActi
                 ExceptionalOwnerGateAction.IGNORE,
                 ExceptionalOwnerGateAction.CANCEL_TASK,
             ),
-            OwnerGateType.GITHUB_STATE_MISMATCH: (
-                ExceptionalOwnerGateAction.RETRY,
-                ExceptionalOwnerGateAction.CANCEL_TASK,
-            ),
+            OwnerGateType.GITHUB_STATE_MISMATCH: (ExceptionalOwnerGateAction.CANCEL_TASK,),
             OwnerGateType.COST_LIMIT: (
                 ExceptionalOwnerGateAction.CONTINUE,
                 ExceptionalOwnerGateAction.CANCEL_TASK,

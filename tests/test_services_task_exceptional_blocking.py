@@ -485,13 +485,20 @@ def test_command_shape_is_validated_before_any_database_access() -> None:
             block_reason=TaskBlockReason.OWNER_ACTION_REQUIRED,
             **base,
         )
-    with pytest.raises(InvalidCommandError):
-        _install(
-            conn,
-            gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
-            block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
-            **base,
-        )
+    # The legacy GITHUB_STATE_MISMATCH type (F8e, issue #290) is not
+    # installable for any new block: its formerly accepted
+    # stale_operation pairing and every other reason reject alike.
+    for mismatch_reason in (
+        TaskBlockReason.STALE_OPERATION,
+        TaskBlockReason.GITHUB_SOURCE_CHANGED,
+    ):
+        with pytest.raises(InvalidCommandError):
+            _install(
+                conn,
+                gate_type=OwnerGateType.GITHUB_STATE_MISMATCH,
+                block_reason=mismatch_reason,
+                **base,
+            )
     with pytest.raises(InvalidCommandError):
         _install(
             conn,
@@ -544,11 +551,13 @@ def test_the_block_reason_pairing_accepts_the_applicable_reasons() -> None:
     # BLOCK_RESOLUTION accepts every settled reason except the terminal
     # pr_closed_unmerged cause — including github_source_changed since the
     # F8a Level 3 catalog (issue #286) falls back to the Type B diagnostic
-    # gate when it cannot establish the specific Type A case; the
+    # gate when it cannot establish the specific Type A case, and the two
+    # proven GitHub authority-mismatch conditions the catalog routes to
+    # that same Type B gate since F8e (issue #290); the
     # COST_LIMIT and OWNER_ABORT gate cases accept exactly their own
     # Owner-authorized stop reasons; GITHUB_ISSUE_CHANGE accepts exactly
-    # github_source_changed; GITHUB_STATE_MISMATCH accepts exactly
-    # stale_operation.
+    # github_source_changed; the legacy GITHUB_STATE_MISMATCH type accepts
+    # nothing (issue #290: never newly installed).
     for reason in (
         TaskBlockReason.OWNER_ACTION_REQUIRED,
         TaskBlockReason.COST_LIMIT,
@@ -574,7 +583,6 @@ def test_the_block_reason_pairing_accepts_the_applicable_reasons() -> None:
         assert result.task.status is TaskStatus.BLOCKED
     for gate_type, reason in (
         (OwnerGateType.GITHUB_ISSUE_CHANGE, TaskBlockReason.GITHUB_SOURCE_CHANGED),
-        (OwnerGateType.GITHUB_STATE_MISMATCH, TaskBlockReason.STALE_OPERATION),
         (OwnerGateType.COST_LIMIT, TaskBlockReason.COST_LIMIT),
         (OwnerGateType.OWNER_ABORT, TaskBlockReason.OWNER_ACTION_REQUIRED),
     ):

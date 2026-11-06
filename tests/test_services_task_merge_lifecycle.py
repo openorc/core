@@ -418,7 +418,7 @@ def _script_block(
     *,
     token: Any = _STATE_TOKEN,
     reason: str = "stale_operation",
-    gate_type: str = "github_state_mismatch",
+    gate_type: str = "block_resolution",
     prior_gate_id: Any = None,
     installer_token: Any = None,
 ) -> None:
@@ -768,14 +768,14 @@ def test_changed_head_blocks_stale_operation_where_current(
     assert outcome.task_block.reason.value == "stale_operation"
     assert merge.calls == []
     # The pre-send supersession: the still-current pending MERGE_DECISION
-    # gate is superseded by the exceptional GITHUB_STATE_MISMATCH gate as
-    # pending history — no manufactured Owner vote, no resolved event, and
-    # the prior gate row is never rewritten.
+    # gate is superseded by the exceptional Type B BLOCK_RESOLUTION gate
+    # (F8e, issue #290) as pending history — no manufactured Owner vote,
+    # no resolved event, and the prior gate row is never rewritten.
     assert _count(conn, _GATE_READ) >= 1
     assert _count(conn, _GATE_UPDATE) == 0
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
     assert gate_insert is not None
-    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[2] == "block_resolution"
     assert gate_insert[3] == "pending"
     (install_params,) = [params for sql, params in conn.executed if _TASK_GATE_INSTALL(sql, None)]
     assert install_params is not None
@@ -1267,12 +1267,13 @@ def test_head_mismatch_after_send_blocks_stale_operation(
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
     assert outcome.task.status is TaskStatus.BLOCKED
-    # The F7a staleness block installs its one exceptional GITHUB_STATE_MISMATCH
-    # gate; no Reviewer acceptance transfers to the unreviewed head: no new
-    # merge-decision (retry) gate is ever minted.
+    # The F7a staleness block installs its one exceptional Type B
+    # BLOCK_RESOLUTION gate (F8e, issue #290); no Reviewer acceptance
+    # transfers to the unreviewed head: no new merge-decision (retry)
+    # gate is ever minted.
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
     assert gate_insert is not None
-    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[2] == "block_resolution"
     assert gate_insert[3] == "pending"
     # The pre-send classification fires before the one-shot approval, so the
     # only audits are the exceptional block's own truthful pair.
@@ -1756,12 +1757,12 @@ def test_send_uncertainty_with_a_changed_head_routes_through_the_staleness_conse
     block_context = block_inserts[0][3].obj
     assert block_context["observed_head_sha"] == _NEW_HEAD_SHA
     assert block_context["expected_head_sha"] == _HEAD_SHA
-    # The staleness consequence installs its one exceptional
-    # GITHUB_STATE_MISMATCH gate; no retry gate is minted and no Reviewer
-    # acceptance transfers.
+    # The staleness consequence installs its one exceptional Type B
+    # BLOCK_RESOLUTION gate (F8e, issue #290); no retry gate is minted
+    # and no Reviewer acceptance transfers.
     (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
     assert gate_insert is not None
-    assert gate_insert[2] == "github_state_mismatch"
+    assert gate_insert[2] == "block_resolution"
     assert gate_insert[3] == "pending"
     assert len(merge.calls) == 1
 

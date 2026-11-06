@@ -82,6 +82,10 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
   (issue #258) and COST_LIMIT and OWNER_ABORT (issue #286, the F8a Level 3
   blocking-case types; their fixed Owner decision menus are completed in
   F8c, issue #288, and until then no action vocabulary exists for them).
+  GITHUB_STATE_MISMATCH is legacy vocabulary retained for schema
+  compatibility (F8e, issue #290): the Level 3 catalog never newly
+  selects it, the installer rejects it for new blocks, and its fixed
+  menu is Cancel Task only — no v1 gate advertises Try Again/RETRY.
   Statuses are PENDING, APPROVED, REJECTED, CANCELLED,
   SETTLED; SETTLED (issue #211) is the Reviewer-driven settlement outcome of
   a REVIEW_RESOLUTION gate, representable only for that gate type and
@@ -95,7 +99,11 @@ Do not add speculative generic entities, settings bags, workflow nodes, credenti
   application-service decision — alone selects the exceptional gate case
   or the Type B `BLOCK_RESOLUTION` diagnostic fallback; callers never
   choose exceptional gate types, and the policy performs no recovery and
-  executes no action.
+  executes no action. Since F8e (issue #290) both proven GitHub
+  authority-mismatch conditions (PR publication and merge head)
+  deliberately classify to that Type B fallback — their typed origin and
+  exact authorized PR/head context ride the block, and the Try Again flow
+  stays retired.
 - Resolved gates are immutable and never recycled. Only one gate may be current at a time; resolution clears currency before another is installed. Currency can also clear without any terminal stamp (issue #219): a Reviewer-triggered change request at an accepted-plan implementation gate supersedes the pending gate — pointer cleared, gate kept as pending history, never stamped with an Owner outcome or the REVIEW_RESOLUTION-only SETTLED status.
 - Execution is historical attempt data inside the Producer Task session. It is not a hidden workflow phase and does not imply one active execution globally.
 - RuntimeRequest remains a scoped Producer/runtime-originated ACTION_APPROVAL correlation only for adapter contracts that actually require OpenOrc participation. Cline v1 native tool approvals do not create RuntimeRequests. It is never free-form Owner ↔ Producer conversation.

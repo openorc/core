@@ -37,11 +37,12 @@ PlanRevision for implementation authorization, the exact head SHA (with
 no PR binding) for the pre-PR authorization gate, the exact
 TaskPullRequest plus the exact head SHA for merge decision, exactly one
 subject for REVIEW_RESOLUTION (planning PlanRevision, or PR subject as
-TaskPullRequest plus exact head SHA), and — for the three exceptional
-types (issue #258: block_resolution, github_issue_change,
-github_state_mismatch) — exactly the unresolved TaskBlock, with every
-other subject form NULL and ordinary types never carrying a TaskBlock
-subject.
+TaskPullRequest plus exact head SHA), and — for the five exceptional
+types (issues #258, #286: block_resolution, github_issue_change,
+cost_limit, owner_abort, and the legacy github_state_mismatch, which the
+Level 3 catalog never newly selects since F8e, issue #290) — exactly the
+unresolved TaskBlock, with every other subject form NULL and ordinary
+types never carrying a TaskBlock subject.
 """
 
 from __future__ import annotations
