@@ -263,13 +263,16 @@ class Task:
         _require_uuid(self.current_owner_gate_id, "current_owner_gate_id", nullable=True)
         # The immutable Task source baseline (issue #60, corrected by issue
         # #233): frozen by a successful Owner Start atomically with the
-        # ready_to_plan -> queued/planning transition, and never rewritten
-        # when GitHub requirements change afterwards. Before Start the
-        # baseline does not exist: a never-started Task carries None, and the
-        # only statuses that may carry None are ready_to_plan and a cancelled
-        # attempt that never started. Any present value is a lowercase hex
-        # SHA-256 digest. The issue body/title itself is deliberately not
-        # duplicated here.
+        # ready_to_plan -> queued/planning transition. The value is the Task's
+        # last Owner-accepted comparison value: never rewritten by GitHub
+        # requirements changes, and overwritten exactly once by the Owner's
+        # guarded Ignore of an exactly-matched GITHUB_ISSUE_CHANGE gate
+        # (issue #289), whose acknowledged observed value becomes the new
+        # comparison value. Before Start the baseline does not exist: a
+        # never-started Task carries None, and the only statuses that may
+        # carry None are ready_to_plan and a cancelled attempt that never
+        # started. Any present value is a lowercase hex SHA-256 digest. The
+        # issue body/title itself is deliberately not duplicated here.
         if self.source_requirements_fingerprint is None:
             if self.status not in _FINGERPRINT_OPTIONAL_STATUSES:
                 raise TaskDomainError(

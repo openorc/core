@@ -24,6 +24,7 @@ import pytest
 from openorc.domain.tasks import TaskDomainError, TaskStatus, TaskTerminalCause
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import (
+    acknowledge_source_requirements_fingerprint,
     archive_task,
     bind_canonical_branch,
     block_task_with_exceptional_gate,
@@ -1006,6 +1007,99 @@ def test_block_task_with_exceptional_gate_supersedes_the_prior_current_gate() ->
     sql, params = fake_conn.executed[0]
     assert "current_owner_gate_id is not distinct from %s" in sql
     assert params == (new_gate_id, row[0], row[8], "waiting_for_owner", prior_gate_id, new_gate_id)
+
+
+def test_acknowledge_source_requirements_fingerprint_overwrites_and_restores_atomically() -> None:
+    # The Owner Ignore composition's one guarded Task mutation (issue #289):
+    # the acknowledged observed fingerprint becomes the Task's last
+    # Owner-accepted comparison value and the Task leaves blocked for the
+    # interrupted boundary's pre-gate status — one statement, one rotation.
+    row = _task_row(
+        status="blocked",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=None,
+        source_requirements_fingerprint="b" * 64,
+    )
+    acknowledged = "c" * 64
+    updated = _task_row(
+        id=row[0],
+        status="planning",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=None,
+        source_requirements_fingerprint=acknowledged,
+    )
+    fake_conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = acknowledge_source_requirements_fingerprint(
+        pool,
+        row[0],
+        expected_state_token=row[8],
+        fingerprint=acknowledged,
+        restored_status=TaskStatus.PLANNING,
+    )
+
+    assert task is not None
+    assert task.status is TaskStatus.PLANNING
+    assert task.source_requirements_fingerprint == acknowledged
+    assert task.state_token != row[8]
+    sql, params = fake_conn.executed[0]
+    assert "update openorc.tasks" in sql
+    assert "source_requirements_fingerprint = %s" in sql
+    assert "status = 'blocked'" in sql
+    assert "current_owner_gate_id is null" in sql
+    # One token rotation, no second statement.
+    assert sql.count("gen_random_uuid()") == 1
+    assert params == (acknowledged, "planning", row[0], row[8])
+    assert len(fake_conn.executed) == 1
+
+
+def test_acknowledge_source_requirements_fingerprint_rejects_invalid_commands() -> None:
+    # Command shape is validated before any SQL: the acknowledged value must
+    # be the lowercase hex digest vocabulary and the restored status must be
+    # a nonterminal, non-blocked status.
+    row = _task_row(status="blocked")
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    for fingerprint in ("not-a-digest", "A" * 64, "c" * 63, 12345):
+        with pytest.raises(TaskDomainError, match="fingerprint must be"):
+            acknowledge_source_requirements_fingerprint(
+                pool,
+                row[0],
+                expected_state_token=row[8],
+                fingerprint=fingerprint,  # type: ignore[arg-type]
+                restored_status=TaskStatus.PLANNING,
+            )
+    for restored_status in (TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.COMPLETED):
+        with pytest.raises(TaskDomainError, match="restored_status must be"):
+            acknowledge_source_requirements_fingerprint(
+                pool,
+                row[0],
+                expected_state_token=row[8],
+                fingerprint="c" * 64,
+                restored_status=restored_status,
+            )
+    assert fake_conn.executed == []
+
+
+def test_acknowledge_source_requirements_fingerprint_returns_none_when_stale() -> None:
+    # A token that no longer matches, an already-restored status, a still-set
+    # gate pointer, or an archived Task applies nothing (a stale operation
+    # that must not be retried blindly).
+    row = _task_row(status="blocked")
+    fake_conn = FakeConnection(None)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    task = acknowledge_source_requirements_fingerprint(
+        pool,
+        row[0],
+        expected_state_token=uuid.uuid4(),
+        fingerprint="c" * 64,
+        restored_status=TaskStatus.PLANNING,
+    )
+
+    assert task is None
+    assert len(fake_conn.executed) == 1
 
 
 def test_block_task_with_exceptional_gate_returns_none_when_stale() -> None:

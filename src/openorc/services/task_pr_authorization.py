@@ -27,14 +27,16 @@ Authority boundaries (continuing the merged E5/E6 contracts):
   creates and installs one pending exact-head ``PR_AUTHORIZATION`` gate,
   and moves the Task ``implementing → waiting_for_owner`` atomically.
 - **Source invalidity is reason-specific.** A confirmed requirements
-  fingerprint change against the Task's immutable baseline is the one
-  ``BLOCKED / GITHUB_SOURCE_CHANGED`` path: the TaskBlock, the
-  ``implementing → blocked`` transition, and the ``task_blocked`` audit
-  commit or roll back together, and no gate is created. A closed source
-  issue, a stable-identity mismatch, access loss, known provider failure,
-  and uncertain outcomes are the existing typed fail-closed refusals —
-  never fabricated requirements drift, never a gate. Recovery from the
-  blocked state belongs to later layers, not this leaf.
+  fingerprint change against the Task's stored comparison value is the one
+  ``BLOCKED / GITHUB_SOURCE_CHANGED`` path, taken through the shared
+  comparison policy (issue #289): the atomic ``github_source_changed``
+  TaskBlock, its pending Level 3-selected ``GITHUB_ISSUE_CHANGE``
+  OwnerGate, the ``implementing → blocked`` transition, and the two audits
+  commit or roll back together. A closed source issue, a stable-identity
+  mismatch, access loss, known provider failure, and uncertain outcomes
+  are the existing typed fail-closed refusals — never fabricated
+  requirements drift, never a gate. Recovery from the blocked state
+  belongs to the exceptional action services (#254), not this leaf.
 - **Approve and Cancel are the only Owner actions at this gate.**
   ``PR_AUTHORIZATION`` is the human accountability checkpoint for
   publishing this implementation — not another technical review, not a
@@ -86,8 +88,6 @@ from uuid import UUID
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.github import GitHubAppClient
-from openorc.domain.blocking_cases import Level3BlockingCondition
-from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.executions import Execution, ExecutionStatus
@@ -129,8 +129,7 @@ from openorc.services.github_reconciliation import reconcile_repository_issue
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
-from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
-from openorc.services.task_level3_blocking_catalog import classify_blocking_case
+from openorc.services.task_source_requirements import compare_source_fingerprint_or_block
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -146,6 +145,8 @@ __all__ = [
     "approve_pr_authorization",
     "cancel_pr_authorization",
     "open_pr_authorization",
+    "present_pr_authorization_gate",
+    "resolve_pr_authorization_continuation",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_authorization"
@@ -426,99 +427,11 @@ def _unexplained_rejection() -> StaleOperationError:
     return StaleOperationError("the pr authorization could not be applied; the operation is stale")
 
 
-# --- the atomic source-drift block path ---------------------------------------------
-
-
-def _block_source_requirements_drift(
-    pool: DatabasePool,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-) -> Task:
-    """Atomically block the Task on confirmed requirements drift (issue #82).
-
-    One short composed transaction re-proves the authenticated Owner's
-    account-operational barrier FIRST (before any subject-row lock: the
-    admission check does not remain authoritative across the intervening
-    GitHub calls) and the durable drift evidence against the freshly
-    written projection under the Task row lock, then the F3 exceptional
-    blocking foundation (#258) installs — atomically — the
-    ``github_source_changed`` TaskBlock with its exact GitHub issue
-    identity and expected/observed fingerprint evidence, its pending
-    Level 3-selected ``GITHUB_ISSUE_CHANGE`` OwnerGate bound to it as the
-    only subject (F8b, issue #287), the
-    ``implementing → blocked`` transition with one rotated token, and the
-    ``task_blocked`` / ``owner_gate_created`` audits under the truthful
-    OPENORC actor — commit or roll back together. The pre-gate
-    implementing Task carries no current OwnerGate, so the NULL-safe
-    pointer expectation is the Task's locked (absent) pointer. A moved-on
-    Task applies nothing and is a typed stale operation. The distinct
-    blocked path creates no PR presentation and no canonical pull request
-    record; recovery from the blocked state belongs to later layers, not
-    this leaf.
-    """
-    with composed_transaction(pool) as transaction_pool:
-        require_account_operational(transaction_pool, profile_id=profile_id)
-        locked = task_records.get_task_for_update(transaction_pool, task_id)
-        if locked is None or locked.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
-        _require_pr_presentation_state(transaction_pool, task=task)
-        projection = issue_records.find_github_issue(
-            transaction_pool,
-            repository_id=task.repository_id,
-            github_issue_id=task.github_issue_id,
-        )
-        if projection is None or projection.identity.github_issue_id != task.github_issue_id:
-            raise ConflictError(
-                "the task's source issue projection is no longer available under its "
-                "stable identity"
-            )
-        if projection.requirements_fingerprint == task.source_requirements_fingerprint:
-            raise StaleOperationError(
-                "the durable source requirements no longer differ from the task's "
-                "baseline; the drift block is stale"
-            )
-        # The F3 exceptional blocking foundation (#258): one atomic block,
-        # gate, transition, token rotation, and audit pair. The proven drift
-        # is declared to the Level 3 blocking-case catalog (F8b, issue #287)
-        # with its exact evidence — the authoritative policy, never this
-        # caller, selects the exceptional OwnerGate case — and the
-        # installer's guarded currentness re-proof is the durable backstop;
-        # a raced or stale caller commits nothing at all.
-        block_context = {
-            "github_issue_id": task.github_issue_id,
-            "expected_fingerprint": task.source_requirements_fingerprint,
-            "observed_fingerprint": projection.requirements_fingerprint,
-        }
-        gate_type = classify_blocking_case(
-            Level3BlockingCondition.GITHUB_ISSUE_REQUIREMENTS_CHANGE,
-            block_context,
-            TaskBlockReason.GITHUB_SOURCE_CHANGED,
-        )
-        installation = install_exceptional_block_gate(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            expected_status=task.status,
-            expected_current_owner_gate_id=task.current_owner_gate_id,
-            gate_type=gate_type,
-            block_reason=TaskBlockReason.GITHUB_SOURCE_CHANGED,
-            block_context=block_context,
-            actor=_OPENORC_ACTOR,
-        )
-        return installation.task
-
-
 # --- the authoritative GitHub source/branch verification phase ----------------------
+# The requirements-fingerprint comparison and the atomic drift-block
+# composition are the shared policy in
+# :mod:`openorc.services.task_source_requirements` (issue #289); this
+# boundary adds only its own closed-issue approval condition.
 
 
 def _verify_source_authority(
@@ -528,13 +441,14 @@ def _verify_source_authority(
 
     The trusted B3 primitive performs the authoritative reads with no
     database transaction open and writes the refreshed projection. The
-    classification is reason-specific (issue #82): only a confirmed
-    requirements-fingerprint change against the Task's immutable baseline
-    takes the atomic ``github_source_changed`` block path; a closed source
-    issue and a stable-identity mismatch are typed fail-closed conflicts
-    that fabricate no drift, and the B3 outcome vocabulary (access loss,
-    known provider failure, uncertainty, stale route) passes through
-    unchanged. Nothing here produces a gate.
+    classification is reason-specific (issue #82): a closed source issue
+    and a stable-identity mismatch are typed fail-closed conflicts that
+    fabricate no drift, and the B3 outcome vocabulary (access loss, known
+    provider failure, uncertainty, stale route) passes through unchanged.
+    The requirements-fingerprint comparison and the atomic
+    ``github_source_changed`` block path are the shared policy
+    (issue #289) — this boundary adds only its own closed-issue approval
+    condition. Nothing here produces a presentation gate.
     """
     task = claim.task
     reconciliation = reconcile_repository_issue(
@@ -553,18 +467,13 @@ def _verify_source_authority(
         raise ConflictError(
             "the task's source github issue is closed; pr authorization is not available"
         )
-    if projection.requirements_fingerprint != task.source_requirements_fingerprint:
-        _block_source_requirements_drift(
-            pool,
-            profile_id=claim.profile_id,
-            workspace_id=task.workspace_id,
-            task_id=task.id,
-            expected_state_token=claim.expected_state_token,
-        )
-        raise ConflictError(
-            "the source github issue's requirements changed; the task is blocked as "
-            "github_source_changed pending owner recovery"
-        )
+    compare_source_fingerprint_or_block(
+        pool,
+        task=task,
+        projection=projection,
+        profile_id=claim.profile_id,
+        expected_state_token=claim.expected_state_token,
+    )
 
 
 def _require_unmoved_canonical_branch(claim: _ImplementationClaim) -> None:
@@ -631,14 +540,14 @@ def _discover_implementation_claim(
     )
 
 
-def _present_exact_head_gate(
-    pool: DatabasePool,
+def _present_exact_head_gate_body(
+    transaction_pool: DatabasePool,
     *,
     claim: _ImplementationClaim,
     verified_head_sha: str,
     observed_branch_name: str,
 ) -> PrAuthorizationGateOpened:
-    """The atomic bind + exact-head gate presentation (one short transaction).
+    """The atomic bind + exact-head gate presentation's transaction body.
 
     The authenticated Owner's account-operational barrier is re-proven FIRST
     — before any subject-row lock, because the admission check does not
@@ -648,108 +557,150 @@ def _present_exact_head_gate(
     qualifying execution, and the durable source projection. Only then do
     the one-time canonical-branch bind, the exact-head gate creation and
     installation, the ``implementing → waiting_for_owner`` transition, and
-    the safe OPENORC audit commit or roll back together.
+    the safe OPENORC audit commit or roll back together. The body performs
+    no external I/O: the normal E7 flow runs it as its own short
+    transaction, and the Owner Ignore composition (issue #289) completes it
+    inside its own commit transaction.
     """
     workspace_id = claim.task.workspace_id
     task_id = claim.task.id
-    with composed_transaction(pool) as transaction_pool:
-        require_account_operational(transaction_pool, profile_id=claim.profile_id)
-        locked = task_records.get_task_for_update(transaction_pool, task_id)
-        if locked is None or locked.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=claim.expected_state_token,
+    require_account_operational(transaction_pool, profile_id=claim.profile_id)
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=claim.expected_state_token,
+    )
+    _require_pr_presentation_state(transaction_pool, task=task)
+    authority = _load_implementation_authority(transaction_pool, task=task)
+    execution, claimed_branch = _require_qualifying_execution(
+        transaction_pool, task=task, execution_id=claim.execution.id
+    )
+    if (
+        authority.gate.id != claim.authority.gate.id
+        or authority.revision.id != claim.authority.revision.id
+        or authority.loop.id != claim.authority.loop.id
+        or authority.iteration.id != claim.authority.iteration.id
+        or execution.id != claim.execution.id
+        or claimed_branch != claim.claimed_branch
+    ):
+        raise StaleOperationError(
+            "the authorized implementation subjects have moved on; the presentation is stale"
         )
-        _require_pr_presentation_state(transaction_pool, task=task)
-        authority = _load_implementation_authority(transaction_pool, task=task)
-        execution, claimed_branch = _require_qualifying_execution(
-            transaction_pool, task=task, execution_id=claim.execution.id
+    _require_unchanged_source_state(transaction_pool, task=task)
+    bound_branch = task.canonical_feature_branch
+    if bound_branch is not None and bound_branch != observed_branch_name:
+        raise ConflictError(
+            "the task's canonical feature branch is already bound; remediation "
+            "continues on the canonical branch"
         )
-        if (
-            authority.gate.id != claim.authority.gate.id
-            or authority.revision.id != claim.authority.revision.id
-            or authority.loop.id != claim.authority.loop.id
-            or authority.iteration.id != claim.authority.iteration.id
-            or execution.id != claim.execution.id
-            or claimed_branch != claim.claimed_branch
-        ):
-            raise StaleOperationError(
-                "the authorized implementation subjects have moved on; the presentation is stale"
+    if bound_branch is None:
+        try:
+            bound_task = task_records.bind_canonical_branch(
+                transaction_pool,
+                task_id,
+                expected_state_token=task.state_token,
+                canonical_feature_branch=observed_branch_name,
             )
-        _require_unchanged_source_state(transaction_pool, task=task)
-        bound_branch = task.canonical_feature_branch
-        if bound_branch is not None and bound_branch != observed_branch_name:
+        except UniqueViolation as exc:
+            # The repository-wide branch-ownership index rejected the
+            # bind: another current Task of this Repository already owns
+            # the branch. Translated into the stable application
+            # conflict without exposing the other Task; the composition
+            # rolls back and nothing was applied.
             raise ConflictError(
-                "the task's canonical feature branch is already bound; remediation "
-                "continues on the canonical branch"
-            )
-        if bound_branch is None:
-            try:
-                bound_task = task_records.bind_canonical_branch(
-                    transaction_pool,
-                    task_id,
-                    expected_state_token=task.state_token,
-                    canonical_feature_branch=observed_branch_name,
-                )
-            except UniqueViolation as exc:
-                # The repository-wide branch-ownership index rejected the
-                # bind: another current Task of this Repository already owns
-                # the branch. Translated into the stable application
-                # conflict without exposing the other Task; the composition
-                # rolls back and nothing was applied.
-                raise ConflictError(
-                    "the canonical feature branch is already owned by another "
-                    "current task in this repository"
-                ) from exc
-            if bound_task is None:
-                raise StaleOperationError(
-                    "the canonical feature branch could not be bound; the presentation is stale"
-                )
-        else:
-            bound_task = task
-        gate = gate_records.create_owner_gate(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            gate_type=OwnerGateType.PR_AUTHORIZATION,
-            subject_head_sha=verified_head_sha,
-        )
-        installed = task_records.set_current_owner_gate(
-            transaction_pool,
-            task_id,
-            expected_state_token=bound_task.state_token,
-            owner_gate_id=gate.id,
-        )
-        if installed is None:
+                "the canonical feature branch is already owned by another "
+                "current task in this repository"
+            ) from exc
+        if bound_task is None:
             raise StaleOperationError(
-                "the pr authorization gate could not be installed as the task's "
-                "current gate; the presentation is stale"
+                "the canonical feature branch could not be bound; the presentation is stale"
             )
-        waiting = task_records.update_task_status(
-            transaction_pool,
-            task_id,
-            expected_state_token=installed.state_token,
-            status=TaskStatus.WAITING_FOR_OWNER,
+    else:
+        bound_task = task
+    gate = gate_records.create_owner_gate(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        gate_type=OwnerGateType.PR_AUTHORIZATION,
+        subject_head_sha=verified_head_sha,
+    )
+    installed = task_records.set_current_owner_gate(
+        transaction_pool,
+        task_id,
+        expected_state_token=bound_task.state_token,
+        owner_gate_id=gate.id,
+    )
+    if installed is None:
+        raise StaleOperationError(
+            "the pr authorization gate could not be installed as the task's "
+            "current gate; the presentation is stale"
         )
-        if waiting is None:
-            raise StaleOperationError(
-                "the task could not move to waiting_for_owner; the presentation is stale"
+    waiting = task_records.update_task_status(
+        transaction_pool,
+        task_id,
+        expected_state_token=installed.state_token,
+        status=TaskStatus.WAITING_FOR_OWNER,
+    )
+    if waiting is None:
+        raise StaleOperationError(
+            "the task could not move to waiting_for_owner; the presentation is stale"
+        )
+    event_coordination.record_owner_gate_created_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=gate.id,
+        actor=_OPENORC_ACTOR,
+    )
+    return PrAuthorizationGateOpened(
+        task=waiting,
+        owner_gate=gate,
+        canonical_branch=observed_branch_name,
+        verified_head_sha=verified_head_sha,
+    )
+
+
+def present_pr_authorization_gate(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    execution_id: UUID | None,
+    verified_head_sha: str,
+    observed_branch_name: str,
+    claim: _ImplementationClaim | None = None,
+) -> PrAuthorizationGateOpened:
+    """The database-only exact-head presentation composition (issue #289).
+
+    One short composed transaction proves every admission fact and commits
+    the presentation. The normal E7 flow passes its Phase-A admission
+    ``claim`` so the composition re-proves the identical subjects before
+    the bind and gate commit; the Owner Ignore service calls this inside
+    its own commit transaction without a claim, and the claim is then
+    derived fresh from the restored durable state under the caller's
+    expected token. No external I/O occurs here.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        if claim is None:
+            claim = _discover_implementation_claim(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                execution_id=execution_id,
             )
-        event_coordination.record_owner_gate_created_event(
+        return _present_exact_head_gate_body(
             transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            owner_gate_id=gate.id,
-            actor=_OPENORC_ACTOR,
-        )
-        return PrAuthorizationGateOpened(
-            task=waiting,
-            owner_gate=gate,
-            canonical_branch=observed_branch_name,
+            claim=claim,
             verified_head_sha=verified_head_sha,
+            observed_branch_name=observed_branch_name,
         )
 
 
@@ -785,9 +736,10 @@ def open_pr_authorization(
     Task's current gate, the ``implementing → waiting_for_owner``
     transition, and the safe OPENORC audit together.
 
-    A confirmed source-requirements change takes the distinct atomic
-    ``github_source_changed`` block path (TaskBlock + ``blocked`` transition
-    + audit in one transaction, no gate) and fails closed; a closed source
+    A confirmed source-requirements change takes the shared atomic
+    ``github_source_changed`` block path (TaskBlock + pending exceptional
+    ``GITHUB_ISSUE_CHANGE`` gate + ``blocked`` transition + audits in one
+    transaction, issue #289) and fails closed; a closed source
     issue, a stable-identity mismatch, lost access, known provider failure,
     and uncertain outcomes are typed fail-closed refusals that fabricate no
     drift, no block, and no gate. Replay/race can never create a second
@@ -850,11 +802,16 @@ def open_pr_authorization(
             subject_branch=subject_branch,
         )
         # --- Phase C: the atomic bind + exact-head gate presentation. ---
-        return _present_exact_head_gate(
+        return present_pr_authorization_gate(
             pool,
-            claim=claim,
+            profile_id=claim.profile_id,
+            workspace_id=claim.task.workspace_id,
+            task_id=claim.task.id,
+            expected_state_token=claim.expected_state_token,
+            execution_id=claim.execution.id,
             verified_head_sha=branch_observation.head_sha,
             observed_branch_name=branch_observation.branch_name,
+            claim=claim,
         )
 
 
@@ -1080,3 +1037,24 @@ def _load_implementation_authority(
         iteration=iteration,
         producer_session=producer_session,
     )
+
+
+def resolve_pr_authorization_continuation(transaction_pool: DatabasePool, *, task: Task) -> str:
+    """Derive and prove the interrupted E7 continuation's durable facts (issue #289).
+
+    The Owner Ignore composition's pre-commit eligibility derivation: the
+    exact E5-approved implementation authority, the single CLOSED planning
+    loop, the original Producer binding, and the qualifying successful E6
+    Execution — the same derivation the presentation performs, without the
+    pre-gate implementing-state requirement (the blocked Task is restored
+    to it before the presentation composition runs). Returns the validated
+    persisted branch claim the interrupted presentation observes through
+    the shared B7 seam. Any missing or incoherent fact raises the typed
+    vocabulary; the caller treats a refusal as an unsafe continuation and
+    applies nothing, leaving the Task blocked.
+    """
+    _load_implementation_authority(transaction_pool, task=task)
+    _execution, claimed_branch = _require_qualifying_execution(
+        transaction_pool, task=task, execution_id=None
+    )
+    return claimed_branch
