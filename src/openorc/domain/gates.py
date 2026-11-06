@@ -46,10 +46,11 @@ exact Owner decision bound to the exact subject it governs.
   never newly selected, retained for schema compatibility — offers Cancel
   Task only; COST_LIMIT offers Continue or Cancel Task; OWNER_ABORT
   offers Resume or Cancel Task. There is no exceptional Discuss and no
-  universal Retry. Only Cancel is executable today (the single shared
-  cancellation service, issue #278): the other actions are declared menu
-  decisions whose action services arrive with the remaining F8 leaves
-  (issues #289, #291, #292), and until then any non-Cancel decision must
+  universal Retry. Cancel is executable through the single shared
+  cancellation service (issue #278) and Ignore through the Owner Ignore
+  service (issue #289); the remaining actions are declared menu decisions
+  whose action services arrive with the remaining F8 leaves
+  (issues #291, #292), and until then any other non-Cancel decision must
   fail closed rather than falsely resolve or unblock. This module does
   not execute any action; the action services independently enforce
   their own identity, currentness, and effect safety (issue #254).
@@ -190,9 +191,10 @@ class ExceptionalOwnerGateAction(StrEnum):
 # Cancel Task only. GITHUB_STATE_MISMATCH is legacy vocabulary retained
 # for schema compatibility (issue #290): the Level 3 catalog never newly
 # selects it and its menu is Cancel Task only, so no gate advertises the
-# retired Try Again decision. Every menu ends in Cancel Task, the one
-# executable decision (issue #278); the other actions stay inert until
-# their leaves deliver them (issues #289, #291, #292).
+# retired Try Again decision. Every menu ends in Cancel Task; Cancel is
+# executable through the shared cancellation service (issue #278) and
+# Ignore through the Owner Ignore service (issue #289), while the other
+# actions stay inert until their leaves deliver them (issues #291, #292).
 _EXCEPTIONAL_GATE_ACTIONS: Mapping[OwnerGateType, tuple[ExceptionalOwnerGateAction, ...]] = (
     MappingProxyType(
         {

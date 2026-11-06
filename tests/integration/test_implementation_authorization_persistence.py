@@ -24,12 +24,18 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
 from psycopg import Connection
 
+from openorc.adapters.github import (
+    GitHubIssueObservation,
+    GitHubRepositoryObservation,
+)
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
+from openorc.domain.github_issues import github_issue_requirements_fingerprint
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import gates as gate_repositories
@@ -49,6 +55,85 @@ pytestmark = pytest.mark.integration
 
 _BASE_SHA = "d" * 40
 _PLAN_TEXT = "# Plan\n\nStep one.\n"
+_GITHUB_ISSUE_ID = 7703
+_OBSERVED_AT = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
+_FINGERPRINT = github_issue_requirements_fingerprint("Found a bug", "Requirements body")
+
+
+class _FakeGitHubAppClient:
+    """A local fixed-observation client for the durable-composition checks."""
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> GitHubRepositoryObservation:
+        return GitHubRepositoryObservation(
+            github_repository_id=github_repository_id,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        )
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueObservation:
+        return GitHubIssueObservation(
+            github_issue_id=_GITHUB_ISSUE_ID,
+            issue_number=issue_number,
+            title="Found a bug",
+            body="Requirements body",
+            state="open",
+            provider_updated_at=_OBSERVED_AT,
+            is_pull_request=False,
+        )
+
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the E5 seam must not observe branches")
+
+    def validate_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not compose raw validation operations")
+
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not compose user-write validation")
+
+    def get_repository_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe pull requests")
+
+    def get_commit_check_runs(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project check runs")
+
+    def get_commit_combined_status(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not project combined status")
+
+    def merge_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not request merges")
+
+    def create_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not create pull requests")
+
+    def close_pull_request(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not close pull requests")
+
+    def get_installation_capabilities(self, github_installation_id: int) -> Any:
+        raise AssertionError("this fake must not compose raw adapter operations")
+
+    def get_issue_blocked_by(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe relationships")
+
+    def get_issue_sub_issues(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe relationships")
+
+    def get_issue_parent(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not observe relationships")
+
+    def resolve_related_issue_endpoints(self, **_kwargs: Any) -> Any:
+        raise AssertionError("this fake must not resolve related endpoints")
 
 
 class _SingleConnectionPool:
@@ -143,7 +228,7 @@ def _insert_task(
         "(id, workspace_id, repository_id, github_issue_id, github_issue_number, status, "
         "source_requirements_fingerprint) "
         "values (%s, %s, %s, %s, %s, 'planning', %s)",
-        (task_id, workspace_id, repository_id, 7703, 42, "a" * 64),
+        (task_id, workspace_id, repository_id, 7703, 42, _FINGERPRINT),
     )
     return task_id
 
@@ -223,6 +308,7 @@ def _authorization_fixture(conn: Connection[Any]) -> dict[str, Any]:
 def _open_call(pool: DatabasePool, facts: dict[str, Any]) -> Any:
     return open_implementation_authorization(
         pool,
+        _FakeGitHubAppClient(),
         profile_id=facts["profile_id"],
         workspace_id=facts["workspace_id"],
         task_id=facts["task_id"],

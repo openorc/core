@@ -46,7 +46,12 @@ from typing import Any, cast
 
 import pytest
 
+from openorc.adapters.github import (
+    GitHubIssueObservation,
+    GitHubRepositoryObservation,
+)
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
+from openorc.domain.github_issues import github_issue_requirements_fingerprint
 from openorc.domain.reviews import ReviewLoopStatus, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
@@ -78,7 +83,15 @@ _ITERATION_2_ID = uuid.uuid4()
 _ITERATION_3_ID = uuid.uuid4()
 _SETTLED_GATE_ID = uuid.uuid4()
 _GATE_1_ID = uuid.uuid4()
+_DRIFT_GATE_ID = uuid.uuid4()
+_DRIFT_BLOCK_ID = uuid.uuid4()
 _BASE_SHA = "c" * 40
+_EXTERNAL_INSTALLATION_ID = 12345678
+_GITHUB_REPOSITORY_ID = 987654321
+_GITHUB_ISSUE_ID = 503
+_INSTALLATION_READ_ID = uuid.uuid4()
+_FINGERPRINT = github_issue_requirements_fingerprint("Found a bug", "Requirements body")
+_DRIFTED_FINGERPRINT = github_issue_requirements_fingerprint("Found a bug v2", "Requirements body")
 _PLAN_TEXT = "# Plan\n\nStep one.\n"
 
 _CannedResult = tuple[Any, ...] | list[tuple[Any, ...]] | None | Exception
@@ -199,6 +212,13 @@ _GATES_INSERT = _sql_has("insert into openorc.owner_gates")
 _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _GATE_UPDATE = _sql_has("update openorc.owner_gates")
 _EVENT_INSERT = _sql_has("insert into openorc.workflow_events")
+_REPO_READ = _sql_lacks(_sql_has("from openorc.repositories"), "for update")
+_REPO_READ_LOCKED = _sql_has("from openorc.repositories", "for update")
+_INSTALLATION_READ = _sql_has("from openorc.github_installations")
+_ISSUE_READ_LOCKED = _sql_has("from openorc.github_issues", "for update")
+_ISSUE_FIND = _sql_lacks(_sql_has("from openorc.github_issues"), "for update")
+_ISSUE_UPDATE = _sql_has("update openorc.github_issues set")
+_BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
 
 
 def _ws_row() -> tuple[Any, ...]:
@@ -212,12 +232,13 @@ def _task_row(
     current_plan_revision_id: Any = _REVISION_1_ID,
     gate_id: Any = None,
     archived: bool = False,
+    fingerprint: Any = _FINGERPRINT,
 ) -> tuple[Any, ...]:
     return (
         _TASK_ID,
         _WORKSPACE_ID,
         _REPOSITORY_ID,
-        503,
+        _GITHUB_ISSUE_ID,
         42,
         status,
         _OBSERVED if archived else None,
@@ -225,7 +246,7 @@ def _task_row(
         state_token,
         current_plan_revision_id,
         gate_id,
-        "a" * 64,
+        fingerprint,
         None,
         _OBSERVED,
         _OBSERVED,
@@ -309,6 +330,199 @@ def _event_row() -> tuple[Any, ...]:
     )
 
 
+def _repository_row() -> tuple[Any, ...]:
+    return (
+        _REPOSITORY_ID,
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _GITHUB_REPOSITORY_ID,
+        "octocat",
+        "hello-world",
+        "https://github.com/octocat/hello-world",
+        False,
+        "main",
+        _OBSERVED,
+        _OBSERVED,
+        _INSTALLATION_READ_ID,
+    )
+
+
+def _installation_row() -> tuple[Any, ...]:
+    return (
+        _INSTALLATION_READ_ID,
+        _WORKSPACE_ID,
+        _EXTERNAL_INSTALLATION_ID,
+        501,
+        "octocat",
+        "Organization",
+        None,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _issue_row(
+    *,
+    fingerprint: str = _FINGERPRINT,
+    state: str = "open",
+    github_issue_id: int = _GITHUB_ISSUE_ID,
+) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _REPOSITORY_ID,
+        github_issue_id,
+        42,
+        "Found a bug",
+        "Requirements body",
+        state,
+        fingerprint,
+        _OBSERVED,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _block_row() -> tuple[Any, ...]:
+    return (
+        _DRIFT_BLOCK_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "github_source_changed",
+        {
+            "github_issue_id": _GITHUB_ISSUE_ID,
+            "expected_fingerprint": _FINGERPRINT,
+            "observed_fingerprint": _DRIFTED_FINGERPRINT,
+        },
+        None,
+        _OBSERVED,
+    )
+
+
+def _drift_gate_row() -> tuple[Any, ...]:
+    row = list(
+        _gate_row(
+            gate_id=_DRIFT_GATE_ID,
+            gate_type="github_issue_change",
+            status="pending",
+            plan_revision_id=None,
+        )
+    )
+    row[8] = _DRIFT_BLOCK_ID  # the gate's TaskBlock subject binding
+    return tuple(row)
+
+
+def _repository_observation() -> GitHubRepositoryObservation:
+    return GitHubRepositoryObservation(
+        github_repository_id=_GITHUB_REPOSITORY_ID,
+        owner_login="octocat",
+        name="hello-world",
+        html_url="https://github.com/octocat/hello-world",
+        is_private=False,
+        default_branch="main",
+    )
+
+
+def _issue_observation(
+    *,
+    github_issue_id: int = _GITHUB_ISSUE_ID,
+    state: str = "open",
+    title: str = "Found a bug",
+) -> GitHubIssueObservation:
+    return GitHubIssueObservation(
+        github_issue_id=github_issue_id,
+        issue_number=42,
+        title=title,
+        body="Requirements body",
+        state=state,
+        provider_updated_at=_OBSERVED,
+        is_pull_request=False,
+    )
+
+
+class FakeGitHubAppClient:
+    """The adapter Protocol fake recording the exact routing arguments."""
+
+    def __init__(
+        self,
+        *,
+        pool: Any,
+        repository_observation: GitHubRepositoryObservation | None = None,
+        issue_observation: GitHubIssueObservation | None = None,
+        issue_error: Exception | None = None,
+    ) -> None:
+        self._pool = pool
+        self._repository_observation = (
+            repository_observation
+            if repository_observation is not None
+            else _repository_observation()
+        )
+        self._issue_observation = (
+            issue_observation if issue_observation is not None else _issue_observation()
+        )
+        self._issue_error = issue_error
+        self.repository_calls: list[dict[str, int]] = []
+        self.issue_calls: list[dict[str, Any]] = []
+
+    def get_installation_repository(
+        self, *, github_installation_id: int, github_repository_id: int
+    ) -> GitHubRepositoryObservation:
+        assert self._pool.active_connections == 0, (
+            "the service must never hold a database transaction open across "
+            "the external GitHub call"
+        )
+        self.repository_calls.append(
+            {
+                "github_installation_id": github_installation_id,
+                "github_repository_id": github_repository_id,
+            }
+        )
+        return self._repository_observation
+
+    def get_repository_issue(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+        issue_number: int,
+    ) -> GitHubIssueObservation:
+        assert self._pool.active_connections == 0, (
+            "the service must never hold a database transaction open across "
+            "the external GitHub call"
+        )
+        self.issue_calls.append(
+            {
+                "github_installation_id": github_installation_id,
+                "owner_login": owner_login,
+                "repository_name": repository_name,
+                "issue_number": issue_number,
+            }
+        )
+        if self._issue_error is not None:
+            raise self._issue_error
+        return self._issue_observation
+
+    def get_repository_branch(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the E5 seam must not observe branches")
+
+    def validate_user_installation_repository_access(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the E5 seam must not compose user-write validation")
+
+    def get_issue_blocked_by(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the E5 seam must not observe relationships")
+
+    def get_issue_parent(self, **_kwargs: Any) -> Any:
+        raise AssertionError("the E5 seam must not observe relationships")
+
+
+def _fake_github(pool: Any, *, issue_observation: GitHubIssueObservation | None = None) -> Any:
+    return FakeGitHubAppClient(
+        pool=cast(FakePool, pool),
+        issue_observation=issue_observation,
+    )
+
+
 def _event_types(conn: ScriptedConnection) -> list[str]:
     types: list[str] = []
     for sql, params in conn.executed:
@@ -368,6 +582,21 @@ def _script_repeating_reads(conn: ScriptedConnection) -> None:
     conn.on_repeat(_EVENT_INSERT, _event_row())
 
 
+def _script_b3_reconciliation(
+    conn: ScriptedConnection,
+    *,
+    locked_issue_row: tuple[Any, ...] | None = None,
+    updated_issue_row: tuple[Any, ...] | None = None,
+) -> None:
+    """The B3 route resolution, locked reconcile read, and optional update."""
+    conn.on(_REPO_READ, _repository_row())
+    conn.on(_INSTALLATION_READ, _installation_row())
+    conn.on(_REPO_READ_LOCKED, _repository_row())
+    conn.on(_ISSUE_READ_LOCKED, locked_issue_row if locked_issue_row is not None else _issue_row())
+    if updated_issue_row is not None:
+        conn.on(_ISSUE_UPDATE, updated_issue_row)
+
+
 def _script_presentation(
     conn: ScriptedConnection,
     *,
@@ -378,17 +607,26 @@ def _script_presentation(
     gate_row: tuple[Any, ...] | None = None,
     installed_task_row: tuple[Any, ...] | None = None,
     waiting_task_row: tuple[Any, ...] | None = None,
+    issue_row: tuple[Any, ...] | None = None,
 ) -> None:
-    """The gate-presentation transaction in call order.
+    """The three-phase gate-presentation composition in call order.
 
     ``waiting_task_row=None`` scripts the E3c shape (the Task is already
     ``waiting_for_owner`` and no status write may happen); any unexpected
     extra statement fails the script with a handler-miss assertion.
     """
     _script_repeating_reads(conn)
+    # --- Phase A: admission and the baseline context. ---
     conn.on(_TASK_READ, task_row)  # workspace guard task read
     conn.on(_TASK_READ_LOCKED, task_row)  # get_task_for_update
     conn.on(_TASK_READ, task_row)  # require_current_task
+    # --- Phase B: the fresh B3 reconciliation (no transaction open). ---
+    _script_b3_reconciliation(conn, locked_issue_row=issue_row)
+    # --- Phase C: the presentation transaction. ---
+    conn.on(_TASK_READ, task_row)  # workspace guard task read
+    conn.on(_TASK_READ_LOCKED, task_row)  # get_task_for_update
+    conn.on(_TASK_READ, task_row)  # require_current_task
+    conn.on(_ISSUE_FIND, issue_row if issue_row is not None else _issue_row())
     conn.on(_REVISION_READ, revision_row)  # require_current_plan_revision
     conn.on(_LOOPS_LIST, [_loop_row()] if loops is None else loops)
     conn.on(_LOOP_READ_LOCKED, _loop_row())
@@ -402,6 +640,38 @@ def _script_presentation(
     )
     if waiting_task_row is not None:
         conn.on(_STATUS_UPDATE, waiting_task_row)
+
+
+def _script_open_drift_block(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...] | None = None,
+) -> None:
+    """The three-phase composition ending in the shared drift block, in order."""
+    _script_repeating_reads(conn)
+    drifting = task_row if task_row is not None else _task_row()
+    # --- Phase A: admission and the baseline context. ---
+    conn.on(_TASK_READ, drifting)
+    conn.on(_TASK_READ_LOCKED, drifting)
+    conn.on(_TASK_READ, drifting)
+    # --- Phase B: the B3 reconciliation writes the drifted fingerprint. ---
+    _script_b3_reconciliation(
+        conn,
+        locked_issue_row=_issue_row(fingerprint=_FINGERPRINT),
+        updated_issue_row=_issue_row(fingerprint=_DRIFTED_FINGERPRINT),
+    )
+    # --- The shared atomic drift-block composition. ---
+    conn.on(_TASK_READ_LOCKED, drifting)
+    conn.on(_TASK_READ, drifting)
+    conn.on(_ISSUE_FIND, _issue_row(fingerprint=_DRIFTED_FINGERPRINT))
+    conn.on(_TASK_READ_LOCKED, drifting)  # the installer's locked re-read
+    conn.on(_TASK_READ, drifting)  # the installer's currentness re-proof
+    conn.on(_BLOCK_INSERT, _block_row())
+    conn.on(_GATES_INSERT, _drift_gate_row())
+    conn.on(
+        _TASK_GATE_WRITE,
+        _task_row(status="blocked", state_token=_TOKEN_2, gate_id=_DRIFT_GATE_ID),
+    )
 
 
 def _script_approval(
@@ -495,9 +765,15 @@ def _script_cancellation(
         )
 
 
-def _open_call(pool: DatabasePool, *, expected_state_token: Any = _STATE_TOKEN) -> Any:
+def _open_call(
+    pool: DatabasePool,
+    github: Any | None = None,
+    *,
+    expected_state_token: Any = _STATE_TOKEN,
+) -> Any:
     return open_implementation_authorization(
         pool,
+        github if github is not None else _fake_github(pool),
         profile_id=_OWNER_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -659,14 +935,103 @@ def test_a_task_without_a_current_plan_refuses_presentation() -> None:
     conn = ScriptedConnection()
     _script_repeating_reads(conn)
     unplanned = _task_row(status="planning", current_plan_revision_id=None, gate_id=None)
+    # --- Phase A: admission and the baseline context. ---
     conn.on(_TASK_READ, unplanned)
     conn.on(_TASK_READ_LOCKED, unplanned)
     conn.on(_TASK_READ, unplanned)
+    # --- Phase B: the fresh B3 reconciliation precedes the Phase-C refusal. ---
+    _script_b3_reconciliation(conn)
+    # --- Phase C: the presentation transaction refuses before any write. ---
+    conn.on(_TASK_READ, unplanned)
+    conn.on(_TASK_READ_LOCKED, unplanned)
+    conn.on(_TASK_READ, unplanned)
+    conn.on(_ISSUE_FIND, _issue_row())
+    conn.on(_GATES_INSERT, AssertionError("no gate may be inserted"))
 
     with pytest.raises(ConflictError, match="no current plan revision"):
         _open_call(_pool(conn))
 
     assert _count(conn, _GATES_INSERT) == 0
+
+
+def test_a_confirmed_drift_blocks_atomically_with_the_exceptional_issue_change_gate() -> None:
+    """A confirmed requirements change at the E5 boundary takes the one shared
+    atomic drift-block path: the ``github_source_changed`` TaskBlock, its
+    pending Level 3-selected ``GITHUB_ISSUE_CHANGE`` gate, the guarded
+    ``planning → blocked`` transition, and the two audits — and no E5 gate,
+    no plan-ready audit, and no approval presentation."""
+    conn = ScriptedConnection()
+    _script_open_drift_block(conn)
+    github = _fake_github(_pool(conn), issue_observation=_issue_observation(title="Found a bug v2"))
+    with pytest.raises(ConflictError) as excinfo:
+        _open_call(_pool(conn), github)
+    assert _count(conn, _BLOCK_INSERT) == 1
+    (block_params,) = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    assert block_params is not None
+    assert block_params[2] == "github_source_changed"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context == {
+        "github_issue_id": _GITHUB_ISSUE_ID,
+        "expected_fingerprint": _FINGERPRINT,
+        "observed_fingerprint": _DRIFTED_FINGERPRINT,
+    }
+    assert _count(conn, _GATES_INSERT) == 1
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None
+    assert gate_params[2] == "github_issue_change"
+    assert gate_params[3] == "pending"
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    (write_params,) = [params for sql, params in conn.executed if _TASK_GATE_WRITE(sql, None)]
+    assert write_params is not None
+    # The guarded composition: the new gate pointer, the caller's expected
+    # token, the locked planning status, and the NULL-safe absent pointer.
+    assert write_params[0] == _DRIFT_GATE_ID
+    assert write_params[2] == _STATE_TOKEN
+    assert write_params[3] == "planning"
+    assert write_params[4] is None
+    assert _count(conn, _REVISION_READ) == 0
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    assert excinfo is not None
+
+
+def test_a_closed_source_issue_does_not_veto_the_presentation() -> None:
+    """Issue closure alone is neither a requirements change nor an E5 veto:
+    the shared comparison policy compares the requirements fingerprint only
+    (openness is checked where each boundary's own approval conditions and
+    the merge seam place it)."""
+    conn = ScriptedConnection()
+    _script_presentation(
+        conn,
+        task_row=_task_row(status="planning", gate_id=None),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iterations=[_accepted_iteration()],
+        issue_row=_issue_row(state="closed"),
+    )
+    github = _fake_github(_pool(conn), issue_observation=_issue_observation(state="closed"))
+    result = _open_call(_pool(conn), github)
+    assert result.owner_gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION
+    assert result.task.status is TaskStatus.WAITING_FOR_OWNER
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _event_types(conn)[-2:] == ["owner_gate_created", "plan_ready"]
+
+
+def test_a_stable_identity_mismatch_refuses_without_drift() -> None:
+    """A reused issue number resolving to a different stable identity is a
+    typed fail-closed conflict that fabricates no drift and no block."""
+    conn = ScriptedConnection()
+    _script_presentation(
+        conn,
+        task_row=_task_row(status="planning", gate_id=None),
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iterations=[_accepted_iteration()],
+        issue_row=_issue_row(github_issue_id=999),
+    )
+    github = _fake_github(_pool(conn), issue_observation=_issue_observation(github_issue_id=999))
+    with pytest.raises(ConflictError):
+        _open_call(_pool(conn), github)
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _event_types(conn) == []
 
 
 def test_a_retired_gate_change_request_refuses_a_new_presentation() -> None:
@@ -1113,6 +1478,7 @@ def test_malformed_commands_fail_before_any_state_is_touched() -> None:
     with pytest.raises(InvalidCommandError):
         open_implementation_authorization(
             _pool(conn),
+            _fake_github(_pool(conn)),
             profile_id="not-a-uuid",  # type: ignore[arg-type]
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,

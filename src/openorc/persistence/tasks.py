@@ -27,6 +27,7 @@ surface as driver exceptions (for example ``psycopg.errors.UniqueViolation``,
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
@@ -47,6 +48,7 @@ from openorc.persistence.transactions import transaction
 
 __all__ = [
     "archive_task",
+    "acknowledge_source_requirements_fingerprint",
     "bind_canonical_branch",
     "block_task_with_exceptional_gate",
     "create_task",
@@ -831,5 +833,67 @@ def block_task_with_exceptional_gate(
                 expected_current_owner_gate_id,
                 owner_gate_id,
             ),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+_FINGERPRINT_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def acknowledge_source_requirements_fingerprint(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    fingerprint: str,
+    restored_status: TaskStatus,
+) -> Task | None:
+    """Overwrite the source baseline and restore the blocked Task atomically.
+
+    The Owner Ignore composition's (issue #289) one guarded Task mutation:
+    the acknowledged requirements fingerprint — the exact observed value the
+    resolved ``GITHUB_ISSUE_CHANGE`` gate's bound TaskBlock carries — becomes
+    the Task's last Owner-accepted comparison value, and the Task leaves
+    ``blocked`` for the exact non-blocked pre-gate status the interrupted
+    approval boundary presents from. Both effects are one statement with one
+    ``state_token`` rotation.
+
+    This is the only sanctioned rewrite of a present baseline. Every other
+    Task mutation leaves the frozen fingerprint untouched
+    (:func:`update_task_status` captures with ``coalesce`` and can never
+    rewrite); this statement's guards are what make the overwrite truthful:
+    the exact expected ``state_token``, the exact ``blocked`` status, the
+    cleared current-gate pointer (the exceptional gate has already resolved
+    in the same composition), and non-archived currentness. The database
+    ``tasks_source_requirements_fingerprint_status_check`` backstops the
+    digest shape and the non-NULL baseline for every post-``ready_to_plan``
+    status. Returns the updated Task, or ``None`` when any guard no longer
+    matches (a stale operation that must not be retried blindly).
+    """
+    if not isinstance(expected_state_token, UUID):
+        raise TaskDomainError("expected_state_token must be a UUID")
+    if not isinstance(fingerprint, str) or not _FINGERPRINT_SHAPE.fullmatch(fingerprint):
+        raise TaskDomainError("fingerprint must be a lowercase hex SHA-256 requirements digest")
+    if (
+        not isinstance(restored_status, TaskStatus)
+        or restored_status.is_terminal
+        or restored_status is TaskStatus.BLOCKED
+    ):
+        raise TaskDomainError(
+            "restored_status must be a nonterminal, non-blocked TaskStatus; "
+            "the acknowledge composition restores the interrupted boundary's "
+            "pre-gate state, never a blocked or terminal state"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set source_requirements_fingerprint = %s, "
+            "status = %s, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and status = 'blocked' "
+            "and current_owner_gate_id is null "
+            f"returning {_TASK_COLUMNS}",
+            (fingerprint, restored_status.value, task_id, expected_state_token),
         ).fetchone()
     return None if row is None else _task_from_row(row)

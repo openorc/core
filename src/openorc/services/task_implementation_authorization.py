@@ -8,12 +8,17 @@ consequences of that boundary for the one current, non-archived Task:
 
 - ``open_implementation_authorization`` presents the pending
   IMPLEMENTATION_AUTHORIZATION gate as the natural continuation of accepted
-  formal review. It derives every clearance fact from the canonical tables
-  inside one short composed transaction — never from a caller's free-text
-  acceptance or a detached outcome object — and installs one pending
-  exact-plan gate as the Task's current gate. Both accepted shapes take
-  this one path: ordinary E3b ``ACCEPTED_CLEAR`` (Task still ``planning``,
-  no gate) and mediated E3c ``SETTLED_ACCEPTED`` (Task still
+  formal review. Before presenting, the shared source-requirements
+  pre-check (issue #289) freshly reconciles the authoritative GitHub issue
+  with no transaction open and compares its requirements fingerprint
+  against the Task's stored comparison value; a confirmed change takes the
+  shared atomic ``github_source_changed`` block path and refuses the
+  presentation. It then derives every clearance fact from the canonical
+  tables inside one short composed transaction — never from a caller's
+  free-text acceptance or a detached outcome object — and installs one
+  pending exact-plan gate as the Task's current gate. Both accepted shapes
+  take this one path: ordinary E3b ``ACCEPTED_CLEAR`` (Task still
+  ``planning``, no gate) and mediated E3c ``SETTLED_ACCEPTED`` (Task still
   ``waiting_for_owner`` with the settled gate's pointer cleared). The
   Owner's choices at the presented gate are Approve (below), ordinary E4
   discussion on the same still-pending gate (no E5 seam: discussion keeps
@@ -55,7 +60,8 @@ Reviewer acceptance evidence, an unresolved trailing attempt, a newer
 change request, an existing current gate, a wrong pre-gate state) are
 ``ConflictError``. Facts are derived from the established records only:
 no new gate types, gate statuses, columns, tables, or status vocabulary
-exist, and no database transaction spans external I/O (E5 performs none).
+exist, and no database transaction spans external I/O (the fresh source
+reconciliation of the pre-check runs with none open).
 """
 
 from __future__ import annotations
@@ -63,6 +69,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
+from openorc.adapters.github import GitHubAppClient
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.planning import PlanRevision
@@ -75,6 +82,7 @@ from openorc.domain.reviews import (
 )
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.gates import (
@@ -93,8 +101,13 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.github_reconciliation import reconcile_repository_issue
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
+from openorc.services.task_source_requirements import (
+    compare_source_fingerprint_or_block,
+    require_unchanged_durable_source_state,
+)
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -110,6 +123,9 @@ __all__ = [
     "approve_implementation_authorization",
     "cancel_implementation_authorization",
     "open_implementation_authorization",
+    "present_implementation_authorization_gate",
+    "require_resolution_applied",
+    "resolve_implementation_authorization_continuation",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_implementation_authorization"
@@ -275,7 +291,7 @@ def _require_accepted_clearance(
     return adjudicating
 
 
-def _require_resolution_applied(resolution: OwnerGateResolution) -> tuple[OwnerGate, Task]:
+def require_resolution_applied(resolution: OwnerGateResolution) -> tuple[OwnerGate, Task]:
     """Translate the persistence resolution outcome into the typed vocabulary.
 
     ``RESOLVED`` returns the resolved gate and post-write Task (pointer
@@ -303,6 +319,7 @@ def _require_resolution_applied(resolution: OwnerGateResolution) -> tuple[OwnerG
 
 def open_implementation_authorization(
     pool: DatabasePool,
+    github: GitHubAppClient,
     *,
     profile_id: UUID,
     workspace_id: UUID,
@@ -312,15 +329,20 @@ def open_implementation_authorization(
     """Present the exact current accepted plan's implementation gate.
 
     The Owner-authorized continuation of accepted formal review (no
-    additional Owner decision is required to *present* the gate): one
-    short composed transaction validates the command, the account
-    operational barrier, and exact Workspace/Task Owner scope; locks the
-    exact non-archived Task row; requires the expected Task token; requires
-    the pre-gate state — ``planning`` (ordinary E3b acceptance) or
-    ``waiting_for_owner`` with no current gate (E3c settlement) — the exact
-    current PlanRevision, exactly one OPEN planning ReviewLoop, and the
-    latest adjudicating finalized Reviewer ACCEPTED bound to that exact
-    revision; then creates and installs one pending exact-plan
+    additional Owner decision is required to *present* the gate). Phase A
+    proves the admission context in one short composed transaction: the
+    account operational barrier, exact Workspace/Task Owner scope, the
+    locked non-archived Task row under the expected token, the pre-gate
+    state — ``planning`` (ordinary E3b acceptance) or ``waiting_for_owner``
+    with no current gate (E3c settlement) — and the present baseline. Then,
+    with no database transaction open, the shared source-requirements
+    pre-check (issue #289) freshly reconciles the authoritative GitHub
+    issue through the trusted B3 primitive and compares its requirements
+    fingerprint against the Task's stored comparison value: a confirmed
+    change takes the shared atomic ``github_source_changed`` block path and
+    refuses the presentation. Finally the database-only presentation
+    composition re-proves every admission fact and the durable projection,
+    then creates and installs one pending exact-plan
     IMPLEMENTATION_AUTHORIZATION gate as the Task's current gate, moves a
     still-``planning`` Task to ``waiting_for_owner``, and records the safe
     OPENORC audit facts. Atomic rollback on any failure: replay/race can
@@ -337,6 +359,7 @@ def open_implementation_authorization(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
+        # --- Phase A: admission and the baseline context (one short txn). ---
         with composed_transaction(pool) as transaction_pool:
             require_account_operational(transaction_pool, profile_id=profile_id)
             require_workspace_task(
@@ -367,72 +390,156 @@ def open_implementation_authorization(
                     "the task is not in a pre-gate planning state; the "
                     "implementation authorization gate cannot be opened"
                 )
-            if task.current_plan_revision_id is None:
+            if task.source_requirements_fingerprint is None:
                 raise ConflictError(
-                    "the task carries no current plan revision; the "
+                    "the task carries no source requirements baseline; the "
                     "implementation authorization gate cannot be opened"
                 )
-            revision = require_current_plan_revision(
-                transaction_pool,
-                task=task,
-                plan_revision_id=task.current_plan_revision_id,
+        # --- Phase B: the shared fresh source-requirements comparison. ---
+        reconciliation = reconcile_repository_issue(
+            pool,
+            github,
+            workspace_id=workspace_id,
+            repository_id=task.repository_id,
+            issue_number=task.github_issue_number,
+        )
+        compare_source_fingerprint_or_block(
+            pool,
+            task=task,
+            projection=reconciliation.issue,
+            profile_id=profile_id,
+            expected_state_token=expected_state_token,
+        )
+        # --- Phase C: the database-only presentation composition. ---
+        return present_implementation_authorization_gate(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+
+
+def present_implementation_authorization_gate(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+) -> ImplementationGateOpened:
+    """The database-only E5 presentation composition (issue #289).
+
+    The established gate-presentation transaction: one short composed
+    transaction validates the account operational barrier and exact
+    Workspace/Task Owner scope, locks the exact non-archived Task row,
+    requires the expected Task token and the pre-gate state, re-proves the
+    durable source projection against the Task's baseline (the shared
+    staleness re-proof closing the window since the fresh external
+    reconciliation), the exact current PlanRevision, exactly one OPEN
+    planning ReviewLoop, and the latest adjudicating finalized Reviewer
+    ACCEPTED bound to that exact revision; then creates and installs one
+    pending exact-plan IMPLEMENTATION_AUTHORIZATION gate as the Task's
+    current gate, moves a still-``planning`` Task to ``waiting_for_owner``,
+    and records the safe OPENORC audit facts. The body performs no external
+    I/O: the normal E5 flow runs it as its own short transaction, and the
+    Owner Ignore composition (issue #289) completes it inside its own
+    commit transaction.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        require_workspace_task(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        require_unchanged_durable_source_state(transaction_pool, task=task)
+        if task.current_owner_gate_id is not None:
+            raise ConflictError(
+                "the task already carries a current owner gate; the "
+                "implementation authorization gate cannot be opened"
             )
-            loop = _require_open_planning_loop(
-                transaction_pool, workspace_id=workspace_id, task_id=task_id
+        if task.status not in (TaskStatus.PLANNING, TaskStatus.WAITING_FOR_OWNER):
+            raise ConflictError(
+                "the task is not in a pre-gate planning state; the "
+                "implementation authorization gate cannot be opened"
             )
-            iteration = _require_accepted_clearance(transaction_pool, loop=loop, revision=revision)
-            gate = create_owner_gate(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
-                plan_revision_id=revision.id,
+        if task.current_plan_revision_id is None:
+            raise ConflictError(
+                "the task carries no current plan revision; the "
+                "implementation authorization gate cannot be opened"
             )
-            installed = task_records.set_current_owner_gate(
+        revision = require_current_plan_revision(
+            transaction_pool,
+            task=task,
+            plan_revision_id=task.current_plan_revision_id,
+        )
+        loop = _require_open_planning_loop(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        iteration = _require_accepted_clearance(transaction_pool, loop=loop, revision=revision)
+        gate = create_owner_gate(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            gate_type=OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+            plan_revision_id=revision.id,
+        )
+        installed = task_records.set_current_owner_gate(
+            transaction_pool,
+            task_id,
+            expected_state_token=task.state_token,
+            owner_gate_id=gate.id,
+        )
+        if installed is None:
+            raise StaleOperationError(
+                "the implementation authorization gate could not be installed "
+                "as the task's current gate; the presentation is stale"
+            )
+        if installed.status is TaskStatus.PLANNING:
+            waiting = task_records.update_task_status(
                 transaction_pool,
                 task_id,
-                expected_state_token=task.state_token,
-                owner_gate_id=gate.id,
+                expected_state_token=installed.state_token,
+                status=TaskStatus.WAITING_FOR_OWNER,
             )
-            if installed is None:
+            if waiting is None:
                 raise StaleOperationError(
-                    "the implementation authorization gate could not be installed "
-                    "as the task's current gate; the presentation is stale"
+                    "the task could not move to waiting_for_owner; the presentation is stale"
                 )
-            if installed.status is TaskStatus.PLANNING:
-                waiting = task_records.update_task_status(
-                    transaction_pool,
-                    task_id,
-                    expected_state_token=installed.state_token,
-                    status=TaskStatus.WAITING_FOR_OWNER,
-                )
-                if waiting is None:
-                    raise StaleOperationError(
-                        "the task could not move to waiting_for_owner; the presentation is stale"
-                    )
-            else:
-                waiting = installed
-            event_coordination.record_owner_gate_created_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=gate.id,
-                actor=_OPENORC_ACTOR,
-            )
-            event_coordination.record_plan_ready_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                plan_revision_id=revision.id,
-                actor=_OPENORC_ACTOR,
-            )
-            return ImplementationGateOpened(
-                task=waiting,
-                owner_gate=gate,
-                plan_revision=revision,
-                review_iteration=iteration,
-                review_loop=loop,
-            )
+        else:
+            waiting = installed
+        event_coordination.record_owner_gate_created_event(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=gate.id,
+            actor=_OPENORC_ACTOR,
+        )
+        event_coordination.record_plan_ready_event(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_revision_id=revision.id,
+            actor=_OPENORC_ACTOR,
+        )
+        return ImplementationGateOpened(
+            task=waiting,
+            owner_gate=gate,
+            plan_revision=revision,
+            review_iteration=iteration,
+            review_loop=loop,
+        )
 
 
 def approve_implementation_authorization(
@@ -522,7 +629,7 @@ def approve_implementation_authorization(
                 outcome=OwnerGateStatus.APPROVED,
                 expected_task_state_token=expected_state_token,
             )
-            approved_gate, approved_task = _require_resolution_applied(resolution)
+            approved_gate, approved_task = require_resolution_applied(resolution)
             closed_loop = review_records.close_review_loop(transaction_pool, review_loop_id=loop.id)
             if closed_loop is None:
                 # The loop was re-locked OPEN above in this transaction; fail
@@ -625,3 +732,45 @@ def cancel_implementation_authorization(
             task=composition.task,
             owner_gate=owner_gate,
         )
+
+
+def resolve_implementation_authorization_continuation(
+    transaction_pool: DatabasePool, *, task: Task
+) -> TaskStatus:
+    """Derive and prove the interrupted E5 continuation's durable facts (issue #289).
+
+    The Owner Ignore composition's pre-commit eligibility derivation: the
+    exact current PlanRevision, the one OPEN planning ReviewLoop, and the
+    latest adjudicating finalized Reviewer ACCEPTED bound to that exact
+    revision — the same derivation the presentation performs, without the
+    pre-gate-state requirement (the blocked Task is restored to it before
+    the presentation composition runs). Returns the exact pre-gate status
+    the interrupted presentation presents from: ``waiting_for_owner`` when
+    the current revision's acceptance is a settled (E3c) REVIEW_RESOLUTION
+    gate, ``planning`` for the ordinary E3b acceptance shape. Any missing
+    or incoherent fact raises the typed vocabulary; the caller treats a
+    refusal as an unsafe continuation and applies nothing, leaving the
+    Task blocked.
+    """
+    if task.current_plan_revision_id is None:
+        raise ConflictError(
+            "the task carries no current plan revision; the interrupted "
+            "implementation authorization boundary cannot be established"
+        )
+    revision = require_current_plan_revision(
+        transaction_pool, task=task, plan_revision_id=task.current_plan_revision_id
+    )
+    loop = _require_open_planning_loop(
+        transaction_pool, workspace_id=task.workspace_id, task_id=task.id
+    )
+    _require_accepted_clearance(transaction_pool, loop=loop, revision=revision)
+    gates = gate_records.list_task_owner_gates(transaction_pool, task_id=task.id)
+    settled_acceptance = any(
+        gate.gate_type is OwnerGateType.REVIEW_RESOLUTION
+        and gate.status is OwnerGateStatus.SETTLED
+        and gate.plan_revision_id == revision.id
+        for gate in gates
+    )
+    if settled_acceptance:
+        return TaskStatus.WAITING_FOR_OWNER
+    return TaskStatus.PLANNING

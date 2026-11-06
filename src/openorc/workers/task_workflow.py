@@ -633,9 +633,13 @@ def _compose_task_planning_review(
         # present the exact-plan IMPLEMENTATION_AUTHORIZATION gate. No Owner
         # decision is required to present it, and approval never follows from
         # Reviewer acceptance — the explicit E5 approval remains an Owner
-        # command outside this module.
+        # command outside this module. The shared source-requirements
+        # pre-check (issue #289) freshly verifies the authoritative issue
+        # before the gate is presented; a confirmed requirements change
+        # blocks the Task through the shared atomic drift-block path.
         open_implementation_authorization(
             pool,
+            github,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
