@@ -160,16 +160,14 @@ def _wire_activity(
     executions: list[Any] | None = None,
     loops: list[Any] | None = None,
     iterations_by_loop: dict[Any, list[Any]] | None = None,
-) -> list[tuple[Any, Any, Any]]:
+) -> None:
     """Patch the durable in-flight activity readers at their module seams.
 
     The activity proof reads the Producer's open Executions and the Task's
-    OPEN ReviewLoops with unfinalized ReviewIterations; the settlement
-    accounting re-reads them and applies the guarded status transition.
-    Returns the recorded ``(execution_id, expected, next)`` accounting
-    transitions.
+    OPEN ReviewLoops with unfinalized ReviewIterations. Settlement never
+    reads or finalizes them (issue #298): a positively settled interruption
+    leaves an open Execution truthfully open.
     """
-    accounted: list[tuple[Any, Any, Any]] = []
     monkeypatch.setattr(
         execution_records,
         "list_task_executions",
@@ -185,17 +183,6 @@ def _wire_activity(
         "list_review_loop_iterations",
         lambda pool, *, review_loop_id: list((iterations_by_loop or {}).get(review_loop_id, [])),
     )
-
-    def _update(pool: Any, *, execution_id: Any, expected_status: Any, next_status: Any) -> Any:
-        accounted.append((execution_id, expected_status, next_status))
-        for execution in executions or []:
-            if execution.id == execution_id:
-                execution.status = next_status
-                return execution
-        return None
-
-    monkeypatch.setattr(execution_records, "update_execution_status", _update)
-    return accounted
 
 
 def _open_execution(
@@ -572,7 +559,16 @@ def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting(
     _script_settlement_head(conn, intents=[_intent_row()])
     conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
     execution = _open_execution()
-    accounted = _wire_activity(monkeypatch, executions=[execution])
+    finalizations: list[tuple[Any, Any, Any]] = []
+    _wire_activity(monkeypatch, executions=[execution])
+
+    def _no_finalization(
+        pool: Any, *, execution_id: Any, expected_status: Any, next_status: Any
+    ) -> Any:
+        finalizations.append((execution_id, expected_status, next_status))
+        return None
+
+    monkeypatch.setattr(execution_records, "update_execution_status", _no_finalization)
     adapter = _FakeClineAdapter()
 
     outcome = _settlement_call(
@@ -587,23 +583,19 @@ def test_a_second_abort_settles_under_positive_evidence_without_reinterrupting(
     assert adapter.abort_calls == []
     assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
     assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.SETTLED
-    # Positive cessation established: the exact-attempt accounting applied
-    # the existing guarded transition to the cancelled final status.
-    assert accounted == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
-    assert len(outcome.accounted_executions) == 1
-    assert outcome.accounted_executions[0].status is ExecutionStatus.CANCELLED
+    # Settlement records the Interrupt intent, never a formal workflow
+    # outcome (issue #298): the open Execution keeps its truthful status and
+    # no guarded finalization transition is even attempted.
+    assert finalizations == []
+    assert execution.status is ExecutionStatus.RUNNING
     assert _count(conn, _BLOCK_INSERT) == 0
     assert _count(conn, _TASK_BLOCK_UPDATE) == 0
     assert _event_types(conn) == []
 
 
-def test_a_settlement_refusal_keeps_the_interruption_unresolved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_settlement_refusal_keeps_the_interruption_unresolved() -> None:
     conn = ScriptedConnection()
     _script_settlement_head(conn, intents=[_intent_row()])
-    execution = _open_execution()
-    accounted = _wire_activity(monkeypatch, executions=[execution])
     conn.on(
         _INTENT_UPDATE,
         _intent_row(outcome={"settlement_refusal": "outstanding_abort"}),
@@ -627,9 +619,6 @@ def test_a_settlement_refusal_keeps_the_interruption_unresolved(
     annotate_sql = [sql for sql, _ in conn.executed if "set outcome = %s" in sql]
     assert len(annotate_sql) == 1
     assert all("set status = %s" not in sql for sql in annotate_sql)
-    # Cessation was never positively established: no execution accounting.
-    assert accounted == []
-    assert execution.status is ExecutionStatus.RUNNING
 
 
 def test_an_abort_without_evidence_refuses_and_surfaces_the_unresolved_interruption() -> None:
@@ -753,19 +742,16 @@ def test_abort_eligibility_covers_the_autonomous_planning_phase(
     assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
 
 
-def test_settlement_recording_and_execution_accounting_commit_atomically(
+def test_settlement_recording_commits_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The crash boundary between the settlement records and the interrupted
-    Execution accounting cannot persist a half-settled state: one failure
-    inside the recording transaction rolls the settlement outcomes AND the
-    execution accounting back together, leaving the durable intents
-    unsettled (truthfully re-settleable) and the Execution untouched."""
+    """The settlement outcome records commit or roll back together: one
+    failure inside the recording transaction leaves the durable intents
+    unsettled (truthfully re-settleable), and a retried settlement completes
+    without ever touching the interrupted Execution (issue #298)."""
     conn = ScriptedConnection()
     second_intent = _intent_row(intent_id=uuid4(), role="reviewer", external_id="fake-session-2")
     _script_settlement_head(conn, intents=[_intent_row(), second_intent])
-    execution = _open_execution()
-    accounted = _wire_activity(monkeypatch, executions=[execution])
     adapter = _FakeClineAdapter()
 
     real_record = intent_records.record_task_interrupt_intent_outcome
@@ -795,13 +781,9 @@ def test_settlement_recording_and_execution_accounting_commit_atomically(
         )
 
     assert len(adapter.settle_calls) == 2
-    # The accounting never applied: no transition and the Execution is still
-    # durably open, exactly as the rollback left it.
-    assert accounted == []
-    assert execution.status is ExecutionStatus.RUNNING
 
     # The still-unsettled durable state is truthfully re-settleable: a
-    # retried settlement completes and applies the accounting atomically.
+    # retried settlement completes the recording atomically.
     monkeypatch.setattr(intent_records, "record_task_interrupt_intent_outcome", real_record)
     _script_settlement_head(conn, intents=[_intent_row(), second_intent])
     conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
@@ -823,8 +805,8 @@ def test_settlement_recording_and_execution_accounting_commit_atomically(
     )
 
     assert retry.kind is TaskAbortOutcomeKind.SETTLED
-    assert accounted == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
-    assert execution.status is ExecutionStatus.CANCELLED
+    assert retry.interrupt_outcomes[0].status is TaskInterruptIntentStatus.SETTLED
+    assert retry.interrupt_outcomes[1].status is TaskInterruptIntentStatus.SETTLED
 
 
 def test_malformed_abort_commands_fail_before_any_state_is_touched() -> None:
