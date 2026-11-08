@@ -57,6 +57,26 @@ abort's known pre-effect failure can never release a concurrent abort's
 unresolved intent, and an acknowledged abort never clears the guard by
 itself: that reconciliation belongs to D6b, not to this adapter.
 
+The D9 same-session Resume seam (``resume_activity``, issue #300) is the
+narrow Cline-specific continuation control beside the abort operation: one
+exact-session ``send`` of the adapter-owned fixed synthetic continuation
+instruction to an already-live, settled bound session, qualified live
+against the pinned remote SDK baseline (an ``aborted`` in-flight send
+resolves deterministically, the settled session stays live, and the fixed
+follow-up ``send`` starts a new model turn over the retained conversation).
+Like abort it resolves the durable binding and dispatches exactly once for
+the bound Producer or Reviewer session; unlike abort it takes the
+per-session send/reconstruction lock (a Resume is an ordinary turn on the
+serialized send path, so it can never interleave a same-ID
+reconstruction's read/stop/start incarnation section) and refuses —
+before any effect — while any unresolved uncertain effect kind or the
+session's abort guard still accounts for an outstanding, acknowledged, or
+uncertain interruption: continuing an unaccounted interruption contradicts
+the D6a stance. The instruction is a fixed adapter-owned constant — never
+Owner prose, never the original task prompt, and never a mode change or a
+replacement session. Caller authorization, gate selection, and
+Task/Execution consequences stay entirely with the application layer.
+
 The D6b interruption-reconciliation and recovery seam (issue #148) is the
 small Cline-local, caller-invoked surface beside these operations:
 ``reconcile_session`` inspects the exact bound session through qualified
@@ -155,6 +175,7 @@ from openorc.protocol.interaction import (
     ReviewInteraction,
 )
 from openorc.protocol.models import (
+    FORMAL_RESPONSE_FAMILIES,
     SESSION_READY_FAMILY,
     FormalResponse,
     SessionReady,
@@ -169,6 +190,12 @@ _TRACER_SCOPE: Final = "openorc.adapters.cline"
 # The pinned SDK-native ``AgentResult`` completion marker: the one finish
 # reason that carries a usable reply candidate (qualified R2b/R3 baseline).
 _SUCCESSFUL_FINISH: Final = "completed"
+
+# The D9 fixed synthetic continuation instruction (issue #300), qualified
+# live against the pinned 0.0.90 remote baseline as the Cline-native
+# same-session Resume shape. Adapter-owned and deliberately fixed: no
+# Owner prose, no replayed task prompt, no session or mode semantics.
+_RESUMPTION_INSTRUCTION: Final = "[TASK RESUMPTION] Please continue where you left off."
 
 
 def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
@@ -643,8 +670,9 @@ class ClineAdapter(AgentRuntimeAdapter):
         the active turn is fully quiescent, that an in-flight ``send``
         definitively failed, or that a later workflow result cannot arrive.
         An acknowledged or uncertain interruption stays locally unresolved
-        for #148's reconciliation through public runtime state; no
-        ``resume()`` operation exists here, and any subsequent authorized
+        for #148's reconciliation through public runtime state; a later
+        authorized continuation goes through ``resume_activity`` (issue
+        #300) only after positive settlement, and any other authorized
         interaction uses the existing exact-session send path. Caller
         authorization and Task/Execution consequences stay entirely with the
         application layer.
@@ -705,6 +733,82 @@ class ClineAdapter(AgentRuntimeAdapter):
                 guard.state = _AbortState.UNCERTAIN
             elif guard.outstanding == 0 and guard.state is _AbortState.PENDING:
                 guard.state = _AbortState.NONE
+
+    def resume_activity(
+        self,
+        session_id: str,
+        *,
+        expected_family: str | None = None,
+    ) -> FormalResponse | AgentTextResponse:
+        """Continue the exact bound session with the fixed D9 instruction.
+
+        The narrow Cline-specific Resume beside ``abort_activity``
+        (issue #300): one exact-session ``send`` of the adapter-owned fixed
+        synthetic continuation instruction to the already-live bound
+        Producer or Reviewer session — a new model turn over the retained
+        conversation, qualified live against the pinned 0.0.90 remote
+        baseline. Never a replay of the original task prompt, never
+        Owner-written text, never a session replacement, mode change, or
+        ``stop``/``start``, and never a reconstruction of an already-live
+        session. With an expected family the reply is validated through the
+        same shared #65 funnel as ``send``; without one it stays ordinary
+        text. The adapter neither selects an OwnerGate nor alters
+        Task/Execution/ReviewIteration persistence, decides authorization,
+        or owns one-shot outbound-effect claims — those stay with the
+        runtime-neutral application service.
+
+        Ordering (fail closed before any effect): the durable binding is
+        resolved first, then the dispatch takes the per-session
+        send/reconstruction lock — serializing the resumed turn against
+        this adapter's own same-session sends and against the whole
+        read_messages → stop → start reconstruction section (it can never
+        interleave a changing runtime incarnation) — and, under the
+        documented send-lock → coordination-lock order, refuses while any
+        unresolved uncertain effect kind remains or while the session's
+        abort guard still accounts for an outstanding, acknowledged, or
+        uncertain interruption: continuing an unaccounted interruption
+        contradicts the D6a stance, and D6b's settlement returns the guard
+        to ``NONE`` before any authorized continuation. An abort
+        registered after this check still reaches the runtime while the
+        resumed turn is in flight (that is the designed D6a capability):
+        the interrupted resumed turn then resolves as a transport failure,
+        never a silent partial success. Caller authorization and
+        Task/Execution consequences stay entirely with the application
+        layer.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.resume_activity") as span:
+            annotate_span(span, operation="cline_adapter.resume_activity")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if expected_family is not None and expected_family not in FORMAL_RESPONSE_FAMILIES:
+                raise ValueError(
+                    "expected_family does not name a canonical v1 response "
+                    f"family: {expected_family!r}"
+                )
+            self._resolve_bound_context(session_id)
+            with self._lock_for(session_id), self._abort_coordination:
+                if self._uncertain_effects.get(session_id):
+                    raise AgentRuntimeUncertainOutcomeError(
+                        "an earlier interaction on this session ended with an "
+                        "uncertain outcome; the same-session resume is declined"
+                    )
+                guard = self._abort_guards.get(session_id)
+                if guard is not None and (
+                    guard.outstanding > 0 or guard.state is not _AbortState.NONE
+                ):
+                    raise AgentRuntimeUnavailableError(
+                        "the session's activity interruption is not settled; "
+                        "the same-session resume is declined before dispatch"
+                    )
+                raw = self._backend_operation(
+                    "send",
+                    lambda: self._backend.send(session_id, _RESUMPTION_INSTRUCTION),
+                    session_id=session_id,
+                )
+            candidate = _extract_reply_candidate(raw, phase="resume")
+            if expected_family is None:
+                return AgentTextResponse(text=candidate)
+            return self._parse_formal_candidate(candidate, expected_family=expected_family)
 
     def reconstruct_session(
         self,
