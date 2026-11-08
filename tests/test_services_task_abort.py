@@ -60,6 +60,7 @@ from openorc.services.task_abort import (
     TaskAbortOutcomeKind,
     TaskInterruptSettlement,
     abort_task_activity,
+    settle_observed_task_interrupt,
 )
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
@@ -620,6 +621,137 @@ def test_a_settlement_refusal_keeps_the_interruption_unresolved() -> None:
     # The intent stayed unsettled: the annotation wrote no terminal status.
     annotate_sql = [sql for sql, _ in conn.executed if "set outcome = %s" in sql]
     assert len(annotate_sql) == 1
+    assert all("set status = %s" not in sql for sql in annotate_sql)
+
+
+def test_a_second_abort_settles_across_a_fresh_adapter_instance() -> None:
+    """The verified cross-lease shape for the Owner settlement branch: the
+    settling adapter instance holds no local abort latch, so its D6b
+    settle_abort refuses NOTHING_TO_SETTLE — the owner-attested positive
+    evidence stands and the durable intent still records SETTLED."""
+    conn = ScriptedConnection()
+    _script_settlement_head(conn, intents=[_intent_row()])
+    conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+    adapter = _FakeClineAdapter(
+        settle_results=(
+            ClineSettlementOutcome(settled=False, refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE),
+        )
+    )
+
+    outcome = _settlement_call(
+        _pool(conn),
+        adapter,
+        settlement=TaskInterruptSettlement(runtime_work_settled=True, operation_accounted_for=True),
+    )
+
+    assert outcome.kind is TaskAbortOutcomeKind.SETTLED
+    assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.SETTLED
+    assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
+
+
+def test_the_observed_resolution_settles_after_the_acknowledged_dispatch() -> None:
+    """Ordering A (the ordinary happy path): the dispatch acknowledgement is
+    already recorded when the interrupted session's terminal interrupted-turn
+    resolution arrives; the worker-side seam correlates it with the exact
+    unsettled intent and records the durable SETTLED outcome through the
+    cross-lease nothing-to-release shape."""
+    conn = ScriptedConnection()
+    _script_settlement_head(conn, intents=[_intent_row(outcome={"dispatch": "acknowledged"})])
+    conn.on(_INTENT_UPDATE, _intent_row(outcome={"observed_resolution": "interrupted_turn"}))
+    conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+    adapter = _FakeClineAdapter(
+        settle_results=(
+            ClineSettlementOutcome(settled=False, refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE),
+        )
+    )
+
+    outcome = settle_observed_task_interrupt(
+        _pool(conn), cast(Any, adapter), task_id=_TASK_ID, external_session_id=_EXTERNAL_SESSION_ID
+    )
+
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.SETTLED
+    assert outcome.detail == "settled"
+    # The D6b discipline received both derived preconditions on the exact
+    # session; no dispatch and no new intent were involved.
+    assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
+    assert adapter.abort_calls == []
+    # The settled record asserts the Interrupt intent alone: no blocking
+    # composition, no gate, and no workflow event.
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_late_dispatch_annotation_cannot_undo_the_settlement() -> None:
+    """Ordering B: the worker's settlement commits while the dispatch
+    acknowledgement annotation is still pending. The annotation applies only
+    while the intent is unsettled, so the late write is a rejected no-op and
+    the durable SETTLED outcome stands."""
+    conn = ScriptedConnection()
+    _script_settlement_head(conn, intents=[_intent_row()])
+    conn.on(_INTENT_UPDATE, _intent_row(outcome={"observed_resolution": "interrupted_turn"}))
+    conn.on(_INTENT_UPDATE, _intent_row(status="settled", outcome={"settlement": "confirmed"}))
+    adapter = _FakeClineAdapter()
+
+    outcome = settle_observed_task_interrupt(
+        _pool(conn), cast(Any, adapter), task_id=_TASK_ID, external_session_id=_EXTERNAL_SESSION_ID
+    )
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.SETTLED
+
+    # The late acknowledgement annotation: one-shot guarded — a raced
+    # terminal outcome is a rejected no-op, never a demotion.
+    conn.on(_INTENT_UPDATE, None)
+    annotated = intent_records.annotate_unsettled_task_interrupt_intent(
+        _pool(conn),
+        task_interrupt_intent_id=_INTENT_ID,
+        outcome={"dispatch": "acknowledged"},
+    )
+    assert annotated is None
+
+
+def test_the_observed_resolution_settles_nothing_without_an_outstanding_intent() -> None:
+    """Fail closed: an interrupted-turn resolution on a session with no
+    unsettled Interrupt intent (no OpenOrc abort outstanding, or an already
+    terminal intent) correlates nothing, settles nothing, and never touches
+    the adapter."""
+    conn = ScriptedConnection()
+    conn.on(_INTENTS_LIST, [])
+    adapter = _FakeClineAdapter()
+
+    outcome = settle_observed_task_interrupt(
+        _pool(conn), cast(Any, adapter), task_id=_TASK_ID, external_session_id=_EXTERNAL_SESSION_ID
+    )
+
+    assert outcome is None
+    assert adapter.settle_calls == []
+    assert adapter.abort_calls == []
+
+
+def test_an_adapter_veto_keeps_the_observed_interruption_unresolved() -> None:
+    """A genuine same-instance veto (an outstanding abort on the settling
+    instance) refuses the settlement: the observation is recorded, and the
+    intent stays unsettled with its refusal annotation — never settled over
+    a live interruption."""
+    conn = ScriptedConnection()
+    _script_settlement_head(conn, intents=[_intent_row(outcome={"dispatch": "acknowledged"})])
+    conn.on(_INTENT_UPDATE, _intent_row(outcome={"observed_resolution": "interrupted_turn"}))
+    conn.on(_INTENT_UPDATE, _intent_row(outcome={"settlement_refusal": "outstanding_abort"}))
+    adapter = _FakeClineAdapter(
+        settle_results=(
+            ClineSettlementOutcome(settled=False, refusal=ClineSettlementRefusal.OUTSTANDING_ABORT),
+        )
+    )
+
+    outcome = settle_observed_task_interrupt(
+        _pool(conn), cast(Any, adapter), task_id=_TASK_ID, external_session_id=_EXTERNAL_SESSION_ID
+    )
+
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.UNSETTLED
+    assert outcome.detail == "refused:outstanding_abort"
+    annotate_sql = [sql for sql, _ in conn.executed if "set outcome = %s" in sql]
+    assert len(annotate_sql) == 2  # the observation, then the refusal annotation
     assert all("set status = %s" not in sql for sql in annotate_sql)
 
 

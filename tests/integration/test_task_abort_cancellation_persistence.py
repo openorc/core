@@ -35,6 +35,7 @@ from typing import Any, cast
 import pytest
 from psycopg import Connection
 
+from openorc.adapters.cline import ClineSettlementOutcome, ClineSettlementRefusal
 from openorc.adapters.github import (
     GitHubPullRequestCloseOperation,
     GitHubPullRequestCloseResult,
@@ -57,7 +58,7 @@ from openorc.persistence import tasks as task_repositories
 from openorc.persistence.blocks import list_task_blocks
 from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination, task_cancellation
-from openorc.services.task_abort import abort_task_activity
+from openorc.services.task_abort import abort_task_activity, settle_observed_task_interrupt
 from openorc.services.task_cancellation import cancel_task
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
 from tests.integration.test_task_planning_gate_change_request_persistence import (
@@ -109,13 +110,27 @@ def _insert_canonical_pr(
 
 
 class _RecordingClineAdapter:
-    """The runtime seam recording the exact post-commit interrupt dispatch."""
+    """The runtime seam recording the exact post-commit interrupt dispatch
+    and the D6b settlement calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, settle_results: tuple[Any, ...] = ()) -> None:
         self.abort_calls: list[str] = []
+        self.settle_calls: list[tuple[str, bool, bool]] = []
+        self._settle_results = list(settle_results)
 
     def abort_activity(self, session_id: str) -> None:
         self.abort_calls.append(session_id)
+
+    def settle_abort(
+        self, session_id: str, *, runtime_work_settled: bool, operation_accounted_for: bool
+    ) -> Any:
+        self.settle_calls.append((session_id, runtime_work_settled, operation_accounted_for))
+        if not self._settle_results:
+            return ClineSettlementOutcome(settled=True)
+        result = self._settle_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class _CloseGithub:
@@ -548,6 +563,98 @@ def test_the_owner_cancel_after_a_settled_interruption_finalizes_the_execution(
     # The runtime was invoked exactly once — by the Abort dispatch, never
     # by the Cancel.
     assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
+
+
+def test_the_observed_interrupted_turn_resolution_settles_automatically_and_cancel_applies(
+    conn: Connection[Any],
+) -> None:
+    """The automatic happy path (the worker-side seam): the Abort dispatch
+    leaves the acknowledged intent unsettled; the owning executing service
+    then reports the interrupted session's terminal interrupted-turn
+    resolution and the seam correlates it with the exact unsettled intent
+    and records the durable SETTLED outcome — through a fresh adapter
+    instance that holds no local abort latch (the cross-lease
+    NOTHING_TO_SETTLE shape) — while the unfinished Execution stays RUNNING
+    (issue #298). The SAME unified Owner Cancel then applies unchanged
+    (issue #299)."""
+    facts = _abort_fixture(conn)
+    pool = facts["pool"]
+    adapter = _RecordingClineAdapter()
+
+    abort_outcome = abort_task_activity(
+        pool,
+        cast(Any, adapter),
+        profile_id=facts["profile_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+        expected_state_token=facts["state_token"],
+        target_roles=(WorkflowRole.PRODUCER,),
+    )
+    assert abort_outcome.kind.value == "interrupted"
+    assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
+
+    intents = intent_repositories.list_task_interrupt_intents(pool, task_id=facts["task_id"])
+    assert len(intents) == 1
+    assert intents[0].status is TaskInterruptIntentStatus.UNSETTLED
+
+    # The cross-lease settlement: a fresh adapter instance never saw the
+    # dispatching lease's abort, so its D6b settle_abort refuses
+    # NOTHING_TO_SETTLE — the recorded durable observation stands and the
+    # settlement still records.
+    settle_adapter = _RecordingClineAdapter(
+        settle_results=(
+            ClineSettlementOutcome(settled=False, refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE),
+        )
+    )
+    outcome = settle_observed_task_interrupt(
+        pool,
+        cast(Any, settle_adapter),
+        task_id=facts["task_id"],
+        external_session_id=_EXTERNAL_SESSION_ID,
+    )
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.SETTLED
+    assert settle_adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
+    assert settle_adapter.abort_calls == []
+
+    settled = intent_repositories.list_task_interrupt_intents(pool, task_id=facts["task_id"])
+    assert settled[0].status is TaskInterruptIntentStatus.SETTLED
+    assert settled[0].outcome == {"settlement": "confirmed"}
+    # Settlement records the Interrupt intent alone (issue #298): the
+    # unfinished Execution stays RUNNING and available for Resume.
+    executions = execution_repositories.list_task_executions(pool, task_id=facts["task_id"])
+    assert len(executions) == 1
+    assert executions[0].status is ExecutionStatus.RUNNING
+
+    # The same unified Owner Cancel applies unchanged (issue #299).
+    blocked = task_repositories.get_task(pool, facts["task_id"])
+    assert blocked is not None
+    assert blocked.status is TaskStatus.BLOCKED
+    cancel_outcome = cancel_task(
+        pool,
+        cast(Any, object()),
+        cast(Any, object()),
+        profile_id=facts["profile_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+        expected_state_token=blocked.state_token,
+    )
+    assert cancel_outcome.kind.value == "cancelled"
+    cancelled = task_repositories.get_task(pool, facts["task_id"])
+    assert cancelled is not None
+    assert cancelled.status is TaskStatus.CANCELLED
+    executions = execution_repositories.list_task_executions(pool, task_id=facts["task_id"])
+    assert executions[0].status is ExecutionStatus.CANCELLED
+    assert _event_counts(facts["conn"], facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+        "owner_gate_resolved": 1,
+        "execution_cancelled": 1,
+        "task_cancelled": 1,
+    }
+    # No second dispatch and no Cancel-time runtime involvement.
+    assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
+    assert settle_adapter.abort_calls == []
 
 
 def test_the_cancellation_composition_commits_atomically_and_releases_the_issue(

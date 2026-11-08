@@ -37,6 +37,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeDeliveryUncertainError,
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUnavailableError,
@@ -1802,6 +1803,66 @@ def test_an_abort_reaches_the_backend_while_a_resume_send_is_in_flight() -> None
     assert len(resume_errors) == 1
     assert isinstance(resume_errors[0], AgentRuntimeTransportError)
     assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+
+
+def test_an_aborted_in_flight_send_resolves_as_the_interrupted_turn_outcome() -> None:
+    """The pinned ``aborted`` finish reason normalizes onto the definitive
+    interrupted-turn outcome: transport-class (the runtime answered), never
+    uncertain, and no uncertain-send latch is recorded for the definitive
+    resolution."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _failed("interrupted turn", finish_reason="aborted"))
+
+    with pytest.raises(AgentRuntimeInterruptedTurnError) as excinfo:
+        adapter.send(session_id, "interrupted work")
+
+    assert isinstance(excinfo.value, AgentRuntimeTransportError)
+    assert not isinstance(excinfo.value, AgentRuntimeUncertainOutcomeError)
+    # A definitive terminal resolution latches nothing: the per-kind
+    # uncertain-send settlement has nothing to release.
+    outcome = adapter.settle_uncertain_send(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is False
+    assert outcome.refusal is ClineSettlementRefusal.NOTHING_TO_SETTLE
+
+
+def test_a_readiness_aborted_finish_keeps_its_construction_classification() -> None:
+    """The establishment readiness turn keeps its own non-success
+    classification regardless of the finish reason: an aborted readiness
+    turn is the known construction-rejection shape, never an interrupted
+    workflow dispatch."""
+    backend = FakeClineSdkBackend()
+    backend.queue_start(ClineStartResult(session_id="cline-session-1"))
+    backend.queue_send("cline-session-1", _failed("interrupted readiness", finish_reason="aborted"))
+    adapter = ClineAdapter(backend, ScriptedResolver(creation=_context()))
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.create_session(_creation_request())
+
+
+def test_a_fresh_instance_has_nothing_to_settle_for_another_lease_s_interrupt() -> None:
+    """Adapters are per-attachment-lease: a fresh instance never saw another
+    lease's abort, so its D6b settlement refuses NOTHING_TO_SETTLE — the
+    cross-lease shape the durable-evidence refinement in the settlement
+    service compensates for — while the dispatching instance still settles
+    its own latch."""
+    adapter_a, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    adapter_a.abort_activity(session_id)  # acknowledged on lease A
+
+    adapter_b = ClineAdapter(backend, resolver)
+    outcome_b = adapter_b.settle_abort(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome_b.settled is False
+    assert outcome_b.refusal is ClineSettlementRefusal.NOTHING_TO_SETTLE
+
+    outcome_a = adapter_a.settle_abort(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome_a.settled is True
 
 
 def test_resume_activity_refuses_while_uncertain_send_effects_remain() -> None:

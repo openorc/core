@@ -95,6 +95,7 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -159,6 +160,7 @@ from openorc.services.github_installation_route import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_runtime_send_claims import (
     RUNTIME_PRE_EFFECT_FAILURE_KIND,
@@ -401,10 +403,12 @@ def _repository_full_name(observation: GitHubRepositoryObservation) -> str:
 
 
 def _realize_plan_control(
+    pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
     session_id: str,
     interaction: PlanInteraction | ReviseInteraction,
     *,
+    task_id: UUID,
     message: str,
 ) -> PlanResult:
     """Send ONE established plan-family interaction to the exact bound Producer.
@@ -421,6 +425,18 @@ def _realize_plan_control(
         outcome = runtime.realize_control(
             session_id, interaction, message=message, expected_family=PLAN_RESULT_FAMILY
         )
+    except AgentRuntimeInterruptedTurnError as error:
+        settle_observed_task_interrupt(
+            pool, runtime, task_id=task_id, external_session_id=session_id
+        )
+        logger.warning(
+            "plan production ended with the runtime interrupting the send; the "
+            "dispatch claim stays unresolved"
+        )
+        raise ExternalOperationUncertainError(
+            "the plan interaction's send was interrupted by the runtime; no plan "
+            "revision is published and the send is never resent"
+        ) from error
     except AgentRuntimeUncertainOutcomeError as error:
         logger.warning(
             "plan production ended with an uncertain runtime outcome; no plan revision is published"
@@ -461,6 +477,7 @@ def _realize_plan_control(
 
 
 def _send_initial_plan(
+    pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
     session_id: str,
     *,
@@ -474,7 +491,14 @@ def _send_initial_plan(
         issue_number=task.github_issue_number,
         guidance=workspace.guidance,
     )
-    return _realize_plan_control(runtime, session_id, interaction, message=interaction.render())
+    return _realize_plan_control(
+        pool,
+        runtime,
+        session_id,
+        interaction,
+        task_id=task.id,
+        message=interaction.render(),
+    )
 
 
 def _review_result_from_iteration(iteration: ReviewIteration) -> ReviewResult:
@@ -509,6 +533,7 @@ def _review_result_from_iteration(iteration: ReviewIteration) -> ReviewResult:
 
 
 def _send_revision_plan(
+    pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
     session_id: str,
     *,
@@ -526,7 +551,12 @@ def _send_revision_plan(
     )
     interaction = ReviseInteraction(subject=subject, review_result=review_result)
     return _realize_plan_control(
-        runtime, session_id, interaction, message=serialize_review_result(review_result)
+        pool,
+        runtime,
+        session_id,
+        interaction,
+        task_id=task.id,
+        message=serialize_review_result(review_result),
     )
 
 
@@ -813,6 +843,7 @@ def produce_initial_task_plan(
         # --- Phase 4: the ONE canonical PLAN send. ---
         try:
             plan_result = _send_initial_plan(
+                pool,
                 runtime_adapter,
                 producer.external_session_id or "",
                 task=task,
@@ -963,6 +994,7 @@ def revise_task_plan(
         # --- Phase 4: the REVISE send to the same Producer session. ---
         try:
             plan_result = _send_revision_plan(
+                pool,
                 runtime_adapter,
                 producer.external_session_id or "",
                 task=task,

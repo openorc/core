@@ -73,6 +73,7 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -120,6 +121,7 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pr_review_dispatch import (
     TaskPrReviewDispatchOutcome,
@@ -607,6 +609,7 @@ def _record_remediation_completion(
 
 
 def _send_remediation_revision(
+    pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
     session_id: str,
     *,
@@ -649,6 +652,18 @@ def _send_remediation_revision(
             message=serialize_review_result(review_result),
             expected_family=IMPLEMENTATION_RESULT_FAMILY,
         )
+    except AgentRuntimeInterruptedTurnError as error:
+        settle_observed_task_interrupt(
+            pool, runtime, task_id=task.id, external_session_id=session_id
+        )
+        logger.warning(
+            "pr remediation ended with the runtime interrupting the send; the claimed "
+            "attempt remains potentially dispatched"
+        )
+        raise ExternalOperationUncertainError(
+            "the pr remediation send was interrupted by the runtime; the attempt "
+            "remains potentially dispatched and is never resent"
+        ) from error
     except AgentRuntimeUncertainOutcomeError as error:
         logger.warning(
             "pr remediation ended with an uncertain runtime outcome; the claimed "
@@ -898,6 +913,7 @@ def route_pr_remediation(
             raise
         try:
             completed = _send_remediation_revision(
+                pool,
                 producer_adapter,
                 producer_session.external_session_id or "",
                 repository_full_name=repository_full_name,

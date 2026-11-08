@@ -82,6 +82,7 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -130,6 +131,7 @@ from openorc.services.github_user_authorization import ProfileUserAccessTokenRes
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_runtime_send_claims import (
@@ -979,6 +981,18 @@ def _compose_pr_with_producer(
                 message=interaction.render(),
                 expected_family=PR_RESULT_FAMILY,
             )
+        except AgentRuntimeInterruptedTurnError as error:
+            settle_observed_task_interrupt(
+                pool, runtime, task_id=task_id, external_session_id=external_session_id
+            )
+            logger.warning(
+                "the pr composition ended with the runtime interrupting the send; the "
+                "compose dispatch claim stays unresolved"
+            )
+            raise ExternalOperationUncertainError(
+                "the pr composition's send was interrupted by the runtime; the compose "
+                "dispatch is never resent"
+            ) from error
         except AgentRuntimeUncertainOutcomeError as error:
             raise ExternalOperationUncertainError(
                 "the outcome of the pr composition is unknown; the compose "

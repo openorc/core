@@ -50,6 +50,16 @@ state and never by Cline's instantaneous busy/status field:
   evidence for the exact affected Executions. A refused settlement keeps
   every guard latched and the intent unsettled.
 
+  The same settlement discipline also runs automatically on the happy path
+  (:func:`settle_observed_task_interrupt`): the executing service that owned
+  the interrupted in-flight send correlates the runtime's terminal
+  interrupted-turn classification with the exact session's unsettled intent
+  and records the settlement without any second Owner command. Adapters are
+  per-attachment-lease, so the settling instance legitimately holds no local
+  abort latch; that nothing-to-release shape never blocks the durable
+  settlement when the positive evidence already stands, while a live
+  same-instance outstanding abort or reconstruction still vetoes it.
+
 The Task stays ``blocked`` regardless of the Interrupt outcome; late formal
 results can never advance it. Terminal session identities are preserved:
 the command never calls ``stop``/``start``/``send``, never allocates a
@@ -79,17 +89,20 @@ Owner Abort command's contract is unchanged. F4b (issue #230) owns
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from openorc.adapters.agent_runtime import (
     AgentRuntimeError,
     AgentRuntimeUncertainOutcomeError,
 )
-from openorc.adapters.cline import ClineAdapter, ClineSettlementRefusal
+from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.cline import ClineAdapter, ClineSettlementOutcome, ClineSettlementRefusal
 from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
@@ -131,10 +144,32 @@ __all__ = [
     "apply_owner_authorized_cost_limit_block",
     "dispatch_registered_task_interrupt",
     "establish_owner_authorized_cost_limit_block",
+    "settle_observed_task_interrupt",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_abort"
 _ABORT_SPAN_NAME = "task_abort.abort_task_activity"
+_OBSERVED_SETTLEMENT_SPAN_NAME = "task_abort.settle_observed_task_interrupt"
+
+logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class _D6bSettlementDiscipline(Protocol):
+    """The D6b settlement discipline the observed-resolution seam needs.
+
+    The structural view of the addressed session's runtime adapter: the
+    settlement operation that releases exactly one accounted-for uncertainty
+    kind under positive caller-attested evidence. Stated runtime-neutrally so
+    the executing services can hand over the adapter they hold under the
+    shared Agent Runtime contract, while the concrete discipline stays with
+    the concrete adapter.
+    """
+
+    def settle_abort(
+        self, session_id: str, *, runtime_work_settled: bool, operation_accounted_for: bool
+    ) -> ClineSettlementOutcome: ...
+
 
 # The workflow phases whose authorized autonomous progression (or in-flight
 # gate interaction) an Owner Abort may stop. Every other current status has
@@ -847,7 +882,7 @@ class _SettlementResult:
 
 
 def _settle_interrupt_attempt(
-    cline_adapter: ClineAdapter,
+    cline_adapter: _D6bSettlementDiscipline,
     *,
     intent: TaskInterruptIntent,
     external_session_id: str,
@@ -860,6 +895,16 @@ def _settle_interrupt_attempt(
     settlement records and the interrupted-Execution accounting can commit
     in one short transaction afterwards. A raced terminal outcome is left
     untouched by the recording step.
+
+    A ``NOTHING_TO_SETTLE`` refusal is classified as settled: the settling
+    adapter instance holds no local abort guard and no abort-kind uncertain
+    effect, and adapters are per-attachment-lease, so a fresh instance
+    legitimately has nothing local to release. The caller's positive durable
+    evidence (the attested :class:`TaskInterruptSettlement`) stands, and the
+    durable Interrupt intent is the authority — a missing process-local
+    latch never blocks the durable settlement. The genuine vetoes
+    (``OUTSTANDING_ABORT`` on this instance, an active reconstruction) still
+    refuse and keep every guard latched.
     """
     try:
         result = cline_adapter.settle_abort(
@@ -872,6 +917,8 @@ def _settle_interrupt_attempt(
             intent=intent, kind="unavailable", detail="unavailable", refusal=None
         )
     if result.settled:
+        return _SettlementResult(intent=intent, kind="settled", detail="settled", refusal=None)
+    if result.refusal is ClineSettlementRefusal.NOTHING_TO_SETTLE:
         return _SettlementResult(intent=intent, kind="settled", detail="settled", refusal=None)
     refusal = (
         result.refusal.value if isinstance(result.refusal, ClineSettlementRefusal) else "refused"
@@ -945,6 +992,118 @@ def _record_settlement_outcomes(
                     )
                 )
     return tuple(outcomes)
+
+
+def settle_observed_task_interrupt(
+    pool: DatabasePool,
+    cline_adapter: AgentRuntimeAdapter,
+    *,
+    task_id: UUID,
+    external_session_id: str,
+) -> TaskInterruptOutcome | None:
+    """Settle one session's interruption from an observed terminal turn end.
+
+    The trusted worker-side seam of the Owner Abort happy path's automatic
+    settlement: the executing service that owned the interrupted in-flight
+    send invokes this exactly once from its interrupted-send handler, after
+    the runtime classified the turn's terminal resolution as the normalized
+    interrupted-turn outcome (``AgentRuntimeInterruptedTurnError`` — the
+    runtime positively answered that the turn was interrupted before any
+    usable formal result). The runtime-specific finish reason never crosses
+    the adapter boundary, so this seam is session-level and
+    workflow-phase-neutral.
+
+    The adapter arrives under the shared runtime-neutral contract and is
+    narrowed fail-closed onto its D6b settlement discipline before any
+    effect; an adapter without the discipline is a caller defect that raises
+    the typed invalid-command error instead of being contained.
+
+    One short composed transaction first correlates the observation with the
+    exact session's unsettled Interrupt intent — the one outstanding
+    interruption the blocking composition registered for that session — and
+    records the durable observation on it in place; then, strictly outside
+    any transaction, the existing D6b settlement discipline runs on the
+    caller's attached adapter and the settlement outcome is recorded exactly
+    as the Owner settlement branch records it. Both attestations are derived
+    here, never caller-supplied: ``runtime_work_settled`` from the durable
+    observation just recorded on the unsettled intent, and
+    ``operation_accounted_for`` from the owning caller's handler position —
+    the interrupted dispatch's Execution or claim identity was left
+    conservatively tracked on its exact subject and this settlement performs
+    no Execution/claim write (issue #298), so the operation stays available
+    for later Owner Resume or Cancel (issues #292/#299).
+
+    Fail closed: no matching unsettled intent, an unexpected durable shape,
+    or a raced terminal outcome correlates nothing and settles nothing; the
+    Task stays ``blocked`` and the intent keeps its recorded status. The
+    genuine same-instance vetoes (an outstanding abort, an active
+    reconstruction) still refuse. Unexpected failures are contained at this
+    best-effort observation boundary — the durable intent remains the truth
+    and the caller's own interrupted-send classification is never masked.
+    """
+    _require_uuid_command(task_id, "task_id")
+    if not isinstance(external_session_id, str) or not external_session_id.strip():
+        raise InvalidCommandError("external_session_id must be a non-empty string")
+    if not isinstance(cline_adapter, _D6bSettlementDiscipline):
+        raise InvalidCommandError(
+            "the addressed runtime adapter carries no D6b settlement discipline"
+        )
+    with application_span(_SERVICE_TRACER_SCOPE, _OBSERVED_SETTLEMENT_SPAN_NAME) as span:
+        annotate_span(span, operation=_OBSERVED_SETTLEMENT_SPAN_NAME, task_id=str(task_id))
+        try:
+            return _settle_observed_task_interrupt(
+                pool,
+                cline_adapter,
+                task_id=task_id,
+                external_session_id=external_session_id,
+            )
+        except Exception as error:  # noqa: BLE001 - best-effort observation boundary
+            logger.warning(
+                "the observed interrupt settlement ended unexpectedly (%s) for task %s",
+                type(error).__name__,
+                task_id,
+            )
+            return None
+
+
+def _settle_observed_task_interrupt(
+    pool: DatabasePool,
+    cline_adapter: _D6bSettlementDiscipline,
+    *,
+    task_id: UUID,
+    external_session_id: str,
+) -> TaskInterruptOutcome | None:
+    with composed_transaction(pool) as transaction_pool:
+        matches = [
+            intent
+            for intent in intent_records.list_unsettled_task_interrupt_intents(
+                transaction_pool, task_id=task_id
+            )
+            if intent.external_session_id == external_session_id
+        ]
+        if len(matches) != 1:
+            # No outstanding interruption for this exact session (or an
+            # unexpected durable shape): nothing is correlated and nothing
+            # is settled.
+            return None
+        observed = intent_records.annotate_unsettled_task_interrupt_intent(
+            transaction_pool,
+            task_interrupt_intent_id=matches[0].id,
+            outcome={"observed_resolution": "interrupted_turn"},
+        )
+        if observed is None:
+            # A raced terminal outcome: the durable record the flow already
+            # holds is the truth, and no settlement runs over it.
+            return None
+    settlement = TaskInterruptSettlement(runtime_work_settled=True, operation_accounted_for=True)
+    result = _settle_interrupt_attempt(
+        cline_adapter,
+        intent=observed,
+        external_session_id=external_session_id,
+        settlement=settlement,
+    )
+    outcomes = _record_settlement_outcomes(pool, results=(result,))
+    return outcomes[0] if outcomes else None
 
 
 def abort_task_activity(

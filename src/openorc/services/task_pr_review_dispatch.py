@@ -82,6 +82,7 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
@@ -126,6 +127,7 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pull_request_reconciliation import (
     TaskPullRequestReconciliation,
@@ -639,9 +641,11 @@ def _require_review_eligible_pull_request(
 
 
 def _realize_pr_review_control(
+    pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
     session_id: str,
     *,
+    task_id: UUID,
     interaction: ReviewInteraction,
     message: str,
 ) -> ReviewResult:
@@ -657,6 +661,14 @@ def _realize_pr_review_control(
         outcome = runtime.realize_control(
             session_id, interaction, message=message, expected_family=REVIEW_RESULT_FAMILY
         )
+    except AgentRuntimeInterruptedTurnError as error:
+        settle_observed_task_interrupt(
+            pool, runtime, task_id=task_id, external_session_id=session_id
+        )
+        raise ExternalOperationFailedError(
+            "the agent runtime pr review interaction was interrupted by the runtime; "
+            "the reserved review attempt remains unresolved"
+        ) from error
     except AgentRuntimeUncertainOutcomeError as error:
         logger.warning(
             "pr review dispatch ended with an uncertain runtime outcome; "
@@ -982,8 +994,10 @@ def dispatch_pr_review(
                 reviewer_session=reviewer,
             )
             review_result = _realize_pr_review_control(
+                pool,
                 runtime,
                 reviewer.external_session_id or "",
+                task_id=task_id,
                 interaction=interaction,
                 message=message,
             )

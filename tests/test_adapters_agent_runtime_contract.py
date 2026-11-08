@@ -25,6 +25,7 @@ from openorc.adapters.agent_runtime import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeDeliveryUncertainError,
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTimeoutError,
     AgentRuntimeTransportError,
@@ -474,13 +475,17 @@ def test_uncertain_outcomes_stay_catchable_as_one_class() -> None:
         AgentRuntimeUnavailableError,
         AgentSessionNotFoundError,
         AgentRuntimeTransportError,
+        AgentRuntimeInterruptedTurnError,
         AgentRuntimeProtocolFailureError,
     ):
         assert not issubclass(known_failure, AgentRuntimeUncertainOutcomeError)
     for error in agent_runtime_errors.__all__:
         assert issubclass(getattr(agent_runtime_errors, error), AgentRuntimeError)
+    # The interrupted-turn outcome is a transport-class leaf: the runtime
+    # answered, and the definitive answer is that the turn was interrupted.
+    assert issubclass(AgentRuntimeInterruptedTurnError, AgentRuntimeTransportError)
     # The taxonomy is compact: no provider-status mirror enums.
-    assert len(agent_runtime_errors.__all__) == 9
+    assert len(agent_runtime_errors.__all__) == 10
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,13 @@ Outcome classification (the discipline downstream code relies on):
 - ``AgentRuntimeTransportError`` — the runtime answered, but its native
   response could not be extracted from the transport/framing layer before
   any formal-object work.
+  - ``AgentRuntimeInterruptedTurnError`` — the runtime answered that the
+    dispatched turn was interrupted before any usable formal result. A
+    definitive post-effect outcome by construction: the send reached the
+    runtime and the runtime terminated the turn by interruption rather than
+    completion, so the interrupted turn can never deliver a formal result.
+    Callers keep their conservative interrupted-work accounting and never
+    resend; the normalized classification carries no provider-native value.
 - ``AgentRuntimeProtocolFailureError`` — the extracted candidate response
   failed the shared canonical v1 formal-response contract (issue #65). The
   original typed ``ProtocolError`` stays chained as ``__cause__``; the
@@ -61,6 +68,7 @@ __all__ = [
     "AgentRuntimeConfigurationRejectedError",
     "AgentRuntimeDeliveryUncertainError",
     "AgentRuntimeError",
+    "AgentRuntimeInterruptedTurnError",
     "AgentRuntimeProtocolFailureError",
     "AgentRuntimeTimeoutError",
     "AgentRuntimeTransportError",
@@ -126,6 +134,21 @@ class AgentRuntimeTransportError(AgentRuntimeError):
 
     A framing/transport failure of the runtime-native response envelope,
     surfaced before any formal-object extraction is attempted.
+    """
+
+
+class AgentRuntimeInterruptedTurnError(AgentRuntimeTransportError):
+    """The runtime answered that the dispatched turn was interrupted.
+
+    A definitive post-effect outcome: the send reached the runtime and the
+    runtime terminated the turn by interruption rather than completion, so
+    the interrupted turn can never deliver a usable formal result. The
+    normalized classification carries no provider-native value; concrete
+    adapters translate their own interruption signal onto this class.
+    Callers keep their conservative interrupted-work accounting — the
+    attempt stays unresolved on its durable subject and is never resent —
+    and this outcome is never classified as uncertain, because the runtime
+    positively answered that the turn ended by interruption.
     """
 
 

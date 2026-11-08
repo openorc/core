@@ -48,8 +48,10 @@ from typing import Any, cast
 
 import pytest
 
+import openorc.services.task_authorized_implementation_execution as implementation_execution_module
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeTimeoutError,
     AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
@@ -1150,6 +1152,43 @@ def test_send_uncertainty_after_possible_dispatch_never_resends_or_finalizes() -
         assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
         assert _count(conn, _EXECUTION_COMPLETE) == 0
         assert _event_types(conn) == ["execution_started"]
+
+
+def test_an_interrupted_send_settles_the_observed_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime-attributed interrupted-turn resolution on the
+    implementation send invokes the worker-side settlement seam with the
+    exact task/session identity, then keeps the attempt conservatively
+    unresolved — never resent, never finalized."""
+    conn = ScriptedConnection()
+    _script_happy_path(conn)
+    pool, runtime, attachment = _arrange(
+        conn, send_outcomes=[AgentRuntimeInterruptedTurnError("interrupted")]
+    )
+    settlements: list[tuple[Any, Any, Any, str]] = []
+
+    def _record_settlement(
+        settled_pool: Any, adapter: Any, *, task_id: Any, external_session_id: str
+    ) -> None:
+        settlements.append((settled_pool, adapter, task_id, external_session_id))
+        return None
+
+    monkeypatch.setattr(
+        implementation_execution_module,
+        "settle_observed_task_interrupt",
+        _record_settlement,
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _execute_call(cast(DatabasePool, pool), producer_runtime_factory=attachment)
+
+    assert settlements == [(pool, runtime, _TASK_ID, _EXTERNAL_SESSION_ID)]
+    # The one send was attempted; nothing finalized it afterwards.
+    assert len(runtime.submitted_sends()) == 1
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
+    assert _count(conn, _EXECUTION_COMPLETE) == 0
+    assert _event_types(conn) == ["execution_started"]
 
 
 # --- finalize currentness and duplicate races -------------------------------------
