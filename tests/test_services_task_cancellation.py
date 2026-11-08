@@ -1909,11 +1909,14 @@ def test_a_historical_settlement_cannot_authorize_cancelling_later_work(
     is historical evidence: an open Execution in the same reused session
     binding still vetoes Cancel (issue #299)."""
     current_block = _unresolved_block()
-    historical_intent = _settled_episode_intent(session_id=uuid4(), block_id=_OTHER_BLOCK_ID)
+    reused_session_id = uuid4()
+    historical_intent = _settled_episode_intent(
+        session_id=reused_session_id, block_id=_OTHER_BLOCK_ID
+    )
     _wire(
         monkeypatch,
         interrupt_intents=[historical_intent],
-        executions=[_open_producer_execution(session_id=uuid4())],
+        executions=[_open_producer_execution(session_id=reused_session_id)],
         current_blocks=[current_block],
     )
     conn = ScriptedConnection()
@@ -1934,11 +1937,12 @@ def test_a_legacy_unlinked_settled_intent_cannot_authorize_cancellation(
     ``task_block_id``) is never current-episode evidence: the open
     Execution keeps vetoing (issue #299)."""
     current_block = _unresolved_block()
-    legacy_intent = _settled_episode_intent(session_id=uuid4(), block_id=None)
+    reused_session_id = uuid4()
+    legacy_intent = _settled_episode_intent(session_id=reused_session_id, block_id=None)
     _wire(
         monkeypatch,
         interrupt_intents=[legacy_intent],
-        executions=[_open_producer_execution(session_id=uuid4())],
+        executions=[_open_producer_execution(session_id=reused_session_id)],
         current_blocks=[current_block],
     )
     conn = ScriptedConnection()
