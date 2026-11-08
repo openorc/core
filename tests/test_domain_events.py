@@ -42,7 +42,7 @@ def _event(**overrides: Any) -> WorkflowEvent:
     return WorkflowEvent(**values)
 
 
-def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
+def test_event_type_vocabulary_is_exactly_the_locked_34() -> None:
     locked = {
         "task_created",
         "agent_session_created",
@@ -58,6 +58,9 @@ def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
         "execution_started",
         "execution_completed",
         "execution_failed",
+        # The issue #299 vocabulary extension: the Owner-attributed
+        # cancellation of one interrupted implementation attempt.
+        "execution_cancelled",
         "runtime_request_created",
         "runtime_request_resolved",
         "runtime_request_cancelled",
@@ -81,7 +84,7 @@ def test_event_type_vocabulary_is_exactly_the_locked_33() -> None:
         "workspace_configuration_changed",
     }
     assert {member.value for member in WorkflowEventType} == locked
-    assert len(WorkflowEventType) == 33
+    assert len(WorkflowEventType) == 34
 
 
 def test_excluded_crud_event_types_do_not_exist() -> None:

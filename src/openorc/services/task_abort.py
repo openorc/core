@@ -43,10 +43,12 @@ state and never by Cline's instantaneous busy/status field:
   the Interrupt intent alone, never a formal workflow outcome: no Execution
   is finalized and no Cline conversation is touched (issue #298). The Task
   stays ``blocked`` with its pending Level 3 gate and exact session
-  identities preserved for later guarded continuation; until the
-  Cancel-after-Abort remediation (issue #299) lands, Cancel may temporarily
-  refuse a settled-but-open Execution. A refused settlement keeps every
-  guard latched and the intent unsettled.
+  identities preserved for later guarded continuation; the Cancel-after-
+  Abort remediation (issue #299) makes the unified Cancel command treat a
+  positively settled interruption — bound to its exact current blocking
+  episode through the intent's durable TaskBlock linkage — as cessation
+  evidence for the exact affected Executions. A refused settlement keeps
+  every guard latched and the intent unsettled.
 
 The Task stays ``blocked`` regardless of the Interrupt outcome; late formal
 results can never advance it. Terminal session identities are preserved:
@@ -520,6 +522,7 @@ def _apply_owner_authorized_block(
                 workspace_id=task.workspace_id,
                 task_id=task.id,
                 task_agent_session_id=target.task_agent_session_id,
+                task_block_id=installation.task_block.id,
                 workflow_role=target.workflow_role,
                 external_session_id=target.external_session_id,
                 requested_by_profile_id=owner_profile_id,

@@ -66,9 +66,9 @@ __all__ = [
 ]
 
 _TASK_INTERRUPT_INTENT_COLUMNS = (
-    "id, workspace_id, task_id, task_agent_session_id, workflow_role, "
-    "external_session_id, requested_by_profile_id, status, outcome, "
-    "created_at, updated_at"
+    "id, workspace_id, task_id, task_agent_session_id, task_block_id, "
+    "workflow_role, external_session_id, requested_by_profile_id, status, "
+    "outcome, created_at, updated_at"
 )
 _TASK_PULL_REQUEST_CLOSE_INTENT_COLUMNS = (
     "id, workspace_id, task_id, task_pull_request_id, github_pr_id, "
@@ -93,13 +93,14 @@ def _interrupt_intent_from_row(row: Sequence[Any]) -> TaskInterruptIntent:
         workspace_id=row[1],
         task_id=row[2],
         task_agent_session_id=row[3],
-        workflow_role=WorkflowRole(row[4]),
-        external_session_id=row[5],
-        requested_by_profile_id=row[6],
-        status=TaskInterruptIntentStatus(row[7]),
-        outcome=row[8],
-        created_at=normalize_utc(row[9]),
-        updated_at=normalize_utc(row[10]),
+        task_block_id=row[4],
+        workflow_role=WorkflowRole(row[5]),
+        external_session_id=row[6],
+        requested_by_profile_id=row[7],
+        status=TaskInterruptIntentStatus(row[8]),
+        outcome=row[9],
+        created_at=normalize_utc(row[10]),
+        updated_at=normalize_utc(row[11]),
     )
 
 
@@ -125,6 +126,7 @@ def create_task_interrupt_intent(
     workspace_id: UUID,
     task_id: UUID,
     task_agent_session_id: UUID,
+    task_block_id: UUID,
     workflow_role: WorkflowRole,
     external_session_id: str,
     requested_by_profile_id: UUID,
@@ -132,14 +134,19 @@ def create_task_interrupt_intent(
     """Insert one unsettled exact-session Interrupt intent.
 
     Created inside the caller's transaction (the Owner Abort's blocking
-    composition). The one-shot unsettled-per-session discipline is the
-    database partial unique index: a second unsettled intent for the same
-    session binding raises ``UniqueViolation`` for service classification —
-    a duplicate dispatch can never replace a pending uncertainty.
+    composition). ``task_block_id`` is the durable episode identity of the
+    exact blocking composition that registered this intent (issue #299):
+    the composition holds the TaskBlock it created in the same transaction,
+    so the linkage is an in-transaction fact pass-through, not a lookup.
+    The one-shot unsettled-per-session discipline is the database partial
+    unique index: a second unsettled intent for the same session binding
+    raises ``UniqueViolation`` for service classification — a duplicate
+    dispatch can never replace a pending uncertainty.
     """
     _require_uuid(workspace_id, "workspace_id")
     _require_uuid(task_id, "task_id")
     _require_uuid(task_agent_session_id, "task_agent_session_id")
+    _require_uuid(task_block_id, "task_block_id")
     if not isinstance(workflow_role, WorkflowRole):
         raise ValueError("create_task_interrupt_intent requires a WorkflowRole")
     _require_nonblank_str(external_session_id, "external_session_id")
@@ -147,14 +154,15 @@ def create_task_interrupt_intent(
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.task_interrupt_intents "
-            "(workspace_id, task_id, task_agent_session_id, workflow_role, "
-            "external_session_id, requested_by_profile_id, status) "
-            "values (%s, %s, %s, %s, %s, %s, 'unsettled') "
+            "(workspace_id, task_id, task_agent_session_id, task_block_id, "
+            "workflow_role, external_session_id, requested_by_profile_id, status) "
+            "values (%s, %s, %s, %s, %s, %s, %s, 'unsettled') "
             f"returning {_TASK_INTERRUPT_INTENT_COLUMNS}",
             (
                 workspace_id,
                 task_id,
                 task_agent_session_id,
+                task_block_id,
                 workflow_role.value,
                 external_session_id,
                 requested_by_profile_id,

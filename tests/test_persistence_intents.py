@@ -101,6 +101,7 @@ def _utc_observed_at() -> datetime:
 _WORKSPACE_ID = uuid.uuid4()
 _TASK_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
+_BLOCK_ID = uuid.uuid4()
 _OWNER_PROFILE_ID = uuid.uuid4()
 _PR_RECORD_ID = uuid.uuid4()
 
@@ -111,6 +112,7 @@ def _intent_row(**overrides: Any) -> tuple[Any, ...]:
         "workspace_id": _WORKSPACE_ID,
         "task_id": _TASK_ID,
         "task_agent_session_id": _SESSION_ID,
+        "task_block_id": _BLOCK_ID,
         "workflow_role": "producer",
         "external_session_id": "external-session-1",
         "requested_by_profile_id": _OWNER_PROFILE_ID,
@@ -125,6 +127,7 @@ def _intent_row(**overrides: Any) -> tuple[Any, ...]:
         values["workspace_id"],
         values["task_id"],
         values["task_agent_session_id"],
+        values["task_block_id"],
         values["workflow_role"],
         values["external_session_id"],
         values["requested_by_profile_id"],
@@ -175,6 +178,7 @@ def test_create_task_interrupt_intent_inserts_unsettled_and_maps_the_row() -> No
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         task_agent_session_id=_SESSION_ID,
+        task_block_id=_BLOCK_ID,
         workflow_role=WorkflowRole.PRODUCER,
         external_session_id="external-session-1",
         requested_by_profile_id=_OWNER_PROFILE_ID,
@@ -183,6 +187,7 @@ def test_create_task_interrupt_intent_inserts_unsettled_and_maps_the_row() -> No
     assert intent.status is TaskInterruptIntentStatus.UNSETTLED
     assert intent.workflow_role is WorkflowRole.PRODUCER
     assert intent.external_session_id == "external-session-1"
+    assert intent.task_block_id == _BLOCK_ID
     assert intent.created_at == _utc_observed_at()
     sql, params = fake_conn.executed[0]
     assert params is not None
@@ -192,6 +197,7 @@ def test_create_task_interrupt_intent_inserts_unsettled_and_maps_the_row() -> No
         _WORKSPACE_ID,
         _TASK_ID,
         _SESSION_ID,
+        _BLOCK_ID,
         "producer",
         "external-session-1",
         _OWNER_PROFILE_ID,
@@ -382,6 +388,18 @@ def test_intent_commands_reject_malformed_shapes_before_any_sql() -> None:
             workspace_id="not-a-uuid",  # type: ignore[arg-type]
             task_id=_TASK_ID,
             task_agent_session_id=_SESSION_ID,
+            task_block_id=_BLOCK_ID,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id="external-session-1",
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+        )
+    with pytest.raises(ValueError):
+        create_task_interrupt_intent(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id="not-a-uuid",  # type: ignore[arg-type]
             workflow_role=WorkflowRole.PRODUCER,
             external_session_id="external-session-1",
             requested_by_profile_id=_OWNER_PROFILE_ID,
