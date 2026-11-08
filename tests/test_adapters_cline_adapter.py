@@ -1774,6 +1774,36 @@ def test_resume_activity_refuses_while_an_abort_is_still_outstanding() -> None:
     assert abort_errors == []
 
 
+def test_an_abort_reaches_the_backend_while_a_resume_send_is_in_flight() -> None:
+    """The D6a invariant holds for resumed turns: the coordination lock is
+    never held across the blocking SDK send, so an Owner Abort registers and
+    dispatches while the resumed turn is still in flight — and the
+    interrupted resumed turn resolves as a transport failure, never a
+    silent partial success."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _failed("interrupted resumed turn", finish_reason="aborted"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    resume_thread, resume_errors = _call_in_thread(lambda: adapter.resume_activity(session_id))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    # The abort must dispatch while the resumed turn is still held open at
+    # the gate: with the coordination lock held across the SDK send this
+    # would block until the gate's deadlock-guard expiry instead.
+    adapter.abort_activity(session_id)
+    assert [call.operation for call in backend.calls()][-1] == "abort"
+    assert resume_thread.is_alive()
+
+    release.set()
+    resume_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert isinstance(resume_errors[0], AgentRuntimeTransportError)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+
+
 def test_resume_activity_refuses_while_uncertain_send_effects_remain() -> None:
     """An unresolved uncertain-send latch vetoes the Resume; the explicit
     per-kind settlement releases it."""

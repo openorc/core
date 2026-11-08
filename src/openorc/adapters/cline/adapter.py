@@ -768,13 +768,14 @@ class ClineAdapter(AgentRuntimeAdapter):
         abort guard still accounts for an outstanding, acknowledged, or
         uncertain interruption: continuing an unaccounted interruption
         contradicts the D6a stance, and D6b's settlement returns the guard
-        to ``NONE`` before any authorized continuation. An abort
-        registered after this check still reaches the runtime while the
-        resumed turn is in flight (that is the designed D6a capability):
-        the interrupted resumed turn then resolves as a transport failure,
-        never a silent partial success. Caller authorization and
-        Task/Execution consequences stay entirely with the application
-        layer.
+        to ``NONE`` before any authorized continuation. The coordination
+        lock guards those checks only and is released before the blocking
+        SDK send — an abort can therefore always register its intent and
+        reach the runtime while the resumed turn is in flight (the
+        designed D6a capability): the interrupted resumed turn then
+        resolves as a transport failure, never a silent partial success.
+        Caller authorization and Task/Execution consequences stay entirely
+        with the application layer.
         """
         with application_span(_TRACER_SCOPE, "cline_adapter.resume_activity") as span:
             annotate_span(span, operation="cline_adapter.resume_activity")
@@ -786,20 +787,25 @@ class ClineAdapter(AgentRuntimeAdapter):
                     f"family: {expected_family!r}"
                 )
             self._resolve_bound_context(session_id)
-            with self._lock_for(session_id), self._abort_coordination:
-                if self._uncertain_effects.get(session_id):
-                    raise AgentRuntimeUncertainOutcomeError(
-                        "an earlier interaction on this session ended with an "
-                        "uncertain outcome; the same-session resume is declined"
-                    )
-                guard = self._abort_guards.get(session_id)
-                if guard is not None and (
-                    guard.outstanding > 0 or guard.state is not _AbortState.NONE
-                ):
-                    raise AgentRuntimeUnavailableError(
-                        "the session's activity interruption is not settled; "
-                        "the same-session resume is declined before dispatch"
-                    )
+            with self._lock_for(session_id):
+                with self._abort_coordination:
+                    if self._uncertain_effects.get(session_id):
+                        raise AgentRuntimeUncertainOutcomeError(
+                            "an earlier interaction on this session ended with an "
+                            "uncertain outcome; the same-session resume is declined"
+                        )
+                    guard = self._abort_guards.get(session_id)
+                    if guard is not None and (
+                        guard.outstanding > 0 or guard.state is not _AbortState.NONE
+                    ):
+                        raise AgentRuntimeUnavailableError(
+                            "the session's activity interruption is not settled; "
+                            "the same-session resume is declined before dispatch"
+                        )
+                # The coordination lock guards the checks only: it is released
+                # before the blocking SDK send, exactly so an Owner Abort can
+                # always register and reach the runtime while the resumed
+                # turn is in flight (the D6a capability).
                 raw = self._backend_operation(
                     "send",
                     lambda: self._backend.send(session_id, _RESUMPTION_INSTRUCTION),
