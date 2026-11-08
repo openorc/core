@@ -14,7 +14,12 @@ representation.
   status is forward-only: ``unsettled`` is the registered-but-unaccounted
   state (the interruption's outcome is not yet durably known), and
   ``settled``/``failed``/``unknown`` are terminal outcome records. At most
-  one unsettled intent may exist per session binding.
+  one unsettled intent may exist per session binding. Each intent carries
+  the exact ``task_block_id`` of the blocking composition that registered
+  it — the durable episode identity that distinguishes the current
+  interruption from a historical settled intent for the same reused
+  session binding (issue #299); historical rows predating the linkage
+  carry ``None`` and never satisfy a current-episode guard.
 - A TaskPullRequestCloseIntent is the cancellation's one-shot PR-close
   obligation, committed atomically with the terminal archival. Its status
   is forward-only: ``pending`` is the unresolved obligation,
@@ -178,6 +183,11 @@ class TaskInterruptIntent:
     workspace_id: UUID
     task_id: UUID
     task_agent_session_id: UUID
+    # The exact blocking composition that registered this intent (issue
+    # #299): the durable episode identity binding the interruption to its
+    # originating TaskBlock. Historical rows predating the linkage carry
+    # ``None`` and never satisfy a current-episode guard.
+    task_block_id: UUID | None
     workflow_role: WorkflowRole
     external_session_id: str
     requested_by_profile_id: UUID
@@ -195,6 +205,8 @@ class TaskInterruptIntent:
             "requested_by_profile_id",
         ):
             _require_uuid(getattr(self, name), name)
+        if self.task_block_id is not None:
+            _require_uuid(self.task_block_id, "task_block_id")
         if not isinstance(self.workflow_role, WorkflowRole):
             raise ValueError("TaskInterruptIntent.workflow_role must be a WorkflowRole")
         _require_nonblank_str(self.external_session_id, "external_session_id")

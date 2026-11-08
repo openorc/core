@@ -28,6 +28,22 @@ positively proven non-delivery evidence) vetoes Cancel. The veto composes
 every durable outstanding-work fact available in v1 (F2 #87 included);
 only truthfully superseded or positively accounted work permits Cancel.
 
+The one settlement exemption (issue #299): a positively settled
+interruption is cessation evidence for exactly the Executions the current
+blocking episode interrupted. Each Interrupt intent carries the durable
+``task_block_id`` of the blocking composition that registered it, so the
+exemption keys on the settled intent bound to the Task's current unresolved
+blocking composition and its interrupted session bindings — a settled
+intent from an earlier episode (a different or NULL block linkage) is
+historical evidence that never covers later, independently unaccounted
+work. When Owner Cancel is authorized, those accounted Executions finalize
+with truthful terminal ``CANCELLED`` accounting in the same decision
+transaction, atomically with the gate resolution and the archival; a
+rejected finalization must positively prove a terminal re-read or the
+cancellation fails closed and rolls back. Cancel never depends on a fresh
+Cline status observation, never sends an Interrupt, and never deletes the
+external session.
+
 The command's ordering is load-bearing (issue #228 §4):
 
 - **Before any irreversible mutation**, the available authoritative
@@ -104,7 +120,7 @@ from openorc.adapters.github import (
     GitHubRequestRejectedError,
 )
 from openorc.domain.events import WorkflowEventActor
-from openorc.domain.executions import ExecutionStatus
+from openorc.domain.executions import FINAL_EXECUTION_STATUSES, Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
     TaskInterruptIntentStatus,
@@ -364,7 +380,9 @@ def _require_cancel_eligible_status(task: Task) -> None:
         )
 
 
-def _require_runtime_work_accounted(transaction_pool: DatabasePool, *, task: Task) -> None:
+def _require_runtime_work_accounted(
+    transaction_pool: DatabasePool, *, task: Task
+) -> tuple[Execution, ...]:
     """Veto cancellation while any durable runtime work fact is outstanding.
 
     The authoritative durable outstanding-work facts available in v1: an
@@ -378,17 +396,59 @@ def _require_runtime_work_accounted(transaction_pool: DatabasePool, *, task: Tas
     missing evidence are never proof of quiescence: every family is
     accounted from its own durable settlement/outcome facts, and only
     truthfully superseded or positively accounted work permits Cancel.
+
+    The one settlement exemption (issue #299): a positively settled
+    interruption is cessation evidence for exactly the Executions the
+    current blocking episode interrupted. The episode identity is the
+    intent's durable TaskBlock linkage — only a settled intent bound to the
+    Task's current unresolved blocking composition covers the Execution
+    anchored in the same interrupted session binding; a settled intent from
+    an earlier episode (a different or NULL block linkage) is historical
+    evidence and never covers later, independently unaccounted work, and a
+    session with no current-episode settlement keeps vetoing. The partial
+    unique index guarantees at most one unresolved block per Task; any
+    other shape exempts nothing (fail closed).
+
+    Returns the accounted open Executions — the interrupted attempts the
+    Owner Cancel is authorized to finalize terminal ``CANCELLED`` in the
+    same decision transaction. Empty for every fully-accounted Task.
     """
     pull_request = get_task_pull_request_for_task(transaction_pool, task_id=task.id)
-    for intent in intent_records.list_task_interrupt_intents(transaction_pool, task_id=task.id):
+    intents = intent_records.list_task_interrupt_intents(transaction_pool, task_id=task.id)
+    for intent in intents:
         if intent.status is not TaskInterruptIntentStatus.SETTLED:
             raise ConflictError(
                 "the task's activity interruption is not settled; the owner abort "
                 "settlement or reconciliation must account for it first"
             )
-    for execution in execution_records.list_task_executions(transaction_pool, task_id=task.id):
-        if execution.status in _OPEN_EXECUTION_STATUSES:
-            raise ConflictError("the task has an open execution; its runtime work is unaccounted")
+    open_executions = [
+        execution
+        for execution in execution_records.list_task_executions(transaction_pool, task_id=task.id)
+        if execution.status in _OPEN_EXECUTION_STATUSES
+    ]
+    accounted: list[Execution] = []
+    if open_executions:
+        current_blocks = block_records.list_current_task_blocks(transaction_pool, task_id=task.id)
+        # The partial unique index admits at most one unresolved block per
+        # Task; any other shape is an unexpected durable-state violation and
+        # exempts nothing.
+        current_block = current_blocks[0] if len(current_blocks) == 1 else None
+        episode_sessions = (
+            {
+                intent.task_agent_session_id
+                for intent in intents
+                if intent.status is TaskInterruptIntentStatus.SETTLED
+                and intent.task_block_id == current_block.id
+            }
+            if current_block is not None
+            else set()
+        )
+        for execution in open_executions:
+            if current_block is None or execution.producer_session_id not in episode_sessions:
+                raise ConflictError(
+                    "the task has an open execution; its runtime work is unaccounted"
+                )
+            accounted.append(execution)
     for request in runtime_request_records.list_task_runtime_requests(
         transaction_pool, task_id=task.id
     ):
@@ -399,6 +459,7 @@ def _require_runtime_work_accounted(transaction_pool: DatabasePool, *, task: Tas
     _require_send_claims_accounted(transaction_pool, task=task, pull_request=pull_request)
     _require_bootstrap_accounted(transaction_pool, task=task)
     _require_review_dispatches_accounted(transaction_pool, task=task, pull_request=pull_request)
+    return tuple(accounted)
 
 
 def _send_claim_subject_superseded(
@@ -670,7 +731,11 @@ def _cancel_composition(
     mapping), commit exactly one terminal ``task_cancelled`` audit with the
     path's truthful actor, stamp the trusted path's canonical
     ``pr_closed_unmerged`` terminal cause, and — Owner path only, when the
-    close obligation exists — the durable one-shot PR-close intent.
+    close obligation exists — the durable one-shot PR-close intent. The
+    Owner path also finalizes the accounted-runtime veto's Executions —
+    the interrupted attempts the current blocking episode positively
+    settled — with truthful terminal ``CANCELLED`` accounting and their
+    ``execution_cancelled`` audits in this same transaction (issue #299).
     Everything commits or rolls back together; a stale request mutates
     nothing.
     """
@@ -764,7 +829,7 @@ def _cancel_composition(
                     "waiting_for_owner task; blocked tasks cancel through the "
                     "unified cancel command"
                 )
-            _require_runtime_work_accounted(transaction_pool, task=task)
+            accounted_executions = _require_runtime_work_accounted(transaction_pool, task=task)
             if preflight_pull_request_id is not None:
                 # The pre-decision canonical-PR facts are revalidated under
                 # the Task row lock BEFORE any mutation: B7 reconciliation
@@ -866,6 +931,42 @@ def _cancel_composition(
                 working_token = cancelled_task.state_token
             else:
                 working_token = task.state_token
+
+            # The Cancel-after-settled-Abort accounting (issue #299): the
+            # veto's accounted Executions — the interrupted attempts the
+            # current blocking episode positively settled — are finalized
+            # terminal CANCELLED in this same decision transaction,
+            # atomically with the gate resolution and the archival. Each
+            # guarded conditional write applies only while the attempt still
+            # carries its veto-observed open status; a rejected write is
+            # never assumed to be concurrent finalization — the row is
+            # re-read and its status must positively be terminal before the
+            # transition is treated as a truthful no-op. Anything else fails
+            # closed and rolls the whole cancellation back.
+            for execution in accounted_executions:
+                finalized = execution_records.update_execution_status(
+                    transaction_pool,
+                    execution_id=execution.id,
+                    expected_status=execution.status,
+                    next_status=ExecutionStatus.CANCELLED,
+                )
+                if finalized is None:
+                    current = execution_records.get_execution(
+                        transaction_pool, execution_id=execution.id
+                    )
+                    if current is None or current.status not in FINAL_EXECUTION_STATUSES:
+                        raise ConflictError(
+                            "the accounted execution's cancellation could not be "
+                            "applied; the cancellation is stale"
+                        )
+                    continue
+                event_coordination.record_execution_cancelled_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    execution_id=finalized.id,
+                    actor=actor,
+                )
 
         open_loops = review_records.list_task_review_loops(
             transaction_pool, task_id=task_id, status=ReviewLoopStatus.OPEN

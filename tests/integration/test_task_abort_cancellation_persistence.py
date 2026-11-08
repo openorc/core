@@ -40,6 +40,7 @@ from openorc.adapters.github import (
     GitHubPullRequestCloseResult,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
     TaskInterruptIntentStatus,
@@ -48,6 +49,7 @@ from openorc.domain.intents import (
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose
 from openorc.domain.tasks import TaskStatus
+from openorc.persistence import executions as execution_repositories
 from openorc.persistence import gates as gate_repositories
 from openorc.persistence import intents as intent_repositories
 from openorc.persistence import reviews as review_repositories
@@ -390,6 +392,10 @@ def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -
     assert intents[0].status is TaskInterruptIntentStatus.UNSETTLED
     assert intents[0].workflow_role.value == "producer"
     assert intents[0].external_session_id == _EXTERNAL_SESSION_ID
+    # The durable episode identity (issue #299): the intent is bound to the
+    # exact blocking composition's TaskBlock row, never merely to the
+    # session binding.
+    assert intents[0].task_block_id == blocks[0].id
     # The F3 composition also committed the pending BLOCK_RESOLUTION gate
     # bound to the block as its only subject, installed as the Task's
     # current OwnerGate pointer.
@@ -453,6 +459,94 @@ def test_a_late_abort_failure_rolls_the_whole_composition_back(
     assert _event_counts(facts["conn"], facts["task_id"]) == {}
     # The runtime is never invoked when the composition rolls back.
     assert adapter.abort_calls == []
+
+
+def test_the_owner_cancel_after_a_settled_interruption_finalizes_the_execution(
+    conn: Connection[Any],
+) -> None:
+    """The full durable chain (issue #299): the Abort composition's block +
+    unsettled intent commits; the positive settlement records the settled
+    intent (its episode linkage intact); and the SAME unified Owner Cancel
+    action then applies — finalizing the interrupted RUNNING Execution
+    terminal CANCELLED, resolving the exact gate, archiving the Task, and
+    committing the three audit facts together — with no SDK Interrupt."""
+    facts = _abort_fixture(conn)
+    pool = facts["pool"]
+    adapter = _RecordingClineAdapter()
+
+    abort_outcome = abort_task_activity(
+        pool,
+        cast(Any, adapter),
+        profile_id=facts["profile_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+        expected_state_token=facts["state_token"],
+        target_roles=(WorkflowRole.PRODUCER,),
+    )
+    assert abort_outcome.kind.value == "interrupted"
+    assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
+
+    # The Owner's positive settlement evidence (the D6b adapter settlement
+    # discipline owns its own matrices): the durable settled intent is the
+    # cessation fact Cancel reads.
+    intents = intent_repositories.list_task_interrupt_intents(pool, task_id=facts["task_id"])
+    assert len(intents) == 1
+    recorded = intent_repositories.record_task_interrupt_intent_outcome(
+        pool,
+        task_interrupt_intent_id=intents[0].id,
+        status=TaskInterruptIntentStatus.SETTLED,
+        outcome={"settlement": "confirmed"},
+    )
+    assert recorded is not None
+    assert recorded.status is TaskInterruptIntentStatus.SETTLED
+    assert recorded.task_block_id == intents[0].task_block_id
+
+    # The same unified Owner Cancel action — no second Cancel service, no
+    # cause branching, no fresh Cline status observation, no Interrupt.
+    blocked = task_repositories.get_task(pool, facts["task_id"])
+    assert blocked is not None
+    assert blocked.status is TaskStatus.BLOCKED
+    outcome = cancel_task(
+        pool,
+        cast(Any, object()),
+        cast(Any, object()),
+        profile_id=facts["profile_id"],
+        workspace_id=facts["workspace_id"],
+        task_id=facts["task_id"],
+        expected_state_token=blocked.state_token,
+    )
+
+    assert outcome.kind.value == "cancelled"
+    task = task_repositories.get_task(pool, facts["task_id"])
+    assert task is not None
+    assert task.status is TaskStatus.CANCELLED
+    assert task.archived_at is not None
+    assert task.current_owner_gate_id is None
+    # The exact affected Execution finalized terminal CANCELLED in the same
+    # decision transaction.
+    executions = execution_repositories.list_task_executions(pool, task_id=facts["task_id"])
+    assert len(executions) == 1
+    assert executions[0].status is ExecutionStatus.CANCELLED
+    assert executions[0].implementation_result is None
+    # The gate resolved CANCELLED and stays resolved history.
+    blocked_gate_id = blocked.current_owner_gate_id
+    assert blocked_gate_id is not None
+    gate = gate_repositories.get_owner_gate(pool, owner_gate_id=blocked_gate_id)
+    assert gate is not None
+    assert gate.status is OwnerGateStatus.CANCELLED
+    assert gate.decided_at is not None
+    # The audit lineage: the abort's two facts, then the cancellation's
+    # three — gate resolution, execution cancellation, terminal archival.
+    assert _event_counts(facts["conn"], facts["task_id"]) == {
+        "task_blocked": 1,
+        "owner_gate_created": 1,
+        "owner_gate_resolved": 1,
+        "execution_cancelled": 1,
+        "task_cancelled": 1,
+    }
+    # The runtime was invoked exactly once — by the Abort dispatch, never
+    # by the Cancel.
+    assert adapter.abort_calls == [_EXTERNAL_SESSION_ID]
 
 
 def test_the_cancellation_composition_commits_atomically_and_releases_the_issue(

@@ -120,13 +120,15 @@ def _block_row() -> tuple[Any, ...]:
 
 def _intent_row() -> tuple[Any, ...]:
     # openorc.task_interrupt_intents: id, workspace_id, task_id,
-    # task_agent_session_id, workflow_role, external_session_id,
-    # requested_by_profile_id, status, outcome, created_at, updated_at.
+    # task_agent_session_id, task_block_id, workflow_role,
+    # external_session_id, requested_by_profile_id, status, outcome,
+    # created_at, updated_at.
     return (
         uuid4(),
         _WORKSPACE_ID,
         _TASK_ID,
         _SESSION_ID,
+        _BLOCK_ID,
         "producer",
         _EXTERNAL_SESSION_ID,
         _OWNER_PROFILE_ID,
@@ -326,7 +328,8 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
         if "insert into openorc.task_interrupt_intents" in sql
     )
     assert intent_params is not None
-    assert intent_params[5] == _OWNER_PROFILE_ID
+    assert intent_params[3] == _BLOCK_ID
+    assert intent_params[6] == _OWNER_PROFILE_ID
     # The threshold was re-verified under the lock: the aggregate ran for
     # the evaluation and again inside the shared composition.
     assert len(_sql_of_kind(conn, lambda sql: "select sum(retained_cost_usd)" in sql)) == 2
@@ -479,7 +482,7 @@ def test_active_planning_interaction_is_interrupted_on_exhaustion(
         for sql, params in conn.executed
         if "insert into openorc.task_interrupt_intents" in sql
     )
-    assert intent_params is not None
+    assert intent_params is not None and intent_params[6] == _OWNER_PROFILE_ID
 
 
 def test_idle_waiting_for_owner_gate_still_blocks_without_interruption(
@@ -572,7 +575,8 @@ def test_the_establish_seam_barriers_before_the_task_lock(
         for sql, params in conn.executed
         if "insert into openorc.task_interrupt_intents" in sql
     )
-    assert intent_params is not None and intent_params[5] == _OWNER_PROFILE_ID
+    assert intent_params is not None and intent_params[3] == _BLOCK_ID
+    assert intent_params[6] == _OWNER_PROFILE_ID
 
 
 def _gate(

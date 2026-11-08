@@ -303,6 +303,7 @@ def _wire(
     escalated_block: Any = None,
     block: Any = None,
     veto_gate: Any = None,
+    current_blocks: list[Any] | None = None,
 ) -> None:
     if reconcile is not None:
         monkeypatch.setattr(task_cancellation, "reconcile_task_pull_request", reconcile)
@@ -362,6 +363,11 @@ def _wire(
         block_records,
         "get_task_block",
         lambda pool, *, task_block_id: escalated_block,
+    )
+    monkeypatch.setattr(
+        block_records,
+        "list_current_task_blocks",
+        lambda pool, *, task_id: list(current_blocks or []),
     )
     monkeypatch.setattr(
         task_subject_guards,
@@ -1702,15 +1708,16 @@ def test_a_merge_confirmed_under_the_final_lock_routes_to_completion(
     assert _event_types(conn) == []
 
 
-def test_the_complete_implementing_abort_settlement_path_keeps_the_execution_open(
+def test_the_complete_implementing_abort_settlement_path_cancels_with_terminal_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The full Owner path after the settlement correction (issue #298):
-    IMPLEMENTING → Abort dispatch → positive settlement records the settled
-    Interrupt intent only → the interrupted Execution stays truthfully open,
-    and the existing accounted-runtime veto still refuses Cancel while it
-    remains open (the Cancel-after-Abort remediation, issue #299, owns
-    reopening that path)."""
+    """The full Owner path after the settlement correction (issue #298) and
+    the Cancel-after-Abort remediation (issue #299): IMPLEMENTING → Abort
+    dispatch → positive settlement records the settled Interrupt intent
+    alone → the same Owner Cancel action applies, finalizing the exact
+    affected Execution terminal CANCELLED inside the one decision
+    transaction, atomically with the exact gate resolution and the
+    archival, with no SDK Interrupt ever sent."""
     from openorc.services.task_abort import (
         TaskAbortOutcomeKind as _AbortOutcomeKind,
     )
@@ -1819,31 +1826,307 @@ def test_the_complete_implementing_abort_settlement_path_keeps_the_execution_ope
     assert transitions == []
     assert execution.status is ExecutionStatus.RUNNING
 
-    # --- Phase 3: the accounted-runtime veto still refuses Cancel ---
+    # --- Phase 3: the same Owner Cancel action now applies (issue #299) ---
+    current_block = _unresolved_block()
+    settled_intent = SimpleNamespace(
+        status=TaskInterruptIntentStatus.SETTLED,
+        task_agent_session_id=_ABORT_SESSION_ID,
+        task_block_id=_BLOCK_ID,
+    )
     _wire(
         monkeypatch,
-        interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.SETTLED)],
+        interrupt_intents=[settled_intent],
         executions=[execution],
+        current_blocks=[current_block],
+        block=current_block,
     )
     conn2 = ScriptedConnection()
-    _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
-    _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
+    blocked = _task_values(status="blocked", state_token=_CANCELLED_TOKEN, current_gate_id=_GATE_ID)
+    _script_authorization(conn2, row=blocked)
+    _script_authorization(conn2, row=blocked)
+    _script_exceptional_gate_resolution(conn2, row=blocked, gate_type="owner_abort")
+    conn2.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn2.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+    conn2.on(_EVENT_INSERT, _event_returned_row("execution_cancelled"))
+    conn2.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+
+    outcome = cancel_task(
+        _pool(conn2),
+        cast(Any, _CloseGithub()),
+        cast(Any, object()),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_CANCELLED_TOKEN,
+    )
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.owner_gate is not None
+    # The exact affected Execution is finalized terminal CANCELLED in the
+    # same decision transaction: exactly one guarded transition, no other
+    # status ever touched, and the three audit facts commit together.
+    assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
+    assert execution.status is ExecutionStatus.CANCELLED
+    assert _event_types(conn2) == [
+        "owner_gate_resolved",
+        "execution_cancelled",
+        "task_cancelled",
+    ]
+
+
+def _settled_episode_intent(*, session_id: Any, block_id: Any | None = _BLOCK_ID) -> Any:
+    """One positively settled Interrupt intent with its episode linkage."""
+    return SimpleNamespace(
+        status=TaskInterruptIntentStatus.SETTLED,
+        task_agent_session_id=session_id,
+        task_block_id=block_id,
+    )
+
+
+def _open_producer_execution(*, session_id: Any) -> Any:
+    """One open RUNNING Execution anchored in the named Producer session."""
+    return SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        producer_session_id=session_id,
+        execution_number=1,
+        status=ExecutionStatus.RUNNING,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        implementation_result=None,
+        last_qualifying_activity_at=None,
+        review_iteration_id=None,
+    )
+
+
+def test_a_historical_settlement_cannot_authorize_cancelling_later_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled Interrupt intent from an earlier blocking episode — a
+    different TaskBlock linkage than the Task's current unresolved block —
+    is historical evidence: an open Execution in the same reused session
+    binding still vetoes Cancel (issue #299)."""
+    current_block = _unresolved_block()
+    historical_intent = _settled_episode_intent(session_id=uuid4(), block_id=_OTHER_BLOCK_ID)
+    _wire(
+        monkeypatch,
+        interrupt_intents=[historical_intent],
+        executions=[_open_producer_execution(session_id=uuid4())],
+        current_blocks=[current_block],
+    )
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
 
     with pytest.raises(ConflictError, match="open execution"):
-        cancel_task(
-            _pool(conn2),
-            cast(Any, _CloseGithub()),
-            cast(Any, object()),
-            profile_id=_OWNER_PROFILE_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_CANCELLED_TOKEN,
-        )
+        _cancel_call(_pool(conn), _CloseGithub())
 
-    # The veto is a safety boundary, not a gap: nothing archived, nothing
-    # resolved — the settled-but-open Execution awaits issue #299.
-    assert _count(conn2, _ARCHIVE_WRITE) == 0
-    assert _event_types(conn2) == []
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_legacy_unlinked_settled_intent_cannot_authorize_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled Interrupt intent predating the episode linkage (NULL
+    ``task_block_id``) is never current-episode evidence: the open
+    Execution keeps vetoing (issue #299)."""
+    current_block = _unresolved_block()
+    legacy_intent = _settled_episode_intent(session_id=uuid4(), block_id=None)
+    _wire(
+        monkeypatch,
+        interrupt_intents=[legacy_intent],
+        executions=[_open_producer_execution(session_id=uuid4())],
+        current_blocks=[current_block],
+    )
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+
+    with pytest.raises(ConflictError, match="open execution"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_settled_interruption_of_another_session_cannot_cover_an_open_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coverage is exact-session: a settled intent bound to the current
+    blocking episode but for a different session binding never covers an
+    Execution anchored in another session (issue #299)."""
+    current_block = _unresolved_block()
+    other_session_intent = _settled_episode_intent(session_id=uuid4())
+    _wire(
+        monkeypatch,
+        interrupt_intents=[other_session_intent],
+        executions=[_open_producer_execution(session_id=uuid4())],
+        current_blocks=[current_block],
+    )
+    conn = ScriptedConnection()
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+    _script_authorization(conn, row=_task_values(status="blocked", current_gate_id=_GATE_ID))
+
+    with pytest.raises(ConflictError, match="open execution"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn) == []
+
+
+def test_a_settled_cost_limit_interruption_follows_the_same_cancel_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cause-independent rule: a COST_LIMIT-triggered settled
+    interruption follows the same Owner Cancel accounting — identical
+    episode-identity exemption, identical terminal CANCELLED finalization,
+    identical gate resolution and audit events — with no branching by
+    cause (issue #299)."""
+    current_block = _unresolved_block()
+    session_id = uuid4()
+    execution = _open_producer_execution(session_id=session_id)
+    transitions: list[tuple[Any, Any, Any]] = []
+
+    def _update_execution(
+        pool: Any, *, execution_id: Any, expected_status: Any, next_status: Any
+    ) -> Any:
+        transitions.append((execution_id, expected_status, next_status))
+        return SimpleNamespace(id=execution_id, status=next_status)
+
+    monkeypatch.setattr(execution_records, "update_execution_status", _update_execution)
+    _wire(
+        monkeypatch,
+        interrupt_intents=[_settled_episode_intent(session_id=session_id)],
+        executions=[execution],
+        current_blocks=[current_block],
+        block=current_block,
+    )
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    _script_exceptional_gate_resolution(conn, row=blocked, gate_type="cost_limit")
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+    conn.on(_EVENT_INSERT, _event_returned_row("execution_cancelled"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.owner_gate is not None
+    assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
+    assert _event_types(conn) == [
+        "owner_gate_resolved",
+        "execution_cancelled",
+        "task_cancelled",
+    ]
+
+
+def test_a_concurrently_finalized_accounted_execution_is_a_truthful_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected conditional finalize is never assumed to be concurrent
+    finalization: the row is re-read and only a positively terminal status
+    makes the transition a truthful no-op — no event, no manufactured
+    outcome, and the cancellation still applies (issue #299)."""
+    current_block = _unresolved_block()
+    session_id = uuid4()
+    execution = _open_producer_execution(session_id=session_id)
+    terminal = SimpleNamespace(
+        id=execution.id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        producer_session_id=session_id,
+        execution_number=1,
+        status=ExecutionStatus.CANCELLED,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        implementation_result=None,
+        last_qualifying_activity_at=None,
+        review_iteration_id=None,
+    )
+    monkeypatch.setattr(
+        execution_records,
+        "update_execution_status",
+        lambda pool, *, execution_id, expected_status, next_status: None,
+    )
+    monkeypatch.setattr(
+        execution_records,
+        "get_execution",
+        lambda pool, *, execution_id: terminal,
+    )
+    _wire(
+        monkeypatch,
+        interrupt_intents=[_settled_episode_intent(session_id=session_id)],
+        executions=[execution],
+        current_blocks=[current_block],
+        block=current_block,
+    )
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    _script_exceptional_gate_resolution(conn, row=blocked, gate_type="owner_abort")
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+
+    outcome = _cancel_call(_pool(conn), _CloseGithub())
+
+    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
+    assert outcome.task.status is TaskStatus.CANCELLED
+    # The genuinely finalized historical Execution records no second
+    # cancellation event.
+    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+
+
+def test_an_unresolved_accounted_execution_rejection_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected conditional finalize whose re-read shows the Execution
+    still open is never overridden: the decision transaction fails closed
+    and rolls back with nothing archived, nothing resolved, and no close
+    obligation (issue #299)."""
+    current_block = _unresolved_block()
+    session_id = uuid4()
+    execution = _open_producer_execution(session_id=session_id)
+    monkeypatch.setattr(
+        execution_records,
+        "update_execution_status",
+        lambda pool, *, execution_id, expected_status, next_status: None,
+    )
+    monkeypatch.setattr(
+        execution_records,
+        "get_execution",
+        lambda pool, *, execution_id: execution,
+    )
+    _wire(
+        monkeypatch,
+        interrupt_intents=[_settled_episode_intent(session_id=session_id)],
+        executions=[execution],
+        current_blocks=[current_block],
+        block=current_block,
+    )
+    conn = ScriptedConnection()
+    blocked = _task_values(status="blocked", current_gate_id=_GATE_ID)
+    _script_authorization(conn, row=blocked)
+    _script_authorization(conn, row=blocked)
+    _script_exceptional_gate_resolution(conn, row=blocked, gate_type="owner_abort")
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
+
+    with pytest.raises(ConflictError, match="could not be applied"):
+        _cancel_call(_pool(conn), _CloseGithub())
+
+    assert _count(conn, _ARCHIVE_WRITE) == 0
+    # The decision transaction rolls back everything it executed — the fake
+    # connection records the statements, the durable graph never commits
+    # them: no execution event, no terminal archival event, no close intent.
+    assert _event_types(conn) == ["owner_gate_resolved"]
 
 
 # --- E10c: the trusted GitHub-observation cancellation (issue #229) ---------------

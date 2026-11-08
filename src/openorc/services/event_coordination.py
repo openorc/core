@@ -69,6 +69,7 @@ __all__ = [
     "WorkflowActorContext",
     "owner_actor",
     "producer_actor",
+    "record_execution_cancelled_event",
     "record_execution_completed_event",
     "record_execution_failed_event",
     "record_execution_started_event",
@@ -642,6 +643,35 @@ def record_execution_completed_event(
         execution_id=execution_id,
         actor=actor,
         event_type=WorkflowEventType.EXECUTION_COMPLETED,
+    )
+
+
+def record_execution_cancelled_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record the Owner-attributed cancellation of one interrupted attempt (issue #299).
+
+    The unified Cancel command finalizes an affected unfinished Execution
+    with terminal ``CANCELLED`` accounting inside its decision transaction;
+    this event is that fact's audit record. Task-scoped; the primary modeled
+    subject is the finalized Execution over the Task scope. The actor is
+    supplied by the calling capability — the same OWNER context the
+    cancellation's terminal event carries, so the audit lineage is
+    contiguous. No context is recorded: the terminal status and updated_at
+    live on the Execution row and are never shadowed into the event.
+    """
+    _record_execution_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        execution_id=execution_id,
+        actor=actor,
+        event_type=WorkflowEventType.EXECUTION_CANCELLED,
     )
 
 

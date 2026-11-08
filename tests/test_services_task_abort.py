@@ -114,12 +114,14 @@ def _intent_row(
     external_id: str = _EXTERNAL_SESSION_ID,
     status: str = "unsettled",
     outcome: dict[str, Any] | None = None,
+    task_block_id: Any = _BLOCK_ID,
 ) -> tuple[Any, ...]:
     return (
         intent_id,
         _WORKSPACE_ID,
         _TASK_ID,
         _SESSION_ID,
+        task_block_id,
         role,
         external_id,
         _OWNER_PROFILE_ID,

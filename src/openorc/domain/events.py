@@ -88,6 +88,7 @@ class WorkflowEventType(StrEnum):
     EXECUTION_STARTED = "execution_started"
     EXECUTION_COMPLETED = "execution_completed"
     EXECUTION_FAILED = "execution_failed"
+    EXECUTION_CANCELLED = "execution_cancelled"
     RUNTIME_REQUEST_CREATED = "runtime_request_created"
     RUNTIME_REQUEST_RESOLVED = "runtime_request_resolved"
     RUNTIME_REQUEST_CANCELLED = "runtime_request_cancelled"

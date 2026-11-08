@@ -1,12 +1,12 @@
-"""Convention tests for the WorkflowEvent vocabulary extension migration (#56).
+"""Convention tests for the WorkflowEvent vocabulary extension migration.
 
 The ordinary suite cannot execute Postgres. These tests assert the durable,
 architectural properties of the committed additive migration that runtime
-behavior does not naturally establish: it extends the workflow-events
-``event_type`` CHECK with exactly the one demonstrated
-``workspace_configuration_changed`` value so the database CHECK vocabulary
-is exactly the live Python enum, and it is purely additive — no deletes, no
-data migration, no grants, no dynamic constraint discovery.
+behavior does not naturally establish: the latest vocabulary extension
+migration extends the workflow-events ``event_type`` CHECK so the database
+CHECK vocabulary is exactly the live Python enum, and it is purely additive
+— no deletes, no data migration, no grants, no dynamic constraint
+discovery.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from openorc.domain.events import WorkflowEventType
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
 
-EXTENSION_MIGRATION_SUFFIX = "_add_workspace_configuration_changed_event_type.sql"
+EXTENSION_MIGRATION_SUFFIX = "_add_execution_cancelled_event_type.sql"
 
 
 def _migration_text_raw() -> str:
@@ -41,6 +41,7 @@ def test_the_extended_check_matches_the_live_vocabulary_exactly() -> None:
     # The live lock after the extension: the database CHECK vocabulary is
     # exactly the current Python enum, value for value, in enum order.
     assert values == [member.value for member in WorkflowEventType]
+    assert "execution_cancelled" in values
     assert "workspace_configuration_changed" in values
     assert "prompt_override_changed" not in values
 
