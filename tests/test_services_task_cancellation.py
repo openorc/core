@@ -1702,12 +1702,15 @@ def test_a_merge_confirmed_under_the_final_lock_routes_to_completion(
     assert _event_types(conn) == []
 
 
-def test_the_complete_implementing_abort_settlement_cancel_path(
+def test_the_complete_implementing_abort_settlement_path_keeps_the_execution_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The full Owner path the interrupted-execution accounting enables:
-    IMPLEMENTING → Abort dispatch → positive settlement with the exact
-    attempt accounting → Cancel no longer vetoed and archives."""
+    """The full Owner path after the settlement correction (issue #298):
+    IMPLEMENTING → Abort dispatch → positive settlement records the settled
+    Interrupt intent only → the interrupted Execution stays truthfully open,
+    and the existing accounted-runtime veto still refuses Cancel while it
+    remains open (the Cancel-after-Abort remediation, issue #299, owns
+    reopening that path)."""
     from openorc.services.task_abort import (
         TaskAbortOutcomeKind as _AbortOutcomeKind,
     )
@@ -1811,12 +1814,12 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
     )
 
     assert settlement_outcome.kind is _AbortOutcomeKind.SETTLED
-    # The interrupted Execution attempt is accounted for via the existing
-    # guarded transition to the cancelled final status.
-    assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
-    assert execution.status is ExecutionStatus.CANCELLED
+    # Settlement records the Interrupt intent alone (issue #298): no
+    # Execution finalization, the attempt stays truthfully open.
+    assert transitions == []
+    assert execution.status is ExecutionStatus.RUNNING
 
-    # --- Phase 3: Cancel is no longer vetoed and archives the Task ---
+    # --- Phase 3: the accounted-runtime veto still refuses Cancel ---
     _wire(
         monkeypatch,
         interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.SETTLED)],
@@ -1825,22 +1828,22 @@ def test_the_complete_implementing_abort_settlement_cancel_path(
     conn2 = ScriptedConnection()
     _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
     _script_authorization(conn2, row=_task_values(status="blocked", state_token=_CANCELLED_TOKEN))
-    conn2.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn2.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
 
-    outcome = cancel_task(
-        _pool(conn2),
-        cast(Any, _CloseGithub()),
-        cast(Any, object()),
-        profile_id=_OWNER_PROFILE_ID,
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=_CANCELLED_TOKEN,
-    )
+    with pytest.raises(ConflictError, match="open execution"):
+        cancel_task(
+            _pool(conn2),
+            cast(Any, _CloseGithub()),
+            cast(Any, object()),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_CANCELLED_TOKEN,
+        )
 
-    assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
-    assert _event_types(conn2) == ["task_cancelled"]
+    # The veto is a safety boundary, not a gap: nothing archived, nothing
+    # resolved — the settled-but-open Execution awaits issue #299.
+    assert _count(conn2, _ARCHIVE_WRITE) == 0
+    assert _event_types(conn2) == []
 
 
 # --- E10c: the trusted GitHub-observation cancellation (issue #229) ---------------

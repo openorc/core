@@ -38,10 +38,15 @@ state and never by Cline's instantaneous busy/status field:
   blindly. Without positive settlement evidence the command refuses and
   surfaces the unresolved interruption; with the caller-attested positive
   evidence (both D6b preconditions) the existing
-  ``ClineAdapter.settle_abort`` is invoked outside any transaction and a
-  positively settled interruption is recorded on its durable intent — the
-  only state in which Cancel becomes available again. A refused settlement
-  keeps every guard latched and the intent unsettled.
+  ``ClineAdapter.settle_abort`` is invoked outside any transaction and the
+  interruption intent is recorded ``settled`` — the settled record asserts
+  the Interrupt intent alone, never a formal workflow outcome: no Execution
+  is finalized and no Cline conversation is touched (issue #298). The Task
+  stays ``blocked`` with its pending Level 3 gate and exact session
+  identities preserved for later guarded continuation; until the
+  Cancel-after-Abort remediation (issue #299) lands, Cancel may temporarily
+  refuse a settled-but-open Execution. A refused settlement keeps every
+  guard latched and the intent unsettled.
 
 The Task stays ``blocked`` regardless of the Interrupt outcome; late formal
 results can never advance it. Terminal session identities are preserved:
@@ -86,7 +91,7 @@ from openorc.adapters.cline import ClineAdapter, ClineSettlementRefusal
 from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.executions import Execution, ExecutionStatus
+from openorc.domain.executions import ExecutionStatus
 from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
 from openorc.domain.reviews import ReviewLoopStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
@@ -209,7 +214,6 @@ class TaskAbortOutcome:
     task: Task
     task_block: TaskBlock | None
     interrupt_outcomes: tuple[TaskInterruptOutcome, ...]
-    accounted_executions: tuple[Execution, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,35 +763,6 @@ def dispatch_registered_task_interrupt(
     )
 
 
-def _account_for_interrupted_executions(
-    pool: DatabasePool, *, task_id: UUID
-) -> tuple[Execution, ...]:
-    """The exact-attempt accounting of positively established cessation.
-
-    Called only after every outstanding interruption settled positively: the
-    Task's durably open Execution attempts transition to the existing
-    ``cancelled`` final status through the guarded conditional primitive, so
-    the implementation work the Owner interrupted is accounted for and the
-    later Cancel eligibility veto no longer sees outstanding runtime work.
-    Truthful history is preserved: a raced finalization (the guarded update
-    returning ``None``) is left exactly as the other writer recorded it, no
-    completion result is invented, and no interruption state machine exists.
-    """
-    accounted: list[Execution] = []
-    for execution in execution_records.list_task_executions(pool, task_id=task_id):
-        if execution.status not in _OPEN_EXECUTION_STATUSES:
-            continue
-        updated = execution_records.update_execution_status(
-            pool,
-            execution_id=execution.id,
-            expected_status=execution.status,
-            next_status=ExecutionStatus.CANCELLED,
-        )
-        if updated is not None:
-            accounted.append(updated)
-    return tuple(accounted)
-
-
 def _interrupt_outcome(
     intent: TaskInterruptIntent,
     *,
@@ -906,22 +881,19 @@ def _settle_interrupt_attempt(
 def _record_settlement_outcomes(
     pool: DatabasePool,
     *,
-    task_id: UUID,
     results: tuple[_SettlementResult, ...],
-) -> tuple[tuple[TaskInterruptOutcome, ...], tuple[Execution, ...]]:
-    """Record the settlement outcomes and the execution accounting atomically.
+) -> tuple[TaskInterruptOutcome, ...]:
+    """Record the settlement outcomes in one short composed transaction.
 
-    ONE short composed transaction after the positive D6b settlement was
-    established outside it: the settled intents advance to ``settled``, the
-    refused ones are annotated in place (every guard stays latched), the
-    unavailable attempts record ``unknown``, and — only when every
-    outstanding interruption settled positively — the exact-attempt
-    Execution accounting applies through the guarded conditional primitive.
-    Everything commits or rolls back together, so a crash can never leave a
-    settled interruption with an unaccounted open Execution (which would
-    veto Cancel while the settlement entrypoint could not run again); the
-    still-unsettled durable state remains truthfully re-settleable instead.
-    A raced terminal outcome is left untouched: the durable record the flow
+    ONE short composed transaction after the D6b settlement attempts were
+    classified outside it: the settled intents advance to ``settled``, the
+    refused ones are annotated in place (every guard stays latched), and the
+    unavailable attempts record ``unknown``. The settled record asserts the
+    Interrupt intent alone — never a formal workflow outcome (issue #298):
+    no Execution is finalized here, so a positively settled interruption
+    with a still-open Execution remains truthful durable state for later
+    guarded continuation. Everything commits or rolls back together, and a
+    raced terminal outcome is left untouched: the durable record the flow
     already holds is the truth, and no outcome is ever manufactured.
     """
     with composed_transaction(pool) as transaction_pool:
@@ -969,18 +941,7 @@ def _record_settlement_outcomes(
                         detail=result.detail,
                     )
                 )
-        all_settled = all(result.kind == "settled" for result in results)
-        accounted_executions: tuple[Execution, ...] = ()
-        if all_settled:
-            # Positive cessation established for every outstanding
-            # interruption: the exact-attempt accounting commits in the same
-            # transaction as the settlement records, so the later Cancel
-            # eligibility veto can never see a settled interruption with an
-            # unaccounted open Execution.
-            accounted_executions = _account_for_interrupted_executions(
-                transaction_pool, task_id=task_id
-            )
-    return tuple(outcomes), accounted_executions
+    return tuple(outcomes)
 
 
 def abort_task_activity(
@@ -1060,13 +1021,10 @@ def abort_task_activity(
             for intent, external_session_id in plan.targets
         )
         all_settled = all(result.kind == "settled" for result in results)
-        outcomes, accounted_executions = _record_settlement_outcomes(
-            pool, task_id=task_id, results=results
-        )
+        outcomes = _record_settlement_outcomes(pool, results=results)
         return TaskAbortOutcome(
             kind=TaskAbortOutcomeKind.SETTLED if all_settled else TaskAbortOutcomeKind.UNRESOLVED,
             task=plan.task,
             task_block=None,
             interrupt_outcomes=outcomes,
-            accounted_executions=accounted_executions,
         )
