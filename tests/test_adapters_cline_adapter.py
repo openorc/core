@@ -13,7 +13,10 @@ public-state reconciliation with conservative continuity classification,
 caller-attested per-kind guard settlement, and authorized same-ID recovery
 over an already-established attachment — and the #164 D6c activity/usage
 observation seam: safe typed event projection, exact-binding observation
-subscriptions, and the aggregated-usage snapshot read. They reuse the
+subscriptions, and the aggregated-usage snapshot read — and the #300 D9
+same-session Resume seam: the adapter-owned fixed continuation instruction
+on the serialized exact-session send path with its fail-closed
+interruption-accounting guards. They reuse the
 already-covered #65/#66/#181 protocol behavior instead of re-testing it
 and require no database, network, or live runtime.
 """
@@ -40,7 +43,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
     AgentSessionNotFoundError,
 )
-from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
+from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest, AgentTextResponse
 from openorc.adapters.cline import (
     ClineAdapter,
     ClineConstructionContext,
@@ -97,6 +100,7 @@ from openorc.protocol.interaction import (
 from openorc.protocol.models import (
     PLAN_RESULT_FAMILY,
     REVIEW_RESULT_FAMILY,
+    SESSION_READY_FAMILY,
     WORKSPACE_RESULT_FAMILY,
 )
 from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
@@ -862,6 +866,13 @@ def test_normalized_error_chains_stay_clean() -> None:
         ("not_attached_abort", "abort", AgentRuntimeUnavailableError),
         ("unknown_code_abort", "abort", AgentRuntimeUncertainOutcomeError),
         ("session_not_found_abort", "abort", AgentSessionNotFoundError),
+        ("attachment_rejected_resume", "resume", AgentRuntimeConfigurationRejectedError),
+        ("attachment_unavailable_resume", "resume", AgentRuntimeUnavailableError),
+        ("hub_connect_failed_resume", "resume", AgentRuntimeUnavailableError),
+        ("hub_closed_resume", "resume", AgentRuntimeUncertainOutcomeError),
+        ("not_attached_resume", "resume", AgentRuntimeUnavailableError),
+        ("unknown_code_resume", "resume", AgentRuntimeUncertainOutcomeError),
+        ("session_not_found_resume", "resume", AgentSessionNotFoundError),
     ],
 )
 def test_backend_failures_classify_into_the_normalized_taxonomy(
@@ -904,6 +915,31 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
         backend.queue_abort(session_id, ClineSdkOperationRejectedError("mystery_failure"))
     elif script == "session_not_found_abort":
         backend.queue_abort(session_id, ClineSessionNotFoundError("gone"))
+    elif script in (
+        "attachment_rejected_resume",
+        "attachment_unavailable_resume",
+        "hub_connect_failed_resume",
+        "hub_closed_resume",
+        "not_attached_resume",
+        "unknown_code_resume",
+        "session_not_found_resume",
+    ):
+        # Every resume failure manifests as its backend send outcome: the
+        # resume dispatches the fixed instruction through the send path.
+        if script == "attachment_rejected_resume":
+            backend.queue_send(session_id, ClineRemoteAttachmentRejectedError())
+        elif script == "attachment_unavailable_resume":
+            backend.queue_send(session_id, ClineRemoteAttachmentUnavailableError())
+        elif script == "hub_connect_failed_resume":
+            backend.queue_send(session_id, ClineSdkOperationRejectedError("hub_connect_failed"))
+        elif script == "hub_closed_resume":
+            backend.queue_send(session_id, ClineSdkOperationRejectedError("hub_connection_closed"))
+        elif script == "not_attached_resume":
+            backend.queue_send(session_id, ClineBridgeProtocolError("not_attached"))
+        elif script == "unknown_code_resume":
+            backend.queue_send(session_id, ClineSdkOperationRejectedError("mystery_failure"))
+        elif script == "session_not_found_resume":
+            backend.queue_send(session_id, ClineSessionNotFoundError("gone"))
 
     if operation == "send":
         with pytest.raises(expected):
@@ -911,6 +947,9 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
     elif operation == "abort":
         with pytest.raises(expected):
             adapter.abort_activity(session_id)
+    elif operation == "resume":
+        with pytest.raises(expected):
+            adapter.resume_activity(session_id)
     else:
         with pytest.raises(expected):
             adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -1570,6 +1609,273 @@ def test_a_known_pre_effect_abort_failure_releases_the_guard_when_settled() -> N
         "stop",
         "start",
     ]
+
+
+# --- D9: same-session Resume (issue #300) ---
+
+
+def test_resume_activity_sends_the_fixed_instruction_to_the_exact_bound_session() -> None:
+    """One exact-session send of the adapter-owned fixed instruction: the
+    original prompt is never replayed, no Owner text is admitted, and no
+    stop/start/reconstruction takes place."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _completed("resumed commentary"))
+
+    response = adapter.resume_activity(session_id)
+
+    assert isinstance(response, AgentTextResponse)
+    assert response.text == "resumed commentary"
+    resume_sends = [call for call in backend.calls() if call.operation == "send"]
+    assert len(resume_sends) == 2
+    assert resume_sends[-1].session_id == session_id
+    assert resume_sends[-1].prompt == "[TASK RESUMPTION] Please continue where you left off."
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send"]
+
+
+def test_resume_activity_returns_the_validated_formal_response_with_an_expected_family() -> None:
+    """An expected family validates the resumed turn's reply through the same
+    shared #65 funnel as send, so the later application service processes the
+    typed formal result of the resumed turn."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _completed(_READY_PAYLOAD))
+
+    result = adapter.resume_activity(session_id, expected_family=SESSION_READY_FAMILY)
+
+    from openorc.protocol.models import SessionReady
+
+    assert isinstance(result, SessionReady)
+    assert result.status == "READY"
+
+
+def test_resume_activity_rejects_an_unknown_expected_family_before_any_effect() -> None:
+    adapter, backend, _, session_id = _ready_adapter()
+
+    with pytest.raises(ValueError):
+        adapter.resume_activity(session_id, expected_family="not-a-family")
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_resume_activity_rejects_a_blank_session_id_before_any_effect() -> None:
+    adapter, backend, _, _ = _ready_adapter()
+
+    with pytest.raises(ValueError):
+        adapter.resume_activity("")
+    with pytest.raises(ValueError):
+        adapter.resume_activity("   ")
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+
+
+def test_resume_activity_fails_closed_without_an_establishable_binding() -> None:
+    """A missing durable binding fails closed before any runtime dispatch."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.resume_activity(session_id)
+
+    assert [call.operation for call in backend.calls()] == ["start", "send"]
+    assert resolver.bound_queries == [session_id]
+
+
+def test_resume_activity_serves_a_fresh_instance_bound_reviewer_session() -> None:
+    """A fresh adapter instance with only the resolver-established binding
+    resumes the exact bound Reviewer session: both roles are eligible at
+    this seam and _known_identity is never the authority."""
+    adapter, backend, resolver, session_id = _ready_reviewer_adapter()
+    resolver.set_bound(
+        session_id,
+        _context(
+            _identity(role=WorkflowRole.REVIEWER),
+            cwd=_NEUTRAL_DIRECTORY,
+            workspace_root=_NEUTRAL_DIRECTORY,
+        ),
+    )
+    fresh = ClineAdapter(backend, resolver)
+    backend.queue_send(session_id, _completed("resumed review commentary"))
+
+    response = fresh.resume_activity(session_id)
+
+    assert isinstance(response, AgentTextResponse)
+    resume_sends = [call for call in backend.calls() if call.operation == "send"]
+    assert resume_sends[-1].session_id == session_id
+    assert resume_sends[-1].prompt == "[TASK RESUMPTION] Please continue where you left off."
+
+
+def test_resume_activity_refuses_until_the_acknowledged_abort_settles() -> None:
+    """An acknowledged-but-unsettled interruption refuses the Resume before
+    any dispatch; D6b's positive settlement returns the guard to NONE and
+    the same call then dispatches the fixed instruction."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    adapter.abort_activity(session_id)  # acknowledged, deliberately unresolved
+
+    with pytest.raises(AgentRuntimeUnavailableError, match="not settled"):
+        adapter.resume_activity(session_id)
+
+    outcome = adapter.settle_abort(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is True
+
+    backend.queue_send(session_id, _completed("resumed after settlement"))
+    response = adapter.resume_activity(session_id)
+    assert isinstance(response, AgentTextResponse)
+    # The refusal dispatched nothing: exactly one resume send reached the backend.
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort", "send"]
+    resume_sends = [call for call in backend.calls() if call.operation == "send"]
+    assert resume_sends[-1].prompt == "[TASK RESUMPTION] Please continue where you left off."
+
+
+def test_resume_activity_refuses_until_the_uncertain_abort_settles() -> None:
+    """An outcome-uncertain abort keeps the guard and the abort-kind latch
+    latched: the Resume refuses and D6b's settlement releases both."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_abort(session_id, ClineSdkOperationRejectedError("hub_connection_closed"))
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.abort_activity(session_id)
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.resume_activity(session_id)
+
+    outcome = adapter.settle_abort(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is True
+
+    backend.queue_send(session_id, _completed("resumed"))
+    adapter.resume_activity(session_id)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort", "send"]
+
+
+def test_resume_activity_refuses_while_an_abort_is_still_outstanding() -> None:
+    """A registered-but-unsettled abort (outcome not yet known) vetoes the
+    Resume even before its guard state strengthens."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("abort", session_id, entered=entered, release=release)
+
+    abort_thread, abort_errors = _call_in_thread(lambda: adapter.abort_activity(session_id))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    with pytest.raises(AgentRuntimeUnavailableError, match="not settled"):
+        adapter.resume_activity(session_id)
+    assert "[TASK RESUMPTION] Please continue where you left off." not in [
+        call.prompt for call in backend.calls() if call.operation == "send"
+    ]
+
+    release.set()
+    abort_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert abort_errors == []
+
+
+def test_an_abort_reaches_the_backend_while_a_resume_send_is_in_flight() -> None:
+    """The D6a invariant holds for resumed turns: the coordination lock is
+    never held across the blocking SDK send, so an Owner Abort registers and
+    dispatches while the resumed turn is still in flight — and the
+    interrupted resumed turn resolves as a transport failure, never a
+    silent partial success."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _failed("interrupted resumed turn", finish_reason="aborted"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    resume_thread, resume_errors = _call_in_thread(lambda: adapter.resume_activity(session_id))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    # The abort must dispatch while the resumed turn is still held open at
+    # the gate: with the coordination lock held across the SDK send this
+    # would block until the gate's deadlock-guard expiry instead.
+    adapter.abort_activity(session_id)
+    assert [call.operation for call in backend.calls()][-1] == "abort"
+    assert resume_thread.is_alive()
+
+    release.set()
+    resume_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert isinstance(resume_errors[0], AgentRuntimeTransportError)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "abort"]
+
+
+def test_resume_activity_refuses_while_uncertain_send_effects_remain() -> None:
+    """An unresolved uncertain-send latch vetoes the Resume; the explicit
+    per-kind settlement releases it."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.resume_activity(session_id)
+
+    outcome = adapter.settle_uncertain_send(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is True
+
+    backend.queue_send(session_id, _completed("resumed"))
+    adapter.resume_activity(session_id)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "send"]
+
+
+def test_resume_activity_serializes_behind_an_in_flight_reconstruction() -> None:
+    """The resumed turn takes the send/reconstruction lock: it cannot
+    dispatch while the same-ID reconstruction holds its read/stop/start
+    section, and it dispatches only after the reconstruction completes —
+    never interleaving a changing runtime incarnation."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+
+    reconstruct_thread, reconstruct_errors = _call_in_thread(
+        lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    backend.queue_send(session_id, _completed("resumed after reconstruction"))
+    resume_done = threading.Event()
+    resume_errors: list[Exception] = []
+
+    def _resume() -> None:
+        try:
+            adapter.resume_activity(session_id)
+        except Exception as error:  # noqa: BLE001 - captured for assertion
+            resume_errors.append(error)
+        finally:
+            resume_done.set()
+
+    resume_thread = threading.Thread(target=_resume)
+    resume_thread.start()
+    # While the reconstruction holds the section, the resume has not dispatched.
+    assert not resume_done.wait(timeout=1.0)
+    assert len([call for call in backend.calls() if call.operation == "send"]) == 1
+
+    release.set()
+    reconstruct_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not reconstruct_thread.is_alive()
+    assert reconstruct_errors == []
+    assert resume_done.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert resume_errors == []
+    assert [call.operation for call in backend.calls()] == [
+        "start",
+        "send",
+        "read_messages",
+        "stop",
+        "start",
+        "send",
+    ]
+    resume_sends = [call for call in backend.calls() if call.operation == "send"]
+    assert resume_sends[-1].prompt == "[TASK RESUMPTION] Please continue where you left off."
 
 
 # --- D6b: interruption reconciliation and recovery (issue #148) ---
