@@ -4,7 +4,7 @@ The targeted real-Postgres checks the new Abort/Cancel seams own:
 
 - the Owner Abort composition commits atomically: the F3 exceptional
   blocking foundation — the ``owner_action_required`` TaskBlock with its
-  safe ``owner_abort`` context, its pending ``BLOCK_RESOLUTION`` OwnerGate
+  safe ``owner_abort`` context, its pending Level 3 ``OWNER_ABORT`` OwnerGate
   bound to it, the ``blocked`` transition under a rotated token, the OWNER
   ``task_blocked`` / ``owner_gate_created`` audits — and the one-shot
   unsettled exact-session Interrupt intent; a forced late audit failure
@@ -396,9 +396,10 @@ def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -
     # exact blocking composition's TaskBlock row, never merely to the
     # session binding.
     assert intents[0].task_block_id == blocks[0].id
-    # The F3 composition also committed the pending BLOCK_RESOLUTION gate
-    # bound to the block as its only subject, installed as the Task's
-    # current OwnerGate pointer.
+    # The F3 composition also committed the pending Level 3 OWNER_ABORT
+    # gate selected by the Level 3 blocking-case catalog, bound to the
+    # block as its only subject and installed as the Task's current
+    # OwnerGate pointer.
     gate_row = (
         facts["conn"]
         .execute(
@@ -410,7 +411,7 @@ def test_the_owner_abort_composition_commits_atomically(conn: Connection[Any]) -
     )
     assert len(gate_row) == 1
     gate_id, gate_type, gate_status, gate_block_id = gate_row[0]
-    assert gate_type == "block_resolution" and gate_status == "pending"
+    assert gate_type == "owner_abort" and gate_status == "pending"
     assert gate_block_id == blocks[0].id
     assert task.current_owner_gate_id == gate_id
     assert _event_counts(facts["conn"], facts["task_id"]) == {
