@@ -95,6 +95,7 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.agent_runtime.results import AgentTextResponse
@@ -121,6 +122,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_planning_review_resolution import (
     TaskPlanningGateChangeRequestOutcome,
     TaskPlanningReviewResolutionOutcome,
@@ -407,7 +409,11 @@ def _revalidate_currentness(
 
 
 def _send_discussion_message(
-    runtime: AgentRuntimeAdapter, external_session_id: str, message: str
+    pool: DatabasePool,
+    runtime: AgentRuntimeAdapter,
+    task_id: UUID,
+    external_session_id: str,
+    message: str,
 ) -> AgentTextResponse:
     """Send the Owner message verbatim to the exact Reviewer session.
 
@@ -420,6 +426,14 @@ def _send_discussion_message(
     """
     try:
         response = runtime.send(external_session_id, message, expected_family=None)
+    except AgentRuntimeInterruptedTurnError as error:
+        settle_observed_task_interrupt(
+            pool, runtime, task_id=task_id, external_session_id=external_session_id
+        )
+        raise ExternalOperationFailedError(
+            "the agent runtime discussion send was interrupted by the runtime; the "
+            "exchange was not recorded and nothing was applied"
+        ) from error
     except AgentRuntimeUncertainOutcomeError as error:
         logger.warning(
             "owner-reviewer discussion send ended with an uncertain runtime outcome; "
@@ -804,7 +818,9 @@ def send_owner_reviewer_discussion_message(
                 )
             # --- Phase 2c: the ONE verbatim send, no transaction open. ---
             reply = _send_discussion_message(
+                pool,
                 reviewer_runtime,
+                task_id,
                 subjects.reviewer.external_session_id or "",
                 message,
             )

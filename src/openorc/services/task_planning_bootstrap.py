@@ -89,6 +89,7 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -131,6 +132,7 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.session_runtime import establish_task_agent_session
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -760,6 +762,22 @@ def prepare_task_for_planning(
                     message=interaction.render(),
                     expected_family=WORKSPACE_RESULT_FAMILY,
                 )
+            except AgentRuntimeInterruptedTurnError as error:
+                settle_observed_task_interrupt(
+                    pool,
+                    adapter,
+                    task_id=task_id,
+                    external_session_id=producer.external_session_id,
+                )
+                logger.warning(
+                    "the workspace preparation control ended with the runtime "
+                    "interrupting the send; the bootstrap stage stays unsettled"
+                )
+                raise ExternalOperationUncertainError(
+                    "the workspace preparation control's send was interrupted by the "
+                    "runtime; nothing is retried and the bootstrap stops with its "
+                    "partial facts retained"
+                ) from error
             except AgentRuntimeUncertainOutcomeError as error:
                 logger.warning(
                     "the workspace preparation control ended with an uncertain "

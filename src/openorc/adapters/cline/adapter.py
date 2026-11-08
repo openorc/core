@@ -122,6 +122,7 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUnavailableError,
@@ -191,6 +192,13 @@ _TRACER_SCOPE: Final = "openorc.adapters.cline"
 # reason that carries a usable reply candidate (qualified R2b/R3 baseline).
 _SUCCESSFUL_FINISH: Final = "completed"
 
+# The pinned SDK-native interruption marker: the finish reason the runtime
+# reports when a dispatched turn was ended by interruption rather than
+# completion (R2b-qualified: an in-flight send resolves with it, the session
+# stays live, and protocol continuity holds). Normalized onto
+# ``AgentRuntimeInterruptedTurnError`` — never leaked past the adapter.
+_INTERRUPTED_FINISH: Final = "aborted"
+
 # The D9 fixed synthetic continuation instruction (issue #300), qualified
 # live against the pinned 0.0.90 remote baseline as the Cline-native
 # same-session Resume shape. Adapter-owned and deliberately fixed: no
@@ -210,7 +218,10 @@ def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
     SDK-reported non-success finish is a known non-success outcome, never a
     successful response: during the readiness construction it is a
     construction failure (the R3-qualified first-turn provider/configuration
-    rejection shape); on later turns it is a transport-class failure. The
+    rejection shape); on later turns it is a transport-class failure — or,
+    when the SDK reports the pinned ``aborted`` finish reason, the normalized
+    interrupted-turn outcome: the runtime positively answered that the turn
+    was interrupted, so the send can never deliver a formal result. The
     SDK-native ``error`` payload is never read into any message.
     """
     if result is None:
@@ -230,6 +241,10 @@ def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
         if phase == "readiness":
             raise AgentRuntimeConfigurationRejectedError(
                 "the cline session readiness turn did not complete successfully"
+            )
+        if finish_reason == _INTERRUPTED_FINISH:
+            raise AgentRuntimeInterruptedTurnError(
+                "the cline runtime turn was interrupted before a usable response"
             )
         raise AgentRuntimeTransportError(
             "the cline runtime turn ended without a successful response"

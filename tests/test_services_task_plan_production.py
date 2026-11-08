@@ -43,8 +43,10 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 from psycopg.errors import UniqueViolation
 
+import openorc.services.task_plan_production as plan_production_module
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeDeliveryUncertainError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUnavailableError,
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
@@ -1282,6 +1284,46 @@ def test_uncertain_runtime_outcome_never_resent_or_published() -> None:
     _assert_no_consequential_write(env.conn)
     # The claim stays conservatively claimed through the uncertainty (issue
     # #87): never reclassified, never settled, never replayed.
+    claim_inserts = [sql for sql, _ in env.conn.executed if _CLAIM_INSERT(sql, None)]
+    assert len(claim_inserts) == 1
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)
+
+
+def test_interrupted_runtime_outcome_settles_the_observed_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime-attributed interrupted-turn resolution on the PLAN send
+    invokes the worker-side settlement seam with the exact task/session
+    identity and leaves the dispatch claim conservatively claimed."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_initial_claim(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
+    settlements: list[tuple[Any, Any, Any, str]] = []
+
+    def _record_settlement(
+        settled_pool: Any, adapter: Any, *, task_id: Any, external_session_id: str
+    ) -> None:
+        settlements.append((settled_pool, adapter, task_id, external_session_id))
+        return None
+
+    monkeypatch.setattr(
+        plan_production_module,
+        "settle_observed_task_interrupt",
+        _record_settlement,
+    )
+    adapter = _prepared_producer_adapter([AgentRuntimeInterruptedTurnError("interrupted")])
+
+    with pytest.raises(ExternalOperationUncertainError):
+        env.run_initial(adapter=adapter)
+
+    assert settlements == [(env.pool, adapter, _TASK_ID, _PRODUCER_EXTERNAL_ID)]
+    assert len(adapter.submitted_sends(_PRODUCER_EXTERNAL_ID)) == 1
+    _assert_no_consequential_write(env.conn)
     claim_inserts = [sql for sql, _ in env.conn.executed if _CLAIM_INSERT(sql, None)]
     assert len(claim_inserts) == 1
     assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in env.conn.executed)

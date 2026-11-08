@@ -93,6 +93,7 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
+    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -141,6 +142,7 @@ from openorc.services.review_result_envelope import (
     accepted_review_result_from_iteration,
     serialize_review_result,
 )
+from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
@@ -747,6 +749,17 @@ def _send_and_finalize(
                 message,
                 expected_family=IMPLEMENTATION_RESULT_FAMILY,
             )
+        except AgentRuntimeInterruptedTurnError as error:
+            settle_observed_task_interrupt(
+                pool,
+                runtime,
+                task_id=task_id,
+                external_session_id=producer_external_session_id,
+            )
+            raise ExternalOperationUncertainError(
+                "the implementation send was interrupted by the runtime after possible "
+                "implementation work; the attempt remains unresolved and is never resent"
+            ) from error
         except AgentRuntimeUncertainOutcomeError as error:
             raise ExternalOperationUncertainError(
                 "the outcome of the implementation send is unknown; the attempt remains "
