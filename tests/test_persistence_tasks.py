@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
@@ -39,6 +40,7 @@ from openorc.persistence.tasks import (
     list_queued_tasks,
     list_workspace_tasks,
     lock_workspace_task_arbitration,
+    restore_blocked_task_status,
     set_current_owner_gate,
     update_task_status,
 )
@@ -140,6 +142,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["updated_at"],
         values["terminal_cause"],
         values["authorized_task_budget_usd"],
+        None,
     )
 
 
@@ -1165,3 +1168,64 @@ def test_block_task_with_exceptional_gate_validates_arguments_before_sql() -> No
             owner_gate_id="not-a-uuid",  # type: ignore[arg-type]
         )
     assert fake_conn.executed == []
+
+
+def test_restore_blocked_task_status_composes_the_cost_threshold_write() -> None:
+    # The Owner Continue's refreshed allowance (issue #291, F8f) commits in
+    # the SAME conditional, token-rotating statement as the restore; the
+    # Owner Resume default (no threshold) leaves the column untouched.
+    # The canned row mirrors the post-mutation row the database would return:
+    # the restored status with a freshly rotated token.
+    original_token = uuid.uuid4()
+    row = _task_row(status="implementing", state_token=uuid.uuid4())
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    restored = restore_blocked_task_status(
+        pool,
+        row[0],
+        expected_state_token=original_token,
+        restored_status=TaskStatus.IMPLEMENTING,
+        effective_cost_threshold_usd=Decimal("22.00"),
+    )
+
+    assert restored is not None
+    assert restored.status is TaskStatus.IMPLEMENTING
+    sql, params = fake_conn.executed[0]
+    assert params is not None
+    assert "effective_cost_threshold_usd = %s" in sql
+    assert "state_token = gen_random_uuid()" in sql
+    assert "status = 'blocked'" in sql
+    assert "current_owner_gate_id is null" in sql
+    # The parameter order matches the SET-clause assignments exactly: the
+    # restored status feeds ``status = %s`` and the refreshed threshold feeds
+    # ``effective_cost_threshold_usd = %s`` after it.
+    assert params[0] == "implementing"
+    assert params[1] == Decimal("22.00")
+    assert params[2] == row[0]
+    assert params[3] == original_token
+
+
+def test_restore_blocked_task_status_without_a_threshold_touches_no_allowance() -> None:
+    # The Owner Resume restore (issue #292) never writes the allowance: the
+    # default composes the guarded restore statement without any threshold
+    # assignment.
+    original_token = uuid.uuid4()
+    row = _task_row(status="planning", state_token=uuid.uuid4())
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    restored = restore_blocked_task_status(
+        pool,
+        row[0],
+        expected_state_token=original_token,
+        restored_status=TaskStatus.PLANNING,
+    )
+
+    assert restored is not None
+    sql, params = fake_conn.executed[0]
+    assert params is not None
+    # No threshold ASSIGNMENT composes: the column still appears in the
+    # RETURNING projection, never in the SET clause.
+    assert "effective_cost_threshold_usd = %s" not in sql
+    assert params == ("planning", row[0], original_token)

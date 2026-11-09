@@ -578,12 +578,13 @@ class TestAtomicCostLimitBlock:
             == 1
         )
 
-    def test_an_idle_task_blocks_without_gratuitous_intents(self, conn: Connection[Any]) -> None:
+    def test_an_idle_task_crossing_is_not_blocked(self, conn: Connection[Any]) -> None:
         workspace_id, task_id, connection_id, producer_session_id = _seed_budgeted_task(conn)
         # The idle-at-a-pending-Owner-gate scenario: the Task waits for its
-        # Owner with no demonstrated in-flight runtime activity. (The
-        # planning phase itself now admits its bound Producer session, so
-        # the gate wait is the genuinely idle state.)
+        # Owner with no demonstrated in-flight runtime activity. Under the
+        # Owner-approved amendment (issue #291) a threshold crossing with no
+        # in-flight autonomous turn composes NO block at all — the truthful
+        # checkpoint stands and enforcement defers to the next active turn.
         conn.execute(
             "update openorc.tasks set status = 'waiting_for_owner' where id = %s",
             (task_id,),
@@ -605,10 +606,20 @@ class TestAtomicCostLimitBlock:
             pool, workspace_id=workspace_id, task_id=task_id
         )
 
-        # No durably demonstrable in-flight runtime activity: the block
-        # composes with zero interrupt intents — no gratuitous Interrupt.
-        assert result.kind is CostLimitBlockOutcomeKind.BLOCKED_IDLE
+        # No interruptible target: no block is composed, no interrupt
+        # exists, and the Task stays exactly where it was.
+        assert result.kind is CostLimitBlockOutcomeKind.NOT_APPLICABLE
+        assert result.task is None
+        assert result.task_block is None
         assert result.interrupt_dispatches == ()
+        assert (
+            _scalar(
+                conn,
+                "select count(*) from openorc.task_blocks where task_id = %s",
+                (task_id,),
+            )
+            == 0
+        )
         assert (
             _scalar(
                 conn,
@@ -618,26 +629,31 @@ class TestAtomicCostLimitBlock:
             == 0
         )
         assert (
-            _scalar(conn, "select status from openorc.tasks where id = %s", (task_id,)) == "blocked"
+            _scalar(conn, "select status from openorc.tasks where id = %s", (task_id,))
+            == "waiting_for_owner"
         )
-        # The idle branch still installs the pending BLOCK_RESOLUTION gate.
+        # No gate was installed and no audit event exists for a crossing
+        # that composed nothing.
         assert (
             _scalar(conn, "select count(*) from openorc.owner_gates where task_id = %s", (task_id,))
-            == 1
-        )
-        assert (
-            _scalar(
-                conn,
-                "select gate_type from openorc.owner_gates where task_id = %s",
-                (task_id,),
-            )
-            == "cost_limit"
+            == 0
         )
 
     def test_a_forced_failure_rolls_back_the_whole_decision(
         self, conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         workspace_id, task_id, connection_id, producer_session_id = _seed_budgeted_task(conn)
+        # The eligible active-work subject (issue #291): the amended
+        # composition composes no block for a target-free crossing, so the
+        # forced-failure rollback needs the durable in-flight fact — the
+        # same open anchored Execution the successful atomic-composition
+        # test seeds — to reach the deliberately failing audit writer.
+        _insert_open_execution(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            producer_session_id=producer_session_id,
+        )
         pool = cast(DatabasePool, _SingleConnectionPool(conn))
         assert (
             session_repositories.checkpoint_task_agent_session_cost(

@@ -213,6 +213,23 @@ class SessionUsageCostObserver:
                 self._task_agent_session_id,
             )
             return
+        # The autonomous-turn attestation (issue #291, F8f): sampled AFTER the
+        # snapshot read and immediately before the service call, from this
+        # adapter's own synchronous call state. A turn that completed between
+        # the usage signal and this moment reads not-in-flight — the idle
+        # crossing then checkpoints without blocking, deferring enforcement to
+        # the next active autonomous turn. A marker read failure degrades to
+        # not-in-flight: enforcement is never attempted on unavailable
+        # evidence.
+        try:
+            send_in_flight = self._cline_adapter.has_send_in_flight(self._external_session_id)
+        except Exception as error:  # noqa: BLE001 - best-effort marker read
+            logger.warning(
+                "cline autonomous-turn marker read failed (%s) for task session %s",
+                type(error).__name__,
+                self._task_agent_session_id,
+            )
+            send_in_flight = False
         try:
             observation = task_cost_accounting.observe_session_usage(
                 self._pool,
@@ -221,6 +238,7 @@ class SessionUsageCostObserver:
                 task_agent_session_id=self._task_agent_session_id,
                 connection_id=self._connection_id,
                 aggregate_total_cost=aggregate_snapshot_cost_usd(snapshot),
+                send_in_flight=send_in_flight,
             )
         except Exception as error:  # noqa: BLE001 - best-effort boundary
             # A transient persistence failure, an account-operational

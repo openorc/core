@@ -191,6 +191,7 @@ def _task_row(*, state_token: uuid.UUID = _STATE_TOKEN, archived: bool = False) 
         _OBSERVED,
         None,
         None,
+        None,
     )
 
 

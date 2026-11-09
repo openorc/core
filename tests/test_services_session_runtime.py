@@ -220,6 +220,7 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
         _OBSERVED,
         None,
         None,
+        None,
     )
 
 

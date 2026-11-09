@@ -65,6 +65,7 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import InvalidCommandError
 
 __all__ = [
+    "OwnerGateCostAllowanceRefresh",
     "OwnerReviewerDiscussionDirection",
     "WorkflowActorContext",
     "owner_actor",
@@ -111,6 +112,44 @@ _TERMINAL_TASK_EVENT: dict[TaskStatus, WorkflowEventType] = {
     TaskStatus.CANCELLED: WorkflowEventType.TASK_CANCELLED,
     TaskStatus.COMPLETED: WorkflowEventType.TASK_COMPLETED,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerGateCostAllowanceRefresh:
+    """The immutable audit facts of one Owner COST_LIMIT spending authorization.
+
+    The refreshed effective cumulative threshold plus the derivation inputs
+    that produced it (issue #291, F8f): the latest retained known cumulative
+    Task spend at the Continue, the Task's frozen original authorized budget,
+    and the resulting threshold (spend + budget). Every field is a
+    nonnegative/positive finite exact decimal, never a binary float; the
+    event context serializes them as exact decimal strings. The facts ride
+    the resolved gate's OWNER-attributed ``owner_gate_resolved`` event, so
+    every historical grant stays recoverable after later Continues overwrite
+    the Task's current-threshold column.
+    """
+
+    observed_cost_usd: Decimal
+    authorized_budget_usd: Decimal
+    effective_threshold_usd: Decimal
+
+    def __post_init__(self) -> None:
+        for name, minimum in (
+            ("observed_cost_usd", 0),
+            ("authorized_budget_usd", 0),
+            ("effective_threshold_usd", 0),
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value < minimum
+            ):
+                raise InvalidCommandError(
+                    f"cost allowance refresh {name} must be a nonnegative finite "
+                    "USD amount (an exact decimal)"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +407,7 @@ def record_owner_gate_resolved_event(
     outcome: OwnerGateStatus,
     review_iteration_id: UUID | None = None,
     review_outcome: ReviewOutcome | None = None,
+    cost_allowance_refresh: OwnerGateCostAllowanceRefresh | None = None,
 ) -> None:
     """Record one exact current OwnerGate resolution.
 
@@ -384,6 +424,15 @@ def record_owner_gate_resolved_event(
     outcome is an invalid command, not an event. The summary, findings,
     gate record, and every other canonical fact are never copied into the
     event.
+
+    The optional ``cost_allowance_refresh`` (issue #291, F8f) is the
+    immutable Owner-attributed audit of one COST_LIMIT gate's spending
+    authorization: the refreshed effective cumulative threshold plus its
+    derivation inputs, all exact decimal strings, recorded atomically with
+    the authorization against the exact resolved gate. It is admitted only
+    with an Owner-driven ``approved`` outcome and forbidden with every
+    other, so ordinary approvals keep their exact pre-F8f shape and no
+    settled/rejected/cancelled event ever carries a grant.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -414,7 +463,19 @@ def record_owner_gate_resolved_event(
                 "only settled-gate events carry the settling review iteration "
                 "references; owner resolutions carry the outcome value alone"
             )
-        context = {"outcome": outcome.value}
+        if cost_allowance_refresh is not None and outcome is not OwnerGateStatus.APPROVED:
+            raise InvalidCommandError(
+                "a cost allowance refresh is audited only with an Owner-approved gate resolution"
+            )
+        if cost_allowance_refresh is not None:
+            context = {
+                "outcome": outcome.value,
+                "cost_effective_threshold_usd": str(cost_allowance_refresh.effective_threshold_usd),
+                "cost_observed_usd": str(cost_allowance_refresh.observed_cost_usd),
+                "cost_authorized_budget_usd": str(cost_allowance_refresh.authorized_budget_usd),
+            }
+        else:
+            context = {"outcome": outcome.value}
     event_records.record_workflow_event(
         transaction_pool,
         workspace_id=workspace_id,

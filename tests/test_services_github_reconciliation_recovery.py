@@ -380,6 +380,7 @@ def _task_row(
         _NOW,
         None,
         None,
+        None,
     )
 
 

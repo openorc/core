@@ -70,6 +70,7 @@ def _cost_limit(**overrides: Any) -> dict[str, Any]:
         "control": "owner_abort",
         "reason_provenance": "owner_authorized_task_budget",
         "observed_cost_usd": "12.50",
+        "effective_threshold_usd": "10.00",
         "authorized_budget_usd": "10.00",
         "aggregate_includes_unobserved_sessions": False,
         "target_roles": ["producer"],

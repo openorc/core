@@ -13,8 +13,12 @@ nothing else:
   never duplicated onto the Task row.
 - **Enforcing** the Owner-configured budget by entering the existing
   ``BLOCKED`` state through the shared E10b Owner-attributed blocking
-  composition when the retained known total reaches the Task's non-NULL
-  authorized budget under the Task row lock.
+  composition when a LIVE usage observation crosses the Task's effective
+  cumulative threshold **while the observing session's autonomous
+  model-backed turn is in flight** (issue #291, F8f, Owner-approved
+  amendment). Enforcement is never a pre-dispatch check and never applies
+  to idle work: an observation on an idle Task checkpoints and nothing
+  else, and a crossing with no interruptible target composes no block.
 
 Boundary discipline:
 
@@ -36,13 +40,20 @@ Boundary discipline:
 - A reached threshold is authoritative-but-soft: the blocking decision is
   re-verified under the lock by the shared composition, and an
   already-blocked, archived, terminal, or unauthorized Task never receives
-  a duplicate block, duplicate intent, or new interrupt.
+  a duplicate block, duplicate intent, or new interrupt. The threshold is
+  the Task's effective cumulative spending authorization — the frozen
+  ``authorized_task_budget_usd`` until a guarded Owner Continue refreshes
+  it (``effective_cost_threshold_usd``), never reset downward and never
+  reduced by any observation.
 - This service neither resumes nor retries the blocked Task:
-  ``COST_LIMIT`` resolution belongs entirely to F4b (issue #230). The
-  pre-dispatch gate (:func:`check_task_budget_before_dispatch`) is the
-  seam #88 F3a wires into Cline-backed workflow invocations in both
-  ``regular`` and ``queue`` modes before a new model-backed autonomous
-  dispatch.
+  ``COST_LIMIT`` resolution belongs entirely to the Owner's Type A
+  decision (F8f, issue #291). A turn that wins the race against the
+  composed Interrupt fails closed into the existing blocked-episode
+  settlement and Owner-resolution rules; the completed formal result is
+  never processed on the blocked Task. The pre-dispatch gate
+  (:func:`check_task_budget_before_dispatch`) remains a delivered
+  service updated for the effective threshold, but is deliberately UNWIRED
+  per the Owner-approved amendment: it has no production caller.
 """
 
 from __future__ import annotations
@@ -83,12 +94,19 @@ _GATE_SPAN_NAME = "task_cost_accounting.check_task_budget_before_dispatch"
 # state; enforcement is not — a queued or terminal Task has no active work
 # whose standing authorization could interrupt, and the shared blocking
 # composition re-verifies the same eligibility under its own lock.
-_ENFORCEMENT_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
+# ``waiting_for_owner`` is deliberately excluded (issue #291, F8f,
+# Owner-approved amendment): a late observation sampled in-flight can reach
+# this transaction after the finished turn already installed an ordinary
+# Owner approval gate, and a cost block here would supersede that approval
+# boundary — the no-idle-blocking contract. The gate wait checkpoints its
+# truthful spend and defers enforcement to the next active autonomous turn;
+# the guard is cost-specific and leaves the Owner Abort's own dispatch
+# eligibility untouched.
+_COST_ENFORCEMENT_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
     {
         TaskStatus.PLANNING,
         TaskStatus.IMPLEMENTING,
         TaskStatus.REVIEWING,
-        TaskStatus.WAITING_FOR_OWNER,
     }
 )
 
@@ -190,14 +208,25 @@ def _require_aggregate_total_cost(value: object) -> None:
         )
 
 
+def _effective_cost_threshold(task: Task) -> Decimal:
+    """The Task's effective cumulative spending threshold.
+
+    The frozen ``authorized_task_budget_usd`` until a guarded Owner Continue
+    refreshes the allowance (``effective_cost_threshold_usd``, issue #291);
+    never reset downward and never reduced by any observation. The caller has
+    already established a non-NULL authorized budget.
+    """
+    if task.effective_cost_threshold_usd is not None:
+        return task.effective_cost_threshold_usd
+    assert task.authorized_task_budget_usd is not None  # caller-checked
+    return task.authorized_task_budget_usd
+
+
 def _blocked_observation(
     result: task_abort.OwnerAuthorizedCostLimitBlock, fallback_task: Task | None
 ) -> SessionCostObservation:
     """Map the shared blocking composition result into an observation outcome."""
-    if result.kind in (
-        task_abort.CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS,
-        task_abort.CostLimitBlockOutcomeKind.BLOCKED_IDLE,
-    ):
+    if result.kind is task_abort.CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS:
         return SessionCostObservation(
             kind=SessionCostObservationKind.BLOCKED,
             task=result.task,
@@ -210,8 +239,10 @@ def _blocked_observation(
             task=result.task if result.task is not None else fallback_task,
         )
     # Under the same transaction and lock the re-verified threshold cannot
-    # have retreated; a NOT_APPLICABLE here is a defensive classification:
-    # the checkpoint stands, no block is manufactured.
+    # have retreated, and an attested in-flight session is never dropped by
+    # the cross-check without the binding having moved; a NOT_APPLICABLE here
+    # is a defensive classification: the checkpoint stands, no block is
+    # manufactured.
     return SessionCostObservation(kind=SessionCostObservationKind.CHECKPOINTED, task=fallback_task)
 
 
@@ -223,6 +254,7 @@ def observe_session_usage(
     task_agent_session_id: UUID,
     connection_id: UUID,
     aggregate_total_cost: Decimal | None,
+    send_in_flight: bool = False,
 ) -> SessionCostObservation:
     """Checkpoint one session's aggregate reported cost and evaluate its Task budget.
 
@@ -232,18 +264,30 @@ def observe_session_usage(
     per the profile_lifecycle_guard ordering contract): the exact-scope
     high-water checkpoint (only when the binding tuple and a strictly
     greater amount both match), then the budget evaluation against the
-    role-agnostic retained-cost aggregate. A reached
-    threshold composes the shared Owner-authorized cost-limit block in the
-    SAME transaction — block, ``blocked`` transition, OWNER audit, and
-    exact one-shot Interrupt intents commit or roll back together — with
-    the interrupt dispatches returned for post-commit handling. A ``None``
-    reading is unknown truth: nothing is written and nothing is blocked.
+    role-agnostic retained-cost aggregate against the Task's effective
+    cumulative threshold. A reached threshold composes the shared
+    Owner-authorized cost-limit block in the SAME transaction — block,
+    ``blocked`` transition, OWNER audit, and exact one-shot Interrupt
+    intents commit or roll back together — with the interrupt dispatches
+    returned for post-commit handling. A ``None`` reading is unknown truth:
+    nothing is written and nothing is blocked.
+
+    The caller-attested ``send_in_flight`` (issue #291, F8f) is the trusted
+    live-observation evidence that the observing session's own autonomous
+    model-backed turn is executing right now: only an attested crossing
+    attempts the block. An unattested crossing — an idle Task, a reserved
+    but undispatched claim, a late observation after the turn returned —
+    checkpoints its truthful spend and defers enforcement to the next
+    active autonomous turn. No status alone and no reserved claim is ever
+    proof of an active turn.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(task_agent_session_id, "task_agent_session_id")
     _require_uuid_command(connection_id, "connection_id")
     _require_aggregate_total_cost(aggregate_total_cost)
+    if not isinstance(send_in_flight, bool):
+        raise InvalidCommandError("send_in_flight must be a boolean")
     with application_span(_SERVICE_TRACER_SCOPE, _OBSERVE_SPAN_NAME) as span:
         annotate_span(
             span,
@@ -298,23 +342,33 @@ def observe_session_usage(
                 return SessionCostObservation(
                     kind=SessionCostObservationKind.BUDGET_DISABLED, task=locked
                 )
-            if locked.status not in _ENFORCEMENT_ELIGIBLE_STATUSES:
+            if locked.status not in _COST_ENFORCEMENT_ELIGIBLE_STATUSES:
                 return SessionCostObservation(
                     kind=SessionCostObservationKind.TASK_NOT_CURRENT, task=locked
                 )
             costs = session_records.sum_task_retained_session_costs(
                 transaction_pool, task_id=task_id
             )
-            if (
-                costs.known_total_usd is None
-                or costs.known_total_usd < locked.authorized_task_budget_usd
-            ):
+            effective_threshold = _effective_cost_threshold(locked)
+            if costs.known_total_usd is None or costs.known_total_usd < effective_threshold:
+                return SessionCostObservation(
+                    kind=SessionCostObservationKind.CHECKPOINTED, task=locked
+                )
+            if not send_in_flight:
+                # The threshold is crossed but no autonomous model-backed turn
+                # of this session is in flight: the idle crossing checkpoints
+                # its truthful spend and defers enforcement to the next active
+                # turn (issue #291, F8f, Owner-approved amendment). No block,
+                # no interrupt, and no gratuitous stop of idle work.
                 return SessionCostObservation(
                     kind=SessionCostObservationKind.CHECKPOINTED, task=locked
                 )
             return _blocked_observation(
                 task_abort.apply_owner_authorized_cost_limit_block(
-                    transaction_pool, workspace_id=workspace_id, task_id=task_id
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    attested_in_flight_task_agent_session_id=task_agent_session_id,
                 ),
                 fallback_task=locked,
             )
@@ -323,21 +377,25 @@ def observe_session_usage(
 def check_task_budget_before_dispatch(
     pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
 ) -> BudgetGateDecision:
-    """The cost-aware pre-dispatch gate before new model-backed autonomous work.
+    """The delivered-but-unwired pre-dispatch cost gate (issue #291, F8f).
 
-    The seam #88 F3a wires into Cline-backed workflow invocations in both
-    ``regular`` and ``queue`` modes: one short composed transaction whose
-    FIRST lock acquisition is the account-operational barrier (the
-    accountable Workspace Owner Profile, resolved from durable Workspace
-    state, composed before the Task row lock per the profile_lifecycle_guard
-    ordering contract) then, under the Task row lock, evaluates the retained
-    known session cost sum against
-    the Task's authorized budget and — exactly when the threshold is
+    Owner-approved amendment: enforcement is live-observation-only during
+    in-flight autonomous turns, so this pre-dispatch seam has NO production
+    caller. It remains a delivered service, updated coherently for the
+    Task's effective cumulative threshold, so the amendment stays reversible
+    without new machinery.
+
+    One short composed transaction whose FIRST lock acquisition is the
+    account-operational barrier (the accountable Workspace Owner Profile,
+    resolved from durable Workspace state, composed before the Task row lock
+    per the profile_lifecycle_guard ordering contract) then, under the Task
+    row lock, evaluates the retained known session cost sum against the
+    Task's effective cumulative threshold and — exactly when the threshold is
     reached — composes the shared atomic cost-limit block in the same
     transaction. ``allow`` permits the existing authorized work; ``blocked``
     refuses the dispatch and carries the post-commit interrupt dispatches.
     Unknown constituents never change the verdict: the threshold is a known
-    lower bound against the budget, and missing readings are deliberately
+    lower bound against the allowance, and missing readings are deliberately
     nonblocking (no speculative fail-closed cost gate exists).
     """
     _require_uuid_command(workspace_id, "workspace_id")
@@ -363,17 +421,15 @@ def check_task_budget_before_dispatch(
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT)
             if locked.status is TaskStatus.BLOCKED:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.ALREADY_BLOCKED, task=locked)
-            if locked.status not in _ENFORCEMENT_ELIGIBLE_STATUSES:
+            if locked.status not in _COST_ENFORCEMENT_ELIGIBLE_STATUSES:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT, task=locked)
             if locked.authorized_task_budget_usd is None:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.BUDGET_DISABLED, task=locked)
             costs = session_records.sum_task_retained_session_costs(
                 transaction_pool, task_id=task_id
             )
-            if (
-                costs.known_total_usd is None
-                or costs.known_total_usd < locked.authorized_task_budget_usd
-            ):
+            effective_threshold = _effective_cost_threshold(locked)
+            if costs.known_total_usd is None or costs.known_total_usd < effective_threshold:
                 return BudgetGateDecision(
                     kind=BudgetGateDecisionKind.ALLOW,
                     task=locked,
@@ -383,10 +439,7 @@ def check_task_budget_before_dispatch(
             result = task_abort.apply_owner_authorized_cost_limit_block(
                 transaction_pool, workspace_id=workspace_id, task_id=task_id
             )
-            if result.kind in (
-                task_abort.CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS,
-                task_abort.CostLimitBlockOutcomeKind.BLOCKED_IDLE,
-            ):
+            if result.kind is task_abort.CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS:
                 return BudgetGateDecision(
                     kind=BudgetGateDecisionKind.BLOCKED,
                     task=result.task,

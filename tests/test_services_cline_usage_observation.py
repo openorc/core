@@ -51,6 +51,8 @@ class _FakeAdapter:
         self.snapshot_reads = 0
         self._snapshot = snapshot
         self._subscription: _FakeSubscription | None = None
+        self.send_in_flight = False
+        self.marker_raises = False
 
     def subscribe_activity(self, session_id: str, listener: Any) -> _FakeSubscription:
         self.subscriptions.append((session_id, listener))
@@ -60,6 +62,11 @@ class _FakeAdapter:
     def read_activity_snapshot(self, session_id: str) -> Any:  # noqa: ANN401 - test fake
         self.snapshot_reads += 1
         return self._snapshot
+
+    def has_send_in_flight(self, session_id: str) -> bool:
+        if self.marker_raises:
+            raise RuntimeError("marker read failure")
+        return self.send_in_flight
 
     def emit_usage(self) -> None:
         assert self.subscriptions, "no subscription to deliver to"
@@ -437,3 +444,70 @@ def test_observer_identity_shape_fails_closed() -> None:
             connection_id=_CONN,
             external_session_id="   ",
         )
+
+
+# --- F8f: the autonomous-turn attestation (issue #291) ---
+
+
+def test_the_live_evaluation_attests_only_an_in_flight_autonomous_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attestations: list[bool] = []
+    adapter = _FakeAdapter(snapshot=_snapshot(aggregate=ClineAccumulatedUsage(total_cost=1.0)))
+    observer = _observer(adapter)
+
+    def _record(pool, **kwargs):
+        attestations.append(kwargs["send_in_flight"])
+        return SimpleNamespace(interrupt_dispatches=())
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", _record)
+    observer.start()
+
+    # An idle crossing (no autonomous turn of this session in flight)
+    # attests False.
+    adapter.emit_usage()
+    # The live evaluation of an in-flight autonomous turn attests True.
+    adapter.send_in_flight = True
+    adapter.emit_usage()
+
+    assert attestations == [False, True]
+
+
+def test_a_marker_read_failure_degrades_to_not_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attestations: list[bool] = []
+    adapter = _FakeAdapter(snapshot=_snapshot(aggregate=ClineAccumulatedUsage(total_cost=1.0)))
+    adapter.marker_raises = True
+    observer = _observer(adapter)
+
+    def _record(pool, **kwargs):
+        attestations.append(kwargs["send_in_flight"])
+        return SimpleNamespace(interrupt_dispatches=())
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", _record)
+    observer.start()
+
+    adapter.emit_usage()
+
+    # Enforcement is never attempted on unavailable evidence.
+    assert attestations == [False]
+
+
+def test_a_boundary_checkpoint_carries_the_sampled_marker_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attestations: list[bool] = []
+    adapter = _FakeAdapter(snapshot=_snapshot(aggregate=ClineAccumulatedUsage(total_cost=1.0)))
+    observer = _observer(adapter)
+
+    def _record(pool, **kwargs):
+        attestations.append(kwargs["send_in_flight"])
+        return SimpleNamespace(interrupt_dispatches=())
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", _record)
+
+    # A lease-boundary checkpoint runs outside any send: the marker reads
+    # not-in-flight and the checkpoint never attests enforcement.
+    observer.observe_now()
+    assert attestations == [False]
