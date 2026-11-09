@@ -111,6 +111,7 @@ from openorc.adapters.github import (
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+from openorc.domain.intents import TaskResumeIntentStatus
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Workspace
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -120,15 +121,21 @@ from openorc.domain.reviews import (
     ReviewLoopStatus,
     ReviewOutcome,
 )
-from openorc.domain.send_claims import TaskRuntimeSendClaim
+from openorc.domain.send_claims import (
+    TaskRuntimeSendClaim,
+    TaskRuntimeSendClaimKind,
+    TaskRuntimeSendClaimStatus,
+)
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import planning as planning_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.intents import record_task_resume_intent_outcome
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
+from openorc.persistence.send_claims import list_task_runtime_send_claims
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.interaction import (
     REVIEW_OUTCOME_CHANGES_REQUESTED,
@@ -178,6 +185,9 @@ from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
     "TaskPlanProductionOutcome",
+    "complete_resumed_initial_plan_result",
+    "settle_resumed_task_record",
+    "complete_resumed_plan_revision_result",
     "produce_initial_task_plan",
     "revise_task_plan",
 ]
@@ -606,7 +616,46 @@ def _commit_new_plan_revision(
 ) -> TaskPlanProductionOutcome:
     """Insert the immutable revision, install the pointer, and record the event.
 
-    One short composed transaction: the post-send exact-subject recheck (the
+    One short composed transaction around the shared commit composition (the
+    same composition the F8g resume routing completes through, issue #292).
+    """
+    with composed_transaction(pool) as transaction_pool:
+        return _commit_new_plan_revision_transaction(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            plan_text=plan_text,
+            repository_base_sha=repository_base_sha,
+            actor=actor,
+            event_type=event_type,
+            prior_revision=prior_revision,
+            expected_review_iteration=expected_review_iteration,
+            expected_producer_session=expected_producer_session,
+            expected_reviewer_session=expected_reviewer_session,
+            send_claim=send_claim,
+        )
+
+
+def _commit_new_plan_revision_transaction(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    plan_text: str,
+    repository_base_sha: str,
+    actor: event_coordination.WorkflowActorContext,
+    event_type: WorkflowEventType,
+    prior_revision: planning_records.PlanRevision | None,
+    expected_review_iteration: ReviewIteration | None,
+    expected_producer_session: TaskAgentSession,
+    expected_reviewer_session: TaskAgentSession | None,
+    send_claim: TaskRuntimeSendClaim,
+) -> TaskPlanProductionOutcome:
+    """The shared plan-revision commit composition (one open transaction).
+
+    The post-send exact-subject recheck (the
     exact Task token and coarse planning state, the exact expected session
     bindings still READY and identity-matched — session loss and explicit
     ends do not rotate the Task token, so the token alone cannot prove the
@@ -620,9 +669,11 @@ def _commit_new_plan_revision(
     constraint and the same-Task pointer foreign key are the durable
     backstops behind the derived next number. A rejected pointer write or a
     competing committed revision rolls the insert, pointer, and event back
-    together — never two success outcomes.
+    together — never two success outcomes. Composed inside the caller's
+    open transaction (a nested composition becomes a SAVEPOINT), so the
+    F8g resume routing settles its record atomically with the commit.
     """
-    with composed_transaction(pool) as transaction_pool:
+    with composed_transaction(transaction_pool) as transaction_pool:
         task = require_current_task(
             transaction_pool,
             workspace_id=workspace_id,
@@ -1167,3 +1218,282 @@ def _require_unsuperseded_review_iteration(
         prior_revision=prior_revision,
         iteration=expected_review_iteration,
     )
+
+
+def _require_claimed_dispatch_claim(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    kind: TaskRuntimeSendClaimKind,
+) -> TaskRuntimeSendClaim:
+    """Locate the exact conservatively claimed F2 dispatch claim of one kind.
+
+    The F8g resume routing's durable association between the resumed turn
+    and its original dispatch: the claim must exist in the Task's scope,
+    be of the exact kind, and still be conservatively claimed (its formal
+    result never arrived). A missing, settled, or known-nondelivery claim
+    means the resumed turn has no outstanding original operation to
+    complete — a stale or unsafe resume that fails closed.
+    """
+    for claim in list_task_runtime_send_claims(transaction_pool, task_id=task_id):
+        if claim.workspace_id != workspace_id or claim.task_id != task_id:
+            continue
+        if claim.kind is kind and claim.status is TaskRuntimeSendClaimStatus.CLAIMED:
+            return claim
+    raise StaleOperationError(
+        f"the task carries no conservatively claimed {kind.value} dispatch; "
+        "the resumed planning result has no outstanding original operation "
+        "to complete"
+    )
+
+
+def settle_resumed_task_record(
+    transaction_pool: DatabasePool,
+    *,
+    task_resume_intent_id: UUID,
+) -> None:
+    """Settle the resumed operation's record atomically with its completion.
+
+    The F8g one-shot discipline's final transition: the resumed turn's
+    result was durably processed by its original workflow owner in this
+    same composition, so the record settles exactly once here. A raced or
+    already-terminal record is a durable invariant failure that rolls the
+    completion back rather than fabricating a second outcome.
+    """
+    recorded = record_task_resume_intent_outcome(
+        transaction_pool,
+        task_resume_intent_id=task_resume_intent_id,
+        status=TaskResumeIntentStatus.SETTLED,
+        outcome={"result": "processed"},
+    )
+    if recorded is None:
+        raise StaleOperationError(
+            "the session-resume record is no longer awaiting its settled "
+            "outcome; the completion composition is stale"
+        )
+
+
+def _revalidate_resumed_planning_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    profile_id: UUID,
+    require_no_current_revision: bool,
+) -> tuple[Task, TaskAgentSession, TaskAgentSession, ResolvedRepositoryInstallationRoute]:
+    """Re-prove the resumed planning turn's exact durable subjects.
+
+    The F8g resume routing's shared re-derivation for both planning-dispatch
+    subjects: the accountable Owner's account/scope barriers, the exact
+    locked current Task at the authorization's restored token, the coarse
+    planning state, the per-kind revision state, and both READY planning
+    bindings, plus the resolved repository installation route for the fresh
+    base observation.
+    """
+    require_account_operational(transaction_pool, profile_id=profile_id)
+    require_workspace_task(
+        transaction_pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.PLANNING:
+        raise StaleOperationError(
+            "the task is no longer in its coarse planning state; the resumed "
+            "planning result is stale"
+        )
+    if require_no_current_revision and task.current_plan_revision_id is not None:
+        raise StaleOperationError(
+            "the task already has a current plan revision; the resumed initial plan is stale"
+        )
+    if not require_no_current_revision and task.current_plan_revision_id is None:
+        raise StaleOperationError(
+            "the task carries no current plan revision; the resumed plan revision is stale"
+        )
+    producer = get_task_agent_session(transaction_pool, task_id=task_id, role=WorkflowRole.PRODUCER)
+    reviewer = get_task_agent_session(transaction_pool, task_id=task_id, role=WorkflowRole.REVIEWER)
+    if (
+        producer is None
+        or producer.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        or producer.external_session_id is None
+        or reviewer is None
+        or reviewer.lifecycle_status is not TaskSessionLifecycleStatus.READY
+    ):
+        raise StaleOperationError(
+            "the prepared planning bindings are not both ready; the resumed "
+            "planning result is stale"
+        )
+    workspace = get_workspace(transaction_pool, workspace_id)
+    if workspace is None:
+        raise NotFoundError("the requested workspace is not available")
+    route = resolve_system_repository_installation_route(
+        transaction_pool,
+        workspace_id=workspace_id,
+        repository_id=task.repository_id,
+    )
+    return task, producer, reviewer, route
+
+
+def complete_resumed_plan_revision_result(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    profile_id: UUID,
+    task_resume_intent_id: UUID,
+    plan_result: PlanResult,
+) -> TaskPlanProductionOutcome:
+    """Commit the resumed planning-REVISE result as the next revision.
+
+    The Owner Resume routing's boundary-C composition for the interrupted
+    planning REVISE dispatch (issue #292): the exact durable subjects, the
+    exact current prior revision, and the conservatively claimed
+    PLANNING_REVISE_DISPATCH claim with its routed change request are
+    re-proven from durable state, and the resumed turn's validated plan
+    continues the SAME logical operation through the one shared commit
+    composition — its repository-base context freshly re-observed outside
+    any transaction. No second dispatch, no replacement revision, and the
+    resume record settles atomically with the commit.
+    """
+    if not isinstance(plan_result, PlanResult):
+        raise ExternalOperationUncertainError(
+            "the resumed planning turn did not return the validated plan "
+            "result family; the planning revise continuation remains unresolved"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        task, producer, reviewer, route = _revalidate_resumed_planning_subjects(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            profile_id=profile_id,
+            require_no_current_revision=False,
+        )
+        if task.current_plan_revision_id is None:
+            raise StaleOperationError(
+                "the task carries no current plan revision; the resumed plan revision is stale"
+            )
+        prior_revision = require_current_plan_revision(
+            transaction_pool, task=task, plan_revision_id=task.current_plan_revision_id
+        )
+        send_claim = _require_claimed_dispatch_claim(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            kind=TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH,
+        )
+        if send_claim.review_iteration_id is None:
+            raise StaleOperationError(
+                "the claimed planning revise dispatch carries no routed change "
+                "request; the resumed plan revision is stale"
+            )
+        expected_review_iteration = review_records.get_review_iteration(
+            transaction_pool, review_iteration_id=send_claim.review_iteration_id
+        )
+        if (
+            expected_review_iteration is None
+            or expected_review_iteration.workspace_id != workspace_id
+            or expected_review_iteration.task_id != task_id
+            or expected_review_iteration.plan_revision_id != prior_revision.id
+        ):
+            raise StaleOperationError(
+                "the claimed planning revise dispatch's routed change request no "
+                "longer addresses the current revision; the resumed plan revision "
+                "is stale"
+            )
+    repository_observation, base_sha = _observe_repository_base(github, route)
+    with composed_transaction(pool) as transaction_pool:
+        outcome = _commit_new_plan_revision_transaction(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=task.state_token,
+            plan_text=plan_result.plan,
+            repository_base_sha=base_sha,
+            actor=_producer_actor(producer),
+            event_type=WorkflowEventType.PLAN_REVISION_REVISED,
+            prior_revision=prior_revision,
+            expected_review_iteration=expected_review_iteration,
+            expected_producer_session=producer,
+            expected_reviewer_session=reviewer,
+            send_claim=send_claim,
+        )
+        settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
+    return outcome
+
+
+def complete_resumed_initial_plan_result(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    profile_id: UUID,
+    task_resume_intent_id: UUID,
+    plan_result: PlanResult,
+) -> TaskPlanProductionOutcome:
+    """Commit the resumed initial PLAN result as the Task's first revision.
+
+    The Owner Resume routing's boundary-C composition for the interrupted
+    initial PLAN dispatch (issue #292): the exact durable subjects are
+    re-proven, the conservatively claimed INITIAL_PLAN_DISPATCH claim is
+    located, and the resumed turn's validated plan continues the SAME
+    logical operation through the one shared commit composition — its
+    repository-base context freshly re-observed outside any transaction,
+    exactly as the ordinary dispatch established it. No second dispatch, no
+    replacement revision, and the resume record settles atomically with the
+    commit.
+    """
+    if not isinstance(plan_result, PlanResult):
+        raise ExternalOperationUncertainError(
+            "the resumed planning turn did not return the validated plan "
+            "result family; the initial-plan continuation remains unresolved"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        task, producer, reviewer, route = _revalidate_resumed_planning_subjects(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            profile_id=profile_id,
+            require_no_current_revision=True,
+        )
+        send_claim = _require_claimed_dispatch_claim(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH,
+        )
+    repository_observation, base_sha = _observe_repository_base(github, route)
+    with composed_transaction(pool) as transaction_pool:
+        outcome = _commit_new_plan_revision_transaction(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=task.state_token,
+            plan_text=plan_result.plan,
+            repository_base_sha=base_sha,
+            actor=_producer_actor(producer),
+            event_type=WorkflowEventType.PLAN_REVISION_CREATED,
+            prior_revision=None,
+            expected_review_iteration=None,
+            expected_producer_session=producer,
+            expected_reviewer_session=reviewer,
+            send_claim=send_claim,
+        )
+        settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
+    return outcome

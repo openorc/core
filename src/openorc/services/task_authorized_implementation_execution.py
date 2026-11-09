@@ -155,6 +155,7 @@ __all__ = [
     "AuthorizedImplementationExecution",
     "ProducerRuntimeAttachmentFactory",
     "QualifyingActivityPulse",
+    "complete_resumed_implementation_result",
     "execute_authorized_implementation",
 ]
 
@@ -589,6 +590,41 @@ def _canonical_result_payload(result: ImplementationResult) -> dict[str, object]
     return payload
 
 
+def _finalize_implementation_attempt(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    execution: Execution,
+    result: ImplementationResult,
+) -> Execution:
+    """The one-shot completion of one running implementation attempt.
+
+    The shared finalize core of the ordinary E6 dispatch and the Owner
+    Resume routing's boundary-C composition (issue #292): the conditional
+    ``running`` → ``succeeded`` transition with the validated canonical
+    result payload and the truthful ``execution_completed`` audit commit
+    atomically; a concurrent finalize wins the conditional write and the
+    stale caller fails closed. The attempt is never rewritten afterwards.
+    """
+    finalized = execution_records.complete_execution_with_result(
+        transaction_pool,
+        execution_id=execution.id,
+        implementation_result=_canonical_result_payload(result),
+    )
+    if finalized is None:
+        raise StaleOperationError(
+            "the implementation attempt is no longer running; finalization is stale"
+        )
+    event_coordination.record_execution_completed_event(
+        transaction_pool,
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        execution_id=execution.id,
+        actor=event_coordination.producer_actor(execution.producer_session_id),
+    )
+    return finalized
+
+
 # --- the dispatch phase and the service entry -------------------------------------
 
 
@@ -789,21 +825,8 @@ def _send_and_finalize(
             reserved=reserved,
             require_ready_producer=False,
         )
-        finalized = execution_records.complete_execution_with_result(
-            transaction_pool,
-            execution_id=reserved.execution.id,
-            implementation_result=_canonical_result_payload(result),
-        )
-        if finalized is None:
-            raise StaleOperationError(
-                "the implementation attempt is no longer running; finalization is stale"
-            )
-        event_coordination.record_execution_completed_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            execution_id=reserved.execution.id,
-            actor=event_coordination.producer_actor(reserved.producer_session.id),
+        finalized = _finalize_implementation_attempt(
+            transaction_pool, task=current_task, execution=reserved.execution, result=result
         )
     return AuthorizedImplementationExecution(
         task=current_task,
@@ -877,3 +900,55 @@ def execute_authorized_implementation(
             producer_factory=producer_factory,
             activity_factory=activity_factory,
         )
+
+
+def complete_resumed_implementation_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    execution_id: UUID,
+    result: ImplementationResult,
+) -> tuple[Task, Execution]:
+    """Complete the resumed implementation attempt with its formal result.
+
+    The Owner Resume routing's boundary-C composition for the interrupted
+    E6 implementation execution (issue #292): the exact Task/token/status
+    currentness and the full authorized-subject derivation are re-proven
+    from durable state under the caller's Task row lock, the addressed
+    Execution must still be the running attempt anchored to the Task's
+    Producer session, and the resumed formal result completes it through
+    the one shared finalize. No new attempt is ever created, no original
+    prompt is replayed, and the interrupted attempt's history is preserved:
+    the resumed turn continues the SAME logical operation.
+    """
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    _require_implementing_task(task)
+    _gate, _revision, _loop, _iteration, producer_session = _load_authorized_subjects(
+        transaction_pool, task=task, require_ready_producer=False
+    )
+    execution = execution_records.get_execution(transaction_pool, execution_id=execution_id)
+    if (
+        execution is None
+        or execution.workspace_id != workspace_id
+        or execution.task_id != task_id
+        or execution.producer_session_id != producer_session.id
+        or execution.status is not ExecutionStatus.RUNNING
+    ):
+        raise StaleOperationError(
+            "the addressed implementation attempt is not the task's running "
+            "producer attempt; the resumed result cannot complete it"
+        )
+    finalized = _finalize_implementation_attempt(
+        transaction_pool, task=task, execution=execution, result=result
+    )
+    return task, finalized

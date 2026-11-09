@@ -26,6 +26,19 @@ representation.
   ``close_requested``/``no_action``/``failed``/``unknown`` are terminal
   outcome records. One canonical PR per Task means at most one close intent
   per Task.
+- A TaskResumeIntent (F8g, issue #292) is the one-shot session-resume
+  authorization of one Owner Resume decision: committed with the atomic
+  resolution of the exact ``OWNER_ABORT`` gate and its TaskBlock, it is the
+  durable pre-dispatch guard that makes the qualified same-session
+  continuation exactly-once across crashes and concurrent commands. Its
+  status is forward-only: ``authorized`` is the committed-but-never-
+  dispatched authorization, ``dispatched`` is the claimed in-flight resumed
+  turn, and ``settled``/``non_delivered``/``interrupted``/``superseded`` are
+  terminal outcome records. At most one non-terminal record may exist per
+  session binding. Its immutable ``routing`` mapping is the safe machine
+  context established at authorization — the original workflow operation it
+  continues, the expected formal response family, the exact durable subject
+  reference, the restored Task status, and the authorization token.
 - ``outcome`` is a small canonical JSON object of safe machine facts only:
   stable internal identifiers, role names, and classified outcome labels.
   Tokens, credentials, transcript content, prompts, and raw provider errors
@@ -49,13 +62,17 @@ from openorc.domain.connections import WorkflowRole
 __all__ = [
     "TERMINAL_TASK_INTERRUPT_INTENT_STATUSES",
     "TERMINAL_TASK_PULL_REQUEST_CLOSE_INTENT_STATUSES",
+    "TERMINAL_TASK_RESUME_INTENT_STATUSES",
     "TaskInterruptIntent",
     "TaskInterruptIntentStatus",
     "TaskPullRequestCloseIntent",
     "TaskPullRequestCloseIntentStatus",
+    "TaskResumeIntent",
+    "TaskResumeIntentStatus",
     "canonical_intent_outcome",
     "task_interrupt_intent_field_names",
     "task_pull_request_close_intent_field_names",
+    "task_resume_intent_field_names",
 ]
 
 
@@ -282,3 +299,94 @@ def task_interrupt_intent_field_names() -> frozenset[str]:
 def task_pull_request_close_intent_field_names() -> frozenset[str]:
     """Return the exact field set a TaskPullRequestCloseIntent exposes."""
     return frozenset(field.name for field in fields(TaskPullRequestCloseIntent))
+
+
+class TaskResumeIntentStatus(StrEnum):
+    """The forward-only status vocabulary of one session-resume authorization.
+
+    ``authorized`` is the committed-but-never-dispatched authorization: the
+    record exists, the durable pre-dispatch one-shot guard stands, and no
+    runtime effect has been claimed. ``dispatched`` is the claimed in-flight
+    resumed turn — the only state from which a runtime effect may have
+    begun. The terminal values are outcome records written exactly once:
+    ``settled`` (the resumed turn's result was durably processed by its
+    original workflow owner), ``non_delivered`` (a positively proven
+    pre-effect refusal — nothing reached the runtime), ``interrupted`` (the
+    runtime positively terminated the resumed turn by interruption), and
+    ``superseded`` (proven never-dispatched supersession: a later Owner
+    decision re-blocked the Task before the dispatch claim committed).
+    """
+
+    AUTHORIZED = "authorized"
+    DISPATCHED = "dispatched"
+    SETTLED = "settled"
+    NON_DELIVERED = "non_delivered"
+    INTERRUPTED = "interrupted"
+    SUPERSEDED = "superseded"
+
+
+TERMINAL_TASK_RESUME_INTENT_STATUSES: frozenset[TaskResumeIntentStatus] = frozenset(
+    {
+        TaskResumeIntentStatus.SETTLED,
+        TaskResumeIntentStatus.NON_DELIVERED,
+        TaskResumeIntentStatus.INTERRUPTED,
+        TaskResumeIntentStatus.SUPERSEDED,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResumeIntent:
+    """The one-shot session-resume authorization of one Owner Resume decision.
+
+    Committed atomically with the resolution of the exact ``OWNER_ABORT``
+    gate and its TaskBlock, the record is the durable pre-dispatch guard
+    that makes the qualified same-session continuation exactly-once across
+    crashes, concurrent commands, and worker delays. ``task_block_id`` is
+    the resolved blocking episode the Resume continues — the lineage the
+    cancellation accounting reads. ``routing`` is written once at
+    authorization and never mutated; ``status`` is forward-only;
+    ``outcome`` records the safe dispatch/supersession/settlement facts
+    once they exist.
+    """
+
+    id: UUID
+    workspace_id: UUID
+    task_id: UUID
+    task_agent_session_id: UUID
+    task_block_id: UUID
+    workflow_role: WorkflowRole
+    external_session_id: str
+    requested_by_profile_id: UUID
+    status: TaskResumeIntentStatus
+    routing: Mapping[str, object]
+    outcome: Mapping[str, object]
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in (
+            "id",
+            "workspace_id",
+            "task_id",
+            "task_agent_session_id",
+            "task_block_id",
+            "requested_by_profile_id",
+        ):
+            _require_uuid(getattr(self, name), name)
+        if not isinstance(self.workflow_role, WorkflowRole):
+            raise ValueError("TaskResumeIntent.workflow_role must be a WorkflowRole")
+        _require_nonblank_str(self.external_session_id, "external_session_id")
+        if not isinstance(self.status, TaskResumeIntentStatus):
+            raise ValueError("TaskResumeIntent.status must be a TaskResumeIntentStatus")
+        if not isinstance(self.routing, Mapping):
+            raise ValueError("TaskResumeIntent.routing must be a mapping")
+        if not isinstance(self.outcome, Mapping):
+            raise ValueError("TaskResumeIntent.outcome must be a mapping")
+        object.__setattr__(self, "routing", canonical_intent_outcome(self.routing))
+        object.__setattr__(self, "outcome", canonical_intent_outcome(self.outcome))
+
+
+def task_resume_intent_field_names() -> frozenset[str]:
+    """Return the exact field set a TaskResumeIntent exposes."""
+    return frozenset(field.name for field in fields(TaskResumeIntent))

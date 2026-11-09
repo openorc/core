@@ -897,3 +897,49 @@ def acknowledge_source_requirements_fingerprint(
             (fingerprint, restored_status.value, task_id, expected_state_token),
         ).fetchone()
     return None if row is None else _task_from_row(row)
+
+
+def restore_blocked_task_status(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    restored_status: TaskStatus,
+) -> Task | None:
+    """Restore a blocked Task to its pre-block workflow status atomically.
+
+    The Owner Resume composition's (issue #292) one guarded Task mutation:
+    the Task leaves ``blocked`` for the exact non-blocked restored status
+    the derived continuation presents from — one statement, one
+    ``state_token`` rotation. The guards mirror the acknowledge statement's:
+    the exact expected ``state_token``, the exact ``blocked`` status, the
+    cleared current-gate pointer (the exceptional gate has already resolved
+    in the same composition), and non-archived currentness. The database
+    status CHECK backstops the vocabulary. Returns the updated Task, or
+    ``None`` when any guard no longer matches (a stale operation that must
+    not be retried blindly).
+    """
+    if not isinstance(expected_state_token, UUID):
+        raise TaskDomainError("expected_state_token must be a UUID")
+    if (
+        not isinstance(restored_status, TaskStatus)
+        or restored_status.is_terminal
+        or restored_status is TaskStatus.BLOCKED
+    ):
+        raise TaskDomainError(
+            "restored_status must be a nonterminal, non-blocked TaskStatus; "
+            "the resume composition restores the interrupted workflow's "
+            "pre-abort state, never a blocked or terminal state"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set status = %s, "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and status = 'blocked' "
+            "and current_owner_gate_id is null "
+            f"returning {_TASK_COLUMNS}",
+            (restored_status.value, task_id, expected_state_token),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)

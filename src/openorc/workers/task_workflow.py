@@ -79,6 +79,11 @@ from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
 )
+from openorc.services.task_owner_resume import (
+    AuthorizedTaskResume,
+    SessionResumeFollowUp,
+    dispatch_authorized_task_resume,
+)
 from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
     produce_initial_task_plan,
@@ -127,6 +132,7 @@ from openorc.workers.invocation import (
     TaskPrCompositionPayload,
     TaskPrReviewPayload,
     TaskScope,
+    TaskSessionResumePayload,
     WorkflowRoleRef,
 )
 
@@ -134,6 +140,7 @@ __all__ = [
     "build_task_workflow_handlers",
     "execute_task_workflow_operation",
     "submit_authorized_implementation_after_approval",
+    "submit_task_session_resume_after_authorization",
     "submit_planning_bootstrap_after_start",
     "submit_pr_composition_after_approval",
 ]
@@ -421,6 +428,43 @@ def submit_authorized_implementation_after_approval(
                 ),
                 profile_id=str(profile_id),
                 expected_state_token=str(authorization.task.state_token),
+            ),
+        ),
+    )
+
+
+def submit_task_session_resume_after_authorization(
+    authorized: AuthorizedTaskResume,
+    *,
+    dependencies: OperationDependencies,
+) -> SubmissionResult:
+    """Submit the authorized session-resume continuation after one Resume (F8g).
+
+    The explicitly invoked application continuation of the Owner's Resume
+    authorization: the ``AuthorizedTaskResume`` carries the restored Task
+    with its rotated token and the committed one-shot session-resume record —
+    the durable handoff the continuation addresses — so this helper
+    constructs the exact typed invocation from that outcome and submits it
+    for delivery. The record's routing context is re-derived by the executing
+    continuation and is never carried on the wire. The returned submission
+    outcome is transport information only, never Task truth: a known refusal
+    or uncertain submission never fails the already-completed authorization
+    and is never retried here.
+    """
+    return _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_SESSION_RESUME,
+            payload=TaskSessionResumePayload(
+                task=TaskScope(
+                    workspace_id=str(authorized.task.workspace_id),
+                    task_id=str(authorized.task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(authorized.resume.requested_by_profile_id),
+                task_resume_intent_id=str(authorized.resume.id),
+                restored_status=authorized.task.status.value,
+                expected_state_token=str(authorized.task.state_token),
             ),
         ),
     )
@@ -953,6 +997,68 @@ def _compose_task_pr_review(
         dispatch_outcome = remediated_dispatch
 
 
+def _compose_task_session_resume(
+    payload: TaskSessionResumePayload,
+    *,
+    dependencies: OperationDependencies,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> None:
+    """Dispatch the authorized session-resume continuation (F8g, issue #292).
+
+    The one-shot continuation the Owner Resume action's authorization
+    committed: the durable record's routing context is re-derived from
+    committed state, the record is claimed exactly once (or its proven
+    never-dispatched supersession is recorded), the fixed-prompt same-session
+    dispatch runs strictly outside any transaction, and the resumed formal
+    result routes through the original workflow operation's existing
+    completion logic. The handler owns no workflow rules of its own.
+    """
+    pool = dependencies.database_pool()
+    github = dependencies.github_client()
+    workspace_id = UUID(payload.task.workspace_id)
+    task_id = UUID(payload.task.task_id)
+    outcome = dispatch_authorized_task_resume(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        task_resume_intent_id=UUID(payload.task_resume_intent_id),
+        profile_id=UUID(payload.profile_id),
+        expected_state_token=UUID(payload.expected_state_token),
+        producer_runtime_factory=_producer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        reviewer_runtime_factory=_reviewer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        github=github,
+        bootstrap_composition=dependencies.task_bootstrap_runtime_composition(),
+        attempt_evidence=attempt_evidence,
+    )
+    if outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH:
+        if outcome.follow_up_state_token is None:
+            raise ConflictError("the planning-review follow-up carried no continuation token")
+        # The ordinary authorized continuation of a produced planning
+        # revision: the fresh post-production token authorizes the next
+        # planning REVIEW round, submitted through the same seam the ordinary
+        # planning handlers use. Submission outcomes are transport
+        # information only, never Task truth.
+        _submit_continuation(
+            dependencies,
+            OperationInvocation(
+                kind=OperationKind.TASK_PLANNING_REVIEW,
+                payload=TaskPlanningReviewPayload(
+                    task=TaskScope(
+                        workspace_id=payload.task.workspace_id,
+                        task_id=payload.task.task_id,
+                        role=WorkflowRoleRef.REVIEWER,
+                    ),
+                    profile_id=payload.profile_id,
+                    expected_state_token=str(outcome.follow_up_state_token),
+                ),
+            ),
+        )
+
+
 # --- the single composition seam and the production handler table ------------
 
 
@@ -969,6 +1075,7 @@ _TASK_WORKFLOW_COMPOSITIONS: Mapping[OperationKind, TaskWorkflowComposition] = {
     OperationKind.TASK_PR_AUTHORIZATION_RETRY: _compose_task_pr_authorization_retry,
     OperationKind.TASK_PR_COMPOSITION: _compose_task_pr_composition,
     OperationKind.TASK_PR_REVIEW: _compose_task_pr_review,
+    OperationKind.TASK_SESSION_RESUME: _compose_task_session_resume,
 }
 
 
@@ -1026,9 +1133,16 @@ def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
         # the Level 2 triage service with the invocation's own Level 1
         # attempt identity and Level 1-established currentness. The handler
         # itself only decodes and delegates.
+        if kind is OperationKind.TASK_SESSION_RESUME:
+            # The F8g resume addresses the authorization-established restored
+            # status carried on its payload (the one variable-status kind).
+            resume_payload = cast(TaskSessionResumePayload, payload)
+            expected_status = TaskStatus(resume_payload.restored_status)
+        else:
+            expected_status = _TASK_KIND_EXPECTED_STATUS[kind]
         coordinate_task_workflow_operation(
             dependencies.database_pool(),
-            expected_status=_TASK_KIND_EXPECTED_STATUS[kind],
+            expected_status=expected_status,
             workspace_id=UUID(payload.task.workspace_id),
             task_id=UUID(payload.task.task_id),
             profile_id=UUID(payload.profile_id),

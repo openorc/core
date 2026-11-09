@@ -1,8 +1,8 @@
 """Repositories for one-shot external-effect intent persistence (issue #228).
 
-Explicit SQL repositories over the ``openorc`` schema for the two narrow
-one-shot intent records the Owner Abort and unified Task Cancel commands
-register:
+Explicit SQL repositories over the ``openorc`` schema for the narrow
+one-shot intent records the Owner Abort, unified Task Cancel, and Owner
+Resume commands register:
 
 - ``openorc.task_interrupt_intents`` — the exact-session ClineBox activity
   Interrupt intent of one Owner Abort, created unsettled and advanced
@@ -11,6 +11,14 @@ register:
 - ``openorc.task_pull_request_close_intents`` — the Task cancellation's
   one-shot PR-close obligation, created pending and advanced exactly once
   to a terminal outcome record.
+- ``openorc.task_resume_intents`` (F8g, issue #292) — the one-shot
+  session-resume authorization of one Owner Resume decision, created
+  ``authorized`` with its immutable routing context and advanced exactly
+  once: ``authorized`` → ``dispatched`` is the pre-dispatch one-shot
+  dispatch claim, ``authorized`` → ``superseded`` the proven
+  never-dispatched supersession, and ``authorized``/``dispatched`` →
+  ``settled``/``non_delivered``/``interrupted`` the terminal outcome
+  records.
 
 Rows map to transport-independent domain objects from
 :mod:`openorc.domain.intents`; instants returned from Postgres are
@@ -20,12 +28,13 @@ adapter.
 
 The forward-only discipline is enforced by conditional UPDATEs: an outcome
 write applies only while the row is still nonterminal (``unsettled`` /
-``pending``) and only to a terminal target status, so a raced duplicate
-recording is a rejected no-op (``None``) that must not be retried blindly —
-translating that into typed application errors is a service-layer concern.
-The database partial unique index (one unsettled interrupt intent per
-session binding) and ``unique (task_id)`` (one close intent per Task) are
-the durable one-shot backstops.
+``pending`` / ``authorized`` / ``dispatched``) and only to a terminal
+target status, so a raced duplicate recording is a rejected no-op
+(``None``) that must not be retried blindly — translating that into typed
+application errors is a service-layer concern. The database partial unique
+index (one unsettled interrupt intent per session binding; one non-terminal
+resume record per session binding) and ``unique (task_id)`` (one close
+intent per Task) are the durable one-shot backstops.
 
 Violated database invariants surface as driver exceptions; translating
 driver exceptions into typed application errors is a service-layer concern.
@@ -43,10 +52,13 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.intents import (
     TERMINAL_TASK_INTERRUPT_INTENT_STATUSES,
     TERMINAL_TASK_PULL_REQUEST_CLOSE_INTENT_STATUSES,
+    TERMINAL_TASK_RESUME_INTENT_STATUSES,
     TaskInterruptIntent,
     TaskInterruptIntentStatus,
     TaskPullRequestCloseIntent,
     TaskPullRequestCloseIntentStatus,
+    TaskResumeIntent,
+    TaskResumeIntentStatus,
     canonical_intent_outcome,
 )
 from openorc.persistence.pool import DatabasePool
@@ -55,14 +67,21 @@ from openorc.persistence.transactions import transaction
 
 __all__ = [
     "annotate_unsettled_task_interrupt_intent",
+    "claim_task_resume_dispatch",
     "create_task_interrupt_intent",
     "create_task_pull_request_close_intent",
+    "create_task_resume_intent",
     "get_task_interrupt_intent",
     "get_task_pull_request_close_intent_for_task",
+    "get_task_resume_intent",
+    "list_open_task_resume_intents",
     "list_task_interrupt_intents",
+    "list_task_resume_intents",
     "list_unsettled_task_interrupt_intents",
     "record_task_interrupt_intent_outcome",
     "record_task_pull_request_close_intent_outcome",
+    "record_task_resume_intent_outcome",
+    "supersede_task_resume_intent",
 ]
 
 _TASK_INTERRUPT_INTENT_COLUMNS = (
@@ -385,3 +404,225 @@ def record_task_pull_request_close_intent_outcome(
             (status.value, Jsonb(dict(canonical_outcome)), task_pull_request_close_intent_id),
         ).fetchone()
     return None if row is None else _close_intent_from_row(row)
+
+
+_TASK_RESUME_INTENT_COLUMNS = (
+    "id, workspace_id, task_id, task_agent_session_id, task_block_id, "
+    "workflow_role, external_session_id, requested_by_profile_id, status, "
+    "routing, outcome, created_at, updated_at"
+)
+
+
+def _resume_intent_from_row(row: Sequence[Any]) -> TaskResumeIntent:
+    return TaskResumeIntent(
+        id=row[0],
+        workspace_id=row[1],
+        task_id=row[2],
+        task_agent_session_id=row[3],
+        task_block_id=row[4],
+        workflow_role=WorkflowRole(row[5]),
+        external_session_id=row[6],
+        requested_by_profile_id=row[7],
+        status=TaskResumeIntentStatus(row[8]),
+        routing=row[9],
+        outcome=row[10],
+        created_at=normalize_utc(row[11]),
+        updated_at=normalize_utc(row[12]),
+    )
+
+
+def create_task_resume_intent(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_agent_session_id: UUID,
+    task_block_id: UUID,
+    workflow_role: WorkflowRole,
+    external_session_id: str,
+    requested_by_profile_id: UUID,
+    routing: Any,
+) -> TaskResumeIntent:
+    """Insert one ``authorized`` session-resume record with its routing.
+
+    Created inside the caller's transaction (the Owner Resume action's
+    atomic authorization composition): the record is the durable
+    pre-dispatch one-shot guard committed together with the gate resolution
+    it evidences. ``routing`` is the immutable canonical machine context
+    established at authorization. The one-shot non-terminal-per-session
+    discipline is the database partial unique index: a second authorization
+    for the same session binding raises ``UniqueViolation`` for service
+    classification — a duplicate authorization can never replace a pending
+    or in-flight dispatch.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(task_agent_session_id, "task_agent_session_id")
+    _require_uuid(task_block_id, "task_block_id")
+    if not isinstance(workflow_role, WorkflowRole):
+        raise ValueError("create_task_resume_intent requires a WorkflowRole")
+    _require_nonblank_str(external_session_id, "external_session_id")
+    _require_uuid(requested_by_profile_id, "requested_by_profile_id")
+    canonical_routing = canonical_intent_outcome(routing)
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "insert into openorc.task_resume_intents "
+            "(workspace_id, task_id, task_agent_session_id, task_block_id, "
+            "workflow_role, external_session_id, requested_by_profile_id, "
+            "status, routing) "
+            "values (%s, %s, %s, %s, %s, %s, %s, 'authorized', %s) "
+            f"returning {_TASK_RESUME_INTENT_COLUMNS}",
+            (
+                workspace_id,
+                task_id,
+                task_agent_session_id,
+                task_block_id,
+                workflow_role.value,
+                external_session_id,
+                requested_by_profile_id,
+                Jsonb(dict(canonical_routing)),
+            ),
+        ).fetchone()
+    assert row is not None
+    return _resume_intent_from_row(row)
+
+
+def get_task_resume_intent(
+    pool: DatabasePool, *, task_resume_intent_id: UUID
+) -> TaskResumeIntent | None:
+    """Return one session-resume record by id, or ``None`` when it does not exist."""
+    _require_uuid(task_resume_intent_id, "task_resume_intent_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select "
+            + _TASK_RESUME_INTENT_COLUMNS
+            + " from openorc.task_resume_intents where id = %s",
+            (task_resume_intent_id,),
+        ).fetchone()
+    return None if row is None else _resume_intent_from_row(row)
+
+
+def list_task_resume_intents(pool: DatabasePool, *, task_id: UUID) -> list[TaskResumeIntent]:
+    """List a Task's complete session-resume record history, oldest first.
+
+    Every record of the Task — non-terminal and terminal alike — is
+    retained: terminal records are the durable outcome records the
+    workflow's safety decisions (the Cancel eligibility veto and the
+    escalation lineage) read.
+    """
+    _require_uuid(task_id, "task_id")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select "
+            + _TASK_RESUME_INTENT_COLUMNS
+            + " from openorc.task_resume_intents where task_id = %s order by created_at, id",
+            (task_id,),
+        ).fetchall()
+    return [_resume_intent_from_row(row) for row in rows]
+
+
+def list_open_task_resume_intents(pool: DatabasePool, *, task_id: UUID) -> list[TaskResumeIntent]:
+    """List a Task's non-terminal session-resume records, oldest first.
+
+    Exactly the records whose Resume effect is potentially pending
+    (``authorized``) or potentially active/uncertain (``dispatched``) —
+    the durable facts the Cancel eligibility veto reads.
+    """
+    _require_uuid(task_id, "task_id")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select " + _TASK_RESUME_INTENT_COLUMNS + " from openorc.task_resume_intents "
+            "where task_id = %s and status in ('authorized', 'dispatched') "
+            "order by created_at, id",
+            (task_id,),
+        ).fetchall()
+    return [_resume_intent_from_row(row) for row in rows]
+
+
+def claim_task_resume_dispatch(
+    pool: DatabasePool, *, task_resume_intent_id: UUID
+) -> TaskResumeIntent | None:
+    """Claim one authorized record for its one-shot dispatch, exactly once.
+
+    The pre-dispatch one-shot transition: applies only while the record is
+    still ``authorized``. ``None`` means the record is missing, already
+    dispatched (a concurrent continuation claimed it), or already terminal
+    — a rejected no-op that must never dispatch again.
+    """
+    _require_uuid(task_resume_intent_id, "task_resume_intent_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_resume_intents "
+            "set status = 'dispatched', updated_at = now() "
+            "where id = %s and status = 'authorized' "
+            f"returning {_TASK_RESUME_INTENT_COLUMNS}",
+            (task_resume_intent_id,),
+        ).fetchone()
+    return None if row is None else _resume_intent_from_row(row)
+
+
+def record_task_resume_intent_outcome(
+    pool: DatabasePool,
+    *,
+    task_resume_intent_id: UUID,
+    status: TaskResumeIntentStatus,
+    outcome: Any,
+) -> TaskResumeIntent | None:
+    """Advance one non-terminal session-resume record to its outcome, once.
+
+    Applies only while the record is ``authorized`` or ``dispatched`` and
+    the target status is one of the effect-outcome terminals (``settled``,
+    ``non_delivered``, ``interrupted``). ``None`` means the record is
+    missing or already terminal — a rejected no-op that must not be retried
+    blindly.
+    """
+    _require_uuid(task_resume_intent_id, "task_resume_intent_id")
+    if status not in TERMINAL_TASK_RESUME_INTENT_STATUSES:
+        raise ValueError(
+            "record_task_resume_intent_outcome requires a terminal "
+            "TaskResumeIntentStatus; use claim_task_resume_dispatch or "
+            "supersede_task_resume_intent for the nonterminal transitions"
+        )
+    if status is TaskResumeIntentStatus.SUPERSEDED:
+        raise ValueError(
+            "the proven never-dispatched supersession advances only from "
+            "the authorized state through supersede_task_resume_intent"
+        )
+    canonical_outcome = canonical_intent_outcome(outcome)
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_resume_intents "
+            "set status = %s, outcome = %s, updated_at = now() "
+            "where id = %s and status in ('authorized', 'dispatched') "
+            f"returning {_TASK_RESUME_INTENT_COLUMNS}",
+            (status.value, Jsonb(dict(canonical_outcome)), task_resume_intent_id),
+        ).fetchone()
+    return None if row is None else _resume_intent_from_row(row)
+
+
+def supersede_task_resume_intent(
+    pool: DatabasePool,
+    *,
+    task_resume_intent_id: UUID,
+    outcome: Any,
+) -> TaskResumeIntent | None:
+    """Record one authorized record's proven never-dispatched supersession.
+
+    Applies only while the record is still ``authorized``: the pre-dispatch
+    supersession is positively established by the record's own state (the
+    dispatch claim never committed) together with the Task's currentness
+    under the caller's Task row lock. ``None`` means the record is missing,
+    already dispatched, or already terminal — a rejected no-op that must
+    never classify a potentially dispatched effect as superseded.
+    """
+    _require_uuid(task_resume_intent_id, "task_resume_intent_id")
+    canonical_outcome = canonical_intent_outcome(outcome)
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_resume_intents "
+            "set status = 'superseded', outcome = %s, updated_at = now() "
+            "where id = %s and status = 'authorized' "
+            f"returning {_TASK_RESUME_INTENT_COLUMNS}",
+            (Jsonb(dict(canonical_outcome)), task_resume_intent_id),
+        ).fetchone()
+    return None if row is None else _resume_intent_from_row(row)
