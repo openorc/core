@@ -162,6 +162,7 @@ def _task_values(
         _OBSERVED,
         cause,
         None,
+        None,
     )
 
 

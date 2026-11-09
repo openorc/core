@@ -81,6 +81,7 @@ from openorc.persistence.connections import get_connection
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services.cline_construction import DurableClineConstructionContextResolver
+from openorc.services.cline_usage_observation import SessionUsageCostObserver
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
 from openorc.services.errors import (
     ConflictError,
@@ -420,9 +421,59 @@ def attach_cline_runtime(
                 bootstrap_repository_base=bootstrap_repository_base,
                 working_directory=working_directory,
             )
-            yield AttachedClineRuntime(
-                adapter=ClineAdapter(backend, resolver),
-                selected_configuration=selection if phase is ClineAttachmentPhase.FRESH else None,
-            )
+            adapter = ClineAdapter(backend, resolver)
+            # The live cost-enforcement observation (issue #291, F8f): on the
+            # BOUND phase the established binding's exact identity drives one
+            # SessionUsageCostObserver over THIS attachment — subscribed
+            # best-effort, checkpointed at the lease boundary, and disposed
+            # idempotently on every exit path (normal, exceptional,
+            # cancelled) inside the same single-disposal ownership as the
+            # backend. A FRESH-phase attach has no established external
+            # session to observe yet: later BOUND attachments own the
+            # established binding's usage. Subscription failures and
+            # boundary-checkpoint failures are contained best-effort and
+            # never fail the attachment or the workflow interaction.
+            usage_observer: SessionUsageCostObserver | None = None
+            if phase is ClineAttachmentPhase.BOUND:
+                # The BOUND validation guarantees a non-blank external
+                # session identity for the established binding.
+                assert binding.external_session_id is not None  # caller-checked
+                assert binding.external_session_id.strip()  # caller-checked
+                usage_observer = SessionUsageCostObserver(
+                    pool,
+                    adapter,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    task_agent_session_id=binding.id,
+                    connection_id=binding.connection_id,
+                    external_session_id=binding.external_session_id,
+                )
+                try:
+                    usage_observer.start()
+                except Exception as error:  # noqa: BLE001 - best-effort subscription
+                    logger.warning(
+                        "cline usage observation subscription failed (%s) for task session %s",
+                        type(error).__name__,
+                        binding.id,
+                    )
+                    usage_observer = None
+            try:
+                yield AttachedClineRuntime(
+                    adapter=adapter,
+                    selected_configuration=(
+                        selection if phase is ClineAttachmentPhase.FRESH else None
+                    ),
+                )
+            finally:
+                if usage_observer is not None:
+                    try:
+                        usage_observer.observe_now()
+                    except Exception as error:  # noqa: BLE001 - best-effort boundary checkpoint
+                        logger.warning(
+                            "cline usage boundary checkpoint failed (%s) for task session %s",
+                            type(error).__name__,
+                            binding.id,
+                        )
+                    usage_observer.dispose()
         finally:
             backend.dispose()

@@ -75,7 +75,7 @@ _TASK_COLUMNS = (
     "status, archived_at, canonical_feature_branch, state_token, "
     "current_plan_revision_id, current_owner_gate_id, "
     "source_requirements_fingerprint, queued_at, created_at, updated_at, "
-    "terminal_cause, authorized_task_budget_usd"
+    "terminal_cause, authorized_task_budget_usd, effective_cost_threshold_usd"
 )
 
 
@@ -100,6 +100,7 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         updated_at=normalize_utc(row[14]),
         terminal_cause=None if row[15] is None else TaskTerminalCause(row[15]),
         authorized_task_budget_usd=row[16],
+        effective_cost_threshold_usd=row[17],
     )
 
 
@@ -905,6 +906,7 @@ def restore_blocked_task_status(
     *,
     expected_state_token: UUID,
     restored_status: TaskStatus,
+    effective_cost_threshold_usd: Decimal | None = None,
 ) -> Task | None:
     """Restore a blocked Task to its pre-block workflow status atomically.
 
@@ -918,6 +920,12 @@ def restore_blocked_task_status(
     status CHECK backstops the vocabulary. Returns the updated Task, or
     ``None`` when any guard no longer matches (a stale operation that must
     not be retried blindly).
+
+    The optional ``effective_cost_threshold_usd`` (issue #291, F8f) is the
+    Owner Continue's refreshed cumulative spending allowance, written in the
+    SAME guarded statement as the restore so the grant can never commit
+    apart from the restored authority it belongs to. ``None`` (the Owner
+    Resume default) leaves the column untouched.
     """
     if not isinstance(expected_state_token, UUID):
         raise TaskDomainError("expected_state_token must be a UUID")
@@ -931,15 +939,36 @@ def restore_blocked_task_status(
             "the resume composition restores the interrupted workflow's "
             "pre-abort state, never a blocked or terminal state"
         )
+    if effective_cost_threshold_usd is not None and (
+        isinstance(effective_cost_threshold_usd, bool)
+        or not isinstance(effective_cost_threshold_usd, Decimal)
+        or not effective_cost_threshold_usd.is_finite()
+        or effective_cost_threshold_usd <= 0
+    ):
+        raise TaskDomainError(
+            "effective_cost_threshold_usd must be None or a positive finite "
+            "USD amount (an exact decimal)"
+        )
+    threshold_assignment = (
+        "effective_cost_threshold_usd = %s, " if effective_cost_threshold_usd is not None else ""
+    )
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.tasks "
             "set status = %s, "
+            f"{threshold_assignment}"
             "state_token = gen_random_uuid(), updated_at = now() "
             "where id = %s and state_token = %s and archived_at is null "
             "and status = 'blocked' "
             "and current_owner_gate_id is null "
             f"returning {_TASK_COLUMNS}",
-            (restored_status.value, task_id, expected_state_token),
+            (
+                (
+                    (effective_cost_threshold_usd,)
+                    if effective_cost_threshold_usd is not None
+                    else ()
+                )
+                + (restored_status.value, task_id, expected_state_token)
+            ),
         ).fetchone()
     return None if row is None else _task_from_row(row)

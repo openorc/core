@@ -83,7 +83,7 @@ _INTENT_INSERT = _sql_has("insert into openorc.task_interrupt_intents")
 
 def _budgeted_task_row(status: str = "implementing") -> tuple[Any, ...]:
     row = _task_row(status=status, state_token=uuid4())
-    return (*row[:16], _BUDGET)
+    return (*row[:16], _BUDGET, *row[17:])
 
 
 def _queued_budgeted_task_row() -> tuple[Any, ...]:
@@ -231,7 +231,12 @@ def _sql_of_kind(conn: ScriptedConnection, predicate: Callable[[Any], bool]) -> 
     return [sql for sql, _ in conn.executed if predicate(sql)]
 
 
-def _observe(conn: ScriptedConnection, *, cost: Decimal | None = Decimal("26.00")) -> Any:
+def _observe(
+    conn: ScriptedConnection,
+    *,
+    cost: Decimal | None = Decimal("26.00"),
+    send_in_flight: bool = False,
+) -> Any:
     return observe_session_usage(
         cast(DatabasePool, _pool(conn)),
         workspace_id=_WORKSPACE_ID,
@@ -239,6 +244,7 @@ def _observe(conn: ScriptedConnection, *, cost: Decimal | None = Decimal("26.00"
         task_agent_session_id=_SESSION_ID,
         connection_id=_CONNECTION_ID,
         aggregate_total_cost=cost,
+        send_in_flight=send_in_flight,
     )
 
 
@@ -293,7 +299,7 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
         executions=[_open_execution()],
     )
 
-    observation = _observe(conn, cost=Decimal("26.00"))
+    observation = _observe(conn, cost=Decimal("26.00"), send_in_flight=True)
 
     assert observation.kind is SessionCostObservationKind.BLOCKED
     assert observation.task is not None
@@ -335,12 +341,13 @@ def test_threshold_reached_blocks_with_owner_attribution_and_exact_intent(
     assert len(_sql_of_kind(conn, lambda sql: "select sum(retained_cost_usd)" in sql)) == 2
 
 
-def test_idle_task_blocks_without_gratuitous_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A Task with no durably demonstrable in-flight runtime activity —
-    # idle at its pending ordinary Owner gate — enters BLOCKED with zero
-    # interrupt intents: no gratuitous Interrupt, and the F3 composition
-    # supersedes that pending gate truthfully (its row is never rewritten,
-    # and no owner_gate_resolved event exists) for F4b.
+def test_idle_crossing_checkpoints_without_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A threshold crossing observed while NO autonomous model-backed turn of
+    # the observing session is in flight — an idle Task, here waiting at its
+    # pending ordinary Owner gate — checkpoints its truthful spend and
+    # defers enforcement to the next active turn (issue #291, F8f,
+    # Owner-approved amendment). No block, no interrupt, and the pending
+    # ordinary gate stays exactly where it was.
     conn = ScriptedConnection()
     idle_row = _budgeted_task_row(status="waiting_for_owner")
     idle_row = (*idle_row[:10], _PRIOR_GATE_ID, *idle_row[11:])
@@ -354,20 +361,17 @@ def test_idle_task_blocks_without_gratuitous_interrupt(monkeypatch: pytest.Monke
         executions=[],
     )
 
-    observation = _observe(conn)
+    observation = _observe(conn, send_in_flight=False)
 
-    assert observation.kind is SessionCostObservationKind.BLOCKED
-    assert observation.task_block is not None
-    assert observation.task_block.reason is TaskBlockReason.COST_LIMIT
+    assert observation.kind is SessionCostObservationKind.CHECKPOINTED
+    assert observation.task_block is None
     assert observation.interrupt_dispatches == ()
+    assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
-    # The new pending BLOCK_RESOLUTION gate became current; the superseded
-    # ordinary gate row was never rewritten.
-    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    assert not _sql_of_kind(conn, lambda sql: _TASK_BLOCK_UPDATE(sql, None))
+    # The truthful checkpoint stands; the pending ordinary gate is untouched.
+    assert not _event_types(conn)
     assert _count(conn, _sql_has("update openorc.owner_gates")) == 0
-    status_params = next(params for sql, params in conn.executed if _TASK_BLOCK_UPDATE(sql, None))
-    assert status_params is not None
-    assert status_params[4] == _PRIOR_GATE_ID and status_params[5] == _GATE_ID
 
 
 def test_unknown_reading_is_unknown_and_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -463,14 +467,24 @@ def test_active_planning_interaction_is_interrupted_on_exhaustion(
 ) -> None:
     # A planning-phase Producer interaction runs as an admitted model-backed
     # interaction OUTSIDE any Execution (plan production, the planning
-    # bootstrap): the autonomous phase's own admission makes the bound
-    # READY Producer session an interrupt target, so a budget crossing
-    # during the active turn interrupts it instead of silently letting it
-    # continue consuming funds.
+    # bootstrap): the durable facts alone never prove an active turn there,
+    # so the unattested crossing checkpoints without blocking (issue #291,
+    # F8f, Owner-approved amendment), while the LIVE observation's attested
+    # in-flight turn makes the bound READY Producer session an interrupt
+    # target and the crossing interrupts it.
     conn = ScriptedConnection()
     _wire_budgeted_task(conn, monkeypatch, status="planning", sessions=[_ready_session_row()])
 
-    observation = _observe(conn)
+    idle_observation = _observe(conn)
+
+    assert idle_observation.kind is SessionCostObservationKind.CHECKPOINTED
+    assert idle_observation.task_block is None
+    assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
+
+    live_conn = ScriptedConnection()
+    _wire_budgeted_task(live_conn, monkeypatch, status="planning", sessions=[_ready_session_row()])
+
+    observation = _observe(live_conn, send_in_flight=True)
 
     assert observation.kind is SessionCostObservationKind.BLOCKED
     assert observation.task_block is not None
@@ -479,18 +493,19 @@ def test_active_planning_interaction_is_interrupted_on_exhaustion(
     assert observation.interrupt_dispatches[0][1] == _EXTERNAL_SESSION_ID
     intent_params = next(
         params
-        for sql, params in conn.executed
+        for sql, params in live_conn.executed
         if "insert into openorc.task_interrupt_intents" in sql
     )
     assert intent_params is not None and intent_params[6] == _OWNER_PROFILE_ID
 
 
-def test_idle_waiting_for_owner_gate_still_blocks_without_interruption(
+def test_unattested_idle_waiting_for_owner_crossing_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The planning-phase admission never leaks into an idle Owner gate: a
-    # waiting_for_owner Task with no demonstrated in-flight activity keeps
-    # the no-gratuitous-Interrupt behavior.
+    # The planning-phase admission never leaks into an idle Owner gate, and
+    # the amended contract never blocks an idle Task at all: a
+    # waiting_for_owner crossing with no attested in-flight autonomous turn
+    # checkpoints its truthful spend and applies no policy (issue #291, F8f).
     conn = ScriptedConnection()
     _wire_budgeted_task(
         conn,
@@ -501,14 +516,12 @@ def test_idle_waiting_for_owner_gate_still_blocks_without_interruption(
 
     observation = _observe(conn)
 
-    assert observation.kind is SessionCostObservationKind.BLOCKED
+    assert observation.kind is SessionCostObservationKind.CHECKPOINTED
+    assert observation.task_block is None
     assert observation.interrupt_dispatches == ()
+    assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
+    assert not _sql_of_kind(conn, lambda sql: _GATE_INSERT(sql, None))
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
-    # The idle cost-limit block is the TASK_COST_LIMIT_REACHED condition's
-    # empty-target form: it classifies through the Level 3 catalog to the
-    # pending COST_LIMIT gate (F8b, issue #287) with no Interrupt.
-    (gate_insert,) = [params for sql, params in conn.executed if _GATE_INSERT(sql, None)]
-    assert gate_insert is not None and gate_insert[2] == "cost_limit"
 
 
 def _assert_barrier_precedes_task_lock(conn: ScriptedConnection) -> None:
@@ -683,3 +696,94 @@ def test_malformed_observations_and_gates_fail_closed_before_any_state() -> None
             workspace_id="x",  # type: ignore[arg-type]
             task_id=_TASK_ID,
         )
+
+
+# --- F8f: the effective cumulative threshold and the fail-closed race (issue #291) ---
+
+
+def _refreshed_task_row(threshold: Decimal) -> tuple[Any, ...]:
+    row = _budgeted_task_row()
+    return (*row[:17], threshold)
+
+
+def test_a_refreshed_threshold_is_the_enforced_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After a Continue set the effective cumulative threshold to $22 (the
+    # $10 frozen budget measured from the $12 observed spend), a $21.50
+    # observation is BELOW the refreshed allowance even though it exceeds
+    # the original budget: no block, truthful checkpoint.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(
+        conn,
+        monkeypatch,
+        task_row=_refreshed_task_row(Decimal("22.00")),
+        known_total=Decimal("21.50"),
+    )
+
+    below = _observe(conn, cost=Decimal("21.50"), send_in_flight=True)
+
+    assert below.kind is SessionCostObservationKind.CHECKPOINTED
+    assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
+
+    # A $22.50 observation crosses the refreshed allowance mid-turn and
+    # blocks: the fresh full Task-budget allowance repeats the rule.
+    crossed_conn = ScriptedConnection()
+    _wire_budgeted_task(
+        crossed_conn,
+        monkeypatch,
+        task_row=_refreshed_task_row(Decimal("22.00")),
+        known_total=Decimal("22.50"),
+        executions=[_open_execution()],
+    )
+
+    crossed = _observe(crossed_conn, cost=Decimal("22.50"), send_in_flight=True)
+
+    assert crossed.kind is SessionCostObservationKind.BLOCKED
+    assert crossed.task_block is not None
+    assert crossed.task_block.reason is TaskBlockReason.COST_LIMIT
+
+
+def test_the_pre_dispatch_gate_honors_the_refreshed_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The delivered-but-unwired pre-dispatch gate stays coherent with the
+    # effective threshold: below the refreshed allowance it permits.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(
+        conn,
+        monkeypatch,
+        task_row=_refreshed_task_row(Decimal("22.00")),
+        known_total=Decimal("21.50"),
+    )
+
+    decision = _gate(conn)
+
+    assert decision.kind is BudgetGateDecisionKind.ALLOW
+
+
+def test_an_attested_mid_turn_crossing_registers_an_unsettled_interrupt_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The representative turn-completion race shape: the mid-turn crossing
+    # composes the block and registers its Interrupt intent in the INITIAL
+    # unsettled state. Only the runtime's terminal interrupted-turn
+    # classification settles it (the existing E10b machinery); if the turn
+    # completes normally instead, the intent stays unsettled — which is what
+    # keeps the Owner Continue safely refused at the existing settlement
+    # check while the Owner resolves through the existing rules.
+    conn = ScriptedConnection()
+    _wire_budgeted_task(
+        conn,
+        monkeypatch,
+        known_total=Decimal("26.00"),
+        executions=[_open_execution()],
+    )
+
+    observation = _observe(conn, cost=Decimal("26.00"), send_in_flight=True)
+
+    assert observation.kind is SessionCostObservationKind.BLOCKED
+    assert observation.interrupt_dispatches != ()
+    intent_inserts = [sql for sql, _ in conn.executed if _INTENT_INSERT(sql, None)]
+    assert len(intent_inserts) == 1
+    assert "'unsettled'" in intent_inserts[0]

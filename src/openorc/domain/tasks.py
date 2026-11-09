@@ -209,6 +209,15 @@ class Task:
     # never a binary float, and never rewritten by a later Workspace default
     # edit or queued wakeup.
     authorized_task_budget_usd: Decimal | None = None
+    # The refreshed effective cumulative spending threshold (issue #291,
+    # F8f): committed atomically with the Owner Continue's guarded COST_LIMIT
+    # resolution as the latest retained known cumulative spend plus the
+    # frozen original budget. The default keeps every existing construction
+    # site truthful; NULL is the ordinary pre-Continue state whose
+    # enforcement threshold is exactly the frozen authorized budget. Carried
+    # as an exact decimal, never a binary float, and never rewritten by
+    # anything but a later fully guarded Continue of the next episode.
+    effective_cost_threshold_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
         _require_positive_int(self.github_issue_id, "github_issue_id")
@@ -307,6 +316,34 @@ class Task:
                 raise TaskDomainError(
                     "a ready_to_plan Task carries no authorized budget yet: the "
                     "authorization is captured only by a successful Owner Start"
+                )
+        # The refreshed effective cumulative spending threshold (issue #291,
+        # F8f): written only by the Owner Continue's guarded restore statement
+        # as the latest retained known spend plus the frozen original budget.
+        # A present value is a positive finite exact decimal and is coherent
+        # only with a present authorized budget; a ready_to_plan Task carries
+        # neither. The database CHECK mirrors the never-started NULL
+        # invariant.
+        if self.effective_cost_threshold_usd is not None:
+            if (
+                isinstance(self.effective_cost_threshold_usd, bool)
+                or not isinstance(self.effective_cost_threshold_usd, Decimal)
+                or not self.effective_cost_threshold_usd.is_finite()
+                or self.effective_cost_threshold_usd <= 0
+            ):
+                raise TaskDomainError(
+                    "Task.effective_cost_threshold_usd must be None or a positive "
+                    "finite USD amount (an exact decimal)"
+                )
+            if self.authorized_task_budget_usd is None:
+                raise TaskDomainError(
+                    "an effective cost threshold is coherent only with the "
+                    "Task's present authorized budget"
+                )
+            if self.status is TaskStatus.READY_TO_PLAN:
+                raise TaskDomainError(
+                    "a ready_to_plan Task carries no effective cost threshold: "
+                    "the refresh is committed only by a guarded Owner Continue"
                 )
 
 

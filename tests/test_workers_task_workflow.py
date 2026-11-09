@@ -1095,6 +1095,7 @@ def _durable_task_row(*, state_token: UUID, revision_id: UUID | None) -> tuple[A
         _OBSERVED,
         None,
         None,
+        None,
     )
 
 

@@ -291,6 +291,7 @@ def _task_row(workspace_id: Any) -> tuple[Any, ...]:
         _OBSERVED,
         None,
         None,
+        None,
     )
 
 
@@ -487,6 +488,11 @@ def test_bound_producer_attachment_keeps_the_snapshot_base_and_exact_identity() 
             connection_row,
             connection_row,
             (_SECRET,),
+            # The wired usage observer's start(): the subscription resolves
+            # the exact bound context before its backend effect.
+            [binding],
+            connection_row,
+            route_row,
             # The wired resolver's bound resolution:
             [binding],
             connection_row,
@@ -495,9 +501,14 @@ def test_bound_producer_attachment_keeps_the_snapshot_base_and_exact_identity() 
             [binding],
             connection_row,
             route_row,
+            # The lease-boundary usage checkpoint before the observer disposes:
+            [binding],
+            connection_row,
+            route_row,
         ]
     )
     backend = FakeClineSdkBackend()
+    backend.queue_get_accumulated_usage("ext-1", {"usage": None, "aggregateUsage": None})
     backend.queue_get_accumulated_usage("ext-1", {"usage": None, "aggregateUsage": None})
     factory = _ScriptedBackendFactory(backend)
 
@@ -1215,3 +1226,126 @@ def test_attachment_failures_never_leak_secret_or_endpoint_material(
         pass
     assert malformed not in str(refusal.value)
     assert malformed not in repr(refusal.value)
+
+
+# --- F8f: the live cost-enforcement observation lifecycle (issue #291) ---
+
+
+def test_bound_attachment_subscribes_the_usage_observer_and_disposes_at_the_lease_exit() -> None:
+    """The BOUND-phase attach owns one usage observer for the established
+    binding: subscribed best-effort at attach, checkpointed at the lease
+    boundary, and disposed idempotently on the lease exit — inside the same
+    single-disposal ownership as the backend."""
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    reference = _auth_reference(uuid.uuid4())
+    durable_snapshot = {
+        "adapter": "cline",
+        "configuration": _selected_config(base=_ORIGINAL_BASE),
+    }
+    binding = _binding_row(
+        workspace_id,
+        task_id,
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        snapshot=durable_snapshot,
+    )
+    connection_row = _connection_row(
+        workspace_id, connection_id, safe_config=_selected_config(), auth_reference=reference
+    )
+    route_row = _route_row(
+        workspace_id, connection_id, provider="configured-provider", model="configured-model"
+    )
+    read_group = ([binding], connection_row, route_row)
+    conn = ScriptedConnection(
+        [
+            # Composition: binding, connection validation, credential + Vault.
+            binding,
+            connection_row,
+            connection_row,
+            (_SECRET,),
+            # The observer's start(): the subscription's context resolution.
+            *read_group,
+            # The lease-boundary usage checkpoint before the observer disposes.
+            *read_group,
+        ]
+    )
+    backend = FakeClineSdkBackend()
+    backend.queue_get_accumulated_usage("ext-1", {"usage": None, "aggregateUsage": None})
+    factory = _ScriptedBackendFactory(backend)
+
+    with attach_cline_runtime(
+        _pool(conn),
+        **_attach_kwargs(
+            workspace_id,
+            task_id,
+            phase=ClineAttachmentPhase.BOUND,
+            external_session_id="ext-1",
+            working_directory=_ORIGINAL_BASE,
+            backend_factory=factory,
+        ),
+    ):
+        subscriptions = [call for call in backend.calls() if call.operation == "subscribe"]
+        assert len(subscriptions) == 1
+        assert subscriptions[0].session_id == "ext-1"
+        assert backend._subscriptions[0].active is True
+
+    # The lease exit deactivated the subscription exactly once and disposed
+    # the backend exactly once.
+    assert len(backend._subscriptions) == 1
+    assert backend._subscriptions[0].active is False
+    operations = [call.operation for call in backend.calls()]
+    assert operations.count("dispose") == 1
+    # The boundary checkpoint read the session's aggregate usage exactly once.
+    usage_reads = [call for call in backend.calls() if call.operation == "get_accumulated_usage"]
+    assert len(usage_reads) == 1
+
+
+def test_fresh_attachment_subscribes_no_usage_observer() -> None:
+    """A FRESH-phase attach has no established external session to observe
+    yet: later BOUND attachments own the established binding's usage."""
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    reference = _auth_reference(uuid.uuid4())
+    selected = _selected_config()
+    conn = ScriptedConnection(
+        [
+            _binding_row(workspace_id, task_id, connection_id),
+            _connection_row(
+                workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            _connection_row(
+                workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            (_SECRET,),
+            _binding_row(workspace_id, task_id, connection_id),
+            _connection_row(
+                workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
+            ),
+        ]
+    )
+    backend = FakeClineSdkBackend()
+    factory = _ScriptedBackendFactory(backend)
+
+    with attach_cline_runtime(
+        _pool(conn),
+        **_attach_kwargs(
+            workspace_id,
+            task_id,
+            phase=ClineAttachmentPhase.FRESH,
+            working_directory=_ORIGINAL_BASE,
+            backend_factory=factory,
+        ),
+    ) as attached:
+        assert attached.selected_configuration is not None
+
+    assert [call.operation for call in backend.calls() if call.operation == "subscribe"] == []

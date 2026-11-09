@@ -174,6 +174,7 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["updated_at"],
         values["terminal_cause"],
         None,
+        None,
     )
 
 

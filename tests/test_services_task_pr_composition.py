@@ -287,6 +287,7 @@ def _task_row(
         _OBSERVED,
         terminal_cause,
         None,
+        None,
     )
 
 

@@ -326,6 +326,7 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             _OBSERVED,
             None,
             None,
+            None,
         ),
         "session": (
             uuid.uuid4(),

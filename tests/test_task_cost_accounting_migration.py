@@ -74,3 +74,16 @@ def test_cost_limit_joins_the_block_reason_vocabulary_additively() -> None:
     assert "'cost_limit'" in text
     # No other vocabulary value is introduced by this migration.
     assert text.count("'") >= 26  # the thirteen quoted values plus prose
+
+
+def test_the_effective_cost_threshold_is_nullable_and_strictly_positive() -> None:
+    text = _migration_text("add_task_effective_cost_threshold")
+    assert "add column effective_cost_threshold_usd numeric" in text
+    # NULL is the ordinary pre-Continue state whose enforcement threshold is
+    # exactly the frozen authorized budget; zero and negative values are
+    # never valid allowances.
+    assert "effective_cost_threshold_usd is null" in text
+    assert "effective_cost_threshold_usd > 0" in text
+    # A never-started Task cannot carry a refreshed threshold: the grant
+    # commits only together with the guarded Continue restore.
+    assert "status <> 'ready_to_plan'" in text

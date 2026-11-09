@@ -115,6 +115,7 @@ _COST_LIMIT_KEYS = (
     "control",
     "reason_provenance",
     "observed_cost_usd",
+    "effective_threshold_usd",
     "authorized_budget_usd",
     "aggregate_includes_unobserved_sessions",
     "target_roles",
@@ -273,15 +274,17 @@ def _validate_cost_limit_evidence(evidence: Mapping[str, object]) -> None:
     _require_fixed_value(evidence, "control", "owner_abort")
     _require_fixed_value(evidence, "reason_provenance", "owner_authorized_task_budget")
     _require_non_empty_str(evidence, "observed_cost_usd")
+    _require_non_empty_str(evidence, "effective_threshold_usd")
     _require_non_empty_str(evidence, "authorized_budget_usd")
     if not isinstance(evidence.get("aggregate_includes_unobserved_sessions"), bool):
         raise BlockingCaseDomainError(
             "the aggregate_includes_unobserved_sessions blocking-case evidence must be a boolean"
         )
-    # The interrupted-activity facts may legitimately be empty: the
-    # cost-limit stop explicitly supports the idle form (BLOCKED_IDLE) where
-    # no runtime activity requires interruption, and the context then
-    # records empty role/session lists. Only their structure is enforced.
+    # The interrupted-activity facts record the exact session identities the
+    # block interrupted: the attested in-flight session plus any
+    # durably-eligible one (issue #291). Idle crossings compose no block at
+    # all, so a committed block always carries at least one target. Only
+    # their structure is enforced here.
     _require_str_list(evidence, "target_roles", allow_empty=True)
     _require_str_list(evidence, "task_agent_session_ids", allow_empty=True)
 

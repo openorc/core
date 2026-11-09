@@ -363,24 +363,22 @@ def _has_cost_limit_eligible_activity(
     transaction_pool: DatabasePool, *, task: Task, target: _InterruptTarget
 ) -> bool:
     """Whether the admitted session holds activity the standing budget decision
-    may interrupt (issue #240).
+    may interrupt (issue #240, as amended by issue #291).
 
-    The demonstrated in-flight facts apply in every phase: a Producer-bound
-    open Execution anchored to that exact session, a Reviewer-owned OPEN
-    ReviewLoop carrying an unfinalized iteration. The autonomous
-    ``planning`` phase additionally admits its bound Producer session:
-    plan production and the planning bootstrap run as admitted model-backed
-    interactions OUTSIDE any Execution, and E10b's own dispatch rule already
-    treats the autonomous phases as eligible against their appropriate
-    bound session without further proof — so a budget crossing during an
-    active planning turn still interrupts it. A genuinely idle pending
-    Owner gate (``waiting_for_owner``) gains nothing from any phase: only
+    Only the demonstrated in-flight facts apply in every phase: a
+    Producer-bound open Execution anchored to that exact session, a
+    Reviewer-owned OPEN ReviewLoop carrying an unfinalized iteration. The
+    autonomous ``planning`` phase no longer admits its bound Producer session
+    by status alone — PLANNING is never proof of an active turn (issue #291,
+    Owner-approved amendment); a live planning-turn crossing reaches the
+    blocking composition through the caller's attested in-flight session
+    instead, which the composition cross-checks against the durable READY
+    binding exactly like every other target. A genuinely idle pending Owner
+    gate (``waiting_for_owner``) gains nothing from any phase: only
     demonstrated in-flight activity is interruptible there, preserving the
     no-gratuitous-Interrupt behavior.
     """
-    if _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
-        return True
-    return task.status is TaskStatus.PLANNING and target.workflow_role is WorkflowRole.PRODUCER
+    return _has_admitted_in_flight_activity(transaction_pool, task=task, target=target)
 
 
 def _require_admitted_in_flight_activity(
@@ -575,18 +573,16 @@ class CostLimitBlockOutcomeKind(StrEnum):
     """The classified outcome of one persisted standing cost-limit blocking.
 
     ``blocked_with_interrupts`` composed the block and registered exact
-    Interrupt intents for durably in-flight sessions (dispatch happens
-    post-commit, outside any transaction); ``blocked_idle`` composed the
-    block for a Task with no durably demonstrable in-flight runtime
-    activity — no gratuitous Interrupt exists; ``already_blocked`` found the
+    Interrupt intents for the durably in-flight sessions plus the caller's
+    attested in-flight session (issue #291); ``already_blocked`` found the
     Task already blocked (one durable block stands, never a duplicate);
     ``not_applicable`` found no current budget-controlled blocking decision
-    under the lock (stale, foreign, archived, unauthorized, or the
-    threshold no longer true).
+    under the lock (stale, foreign, archived, unauthorized, the threshold no
+    longer true, or a crossing with no interruptible target — the
+    Owner-approved amendment never stops idle work).
     """
 
     BLOCKED_WITH_INTERRUPTS = "blocked_with_interrupts"
-    BLOCKED_IDLE = "blocked_idle"
     ALREADY_BLOCKED = "already_blocked"
     NOT_APPLICABLE = "not_applicable"
 
@@ -609,19 +605,28 @@ class OwnerAuthorizedCostLimitBlock:
 
 
 def _resolve_cost_limit_interrupt_targets(
-    transaction_pool: DatabasePool, *, task: Task
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    attested_in_flight_task_agent_session_id: UUID | None = None,
 ) -> tuple[_InterruptTarget, ...]:
-    """Derive the exact in-flight interrupt targets from durable facts only.
+    """Derive the exact in-flight interrupt targets from durable facts plus the
+    caller's attested in-flight session (issue #291).
 
     The cost-policy control never trusts Cline's transient status and never
     hardcodes a role list: every READY bound session of the Task — the
     role-agnostic binding read — is examined against the cost-path
-    eligibility facts (:func:`_has_cost_limit_eligible_activity`).
-    Sessions without eligible activity are never gratuitously interrupted:
-    where the Task is idle (typically at a pending Owner gate), the block
-    composes with zero targets — the Level 3-selected ``COST_LIMIT``
-    installation supersedes that pending ordinary gate truthfully (it stays pending
-    history, unusable while blocked) and no Interrupt exists, for F4b.
+    eligibility facts (:func:`_has_cost_limit_eligible_activity`). The live
+    observation path additionally attests the one session whose autonomous
+    model-backed turn is executing right now; that session is an interrupt
+    target exactly when the durable READY binding with that identity exists
+    (the same caller-attested-targets cross-check the Owner Abort command
+    performs) — a planning-phase turn carries no durable in-flight activity
+    fact, so the attestation is its only target proof. Sessions without
+    eligible activity or a cross-checked attestation are never gratuitously
+    interrupted: a threshold crossing with zero targets composes no block at
+    all (the caller classifies it ``not_applicable``), per the Owner-approved
+    no-idle-blocking amendment.
     """
     targets: list[_InterruptTarget] = []
     for session in session_records.list_task_agent_sessions(transaction_pool, task_id=task.id):
@@ -634,7 +639,10 @@ def _resolve_cost_limit_interrupt_targets(
             workflow_role=session.role,
             external_session_id=session.external_session_id,
         )
-        if _has_cost_limit_eligible_activity(transaction_pool, task=task, target=target):
+        if _has_cost_limit_eligible_activity(transaction_pool, task=task, target=target) or (
+            attested_in_flight_task_agent_session_id is not None
+            and session.id == attested_in_flight_task_agent_session_id
+        ):
             targets.append(target)
     return tuple(targets)
 
@@ -643,6 +651,7 @@ def _cost_limit_block_context(
     *,
     targets: tuple[_InterruptTarget, ...],
     observed_cost_usd: Decimal,
+    effective_threshold_usd: Decimal,
     authorized_budget_usd: Decimal,
     has_unobserved_sessions: bool,
 ) -> dict[str, object]:
@@ -650,15 +659,18 @@ def _cost_limit_block_context(
 
     It is still an Owner-authorized ``owner_abort`` control — the standing
     budget decision — so the context records that control identity, the
-    exact threshold facts (observed known total and authorized budget as
-    exact decimal strings; never floats), whether any constituent reading
-    was unknown, and the interrupted session identities. Never transcript
-    content, prompts, credentials, or raw provider errors.
+    exact threshold facts (the observed known total, the effective
+    cumulative threshold the block enforced, and the frozen original
+    authorized budget, all as exact decimal strings; never floats), whether
+    any constituent reading was unknown, and the interrupted session
+    identities. Never transcript content, prompts, credentials, or raw
+    provider errors.
     """
     return {
         "control": "owner_abort",
         "reason_provenance": "owner_authorized_task_budget",
         "observed_cost_usd": str(observed_cost_usd),
+        "effective_threshold_usd": str(effective_threshold_usd),
         "authorized_budget_usd": str(authorized_budget_usd),
         "aggregate_includes_unobserved_sessions": has_unobserved_sessions,
         "target_roles": [target.workflow_role.value for target in targets],
@@ -667,26 +679,39 @@ def _cost_limit_block_context(
 
 
 def apply_owner_authorized_cost_limit_block(
-    transaction_pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    attested_in_flight_task_agent_session_id: UUID | None = None,
 ) -> OwnerAuthorizedCostLimitBlock:
     """Compose the Owner-authorized cost-limit block inside an open transaction.
 
     The trusted internal admission of the persisted standing budget decision
-    (issue #240) — services only, never an API/RQ surface. Requires an open
-    composed transaction. The account-operational barrier is the FIRST lock
-    acquisition — the accountable Workspace Owner Profile is resolved from
-    durable Workspace state and its FOR KEY SHARE guard composes BEFORE the
-    Task row lock, preserving the profile_lifecycle_guard ordering contract
-    with account deletion — and Task scope, budget, and threshold are then
-    revalidated under that lock. Everything is verified against the locked
-    durable state: the current non-archived Task in the exact Workspace, its
-    non-NULL authorized budget, and the threshold re-checked against the
+    (issue #240, as amended by issue #291) — services only, never an API/RQ
+    surface. Requires an open composed transaction. The account-operational
+    barrier is the FIRST lock acquisition — the accountable Workspace Owner
+    Profile is resolved from durable Workspace state and its FOR KEY SHARE
+    guard composes BEFORE the Task row lock, preserving the
+    profile_lifecycle_guard ordering contract with account deletion — and
+    Task scope, budget, and threshold are then revalidated under that lock.
+    Everything is verified against the locked durable state: the current
+    non-archived Task in the exact Workspace, its non-NULL authorized
+    budget, and the effective cumulative threshold re-checked against the
     role-agnostic retained-cost aggregate. An already-blocked Task never
     receives a duplicate block, duplicate intent, or new interrupt; an
     archived/terminal, foreign, or unauthorized Task, a missing Workspace,
     and a threshold no longer true under the lock are classified no-ops,
     never errors. A detected cost-limit policy never silently settles or
     cancels existing work.
+
+    The optional ``attested_in_flight_task_agent_session_id`` is the live
+    observation path's attested in-flight session (issue #291): it is an
+    interrupt target exactly when the durable READY binding with that
+    identity exists. A threshold crossing whose resolved target set is empty
+    composes NO block and classifies ``not_applicable`` — the
+    Owner-approved amendment never stops idle work, and the next active
+    autonomous turn's live observation enforces instead.
     """
     # The accountable Owner is resolved from durable Workspace state before
     # any lock: the account-operational barrier below is therefore the first
@@ -710,11 +735,26 @@ def apply_owner_authorized_cost_limit_block(
         # pre-migration started Task): no policy decision is ever invented.
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
     costs = session_records.sum_task_retained_session_costs(transaction_pool, task_id=task_id)
-    if costs.known_total_usd is None or costs.known_total_usd < budget:
+    effective_threshold = (
+        locked.effective_cost_threshold_usd
+        if locked.effective_cost_threshold_usd is not None
+        else budget
+    )
+    if costs.known_total_usd is None or costs.known_total_usd < effective_threshold:
         # The threshold is not true under the lock: refuse to manufacture a
         # blocking decision from earlier, weaker observations.
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
-    targets = _resolve_cost_limit_interrupt_targets(transaction_pool, task=locked)
+    targets = _resolve_cost_limit_interrupt_targets(
+        transaction_pool,
+        task=locked,
+        attested_in_flight_task_agent_session_id=attested_in_flight_task_agent_session_id,
+    )
+    if not targets:
+        # The Owner-approved amendment (issue #291) never stops idle work: a
+        # crossing with no interruptible target composes no block. The
+        # checkpoint stands and the next active autonomous turn's live
+        # observation enforces instead.
+        return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
     plan = _apply_owner_authorized_block(
         transaction_pool,
         task=locked,
@@ -724,17 +764,14 @@ def apply_owner_authorized_cost_limit_block(
         context=_cost_limit_block_context(
             targets=targets,
             observed_cost_usd=costs.known_total_usd,
+            effective_threshold_usd=effective_threshold,
             authorized_budget_usd=budget,
             has_unobserved_sessions=costs.has_unobserved_sessions,
         ),
         targets=targets,
     )
     return OwnerAuthorizedCostLimitBlock(
-        kind=(
-            CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS
-            if targets
-            else CostLimitBlockOutcomeKind.BLOCKED_IDLE
-        ),
+        kind=CostLimitBlockOutcomeKind.BLOCKED_WITH_INTERRUPTS,
         task=plan.task,
         task_block=plan.task_block,
         interrupt_dispatches=tuple(

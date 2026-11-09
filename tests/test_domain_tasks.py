@@ -12,6 +12,7 @@ current-Execution pointer.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
@@ -214,6 +215,7 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "updated_at",
             "terminal_cause",
             "authorized_task_budget_usd",
+            "effective_cost_threshold_usd",
         }
     )
 
@@ -251,4 +253,43 @@ def test_a_terminal_cause_belongs_only_to_an_archived_cancelled_attempt() -> Non
     ):
         assert forbidden not in task_field_names(), (
             f"Task must not carry duplicated subordinate fact: {forbidden}"
+        )
+
+
+def test_an_effective_cost_threshold_is_positive_decimal_and_budget_coherent() -> None:
+    # The refreshed effective cumulative spending threshold (issue #291,
+    # F8f): a present value is a positive finite exact decimal, coherent
+    # only with a present authorized budget, and never carried by a
+    # ready_to_plan Task.
+    started = _task(status=TaskStatus.PLANNING, authorized_task_budget_usd=Decimal("10.00"))
+    assert started.authorized_task_budget_usd == Decimal("10.00")
+
+    refreshed = _task(
+        status=TaskStatus.PLANNING,
+        authorized_task_budget_usd=Decimal("10.00"),
+        effective_cost_threshold_usd=Decimal("22.00"),
+    )
+    assert refreshed.effective_cost_threshold_usd == Decimal("22.00")
+
+    with pytest.raises(TaskDomainError, match="positive"):
+        _task(
+            status=TaskStatus.PLANNING,
+            authorized_task_budget_usd=Decimal("10.00"),
+            effective_cost_threshold_usd=Decimal("0.00"),
+        )
+    with pytest.raises(TaskDomainError, match="exact decimal"):
+        _task(
+            status=TaskStatus.PLANNING,
+            authorized_task_budget_usd=Decimal("10.00"),
+            effective_cost_threshold_usd=0.5,
+        )
+    with pytest.raises(TaskDomainError, match="authorized budget"):
+        _task(
+            status=TaskStatus.PLANNING,
+            effective_cost_threshold_usd=Decimal("22.00"),
+        )
+    with pytest.raises(TaskDomainError, match="ready_to_plan"):
+        _task(
+            effective_cost_threshold_usd=Decimal("22.00"),
+            authorized_task_budget_usd=Decimal("10.00"),
         )

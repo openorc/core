@@ -364,6 +364,7 @@ def _task_row(state_fingerprint: str | None = None) -> tuple[Any, ...]:
         _OBSERVED,
         None,
         None,
+        None,
     )
 
 

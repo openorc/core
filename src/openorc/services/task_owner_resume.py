@@ -376,7 +376,7 @@ def _require_episode_interruptions_settled(
         if target.session.id not in settled_sessions:
             raise ConflictError(
                 "the addressed session's activity interruption is not positively "
-                "settled for this blocking episode; the resume action is refused"
+                "settled for this blocking episode; the guarded continuation action is refused"
             )
 
 
@@ -412,7 +412,7 @@ def _derive_resume_routing(
     if len(candidates) > 1:
         raise ConflictError(
             "multiple interrupted workflow operations claim continuation; the "
-            "durable state is unsafe and the resume action is refused"
+            "durable state is unsafe and the guarded continuation action is refused"
         )
     return candidates[0]
 
@@ -460,7 +460,7 @@ def _derive_producer_candidates(
         if execution.status is not ExecutionStatus.RUNNING:
             raise ConflictError(
                 "the open execution is not a running interrupted attempt; the "
-                "resume action cannot continue it"
+                "guarded continuation cannot continue it"
             )
         if execution.review_iteration_id is None:
             candidates.append(
@@ -594,7 +594,7 @@ def _require_no_independent_outstanding_work(
         if execution.status in _OPEN_EXECUTION_STATUSES and execution.id != subject_execution:
             raise ConflictError(
                 "the task carries an independently outstanding open execution; "
-                "the resume action is refused"
+                "the guarded continuation action is refused"
             )
     for claim in send_claim_records.list_task_runtime_send_claims(
         transaction_pool, task_id=task.id
@@ -602,13 +602,13 @@ def _require_no_independent_outstanding_work(
         if claim.status is TaskRuntimeSendClaimStatus.CLAIMED and claim.id != subject_claim:
             raise ConflictError(
                 "the task carries an independently outstanding dispatch claim; "
-                "the resume action is refused"
+                "the guarded continuation action is refused"
             )
     evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task.id)
     if evidence is not None and evidence.stage is None and not subject_bootstrap:
         raise ConflictError(
             "the task's planning bootstrap is independently outstanding; "
-            "the resume action is refused"
+            "the guarded continuation action is refused"
         )
     for loop in review_records.list_task_review_loops(
         transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
@@ -619,7 +619,7 @@ def _require_no_independent_outstanding_work(
             if iteration.outcome is None and iteration.id != subject_iteration:
                 raise ConflictError(
                     "the task carries an independently outstanding review turn; "
-                    "the resume action is refused"
+                    "the guarded continuation action is refused"
                 )
 
 
@@ -631,6 +631,97 @@ _OPEN_EXECUTION_STATUSES: Final[frozenset[ExecutionStatus]] = frozenset(
         ExecutionStatus.PAUSED_FOR_APPROVAL,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockedContinuationSubject:
+    """The guarded subject one blocked-Task Owner continuation addresses.
+
+    Everything the shared authorization prologue proved under one composed
+    transaction: the locked blocked Task under the caller's token, the exact
+    current pending exceptional gate of the addressed type, its sole
+    unresolved TaskBlock with coherent episode evidence, the exact
+    interrupted session targets re-derived from the block context, and the
+    one durably identifiable interrupted workflow operation with its result
+    routing. Ambiguous, stale, or unsafe state refuses before this subject
+    exists.
+    """
+
+    task: Task
+    gate: OwnerGate
+    block: TaskBlock
+    targets: tuple[_ResumeTarget, ...]
+    routing: _ResumeRouting
+
+
+def _authorize_blocked_task_continuation(
+    transaction_pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+    gate_type: OwnerGateType,
+    blocking_condition: Level3BlockingCondition,
+    action: str,
+) -> _BlockedContinuationSubject:
+    """The shared guarded authorization prologue of the blocked-Task Owner
+    continuations (issue #292 Resume; issue #291 COST_LIMIT Continue).
+
+    Called INSIDE an open composed transaction. One guard sequence proves
+    the account-operational barrier, the exact Workspace/Task Owner scope,
+    the locked non-archived ``blocked`` Task under the caller's token, the
+    exact current pending gate of the addressed type, its sole unresolved
+    TaskBlock with coherent episode evidence for the addressed blocking
+    condition, the exact interrupted session identities re-derived from the
+    block context against the durable READY bindings, every Interrupt intent
+    bound to that block positively SETTLED, no independently outstanding or
+    uncertain runtime work beyond the derived subject, and the result-routing
+    derivation — the one durably identifiable interrupted workflow operation
+    with its expected formal response family and existing result owner.
+    Ambiguous, stale, or unsafe state refuses the whole action: nothing is
+    applied and the Task stays ``blocked``.
+    """
+    require_account_operational(transaction_pool, profile_id=profile_id)
+    require_workspace_task(
+        transaction_pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.BLOCKED:
+        raise ConflictError(
+            f"the addressed task is not blocked; the {action} action is not available"
+        )
+    gate = require_current_owner_gate(transaction_pool, task=task, owner_gate_id=owner_gate_id)
+    if gate.gate_type is not gate_type:
+        raise ConflictError(f"only the current {gate_type.value} gate continues through this seam")
+    block = require_owner_gate_unresolved_block_subject(transaction_pool, task=task, gate=gate)
+    try:
+        validate_blocking_case_evidence(blocking_condition, block.context)
+    except BlockingCaseDomainError as error:
+        raise ConflictError(
+            f"the {blocking_condition.value} block carries incoherent episode evidence"
+        ) from error
+    targets = _resolve_resume_targets(transaction_pool, task=task, context=block)
+    _require_episode_interruptions_settled(
+        transaction_pool, task=task, block=block, targets=targets
+    )
+    routing = _derive_resume_routing(transaction_pool, task=task, targets=targets)
+    _require_no_independent_outstanding_work(transaction_pool, task=task, routing=routing)
+    return _BlockedContinuationSubject(
+        task=task, gate=gate, block=block, targets=targets, routing=routing
+    )
 
 
 def resume_task_after_abort(
@@ -670,57 +761,26 @@ def resume_task_after_abort(
             task_id=str(task_id),
         )
         with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
+            subject = _authorize_blocked_task_continuation(
                 transaction_pool,
                 profile_id=profile_id,
                 workspace_id=workspace_id,
                 task_id=task_id,
-            )
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
+                owner_gate_id=owner_gate_id,
                 expected_state_token=expected_state_token,
+                gate_type=OwnerGateType.OWNER_ABORT,
+                blocking_condition=Level3BlockingCondition.OWNER_ABORT_ISSUED,
+                action="resume",
             )
-            if task.status is not TaskStatus.BLOCKED:
-                raise ConflictError(
-                    "the addressed task is not blocked; the resume action is not available"
-                )
-            gate = require_current_owner_gate(
-                transaction_pool, task=task, owner_gate_id=owner_gate_id
-            )
-            if gate.gate_type is not OwnerGateType.OWNER_ABORT:
-                raise ConflictError("only the current owner_abort gate resumes through this seam")
-            block = require_owner_gate_unresolved_block_subject(
-                transaction_pool, task=task, gate=gate
-            )
-            try:
-                validate_blocking_case_evidence(
-                    Level3BlockingCondition.OWNER_ABORT_ISSUED, block.context
-                )
-            except BlockingCaseDomainError as error:
-                raise ConflictError(
-                    "the owner_abort block carries incoherent episode evidence"
-                ) from error
-            targets = _resolve_resume_targets(transaction_pool, task=task, context=block)
-            _require_episode_interruptions_settled(
-                transaction_pool, task=task, block=block, targets=targets
-            )
-            routing = _derive_resume_routing(transaction_pool, task=task, targets=targets)
-            _require_no_independent_outstanding_work(transaction_pool, task=task, routing=routing)
             resolution = resolve_gate_records(
                 transaction_pool,
-                owner_gate_id=gate.id,
+                owner_gate_id=subject.gate.id,
                 outcome=OwnerGateStatus.APPROVED,
-                expected_task_state_token=task.state_token,
+                expected_task_state_token=subject.task.state_token,
             )
             resolved_gate, gate_task = require_resolution_applied(resolution)
             resolved_block = block_records.resolve_task_block(
-                transaction_pool, task_block_id=block.id
+                transaction_pool, task_block_id=subject.block.id
             )
             if resolved_block is None:
                 raise StaleOperationError(
@@ -730,7 +790,7 @@ def resume_task_after_abort(
                 transaction_pool,
                 task_id,
                 expected_state_token=gate_task.state_token,
-                restored_status=routing.restore_status,
+                restored_status=subject.routing.restore_status,
             )
             if restored is None:
                 raise StaleOperationError(
@@ -748,12 +808,14 @@ def resume_task_after_abort(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                task_agent_session_id=routing.session.id,
-                task_block_id=block.id,
-                workflow_role=routing.session.role,
-                external_session_id=routing.session.external_session_id or "",
+                task_agent_session_id=subject.routing.session.id,
+                task_block_id=subject.block.id,
+                workflow_role=subject.routing.session.role,
+                external_session_id=subject.routing.session.external_session_id or "",
                 requested_by_profile_id=profile_id,
-                routing=routing.routing_context(authorized_state_token=restored.state_token),
+                routing=subject.routing.routing_context(
+                    authorized_state_token=restored.state_token
+                ),
             )
         return AuthorizedTaskResume(
             task=restored,

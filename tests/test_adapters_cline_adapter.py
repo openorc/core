@@ -3982,3 +3982,83 @@ def test_activity_surface_validates_its_inputs() -> None:
         adapter.read_activity_snapshot("")
     with pytest.raises(ValueError):
         adapter.read_activity_snapshot("   ")
+
+
+# --- F8f: the autonomous-turn in-flight marker (issue #291) ---
+
+
+def test_a_formal_family_send_marks_the_autonomous_turn_in_flight_and_clears_it() -> None:
+    """The marker is set exactly around the blocking model turn and cleared the
+    moment the backend call returns — the turn's completion at Cline."""
+    adapter, backend, _, session_id = _ready_adapter()
+    plan_payload = json.dumps(
+        {"type": "plan_result", "schema_version": 1, "plan": "Plan the flow."}
+    )
+    backend.queue_send(session_id, _completed(plan_payload))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    send_thread, send_errors = _call_in_thread(
+        lambda: adapter.send(session_id, "long running turn", expected_family=PLAN_RESULT_FAMILY)
+    )
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    # The turn is executing: the marker reads in-flight for the exact session.
+    assert adapter.has_send_in_flight(session_id) is True
+
+    release.set()
+    send_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not send_thread.is_alive()
+    assert send_errors == []
+    # Turn completion clears the marker on the method's exit path.
+    assert adapter.has_send_in_flight(session_id) is False
+
+
+def test_a_plain_text_send_never_marks_the_autonomous_turn_in_flight() -> None:
+    """The Owner-reviewer discussion's family-less send is never an
+    autonomous enforcement trigger."""
+    adapter, backend, _, session_id = _ready_adapter()
+    backend.queue_send(session_id, _completed("ordinary prose"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    send_thread, send_errors = _call_in_thread(lambda: adapter.send(session_id, "question"))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    assert adapter.has_send_in_flight(session_id) is False
+
+    release.set()
+    send_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not send_thread.is_alive()
+    assert send_errors == []
+    assert adapter.has_send_in_flight(session_id) is False
+
+
+def test_a_resumption_send_marks_the_autonomous_turn_in_flight_and_clears_it() -> None:
+    """A resumed turn is by definition an autonomous model-backed
+    continuation, so its blocking send carries the marker too."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, _completed("resumed commentary"))
+    entered, release = threading.Event(), threading.Event()
+    backend.gate_operation("send", session_id, entered=entered, release=release)
+
+    resume_thread, resume_errors = _call_in_thread(lambda: adapter.resume_activity(session_id))
+    assert entered.wait(timeout=_EVENT_TIMEOUT_SECONDS)
+
+    assert adapter.has_send_in_flight(session_id) is True
+
+    release.set()
+    resume_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
+    assert not resume_thread.is_alive()
+    assert resume_errors == []
+    assert adapter.has_send_in_flight(session_id) is False
+
+
+def test_a_session_this_instance_never_sent_reads_not_in_flight() -> None:
+    adapter, _, _, _ = _ready_adapter()
+
+    assert adapter.has_send_in_flight("cline-session-9") is False
+
+    with pytest.raises(ValueError):
+        adapter.has_send_in_flight("   ")

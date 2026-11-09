@@ -84,6 +84,7 @@ def _cost_limit(**overrides: Any) -> dict[str, Any]:
         "control": "owner_abort",
         "reason_provenance": "owner_authorized_task_budget",
         "observed_cost_usd": "12.50",
+        "effective_threshold_usd": "10.00",
         "authorized_budget_usd": "10.00",
         "aggregate_includes_unobserved_sessions": False,
         "target_roles": ["producer"],
@@ -199,8 +200,10 @@ def test_representative_supported_paths_classify_to_their_designated_cases() -> 
         )
         is OwnerGateType.COST_LIMIT
     )
-    # The idle cost-limit stop (BLOCKED_IDLE): empty interrupt facts are the
-    # legitimate standing-budget shape and keep the Type A case.
+    # An interrupted-activity-free evidence shape stays structurally valid:
+    # the amended contract composes no block for a target-free crossing, but
+    # the evidence validator still accepts the empty-list form for the
+    # committed-history shapes.
     assert (
         classify_blocking_case(
             Level3BlockingCondition.TASK_COST_LIMIT_REACHED,

@@ -424,9 +424,39 @@ class ClineAdapter(AgentRuntimeAdapter):
         self._abort_coordination = threading.Lock()
         self._abort_guards: dict[str, _AbortGuard] = {}
         self._reconstruction_active: set[str] = set()
+        # The live cost-enforcement marker (issue #291, F8f): per-session
+        # adapter-local evidence that one of THIS instance's autonomous
+        # model-backed turn sends is executing right now — a formal-family
+        # send, a realize_control turn, or a resumption send. It is OpenOrc's
+        # own synchronous call state, never persisted, never exported, and
+        # never workflow authority: the cost path consults it only to decide
+        # whether a live usage observation may attempt the standing
+        # Owner-authorized cost-limit block. Plain text sends (the
+        # Owner-reviewer discussion), snapshot reads, reconstructions, and
+        # settlements never set it.
+        self._autonomous_turn_in_flight: dict[str, bool] = {}
 
     def _lock_for(self, session_id: str) -> threading.Lock:
         return self._session_locks.setdefault(session_id, threading.Lock())
+
+    def has_send_in_flight(self, session_id: str) -> bool:
+        """Whether one of THIS adapter's autonomous model-backed turn sends is
+        executing right now for the exact session (issue #291, F8f).
+
+        The trusted read-only query behind the live cost-enforcement path:
+        the per-session marker is set only around the blocking turn send of
+        a formal-family send, a ``realize_control`` turn, or a resumption
+        send, and is cleared the moment that backend call returns — the
+        turn's completion at Cline. The value is OpenOrc's own synchronous
+        call state, never Cline bookkeeping or telemetry, and is never
+        persisted, exported, or treated as workflow authority; the cost path
+        consumes it only as the caller-attested in-flight evidence of
+        :func:`openorc.services.task_cost_accounting.observe_session_usage`.
+        A session this instance never sent to reads ``False``.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        return bool(self._autonomous_turn_in_flight.get(session_id, False))
 
     def _backend_operation(
         self,
@@ -579,12 +609,25 @@ class ClineAdapter(AgentRuntimeAdapter):
                 raise ValueError("session_id must be a non-empty string")
             if not isinstance(message, str) or not message.strip():
                 raise ValueError("message must be a non-empty string")
-            with self._lock_for(session_id):
-                raw = self._backend_operation(
-                    "send",
-                    lambda: self._backend.send(session_id, message),
-                    session_id=session_id,
-                )
+            # The autonomous-turn marker (issue #291) brackets exactly the
+            # blocking model turn: a formal-family send is an autonomous
+            # workflow interaction, while a plain text send (the
+            # Owner-reviewer discussion) never is. The flag is cleared the
+            # moment the backend call returns — turn completion at Cline —
+            # on every exit path.
+            autonomous_turn = expected_family is not None
+            if autonomous_turn:
+                self._autonomous_turn_in_flight[session_id] = True
+            try:
+                with self._lock_for(session_id):
+                    raw = self._backend_operation(
+                        "send",
+                        lambda: self._backend.send(session_id, message),
+                        session_id=session_id,
+                    )
+            finally:
+                if autonomous_turn:
+                    self._autonomous_turn_in_flight[session_id] = False
             candidate = _extract_reply_candidate(raw, phase="send")
             if expected_family is None:
                 return AgentTextResponse(text=candidate)
@@ -821,11 +864,20 @@ class ClineAdapter(AgentRuntimeAdapter):
                 # before the blocking SDK send, exactly so an Owner Abort can
                 # always register and reach the runtime while the resumed
                 # turn is in flight (the D6a capability).
-                raw = self._backend_operation(
-                    "send",
-                    lambda: self._backend.send(session_id, _RESUMPTION_INSTRUCTION),
-                    session_id=session_id,
-                )
+                # The autonomous-turn marker (issue #291) brackets the
+                # blocking resumption send: a resumed turn is by definition
+                # an autonomous model-backed continuation. The flag is
+                # cleared the moment the backend call returns — turn
+                # completion at Cline — on every exit path.
+                self._autonomous_turn_in_flight[session_id] = True
+                try:
+                    raw = self._backend_operation(
+                        "send",
+                        lambda: self._backend.send(session_id, _RESUMPTION_INSTRUCTION),
+                        session_id=session_id,
+                    )
+                finally:
+                    self._autonomous_turn_in_flight[session_id] = False
             candidate = _extract_reply_candidate(raw, phase="resume")
             if expected_family is None:
                 return AgentTextResponse(text=candidate)
