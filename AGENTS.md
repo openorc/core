@@ -46,6 +46,7 @@ Supabase persistence/auth integration and the official v1 Cline adapter belong i
 - Prompt customization may change instructions, never protocol, authority, session semantics, or state-machine meaning.
 - Repository review is bound to exact committed subjects; PR acceptance is exact-head addressed.
 - Stale workflow-changing operations must never be applied to newer subjects or gates.
+- Operational workflow failures use OpenOrc's shared Level 1 (authorized operation/evidence) → Level 2 (failure disposition) → Level 3 (exceptional blocking/gate selection) path where applicable. Do not invent per-workflow retry or escalation machinery; read `src/openorc/services/AGENTS.md` before adding a failure path. Direct controls/guards may enter Level 3 without Level 2.
 - Lost Task role sessions are blocking/recovery conditions; never silently replace them.
 - Cancellation ends OpenOrc orchestration without implicitly deleting or mutating GitHub issue/branch/commit/PR/CI artifacts.
 

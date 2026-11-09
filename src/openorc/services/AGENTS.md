@@ -21,6 +21,13 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
 - Expected failures use the typed ApplicationError vocabulary. Transports map those errors; service errors must carry only safe fields.
 
 ## Transactions and external I/O
+## Shared operational-failure path (Levels 1–3)
+
+- **Level 1 — operation service:** Execute one authorized logical attempt against its exact current Task/subject; own durable one-shot claims, typed failure/effect evidence, and ordinary success/finalization. Workflow-semantic/stale refusals are not automatically operational failures. Never treat an uncertain external effect as proven non-delivery.
+- **Level 2 — operational disposition:** For applicable workflow invocations, `task_workflow_operation_coordinator` carries the failing Level 1 invocation's own durable attempt identity, currentness, and typed evidence to `task_operational_failure_triage`. This service alone decides bounded, positively safe automatic retries as distinct authorized attempts or terminal escalation. Workers, adapters, and individual operation services do not select retries or manufacture replacement attempts.
+- **Level 3 — exceptional blocking:** `task_level3_blocking_catalog.classify_blocking_case` selects a supported Type A case from positively evidenced typed conditions, otherwise the Type B `BLOCK_RESOLUTION` diagnostic fallback. `task_exceptional_blocking` installs the exact TaskBlock, selected OwnerGate, BLOCKED transition, and audit atomically. Callers supply conditions/evidence, never choose gate types themselves. Direct blocking controls/guards (such as Owner Abort and cost enforcement) reach Level 3 without pretending to be Level 2 operational failures.
+- **Extension rule:** Before adding a new operational failure path, inspect `domain/operational_failures.py`, the Level 1 attempt-evidence seam, the coordinator's supported families/currentness checks, and triage eligibility. Registering a worker `OperationKind` alone does **not** enroll its failures in Level 2. Reuse these services; account explicitly for pre-invocation submission failures and uncertain effects rather than inventing local retry/blocking logic.
+
 
 - composed_transaction(pool) is the supported atomic-composition primitive for database-only service work. The explicit outer transaction is required; nested repository transactions become SAVEPOINTs.
 - Keep database transactions short.
