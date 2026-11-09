@@ -899,7 +899,7 @@ def _route_resumed_review_result_entry(
     monkeypatch: pytest.MonkeyPatch, *, record: Any, subject_id: Any, response: Any
 ) -> Any:
     return resume_module._route_resumed_review_result(
-        None,
+        _POOL,
         cast(Any, None),
         producer_runtime_factory=cast(Any, object()),
         reviewer_runtime_factory=cast(Any, object()),
@@ -1004,7 +1004,7 @@ def test_the_resumed_initial_plan_hands_the_next_review_dispatch(
     )
     record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
     outcome = resume_module._route_resumed_result(
-        None,
+        _POOL,
         cast(Any, None),
         bootstrap_composition=None,
         producer_runtime_factory=None,
@@ -1124,7 +1124,7 @@ def test_review_result_settlement_rolls_back_with_the_finalization(
     )
     with pytest.raises(StaleOperationError, match="no longer awaiting"):
         decision_module.finalize_planning_review_decision(
-            None,
+            _POOL,
             cast(Any, None),
             cast(Any, None),
             profile_id=_OWNER_PROFILE_ID,
@@ -1160,21 +1160,22 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
     exhausted_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
 
     settle_depths: list[bool] = []
+    tx_depth: list[int] = [0]
 
     from contextlib import contextmanager
 
     @contextmanager
     def _tracking_tx(pool):
-        decision_module._TX_DEPTH = getattr(decision_module, "_TX_DEPTH", 0) + 1
+        tx_depth[0] += 1
         try:
             yield pool
         finally:
-            decision_module._TX_DEPTH -= 1
+            tx_depth[0] -= 1
 
     monkeypatch.setattr(decision_module, "composed_transaction", _tracking_tx)
 
     def _settling_recorder(transaction_pool, **kwargs):
-        settle_depths.append(decision_module._TX_DEPTH > 0)
+        settle_depths.append(tx_depth[0] > 0)
         return finalized
 
     monkeypatch.setattr(
@@ -1185,9 +1186,7 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
     monkeypatch.setattr(
         decision_module,
         "settle_resumed_task_record",
-        lambda transaction_pool, *, task_resume_intent_id: settle_depths.append(
-            decision_module._TX_DEPTH > 0
-        ),
+        lambda transaction_pool, *, task_resume_intent_id: settle_depths.append(tx_depth[0] > 0),
     )
     monkeypatch.setattr(decision_module, "_require_runtime", lambda runtime: runtime)
     monkeypatch.setattr(decision_module, "_require_github", lambda github: github)
@@ -1237,7 +1236,7 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
     # depth assertion is about the composition boundary, not the outcome.
     with pytest.raises(ConflictError):
         decision_module.finalize_planning_review_decision(
-            None,
+            _POOL,
             cast(Any, None),
             cast(Any, None),
             profile_id=_OWNER_PROFILE_ID,
@@ -1247,9 +1246,7 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
             dispatch=TaskPlanningReviewDispatchOutcome(
                 review_loop=loop,
                 review_iteration=iteration,
-                review_result=ReviewResult(
-                    outcome="CHANGES_REQUESTED", summary="s", findings=()
-                ),
+                review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
                 reviewer_session=_session(),
             ),
             task_resume_intent_id=record.id,

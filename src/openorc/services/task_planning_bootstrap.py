@@ -1001,9 +1001,7 @@ def complete_resumed_bootstrap_prepare(
     )
 
 
-def producer_checkout_directory(
-    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
-) -> str:
+def producer_checkout_directory(pool: DatabasePool, *, workspace_id: UUID, task_id: UUID) -> str:
     """Derive the exact prepared Task checkout from the durable binding snapshot.
 
     The derivation rule this module owns (the original base's deterministic
