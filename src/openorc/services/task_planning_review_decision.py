@@ -113,7 +113,11 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.task_plan_production import TaskPlanProductionOutcome, revise_task_plan
+from openorc.services.task_plan_production import (
+    TaskPlanProductionOutcome,
+    revise_task_plan,
+    settle_resumed_task_record,
+)
 from openorc.services.task_planning_review_dispatch import TaskPlanningReviewDispatchOutcome
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
@@ -463,6 +467,7 @@ def _finalize_decision_transaction(
     task_id: UUID,
     expected_state_token: UUID,
     attempt: TaskPlanningReviewDispatchOutcome,
+    task_resume_intent_id: UUID | None = None,
 ) -> _Finalization:
     """Record the result and its durable next decision in one transaction.
 
@@ -532,6 +537,14 @@ def _finalize_decision_transaction(
             summary=attempt.review_result.summary,
             findings=_finding_documents(attempt.review_result),
         )
+        if task_resume_intent_id is not None:
+            # The F8g atomic settlement seam (issue #292): the resumed turn's
+            # result was durably processed by its original workflow owner in
+            # THIS transaction, so the resume record settles or the whole
+            # finalization rolls back together.
+            settle_resumed_task_record(
+                transaction_pool, task_resume_intent_id=task_resume_intent_id
+            )
         if finalized is None:
             # The conditional write rejected: the attempt was finalized (or
             # removed) concurrently. A duplicate or raced delivery never
@@ -704,6 +717,7 @@ def finalize_planning_review_decision(
     expected_state_token: UUID,
     dispatch: TaskPlanningReviewDispatchOutcome,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    task_resume_intent_id: UUID | None = None,
 ) -> TaskPlanningReviewDecisionOutcome:
     """Finalize one reserved planning review and commit its durable decision.
 
@@ -748,6 +762,7 @@ def finalize_planning_review_decision(
             task_id=task_id,
             expected_state_token=expected_state_token,
             attempt=attempt,
+            task_resume_intent_id=task_resume_intent_id,
         )
 
         # --- Phase 2: the external consequence, with NO transaction open. ---

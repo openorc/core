@@ -701,6 +701,10 @@ def _require_review_dispatches_accounted(
             continue
         if _review_iteration_positively_accounted(transaction_pool, task=task, iteration=latest):
             continue
+        if _review_iteration_resume_lineage_accounted(
+            transaction_pool, task=task, iteration=latest
+        ):
+            continue
         raise ConflictError(
             "the task has an outstanding reviewer review dispatch; its formal "
             "result is unaccounted and the cancellation is unsafe"
@@ -1630,3 +1634,71 @@ def _resume_episode_lineage_sessions(
         if intent.status is TaskInterruptIntentStatus.SETTLED
         and intent.task_block_id == record.task_block_id
     }
+
+
+def _review_iteration_resume_lineage_accounted(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    iteration: ReviewIteration,
+) -> bool:
+    """Whether the iteration is accounted through its Resume lineage (F8g).
+
+    The narrow composition the Owner Resume failure path requires: a
+    terminal ``non_delivered`` session-resume record whose immutable routing
+    names EXACTLY this iteration as its continued subject, whose failure
+    episode is terminally escalated with the positive pre-effect
+    non-delivery evidence on the escalated block, and whose ORIGINAL
+    OWNER_ABORT episode is positively settled for the record's own session —
+    the interrupted review interaction the Owner's Resume was authorized to
+    continue never reached the runtime. Every other state vetoes: a
+    dispatched or uncertain record is potentially active work, and any
+    unrelated review work keeps its own accounting.
+    """
+    for record in intent_records.list_task_resume_intents(transaction_pool, task_id=task.id):
+        if record.workspace_id != task.workspace_id:
+            continue
+        routing = record.routing
+        if routing.get("subject_kind") != "review_iteration" or routing.get("subject_id") != str(
+            iteration.id
+        ):
+            continue
+        if record.status is not TaskResumeIntentStatus.NON_DELIVERED:
+            return False
+        episode = failure_records.get_operational_failure_episode_by_original_attempt(
+            transaction_pool,
+            original_attempt_kind=OriginalAttemptKind.OWNER_CONTROL_INTENT,
+            original_attempt_id=record.id,
+        )
+        if (
+            episode is None
+            or episode.workspace_id != task.workspace_id
+            or episode.task_id != task.id
+            or episode.escalated_task_block_id is None
+        ):
+            return False
+        escalated_block = block_records.get_task_block(
+            transaction_pool, task_block_id=episode.escalated_task_block_id
+        )
+        if (
+            escalated_block is None
+            or escalated_block.workspace_id != task.workspace_id
+            or escalated_block.task_id != task.id
+        ):
+            return False
+        context = escalated_block.context
+        if (
+            context.get("failure_episode_id") != str(episode.id)
+            or context.get("effect_evidence") != FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED.value
+            or context.get("original_attempt_id") != str(record.id)
+        ):
+            return False
+        intents = intent_records.list_task_interrupt_intents(transaction_pool, task_id=task.id)
+        settled = any(
+            intent.status is TaskInterruptIntentStatus.SETTLED
+            and intent.task_block_id == record.task_block_id
+            and intent.task_agent_session_id == record.task_agent_session_id
+            for intent in intents
+        )
+        return settled
+    return False

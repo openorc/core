@@ -999,3 +999,26 @@ def complete_resumed_bootstrap_prepare(
         checkout_directory=checkout_directory,
         attempt_evidence=None,
     )
+
+
+def producer_checkout_directory(
+    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> str:
+    """Derive the exact prepared Task checkout from the durable binding snapshot.
+
+    The derivation rule this module owns (the original base's deterministic
+    per-Task directory, fail-closed snapshot recovery) exposed for the F8g
+    resume routing's Producer attachments: the workflow's Producer sessions
+    address exactly the isolated checkout the bootstrap prepared, never a
+    substituted path.
+    """
+    binding = get_task_agent_session(pool, task_id=task_id, role=WorkflowRole.PRODUCER)
+    if binding is None or binding.workspace_id != workspace_id:
+        raise ConflictError(
+            "the requested producer session binding is not available in this workspace"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        base = _producer_snapshot_repository_base(
+            transaction_pool, binding, workspace_id=workspace_id
+        )
+    return f"{base}/{task_id}"

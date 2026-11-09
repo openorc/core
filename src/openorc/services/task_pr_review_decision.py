@@ -133,6 +133,7 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_plan_production import settle_resumed_task_record
 from openorc.services.task_pr_remediation import (
     ReviewerRuntimeAttachmentFactory,
     route_pr_remediation,
@@ -447,6 +448,7 @@ def _finalize_pr_decision_transaction(
     task_id: UUID,
     expected_state_token: UUID,
     dispatch: TaskPrReviewDispatchOutcome,
+    task_resume_intent_id: UUID | None = None,
 ) -> tuple:
     """Finalize the reserved PR attempt and commit the next decision atomically.
 
@@ -533,6 +535,14 @@ def _finalize_pr_decision_transaction(
             summary=dispatch.review_result.summary,
             findings=_finding_documents(dispatch.review_result),
         )
+        if task_resume_intent_id is not None:
+            # The F8g atomic settlement seam (issue #292): the resumed turn's
+            # result was durably processed by its original workflow owner in
+            # THIS transaction, so the resume record settles or the whole
+            # finalization rolls back together.
+            settle_resumed_task_record(
+                transaction_pool, task_resume_intent_id=task_resume_intent_id
+            )
         if finalized is None:
             raise StaleOperationError(
                 "the review attempt is no longer unfinalized; the decision is stale"
@@ -688,6 +698,7 @@ def finalize_pr_review_decision(
     expected_state_token: UUID,
     dispatch: TaskPrReviewDispatchOutcome,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    task_resume_intent_id: UUID | None = None,
 ) -> TaskPrReviewDecisionOutcome:
     """Record the bounded PR review decision atomically and commit its effect.
 
@@ -741,6 +752,7 @@ def finalize_pr_review_decision(
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
+            task_resume_intent_id=task_resume_intent_id,
             expected_state_token=expected_state_token,
             dispatch=dispatch,
         )

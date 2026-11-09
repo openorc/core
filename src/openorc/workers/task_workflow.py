@@ -81,6 +81,7 @@ from openorc.services.task_implementation_authorization import (
 )
 from openorc.services.task_owner_resume import (
     AuthorizedTaskResume,
+    SessionResumeFollowUp,
     dispatch_authorized_task_resume,
 )
 from openorc.services.task_plan_production import (
@@ -1016,7 +1017,7 @@ def _compose_task_session_resume(
     github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
-    dispatch_authorized_task_resume(
+    outcome = dispatch_authorized_task_resume(
         pool,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -1033,6 +1034,29 @@ def _compose_task_session_resume(
         bootstrap_composition=dependencies.task_bootstrap_runtime_composition(),
         attempt_evidence=attempt_evidence,
     )
+    if outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH:
+        if outcome.follow_up_state_token is None:
+            raise ConflictError("the planning-review follow-up carried no continuation token")
+        # The ordinary authorized continuation of a produced planning
+        # revision: the fresh post-production token authorizes the next
+        # planning REVIEW round, submitted through the same seam the ordinary
+        # planning handlers use. Submission outcomes are transport
+        # information only, never Task truth.
+        _submit_continuation(
+            dependencies,
+            OperationInvocation(
+                kind=OperationKind.TASK_PLANNING_REVIEW,
+                payload=TaskPlanningReviewPayload(
+                    task=TaskScope(
+                        workspace_id=payload.task.workspace_id,
+                        task_id=payload.task.task_id,
+                        role=WorkflowRoleRef.REVIEWER,
+                    ),
+                    profile_id=payload.profile_id,
+                    expected_state_token=str(outcome.follow_up_state_token),
+                ),
+            ),
+        )
 
 
 # --- the single composition seam and the production handler table ------------

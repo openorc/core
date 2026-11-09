@@ -144,6 +144,7 @@ from openorc.protocol.models import (
     WorkspaceResult,
 )
 from openorc.services import event_coordination
+from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
@@ -159,7 +160,10 @@ from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_authorized_implementation_execution import (
     complete_resumed_implementation_result,
 )
-from openorc.services.task_implementation_authorization import require_resolution_applied
+from openorc.services.task_implementation_authorization import (
+    open_implementation_authorization,
+    require_resolution_applied,
+)
 from openorc.services.task_plan_production import (
     complete_resumed_initial_plan_result,
     complete_resumed_plan_revision_result,
@@ -168,8 +172,10 @@ from openorc.services.task_plan_production import (
 from openorc.services.task_planning_bootstrap import (
     TaskBootstrapRuntimeComposition,
     complete_resumed_bootstrap_prepare,
+    producer_checkout_directory,
 )
 from openorc.services.task_planning_review_decision import (
+    PlanningReviewDecision,
     TaskPlanningReviewDispatchOutcome,
     finalize_planning_review_decision,
 )
@@ -757,6 +763,20 @@ def resume_task_after_abort(
         )
 
 
+class SessionResumeFollowUp(StrEnum):
+    """The ordinary workflow follow-up one completed resume hands off.
+
+    The resumed planning subjects produce their revision and hand the next
+    planning REVIEW dispatch to the ordinary operation catalog — the same
+    authorized continuation the ordinary planning handlers submit.
+    Presentation, exhaustion, and remediation continuations complete inside
+    the routing itself.
+    """
+
+    NONE = "none"
+    PLANNING_REVIEW_DISPATCH = "planning_review_dispatch"
+
+
 class SessionResumeOutcomeKind(StrEnum):
     """The typed outcome of one authorized session-resume continuation."""
 
@@ -781,6 +801,8 @@ class SessionResumeOutcome:
     kind: SessionResumeOutcomeKind
     resume: TaskResumeIntent
     detail: str
+    follow_up: SessionResumeFollowUp = SessionResumeFollowUp.NONE
+    follow_up_state_token: UUID | None = None
 
 
 def _resume_routing_from_record(
@@ -994,22 +1016,23 @@ def dispatch_authorized_task_resume(
                     "resumed turn is never replayed"
                 ) from error
 
-            # --- Boundary C: route the resumed formal result through the
-            # original workflow operation's existing completion logic. ---
-            return _route_resumed_result(
-                pool,
-                attached_adapter,
-                github,
-                bootstrap_composition=bootstrap_composition,
-                producer_runtime_factory=producer_runtime_factory,
-                reviewer_runtime_factory=reviewer_runtime_factory,
-                record=record,
-                operation=operation,
-                subject_id=subject_id,
-                authorized_token=authorized_token,
-                response=response,
-                attempt_evidence=attempt_evidence,
-            )
+        # --- Boundary C: route the resumed formal result through the
+        # original workflow operation's existing completion logic. The
+        # dispatch adapter's lease is closed first; each route attaches the
+        # exact role/session runtime its ordinary continuation addresses. ---
+        return _route_resumed_result(
+            pool,
+            github,
+            bootstrap_composition=bootstrap_composition,
+            producer_runtime_factory=producer_runtime_factory,
+            reviewer_runtime_factory=reviewer_runtime_factory,
+            record=record,
+            operation=operation,
+            subject_id=subject_id,
+            authorized_token=authorized_token,
+            response=response,
+            attempt_evidence=attempt_evidence,
+        )
 
 
 def _settle_resume_record(pool: DatabasePool, *, task_resume_intent_id: UUID) -> TaskResumeIntent:
@@ -1031,7 +1054,6 @@ def _settle_resume_record(pool: DatabasePool, *, task_resume_intent_id: UUID) ->
 
 def _route_resumed_result(
     pool: DatabasePool,
-    adapter: AgentRuntimeAdapter,
     github: GitHubAppClient,
     *,
     bootstrap_composition: TaskBootstrapRuntimeComposition | None,
@@ -1050,139 +1072,49 @@ def _route_resumed_result(
     typed resumed result to the owning service's EXISTING completion logic —
     the same Execution, dispatch claim, ReviewIteration, or bootstrap claim
     the interruption suspended — and the record settles exactly once with
-    the processed result. Post-completion continuations the ordinary flow
-    performs (the PR-authorization presentation, the remediation chain, the
-    bootstrap's first PLAN dispatch) re-enter their existing services with
-    the completed subjects.
+    the processed result (inside the owning completion's own transaction
+    where the service exposes that seam). Each route then re-enters the
+    ordinary workflow continuation the completed subject requires, with the
+    exact role/session runtime attachment that continuation addresses: the
+    planning subjects hand the next planning REVIEW dispatch to the ordinary
+    operation catalog, an accepted planning review presents the exact-plan
+    IMPLEMENTATION_AUTHORIZATION gate, and the remediation chain re-enters
+    its ordinary fresh exact-head verification and re-dispatch.
     """
     profile_id = record.requested_by_profile_id
     if operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION:
-        if not isinstance(response, ImplementationResult):
-            raise ExternalOperationUncertainError(
-                "the resumed implementation turn did not return the validated "
-                "implementation result family; the continuation remains unresolved"
-            )
-        with composed_transaction(pool) as transaction_pool:
-            _task, execution = complete_resumed_implementation_result(
-                transaction_pool,
-                workspace_id=record.workspace_id,
-                task_id=record.task_id,
-                expected_state_token=authorized_token,
-                execution_id=subject_id,
-                result=response,
-            )
-            recorded = record_task_resume_intent_outcome(
-                transaction_pool,
-                task_resume_intent_id=record.id,
-                status=TaskResumeIntentStatus.SETTLED,
-                outcome={"result": "processed"},
-            )
-            if recorded is None:
-                raise StaleOperationError(
-                    "the session-resume record could not settle with its processed "
-                    "result; the completion composition is stale"
-                )
-        if attempt_evidence is not None:
-            attempt_evidence.record_attempt(
-                family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
-                original_attempt_kind=OriginalAttemptKind.EXECUTION,
-                original_attempt_id=execution.id,
-                phase="resumed_implementation_presentation",
-            )
-        open_pr_authorization(
+        return _complete_resumed_implementation_route(
             pool,
             github,
-            profile_id=profile_id,
-            workspace_id=record.workspace_id,
-            task_id=record.task_id,
-            expected_state_token=_task.state_token,
-            execution_id=execution.id,
-        )
-        return SessionResumeOutcome(
-            kind=SessionResumeOutcomeKind.COMPLETED,
-            resume=recorded,
-            detail="implementation_completed",
-        )
-    if operation is PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION:
-        if not isinstance(response, ImplementationResult):
-            raise ExternalOperationUncertainError(
-                "the resumed remediation turn did not return the validated "
-                "implementation result family; the continuation remains unresolved"
-            )
-        if reviewer_runtime_factory is None:
-            raise InvalidCommandError(
-                "the remediation continuation carries no reviewer attachment factory"
-            )
-        with composed_transaction(pool) as transaction_pool:
-            _task, execution = complete_resumed_pr_remediation_result(
-                transaction_pool,
-                workspace_id=record.workspace_id,
-                task_id=record.task_id,
-                expected_state_token=authorized_token,
-                execution_id=subject_id,
-                result=response,
-            )
-            recorded = record_task_resume_intent_outcome(
-                transaction_pool,
-                task_resume_intent_id=record.id,
-                status=TaskResumeIntentStatus.SETTLED,
-                outcome={"result": "processed"},
-            )
-            if recorded is None:
-                raise StaleOperationError(
-                    "the session-resume record could not settle with its processed "
-                    "result; the completion composition is stale"
-                )
-        continue_resumed_pr_remediation_chain(
-            pool,
-            github,
-            cast(ReviewerRuntimeAttachmentFactory, reviewer_runtime_factory),
-            workspace_id=record.workspace_id,
-            task_id=record.task_id,
-            profile_id=profile_id,
-            finalized_execution=execution,
-            result=response,
-        )
-        return SessionResumeOutcome(
-            kind=SessionResumeOutcomeKind.COMPLETED,
-            resume=recorded,
-            detail="remediation_completed",
-        )
-    if operation is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE:
-        if not isinstance(response, WorkspaceResult):
-            raise ExternalOperationUncertainError(
-                "the resumed bootstrap turn did not return the validated "
-                "workspace result family; the continuation remains unresolved"
-            )
-        if bootstrap_composition is None:
-            raise InvalidCommandError("the bootstrap continuation carries no runtime composition")
-        preparation = complete_resumed_bootstrap_prepare(
-            pool,
-            bootstrap_composition,
-            workspace_id=record.workspace_id,
-            profile_id=profile_id,
-            task_id=record.task_id,
-            expected_state_token=authorized_token,
-            result=response,
-        )
-        recorded = _settle_resume_record(pool, task_resume_intent_id=record.id)
-        produce_initial_task_plan(
-            pool,
-            adapter,
-            github,
-            workspace_id=record.workspace_id,
-            task_id=record.task_id,
-            profile_id=profile_id,
-            preparation=preparation,
+            record=record,
+            subject_id=subject_id,
+            authorized_token=authorized_token,
+            response=response,
             attempt_evidence=attempt_evidence,
         )
-        return SessionResumeOutcome(
-            kind=SessionResumeOutcomeKind.COMPLETED,
-            resume=recorded,
-            detail="bootstrap_prepared",
+    if operation is PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION:
+        return _complete_resumed_remediation_route(
+            pool,
+            github,
+            reviewer_runtime_factory=reviewer_runtime_factory,
+            record=record,
+            subject_id=subject_id,
+            authorized_token=authorized_token,
+            response=response,
+        )
+    if operation is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE:
+        return _complete_resumed_bootstrap_route(
+            pool,
+            github,
+            bootstrap_composition=bootstrap_composition,
+            record=record,
+            authorized_token=authorized_token,
+            response=response,
+            profile_id=profile_id,
+            attempt_evidence=attempt_evidence,
         )
     if operation is PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH:
-        complete_resumed_initial_plan_result(
+        outcome = complete_resumed_initial_plan_result(
             pool,
             github,
             workspace_id=record.workspace_id,
@@ -1196,9 +1128,11 @@ def _route_resumed_result(
             kind=SessionResumeOutcomeKind.COMPLETED,
             resume=record,
             detail="initial_plan_committed",
+            follow_up=SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH,
+            follow_up_state_token=outcome.task.state_token,
         )
     if operation is PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH:
-        complete_resumed_plan_revision_result(
+        outcome = complete_resumed_plan_revision_result(
             pool,
             github,
             workspace_id=record.workspace_id,
@@ -1212,11 +1146,12 @@ def _route_resumed_result(
             kind=SessionResumeOutcomeKind.COMPLETED,
             resume=record,
             detail="plan_revision_committed",
+            follow_up=SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH,
+            follow_up_state_token=outcome.task.state_token,
         )
     if operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
         return _route_resumed_review_result(
             pool,
-            adapter,
             github,
             producer_runtime_factory=producer_runtime_factory,
             reviewer_runtime_factory=reviewer_runtime_factory,
@@ -1229,19 +1164,189 @@ def _route_resumed_result(
     raise ConflictError("the session-resume record's operation is not a supported continuation")
 
 
-def _require_plan_result(response: object) -> PlanResult:
-    """Require the resumed planning turn's validated plan result."""
-    if not isinstance(response, PlanResult):
+def _complete_resumed_implementation_route(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    record: TaskResumeIntent,
+    subject_id: UUID,
+    authorized_token: UUID,
+    response: object,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> SessionResumeOutcome:
+    """Complete the resumed implementation and present its PR-authorization gate."""
+    if not isinstance(response, ImplementationResult):
         raise ExternalOperationUncertainError(
-            "the resumed planning turn did not return the validated plan result "
-            "family; the continuation remains unresolved"
+            "the resumed implementation turn did not return the validated "
+            "implementation result family; the continuation remains unresolved"
         )
-    return response
+    with composed_transaction(pool) as transaction_pool:
+        task, execution = complete_resumed_implementation_result(
+            transaction_pool,
+            workspace_id=record.workspace_id,
+            task_id=record.task_id,
+            expected_state_token=authorized_token,
+            execution_id=subject_id,
+            result=response,
+        )
+        recorded = record_task_resume_intent_outcome(
+            transaction_pool,
+            task_resume_intent_id=record.id,
+            status=TaskResumeIntentStatus.SETTLED,
+            outcome={"result": "processed"},
+        )
+        if recorded is None:
+            raise StaleOperationError(
+                "the session-resume record could not settle with its processed "
+                "result; the completion composition is stale"
+            )
+    if attempt_evidence is not None:
+        attempt_evidence.record_attempt(
+            family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=execution.id,
+            phase="resumed_implementation_presentation",
+        )
+    open_pr_authorization(
+        pool,
+        github,
+        profile_id=record.requested_by_profile_id,
+        workspace_id=record.workspace_id,
+        task_id=record.task_id,
+        expected_state_token=task.state_token,
+        execution_id=execution.id,
+    )
+    return SessionResumeOutcome(
+        kind=SessionResumeOutcomeKind.COMPLETED,
+        resume=recorded,
+        detail="implementation_completed",
+    )
+
+
+def _complete_resumed_remediation_route(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory | None,
+    record: TaskResumeIntent,
+    subject_id: UUID,
+    authorized_token: UUID,
+    response: object,
+) -> SessionResumeOutcome:
+    """Complete the resumed remediation and re-enter its ordinary chain."""
+    if not isinstance(response, ImplementationResult):
+        raise ExternalOperationUncertainError(
+            "the resumed remediation turn did not return the validated "
+            "implementation result family; the continuation remains unresolved"
+        )
+    if reviewer_runtime_factory is None:
+        raise InvalidCommandError(
+            "the remediation continuation carries no reviewer attachment factory"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        _task, execution = complete_resumed_pr_remediation_result(
+            transaction_pool,
+            workspace_id=record.workspace_id,
+            task_id=record.task_id,
+            expected_state_token=authorized_token,
+            execution_id=subject_id,
+            result=response,
+        )
+        recorded = record_task_resume_intent_outcome(
+            transaction_pool,
+            task_resume_intent_id=record.id,
+            status=TaskResumeIntentStatus.SETTLED,
+            outcome={"result": "processed"},
+        )
+        if recorded is None:
+            raise StaleOperationError(
+                "the session-resume record could not settle with its processed "
+                "result; the completion composition is stale"
+            )
+    continue_resumed_pr_remediation_chain(
+        pool,
+        github,
+        reviewer_runtime_factory,
+        workspace_id=record.workspace_id,
+        task_id=record.task_id,
+        profile_id=record.requested_by_profile_id,
+        finalized_execution=execution,
+        result=response,
+    )
+    return SessionResumeOutcome(
+        kind=SessionResumeOutcomeKind.COMPLETED,
+        resume=recorded,
+        detail="remediation_completed",
+    )
+
+
+def _complete_resumed_bootstrap_route(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    bootstrap_composition: TaskBootstrapRuntimeComposition | None,
+    record: TaskResumeIntent,
+    authorized_token: UUID,
+    response: object,
+    profile_id: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> SessionResumeOutcome:
+    """Complete the resumed bootstrap PREPARE and produce the first PLAN.
+
+    The planning checkout transition settles inside the shared tail; the
+    first PLAN dispatch then runs through the ordinary E2 service in the
+    prepared Producer session's checkout attachment — the same coupled
+    in-process sequence the ordinary bootstrap continuation executes — and
+    the fresh post-production token hands the next planning REVIEW dispatch
+    to the ordinary operation catalog.
+    """
+    if not isinstance(response, WorkspaceResult):
+        raise ExternalOperationUncertainError(
+            "the resumed bootstrap turn did not return the validated "
+            "workspace result family; the continuation remains unresolved"
+        )
+    if bootstrap_composition is None:
+        raise InvalidCommandError("the bootstrap continuation carries no runtime composition")
+    preparation = complete_resumed_bootstrap_prepare(
+        pool,
+        bootstrap_composition,
+        workspace_id=record.workspace_id,
+        profile_id=profile_id,
+        task_id=record.task_id,
+        expected_state_token=authorized_token,
+        result=response,
+    )
+    recorded = _settle_resume_record(pool, task_resume_intent_id=record.id)
+    with attach_cline_runtime(
+        pool,
+        workspace_id=record.workspace_id,
+        task_id=record.task_id,
+        role=WorkflowRole.PRODUCER,
+        phase=ClineAttachmentPhase.BOUND,
+        external_session_id=record.external_session_id,
+        working_directory=preparation.producer_checkout_directory,
+    ) as attached:
+        production = produce_initial_task_plan(
+            pool,
+            attached.adapter,
+            github,
+            workspace_id=record.workspace_id,
+            task_id=record.task_id,
+            profile_id=profile_id,
+            preparation=preparation,
+            attempt_evidence=attempt_evidence,
+        )
+    return SessionResumeOutcome(
+        kind=SessionResumeOutcomeKind.COMPLETED,
+        resume=recorded,
+        detail="bootstrap_prepared",
+        follow_up=SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH,
+        follow_up_state_token=production.task.state_token,
+    )
 
 
 def _route_resumed_review_result(
     pool: DatabasePool,
-    adapter: AgentRuntimeAdapter,
     github: GitHubAppClient,
     *,
     producer_runtime_factory: ProducerRuntimeAttachmentFactory | None,
@@ -1257,14 +1362,24 @@ def _route_resumed_review_result(
     The reserved unfinalized ReviewIteration and its OPEN loop are re-derived
     from durable state, the resumed turn's validated ``ReviewResult``
     completes the SAME iteration, and the ordinary decision entry records the
-    result and commits its durable next decision — the planning decision or
-    the PR decision with its remediation/re-dispatch chain, exactly as the
-    ordinary dispatch→decision handoff does.
+    result and commits its durable next decision — settling the resume record
+    atomically inside that finalization transaction. The decision's runtime
+    argument addresses the PRODUCER session in its prepared checkout exactly
+    as the ordinary planning handler attaches it (the merged E2 revise send),
+    never the Reviewer attachment the resumed turn itself used. The ordinary
+    post-decision continuations follow: an in-budget change request hands the
+    next planning REVIEW dispatch to the ordinary operation catalog, an
+    accepted planning review presents the exact-plan IMPLEMENTATION_AUTHORIZATION
+    gate, and the PR decision's remediation/re-dispatch chain runs in-process.
     """
     if not isinstance(response, ReviewResult):
         raise ExternalOperationUncertainError(
             "the resumed review turn did not return the validated review result "
             "family; the continuation remains unresolved"
+        )
+    if producer_runtime_factory is None:
+        raise InvalidCommandError(
+            "the review continuation carries no producer runtime attachment factory"
         )
     iteration = review_records.get_review_iteration(pool, review_iteration_id=subject_id)
     if (
@@ -1290,48 +1405,96 @@ def _route_resumed_review_result(
         raise StaleOperationError(
             "the reviewer binding is not ready; the resumed review result is stale"
         )
-    if loop.purpose is ReviewLoopPurpose.PLANNING:
-        finalize_planning_review_decision(
-            pool,
-            adapter,
-            github,
-            profile_id=profile_id,
-            workspace_id=record.workspace_id,
-            task_id=record.task_id,
-            expected_state_token=authorized_token,
-            dispatch=TaskPlanningReviewDispatchOutcome(
-                review_loop=loop,
-                review_iteration=iteration,
-                review_result=response,
-                reviewer_session=reviewer_session,
-            ),
-        )
-        recorded = _settle_resume_record(pool, task_resume_intent_id=record.id)
-        return SessionResumeOutcome(
-            kind=SessionResumeOutcomeKind.COMPLETED,
-            resume=recorded,
-            detail="planning_review_decided",
-        )
-    pull_request = get_task_pull_request_for_task(pool, task_id=record.task_id)
-    if pull_request is None or pull_request.workspace_id != record.workspace_id:
-        raise StaleOperationError(
-            "the pr review iteration's canonical pull request is not available"
-        )
-    if producer_runtime_factory is None or reviewer_runtime_factory is None:
-        raise InvalidCommandError(
-            "the pr review continuation carries no runtime attachment factories"
-        )
-    task_for_dispatch = task_records.get_task(pool, task_id=record.task_id)
-    if task_for_dispatch is None or task_for_dispatch.workspace_id != record.workspace_id:
-        raise StaleOperationError(
-            "the pr review iteration's task is not available; the resumed review result is stale"
-        )
-    with producer_runtime_factory() as producer_adapter:
+    # The decision's own runtime argument is the PRODUCER session in its
+    # prepared checkout — the exact attachment the ordinary planning and PR
+    # review handlers acquire for the decision's merged revise/remediation
+    # sends. The resumed turn's Reviewer attachment is already closed.
+    with attach_cline_runtime(
+        pool,
+        workspace_id=record.workspace_id,
+        task_id=record.task_id,
+        role=WorkflowRole.PRODUCER,
+        phase=ClineAttachmentPhase.BOUND,
+        external_session_id=_require_producer_external_session_id(pool, record=record),
+        working_directory=producer_checkout_directory(
+            pool, workspace_id=record.workspace_id, task_id=record.task_id
+        ),
+    ) as attached:
+        if loop.purpose is ReviewLoopPurpose.PLANNING:
+            decision = finalize_planning_review_decision(
+                pool,
+                attached.adapter,
+                github,
+                profile_id=profile_id,
+                workspace_id=record.workspace_id,
+                task_id=record.task_id,
+                expected_state_token=authorized_token,
+                dispatch=TaskPlanningReviewDispatchOutcome(
+                    review_loop=loop,
+                    review_iteration=iteration,
+                    review_result=response,
+                    reviewer_session=reviewer_session,
+                ),
+                task_resume_intent_id=record.id,
+            )
+            if decision.decision is PlanningReviewDecision.REVISION_ROUTED:
+                routed = decision.revision_production
+                if routed is None:
+                    raise ConflictError(
+                        "the revision-routed planning decision carried no produced revision"
+                    )
+                return SessionResumeOutcome(
+                    kind=SessionResumeOutcomeKind.COMPLETED,
+                    resume=record,
+                    detail="planning_revision_routed",
+                    follow_up=SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH,
+                    follow_up_state_token=routed.task.state_token,
+                )
+            if decision.decision is PlanningReviewDecision.ACCEPTED_CLEAR:
+                # The ordinary authorized continuation of accepted formal
+                # review: present the exact-plan IMPLEMENTATION_AUTHORIZATION
+                # gate (never approved — the explicit E5 approval remains an
+                # Owner command).
+                open_implementation_authorization(
+                    pool,
+                    github,
+                    profile_id=profile_id,
+                    workspace_id=record.workspace_id,
+                    task_id=record.task_id,
+                    expected_state_token=decision.task.state_token,
+                )
+                return SessionResumeOutcome(
+                    kind=SessionResumeOutcomeKind.COMPLETED,
+                    resume=record,
+                    detail="planning_review_accepted",
+                )
+            # EXHAUSTED: the exact-plan REVIEW_RESOLUTION gate already stands
+            # and its Owner-mediated resolution is not a workflow operation.
+            return SessionResumeOutcome(
+                kind=SessionResumeOutcomeKind.COMPLETED,
+                resume=record,
+                detail="planning_review_exhausted",
+            )
+        if reviewer_runtime_factory is None:
+            raise InvalidCommandError(
+                "the pr review continuation carries no reviewer attachment factory"
+            )
+        pull_request = get_task_pull_request_for_task(pool, task_id=record.task_id)
+        if pull_request is None or pull_request.workspace_id != record.workspace_id:
+            raise StaleOperationError(
+                "the pr review iteration's canonical pull request is not available"
+            )
+        task_for_dispatch = task_records.get_task(pool, task_id=record.task_id)
+        if task_for_dispatch is None or task_for_dispatch.workspace_id != record.workspace_id:
+            raise StaleOperationError(
+                "the pr review iteration's task is not available; the resumed "
+                "review result is stale"
+            )
         finalize_pr_review_decision(
             pool,
-            producer_adapter,
+            attached.adapter,
             github,
-            cast(ReviewerRuntimeAttachmentFactory, reviewer_runtime_factory),
+            reviewer_runtime_factory,
             profile_id=profile_id,
             workspace_id=record.workspace_id,
             task_id=record.task_id,
@@ -1345,10 +1508,39 @@ def _route_resumed_review_result(
                 pull_request=pull_request,
                 reconciled_head_sha=pull_request.head_sha,
             ),
+            task_resume_intent_id=record.id,
         )
-    recorded = _settle_resume_record(pool, task_resume_intent_id=record.id)
-    return SessionResumeOutcome(
-        kind=SessionResumeOutcomeKind.COMPLETED,
-        resume=recorded,
-        detail="pr_review_decided",
+        return SessionResumeOutcome(
+            kind=SessionResumeOutcomeKind.COMPLETED,
+            resume=record,
+            detail="pr_review_decided",
+        )
+
+
+def _require_producer_external_session_id(pool: DatabasePool, *, record: TaskResumeIntent) -> str:
+    """Resolve the Producer binding's immutable external session identity."""
+    producer = session_records.get_task_agent_session(
+        pool, task_id=record.task_id, role=WorkflowRole.PRODUCER
     )
+    if (
+        producer is None
+        or producer.workspace_id != record.workspace_id
+        or producer.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        or producer.external_session_id is None
+        or not producer.external_session_id.strip()
+    ):
+        raise StaleOperationError(
+            "the producer binding is not a ready external session; the resumed "
+            "review decision cannot address it"
+        )
+    return producer.external_session_id
+
+
+def _require_plan_result(response: object) -> PlanResult:
+    """Require the resumed planning turn's validated plan result."""
+    if not isinstance(response, PlanResult):
+        raise ExternalOperationUncertainError(
+            "the resumed planning turn did not return the validated plan result "
+            "family; the continuation remains unresolved"
+        )
+    return response

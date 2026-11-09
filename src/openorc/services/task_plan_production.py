@@ -186,6 +186,7 @@ from openorc.services.workspace_authorization import require_workspace_task
 __all__ = [
     "TaskPlanProductionOutcome",
     "complete_resumed_initial_plan_result",
+    "settle_resumed_task_record",
     "complete_resumed_plan_revision_result",
     "produce_initial_task_plan",
     "revise_task_plan",
@@ -1247,7 +1248,7 @@ def _require_claimed_dispatch_claim(
     )
 
 
-def _settle_resumed_record(
+def settle_resumed_task_record(
     transaction_pool: DatabasePool,
     *,
     task_resume_intent_id: UUID,
@@ -1430,7 +1431,7 @@ def complete_resumed_plan_revision_result(
             expected_reviewer_session=reviewer,
             send_claim=send_claim,
         )
-        _settle_resumed_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
+        settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
     return outcome
 
 
@@ -1494,5 +1495,5 @@ def complete_resumed_initial_plan_result(
             expected_reviewer_session=reviewer,
             send_claim=send_claim,
         )
-        _settle_resumed_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
+        settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
     return outcome

@@ -37,6 +37,7 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services import task_owner_resume as resume_module
 from openorc.services.errors import ConflictError, StaleOperationError
 from openorc.services.task_owner_resume import (
+    SessionResumeFollowUp,
     SessionResumeOutcomeKind,
     dispatch_authorized_task_resume,
     resume_task_after_abort,
@@ -724,3 +725,534 @@ def test_an_uncertain_dispatch_keeps_the_record_conservatively_dispatched(
             bootstrap_composition=cast(Any, None),
         )
     assert calls.outcomes == []
+
+
+def _review_iteration() -> Any:
+    from openorc.domain.reviews import ReviewIteration
+
+    return ReviewIteration(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        review_loop_id=uuid.uuid4(),
+        iteration_number=1,
+        plan_revision_id=uuid.uuid4(),
+        task_pull_request_id=None,
+        reviewed_head_sha=None,
+        outcome=None,
+        summary=None,
+        findings=None,
+        decided_at=None,
+        created_at=_NOW,
+    )
+
+
+def _review_loop(purpose: Any) -> Any:
+    from openorc.domain.reviews import ReviewLoop, ReviewLoopStatus
+
+    return ReviewLoop(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose=purpose,
+        iteration_limit=5,
+        status=ReviewLoopStatus.OPEN,
+        closed_at=None,
+        created_at=_NOW,
+    )
+
+
+def _wire_review_route(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    loop: Any,
+    iteration: Any,
+    decision: Any,
+) -> dict[str, Any]:
+    from contextlib import contextmanager
+
+    captured: dict[str, Any] = {"runtimes": [], "presentations": []}
+
+    @contextmanager
+    def _fake_tx(pool):
+        yield pool
+
+    monkeypatch.setattr(resume_module, "composed_transaction", _fake_tx)
+    monkeypatch.setattr(
+        resume_module.review_records,
+        "get_review_iteration",
+        lambda pool, *, review_iteration_id: iteration,
+    )
+    monkeypatch.setattr(
+        resume_module.review_records,
+        "get_review_loop",
+        lambda pool, *, review_loop_id: loop,
+    )
+    monkeypatch.setattr(
+        resume_module.session_records,
+        "get_task_agent_session",
+        lambda pool, *, task_id, role: _session(),
+    )
+
+    class _ProducerAdapter:
+        """Distinguishable producer attachment identity."""
+
+        marker = "producer-checkout-adapter"
+
+    @contextmanager
+    def _fake_attach(pool, **kwargs):
+        yield type("Attached", (), {"adapter": _ProducerAdapter()})()
+
+    monkeypatch.setattr(resume_module, "attach_cline_runtime", _fake_attach)
+    monkeypatch.setattr(
+        resume_module,
+        "producer_checkout_directory",
+        lambda pool, *, workspace_id, task_id: f"/repo/base/{task_id}",
+    )
+
+    def _fake_decision(
+        pool,
+        runtime,
+        github,
+        *,
+        profile_id,
+        workspace_id,
+        task_id,
+        expected_state_token,
+        dispatch,
+        task_resume_intent_id=None,
+    ):
+        captured["runtimes"].append(runtime)
+        captured["settle_id"] = task_resume_intent_id
+        return decision
+
+    monkeypatch.setattr(resume_module, "finalize_planning_review_decision", _fake_decision)
+    monkeypatch.setattr(
+        resume_module,
+        "open_implementation_authorization",
+        lambda pool, github, **kwargs: captured["presentations"].append(kwargs),
+    )
+    return captured
+
+
+def test_an_accepted_planning_review_presents_the_implementation_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openorc.domain.planning import PlanRevision
+    from openorc.domain.reviews import ReviewLoopPurpose
+    from openorc.protocol.models import ReviewResult
+    from openorc.services.task_planning_review_decision import (
+        PlanningReviewDecision,
+        TaskPlanningReviewDecisionOutcome,
+    )
+
+    loop = _review_loop(ReviewLoopPurpose.PLANNING)
+    iteration = _review_iteration()
+    object.__setattr__(iteration, "review_loop_id", loop.id)
+    accepted_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
+    decision = TaskPlanningReviewDecisionOutcome(
+        decision=PlanningReviewDecision.ACCEPTED_CLEAR,
+        review_iteration=iteration,
+        plan_revision=PlanRevision(
+            id=uuid.uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            revision_number=1,
+            content="plan",
+            repository_base_sha="a" * 64,
+            created_at=_NOW,
+        ),
+        review_loop=loop,
+        task=accepted_task,
+        revision_production=None,
+        resolution_gate=None,
+    )
+    captured = _wire_review_route(monkeypatch, loop=loop, iteration=iteration, decision=decision)
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
+    object.__setattr__(
+        record,
+        "routing",
+        {
+            "control": "owner_resume",
+            "operation": "reviewer_review",
+            "expected_response_family": "review_result",
+            "subject_kind": "review_iteration",
+            "subject_id": str(iteration.id),
+            "restored_status": TaskStatus.PLANNING.value,
+            "authorized_state_token": str(_STATE_TOKEN),
+        },
+    )
+    outcome = _route_resumed_review_result_entry(
+        monkeypatch,
+        record=record,
+        subject_id=iteration.id,
+        response=ReviewResult(outcome="ACCEPTED", summary="s", findings=()),
+    )
+    assert outcome.kind is SessionResumeOutcomeKind.COMPLETED
+    assert outcome.follow_up is SessionResumeFollowUp.NONE
+    assert captured["presentations"], "the accepted review presents its gate"
+    assert captured["presentations"][0]["expected_state_token"] == accepted_task.state_token
+    assert captured["settle_id"] == record.id
+
+
+def _route_resumed_review_result_entry(
+    monkeypatch: pytest.MonkeyPatch, *, record: Any, subject_id: Any, response: Any
+) -> Any:
+    return resume_module._route_resumed_review_result(
+        None,
+        cast(Any, None),
+        producer_runtime_factory=cast(Any, object()),
+        reviewer_runtime_factory=cast(Any, object()),
+        record=record,
+        subject_id=subject_id,
+        authorized_token=_STATE_TOKEN,
+        response=response,
+        profile_id=_OWNER_PROFILE_ID,
+    )
+
+
+def test_a_revision_routed_planning_review_hands_the_next_review_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openorc.domain.planning import PlanRevision
+    from openorc.domain.reviews import ReviewLoopPurpose
+    from openorc.protocol.models import ReviewResult
+    from openorc.services.task_plan_production import TaskPlanProductionOutcome
+    from openorc.services.task_planning_review_decision import (
+        PlanningReviewDecision,
+        TaskPlanningReviewDecisionOutcome,
+    )
+
+    loop = _review_loop(ReviewLoopPurpose.PLANNING)
+    iteration = _review_iteration()
+    object.__setattr__(iteration, "review_loop_id", loop.id)
+    routed_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
+    routed_production = TaskPlanProductionOutcome(
+        plan_revision=PlanRevision(
+            id=uuid.uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            revision_number=2,
+            content="plan-2",
+            repository_base_sha="a" * 64,
+            created_at=_NOW,
+        ),
+        task=routed_task,
+    )
+    decision = TaskPlanningReviewDecisionOutcome(
+        decision=PlanningReviewDecision.REVISION_ROUTED,
+        review_iteration=iteration,
+        plan_revision=routed_production.plan_revision,
+        review_loop=loop,
+        task=routed_task,
+        revision_production=routed_production,
+        resolution_gate=None,
+    )
+    captured = _wire_review_route(monkeypatch, loop=loop, iteration=iteration, decision=decision)
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
+    object.__setattr__(
+        record,
+        "routing",
+        {
+            "control": "owner_resume",
+            "operation": "reviewer_review",
+            "expected_response_family": "review_result",
+            "subject_kind": "review_iteration",
+            "subject_id": str(iteration.id),
+            "restored_status": TaskStatus.PLANNING.value,
+            "authorized_state_token": str(_STATE_TOKEN),
+        },
+    )
+    outcome = _route_resumed_review_result_entry(
+        monkeypatch,
+        record=record,
+        subject_id=iteration.id,
+        response=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
+    )
+    assert outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH
+    assert outcome.follow_up_state_token == routed_task.state_token
+    # The decision's runtime argument is the PRODUCER-checkout attachment,
+    # never the Reviewer attachment the resumed turn itself used.
+    assert captured["runtimes"][0].marker == "producer-checkout-adapter"
+    assert captured["settle_id"] == record.id
+
+
+def test_the_resumed_initial_plan_hands_the_next_review_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openorc.domain.planning import PlanRevision
+    from openorc.protocol.models import PlanResult
+    from openorc.services.task_plan_production import TaskPlanProductionOutcome
+
+    produced_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
+    production = TaskPlanProductionOutcome(
+        plan_revision=PlanRevision(
+            id=uuid.uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            revision_number=1,
+            content="plan",
+            repository_base_sha="a" * 64,
+            created_at=_NOW,
+        ),
+        task=produced_task,
+    )
+    monkeypatch.setattr(
+        resume_module,
+        "complete_resumed_initial_plan_result",
+        lambda *args, **kwargs: production,
+    )
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
+    outcome = resume_module._route_resumed_result(
+        None,
+        cast(Any, None),
+        bootstrap_composition=None,
+        producer_runtime_factory=None,
+        reviewer_runtime_factory=None,
+        record=record,
+        operation=resume_module.PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+        subject_id=uuid.uuid4(),
+        authorized_token=_STATE_TOKEN,
+        response=PlanResult(plan="plan"),
+        attempt_evidence=None,
+    )
+    assert outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH
+    assert outcome.follow_up_state_token == produced_task.state_token
+
+
+def test_review_result_settlement_rolls_back_with_the_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F8g atomicity seam (issue #292): the record settles or nothing.
+
+    The planning decision's finalization transaction records the original
+    review result and settles the resume record together; a settlement
+    failure rolls the finalization back and never reaches the external
+    revision consequence.
+    """
+    from openorc.domain.reviews import ReviewLoopPurpose
+    from openorc.protocol.models import ReviewResult
+    from openorc.services import (
+        task_planning_review_decision as decision_module,
+    )
+    from openorc.services.task_planning_review_decision import (
+        TaskPlanningReviewDispatchOutcome,
+    )
+
+    loop = _review_loop(ReviewLoopPurpose.PLANNING)
+    iteration = _review_iteration()
+    object.__setattr__(iteration, "review_loop_id", loop.id)
+    finalized = _review_iteration()
+    object.__setattr__(finalized, "id", iteration.id)
+    object.__setattr__(finalized, "review_loop_id", loop.id)
+    finalized_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
+
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def _fake_decision_tx(pool):
+        yield pool
+
+    monkeypatch.setattr(decision_module, "composed_transaction", _fake_decision_tx)
+    monkeypatch.setattr(decision_module, "_require_runtime", lambda runtime: runtime)
+    monkeypatch.setattr(decision_module, "_require_github", lambda github: github)
+    monkeypatch.setattr(
+        decision_module, "require_account_operational", lambda pool, *, profile_id: None
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "require_workspace_task",
+        lambda pool, *, profile_id, workspace_id, task_id: None,
+    )
+    monkeypatch.setattr(
+        decision_module.task_records,
+        "get_task_for_update",
+        lambda pool, task_id: finalized_task,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "require_current_task",
+        lambda pool, *, workspace_id, task_id, expected_state_token: finalized_task,
+    )
+    monkeypatch.setattr(decision_module, "_require_decision_subject", lambda task, attempt: None)
+    monkeypatch.setattr(
+        decision_module,
+        "require_current_plan_revision",
+        lambda pool, *, task, plan_revision_id: object(),
+    )
+    monkeypatch.setattr(
+        decision_module, "_require_decision_loop", lambda pool, *, workspace_id, attempt: loop
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_reserved_unfinalized_attempt",
+        lambda pool, *, loop, attempt, revision: iteration,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_decision_reviewer",
+        lambda pool, *, workspace_id, task_id, expected_session: _session(),
+    )
+    monkeypatch.setattr(
+        decision_module.review_records,
+        "record_review_iteration_result",
+        lambda pool, **kwargs: finalized,
+    )
+
+    settle_calls: list[dict[str, Any]] = []
+
+    def _failing_settle(transaction_pool, *, task_resume_intent_id):
+        settle_calls.append({"task_resume_intent_id": task_resume_intent_id})
+        raise StaleOperationError(
+            "the session-resume record is no longer awaiting its settled outcome"
+        )
+
+    monkeypatch.setattr(decision_module, "settle_resumed_task_record", _failing_settle)
+    external_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        decision_module,
+        "revise_task_plan",
+        lambda pool, *args, **kwargs: external_calls.append(dict(kwargs)),
+    )
+
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
+    dispatch = TaskPlanningReviewDispatchOutcome(
+        review_loop=loop,
+        review_iteration=iteration,
+        review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
+        reviewer_session=_session(),
+    )
+    with pytest.raises(StaleOperationError, match="no longer awaiting"):
+        decision_module.finalize_planning_review_decision(
+            None,
+            cast(Any, None),
+            cast(Any, None),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=dispatch,
+            task_resume_intent_id=record.id,
+        )
+    assert settle_calls == [{"task_resume_intent_id": record.id}]
+    assert external_calls == []
+
+
+def test_the_exhausted_planning_review_settles_inside_the_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settlement composes inside the finalization transaction, not after."""
+    from openorc.domain.reviews import ReviewLoopPurpose
+    from openorc.protocol.models import ReviewResult
+    from openorc.services import (
+        task_planning_review_decision as decision_module,
+    )
+    from openorc.services.task_planning_review_decision import (
+        TaskPlanningReviewDispatchOutcome,
+    )
+
+    loop = _review_loop(ReviewLoopPurpose.PLANNING)
+    iteration = _review_iteration()
+    object.__setattr__(iteration, "review_loop_id", loop.id)
+    finalized = _review_iteration()
+    object.__setattr__(finalized, "id", iteration.id)
+    object.__setattr__(finalized, "review_loop_id", loop.id)
+    exhausted_task = _task(status=TaskStatus.PLANNING, token=uuid.uuid4())
+
+    settle_depths: list[bool] = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _tracking_tx(pool):
+        decision_module._TX_DEPTH = getattr(decision_module, "_TX_DEPTH", 0) + 1
+        try:
+            yield pool
+        finally:
+            decision_module._TX_DEPTH -= 1
+
+    monkeypatch.setattr(decision_module, "composed_transaction", _tracking_tx)
+
+    def _settling_recorder(transaction_pool, **kwargs):
+        settle_depths.append(decision_module._TX_DEPTH > 0)
+        return finalized
+
+    monkeypatch.setattr(
+        decision_module.review_records,
+        "record_review_iteration_result",
+        _settling_recorder,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "settle_resumed_task_record",
+        lambda transaction_pool, *, task_resume_intent_id: settle_depths.append(
+            decision_module._TX_DEPTH > 0
+        ),
+    )
+    monkeypatch.setattr(decision_module, "_require_runtime", lambda runtime: runtime)
+    monkeypatch.setattr(decision_module, "_require_github", lambda github: github)
+    monkeypatch.setattr(
+        decision_module, "require_account_operational", lambda pool, *, profile_id: None
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "require_workspace_task",
+        lambda pool, *, profile_id, workspace_id, task_id: None,
+    )
+    monkeypatch.setattr(
+        decision_module.task_records,
+        "get_task_for_update",
+        lambda pool, task_id: exhausted_task,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "require_current_task",
+        lambda pool, *, workspace_id, task_id, expected_state_token: exhausted_task,
+    )
+    monkeypatch.setattr(decision_module, "_require_decision_subject", lambda task, attempt: None)
+    monkeypatch.setattr(
+        decision_module,
+        "require_current_plan_revision",
+        lambda pool, *, task, plan_revision_id: object(),
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_decision_loop",
+        lambda pool, *, workspace_id, attempt: loop,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_reserved_unfinalized_attempt",
+        lambda pool, *, loop, attempt, revision: iteration,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_decision_reviewer",
+        lambda pool, *, workspace_id, task_id, expected_session: _session(),
+    )
+
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
+    # The mapped-recording fake's finalized row carries no outcome, so the
+    # decision derivation refuses after the recorded/settled pair — the
+    # depth assertion is about the composition boundary, not the outcome.
+    with pytest.raises(ConflictError):
+        decision_module.finalize_planning_review_decision(
+            None,
+            cast(Any, None),
+            cast(Any, None),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=TaskPlanningReviewDispatchOutcome(
+                review_loop=loop,
+                review_iteration=iteration,
+                review_result=ReviewResult(
+                    outcome="CHANGES_REQUESTED", summary="s", findings=()
+                ),
+                reviewer_session=_session(),
+            ),
+            task_resume_intent_id=record.id,
+        )
+    assert len(settle_depths) == 2
+    assert all(settle_depths), "the result recording and the settlement share the transaction"

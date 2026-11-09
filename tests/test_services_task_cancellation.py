@@ -49,11 +49,12 @@ from openorc.domain.executions import ExecutionStatus
 from openorc.domain.intents import (
     TaskInterruptIntentStatus,
     TaskPullRequestCloseIntentStatus,
+    TaskResumeIntentStatus,
 )
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
-from openorc.domain.reviews import ReviewLoopPurpose
+from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.runtime_requests import RuntimeRequestStatus
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskStatus, TaskTerminalCause
@@ -306,6 +307,7 @@ def _wire(
     current_blocks: list[Any] | None = None,
     resume_intents: list[Any] | None = None,
     resume_record: Any = None,
+    resume_records: list[Any] | None = None,
 ) -> None:
     if reconcile is not None:
         monkeypatch.setattr(task_cancellation, "reconcile_task_pull_request", reconcile)
@@ -330,6 +332,11 @@ def _wire(
         intent_records,
         "get_task_resume_intent",
         lambda pool, *, task_resume_intent_id: resume_record,
+    )
+    monkeypatch.setattr(
+        intent_records,
+        "list_task_resume_intents",
+        lambda pool, *, task_id: list(resume_records or []),
     )
     monkeypatch.setattr(
         execution_records,
@@ -2381,3 +2388,181 @@ def test_a_cross_workspace_canonical_pull_request_fails_closed(
 
     assert _count(conn, _ARCHIVE_WRITE) == 0
     assert _event_types(conn) == []
+
+
+def test_a_proven_non_delivered_reviewer_resume_lineage_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F8g failure path (issue #292): the Type B gate's Cancel proceeds.
+
+    A positively non-delivered resumed Reviewer REVIEW escalates to the Type
+    B diagnostic block with the original review iteration still unfinalized;
+    the accounting recognizes the NON_DELIVERED record's lineage — the
+    positively settled original Abort episode for the record's own session —
+    so the gate's only Owner action stays reachable.
+    """
+    from openorc.domain.reviews import ReviewIteration, ReviewLoop, ReviewLoopPurpose
+
+    reviewer_session_id = uuid4()
+    original_block_id = uuid4()
+    escalated_block_id = uuid4()
+    episode_id = uuid4()
+    record_id = uuid4()
+
+    def _pull_request() -> Any:
+        return TaskPullRequest(
+            id=uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            repository_id=uuid4(),
+            github_pr_id=91,
+            github_pr_number=9,
+            head_ref="feature",
+            base_ref="main",
+            head_sha="b" * 40,
+            state=TaskPullRequestState.OPEN,
+            merged_at=None,
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        )
+
+    pull_request_row = _pull_request()
+    loop = ReviewLoop(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        iteration_limit=5,
+        status=ReviewLoopStatus.OPEN,
+        closed_at=None,
+        created_at=_OBSERVED,
+    )
+    iteration = ReviewIteration(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        review_loop_id=loop.id,
+        iteration_number=1,
+        plan_revision_id=None,
+        task_pull_request_id=pull_request_row.id,
+        reviewed_head_sha=pull_request_row.head_sha,
+        outcome=None,
+        summary=None,
+        findings=None,
+        decided_at=None,
+        created_at=_OBSERVED,
+    )
+    lineage_record = SimpleNamespace(
+        id=record_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=reviewer_session_id,
+        task_block_id=original_block_id,
+        workflow_role=SimpleNamespace(value="reviewer"),
+        status=TaskResumeIntentStatus.NON_DELIVERED,
+        routing={
+            "control": "owner_resume",
+            "operation": "reviewer_review",
+            "subject_kind": "review_iteration",
+            "subject_id": str(iteration.id),
+            "restored_status": "reviewing",
+            "authorized_state_token": str(uuid4()),
+        },
+        outcome={},
+    )
+    escalated_block = SimpleNamespace(
+        id=escalated_block_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        context={
+            "failure_episode_id": str(episode_id),
+            "effect_evidence": "pre_effect_not_applied",
+            "original_attempt_kind": "owner_control_intent",
+            "original_attempt_id": str(record_id),
+        },
+    )
+    episode = SimpleNamespace(
+        id=episode_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        escalated_task_block_id=escalated_block_id,
+    )
+    settled_reviewer_intent = SimpleNamespace(
+        status=TaskInterruptIntentStatus.SETTLED,
+        task_agent_session_id=reviewer_session_id,
+        task_block_id=original_block_id,
+    )
+
+    _wire(
+        monkeypatch,
+        pull_request=pull_request_row,
+        loops=[loop],
+        loop_iterations=[iteration],
+        interrupt_intents=[settled_reviewer_intent],
+        resume_records=[lineage_record],
+    )
+    monkeypatch.setattr(
+        task_cancellation.failure_records,
+        "get_operational_failure_episode_by_original_attempt",
+        lambda pool, *, original_attempt_kind, original_attempt_id: (
+            episode if original_attempt_id == record_id else None
+        ),
+    )
+    monkeypatch.setattr(
+        task_cancellation.block_records,
+        "get_task_block",
+        lambda pool, *, task_block_id: (
+            escalated_block if task_block_id == escalated_block_id else None
+        ),
+    )
+
+    # The full accounting guard passes: no veto remains for the proven
+    # non-delivered resumed review interaction.
+    task_cancellation._require_runtime_work_accounted(
+        cast(DatabasePool, object()),
+        task=_blocked_task(),
+    )
+
+
+def _blocked_task() -> Any:
+    from openorc.domain.tasks import Task
+
+    return Task(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=uuid4(),
+        github_issue_id=123,
+        github_issue_number=7,
+        status=TaskStatus.BLOCKED,
+        archived_at=None,
+        queued_at=None,
+        canonical_feature_branch=None,
+        state_token=uuid4(),
+        current_plan_revision_id=None,
+        current_owner_gate_id=uuid4(),
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+
+
+def _scripted_connection(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A connection stub; every accounting read is monkeypatched above."""
+
+    class _Stub:
+        def execute(self, sql: str, params: Any = None) -> Any:
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+        def transaction(self) -> Any:
+            return self
+
+        def cursor(self) -> Any:
+            return self
+
+    return _Stub()
