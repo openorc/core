@@ -962,13 +962,12 @@ def restore_blocked_task_status(
             "and status = 'blocked' "
             "and current_owner_gate_id is null "
             f"returning {_TASK_COLUMNS}",
-            (
-                (
-                    (effective_cost_threshold_usd,)
-                    if effective_cost_threshold_usd is not None
-                    else ()
-                )
-                + (restored_status.value, task_id, expected_state_token)
-            ),
+            # The parameter order matches the SET-clause assignments exactly:
+            # the restored status feeds ``status = %s`` and — when the Owner
+            # Continue grants one — the refreshed threshold feeds
+            # ``effective_cost_threshold_usd = %s`` after it.
+            (restored_status.value,)
+            + ((effective_cost_threshold_usd,) if effective_cost_threshold_usd is not None else ())
+            + (task_id, expected_state_token),
         ).fetchone()
     return None if row is None else _task_from_row(row)

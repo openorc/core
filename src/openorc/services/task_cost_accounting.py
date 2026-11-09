@@ -94,12 +94,19 @@ _GATE_SPAN_NAME = "task_cost_accounting.check_task_budget_before_dispatch"
 # state; enforcement is not — a queued or terminal Task has no active work
 # whose standing authorization could interrupt, and the shared blocking
 # composition re-verifies the same eligibility under its own lock.
-_ENFORCEMENT_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
+# ``waiting_for_owner`` is deliberately excluded (issue #291, F8f,
+# Owner-approved amendment): a late observation sampled in-flight can reach
+# this transaction after the finished turn already installed an ordinary
+# Owner approval gate, and a cost block here would supersede that approval
+# boundary — the no-idle-blocking contract. The gate wait checkpoints its
+# truthful spend and defers enforcement to the next active autonomous turn;
+# the guard is cost-specific and leaves the Owner Abort's own dispatch
+# eligibility untouched.
+_COST_ENFORCEMENT_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
     {
         TaskStatus.PLANNING,
         TaskStatus.IMPLEMENTING,
         TaskStatus.REVIEWING,
-        TaskStatus.WAITING_FOR_OWNER,
     }
 )
 
@@ -335,7 +342,7 @@ def observe_session_usage(
                 return SessionCostObservation(
                     kind=SessionCostObservationKind.BUDGET_DISABLED, task=locked
                 )
-            if locked.status not in _ENFORCEMENT_ELIGIBLE_STATUSES:
+            if locked.status not in _COST_ENFORCEMENT_ELIGIBLE_STATUSES:
                 return SessionCostObservation(
                     kind=SessionCostObservationKind.TASK_NOT_CURRENT, task=locked
                 )
@@ -414,7 +421,7 @@ def check_task_budget_before_dispatch(
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT)
             if locked.status is TaskStatus.BLOCKED:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.ALREADY_BLOCKED, task=locked)
-            if locked.status not in _ENFORCEMENT_ELIGIBLE_STATUSES:
+            if locked.status not in _COST_ENFORCEMENT_ELIGIBLE_STATUSES:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.NOT_CURRENT, task=locked)
             if locked.authorized_task_budget_usd is None:
                 return BudgetGateDecision(kind=BudgetGateDecisionKind.BUDGET_DISABLED, task=locked)

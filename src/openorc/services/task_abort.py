@@ -183,6 +183,22 @@ _DISPATCH_ELIGIBLE_STATUSES: frozenset[TaskStatus] = frozenset(
     }
 )
 
+# The cost-limit control's own enforcement eligibility (issue #291, F8f,
+# Owner-approved amendment): ``waiting_for_owner`` is deliberately excluded,
+# cost-specifically and without touching the Owner Abort's dispatch rule. A
+# late live observation sampled in-flight can reach the blocking composition
+# under the Task lock after the finished turn already installed an ordinary
+# Owner approval gate; a cost block there would supersede that approval
+# boundary — the no-idle-blocking contract. The gate wait keeps its truthful
+# checkpoint and the next active autonomous turn enforces instead.
+_COST_LIMIT_ENFORCEMENT_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.PLANNING,
+        TaskStatus.IMPLEMENTING,
+        TaskStatus.REVIEWING,
+    }
+)
+
 # The Execution statuses whose runtime work is still outstanding.
 _OPEN_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
     {
@@ -727,7 +743,11 @@ def apply_owner_authorized_cost_limit_block(
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
     if locked.status is TaskStatus.BLOCKED:
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.ALREADY_BLOCKED)
-    if locked.status not in _DISPATCH_ELIGIBLE_STATUSES:
+    if locked.status not in _COST_LIMIT_ENFORCEMENT_STATUSES:
+        # A waiting_for_owner Task sits at an Owner approval boundary (or a
+        # finished turn just installed one): the amended contract never
+        # lets a cost block supersede that gate. The truthful checkpoint
+        # stands and the next active autonomous turn enforces instead.
         return OwnerAuthorizedCostLimitBlock(kind=CostLimitBlockOutcomeKind.NOT_APPLICABLE)
     budget = locked.authorized_task_budget_usd
     if budget is None:

@@ -1197,10 +1197,11 @@ def test_restore_blocked_task_status_composes_the_cost_threshold_write() -> None
     assert "state_token = gen_random_uuid()" in sql
     assert "status = 'blocked'" in sql
     assert "current_owner_gate_id is null" in sql
-    # The threshold precedes the status in the parameter order the SET
-    # clause composes.
-    assert params[0] == Decimal("22.00")
-    assert params[1] == "implementing"
+    # The parameter order matches the SET-clause assignments exactly: the
+    # restored status feeds ``status = %s`` and the refreshed threshold feeds
+    # ``effective_cost_threshold_usd = %s`` after it.
+    assert params[0] == "implementing"
+    assert params[1] == Decimal("22.00")
     assert params[2] == row[0]
     assert params[3] == original_token
 

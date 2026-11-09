@@ -363,7 +363,7 @@ def test_idle_crossing_checkpoints_without_blocking(monkeypatch: pytest.MonkeyPa
 
     observation = _observe(conn, send_in_flight=False)
 
-    assert observation.kind is SessionCostObservationKind.CHECKPOINTED
+    assert observation.kind is SessionCostObservationKind.TASK_NOT_CURRENT
     assert observation.task_block is None
     assert observation.interrupt_dispatches == ()
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
@@ -499,29 +499,43 @@ def test_active_planning_interaction_is_interrupted_on_exhaustion(
     assert intent_params is not None and intent_params[6] == _OWNER_PROFILE_ID
 
 
-def test_unattested_idle_waiting_for_owner_crossing_checkpoints(
+def test_a_late_cost_enforcement_never_supersedes_an_ordinary_owner_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The planning-phase admission never leaks into an idle Owner gate, and
-    # the amended contract never blocks an idle Task at all: a
-    # waiting_for_owner crossing with no attested in-flight autonomous turn
-    # checkpoints its truthful spend and applies no policy (issue #291, F8f).
+    # The representative late-enforcement race (issue #291, F8f): the
+    # in-flight marker was sampled during the autonomous turn, but the turn
+    # finished and installed an ordinary Owner approval gate BEFORE the cost
+    # path acquired the Task lock. Under the lock the Task waits at that
+    # gate, so the cost-specific eligibility excludes waiting_for_owner: the
+    # attested session can no longer make COST_LIMIT replace the approval
+    # boundary. The truthful checkpoint stands, no block or interrupt
+    # exists, and the pending ordinary gate stays exactly where it was.
     conn = ScriptedConnection()
+    waiting_row = _budgeted_task_row(status="waiting_for_owner")
+    waiting_row = (*waiting_row[:10], _PRIOR_GATE_ID, *waiting_row[11:])
     _wire_budgeted_task(
         conn,
         monkeypatch,
         status="waiting_for_owner",
+        task_row=waiting_row,
+        prior_gate_id=_PRIOR_GATE_ID,
         sessions=[_ready_session_row()],
+        executions=[],
     )
 
-    observation = _observe(conn)
+    observation = _observe(conn, send_in_flight=True)
 
-    assert observation.kind is SessionCostObservationKind.CHECKPOINTED
+    assert observation.kind is SessionCostObservationKind.TASK_NOT_CURRENT
     assert observation.task_block is None
     assert observation.interrupt_dispatches == ()
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_blocks" in sql)
     assert not _sql_of_kind(conn, lambda sql: _GATE_INSERT(sql, None))
+    assert not _sql_of_kind(conn, lambda sql: _TASK_BLOCK_UPDATE(sql, None))
     assert not _sql_of_kind(conn, lambda sql: "insert into openorc.task_interrupt_intents" in sql)
+    # The checkpoint stands and the Owner approval gate is untouched.
+    assert _count(conn, _sql_has("update openorc.task_agent_sessions")) == 1
+    assert not _event_types(conn)
+    assert _count(conn, _sql_has("update openorc.owner_gates")) == 0
 
 
 def _assert_barrier_precedes_task_lock(conn: ScriptedConnection) -> None:
