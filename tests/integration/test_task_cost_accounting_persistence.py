@@ -643,6 +643,17 @@ class TestAtomicCostLimitBlock:
         self, conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         workspace_id, task_id, connection_id, producer_session_id = _seed_budgeted_task(conn)
+        # The eligible active-work subject (issue #291): the amended
+        # composition composes no block for a target-free crossing, so the
+        # forced-failure rollback needs the durable in-flight fact — the
+        # same open anchored Execution the successful atomic-composition
+        # test seeds — to reach the deliberately failing audit writer.
+        _insert_open_execution(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            producer_session_id=producer_session_id,
+        )
         pool = cast(DatabasePool, _SingleConnectionPool(conn))
         assert (
             session_repositories.checkpoint_task_agent_session_cost(
