@@ -102,6 +102,7 @@ terminal outcome, and a raced confirmed merge refuses fail-closed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -119,13 +120,16 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
     GitHubRequestRejectedError,
 )
+from openorc.domain.blocks import TaskBlock
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.executions import FINAL_EXECUTION_STATUSES, Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
+    TaskInterruptIntent,
     TaskInterruptIntentStatus,
     TaskPullRequestCloseIntent,
     TaskPullRequestCloseIntentStatus,
+    TaskResumeIntentStatus,
 )
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
@@ -421,6 +425,15 @@ def _require_runtime_work_accounted(
                 "the task's activity interruption is not settled; the owner abort "
                 "settlement or reconciliation must account for it first"
             )
+    if intent_records.list_open_task_resume_intents(transaction_pool, task_id=task.id):
+        # The F8g session-resume guard (issue #292): a non-terminal record
+        # means a Resume effect is potentially pending (authorized) or
+        # potentially active/uncertain (dispatched) — the earlier settled
+        # Abort is not cessation evidence while that effect stands.
+        raise ConflictError(
+            "the task carries a non-terminal session-resume record; the resume "
+            "effect is potentially pending or active and the cancellation is unsafe"
+        )
     open_executions = [
         execution
         for execution in execution_records.list_task_executions(transaction_pool, task_id=task.id)
@@ -443,6 +456,20 @@ def _require_runtime_work_accounted(
             if current_block is not None
             else set()
         )
+        if current_block is not None:
+            # The F8g escalation lineage (issue #292): a Level 2 escalation
+            # block whose failure episode roots at a session-resume record
+            # inherits the record's OWN episode — the settled interruption
+            # the Owner's Resume was continuing. A positively non-delivered
+            # resume left that interrupted work truthfully unaccounted; the
+            # Owner cancelling from the diagnostic block finalizes it through
+            # this lineage. Non-terminal records are vetoed above; every
+            # other shape exempts nothing (fail closed).
+            episode_sessions |= _resume_episode_lineage_sessions(
+                transaction_pool,
+                current_block=current_block,
+                intents=intents,
+            )
         for execution in open_executions:
             if current_block is None or execution.producer_session_id not in episode_sessions:
                 raise ConflictError(
@@ -1558,3 +1585,48 @@ def cancel_task_for_confirmed_pr_closure(
             pull_request=composition.pull_request,
             closed_loops=composition.closed_loops,
         )
+
+
+def _resume_episode_lineage_sessions(
+    transaction_pool: DatabasePool,
+    *,
+    current_block: TaskBlock,
+    intents: Sequence[TaskInterruptIntent],
+) -> set[UUID]:
+    """Resolve an escalation block's session-resume interruption lineage.
+
+    The F8g accounting composition (issue #292): when the current blocking
+    episode is the Level 2 escalation of a Resume continuation failure, its
+    sanitized context roots at the durable session-resume record; a record
+    that terminally recorded a positively proven pre-effect non-delivery
+    hands the accounting the settled-intent sessions of the record's OWN
+    OWNER_ABORT episode — the interrupted Executions the Owner's Resume was
+    authorized to continue. Every other record state or context shape
+    exempts nothing: a settled record's episode resolved with its workflow,
+    and an interrupted/superseded resume never coexists with an escalation
+    block (fail closed).
+    """
+    context = current_block.context
+    if not isinstance(context, Mapping):
+        return set()
+    if context.get("original_attempt_kind") != OriginalAttemptKind.OWNER_CONTROL_INTENT.value:
+        return set()
+    original_id = context.get("original_attempt_id")
+    if not isinstance(original_id, str) or not original_id.strip():
+        return set()
+    try:
+        record = intent_records.get_task_resume_intent(
+            transaction_pool, task_resume_intent_id=UUID(original_id)
+        )
+    except ValueError:
+        return set()
+    if record is None or record.task_id != current_block.task_id:
+        return set()
+    if record.status is not TaskResumeIntentStatus.NON_DELIVERED:
+        return set()
+    return {
+        intent.task_agent_session_id
+        for intent in intents
+        if intent.status is TaskInterruptIntentStatus.SETTLED
+        and intent.task_block_id == record.task_block_id
+    }

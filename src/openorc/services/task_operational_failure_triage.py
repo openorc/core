@@ -118,12 +118,16 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence import events as event_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
+from openorc.persistence import intents as intent_records
 from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.intents import (
+    TaskResumeIntentStatus,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import (
     ConflictError,
@@ -370,6 +374,12 @@ _FAMILY_IDENTITY_KINDS: Mapping[OperationalFailureFamily, frozenset[OriginalAtte
             ),
             PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: frozenset(
                 {OriginalAttemptKind.RUNTIME_SEND_CLAIM}
+            ),
+            # F8g (issue #292): the resume continuation roots at its durable
+            # one-shot session-resume record — the owner-control intent family
+            # the E10 intent identities already reserved.
+            PendingTaskRuntimeInteractionOperation.SESSION_RESUME: frozenset(
+                {OriginalAttemptKind.OWNER_CONTROL_INTENT}
             ),
             # F5d (issue #267): the merge family roots at the approved
             # MERGE_DECISION gate UUID — the original durable merge-operation
@@ -892,6 +902,13 @@ def _verify_family(
             task_id=task_id,
             operation=operation,
             expect_prepared_stage=True,
+        )
+    if family is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        return _verify_resume_family(
+            transaction_pool,
+            task=task,
+            task_id=task_id,
+            operation=operation,
         )
     if family in _FAMILY_CLAIM_KINDS:
         return _verify_send_claim_family(
@@ -1656,3 +1673,36 @@ def _escalate(
             "the escalation composition is stale"
         )
     return OperationalFailureDisposition(kind=DispositionKind.BLOCKED, installation=installation)
+
+
+def _verify_resume_family(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    task_id: UUID,
+    operation: OperationalFailureOperation,
+) -> _VerifiedFailure | OperationalFailureDisposition:
+    """Verify the session-resume record's identity and the addressed binding.
+
+    The durable one-shot session-resume record (issue #292) is the reported
+    failure's original attempt identity: it must exist in the reported Task
+    scope and must NOT be settled — a settled record means the resumed turn's
+    result was durably processed by its original workflow owner, so no
+    failure report about the dispatch is current any more. The definitively
+    terminal pre-dispatch outcomes (a proven non-delivery) are truthfully
+    reportable: their operational failure is the continuation's own and
+    escalates through the standard fallback.
+    """
+    record = intent_records.get_task_resume_intent(
+        transaction_pool, task_resume_intent_id=operation.original_attempt_id
+    )
+    if record is None or record.workspace_id != task.workspace_id or record.task_id != task_id:
+        return _stale_no_op()
+    if record.status is TaskResumeIntentStatus.SETTLED:
+        return _stale_no_op()
+    return _require_applicable_binding(
+        transaction_pool,
+        task_id=task_id,
+        role=record.workflow_role,
+        expected_session_id=record.task_agent_session_id,
+    )

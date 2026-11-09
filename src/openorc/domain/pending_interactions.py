@@ -64,6 +64,10 @@ class PendingTaskRuntimeInteractionOperation(StrEnum):
     IMPLEMENTATION_EXECUTION = "implementation_execution"
     PR_REMEDIATION_EXECUTION = "pr_remediation_execution"
     PR_COMPOSE_DISPATCH = "pr_compose_dispatch"
+    # F8g (issue #292): the authorized same-session Resume continuation of
+    # one interrupted workflow interaction; the durable one-shot
+    # session-resume record is its original attempt identity.
+    SESSION_RESUME = "session_resume"
 
 
 @dataclass(frozen=True, slots=True)

@@ -305,6 +305,7 @@ def test_production_handler_table_registers_exactly_the_task_kinds() -> None:
         invocation.OperationKind.TASK_PR_AUTHORIZATION_RETRY,
         invocation.OperationKind.TASK_PR_COMPOSITION,
         invocation.OperationKind.TASK_PR_REVIEW,
+        invocation.OperationKind.TASK_SESSION_RESUME,
     }
 
 

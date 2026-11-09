@@ -304,6 +304,8 @@ def _wire(
     block: Any = None,
     veto_gate: Any = None,
     current_blocks: list[Any] | None = None,
+    resume_intents: list[Any] | None = None,
+    resume_record: Any = None,
 ) -> None:
     if reconcile is not None:
         monkeypatch.setattr(task_cancellation, "reconcile_task_pull_request", reconcile)
@@ -318,6 +320,16 @@ def _wire(
         intent_records,
         "list_task_interrupt_intents",
         lambda pool, *, task_id: list(interrupt_intents or []),
+    )
+    monkeypatch.setattr(
+        intent_records,
+        "list_open_task_resume_intents",
+        lambda pool, *, task_id: list(resume_intents or []),
+    )
+    monkeypatch.setattr(
+        intent_records,
+        "get_task_resume_intent",
+        lambda pool, *, task_resume_intent_id: resume_record,
     )
     monkeypatch.setattr(
         execution_records,

@@ -120,6 +120,10 @@ class OperationKind(StrEnum):
     TASK_PR_AUTHORIZATION_RETRY = "task_pr_authorization_retry"
     TASK_PR_COMPOSITION = "task_pr_composition"
     TASK_PR_REVIEW = "task_pr_review"
+    # F8g (issue #292): the authorized same-session Resume continuation of
+    # one interrupted workflow interaction, keyed to its durable one-shot
+    # session-resume record identity.
+    TASK_SESSION_RESUME = "task_session_resume"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -548,6 +552,41 @@ class ReconciliationSweepPayload:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class TaskSessionResumePayload:
+    """The F8g authorized session-resume continuation payload (issue #292).
+
+    The exact durable Workspace/Task units, the accountable Owner Profile
+    identity, the one-shot session-resume record identity, and the
+    authorization-established restored Task status (the expected-currentness
+    seed the coordinator supplies to the Level 2 triage) and authorization
+    token. The record's routing context is re-derived from durable state by
+    the continuation (never caller-supplied); the payload carries no gate
+    resolution, routing decisions, or runtime handles.
+    """
+
+    task: TaskScope
+    profile_id: str
+    task_resume_intent_id: str
+    restored_status: str
+    expected_state_token: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self,
+            "task_resume_intent_id",
+            _require_canonical_uuid(self.task_resume_intent_id, "task_resume_intent_id"),
+        )
+        object.__setattr__(
+            self,
+            "expected_state_token",
+            _require_canonical_uuid(self.expected_state_token, "expected_state_token"),
+        )
+
+
 OperationPayload = (
     WebhookDeliveryDispatchPayload
     | ReconciliationSweepPayload
@@ -559,7 +598,9 @@ OperationPayload = (
     | TaskPrAuthorizationRetryPayload
     | TaskPrCompositionPayload
     | TaskPrReviewPayload
+    | TaskSessionResumePayload
 )
+
 
 _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: frozenset({"delivery_guid"}),
@@ -586,6 +627,9 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.TASK_PR_REVIEW: frozenset(
         {"task", "profile_id", "task_pull_request_id", "expected_state_token"}
     ),
+    OperationKind.TASK_SESSION_RESUME: frozenset(
+        {"task", "profile_id", "task_resume_intent_id", "restored_status", "expected_state_token"}
+    ),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -604,6 +648,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_PR_AUTHORIZATION_RETRY: TaskPrAuthorizationRetryPayload,
     OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
+    OperationKind.TASK_SESSION_RESUME: TaskSessionResumePayload,
 }
 
 
@@ -743,6 +788,22 @@ def _decode_task_pr_review_payload(raw: object) -> TaskPrReviewPayload:
     )
 
 
+def _decode_task_session_resume_payload(raw: object) -> TaskSessionResumePayload:
+    kind = OperationKind.TASK_SESSION_RESUME
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TaskSessionResumePayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        task_resume_intent_id=_require_canonical_uuid(
+            fields["task_resume_intent_id"], "task_resume_intent_id"
+        ),
+        restored_status=_require_non_empty_string(fields["restored_status"], "restored_status"),
+        expected_state_token=_require_canonical_uuid(
+            fields["expected_state_token"], "expected_state_token"
+        ),
+    )
+
+
 _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: _decode_webhook_delivery_dispatch_payload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: _decode_reconciliation_sweep_payload,
@@ -756,6 +817,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_PR_AUTHORIZATION_RETRY: _decode_task_pr_authorization_retry_payload,
     OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
+    OperationKind.TASK_SESSION_RESUME: _decode_task_session_resume_payload,
 }
 
 

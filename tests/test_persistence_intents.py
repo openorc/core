@@ -26,17 +26,25 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.intents import (
     TaskInterruptIntentStatus,
     TaskPullRequestCloseIntentStatus,
+    TaskResumeIntentStatus,
 )
 from openorc.persistence.intents import (
     annotate_unsettled_task_interrupt_intent,
+    claim_task_resume_dispatch,
     create_task_interrupt_intent,
     create_task_pull_request_close_intent,
+    create_task_resume_intent,
     get_task_interrupt_intent,
     get_task_pull_request_close_intent_for_task,
+    get_task_resume_intent,
+    list_open_task_resume_intents,
     list_task_interrupt_intents,
+    list_task_resume_intents,
     list_unsettled_task_interrupt_intents,
     record_task_interrupt_intent_outcome,
     record_task_pull_request_close_intent_outcome,
+    record_task_resume_intent_outcome,
+    supersede_task_resume_intent,
 )
 from openorc.persistence.pool import DatabasePool
 
@@ -426,3 +434,143 @@ def test_intent_commands_reject_malformed_shapes_before_any_sql() -> None:
         )
 
     assert fake_conn.executed == []
+
+
+def _resume_row(**overrides: Any) -> tuple[Any, ...]:
+    values: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "task_agent_session_id": _SESSION_ID,
+        "task_block_id": _BLOCK_ID,
+        "workflow_role": "producer",
+        "external_session_id": "external-session-1",
+        "requested_by_profile_id": _OWNER_PROFILE_ID,
+        "status": "authorized",
+        "routing": {"control": "owner_resume", "operation": "implementation_execution"},
+        "outcome": {},
+        "created_at": _observed_at(),
+        "updated_at": _observed_at(),
+    }
+    values.update(overrides)
+    return (
+        values["id"],
+        values["workspace_id"],
+        values["task_id"],
+        values["task_agent_session_id"],
+        values["task_block_id"],
+        values["workflow_role"],
+        values["external_session_id"],
+        values["requested_by_profile_id"],
+        values["status"],
+        values["routing"],
+        values["outcome"],
+        values["created_at"],
+        values["updated_at"],
+    )
+
+
+def test_create_resume_intent_inserts_authorized_with_canonical_routing() -> None:
+    fake_conn = FakeConnection(_resume_row())
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    record = create_task_resume_intent(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=_SESSION_ID,
+        task_block_id=_BLOCK_ID,
+        workflow_role=WorkflowRole.PRODUCER,
+        external_session_id="external-session-1",
+        requested_by_profile_id=_OWNER_PROFILE_ID,
+        routing={"control": "owner_resume", "operation": "implementation_execution"},
+    )
+
+    assert record.status is TaskResumeIntentStatus.AUTHORIZED
+    assert record.routing["control"] == "owner_resume"
+    assert record.created_at == _utc_observed_at()
+    sql, params = fake_conn.executed[0]
+    assert params is not None
+    assert "insert into openorc.task_resume_intents" in sql
+    assert "'authorized'" in sql
+    assert params[4] == "producer"
+    assert isinstance(params[7], Jsonb)
+
+
+def test_claim_resume_dispatch_advances_authorized_once_to_dispatched() -> None:
+    fake_conn = FakeConnection(_resume_row(status="dispatched"))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    claimed = claim_task_resume_dispatch(pool, task_resume_intent_id=uuid.uuid4())
+
+    assert claimed is not None
+    assert claimed.status is TaskResumeIntentStatus.DISPATCHED
+    sql, _params = fake_conn.executed[0]
+    assert "set status = 'dispatched'" in sql
+    assert "status = 'authorized'" in sql
+
+
+def test_record_resume_intent_outcome_advances_once_to_a_terminal_status() -> None:
+    fake_conn = FakeConnection(_resume_row(status="settled"))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    recorded = record_task_resume_intent_outcome(
+        pool,
+        task_resume_intent_id=uuid.uuid4(),
+        status=TaskResumeIntentStatus.SETTLED,
+        outcome={"result": "processed"},
+    )
+
+    assert recorded is not None
+    assert recorded.status is TaskResumeIntentStatus.SETTLED
+    sql, params = fake_conn.executed[0]
+    assert "status in ('authorized', 'dispatched')" in sql
+    assert params is not None
+    assert isinstance(params[1], Jsonb)
+
+
+def test_record_resume_intent_outcome_rejects_superseded_as_an_outcome_target() -> None:
+    pool = cast(DatabasePool, FakePool(FakeConnection()))
+
+    with pytest.raises(ValueError, match="supersession"):
+        record_task_resume_intent_outcome(
+            pool,
+            task_resume_intent_id=uuid.uuid4(),
+            status=TaskResumeIntentStatus.SUPERSEDED,
+            outcome={},
+        )
+
+
+def test_supersede_resume_intent_advances_authorized_once_to_superseded() -> None:
+    fake_conn = FakeConnection(_resume_row(status="superseded"))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    superseded = supersede_task_resume_intent(
+        pool,
+        task_resume_intent_id=uuid.uuid4(),
+        outcome={"supersession": "pre_dispatch"},
+    )
+
+    assert superseded is not None
+    assert superseded.status is TaskResumeIntentStatus.SUPERSEDED
+    sql, params = fake_conn.executed[0]
+    assert "set status = 'superseded'" in sql
+    assert "status = 'authorized'" in sql
+    assert params is not None
+    assert isinstance(params[0], Jsonb)
+    assert params[0].obj["supersession"] == "pre_dispatch"
+
+
+def test_resume_intent_reads_map_rows_and_normalize_utc() -> None:
+    row = _resume_row()
+    fake_conn = FakeConnection(row=row, rows=[row])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    records = list_task_resume_intents(pool, task_id=_TASK_ID)
+    open_records = list_open_task_resume_intents(pool, task_id=_TASK_ID)
+    single = get_task_resume_intent(pool, task_resume_intent_id=_TASK_ID)
+
+    assert records and records[0].workflow_role is WorkflowRole.PRODUCER
+    assert records[0].created_at == _utc_observed_at()
+    assert open_records == records
+    assert single is not None

@@ -95,6 +95,7 @@ from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
+from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.executions import ExecutionStatus
@@ -142,6 +143,8 @@ from openorc.services.workspace_authorization import require_workspace_task
 __all__ = [
     "ReviewerRuntimeAttachmentFactory",
     "TaskPrRemediationOutcome",
+    "complete_resumed_pr_remediation_result",
+    "continue_resumed_pr_remediation_chain",
     "route_pr_remediation",
 ]
 
@@ -589,23 +592,132 @@ def _record_remediation_completion(
             producer_session=producer_session,
             expected_pull_request_id=expected_pull_request_id,
         )
-        finalized = execution_records.complete_execution_with_result(
+        finalized = _finalize_remediation_attempt(
             transaction_pool,
+            task=current_task,
             execution_id=execution_id,
-            implementation_result=_canonical_result_payload(result),
-        )
-        if finalized is None:
-            raise StaleOperationError(
-                "the remediation attempt is no longer running; finalization is stale"
-            )
-        event_coordination.record_execution_completed_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            execution_id=execution_id,
-            actor=event_coordination.producer_actor(producer_session.id),
+            producer_session_id=producer_session.id,
+            result=result,
         )
     return current_task, finalized
+
+
+def _finalize_remediation_attempt(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    execution_id: UUID,
+    producer_session_id: UUID,
+    result: ImplementationResult,
+) -> Execution:
+    """The one-shot completion of one running remediation attempt.
+
+    The shared finalize core of the ordinary E9 remediation dispatch and the
+    Owner Resume routing's boundary-C composition (issue #292): the
+    conditional ``running`` → ``succeeded`` transition with the validated
+    canonical result payload and the truthful ``execution_completed`` audit
+    commit atomically; a concurrent finalize wins the conditional write and
+    the stale caller fails closed. The attempt is never rewritten afterwards.
+    """
+    finalized = execution_records.complete_execution_with_result(
+        transaction_pool,
+        execution_id=execution_id,
+        implementation_result=_canonical_result_payload(result),
+    )
+    if finalized is None:
+        raise StaleOperationError(
+            "the remediation attempt is no longer running; finalization is stale"
+        )
+    event_coordination.record_execution_completed_event(
+        transaction_pool,
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        execution_id=execution_id,
+        actor=event_coordination.producer_actor(producer_session_id),
+    )
+    return finalized
+
+
+def complete_resumed_pr_remediation_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    execution_id: UUID,
+    result: ImplementationResult,
+) -> tuple[Task, Execution]:
+    """Complete the resumed PR-remediation attempt with its formal result.
+
+    The Owner Resume routing's boundary-C composition for the interrupted
+    E9 remediation execution (issue #292): the exact Task/token/status
+    currentness is re-proven from durable state under the caller's Task row
+    lock, the addressed Execution must still be the Task's running
+    remediation attempt anchored to the Producer session and claiming its
+    exact review iteration with the canonical PR present, and the resumed
+    formal result completes it through the one shared finalize. No new
+    attempt is ever created and the interrupted attempt's history is
+    preserved: the resumed turn continues the SAME logical operation.
+    """
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.REVIEWING:
+        raise StaleOperationError(
+            "the task is no longer reviewing; the resumed remediation result is stale"
+        )
+    producer_session = get_task_agent_session(
+        transaction_pool, task_id=task_id, role=WorkflowRole.PRODUCER
+    )
+    if (
+        producer_session is None
+        or producer_session.workspace_id != workspace_id
+        or producer_session.external_session_id is None
+    ):
+        raise ConflictError("the producer session binding is not available for this task")
+    execution = execution_records.get_execution(transaction_pool, execution_id=execution_id)
+    if (
+        execution is None
+        or execution.workspace_id != workspace_id
+        or execution.task_id != task_id
+        or execution.producer_session_id != producer_session.id
+        or execution.status is not ExecutionStatus.RUNNING
+        or execution.review_iteration_id is None
+    ):
+        raise StaleOperationError(
+            "the addressed remediation attempt is not the task's running "
+            "producer remediation attempt; the resumed result cannot complete it"
+        )
+    iteration = review_records.get_review_iteration(
+        transaction_pool, review_iteration_id=execution.review_iteration_id
+    )
+    if iteration is None or iteration.workspace_id != workspace_id or iteration.task_id != task_id:
+        raise StaleOperationError(
+            "the remediation attempt's claimed review iteration is not available; "
+            "the resumed result cannot complete it"
+        )
+    pull_request = pull_request_records.get_task_pull_request_for_task(
+        transaction_pool, task_id=task_id
+    )
+    if pull_request is None or pull_request.workspace_id != workspace_id:
+        raise StaleOperationError(
+            "the remediation attempt's canonical pull request is not available; "
+            "the resumed result cannot complete it"
+        )
+    finalized = _finalize_remediation_attempt(
+        transaction_pool,
+        task=task,
+        execution_id=execution.id,
+        producer_session_id=producer_session.id,
+        result=result,
+    )
+    return task, finalized
 
 
 def _send_remediation_revision(
@@ -962,3 +1074,74 @@ def route_pr_remediation(
             result=completed,
             repository_full_name=repository_full_name,
         )
+
+
+def continue_resumed_pr_remediation_chain(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    finalized_execution: Execution,
+    result: ImplementationResult,
+) -> TaskPrRemediationOutcome:
+    """Re-enter the ordinary remediation chain after the resumed completion.
+
+    The Owner Resume routing's post-completion continuation for the
+    interrupted E9 remediation execution (issue #292): the exact claimed
+    review iteration, its review loop, the Producer binding, and the routed
+    repository address are re-derived from durable state, and the ordinary
+    fresh exact-head verification and re-dispatch chain runs unchanged for
+    the finalized attempt — never a second chain composition.
+    """
+    producer_session = get_task_agent_session(pool, task_id=task_id, role=WorkflowRole.PRODUCER)
+    if (
+        producer_session is None
+        or producer_session.workspace_id != workspace_id
+        or finalized_execution.producer_session_id != producer_session.id
+    ):
+        raise ConflictError("the finalized remediation attempt's producer binding is not available")
+    if finalized_execution.review_iteration_id is None:
+        raise ConflictError("the finalized remediation attempt claims no review iteration")
+    addressed_iteration = review_records.get_review_iteration(
+        pool, review_iteration_id=finalized_execution.review_iteration_id
+    )
+    if (
+        addressed_iteration is None
+        or addressed_iteration.workspace_id != workspace_id
+        or addressed_iteration.task_id != task_id
+    ):
+        raise ConflictError(
+            "the finalized remediation attempt's claimed review iteration is not available"
+        )
+    review_loop = review_records.get_review_loop(
+        pool, review_loop_id=addressed_iteration.review_loop_id
+    )
+    if review_loop is None or review_loop.workspace_id != workspace_id:
+        raise ConflictError("the claimed review iteration's review loop is not available")
+    pull_request = pull_request_records.get_task_pull_request_for_task(pool, task_id=task_id)
+    if pull_request is None or pull_request.workspace_id != workspace_id:
+        raise ConflictError("the remediation chain's canonical pull request is not available")
+    task = task_records.get_task(pool, task_id)
+    if task is None or task.workspace_id != workspace_id or task.repository_id is None:
+        raise ConflictError("the remediation chain's task is not available")
+    repository = get_repository(pool, task.repository_id)
+    if repository is None or repository.workspace_id != workspace_id:
+        raise ConflictError("the remediation chain's repository is not available")
+    return _verify_remediation_push_and_redispatch(
+        pool,
+        github,
+        reviewer_runtime_factory,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=profile_id,
+        expected_state_token=task.state_token,
+        producer_session=producer_session,
+        addressed_iteration=addressed_iteration,
+        review_loop=review_loop,
+        finalized_execution=finalized_execution,
+        result=result,
+        repository_full_name=_repository_full_name(repository),
+    )
