@@ -112,6 +112,7 @@ from openorc.persistence.tasks import (
     claim_task_planning_bootstrap,
     get_task,
     get_task_planning_bootstrap_claim,
+    get_task_planning_bootstrap_evidence,
     lock_workspace_task_arbitration,
     record_planning_bootstrap_stage,
 )
@@ -144,6 +145,7 @@ __all__ = [
     "TaskBootstrapRuntimeComposition",
     "TaskPlanningPreparationOutcome",
     "WorkspacePreparationFailedError",
+    "complete_resumed_bootstrap_prepare",
     "prepare_task_for_planning",
 ]
 
@@ -806,102 +808,194 @@ def prepare_task_for_planning(
                 ) from error
         _require_prepared_workspace_result(result)
 
-        # --- F2 stage evidence: the PREPARE control settled (issue #87). ---
-        _record_bootstrap_stage_or_fail(
+        # --- The shared post-PREPARE tail: stage settlement, the
+        # planning-context transition, and the prepared-for-planning
+        # handoff (shared with the F8g resume continuation, issue #292). ---
+        return _complete_prepared_bootstrap_tail(
             pool,
+            runtime_composition,
+            workspace_id=workspace_id,
+            profile_id=profile_id,
             task_id=task_id,
             claim_token=claim_token,
-            stage=TaskPlanningBootstrapStage.PREPARED,
+            expected_state_token=post_claim_token,
+            producer=bindings[WorkflowRole.PRODUCER],
+            reviewer=bindings[WorkflowRole.REVIEWER],
+            checkout_directory=checkout_directory,
+            attempt_evidence=attempt_evidence,
         )
 
-        if attempt_evidence is not None:
-            # The same claim identity advances to its transition phase: the
-            # coordinator reports the phase the failing invocation reached
-            # (issue #262).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
-                original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
-                original_attempt_id=claim_token,
-                phase="planning_bootstrap_transition",
-            )
 
-        # --- Phase 5: post-PREPARE recheck (one short transaction). ---
-        _recheck_bootstrap_subject(
+def _complete_prepared_bootstrap_tail(
+    pool: DatabasePool,
+    runtime_composition: TaskBootstrapRuntimeComposition,
+    *,
+    workspace_id: UUID,
+    profile_id: UUID,
+    task_id: UUID,
+    claim_token: UUID,
+    expected_state_token: UUID,
+    producer: TaskAgentSession,
+    reviewer: TaskAgentSession,
+    checkout_directory: str,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> TaskPlanningPreparationOutcome:
+    """The shared post-PREPARE tail of the bootstrap continuation.
+
+    One validated ``workspace_result`` in, the settled prepared-for-planning
+    handoff out: the F2 ``prepared`` stage evidence, the post-PREPARE
+    subject recheck, the one runtime-neutral planning-context transition
+    (external, no transaction open; no PLAN control is ever sent here), the
+    ``ready_for_planning`` settlement evidence, and the final recheck. Both
+    the ordinary E1b continuation and the F8g resume continuation complete
+    through this exact tail — never a second bootstrap composition.
+    """
+    _record_bootstrap_stage_or_fail(
+        pool,
+        task_id=task_id,
+        claim_token=claim_token,
+        stage=TaskPlanningBootstrapStage.PREPARED,
+    )
+
+    if attempt_evidence is not None:
+        # The same claim identity advances to its transition phase: the
+        # coordinator reports the phase the failing invocation reached
+        # (issue #262).
+        attempt_evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
+            original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+            original_attempt_id=claim_token,
+            phase="planning_bootstrap_transition",
+        )
+
+    _recheck_bootstrap_subject(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=profile_id,
+        claim_token=claim_token,
+        expected_state_token=expected_state_token,
+        expected_producer=producer,
+        expected_reviewer=reviewer,
+    )
+
+    if producer.external_session_id is None or not producer.external_session_id.strip():
+        raise ConflictError("the producer session binding carries no external session identity")
+
+    try:
+        runtime_composition.enter_planning_checkout(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            profile_id=profile_id,
-            claim_token=claim_token,
-            expected_state_token=post_claim_token,
-            expected_producer=bindings[WorkflowRole.PRODUCER],
-            expected_reviewer=bindings[WorkflowRole.REVIEWER],
+            external_session_id=producer.external_session_id,
+            checkout_directory=checkout_directory,
         )
+    except AgentRuntimeUncertainOutcomeError as error:
+        logger.warning(
+            "the planning-context transition ended with an uncertain outcome; "
+            "it is never retried or replayed here"
+        )
+        raise ExternalOperationUncertainError(
+            "the outcome of the planning-context transition is unknown; "
+            "nothing is retried and the bootstrap stops with its partial "
+            "facts retained"
+        ) from error
+    except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+        logger.warning(
+            "the planning-context transition ended with a post-send runtime "
+            "failure; the bootstrap stage stays unsettled"
+        )
+        raise ExternalOperationUncertainError(
+            "the planning-context transition's send may have been delivered "
+            "but its response could not be interpreted; nothing is retried "
+            "and the bootstrap stops with its partial facts retained"
+        ) from error
+    except AgentRuntimeError as error:
+        raise ExternalOperationFailedError(
+            "the planning-context transition failed; the bootstrap stops "
+            "with its partial facts retained"
+        ) from error
 
-        # --- Phase 6: the one runtime-neutral planning-context transition
-        # (external, no transaction open). No PLAN control is ever sent
-        # here. ---
-        try:
-            runtime_composition.enter_planning_checkout(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                external_session_id=producer.external_session_id,
-                checkout_directory=checkout_directory,
-            )
-        except AgentRuntimeUncertainOutcomeError as error:
-            logger.warning(
-                "the planning-context transition ended with an uncertain outcome; "
-                "it is never retried or replayed here"
-            )
-            raise ExternalOperationUncertainError(
-                "the outcome of the planning-context transition is unknown; "
-                "nothing is retried and the bootstrap stops with its partial "
-                "facts retained"
-            ) from error
-        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
-            logger.warning(
-                "the planning-context transition ended with a post-send runtime "
-                "failure; the bootstrap stage stays unsettled"
-            )
-            raise ExternalOperationUncertainError(
-                "the planning-context transition's send may have been delivered "
-                "but its response could not be interpreted; nothing is retried "
-                "and the bootstrap stops with its partial facts retained"
-            ) from error
-        except AgentRuntimeError as error:
-            raise ExternalOperationFailedError(
-                "the planning-context transition failed; the bootstrap stops "
-                "with its partial facts retained"
-            ) from error
+    _record_bootstrap_stage_or_fail(
+        pool,
+        task_id=task_id,
+        claim_token=claim_token,
+        stage=TaskPlanningBootstrapStage.READY_FOR_PLANNING,
+    )
 
-        # --- F2 stage evidence: the planning-context transition settled
-        # (issue #87) — a continuation now waiting for the first PLAN
-        # dispatch. ---
-        _record_bootstrap_stage_or_fail(
-            pool,
-            task_id=task_id,
-            claim_token=claim_token,
-            stage=TaskPlanningBootstrapStage.READY_FOR_PLANNING,
-        )
-
-        # --- Phase 7: final recheck (one short transaction) and the
-        # prepared-for-planning outcome. ---
-        task = _recheck_bootstrap_subject(
-            pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            profile_id=profile_id,
-            claim_token=claim_token,
-            expected_state_token=post_claim_token,
-            expected_producer=bindings[WorkflowRole.PRODUCER],
-            expected_reviewer=bindings[WorkflowRole.REVIEWER],
-        )
-        return TaskPlanningPreparationOutcome(
-            task=task,
-            producer_session=bindings[WorkflowRole.PRODUCER],
-            reviewer_session=bindings[WorkflowRole.REVIEWER],
-            producer_checkout_directory=checkout_directory,
-        )
+    task = _recheck_bootstrap_subject(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=profile_id,
+        claim_token=claim_token,
+        expected_state_token=expected_state_token,
+        expected_producer=producer,
+        expected_reviewer=reviewer,
+    )
+    return TaskPlanningPreparationOutcome(
+        task=task,
+        producer_session=producer,
+        reviewer_session=reviewer,
+        producer_checkout_directory=checkout_directory,
+    )
 
 
 # __CHUNK_APPEND_MARKER__
+
+
+def complete_resumed_bootstrap_prepare(
+    pool: DatabasePool,
+    runtime_composition: TaskBootstrapRuntimeComposition,
+    *,
+    workspace_id: UUID,
+    profile_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: WorkspaceResult,
+) -> TaskPlanningPreparationOutcome:
+    """Complete the resumed bootstrap PREPARE stage with its validated result.
+
+    The Owner Resume routing's boundary-C composition for the interrupted
+    E1b PREPARE control (issue #292): the ORIGINAL bootstrap claim identity
+    and both READY bindings are re-derived from durable state — completed
+    establishment effects are never repeated — and the resumed turn's
+    validated ``workspace_result`` continues the SAME logical operation
+    through the one shared post-PREPARE tail. An already-settled stage (a
+    PREPARED-but-untransitioned bootstrap, whose outstanding fact is the
+    planning-context reconstruction rather than an interrupted turn) fails
+    closed.
+    """
+    evidence = get_task_planning_bootstrap_evidence(pool, task_id=task_id)
+    if evidence is None:
+        raise ConflictError("the task carries no planning bootstrap claim; the resume is stale")
+    if evidence.stage is not None:
+        raise ConflictError("the bootstrap PREPARE stage is already settled; the resume is stale")
+    producer = _require_ready_binding(
+        pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.PRODUCER
+    )
+    reviewer = _require_ready_binding(
+        pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.REVIEWER
+    )
+    with composed_transaction(pool) as transaction_pool:
+        original_base = _producer_snapshot_repository_base(
+            transaction_pool, producer, workspace_id=workspace_id
+        )
+    checkout_directory = f"{original_base}/{task_id}"
+    failure = _canonical_absolute_path_failure(checkout_directory)
+    if failure is not None:
+        raise ConflictError(f"the selected task checkout directory {failure}")
+    _require_prepared_workspace_result(result)
+    return _complete_prepared_bootstrap_tail(
+        pool,
+        runtime_composition,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        task_id=task_id,
+        claim_token=evidence.claim_token,
+        expected_state_token=expected_state_token,
+        producer=producer,
+        reviewer=reviewer,
+        checkout_directory=checkout_directory,
+        attempt_evidence=None,
+    )
