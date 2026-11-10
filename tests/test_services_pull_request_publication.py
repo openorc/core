@@ -72,6 +72,7 @@ from openorc.services.pull_request_publication import (
     TaskPullRequestPublicationOutcome,
     publish_task_pull_request,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -173,25 +174,17 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 def _task_row(*, state_token: uuid.UUID = _STATE_TOKEN, archived: bool = False) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        9001,
-        42,
-        "reviewing",
-        _OBSERVED if archived else None,
-        _BRANCH,
-        state_token,
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        status="reviewing",
+        archived_at=_OBSERVED if archived else None,
+        canonical_feature_branch=_BRANCH,
+        state_token=state_token,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

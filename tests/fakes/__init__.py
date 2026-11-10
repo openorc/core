@@ -23,6 +23,7 @@ from .cline_sdk_backend import (
     FakeBackendCall,
     FakeClineSdkBackend,
 )
+from .task_rows import task_row
 
 __all__ = [
     "ControlRealization",
@@ -39,4 +40,5 @@ __all__ = [
     "plan_result_candidate",
     "pr_result_candidate",
     "session_ready_candidate",
+    "task_row",
 ]

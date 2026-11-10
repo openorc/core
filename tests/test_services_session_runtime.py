@@ -80,6 +80,7 @@ from openorc.services.session_runtime import (
 )
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
 from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 _BARRIER_ROW = (None, None, None)  # account-operational barrier: no attempt state
@@ -202,25 +203,17 @@ def _ws_row(workspace_id: Any, owner_profile_id: Any, *, guidance: str = "") -> 
 
 
 def _task_row(workspace_id: Any) -> tuple[Any, ...]:
-    return (
-        uuid.uuid4(),
-        workspace_id,
-        uuid.uuid4(),
-        42,
-        42,
-        "ready_to_plan",
-        None,
-        None,
-        uuid.uuid4(),
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        repository_id=uuid.uuid4(),
+        github_issue_id=42,
+        github_issue_number=42,
+        status="ready_to_plan",
+        state_token=uuid.uuid4(),
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

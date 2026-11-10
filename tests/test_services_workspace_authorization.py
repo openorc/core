@@ -25,6 +25,7 @@ from openorc.domain.ownership import Workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.services import workspace_authorization
 from openorc.services.errors import NotFoundError
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
 
@@ -308,25 +309,17 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             _OBSERVED,
             _OBSERVED,
         ),
-        "task": (
-            task_id,
-            workspace_id,
-            repository_id,
-            42,
-            7,
-            "ready_to_plan",
-            None,
-            None,
-            uuid.uuid4(),
-            None,
-            None,
-            "a" * 64,
-            None,
-            _OBSERVED,
-            _OBSERVED,
-            None,
-            None,
-            None,
+        "task": task_row(
+            id=task_id,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=42,
+            github_issue_number=7,
+            status="ready_to_plan",
+            state_token=uuid.uuid4(),
+            source_requirements_fingerprint="a" * 64,
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
         ),
         "session": (
             uuid.uuid4(),

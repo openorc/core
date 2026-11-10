@@ -20,6 +20,8 @@ The following are **suite-wide guarantees**, not a checklist to re-prove in ever
 
 Assert observable behavior, durable outcomes, and authority boundaries rather than incidental internal calls or query shapes. Prefer typed builders and reusable stable fixtures over duplicated positional database-row tuples. Mock at focused boundaries; script exact SQL sequences or internal call ordering only when those details are material to the tested contract. Real-Postgres integration tests prove database-enforced constraints and atomicity. Do not rewrite existing tests solely for style.
 
+When simulating the **full canonical Task repository-row projection** (the 18-column row consumed by `openorc.persistence.tasks` mapping), build rows with the shared builder in `tests/fakes/task_rows.py` instead of duplicating positional tuples. Specialized or partial-query row shapes keep bespoke local definitions, and Task persistence-mapping tests keep independent hand-written rows so column order and nullable handling stay independently verified. Detailed builder usage lives in the helper module itself, not here.
+
 Normal test suites must not silently call live production GitHub, Supabase, Valkey, Cline Hub, or model inference. Real integration/E2E layers are explicit and separately configured.
 
 Use `tests/README.md` for commands, suite layout, fixtures, markers, setup, and troubleshooting rather than bloating this standing policy file.

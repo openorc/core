@@ -83,6 +83,7 @@ from openorc.services.task_pr_authorization import (
     open_pr_authorization,
     present_pr_authorization_gate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 _ACCOUNT_OPERATIONAL_ROW: tuple[Any, ...] = (None, None, None)
@@ -275,25 +276,21 @@ def _task_row(
     workspace_id: Any = _WORKSPACE_ID,
     fingerprint: str = _FINGERPRINT,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        workspace_id,
-        _REPOSITORY_ID,
-        _GITHUB_ISSUE_ID,
-        _ISSUE_NUMBER,
-        status,
-        _OBSERVED if archived else None,
-        canonical_branch,
-        state_token,
-        current_plan_revision_id,
-        gate_id,
-        fingerprint,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=_GITHUB_ISSUE_ID,
+        github_issue_number=_ISSUE_NUMBER,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        canonical_feature_branch=canonical_branch,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint=fingerprint,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

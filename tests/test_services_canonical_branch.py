@@ -46,6 +46,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -148,25 +149,17 @@ def _task_row(
     canonical_feature_branch: str | None = None,
     state_token: uuid.UUID = _TOKEN,
 ) -> tuple[Any, ...]:
-    return (
-        task_id,
-        workspace_id,
-        _REPOSITORY_ID,
-        9001,
-        42,
-        status,
-        archived_at,
-        canonical_feature_branch,
-        state_token,
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=task_id,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        status=status,
+        archived_at=archived_at,
+        canonical_feature_branch=canonical_feature_branch,
+        state_token=state_token,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

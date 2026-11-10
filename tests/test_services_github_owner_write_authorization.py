@@ -61,6 +61,7 @@ from openorc.services.github_user_authorization import (
     CONDITION_REVOKED,
     GitHubUserAuthorizationUnavailableError,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
 _PROFILE_ID = uuid.uuid4()
@@ -148,25 +149,16 @@ def _workspace_row(*, owner_profile_id: uuid.UUID = _PROFILE_ID) -> tuple[Any, .
 
 
 def _task_row() -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        9001,
-        42,
-        "reviewing",
-        None,
-        "openorc/task-42-implementation",
-        _STATE_TOKEN,
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        status="reviewing",
+        canonical_feature_branch="openorc/task-42-implementation",
+        state_token=_STATE_TOKEN,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

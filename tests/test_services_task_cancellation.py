@@ -82,6 +82,7 @@ from openorc.services.task_cancellation import (
     cancel_task_composition,
     cancel_task_for_confirmed_pr_closure,
 )
+from tests.fakes.task_rows import task_row
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
     _event_returned_row,
@@ -143,26 +144,23 @@ def _task_values(
     cause: Any = None,
     current_plan_revision: Any = None,
 ) -> tuple[Any, ...]:
-    """One 17-column ``openorc.tasks`` row shaped like the durable model."""
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        503,
-        42,
-        status,
-        _OBSERVED if archived else None,
-        "openorc/task-42-implementation",
-        state_token,
-        current_plan_revision,
-        current_gate_id,
-        fingerprint,
-        _OBSERVED if queued else None,
-        _OBSERVED,
-        _OBSERVED,
-        cause,
-        None,
-        None,
+    """One full ``openorc.tasks`` row shaped like the durable model."""
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        canonical_feature_branch="openorc/task-42-implementation",
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision,
+        current_owner_gate_id=current_gate_id,
+        source_requirements_fingerprint=fingerprint,
+        queued_at=_OBSERVED if queued else None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        terminal_cause=cause,
     )
 
 

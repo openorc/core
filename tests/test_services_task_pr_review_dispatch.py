@@ -59,6 +59,7 @@ from tests.fakes.agent_runtime import (
     accepted_review_result_candidate,
     session_ready_candidate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 21, 12, 0, 0, tzinfo=UTC)
 _ACCOUNT_OPERATIONAL_ROW: tuple[Any, ...] = (None, None, None)
@@ -230,25 +231,19 @@ def _task_row(
     workspace_id: Any = _WORKSPACE_ID,
     current_gate_id: Any = None,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        workspace_id,
-        _REPOSITORY_ID,
-        503,
-        _ISSUE_NUMBER,
-        status,
-        None,
-        canonical_branch,
-        state_token,
-        None,
-        current_gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        github_issue_number=_ISSUE_NUMBER,
+        status=status,
+        canonical_feature_branch=canonical_branch,
+        state_token=state_token,
+        current_owner_gate_id=current_gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

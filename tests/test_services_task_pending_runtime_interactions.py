@@ -27,6 +27,7 @@ from openorc.services.errors import InvalidCommandError, NotFoundError
 from openorc.services.task_pending_runtime_interactions import (
     list_pending_task_runtime_interactions,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 27, 9, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid4()
@@ -149,25 +150,19 @@ def _task_row(
     gate_id: Any = None,
     archived: bool = False,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        503,
-        42,
-        status,
-        _OBSERVED if archived else None,
-        None,
-        state_token,
-        current_plan_revision_id,
-        gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
@@ -882,13 +877,13 @@ def test_phase_ineligible_operations_are_never_listed() -> None:
 
 def test_archived_and_terminal_tasks_never_list_history() -> None:
     conn = ScriptedConnection()
-    for task_row in (
+    for row in (
         _task_row(status="cancelled", archived=True),
         _task_row(status="completed", archived=True),
         _task_row(status="cancelled", archived=True),
     ):
         conn = ScriptedConnection()
-        conn.on(_TASK_READ, task_row)
+        conn.on(_TASK_READ, row)
         assert (
             list_pending_task_runtime_interactions(
                 _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID

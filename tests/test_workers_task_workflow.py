@@ -58,6 +58,7 @@ from openorc.workers.invocation import (
     decode_operation_invocation,
     execute_operation_job,
 )
+from tests.fakes.task_rows import task_row
 
 _WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000001")
 _TASK_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000002")
@@ -1077,25 +1078,17 @@ _REPOSITORY_ID = uuid4()
 
 
 def _durable_task_row(*, state_token: UUID, revision_id: UUID | None) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        503,
-        42,
-        "planning",
-        None,
-        None,
-        state_token,
-        revision_id,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status="planning",
+        state_token=state_token,
+        current_plan_revision_id=revision_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
