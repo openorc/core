@@ -74,6 +74,7 @@ from tests.fakes.agent_runtime import (
     implementation_result_candidate,
     session_ready_candidate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 _DUE = _OBSERVED - timedelta(seconds=1)
@@ -240,25 +241,19 @@ def _task_row(
     archived: bool = False,
     workspace_id: Any = _WORKSPACE_ID,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        workspace_id,
-        _REPOSITORY_ID,
-        503,
-        42,
-        status,
-        _OBSERVED if archived else None,
-        None,
-        state_token,
-        current_plan_revision_id,
-        gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

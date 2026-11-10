@@ -31,6 +31,7 @@ from openorc.persistence import runtime_control_secrets
 from openorc.persistence.pool import DatabasePool
 from openorc.services import administrative_deletion
 from openorc.services.errors import ConflictError, NotFoundError
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
 
@@ -163,26 +164,20 @@ def _repository_row(workspace_id: Any, project_id: Any) -> tuple[Any, ...]:
 
 
 def _task_row(workspace_id: Any, *, archived: bool) -> tuple[Any, ...]:
-    archived_at = _OBSERVED if archived else None
-    return (
-        uuid.uuid4(),
-        workspace_id,
-        uuid.uuid4(),
-        991001,
-        42,
-        "completed" if archived else "ready_to_plan",
-        archived_at,
-        "feature-branch",
-        uuid.uuid4(),
-        uuid.uuid4(),
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        repository_id=uuid.uuid4(),
+        github_issue_id=991001,
+        github_issue_number=42,
+        status="completed" if archived else "ready_to_plan",
+        archived_at=_OBSERVED if archived else None,
+        canonical_feature_branch="feature-branch",
+        state_token=uuid.uuid4(),
+        current_plan_revision_id=uuid.uuid4(),
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

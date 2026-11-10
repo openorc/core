@@ -85,6 +85,7 @@ from tests.fakes.agent_runtime import (
     FakeAgentRuntimeAdapter,
     session_ready_candidate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -249,25 +250,17 @@ def _task_row(
     current_plan_revision_id: Any = None,
     workspace_id: Any = _WORKSPACE_ID,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        workspace_id,
-        _REPOSITORY_ID,
-        503,
-        42,
-        status,
-        None,
-        None,
-        state_token,
-        current_plan_revision_id,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status=status,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

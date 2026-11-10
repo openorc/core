@@ -81,6 +81,7 @@ from tests.fakes.agent_runtime import (
     implementation_result_candidate,
     session_ready_candidate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -228,25 +229,19 @@ def _task_row(
     archived: bool = False,
     workspace_id: Any = _WORKSPACE_ID,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        workspace_id,
-        _REPOSITORY_ID,
-        503,
-        42,
-        status,
-        _OBSERVED if archived else None,
-        None,
-        state_token,
-        current_plan_revision_id,
-        gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=workspace_id,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
@@ -902,23 +897,23 @@ def _refused_before_effects(
 
 
 def test_stale_token_and_archived_tasks_refuse_as_stale_operations() -> None:
-    for task_row in (
+    for row in (
         _task_row(state_token=_TOKEN_2),
         _task_row(archived=True, status="cancelled"),
     ):
         conn = ScriptedConnection()
-        _script_admission(conn, task_row=task_row)
+        _script_admission(conn, task_row=row)
         _refused_before_effects(conn, StaleOperationError)
 
 
 def test_wrong_status_and_current_gate_pointer_refuse_as_conflicts() -> None:
-    for task_row in (
+    for row in (
         _task_row(status="waiting_for_owner", gate_id=_GATE_ID),
         _task_row(status="planning"),
         _task_row(current_plan_revision_id=None),
     ):
         conn = ScriptedConnection()
-        _script_admission(conn, task_row=task_row)
+        _script_admission(conn, task_row=row)
         _refused_before_effects(conn, ConflictError)
 
 

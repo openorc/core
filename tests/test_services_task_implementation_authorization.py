@@ -66,6 +66,7 @@ from openorc.services.task_implementation_authorization import (
     cancel_implementation_authorization,
     open_implementation_authorization,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -237,25 +238,19 @@ def _task_row(
     archived: bool = False,
     fingerprint: Any = _FINGERPRINT,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        _GITHUB_ISSUE_ID,
-        42,
-        status,
-        _OBSERVED if archived else None,
-        None,
-        state_token,
-        current_plan_revision_id,
-        gate_id,
-        fingerprint,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=_GITHUB_ISSUE_ID,
+        status=status,
+        archived_at=_OBSERVED if archived else None,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint=fingerprint,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

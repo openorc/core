@@ -54,6 +54,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 21, 12, 0, 0, tzinfo=UTC)
 
@@ -134,25 +135,19 @@ def _task_row(
     current_plan_revision_id: uuid.UUID | None = None,
     current_owner_gate_id: uuid.UUID | None = None,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        9001,
-        42,
-        status,
-        archived_at,
-        canonical_feature_branch,
-        state_token,
-        current_plan_revision_id,
-        current_owner_gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        status=status,
+        archived_at=archived_at,
+        canonical_feature_branch=canonical_feature_branch,
+        state_token=state_token,
+        current_plan_revision_id=current_plan_revision_id,
+        current_owner_gate_id=current_owner_gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

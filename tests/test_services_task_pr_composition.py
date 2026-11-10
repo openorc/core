@@ -93,6 +93,7 @@ from tests.fakes.agent_runtime import (
     pr_result_candidate,
     session_ready_candidate,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 21, 12, 0, 0, tzinfo=UTC)
 _ACCOUNT_OPERATIONAL_ROW: tuple[Any, ...] = (None, None, None)
@@ -269,25 +270,19 @@ def _task_row(
     terminal_cause: Any = None,
     gate_id: Any = None,
 ) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        _GITHUB_ISSUE_ID,
-        _ISSUE_NUMBER,
-        status,
-        archived_at,
-        canonical_branch,
-        state_token,
-        None,
-        gate_id,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        terminal_cause,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        status=status,
+        archived_at=archived_at,
+        canonical_feature_branch=canonical_branch,
+        state_token=state_token,
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        terminal_cause=terminal_cause,
     )
 
 

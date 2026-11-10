@@ -75,6 +75,7 @@ from openorc.services.github_webhook_dispatch import (
     GitHubWebhookDispatchRouteStatus,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
+from tests.fakes.task_rows import task_row
 
 _NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_A = uuid.uuid4()
@@ -362,25 +363,18 @@ def _task_row(
     canonical_feature_branch: str | None = None,
     fingerprint: str | None = _FINGERPRINT_BASE,
 ) -> tuple[Any, ...]:
-    return (
-        task_id,
-        _WORKSPACE_A,
-        _REPOSITORY_A,
-        github_issue_id,
-        issue_number,
-        status,
-        None,
-        canonical_feature_branch,
-        _TOKEN_A,
-        None,
-        None,
-        fingerprint,
-        None,
-        _NOW,
-        _NOW,
-        None,
-        None,
-        None,
+    return task_row(
+        id=task_id,
+        workspace_id=_WORKSPACE_A,
+        repository_id=_REPOSITORY_A,
+        github_issue_id=github_issue_id,
+        github_issue_number=issue_number,
+        status=status,
+        canonical_feature_branch=canonical_feature_branch,
+        state_token=_TOKEN_A,
+        source_requirements_fingerprint=fingerprint,
+        created_at=_NOW,
+        updated_at=_NOW,
     )
 
 

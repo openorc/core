@@ -48,6 +48,7 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 26, 12, 0, 0, tzinfo=UTC)
 _WORKSPACE_ID = uuid.uuid4()
@@ -346,25 +347,16 @@ def _issue_projection_row(state: str = "open") -> tuple[Any, ...]:
 
 
 def _task_row(state_fingerprint: str | None = None) -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        _GITHUB_ISSUE_ID,
-        _ISSUE_NUMBER,
-        "ready_to_plan",
-        None,
-        None,
-        _STATE_TOKEN,
-        None,
-        None,
-        state_fingerprint,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=_GITHUB_ISSUE_ID,
+        github_issue_number=_ISSUE_NUMBER,
+        state_token=_STATE_TOKEN,
+        source_requirements_fingerprint=state_fingerprint,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

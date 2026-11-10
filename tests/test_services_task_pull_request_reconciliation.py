@@ -52,6 +52,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 _MERGED_AT = datetime(2026, 9, 27, 14, 0, 0, tzinfo=UTC)
@@ -147,25 +148,16 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 def _task_row() -> tuple[Any, ...]:
-    return (
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _REPOSITORY_ID,
-        9001,
-        42,
-        "reviewing",
-        None,
-        "openorc/task-42-implementation",
-        uuid.uuid4(),
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        status="reviewing",
+        canonical_feature_branch="openorc/task-42-implementation",
+        state_token=uuid.uuid4(),
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 

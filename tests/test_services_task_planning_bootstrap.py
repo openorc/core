@@ -58,6 +58,7 @@ from openorc.services.task_planning_bootstrap import (
     prepare_task_for_planning,
 )
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
+from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC)
 _BARRIER_ROW = (None, None, None)  # account-operational barrier: no attempt state
@@ -187,25 +188,14 @@ def _task_row(
     status: str = "planning",
     state_token: Any = None,
 ) -> tuple[Any, ...]:
-    return (
-        row_id if row_id is not None else uuid.uuid4(),
-        workspace_id,
-        uuid.uuid4(),
-        9001,
-        42,
-        status,
-        None,
-        None,
-        state_token if state_token is not None else uuid.uuid4(),
-        None,
-        None,
-        "a" * 64,
-        None,
-        _OBSERVED,
-        _OBSERVED,
-        None,
-        None,
-        None,
+    return task_row(
+        id=row_id if row_id is not None else uuid.uuid4(),
+        workspace_id=workspace_id,
+        status=status,
+        state_token=state_token if state_token is not None else uuid.uuid4(),
+        source_requirements_fingerprint="a" * 64,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
