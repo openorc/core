@@ -7,8 +7,10 @@ delivery headers, delegates the blocking, database-bound intake — pool
 acquisition included — to the shared application service off the event loop (the v1 persistence
 surface is synchronous), and maps the typed intake outcomes/errors onto HTTP
 responses. It contains no GitHub reconciliation, no dispatch-decision or
-enqueue semantics, and no workflow logic — the intake/dispatch facade
-boundary owns those (issue #120).
+submission semantics, and no workflow logic — the intake/dispatch facade
+boundary owns those (issue #120), and accepted deliveries are submitted
+through the serving process's active shared operation submitter (F1,
+issue #86) via the F1-backed submission bridge (issue #255).
 
 Response mapping:
 
@@ -44,7 +46,8 @@ from openorc.services.github_webhook_dispatch import (
     GitHubWebhookIntakeAndDispatch,
     intake_and_dispatch_github_webhook,
 )
-from openorc.workers.jobs.github_webhook_dispatch import build_github_webhook_dispatch_submission
+from openorc.workers.github_operations import F1WebhookDispatchSubmission
+from openorc.workers.invocation import OperationSubmitter
 
 router = APIRouter(tags=["github-webhooks"])
 
@@ -91,6 +94,7 @@ def _declared_length_exceeds_limit(declared_length: str | None) -> bool:
 
 def _intake_and_dispatch(
     settings: Settings,
+    submitter: OperationSubmitter,
     raw_body: bytes,
     signature_header: str | None,
     event_name: str,
@@ -100,13 +104,15 @@ def _intake_and_dispatch(
 
     The process-local pool is acquired HERE, off the event loop: first-use
     pool construction can block on the database and must never run inside an
-    async request handler. The dispatch submission seam is transport wiring;
-    every duplicate/relevance/processing decision is the service's.
+    async request handler. The dispatch submission seam is the serving
+    process's active F1 submitter (``app.state.operation_submitter``, issue
+    #86) wrapped for the facade's protocol (issue #255); every
+    duplicate/relevance/processing decision is the service's.
     """
     return intake_and_dispatch_github_webhook(
         get_database_pool(settings),
         settings,
-        build_github_webhook_dispatch_submission(settings),
+        F1WebhookDispatchSubmission(submitter),
         raw_body=raw_body,
         signature_header=signature_header,
         event_name=event_name,
@@ -123,6 +129,10 @@ async def receive_github_webhook(
 ) -> Response:
     """Intake one authenticated GitHub webhook delivery (issue #61)."""
     settings: Settings = request.app.state.settings
+    # The serving lifespan owns the process's one active operation submitter
+    # (regular mode: the bounded local executor; queue mode: the canonical
+    # queue submission). The route only carries it into the threadpool call.
+    submitter: OperationSubmitter = request.app.state.operation_submitter
     if _declared_length_exceeds_limit(request.headers.get("content-length")):
         return Response(status_code=413)
     if x_github_event is None or not x_github_event.strip():
@@ -133,12 +143,14 @@ async def receive_github_webhook(
     if raw_body is None:
         return Response(status_code=413)
     try:
-        # The blocking, database-and-queue-bound intake-and-dispatch facade —
-        # process-local pool acquisition included — runs off the event loop
-        # in one worker step; its typed result carries no HTTP contract.
+        # The blocking, database-and-submission-bound intake-and-dispatch
+        # facade — process-local pool acquisition included — runs off the
+        # event loop in one worker step; its typed result carries no HTTP
+        # contract.
         await run_in_threadpool(
             _intake_and_dispatch,
             settings,
+            submitter,
             raw_body,
             x_hub_signature_256,
             x_github_event,
