@@ -109,13 +109,14 @@ _FACADE_SPAN_NAME = "github_webhook_dispatch.intake_and_dispatch_github_webhook"
 
 
 class EnqueueOutcome(StrEnum):
-    """The explicit queue-submission outcome for one accepted delivery.
+    """The explicit submission outcome for one accepted delivery.
 
-    ``enqueued`` — known success. ``known_failed`` — a definitive enqueue
-    failure, classified for safe recovery. ``uncertain`` — the enqueue
-    outcome is unknown (a timeout after sending is indistinguishable from a
-    connect failure): never re-enqueued blindly and never reconciled here;
-    recovery (#62) re-derives from durable state.
+    ``enqueued`` — the transport accepted the invocation for delivery.
+    ``known_failed`` — a definitive submission refusal, classified for safe
+    recovery. ``uncertain`` — the submission outcome is unknown (a timeout
+    after sending is indistinguishable from a connect failure): never
+    re-submitted blindly and never reconciled here; recovery (#62)
+    re-derives from durable state.
     """
 
     ENQUEUED = "enqueued"
@@ -143,11 +144,12 @@ class GitHubWebhookDispatchRouteStatus(StrEnum):
 
 
 class WebhookDispatchSubmission(Protocol):
-    """The queue seam dispatch submission hands delivery identities to.
+    """The submission seam dispatch submission hands delivery identities to.
 
-    Implemented by the RQ transport in :mod:`openorc.workers.jobs`; tests
-    inject recording fakes. The seam owns the queue mechanics and classifies
-    the provider outcome; the service owns the decision and its durable
+    Implemented by the F1-backed submission bridge in
+    :mod:`openorc.workers.github_operations` (issue #255); tests inject
+    recording fakes. The seam owns the transport mechanics and classifies
+    the submission outcome; the service owns the decision and its durable
     marking.
     """
 
@@ -181,9 +183,9 @@ class GitHubWebhookDispatchResult:
 class GitHubWebhookDispatchSubmissionResult:
     """The typed result of one dispatch submission invocation.
 
-    ``enqueued`` is true exactly for the known-success outcome;
-    ``enqueue_outcome`` carries the bounded known-failure/uncertain
-    classification otherwise (``None`` when nothing was enqueued or the
+    ``enqueued`` is true exactly for the accepted-for-delivery outcome;
+    ``enqueue_outcome`` carries the bounded known-refusal/uncertain
+    classification otherwise (``None`` when nothing was submitted or the
     delivery identity was unknown).
     """
 
@@ -214,14 +216,15 @@ def submit_github_webhook_dispatch(
 
     Reloads the durable delivery record by the provider delivery GUID and its
     persisted routes — never the intake return object, never any payload
-    content. Ignored/unusable deliveries require no enqueue and no recovery
-    metadata; relevant deliveries whose routing resolved nothing are terminal
-    and gain their bounded ``processed_at`` recovery instant; resolved
-    deliveries are enqueued outside any database transaction, with the
-    delivery GUID as the only payload member. Known enqueue failure and
-    uncertain enqueue outcome are distinct typed results — an uncertain
-    outcome is never re-enqueued blindly and never reconciled here, and
-    unresolved processing stays recoverable by #62's independent path.
+    content. Ignored/unusable deliveries require no submission and no
+    recovery metadata; relevant deliveries whose routing resolved nothing
+    are terminal and gain their bounded ``processed_at`` recovery instant;
+    resolved deliveries are submitted outside any database transaction,
+    with the delivery GUID as the only payload member. Known submission
+    refusal and uncertain submission outcome are distinct typed results —
+    an uncertain outcome is never re-submitted blindly and never
+    reconciled here, and unresolved processing stays recoverable by #62's
+    independent path.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _SUBMIT_SPAN_NAME) as span:
         annotate_span(span, operation=_SUBMIT_SPAN_NAME)
@@ -234,7 +237,7 @@ def submit_github_webhook_dispatch(
             )
         if delivery.classification is not GitHubWebhookDeliveryClassification.RELEVANT:
             # Ignored/unusable deliveries were terminal at intake: they
-            # require neither enqueue nor recovery metadata.
+            # require neither submission nor recovery metadata.
             return GitHubWebhookDispatchSubmissionResult(
                 delivery=delivery, enqueued=False, enqueue_outcome=None
             )
@@ -250,7 +253,7 @@ def submit_github_webhook_dispatch(
         if not routes:
             # A resolved delivery always carries persisted routes (the intake
             # invariant); an empty set is an unexpected durable-state
-            # condition: no enqueue, the delivery stays recoverable.
+            # condition: no submission, the delivery stays recoverable.
             logger.warning(
                 "github webhook dispatch submission found no persisted routes "
                 "for a resolved delivery; the delivery remains recoverable"
@@ -261,14 +264,14 @@ def submit_github_webhook_dispatch(
         outcome = submission.enqueue(delivery_guid)
         if outcome is EnqueueOutcome.KNOWN_FAILED:
             logger.warning(
-                "github webhook dispatch enqueue failed as a known queue "
-                "condition; the delivery remains recoverable"
+                "github webhook dispatch submission failed as a known "
+                "refusal; the delivery remains recoverable"
             )
         elif outcome is EnqueueOutcome.UNCERTAIN:
-            # Uncertain enqueue outcome: no blind re-enqueue, no
+            # Uncertain submission outcome: no blind re-submission, no
             # reconciliation at submission — recovery re-derives.
             logger.warning(
-                "github webhook dispatch enqueue outcome is unknown; "
+                "github webhook dispatch submission outcome is unknown; "
                 "the delivery remains recoverable"
             )
         return GitHubWebhookDispatchSubmissionResult(

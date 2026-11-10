@@ -22,10 +22,10 @@ Boundary rules enforced by this module:
   types, and missing required fields before any service/runtime effect.
 - Dispatch fails closed when a kind has no registered handler. The
   production handler table registers the F5a Task-workflow handlers
-  (``openorc.workers.task_workflow``), which invoke the existing E-series
-  application services directly with process-local dependencies; the two
-  GitHub delivery/reconciliation kinds remain deliberately unregistered
-  until F9 (issue #255).
+  (``openorc.workers.task_workflow``) and the F9 Task-less GitHub
+  handlers (``openorc.workers.github_operations``, issue #255), which
+  invoke the existing application services directly with process-local
+  dependencies.
 - Submission distinguishes accepted-for-delivery, known refusal/failure,
   and uncertain queue submission. Acceptance is never completion, external
   effect, or retry authorization; queue/job IDs are never operation
@@ -1163,14 +1163,16 @@ def build_production_handlers() -> Mapping[OperationKind, OperationHandler]:
     F5a (issue #253) registers the Task-workflow handlers, which invoke the
     existing application services directly with process-local dependencies
     through the single composition seam in ``openorc.workers.task_workflow``.
-    The two GitHub delivery/reconciliation kinds remain deliberately
-    unregistered until F9 (issue #255), so dispatch still fails closed for
-    them. The existing RQ job entrypoints are separate transports and
-    remain unchanged.
+    F9 (issue #255) registers the two Task-less GitHub handlers, which
+    invoke the existing GitHub webhook-dispatch and reconciliation/recovery
+    services the same way through ``openorc.workers.github_operations``.
     """
+    from openorc.workers.github_operations import build_github_operation_handlers
     from openorc.workers.task_workflow import build_task_workflow_handlers
 
-    return build_task_workflow_handlers()
+    handlers: dict[OperationKind, OperationHandler] = dict(build_task_workflow_handlers())
+    handlers.update(build_github_operation_handlers())
+    return handlers
 
 
 def invoke_operation(

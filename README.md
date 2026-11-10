@@ -85,7 +85,7 @@ The v1 execution design provides two deployment choices over **one shared workfl
 - **Regular mode (default):** a bounded local executor owned by the API serving process, without a separate worker service or Valkey. Capacity is bounded (`OPENORC_LOCAL_EXECUTOR_WORKERS`, default 2; `OPENORC_LOCAL_EXECUTOR_PENDING`, default 8), and saturation or shutdown refuses before acceptance.
 - **Queue mode:** RQ/Valkey delivers the same operations to independently deployed workers through an explicitly supplied `VALKEY_URL` (no implicit default backend).
 
-Both modes submit the same typed operation invocations through one shared dispatcher, and the RQ worker refuses to start in regular mode. Postgres remains the durable authority in both modes; neither local memory nor RQ IDs are workflow truth. Mode-neutral delivery for the existing GitHub webhook/sweep jobs lands with their regular/queue integration work.
+Both modes submit the same typed operation invocations through one shared dispatcher, and the RQ worker refuses to start in regular mode. Postgres remains the durable authority in both modes; neither local memory nor queue IDs are workflow truth. GitHub webhook dispatch and the on-demand reconciliation sweep are mode neutral: both are registered shared-operation handlers, and the authenticated webhook route and the explicit sweep submission seam use the serving process's active submitter in either mode.
 
 ## Project status
 

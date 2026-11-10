@@ -1162,9 +1162,9 @@ def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
 def build_task_workflow_handlers() -> Mapping[OperationKind, OperationHandler]:
     """The explicit F5a Task-workflow kind-to-handler table.
 
-    The two GitHub delivery/reconciliation kinds are deliberately absent:
-    they are registered by F9 (issue #255), so production dispatch fails
-    closed for them.
+    The Task-less GitHub delivery/reconciliation kinds are not Task-workflow
+    operations: F9 (issue #255) registers them separately in
+    ``openorc.workers.github_operations``.
     """
     return {kind: _task_workflow_handler(kind) for kind in _TASK_WORKFLOW_COMPOSITIONS}
 
