@@ -65,7 +65,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -139,7 +139,11 @@ from openorc.services.task_subject_guards import (
     require_current_task,
     require_task_pull_request_head,
 )
+from openorc.services.task_terminal_cleanup import submit_terminal_checkout_cleanup
 from openorc.services.transaction_composition import composed_transaction
+
+if TYPE_CHECKING:
+    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
 
 __all__ = [
     "TaskMergeCompletionKind",
@@ -536,7 +540,11 @@ def _install_retry_merge_gate(
 
 
 def complete_confirmed_task_merge(
-    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeCompletionOutcome:
     """Complete a still-current Task whose canonical PR is GitHub-confirmed merged.
 
@@ -560,6 +568,14 @@ def complete_confirmed_task_merge(
     webhook/sweep/Owner completion races produce at most one archival, loop
     closure, and event set. A canonical PR not confirmed merged in durable
     state fails closed and applies nothing.
+
+    Strictly after the archival transaction commits, a newly applied
+    ``COMPLETED`` outcome arranges the F10 best-effort Producer checkout
+    cleanup submission (issue #256) through the optionally supplied
+    submission seam: never for the ``ALREADY_COMPLETED`` replay no-op,
+    never inside the transaction, never changing this composition's
+    outcome, and never blocking or failing the terminal flow — a refused,
+    uncertain, or unwired submission simply accepts the stale checkout.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -570,6 +586,7 @@ def complete_confirmed_task_merge(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
+        outcome: TaskMergeCompletionOutcome
         with composed_transaction(pool) as transaction_pool:
             # The account-wide Owner-mutation barrier (#97), derived from
             # durable Workspace ownership rather than an authenticated
@@ -588,45 +605,55 @@ def complete_confirmed_task_merge(
                         "rewrites its terminal outcome"
                     )
                 # Already archived COMPLETED: the idempotent duplicate-race
-                # no-op — no second archival, loop closure, or event set.
+                # no-op — no second archival, loop closure, event set, or
+                # cleanup arrangement.
                 pull_request = require_canonical_task_pull_request(transaction_pool, task=locked)
-                return TaskMergeCompletionOutcome(
+                outcome = TaskMergeCompletionOutcome(
                     kind=TaskMergeCompletionKind.ALREADY_COMPLETED,
                     task=locked,
                     pull_request=pull_request,
                 )
-            pull_request = require_canonical_task_pull_request(transaction_pool, task=locked)
-            if not _is_confirmed_merged(pull_request):
-                raise StaleOperationError(
-                    "the canonical pull request is not confirmed merged in durable "
-                    "state; completion applies nothing"
+            else:
+                pull_request = require_canonical_task_pull_request(transaction_pool, task=locked)
+                if not _is_confirmed_merged(pull_request):
+                    raise StaleOperationError(
+                        "the canonical pull request is not confirmed merged in durable "
+                        "state; completion applies nothing"
+                    )
+                open_loops = review_records.list_task_review_loops(
+                    transaction_pool, task_id=task_id, status=ReviewLoopStatus.OPEN
                 )
-            open_loops = review_records.list_task_review_loops(
-                transaction_pool, task_id=task_id, status=ReviewLoopStatus.OPEN
+                for loop in open_loops:
+                    if loop.purpose is ReviewLoopPurpose.PR_REVIEW:
+                        review_records.close_review_loop(transaction_pool, review_loop_id=loop.id)
+                completed = task_mutations.archive_task(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=locked.state_token,
+                    terminal_status=TaskStatus.COMPLETED,
+                    actor=_OPENORC_ACTOR,
+                )
+                event_coordination.record_pr_merged_event(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    task_pull_request_id=pull_request.id,
+                    actor=_GITHUB_ACTOR,
+                )
+                outcome = TaskMergeCompletionOutcome(
+                    kind=TaskMergeCompletionKind.COMPLETED,
+                    task=completed,
+                    pull_request=pull_request,
+                )
+        if outcome.kind is TaskMergeCompletionKind.COMPLETED:
+            # The committed post-archival point: one best-effort cleanup
+            # submission strictly after the terminal outcome is durable.
+            # Contained; never raises into the terminal flow.
+            submit_terminal_checkout_cleanup(
+                terminal_cleanup_submission, workspace_id=workspace_id, task_id=task_id
             )
-            for loop in open_loops:
-                if loop.purpose is ReviewLoopPurpose.PR_REVIEW:
-                    review_records.close_review_loop(transaction_pool, review_loop_id=loop.id)
-            completed = task_mutations.archive_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=locked.state_token,
-                terminal_status=TaskStatus.COMPLETED,
-                actor=_OPENORC_ACTOR,
-            )
-            event_coordination.record_pr_merged_event(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                task_pull_request_id=pull_request.id,
-                actor=_GITHUB_ACTOR,
-            )
-            return TaskMergeCompletionOutcome(
-                kind=TaskMergeCompletionKind.COMPLETED,
-                task=completed,
-                pull_request=pull_request,
-            )
+        return outcome
 
 
 def request_task_merge(
@@ -639,6 +666,7 @@ def request_task_merge(
     task_id: UUID,
     owner_gate_id: UUID,
     expected_state_token: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Command the gate's exact GitHub merge as the current Owner merge decision.
 
@@ -653,7 +681,9 @@ def request_task_merge(
     one-shot claim — and the existing exact-head merge primitive is called
     exactly once under the claim-revalidation hook. Outcomes are classified
     by which external effect actually occurred; see
-    :class:`TaskMergeOutcomeKind`.
+    :class:`TaskMergeOutcomeKind`. A newly applied completion forwards the
+    optionally supplied F10 cleanup submission seam (issue #256) to the
+    shared completion seam's post-commit arrangement.
     """
     _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
@@ -719,7 +749,10 @@ def request_task_merge(
             # another merge request; the pending gate is never consumed here
             # and no Owner approval event is invented.
             completion = complete_confirmed_task_merge(
-                pool, workspace_id=workspace_id, task_id=task_id
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
             return TaskMergeOutcome(
                 kind=TaskMergeOutcomeKind.COMPLETED,
@@ -835,6 +868,7 @@ def request_task_merge(
                 task_pull_request_id=pull_request.id,
                 expected_head_sha=reconciled.head_sha,
                 merge_commit_sha=error.merge_commit_sha,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except pull_request_merge.MergeRequestSendUncertainError as error:
             # F5d (issue #267): the merge mutation send's OWN unknown outcome.
@@ -852,6 +886,7 @@ def request_task_merge(
                 task_pull_request_id=pull_request.id,
                 expected_head_sha=reconciled.head_sha,
                 adapter_cause=error.__cause__,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
 
         except ExternalOperationUncertainError:
@@ -869,6 +904,7 @@ def request_task_merge(
                 task_pull_request_id=pull_request.id,
                 expected_head_sha=reconciled.head_sha,
                 merge_commit_sha=None,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
 
         except ExternalOperationRejectedError:
@@ -883,6 +919,7 @@ def request_task_merge(
                 task_pull_request_id=pull_request.id,
                 subject_head_sha=reconciled.head_sha,
                 github_rejected=True,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except (ExternalOperationFailedError, AuthorizationError):
             # Plain known failures are pre-delivery conditions: credential
@@ -899,6 +936,7 @@ def request_task_merge(
                 task_pull_request_id=pull_request.id,
                 subject_head_sha=reconciled.head_sha,
                 github_rejected=False,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except StaleOperationError:
             return _classify_after_stale_merge_request(
@@ -911,8 +949,14 @@ def request_task_merge(
                 expected_state_token=post_approval.state_token,
                 task_pull_request_id=pull_request.id,
                 subject_head_sha=reconciled.head_sha,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,
@@ -1008,6 +1052,7 @@ def _classify_after_uncertain_merge_send(
     task_pull_request_id: UUID,
     expected_head_sha: str,
     adapter_cause: BaseException | None,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Classify the merge mutation send's own unknown outcome (F5d, issue #267).
 
@@ -1044,7 +1089,12 @@ def _classify_after_uncertain_merge_send(
     if reconciliation is not None and _is_confirmed_merged(reconciliation.pull_request):
         # A known merged result always takes the authoritative completion
         # seam — never a retry, whatever the send's own answer was.
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,
@@ -1070,6 +1120,7 @@ def _classify_after_uncertain_merge_send(
             expected_state_token=expected_state_token,
             task_pull_request_id=task_pull_request_id,
             subject_head_sha=expected_head_sha,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     # The retry-eligible transient-transport classification REQUIRES the
     # successful fresh reconciliation above: an unavailable/inconclusive
@@ -1171,6 +1222,7 @@ def _classify_after_unconfirmed_merge(
     task_pull_request_id: UUID,
     expected_head_sha: str,
     merge_commit_sha: str | None,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Classify a merge request whose durable effect is confirmed or unknown.
 
@@ -1190,7 +1242,12 @@ def _classify_after_unconfirmed_merge(
     except ApplicationError:
         reconciliation = None
     if reconciliation is not None and _is_confirmed_merged(reconciliation.pull_request):
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,
@@ -1237,6 +1294,7 @@ def _settle_after_definitive_no_merge(
     task_pull_request_id: UUID,
     subject_head_sha: str,
     github_rejected: bool,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Settle a definitive no-merge outcome with truthful provenance (issue #227).
 
@@ -1266,7 +1324,12 @@ def _settle_after_definitive_no_merge(
     )
     reconciled = reconciliation.pull_request
     if _is_confirmed_merged(reconciled):
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,
@@ -1323,6 +1386,7 @@ def _classify_after_stale_merge_request(
     expected_state_token: UUID,
     task_pull_request_id: UUID,
     subject_head_sha: str,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Classify a stale merge-request outcome (issue #227).
 
@@ -1343,7 +1407,12 @@ def _classify_after_stale_merge_request(
     )
     reconciled = reconciliation.pull_request
     if _is_confirmed_merged(reconciled):
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,

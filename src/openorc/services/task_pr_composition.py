@@ -76,7 +76,7 @@ import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
@@ -142,6 +142,9 @@ from openorc.services.task_runtime_send_claims import (
 )
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
+
+if TYPE_CHECKING:
+    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
@@ -860,6 +863,7 @@ def _finalize_or_block(
     task_id: UUID,
     owner_gate_id: UUID,
     expected_state_token: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskPrPublished:
     """Finalize the clean publication, or record the recoverable stale block.
 
@@ -899,6 +903,7 @@ def _finalize_or_block(
                 pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
             raise StaleOperationError(
                 "the canonical pull request is confirmed closed-unmerged; the "
@@ -1045,6 +1050,7 @@ def compose_and_publish_task_pr(
     owner_gate_id: UUID,
     expected_state_token: UUID,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskPrPublished:
     """Compose the Producer's PR presentation and publish the canonical PR.
 
@@ -1102,6 +1108,7 @@ def compose_and_publish_task_pr(
                 task_id=task_id,
                 owner_gate_id=owner_gate_id,
                 expected_state_token=expected_state_token,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
 
         # --- the durable pre-send dispatch claim (database only) ---
@@ -1204,6 +1211,7 @@ def compose_and_publish_task_pr(
                 task_id=task_id,
                 owner_gate_id=owner_gate_id,
                 expected_state_token=expected_state_token,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         if publication.outcome is TaskPullRequestPublicationOutcome.PREFLIGHT_STALE:
             # No PR was created by this invocation; the approved head can no

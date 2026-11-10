@@ -43,6 +43,7 @@ from openorc.workers.invocation import (
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
 from openorc.workers.queues import queue_name
+from openorc.workers.task_cleanup_operations import F1TerminalCheckoutCleanupSubmission
 
 
 def _settings(*, execution_mode: ExecutionMode = ExecutionMode.REGULAR) -> Settings:
@@ -75,18 +76,45 @@ class _GitHubServiceHarness:
         self.service_error: Exception | None = None
         self.dispatch_started = threading.Event()
         self.sweep_started = threading.Event()
+        self.recording_submitter: _RecordingSubmitter | None = None
 
-    def record_dispatch(self, pool: Any, github: Any, *, delivery_guid: str) -> None:
-        self.dispatch_calls.append({"pool": pool, "github": github, "delivery_guid": delivery_guid})
+    def record_dispatch(
+        self,
+        pool: Any,
+        github: Any,
+        *,
+        delivery_guid: str,
+        terminal_cleanup_submission: Any = None,
+    ) -> None:
+        self.dispatch_calls.append(
+            {
+                "pool": pool,
+                "github": github,
+                "delivery_guid": delivery_guid,
+                "terminal_cleanup_submission": terminal_cleanup_submission,
+            }
+        )
         self.dispatch_started.set()
         if self.service_error is not None:
             raise self.service_error
 
     def record_sweep(
-        self, pool: Any, github: Any, settings: Settings, *, sweep_tick: int | None
+        self,
+        pool: Any,
+        github: Any,
+        settings: Settings,
+        *,
+        sweep_tick: int | None,
+        terminal_cleanup_submission: Any = None,
     ) -> None:
         self.sweep_calls.append(
-            {"pool": pool, "github": github, "settings": settings, "sweep_tick": sweep_tick}
+            {
+                "pool": pool,
+                "github": github,
+                "settings": settings,
+                "sweep_tick": sweep_tick,
+                "terminal_cleanup_submission": terminal_cleanup_submission,
+            }
         )
         self.sweep_started.set()
         if self.service_error is not None:
@@ -106,10 +134,13 @@ def github_service_harness(monkeypatch: pytest.MonkeyPatch) -> _GitHubServiceHar
 
 def _dependencies(settings: Settings, harness: _GitHubServiceHarness) -> OperationDependencies:
     """Process-local dependencies resolving the recording pool/GitHub client."""
+    submitter = _RecordingSubmitter()
+    harness.recording_submitter = submitter
     return OperationDependencies(
         settings=settings,
         database_pool_provider=lambda _settings: harness.pool,
         github_client_provider=lambda _settings: harness.github,
+        continuation_submitter_provider=lambda _settings: submitter,
     )
 
 
@@ -172,6 +203,21 @@ def _recorded_queue_invocation(holder: dict[str, Any]) -> OperationInvocation:
     return decode_operation_invocation(encoded)
 
 
+def _assert_forwarded_cleanup_submission(
+    call: dict[str, Any], harness: _GitHubServiceHarness
+) -> None:
+    """The handler forwards the F10 bridge over its own recording submitter.
+
+    The F10 cleanup submission bridge (issue #256) is resolved from the
+    same process-local F1 submitter the handler already owns; the recorded
+    service call carries it unchanged, and the service arranges it
+    strictly post-commit for a newly applied terminal outcome only.
+    """
+    bridge = call.pop("terminal_cleanup_submission")
+    assert isinstance(bridge, F1TerminalCheckoutCleanupSubmission)
+    assert bridge._submitter is harness.recording_submitter
+
+
 # --- registered handlers invoke the existing shared services --------------------
 
 
@@ -193,6 +239,10 @@ def test_the_dispatch_handler_invokes_the_existing_service_with_only_the_guid(
 
     handler(WebhookDeliveryDispatchPayload(delivery_guid="guid-1"), dependencies=dependencies)
 
+    assert len(github_service_harness.dispatch_calls) == 1
+    _assert_forwarded_cleanup_submission(
+        github_service_harness.dispatch_calls[0], github_service_harness
+    )
     assert github_service_harness.dispatch_calls == [
         {
             "pool": github_service_harness.pool,
@@ -213,6 +263,9 @@ def test_the_sweep_handler_invokes_the_existing_service_with_the_settings_and_ti
     handler(ReconciliationSweepPayload(sweep_tick=7), dependencies=dependencies)
     handler(ReconciliationSweepPayload(sweep_tick=None), dependencies=dependencies)
 
+    assert len(github_service_harness.sweep_calls) == 2
+    for call in github_service_harness.sweep_calls:
+        _assert_forwarded_cleanup_submission(call, github_service_harness)
     assert github_service_harness.sweep_calls == [
         {
             "pool": github_service_harness.pool,
@@ -251,6 +304,10 @@ def test_webhook_dispatch_flows_through_the_regular_mode_executor_to_the_service
         drain = executor.shutdown()
 
     assert drain.drained
+    assert len(github_service_harness.dispatch_calls) == 1
+    _assert_forwarded_cleanup_submission(
+        github_service_harness.dispatch_calls[0], github_service_harness
+    )
     assert github_service_harness.dispatch_calls == [
         {
             "pool": github_service_harness.pool,
@@ -345,6 +402,10 @@ def test_webhook_dispatch_flows_through_the_queue_wire_form_to_the_service(
         handlers=invocation.build_production_handlers(),
         dependencies=dependencies,
     )
+    assert len(github_service_harness.dispatch_calls) == 1
+    _assert_forwarded_cleanup_submission(
+        github_service_harness.dispatch_calls[0], github_service_harness
+    )
     assert github_service_harness.dispatch_calls == [
         {
             "pool": github_service_harness.pool,
@@ -372,6 +433,10 @@ def test_the_explicit_sweep_seam_flows_through_the_queue_wire_form(
         wire_invocation,
         handlers=invocation.build_production_handlers(),
         dependencies=dependencies,
+    )
+    assert len(github_service_harness.sweep_calls) == 1
+    _assert_forwarded_cleanup_submission(
+        github_service_harness.sweep_calls[0], github_service_harness
     )
     assert github_service_harness.sweep_calls == [
         {

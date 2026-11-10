@@ -99,8 +99,15 @@ class RecordingService:
         # The F5b coordinator's attempt-evidence collector is coordinator
         # plumbing the real services accept optionally (issue #262); it is
         # accepted here and excluded from recorded comparisons — its
-        # threading is covered by the dedicated coordinator tests.
-        recorded_kwargs = {key: value for key, value in kwargs.items() if key != "attempt_evidence"}
+        # threading is covered by the dedicated coordinator tests. The F10
+        # cleanup submission bridge (issue #256) is the same shape of
+        # optional process-local plumbing: accepted, excluded from recorded
+        # comparisons, and covered by the dedicated cleanup threading tests.
+        recorded_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in ("attempt_evidence", "terminal_cleanup_submission")
+        }
         self.calls.append({"args": args, "kwargs": recorded_kwargs})
         if self.results is not None:
             index = min(len(self.calls) - 1, len(self.results) - 1)

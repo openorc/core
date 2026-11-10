@@ -220,7 +220,15 @@ class ScriptedCapability:
             "no database transaction may span the external reconciliation invocation"
         )
         index = len(self.calls)
-        self.calls.append(dict(kwargs))
+        # The F10 cleanup submission bridge (issue #256) is optional
+        # process-local plumbing the terminal seams accept and forward
+        # post-commit; it is accepted here and excluded from recorded
+        # comparisons — its threading is covered by the dedicated worker
+        # dispatch tests.
+        recorded_kwargs = {
+            key: value for key, value in kwargs.items() if key != "terminal_cleanup_submission"
+        }
+        self.calls.append(recorded_kwargs)
         error = self.errors.get(index)
         if error is not None:
             raise error

@@ -57,6 +57,7 @@ from openorc.workers.invocation import (
     SubmissionResult,
     WebhookDeliveryDispatchPayload,
 )
+from openorc.workers.task_cleanup_operations import F1TerminalCheckoutCleanupSubmission
 
 __all__ = [
     "F1WebhookDispatchSubmission",
@@ -73,15 +74,22 @@ def _dispatch_github_webhook_delivery_handler(
     The handler only decodes and delegates: the executing process resolves
     its database pool and GitHub App client here, and the shared dispatch
     service owns every durable-state reload, routing derivation, and
-    authoritative GitHub consequence. Handler failures are never swallowed
-    into reported success — F1's sanitized execution-error containment
-    owns them, and the durable delivery stays recoverable.
+    authoritative GitHub consequence. The F10 post-terminal cleanup
+    submission bridge (issue #256) is resolved from the same process-local
+    F1 submitter and forwarded unchanged; the dispatch service arranges it
+    strictly post-commit for a newly applied terminal outcome only. Handler
+    failures are never swallowed into reported success — F1's sanitized
+    execution-error containment owns them, and the durable delivery stays
+    recoverable.
     """
     dispatch_payload = cast(WebhookDeliveryDispatchPayload, payload)
     dispatch_github_webhook_delivery(
         dependencies.database_pool(),
         dependencies.github_client(),
         delivery_guid=dispatch_payload.delivery_guid,
+        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+            dependencies.continuation_submitter()
+        ),
     )
 
 
@@ -95,7 +103,10 @@ def _run_github_reconciliation_sweep_handler(
     the shared sweep service owns the bounded work discovery, the fresh
     authoritative GitHub reads, and every canonical consequence. The tick
     is a scheduling position only — never authority — and is passed
-    through unchanged.
+    through unchanged. The F10 post-terminal cleanup submission bridge
+    (issue #256) is resolved from the same process-local F1 submitter and
+    forwarded unchanged; the sweep's terminal consequences arrange it
+    strictly post-commit for a newly applied terminal outcome only.
     """
     sweep_payload = cast(ReconciliationSweepPayload, payload)
     run_github_reconciliation_sweep(
@@ -103,6 +114,9 @@ def _run_github_reconciliation_sweep_handler(
         dependencies.github_client(),
         dependencies.settings,
         sweep_tick=sweep_payload.sweep_tick,
+        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+            dependencies.continuation_submitter()
+        ),
     )
 
 

@@ -91,7 +91,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from openorc.adapters.github import GitHubAppClient
@@ -156,6 +156,9 @@ from openorc.services.task_operational_failure_triage import (
 )
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
+
+if TYPE_CHECKING:
+    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
 
 __all__ = [
     "execute_authorized_merge_retry",
@@ -383,6 +386,7 @@ def _settle_reconciliation_read_outcome(
     profile_id: UUID,
     expected_state_token: UUID,
     error: ApplicationError,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """The guarded settlement for a failed pre-send reconciliation read.
 
@@ -419,6 +423,7 @@ def _settle_reconciliation_read_outcome(
             task_pull_request_id=admission.task_pull_request_id,
             subject_head_sha=admission.subject_head_sha,
             github_rejected=False,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     raise error
 
@@ -431,6 +436,7 @@ def _settle_source_issue_guard_outcome(
     profile_id: UUID,
     expected_state_token: UUID,
     error: ApplicationError,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """The guarded settlement for a failed source-issue preflight (F5d).
 
@@ -488,6 +494,7 @@ def _settle_source_issue_guard_outcome(
             task_pull_request_id=admission.task_pull_request_id,
             subject_head_sha=admission.subject_head_sha,
             github_rejected=False,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     raise error
 
@@ -499,6 +506,7 @@ def _preflight_before_consumption(
     admission: _MergeRetryAdmission,
     profile_id: UUID,
     expected_state_token: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome | None:
     """The external preflights: reconciliation and the source-issue guard.
 
@@ -522,13 +530,17 @@ def _preflight_before_consumption(
             profile_id=profile_id,
             expected_state_token=expected_state_token,
             error=error,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     reconciled = reconciliation.pull_request
     if _is_confirmed_merged(reconciled):
         # A known merged result always takes the authoritative completion
         # seam — never a resend, and the authorization stays unconsumed.
         completion = complete_confirmed_task_merge(
-            pool, workspace_id=admission.task.workspace_id, task_id=admission.task.id
+            pool,
+            workspace_id=admission.task.workspace_id,
+            task_id=admission.task.id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
@@ -552,6 +564,7 @@ def _preflight_before_consumption(
             expected_state_token=expected_state_token,
             task_pull_request_id=admission.task_pull_request_id,
             subject_head_sha=admission.subject_head_sha,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     # The routed source-issue guard (the same one E10a runs before every
     # merge mutation).
@@ -565,6 +578,7 @@ def _preflight_before_consumption(
             profile_id=profile_id,
             expected_state_token=expected_state_token,
             error=error,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     return None
 
@@ -577,6 +591,7 @@ def _classify_send_uncertainty_for_retry(
     admission: _MergeRetryAdmission,
     profile_id: UUID,
     expected_state_token: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Ground the consumed send's unknown outcome before any Level 2 report.
 
@@ -606,7 +621,10 @@ def _classify_send_uncertainty_for_retry(
         # A known merged result always takes the authoritative completion
         # seam — the unknown send outcome never masks it and never retries.
         completion = complete_confirmed_task_merge(
-            pool, workspace_id=admission.task.workspace_id, task_id=admission.task.id
+            pool,
+            workspace_id=admission.task.workspace_id,
+            task_id=admission.task.id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
@@ -631,6 +649,7 @@ def _classify_send_uncertainty_for_retry(
             expected_state_token=expected_state_token,
             task_pull_request_id=admission.task_pull_request_id,
             subject_head_sha=admission.subject_head_sha,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
     if reconciliation is None:
         # The post-send read is unavailable/inconclusive: it can never ground
@@ -782,6 +801,7 @@ def execute_authorized_merge_retry(
     retry_attempt_id: UUID,
     attempt_evidence: InvocationAttemptEvidence | None = None,
     clock: Callable[[], datetime] | None = None,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskMergeOutcome:
     """Execute the one F4-authorized additional exact-head merge attempt.
 
@@ -823,6 +843,7 @@ def execute_authorized_merge_retry(
             admission=admission,
             profile_id=profile_id,
             expected_state_token=expected_state_token,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
         if settled is not None:
             return settled
@@ -895,6 +916,7 @@ def execute_authorized_merge_retry(
                 task_pull_request_id=consumed_admission.task_pull_request_id,
                 expected_head_sha=consumed_admission.subject_head_sha,
                 merge_commit_sha=error.merge_commit_sha,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except pull_request_merge.MergeRequestSendUncertainError as error:
             # The merge mutation send's OWN unknown outcome (F5d): ground it
@@ -916,6 +938,7 @@ def execute_authorized_merge_retry(
                 admission=consumed_admission,
                 profile_id=profile_id,
                 expected_state_token=expected_state_token,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except ExternalOperationUncertainError:
             # A plain uncertain outcome from the primitive is a pre-send
@@ -945,6 +968,7 @@ def execute_authorized_merge_retry(
                 task_pull_request_id=consumed_admission.task_pull_request_id,
                 subject_head_sha=consumed_admission.subject_head_sha,
                 github_rejected=True,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except (ExternalOperationFailedError, AuthorizationError):
             # Plain known failures are pre-delivery conditions: credential
@@ -961,6 +985,7 @@ def execute_authorized_merge_retry(
                 task_pull_request_id=consumed_admission.task_pull_request_id,
                 subject_head_sha=consumed_admission.subject_head_sha,
                 github_rejected=False,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except StaleOperationError:
             return _classify_after_stale_merge_request(
@@ -973,9 +998,15 @@ def execute_authorized_merge_retry(
                 expected_state_token=expected_state_token,
                 task_pull_request_id=consumed_admission.task_pull_request_id,
                 subject_head_sha=consumed_admission.subject_head_sha,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         # Known success: the authoritative completion seam.
-        completion = complete_confirmed_task_merge(pool, workspace_id=workspace_id, task_id=task_id)
+        completion = complete_confirmed_task_merge(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            terminal_cleanup_submission=terminal_cleanup_submission,
+        )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.COMPLETED,
             task=completion.task,
