@@ -86,6 +86,7 @@ from openorc.services.task_operational_failure_triage import (
     OperationalFailureDisposition,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
+from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmissionOutcome
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
     _GATE_INSERT,
@@ -1354,6 +1355,72 @@ def test_completion_archives_a_blocked_task_and_leaves_no_actionable_gate() -> N
     # A pre-E9 external merge may have no PR-review loop: none is manufactured.
     assert _count(conn, _LOOP_CLOSE) == 0
     assert _event_types(conn) == ["task_completed", "pr_merged"]
+
+
+def test_a_newly_applied_completion_arranges_one_best_effort_cleanup_submission() -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    conn.on(_WORKSPACE_READ, _ws_row())
+    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on(
+        _TASK_READ_LOCKED,
+        _task_row(status="blocked", state_token=_BLOCKED_TOKEN, current_gate_id=_RETRY_GATE_ID),
+    )
+    conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
+    conn.on(_LOOPS_LIST, [])
+    conn.on(_TASK_READ, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
+    conn.on(_ARCHIVE_UPDATE, _archived_task_row(state_token=_COMPLETED_TOKEN))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_completed"))
+    conn.on(_EVENT_INSERT, _event_returned_row("pr_merged"))
+    submissions: list[tuple[Any, Any]] = []
+
+    class _RecordingSubmission:
+        def submit(
+            self, *, workspace_id: Any, task_id: Any
+        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+            submissions.append((workspace_id, task_id))
+            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+    outcome = complete_confirmed_task_merge(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        terminal_cleanup_submission=_RecordingSubmission(),
+    )
+
+    assert outcome.kind is TaskMergeCompletionKind.COMPLETED
+    # Exactly one best-effort post-archival arrangement — strictly after the
+    # archival committed, never part of the terminal transaction.
+    assert submissions == [(_WORKSPACE_ID, _TASK_ID)]
+
+
+def test_an_already_completed_replay_arranges_no_cleanup_submission() -> None:
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    conn.on(_WORKSPACE_READ, _ws_row())
+    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on(_TASK_READ_LOCKED, _archived_task_row(state_token=_COMPLETED_TOKEN))
+    conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
+    submissions: list[tuple[Any, Any]] = []
+
+    class _RecordingSubmission:
+        def submit(
+            self, *, workspace_id: Any, task_id: Any
+        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+            submissions.append((workspace_id, task_id))
+            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+    outcome = complete_confirmed_task_merge(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        terminal_cleanup_submission=_RecordingSubmission(),
+    )
+
+    assert outcome.kind is TaskMergeCompletionKind.ALREADY_COMPLETED
+    # Duplicate terminal observations never intentionally initiate fresh
+    # cleanup attempts.
+    assert submissions == []
 
 
 def test_claim_revalidation_hook_proves_the_durable_claim(

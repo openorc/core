@@ -293,7 +293,8 @@ def test_invoke_operation_fails_closed_for_an_unregistered_kind(
 
 def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
     # F5a (issue #253) registers the Task-workflow handlers; F9 (issue #255)
-    # registers the two Task-less GitHub handlers over the same table.
+    # registers the two Task-less GitHub handlers over the same table; F10
+    # (issue #256) registers the post-terminal cleanup handler the same way.
     handlers = invocation.build_production_handlers()
     assert set(handlers) == {
         invocation.OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH,
@@ -307,6 +308,7 @@ def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
         invocation.OperationKind.TASK_PR_COMPOSITION,
         invocation.OperationKind.TASK_PR_REVIEW,
         invocation.OperationKind.TASK_SESSION_RESUME,
+        invocation.OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP,
     }
 
 

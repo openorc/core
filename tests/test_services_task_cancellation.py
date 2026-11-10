@@ -82,6 +82,7 @@ from openorc.services.task_cancellation import (
     cancel_task_composition,
     cancel_task_for_confirmed_pr_closure,
 )
+from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmissionOutcome
 from tests.fakes.task_rows import task_row
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
@@ -656,7 +657,7 @@ def test_a_confirmed_merge_at_the_point_of_decision_takes_the_completion_path(
         )
     )
 
-    def _completion(pool: Any, *, workspace_id: Any, task_id: Any) -> Any:
+    def _completion(pool: Any, *, workspace_id: Any, task_id: Any, **_forwarded: Any) -> Any:
         return SimpleNamespace(
             task=SimpleNamespace(status=TaskStatus.COMPLETED, archived_at=_OBSERVED),
             pull_request=_pull_request(state=TaskPullRequestState.CLOSED, merged_at=_OBSERVED),
@@ -1703,7 +1704,7 @@ def test_a_merge_confirmed_under_the_final_lock_routes_to_completion(
 
     completion_calls: list[tuple[Any, Any]] = []
 
-    def _completion(pool: Any, *, workspace_id: Any, task_id: Any) -> Any:
+    def _completion(pool: Any, *, workspace_id: Any, task_id: Any, **_forwarded: Any) -> Any:
         completion_calls.append((workspace_id, task_id))
         return SimpleNamespace(
             task=SimpleNamespace(status=TaskStatus.COMPLETED, archived_at=_OBSERVED),
@@ -2355,6 +2356,66 @@ def test_an_already_archived_task_is_the_idempotent_no_op(
     assert outcome.task.status is TaskStatus(status)
     assert _count(conn, _ARCHIVE_WRITE) == 0
     assert _event_types(conn) == []
+
+
+def test_a_newly_applied_closure_arranges_one_best_effort_cleanup_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status="implementing"))
+    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
+    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+    submissions: list[tuple[Any, Any]] = []
+
+    class _RecordingSubmission:
+        def submit(
+            self, *, workspace_id: Any, task_id: Any
+        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+            submissions.append((workspace_id, task_id))
+            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+    outcome = cancel_task_for_confirmed_pr_closure(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        terminal_cleanup_submission=_RecordingSubmission(),
+    )
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
+    # Exactly one best-effort post-archival arrangement for the newly
+    # applied terminal outcome — the archival itself is untouched.
+    assert submissions == [(_WORKSPACE_ID, _TASK_ID)]
+
+
+def test_an_already_terminal_replay_arranges_no_cleanup_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_closure_authorization(conn, row=_task_values(status="cancelled", archived=True))
+    _wire(monkeypatch)
+    _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
+    submissions: list[tuple[Any, Any]] = []
+
+    class _RecordingSubmission:
+        def submit(
+            self, *, workspace_id: Any, task_id: Any
+        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+            submissions.append((workspace_id, task_id))
+            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+    outcome = cancel_task_for_confirmed_pr_closure(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        terminal_cleanup_submission=_RecordingSubmission(),
+    )
+
+    assert outcome.kind is TaskPrClosureOutcomeKind.ALREADY_TERMINAL
+    # Duplicate terminal observations never intentionally initiate fresh
+    # cleanup attempts.
+    assert submissions == []
 
 
 def test_a_missing_canonical_pull_request_fails_closed(

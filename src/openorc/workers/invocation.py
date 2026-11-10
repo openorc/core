@@ -22,10 +22,11 @@ Boundary rules enforced by this module:
   types, and missing required fields before any service/runtime effect.
 - Dispatch fails closed when a kind has no registered handler. The
   production handler table registers the F5a Task-workflow handlers
-  (``openorc.workers.task_workflow``) and the F9 Task-less GitHub
-  handlers (``openorc.workers.github_operations``, issue #255), which
-  invoke the existing application services directly with process-local
-  dependencies.
+  (``openorc.workers.task_workflow``), the F9 Task-less GitHub
+  handlers (``openorc.workers.github_operations``, issue #255), and the
+  F10 post-terminal cleanup handler (``openorc.workers.task_cleanup_operations``,
+  issue #256), which invoke the existing application services directly
+  with process-local dependencies.
 - Submission distinguishes accepted-for-delivery, known refusal/failure,
   and uncertain queue submission. Acceptance is never completion, external
   effect, or retry authorization; queue/job IDs are never operation
@@ -60,6 +61,7 @@ from openorc.workers.queues import queue_name
 if TYPE_CHECKING:
     from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
     from openorc.services.task_planning_bootstrap import TaskBootstrapRuntimeComposition
+    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,12 @@ class OperationKind(StrEnum):
     # one interrupted workflow interaction, keyed to its durable one-shot
     # session-resume record identity.
     TASK_SESSION_RESUME = "task_session_resume"
+    # F10 (issue #256): the post-terminal best-effort Producer checkout
+    # cleanup attempt. The payload carries only the scoped durable
+    # Workspace/Task identifiers; the executing handler rechecks every
+    # current terminal, identity, and safety fact from durable state before
+    # any runtime effect. Not enrolled in the F5b Level 2/3 triage.
+    TASK_TERMINAL_CHECKOUT_CLEANUP = "task_terminal_checkout_cleanup"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -587,6 +595,27 @@ class TaskSessionResumePayload:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalCheckoutCleanupPayload:
+    """The F10 post-terminal checkout-cleanup operation payload (issue #256).
+
+    Only the scoped durable Workspace/Task identifiers. No gate, state
+    token, profile, path, or session field exists: the executing handler
+    reloads the archived terminal Task and re-derives the exact checkout
+    and the original bound Producer session from durable state, never from
+    caller- or agent-supplied values.
+    """
+
+    workspace_id: str
+    task_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "workspace_id", _require_canonical_uuid(self.workspace_id, "workspace_id")
+        )
+        object.__setattr__(self, "task_id", _require_canonical_uuid(self.task_id, "task_id"))
+
+
 OperationPayload = (
     WebhookDeliveryDispatchPayload
     | ReconciliationSweepPayload
@@ -599,6 +628,7 @@ OperationPayload = (
     | TaskPrCompositionPayload
     | TaskPrReviewPayload
     | TaskSessionResumePayload
+    | TerminalCheckoutCleanupPayload
 )
 
 
@@ -630,6 +660,7 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.TASK_SESSION_RESUME: frozenset(
         {"task", "profile_id", "task_resume_intent_id", "restored_status", "expected_state_token"}
     ),
+    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: frozenset({"workspace_id", "task_id"}),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -649,6 +680,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
     OperationKind.TASK_SESSION_RESUME: TaskSessionResumePayload,
+    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: TerminalCheckoutCleanupPayload,
 }
 
 
@@ -804,6 +836,17 @@ def _decode_task_session_resume_payload(raw: object) -> TaskSessionResumePayload
     )
 
 
+def _decode_terminal_checkout_cleanup_payload(
+    raw: object,
+) -> TerminalCheckoutCleanupPayload:
+    kind = OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    return TerminalCheckoutCleanupPayload(
+        workspace_id=_require_canonical_uuid(fields["workspace_id"], "workspace_id"),
+        task_id=_require_canonical_uuid(fields["task_id"], "task_id"),
+    )
+
+
 _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: _decode_webhook_delivery_dispatch_payload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: _decode_reconciliation_sweep_payload,
@@ -818,6 +861,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
     OperationKind.TASK_SESSION_RESUME: _decode_task_session_resume_payload,
+    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: _decode_terminal_checkout_cleanup_payload,
 }
 
 
@@ -831,6 +875,10 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         kind is OperationKind.GITHUB_RECONCILIATION_SWEEP
     ):
         return {"sweep_tick": payload.sweep_tick}
+    if isinstance(payload, TerminalCheckoutCleanupPayload) and (
+        kind is OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
+    ):
+        return {"workspace_id": payload.workspace_id, "task_id": payload.task_id}
     if isinstance(payload, TaskPlanningBootstrapAndInitialPlanPayload) and (
         kind is OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
     ):
@@ -994,6 +1042,7 @@ BootstrapRuntimeCompositionProvider = Callable[[Settings], "TaskBootstrapRuntime
 UserTokenResolverProvider = Callable[[Settings], "ProfileUserAccessTokenResolver"]
 ReviewerNeutralDirectoryProvider = Callable[[Settings], str]
 ContinuationSubmitterProvider = Callable[[Settings], "OperationSubmitter"]
+TerminalCleanupRuntimeProvider = Callable[[Settings], "TerminalCheckoutCleanupRuntime"]
 
 
 class LateBoundProcessSubmitter:
@@ -1048,6 +1097,7 @@ class OperationDependencies:
     user_token_resolver_provider: UserTokenResolverProvider | None = None
     reviewer_neutral_directory_provider: ReviewerNeutralDirectoryProvider | None = None
     continuation_submitter_provider: ContinuationSubmitterProvider | None = None
+    terminal_cleanup_runtime_provider: TerminalCleanupRuntimeProvider | None = None
 
     def database_pool(self) -> DatabasePool:
         """Resolve the executing process's database pool."""
@@ -1097,6 +1147,14 @@ class OperationDependencies:
             )
         return self.continuation_submitter_provider(self.settings)
 
+    def terminal_cleanup_runtime(self) -> TerminalCheckoutCleanupRuntime:
+        """Resolve the executing process's F10 cleanup runtime composition."""
+        if self.terminal_cleanup_runtime_provider is None:
+            raise ExecutionModeDependencyError(
+                "no terminal cleanup runtime provider is configured for operation dependencies"
+            )
+        return self.terminal_cleanup_runtime_provider(self.settings)
+
     def bind_regular_process_submitter(self, submitter: OperationSubmitter) -> None:
         """Bind the serving process's own executor as the continuation submitter.
 
@@ -1116,12 +1174,16 @@ class OperationDependencies:
 def build_default_operation_dependencies(settings: Settings) -> OperationDependencies:
     """Wire the real process-local providers for an executing process.
 
-    The Task-workflow providers come from the F5a composition module; the
-    import is deferred because that module imports this one. In regular
+    The Task-workflow providers come from the F5a composition module and the
+    F10 cleanup runtime provider from its cleanup composition module; the
+    imports are deferred because those modules import this one. In regular
     mode the continuation submitter is the late-bound process seam the
     serving lifespan binds to its executor; in queue mode each continuation
     enqueues through the canonical queue seam.
     """
+    from openorc.workers.task_cleanup_operations import (
+        default_terminal_cleanup_runtime_provider,
+    )
     from openorc.workers.task_workflow import (
         default_bootstrap_runtime_composition_provider,
         default_reviewer_neutral_directory_provider,
@@ -1141,6 +1203,7 @@ def build_default_operation_dependencies(settings: Settings) -> OperationDepende
         user_token_resolver_provider=default_user_token_resolver_provider,
         reviewer_neutral_directory_provider=default_reviewer_neutral_directory_provider,
         continuation_submitter_provider=continuation_provider,
+        terminal_cleanup_runtime_provider=default_terminal_cleanup_runtime_provider,
     )
 
 
@@ -1166,12 +1229,20 @@ def build_production_handlers() -> Mapping[OperationKind, OperationHandler]:
     F9 (issue #255) registers the two Task-less GitHub handlers, which
     invoke the existing GitHub webhook-dispatch and reconciliation/recovery
     services the same way through ``openorc.workers.github_operations``.
+    F10 (issue #256) registers the post-terminal cleanup handler, which
+    invokes the existing checkout-cleanup service through
+    ``openorc.workers.task_cleanup_operations``; like the GitHub family it
+    is not enrolled in the F5b Level 2/3 triage.
     """
     from openorc.workers.github_operations import build_github_operation_handlers
+    from openorc.workers.task_cleanup_operations import (
+        build_terminal_cleanup_operation_handlers,
+    )
     from openorc.workers.task_workflow import build_task_workflow_handlers
 
     handlers: dict[OperationKind, OperationHandler] = dict(build_task_workflow_handlers())
     handlers.update(build_github_operation_handlers())
+    handlers.update(build_terminal_cleanup_operation_handlers())
     return handlers
 
 

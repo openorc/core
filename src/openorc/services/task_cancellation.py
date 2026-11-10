@@ -105,7 +105,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -192,8 +192,12 @@ from openorc.services.task_subject_guards import (
     require_current_task,
     require_owner_gate_unresolved_block_subject,
 )
+from openorc.services.task_terminal_cleanup import submit_terminal_checkout_cleanup
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
+
+if TYPE_CHECKING:
+    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
 
 __all__ = [
     "TaskCancellationComposition",
@@ -737,6 +741,7 @@ def _cancel_composition(
     preflight_pull_request_id: UUID | None = None,
     trusted_pr_closure: bool = False,
     waiting_for_owner_only: bool = False,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> _CancelComposition:
     """The ONE shared atomic cancellation composition (issues #228 §3, #229 §2).
 
@@ -1050,13 +1055,23 @@ def _cancel_composition(
                 github_pr_number=surviving.github_pr_number,
                 requested_by_profile_id=profile_id,
             )
-    return _CancelComposition(
+    composition = _CancelComposition(
         task=archived,
         owner_gate=cancelled_gate,
         closed_loops=tuple(closed_loops),
         close_intent=close_intent,
         pull_request=pull_request,
     )
+    if composition.applied:
+        # The committed post-archival point: one best-effort F10 cleanup
+        # submission strictly after the terminal outcome is durable (issue
+        # #256) — never for the already-archived replay no-op, never inside
+        # the transaction, and never delaying or reversing the archival,
+        # the issue release, or the PR-close obligation recorded above.
+        submit_terminal_checkout_cleanup(
+            terminal_cleanup_submission, workspace_id=workspace_id, task_id=task_id
+        )
+    return composition
 
 
 def cancel_task_composition(
@@ -1068,6 +1083,7 @@ def cancel_task_composition(
     expected_state_token: UUID,
     owner_gate_id: UUID,
     expected_gate_type: OwnerGateType | None = None,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskCancellationComposition:
     """The shared database-only cancellation composition for gate entrypoints.
 
@@ -1082,7 +1098,9 @@ def cancel_task_composition(
     close obligation this delegating entrypoint deliberately lacks (it
     performs no external call and records no PR-close obligation — those
     gate states carry no canonical pull request in the v1 flow, and no
-    GitHub artifact is ever touched).
+    GitHub artifact is ever touched). A newly applied archival forwards the
+    optionally supplied F10 cleanup submission seam (issue #256) through
+    the shared composition's post-commit arrangement.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _COMPOSITION_SPAN_NAME) as span:
         annotate_span(
@@ -1101,6 +1119,7 @@ def cancel_task_composition(
             close_obligation=_CloseObligation.NONE,
             expected_gate_type=expected_gate_type,
             waiting_for_owner_only=True,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
         return TaskCancellationComposition(
             task=composition.task,
@@ -1387,6 +1406,7 @@ def cancel_task(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskCancellationOutcome:
     """Cancel the Task from a current safely inactive state (issue #228).
 
@@ -1399,7 +1419,9 @@ def cancel_task(
     then applies the whole terminal composition atomically, and the one-shot
     closure attempt follows strictly after the commit. Stale, archived,
     already-terminal, autonomous-phase, and unaccounted-runtime requests
-    mutate nothing.
+    mutate nothing. A newly applied terminal outcome forwards the optionally
+    supplied F10 cleanup submission seam (issue #256) through the shared
+    composition's / completion seam's post-commit arrangement.
     """
     _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
@@ -1460,7 +1482,10 @@ def cancel_task(
                     # the point of decision: E10a's completion path, never an
                     # Owner CANCELLED claim over a merged PR.
                     completion = complete_confirmed_task_merge(
-                        pool, workspace_id=workspace_id, task_id=task_id
+                        pool,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        terminal_cleanup_submission=terminal_cleanup_submission,
                     )
                     return TaskCancellationOutcome(
                         kind=TaskCancellationOutcomeKind.COMPLETED,
@@ -1482,6 +1507,7 @@ def cancel_task(
                 owner_gate_id=None,
                 close_obligation=close_obligation,
                 preflight_pull_request_id=preflight_pull_request_id,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except _ConfirmedMergeAtDecision:
             # The durable canonical PR became confirmed merged between the
@@ -1489,7 +1515,10 @@ def cancel_task(
             # read-only composition rolled back and E10a's completion path
             # applies instead of an Owner CANCELLED claim.
             completion = complete_confirmed_task_merge(
-                pool, workspace_id=workspace_id, task_id=task_id
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                terminal_cleanup_submission=terminal_cleanup_submission,
             )
             return TaskCancellationOutcome(
                 kind=TaskCancellationOutcomeKind.COMPLETED,
@@ -1529,6 +1558,7 @@ def cancel_task_for_confirmed_pr_closure(
     *,
     workspace_id: UUID,
     task_id: UUID,
+    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> TaskPrClosureOutcome:
     """Cancel the still-current Task whose canonical PR is confirmed closed-unmerged.
 
@@ -1578,6 +1608,7 @@ def cancel_task_for_confirmed_pr_closure(
             task_id=task_id,
             close_obligation=_CloseObligation.NONE,
             trusted_pr_closure=True,
+            terminal_cleanup_submission=terminal_cleanup_submission,
         )
         return TaskPrClosureOutcome(
             kind=(
