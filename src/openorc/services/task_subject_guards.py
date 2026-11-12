@@ -94,6 +94,14 @@ def require_current_task(
     expected ``state_token``. An archived Task or a token mismatch is a
     stale operation: nothing may be applied against it, and the typed
     ``StaleOperationError`` is never retried blindly.
+
+    A committed, not-yet-archived terminalization (issue #317) is likewise
+    stale for every ordinary command: the exact-Task commitment is the
+    explicit authority/currentness barrier that stops new ordinary workflow
+    effects between the terminal decision and the finalizer's archival, not
+    an advisory flag. Only the terminal finalization itself acts on a
+    committed Task, and it rechecks the commitment directly from durable
+    state rather than through this guard.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -103,6 +111,11 @@ def require_current_task(
         raise NotFoundError("the requested task is not available in this workspace")
     if task.archived_at is not None:
         raise StaleOperationError("the task has already been archived; the operation is stale")
+    if task.terminalization_outcome is not None:
+        raise StaleOperationError(
+            "the task's terminalization is committed and its archival is pending; "
+            "the operation is stale"
+        )
     if task.state_token != expected_state_token:
         raise StaleOperationError(
             "the task state has moved on since this operation was prepared; the operation is stale"

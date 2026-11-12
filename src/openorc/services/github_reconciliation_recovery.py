@@ -101,7 +101,7 @@ from openorc.services.github_webhook_dispatch import (
 )
 
 if TYPE_CHECKING:
-    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
+    from openorc.services.task_terminal_finalization import TerminalFinalizationSubmission
 
 __all__ = [
     "GitHubReconciliationSweepFamily",
@@ -787,7 +787,7 @@ def _complete_merged_task_consequence(
     workspace_id: UUID,
     repository_id: UUID,
     task_id: UUID,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubReconciliationSweepOutcome | None:
     """Apply the narrow E10a completion consequence for one reconciled merged PR.
 
@@ -804,7 +804,7 @@ def _complete_merged_task_consequence(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            terminal_cleanup_submission=terminal_cleanup_submission,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
     except ApplicationError as error:
         return _known_failure_outcome(
@@ -835,7 +835,7 @@ def _cancel_closed_unmerged_task_consequence(
     workspace_id: UUID,
     repository_id: UUID,
     task_id: UUID,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubReconciliationSweepOutcome | None:
     """Apply the narrow E10c cancellation consequence for one closed-unmerged PR.
 
@@ -853,7 +853,7 @@ def _cancel_closed_unmerged_task_consequence(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
-            terminal_cleanup_submission=terminal_cleanup_submission,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
     except ApplicationError as error:
         return _known_failure_outcome(
@@ -973,7 +973,7 @@ def _delivery_dispatch_status(
 def _sweep_delivery_units(
     pool: DatabasePool,
     github: GitHubAppClient,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> list[GitHubReconciliationSweepOutcome]:
     """Recover recorded deliveries whose downstream dispatch did not complete.
 
@@ -996,7 +996,7 @@ def _sweep_delivery_units(
                 pool,
                 github,
                 delivery_guid=delivery.delivery_guid,
-                terminal_cleanup_submission=terminal_cleanup_submission,
+                terminal_finalization_submission=terminal_finalization_submission,
             )
         except ApplicationError as error:
             outcomes.append(
@@ -1081,7 +1081,7 @@ def run_github_reconciliation_sweep(
     settings: Settings,
     *,
     sweep_tick: int | None = None,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubReconciliationSweepResult:
     """Run one bounded, repeatable GitHub reconciliation/recovery sweep.
 
@@ -1214,7 +1214,7 @@ def run_github_reconciliation_sweep(
                         workspace_id=repository.workspace_id,
                         repository_id=repository.id,
                         task_id=task.id,
-                        terminal_cleanup_submission=terminal_cleanup_submission,
+                        terminal_finalization_submission=terminal_finalization_submission,
                     )
                     if consequence_failure is not None:
                         outcomes.append(consequence_failure)
@@ -1231,7 +1231,7 @@ def run_github_reconciliation_sweep(
                         workspace_id=repository.workspace_id,
                         repository_id=repository.id,
                         task_id=task.id,
-                        terminal_cleanup_submission=terminal_cleanup_submission,
+                        terminal_finalization_submission=terminal_finalization_submission,
                     )
                     if consequence_failure is not None:
                         outcomes.append(consequence_failure)
@@ -1246,7 +1246,7 @@ def run_github_reconciliation_sweep(
                 )
 
         # Family 4 — bounded delivery-recovery batch (oldest first).
-        outcomes.extend(_sweep_delivery_units(pool, github, terminal_cleanup_submission))
+        outcomes.extend(_sweep_delivery_units(pool, github, terminal_finalization_submission))
 
         return GitHubReconciliationSweepResult(
             tick=sweep_tick,

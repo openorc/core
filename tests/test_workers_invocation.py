@@ -308,7 +308,7 @@ def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
         invocation.OperationKind.TASK_PR_COMPOSITION,
         invocation.OperationKind.TASK_PR_REVIEW,
         invocation.OperationKind.TASK_SESSION_RESUME,
-        invocation.OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP,
+        invocation.OperationKind.TASK_TERMINAL_FINALIZATION,
     }
 
 

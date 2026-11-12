@@ -282,7 +282,7 @@ class RecordingCapability:
         # comparisons — its threading is covered by the dedicated worker
         # dispatch tests.
         recorded_kwargs = {
-            key: value for key, value in kwargs.items() if key != "terminal_cleanup_submission"
+            key: value for key, value in kwargs.items() if key != "terminal_finalization_submission"
         }
         self.calls.append(recorded_kwargs)
         should_fail = self._error is not None and (

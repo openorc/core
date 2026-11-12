@@ -154,6 +154,11 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
         "terminal_cause": None,
+        "terminalization_outcome": None,
+        "terminalization_origin": None,
+        "terminalization_established_at": None,
+        "cleanup_send_claimed_at": None,
+        "cleanup_send_settled_at": None,
     }
     values.update(overrides)
     return (
@@ -175,6 +180,11 @@ def _task_row(**overrides: Any) -> tuple[Any, ...]:
         values["terminal_cause"],
         None,
         None,
+        values["terminalization_outcome"],
+        values["terminalization_origin"],
+        values["terminalization_established_at"],
+        values["cleanup_send_claimed_at"],
+        values["cleanup_send_settled_at"],
     )
 
 

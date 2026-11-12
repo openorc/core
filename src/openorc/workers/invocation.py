@@ -24,8 +24,8 @@ Boundary rules enforced by this module:
   production handler table registers the F5a Task-workflow handlers
   (``openorc.workers.task_workflow``), the F9 Task-less GitHub
   handlers (``openorc.workers.github_operations``, issue #255), and the
-  F10 post-terminal cleanup handler (``openorc.workers.task_cleanup_operations``,
-  issue #256), which invoke the existing application services directly
+  F10 terminal finalization handler (``openorc.workers.task_cleanup_operations``,
+  issues #256/#317), which invoke the existing application services directly
   with process-local dependencies.
 - Submission distinguishes accepted-for-delivery, known refusal/failure,
   and uncertain queue submission. Acceptance is never completion, external
@@ -126,12 +126,16 @@ class OperationKind(StrEnum):
     # one interrupted workflow interaction, keyed to its durable one-shot
     # session-resume record identity.
     TASK_SESSION_RESUME = "task_session_resume"
-    # F10 (issue #256): the post-terminal best-effort Producer checkout
-    # cleanup attempt. The payload carries only the scoped durable
-    # Workspace/Task identifiers; the executing handler rechecks every
-    # current terminal, identity, and safety fact from durable state before
-    # any runtime effect. Not enrolled in the F5b Level 2/3 triage.
-    TASK_TERMINAL_CHECKOUT_CLEANUP = "task_terminal_checkout_cleanup"
+    # F10 (issues #256/#317): the terminal finalization of one committed
+    # exact-Task terminalization — the bounded optional Producer checkout
+    # cleanup attempt under its one-shot claim, then the mandatory atomic
+    # archival with the terminal audit and the ENDED transition of the
+    # remaining active session bindings. The payload carries only the scoped
+    # durable Workspace/Task identifiers; the executing handler rechecks
+    # every authority, identity, and safety fact from durable state before
+    # any runtime effect, and a late or duplicate invocation is the
+    # idempotent no-op. Not enrolled in the F5b Level 2/3 triage.
+    TASK_TERMINAL_FINALIZATION = "task_terminal_finalization"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -596,12 +600,12 @@ class TaskSessionResumePayload:
 
 
 @dataclass(frozen=True, slots=True)
-class TerminalCheckoutCleanupPayload:
-    """The F10 post-terminal checkout-cleanup operation payload (issue #256).
+class TerminalFinalizationPayload:
+    """The F10 terminal finalization operation payload (issues #256/#317).
 
     Only the scoped durable Workspace/Task identifiers. No gate, state
     token, profile, path, or session field exists: the executing handler
-    reloads the archived terminal Task and re-derives the exact checkout
+    reloads the committed terminalization and re-derives the exact checkout
     and the original bound Producer session from durable state, never from
     caller- or agent-supplied values.
     """
@@ -628,7 +632,7 @@ OperationPayload = (
     | TaskPrCompositionPayload
     | TaskPrReviewPayload
     | TaskSessionResumePayload
-    | TerminalCheckoutCleanupPayload
+    | TerminalFinalizationPayload
 )
 
 
@@ -660,7 +664,7 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.TASK_SESSION_RESUME: frozenset(
         {"task", "profile_id", "task_resume_intent_id", "restored_status", "expected_state_token"}
     ),
-    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: frozenset({"workspace_id", "task_id"}),
+    OperationKind.TASK_TERMINAL_FINALIZATION: frozenset({"workspace_id", "task_id"}),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -680,7 +684,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_PR_COMPOSITION: TaskPrCompositionPayload,
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
     OperationKind.TASK_SESSION_RESUME: TaskSessionResumePayload,
-    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: TerminalCheckoutCleanupPayload,
+    OperationKind.TASK_TERMINAL_FINALIZATION: TerminalFinalizationPayload,
 }
 
 
@@ -836,12 +840,12 @@ def _decode_task_session_resume_payload(raw: object) -> TaskSessionResumePayload
     )
 
 
-def _decode_terminal_checkout_cleanup_payload(
+def _decode_terminal_finalization_payload(
     raw: object,
-) -> TerminalCheckoutCleanupPayload:
-    kind = OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
+) -> TerminalFinalizationPayload:
+    kind = OperationKind.TASK_TERMINAL_FINALIZATION
     fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
-    return TerminalCheckoutCleanupPayload(
+    return TerminalFinalizationPayload(
         workspace_id=_require_canonical_uuid(fields["workspace_id"], "workspace_id"),
         task_id=_require_canonical_uuid(fields["task_id"], "task_id"),
     )
@@ -861,7 +865,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_PR_COMPOSITION: _decode_task_pr_composition_payload,
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
     OperationKind.TASK_SESSION_RESUME: _decode_task_session_resume_payload,
-    OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP: _decode_terminal_checkout_cleanup_payload,
+    OperationKind.TASK_TERMINAL_FINALIZATION: _decode_terminal_finalization_payload,
 }
 
 
@@ -875,8 +879,8 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         kind is OperationKind.GITHUB_RECONCILIATION_SWEEP
     ):
         return {"sweep_tick": payload.sweep_tick}
-    if isinstance(payload, TerminalCheckoutCleanupPayload) and (
-        kind is OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
+    if isinstance(payload, TerminalFinalizationPayload) and (
+        kind is OperationKind.TASK_TERMINAL_FINALIZATION
     ):
         return {"workspace_id": payload.workspace_id, "task_id": payload.task_id}
     if isinstance(payload, TaskPlanningBootstrapAndInitialPlanPayload) and (

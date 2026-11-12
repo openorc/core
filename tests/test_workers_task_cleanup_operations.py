@@ -1,7 +1,7 @@
-"""Deterministic tests for the F10 cleanup operation composition (issue #256).
+"""Deterministic tests for the F10 terminal finalization operation composition (issues #256/#317).
 
-The registered cleanup F1 handler invokes the existing shared cleanup
-application service with process-local dependencies and only the decoded
+The registered terminal finalization F1 handler invokes the shared
+authoritative finalization service with process-local dependencies and only the decoded
 scoped Workspace/Task identifiers; the same production handler table serves
 both execution modes — regular mode through the bounded local executor (no
 queue backend is ever contacted) and queue mode through the F1 queue
@@ -22,7 +22,7 @@ from uuid import UUID
 import pytest
 
 from openorc.config import ExecutionMode, Settings
-from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmissionOutcome
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from openorc.workers import invocation, task_cleanup_operations
 from openorc.workers.invocation import (
     InvalidInvocationError,
@@ -32,14 +32,14 @@ from openorc.workers.invocation import (
     SubmissionOutcome,
     SubmissionRefusalReason,
     SubmissionResult,
-    TerminalCheckoutCleanupPayload,
+    TerminalFinalizationPayload,
     decode_operation_invocation,
     invoke_operation,
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
 from openorc.workers.queues import queue_name
 from openorc.workers.task_cleanup_operations import (
-    F1TerminalCheckoutCleanupSubmission,
+    F1TerminalFinalizationSubmission,
     build_terminal_cleanup_operation_handlers,
 )
 
@@ -99,7 +99,7 @@ def cleanup_service_harness(
 ) -> _CleanupServiceHarness:
     """Patch the shared cleanup service at the composition-module boundary."""
     harness = _CleanupServiceHarness()
-    monkeypatch.setattr(task_cleanup_operations, "execute_terminal_checkout_cleanup", harness)
+    monkeypatch.setattr(task_cleanup_operations, "finalize_task_terminalization", harness)
     return harness
 
 
@@ -161,23 +161,21 @@ def queue_wire(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 def _cleanup_invocation() -> OperationInvocation:
     return OperationInvocation(
-        kind=OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP,
-        payload=TerminalCheckoutCleanupPayload(
-            workspace_id=str(_WORKSPACE_ID), task_id=str(_TASK_ID)
-        ),
+        kind=OperationKind.TASK_TERMINAL_FINALIZATION,
+        payload=TerminalFinalizationPayload(workspace_id=str(_WORKSPACE_ID), task_id=str(_TASK_ID)),
     )
 
 
 # --- the handler table and the direct handler invocation ------------------------
 
 
-def test_the_cleanup_handler_table_registers_exactly_the_cleanup_kind() -> None:
+def test_the_finalization_handler_table_registers_exactly_the_finalization_kind() -> None:
     handlers = build_terminal_cleanup_operation_handlers()
 
-    assert set(handlers) == {OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP}
+    assert set(handlers) == {OperationKind.TASK_TERMINAL_FINALIZATION}
 
 
-def test_the_cleanup_handler_invokes_the_existing_service_with_the_scoped_identifiers(
+def test_the_finalization_handler_invokes_the_existing_service_with_the_scoped_identifiers(
     cleanup_service_harness: _CleanupServiceHarness,
 ) -> None:
     harness = cleanup_service_harness
@@ -185,9 +183,7 @@ def test_the_cleanup_handler_invokes_the_existing_service_with_the_scoped_identi
     runtime = _RecordingRuntime()
     dependencies = _dependencies(settings, runtime)
     resolved_pool = dependencies.database_pool()
-    handler = build_terminal_cleanup_operation_handlers()[
-        OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
-    ]
+    handler = build_terminal_cleanup_operation_handlers()[OperationKind.TASK_TERMINAL_FINALIZATION]
 
     handler(_cleanup_invocation().payload, dependencies=dependencies)
 
@@ -209,27 +205,27 @@ def test_the_cleanup_handler_invokes_the_existing_service_with_the_scoped_identi
     [
         pytest.param(
             SubmissionResult.accepted(),
-            TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY,
+            TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY,
             id="accepted",
         ),
         pytest.param(
             SubmissionResult.refused(SubmissionRefusalReason.QUEUE_UNAVAILABLE),
-            TerminalCheckoutCleanupSubmissionOutcome.KNOWN_REFUSED,
+            TerminalFinalizationSubmissionOutcome.KNOWN_REFUSED,
             id="refused",
         ),
         pytest.param(
             SubmissionResult.uncertain(),
-            TerminalCheckoutCleanupSubmissionOutcome.UNCERTAIN,
+            TerminalFinalizationSubmissionOutcome.UNCERTAIN,
             id="uncertain",
         ),
     ],
 )
-def test_the_f1_cleanup_submission_bridge_maps_the_outcome_1_to_1(
+def test_the_f1_finalization_submission_bridge_maps_the_outcome_1_to_1(
     submission_result: SubmissionResult,
-    expected_outcome: TerminalCheckoutCleanupSubmissionOutcome,
+    expected_outcome: TerminalFinalizationSubmissionOutcome,
 ) -> None:
     submitter = _RecordingSubmitter(outcome=submission_result)
-    bridge = F1TerminalCheckoutCleanupSubmission(submitter)
+    bridge = F1TerminalFinalizationSubmission(submitter)
 
     outcome = bridge.submit(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
 
@@ -249,7 +245,7 @@ def _drained_executor(settings: Settings) -> BoundedLocalExecutor:
     )
 
 
-def test_the_cleanup_attempt_flows_through_the_regular_mode_executor_to_the_service(
+def test_the_finalization_flows_through_the_regular_mode_executor_to_the_service(
     cleanup_service_harness: _CleanupServiceHarness,
     queue_wire: dict[str, Any],
 ) -> None:
@@ -272,7 +268,7 @@ def test_the_cleanup_attempt_flows_through_the_regular_mode_executor_to_the_serv
     assert queue_wire["queue"].enqueued == []
 
 
-def test_the_cleanup_wire_form_is_strictly_decoded_and_dispatched_in_queue_mode(
+def test_the_finalization_wire_form_is_strictly_decoded_and_dispatched_in_queue_mode(
     cleanup_service_harness: _CleanupServiceHarness,
     queue_wire: dict[str, Any],
 ) -> None:
@@ -289,7 +285,7 @@ def test_the_cleanup_wire_form_is_strictly_decoded_and_dispatched_in_queue_mode(
     assert func == invocation._ENTRYPOINT_PATH
     (encoded,) = args
     wire_invocation = decode_operation_invocation(encoded)
-    assert wire_invocation.kind is OperationKind.TASK_TERMINAL_CHECKOUT_CLEANUP
+    assert wire_invocation.kind is OperationKind.TASK_TERMINAL_FINALIZATION
     assert wire_invocation.payload == _cleanup_invocation().payload
     invoke_operation(
         wire_invocation,
@@ -306,12 +302,12 @@ def test_the_cleanup_wire_form_is_strictly_decoded_and_dispatched_in_queue_mode(
 def test_the_wire_payload_decodes_strictly_from_the_scoped_identifiers() -> None:
     wire_invocation = decode_operation_invocation(
         {
-            "kind": "task_terminal_checkout_cleanup",
+            "kind": "task_terminal_finalization",
             "payload": {"workspace_id": str(_WORKSPACE_ID), "task_id": str(_TASK_ID)},
         }
     )
 
-    assert wire_invocation.payload == TerminalCheckoutCleanupPayload(
+    assert wire_invocation.payload == TerminalFinalizationPayload(
         workspace_id=str(_WORKSPACE_ID), task_id=str(_TASK_ID)
     )
 
@@ -320,7 +316,7 @@ def test_the_wire_payload_rejects_unexpected_fields_and_malformed_uuids() -> Non
     with pytest.raises(InvalidInvocationError):
         decode_operation_invocation(
             {
-                "kind": "task_terminal_checkout_cleanup",
+                "kind": "task_terminal_finalization",
                 "payload": {
                     "workspace_id": str(_WORKSPACE_ID),
                     "task_id": str(_TASK_ID),
@@ -334,9 +330,9 @@ def test_the_wire_payload_rejects_unexpected_fields_and_malformed_uuids() -> Non
     with pytest.raises(InvalidInvocationError):
         decode_operation_invocation(
             {
-                "kind": "task_terminal_checkout_cleanup",
+                "kind": "task_terminal_finalization",
                 "payload": {"workspace_id": "not-a-uuid", "task_id": str(_TASK_ID)},
             }
         )
     with pytest.raises(InvalidInvocationError):
-        TerminalCheckoutCleanupPayload(workspace_id=str(_WORKSPACE_ID), task_id="")
+        TerminalFinalizationPayload(workspace_id=str(_WORKSPACE_ID), task_id="")

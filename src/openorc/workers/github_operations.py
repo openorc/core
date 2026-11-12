@@ -57,7 +57,7 @@ from openorc.workers.invocation import (
     SubmissionResult,
     WebhookDeliveryDispatchPayload,
 )
-from openorc.workers.task_cleanup_operations import F1TerminalCheckoutCleanupSubmission
+from openorc.workers.task_cleanup_operations import F1TerminalFinalizationSubmission
 
 __all__ = [
     "F1WebhookDispatchSubmission",
@@ -87,7 +87,7 @@ def _dispatch_github_webhook_delivery_handler(
         dependencies.database_pool(),
         dependencies.github_client(),
         delivery_guid=dispatch_payload.delivery_guid,
-        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
             dependencies.continuation_submitter()
         ),
     )
@@ -114,7 +114,7 @@ def _run_github_reconciliation_sweep_handler(
         dependencies.github_client(),
         dependencies.settings,
         sweep_tick=sweep_payload.sweep_tick,
-        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
             dependencies.continuation_submitter()
         ),
     )

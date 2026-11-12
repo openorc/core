@@ -226,7 +226,7 @@ class ScriptedCapability:
         # comparisons — its threading is covered by the dedicated worker
         # dispatch tests.
         recorded_kwargs = {
-            key: value for key, value in kwargs.items() if key != "terminal_cleanup_submission"
+            key: value for key, value in kwargs.items() if key != "terminal_finalization_submission"
         }
         self.calls.append(recorded_kwargs)
         error = self.errors.get(index)

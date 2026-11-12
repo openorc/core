@@ -3,7 +3,7 @@
 ``task_row`` builds the complete positional ``openorc.tasks`` row consumed by
 the Task repository mapping in :mod:`openorc.persistence.tasks` (the
 ``_TASK_COLUMNS`` projection and the ``_task_from_row`` conversion). Ordinary
-service and worker tests previously duplicated that 18-column positional
+service and worker tests previously duplicated that positional
 tuple layout in local helpers, so every Task-column addition forced a
 mechanical edit across dozens of unrelated modules. Building rows here from
 one shared ordered field list removes that fixture-shape coupling: per-test
@@ -60,13 +60,18 @@ _TASK_ROW_FIELDS: tuple[str, ...] = (
     "terminal_cause",
     "authorized_task_budget_usd",
     "effective_cost_threshold_usd",
+    "terminalization_outcome",
+    "terminalization_origin",
+    "terminalization_established_at",
+    "cleanup_send_claimed_at",
+    "cleanup_send_settled_at",
 )
 
 _DEFAULT_OBSERVED_AT = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
 def task_row(**overrides: Any) -> tuple[Any, ...]:
-    """Build one full 18-column ``openorc.tasks`` repository row.
+    """Build one full canonical ``openorc.tasks`` repository row.
 
     The returned tuple is positionally aligned with the canonical Task
     projection (``_TASK_COLUMNS`` in ``openorc.persistence.tasks``), which
@@ -111,6 +116,11 @@ def task_row(**overrides: Any) -> tuple[Any, ...]:
         "terminal_cause": None,
         "authorized_task_budget_usd": None,
         "effective_cost_threshold_usd": None,
+        "terminalization_outcome": None,
+        "terminalization_origin": None,
+        "terminalization_established_at": None,
+        "cleanup_send_claimed_at": None,
+        "cleanup_send_settled_at": None,
     }
     values.update(overrides)
     return tuple(values[field] for field in _TASK_ROW_FIELDS)

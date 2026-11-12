@@ -717,7 +717,7 @@ def test_malformed_observations_and_gates_fail_closed_before_any_state() -> None
 
 def _refreshed_task_row(threshold: Decimal) -> tuple[Any, ...]:
     row = _budgeted_task_row()
-    return (*row[:17], threshold)
+    return (*row[:17], threshold, *row[18:])
 
 
 def test_a_refreshed_threshold_is_the_enforced_allowance(

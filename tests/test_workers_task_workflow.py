@@ -106,7 +106,7 @@ class RecordingService:
         recorded_kwargs = {
             key: value
             for key, value in kwargs.items()
-            if key not in ("attempt_evidence", "terminal_cleanup_submission")
+            if key not in ("attempt_evidence", "terminal_finalization_submission")
         }
         self.calls.append({"args": args, "kwargs": recorded_kwargs})
         if self.results is not None:

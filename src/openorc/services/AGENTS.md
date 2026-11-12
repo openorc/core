@@ -36,6 +36,13 @@ API routers and RQ jobs remain thin callers. Provider-specific mechanics remain 
 - Known success, known failure/non-delivery, and uncertain outcome are distinct. Timeout/connection loss is not automatically safe to retry.
 - The LLM is never an idempotency mechanism.
 
+## Terminalization and the shared terminal finalization
+
+- One terminalization decision, one finalizer: every terminal authority (the unified Owner Cancel command and the delegating E5/E7 gate-cancellation entrypoints, the trusted GitHub closed-unmerged cancellation, and the confirmed-merge completion) commits its existing decision composition MINUS the inline archival, PLUS the exact-Task terminalization commitment, and then hands off to the shared finalization service (`task_terminal_finalization`) strictly after that commit.
+- The commitment is the explicit authority/currentness barrier across ordinary Task interactions: `require_current_task` refuses operations against a committed, not-yet-archived Task (typed stale classification), and the commitment's token rotation stales every in-flight command. Only the finalizer acts on a committed Task, rechecking the commitment directly from durable state.
+- The finalizer owns the optional bounded Cline cleanup (one `CLEANUP_WORKSPACE` request on the original eligible Producer session under the one-shot claim) and the mandatory archival: arbitration advisory lock FIRST, the guarded archival committing exactly the committed outcome (with the trusted closed-unmerged terminal cause), the terminal event with the origin-selected truthful actor provenance, and the absorbing ENDED transition of the remaining active session bindings — one composed transaction, never holding it across external calls. An unsettled cleanup claim defers the archival to its owning attempt; a duplicate finalizer never ends a session mid-attempt.
+- A KNOWN-REFUSED finalization delivery is an observed delivery failure, not the accepted silent-worker-death limitation: it falls back in-process to the same authoritative archive-only finalization (no cleanup attempt). Uncertain submissions are handled conservatively with no resubmission or polling. A silently dead worker may leave a committed terminalization unfinished — the accepted system-wide v1 limitation recorded on issue #317; no deadline, recovery, or discovery mechanism exists for it, and none may be built here.
+
 ## Workspace authorization
 
 - Owner authorization is exact: workspace.owner_profile_id must match the authenticated Profile ID.

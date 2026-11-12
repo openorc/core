@@ -66,6 +66,7 @@ from openorc.services.task_implementation_authorization import (
     cancel_implementation_authorization,
     open_implementation_authorization,
 )
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
@@ -195,7 +196,7 @@ _TASK_READ = _sql_lacks(_sql_has("from openorc.tasks where id"), "for update")
 _TASK_READ_LOCKED = _sql_has("from openorc.tasks where id", "for update")
 _TASK_GATE_WRITE = _sql_has("update openorc.tasks", "current_owner_gate_id")
 _STATUS_UPDATE = _sql_has("update openorc.tasks", "queued_at = case")
-_ARCHIVE_WRITE = _sql_has("update openorc.tasks", "archived_at = now()")
+_COMMIT_WRITE = _sql_has("update openorc.tasks", "terminalization_outcome = %s")
 _REVISION_READ = _sql_has("from openorc.plan_revisions where id")
 _LOOPS_LIST = _sql_has("from openorc.review_loops where task_id")
 _INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
@@ -237,6 +238,9 @@ def _task_row(
     gate_id: Any = None,
     archived: bool = False,
     fingerprint: Any = _FINGERPRINT,
+    terminalization_outcome: Any = None,
+    terminalization_origin: Any = None,
+    terminalization_established_at: Any = None,
 ) -> tuple[Any, ...]:
     return task_row(
         id=_TASK_ID,
@@ -251,6 +255,9 @@ def _task_row(
         source_requirements_fingerprint=fingerprint,
         created_at=_OBSERVED,
         updated_at=_OBSERVED,
+        terminalization_outcome=terminalization_outcome,
+        terminalization_origin=terminalization_origin,
+        terminalization_established_at=terminalization_established_at,
     )
 
 
@@ -757,11 +764,18 @@ def _script_cancellation(
     )
     conn.on(_LOOPS_LIST, [])  # no OPEN review loop to close at this gate
     if fail_archive:
-        conn.on(_ARCHIVE_WRITE, RuntimeError("forced late cancellation failure"))
+        conn.on(_COMMIT_WRITE, RuntimeError("forced late cancellation failure"))
     else:
         conn.on(
-            _ARCHIVE_WRITE,
-            _task_row(status="cancelled", state_token=_TOKEN_3, gate_id=None, archived=True),
+            _COMMIT_WRITE,
+            _task_row(
+                status="waiting_for_owner",
+                state_token=_TOKEN_3,
+                gate_id=None,
+                terminalization_outcome="cancelled",
+                terminalization_origin="owner_cancelled",
+                terminalization_established_at=_OBSERVED,
+            ),
         )
 
 
@@ -792,6 +806,13 @@ def _approve_call(pool: DatabasePool, *, expected_state_token: Any = _STATE_TOKE
     )
 
 
+class _AcceptedFinalization:
+    """The wired finalization seam: accepted delivery, no in-process fallback."""
+
+    def submit(self, *, workspace_id: Any, task_id: Any) -> Any:
+        return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+
 def _cancel_call(pool: DatabasePool, *, expected_state_token: Any = _STATE_TOKEN) -> Any:
     return cancel_implementation_authorization(
         pool,
@@ -800,6 +821,7 @@ def _cancel_call(pool: DatabasePool, *, expected_state_token: Any = _STATE_TOKEN
         task_id=_TASK_ID,
         owner_gate_id=_GATE_1_ID,
         expected_state_token=expected_state_token,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
 
@@ -844,7 +866,7 @@ def test_an_ordinary_acceptance_presents_the_exact_plan_gate() -> None:
     assert inserted_params[5] is None and inserted_params[6] is None
     assert _count(conn, _GATE_UPDATE) == 0
     assert _count(conn, _LOOP_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _count(conn, _STATUS_UPDATE) == 1
     assert _event_types(conn) == ["owner_gate_created", "plan_ready"]
     (gate_event,) = _event_params_of_type(conn, "owner_gate_created")
@@ -1211,7 +1233,7 @@ def test_owner_approval_is_the_irreversible_planning_boundary() -> None:
     assert _count(conn, _GATES_INSERT) == 0
     assert _count(conn, _GATE_UPDATE) == 1
     assert _count(conn, _LOOP_UPDATE) == 1
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     (gate_update_params,) = [params for sql, params in conn.executed if _GATE_UPDATE(sql, None)]
     assert gate_update_params is not None
     assert gate_update_params[0] == "approved"
@@ -1339,7 +1361,7 @@ def test_a_forced_late_approval_failure_leaves_no_partial_facts() -> None:
 
     assert _event_types(conn) == []
     assert _count(conn, _STATUS_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 # --- Owner cancel at the pending gate ----------------------------------------------
@@ -1355,28 +1377,26 @@ def test_owner_cancel_resolves_the_gate_and_archives_atomically() -> None:
 
     outcome = _cancel_call(_pool(conn))
 
-    assert outcome.task.status is TaskStatus.CANCELLED
-    assert outcome.task.archived_at == _OBSERVED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
+    assert outcome.task.archived_at is None  # archival belongs to the finalizer
     assert outcome.task.state_token == _TOKEN_3
     assert outcome.task.current_owner_gate_id is None
     assert outcome.owner_gate.status is OwnerGateStatus.CANCELLED
     assert outcome.owner_gate.decided_at == _OBSERVED
     assert _count(conn, _GATES_INSERT) == 0
     assert _count(conn, _GATE_UPDATE) == 1
-    assert _count(conn, _ARCHIVE_WRITE) == 1
+    assert _count(conn, _COMMIT_WRITE) == 1
     assert _count(conn, _STATUS_UPDATE) == 0
     assert _count(conn, _LOOP_UPDATE) == 0
     (gate_update_params,) = [params for sql, params in conn.executed if _GATE_UPDATE(sql, None)]
     assert gate_update_params is not None
     assert gate_update_params[0] == "cancelled"
-    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+    assert _event_types(conn) == ["owner_gate_resolved"]
     (resolved_event,) = _event_params_of_type(conn, "owner_gate_resolved")
     assert resolved_event[3] == "owner" and resolved_event[4] == str(_OWNER_PROFILE_ID)
     assert resolved_event[6] == _GATE_1_ID
     assert resolved_event[7].obj == {"outcome": "cancelled"}
-    (terminal_event,) = _event_params_of_type(conn, "task_cancelled")
-    assert terminal_event[3] == "owner" and terminal_event[4] == str(_OWNER_PROFILE_ID)
-    assert terminal_event[5] is None and terminal_event[6] is None
+    assert _event_params_of_type(conn, "task_cancelled") == []  # finalizer-owned
 
 
 def test_approval_after_cancellation_is_stale() -> None:
@@ -1409,7 +1429,7 @@ def test_a_forced_late_cancellation_failure_leaves_no_partial_facts() -> None:
     # scripted failure point, and the terminal event never happened.
     assert _event_types(conn) == ["owner_gate_resolved"]
     assert _event_params_of_type(conn, "task_cancelled") == []
-    assert _count(conn, _ARCHIVE_WRITE) == 1
+    assert _count(conn, _COMMIT_WRITE) == 1
 
 
 def test_cancel_refuses_a_stale_token() -> None:
@@ -1424,7 +1444,7 @@ def test_cancel_refuses_a_stale_token() -> None:
         _cancel_call(_pool(conn))
 
     assert _count(conn, _GATE_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1439,7 +1459,7 @@ def test_cancel_refuses_a_non_implementation_gate() -> None:
         _cancel_call(_pool(conn))
 
     assert _count(conn, _GATE_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1466,7 +1486,7 @@ def test_cancel_refuses_a_gate_that_lost_currency() -> None:
         _cancel_call(_pool(conn))
 
     assert _count(conn, _GATE_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 

@@ -132,7 +132,7 @@ from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_cancellation import cancel_task_composition
 
 if TYPE_CHECKING:
-    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
+    from openorc.services.task_terminal_finalization import TerminalFinalizationSubmission
 from openorc.services.task_source_requirements import compare_source_fingerprint_or_block
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
@@ -957,7 +957,7 @@ def cancel_pr_authorization(
     task_id: UUID,
     owner_gate_id: UUID,
     expected_state_token: UUID,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> CancelledPrAuthorization:
     """Cancel the Task at its exact current pending PR authorization gate.
 
@@ -1000,7 +1000,7 @@ def cancel_pr_authorization(
             expected_state_token=expected_state_token,
             owner_gate_id=owner_gate_id,
             expected_gate_type=OwnerGateType.PR_AUTHORIZATION,
-            terminal_cleanup_submission=terminal_cleanup_submission,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
         owner_gate = composition.owner_gate
         assert owner_gate is not None

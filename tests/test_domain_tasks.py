@@ -216,6 +216,11 @@ def test_task_field_set_is_exactly_the_aggregate_boundary() -> None:
             "terminal_cause",
             "authorized_task_budget_usd",
             "effective_cost_threshold_usd",
+            "terminalization_outcome",
+            "terminalization_origin",
+            "terminalization_established_at",
+            "cleanup_send_claimed_at",
+            "cleanup_send_settled_at",
         }
     )
 

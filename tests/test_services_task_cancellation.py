@@ -11,10 +11,11 @@ paths:
   still allows cancellation with a durable unresolved PR-close obligation;
 - the one shared decision transaction applies the gate ``CANCELLED``
   resolution (exact current pending gate of any type, no fabricated gate),
-  the OPEN ReviewLoop closures, the terminal ``CANCELLED`` archival
-  (clearing ``queued_at`` and the current-gate pointer and releasing the
-  issue mapping), the single OWNER ``task_cancelled`` audit, and the
-  one-shot PR-close intent atomically;
+  the OPEN ReviewLoop closures, the exact-Task terminalization commitment
+  (preserving the authorized CANCELLED outcome and its origin across the
+  bounded external cleanup interaction), and the one-shot PR-close intent
+  atomically; the terminal finalization handoff follows strictly after the
+  commit;
 - the one-shot post-archival closure attempt: already closed-unmerged
   records no-action with no write; a PR observed merged after terminal
   cancellation preserves the archived outcome; an open PR is closed exactly
@@ -57,7 +58,7 @@ from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.runtime_requests import RuntimeRequestStatus
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
-from openorc.domain.tasks import TaskStatus, TaskTerminalCause
+from openorc.domain.tasks import TaskStatus
 from openorc.persistence import blocks as block_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
@@ -82,7 +83,7 @@ from openorc.services.task_cancellation import (
     cancel_task_composition,
     cancel_task_for_confirmed_pr_closure,
 )
-from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmissionOutcome
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from tests.fakes.task_rows import task_row
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
@@ -129,7 +130,7 @@ _EPISODE_ID = uuid4()
 _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _GATE_UPDATE = _sql_has("update openorc.owner_gates")
 _GATE_POINTER_CLEAR = _sql_has("update openorc.tasks", "current_owner_gate_id")
-_ARCHIVE_WRITE = _sql_has("update openorc.tasks", "archived_at = now()")
+_COMMIT_WRITE = _sql_has("update openorc.tasks", "terminalization_outcome = %s")
 _CLOSE_INTENT_INSERT = _sql_has("insert into openorc.task_pull_request_close_intents")
 _CLOSE_INTENT_UPDATE = _sql_has("update openorc.task_pull_request_close_intents")
 
@@ -144,6 +145,11 @@ def _task_values(
     fingerprint: Any = "a" * 64,
     cause: Any = None,
     current_plan_revision: Any = None,
+    terminalization_outcome: Any = None,
+    terminalization_origin: Any = None,
+    terminalization_established_at: Any = None,
+    cleanup_send_claimed_at: Any = None,
+    cleanup_send_settled_at: Any = None,
 ) -> tuple[Any, ...]:
     """One full ``openorc.tasks`` row shaped like the durable model."""
     return task_row(
@@ -162,18 +168,41 @@ def _task_values(
         created_at=_OBSERVED,
         updated_at=_OBSERVED,
         terminal_cause=cause,
+        terminalization_outcome=terminalization_outcome,
+        terminalization_origin=terminalization_origin,
+        terminalization_established_at=terminalization_established_at,
+        cleanup_send_claimed_at=cleanup_send_claimed_at,
+        cleanup_send_settled_at=cleanup_send_settled_at,
     )
 
 
-def _archived_cancelled_row(fingerprint: Any = "a" * 64, cause: Any = None) -> tuple[Any, ...]:
+def _committed_cancelled_row(
+    *,
+    status: str = "waiting_for_owner",
+    fingerprint: Any = "a" * 64,
+    queued: bool = False,
+    current_gate_id: Any = None,
+    outcome: str = "cancelled",
+    origin: str = "owner_cancelled",
+    **overrides: Any,
+) -> tuple[Any, ...]:
+    """The commitment write's returned row: pre-terminal status, commitment set.
+
+    The exact-Task terminalization commitment rotates only the state token
+    and sets the commitment facts — the status, the queued-at admission
+    obligation, and the current-gate pointer are untouched until the
+    terminal finalizer's archival (issue #317).
+    """
     return _task_values(
-        status="cancelled",
-        state_token=_CANCELLED_TOKEN,
-        current_gate_id=None,
-        archived=True,
-        queued=False,
+        status=status,
+        state_token=uuid4(),
+        queued=queued,
         fingerprint=fingerprint,
-        cause=cause,
+        current_gate_id=current_gate_id,
+        terminalization_outcome=outcome,
+        terminalization_origin=origin,
+        terminalization_established_at=_OBSERVED,
+        **overrides,
     )
 
 
@@ -440,8 +469,29 @@ def _credential_stub(monkeypatch: pytest.MonkeyPatch, *, error: Exception | None
     )
 
 
+class _AcceptedFinalization:
+    """The wired finalization seam: accepted delivery, no in-process fallback.
+
+    Every cancellation-flow test wires this stub so the post-commitment
+    arrangement is accepted for delivery and the archive-only fallback never
+    runs inside the test's scripted connection. The finalizer's own behavior
+    matrix lives in tests/test_services_task_terminal_finalization.py.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def submit(self, *, workspace_id: Any, task_id: Any) -> Any:
+        self.calls.append({"workspace_id": workspace_id, "task_id": task_id})
+        return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+
 def _cancel_call(
-    pool: DatabasePool, github: Any, *, expected_state_token: Any = _STATE_TOKEN
+    pool: DatabasePool,
+    github: Any,
+    *,
+    expected_state_token: Any = _STATE_TOKEN,
+    finalization: Any = None,
 ) -> Any:
     return cancel_task(
         pool,
@@ -451,6 +501,9 @@ def _cancel_call(
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=expected_state_token,
+        terminal_finalization_submission=finalization
+        if finalization is not None
+        else _AcceptedFinalization(),
     )
 
 
@@ -504,20 +557,24 @@ def test_cancel_archives_a_ready_to_plan_task_directly(monkeypatch: pytest.Monke
     # runtime sessions, and no canonical PR (zero GitHub calls).
     _script_authorization(conn, row=_task_values(status="ready_to_plan", fingerprint=None))
     _script_authorization(conn, row=_task_values(status="ready_to_plan", fingerprint=None))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(fingerprint=None))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(
+        _COMMIT_WRITE,
+        _committed_cancelled_row(status="ready_to_plan", fingerprint=None),
+    )
     _wire(monkeypatch)
 
     github = _CloseGithub()
     outcome = _cancel_call(_pool(conn), github)
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
-    assert outcome.task.archived_at is not None
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     assert outcome.task.source_requirements_fingerprint is None
+    # The authorized outcome is not reported as committed until the
+    # finalizer's archival commits; the decision Task stays current.
+    assert outcome.task.archived_at is None
     assert outcome.owner_gate is None
     assert outcome.close_intent is None
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
     assert _count(conn, _GATE_READ) == 0
     assert _count(conn, _GATE_UPDATE) == 0
     assert github.repository_calls == []
@@ -530,19 +587,20 @@ def test_cancel_archives_a_queued_task_and_clears_its_admission_obligation(
     conn = ScriptedConnection()
     _script_authorization(conn, row=_task_values(status="queued", queued=True))
     _script_authorization(conn, row=_task_values(status="queued", queued=True))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(status="queued", queued=True))
     _wire(monkeypatch)
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     # A queued Task has started (issue #233): its frozen baseline is
     # immutable through the cancellation — never erased, never invented.
     assert outcome.task.source_requirements_fingerprint == "a" * 64
-    archive_params = [params for sql, params in conn.executed if "archived_at = now()" in sql]
-    assert len(archive_params) == 1
-    assert _event_types(conn) == ["task_cancelled"]
+    commit_params = [
+        params for sql, params in conn.executed if "terminalization_outcome = %s" in sql
+    ]
+    assert len(commit_params) == 1
+    assert _event_types(conn) == []
 
 
 def test_cancel_resolves_the_exact_current_pending_gate_cancelled(
@@ -553,9 +611,8 @@ def test_cancel_resolves_the_exact_current_pending_gate_cancelled(
     _script_authorization(conn, row=waiting)
     _script_authorization(conn, row=waiting)
     _script_gate_resolution(conn, row=waiting)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
     _wire(monkeypatch)
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
@@ -565,7 +622,7 @@ def test_cancel_resolves_the_exact_current_pending_gate_cancelled(
     gate_updates = [params for sql, params in conn.executed if "update openorc.owner_gates" in sql]
     assert gate_updates[0] is not None
     assert gate_updates[0][0] == "cancelled"
-    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+    assert _event_types(conn) == ["owner_gate_resolved"]
 
 
 def test_cancel_closes_every_open_review_loop_as_actually_present(
@@ -574,8 +631,7 @@ def test_cancel_closes_every_open_review_loop_as_actually_present(
     conn = ScriptedConnection()
     _script_authorization(conn, row=_task_values(status="ready_to_plan"))
     _script_authorization(conn, row=_task_values(status="ready_to_plan"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     loops = [
         SimpleNamespace(
             id=_LOOP_ID,
@@ -602,8 +658,7 @@ def test_cancel_from_a_settled_blocked_task_applies_directly(
     conn = ScriptedConnection()
     _script_authorization(conn, row=_task_values(status="blocked"))
     _script_authorization(conn, row=_task_values(status="blocked"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.SETTLED)],
@@ -611,8 +666,8 @@ def test_cancel_from_a_settled_blocked_task_applies_directly(
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
-    assert outcome.task.status is TaskStatus.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
+    assert _event_types(conn) == []
 
 
 # --- the canonical-PR lifecycle ordering (issue #228 §4) -------------------------
@@ -625,11 +680,10 @@ def _script_blocked_cancel_with_close_intent(
     blocked = _task_values(status="blocked")
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn.on(_CLOSE_INTENT_INSERT, _close_intent_row())
     # Phase C's archived-Task read for the close-attempt routing.
-    conn.on(_TASK_READ, _archived_cancelled_row())
+    conn.on(_TASK_READ, _committed_cancelled_row())
 
 
 def _wire_open_pr(monkeypatch: pytest.MonkeyPatch, reconcile: _ReconcileStub) -> None:
@@ -649,7 +703,7 @@ def test_a_confirmed_merge_at_the_point_of_decision_takes_the_completion_path(
     blocked = _task_values(status="blocked")
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _task_values(status="completed", archived=True, state_token=uuid4()))
+    conn.on(_COMMIT_WRITE, _task_values(status="completed", archived=True, state_token=uuid4()))
     conn.on(_EVENT_INSERT, _event_returned_row("task_completed"))
     reconcile = _ReconcileStub(
         _reconciled(
@@ -711,7 +765,7 @@ def test_an_open_pr_is_closed_exactly_once_and_the_outcome_recorded(
     outcome = _cancel_call(_pool(conn), github)
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     # Exactly one close request under the recorded Profile, addressed to the
     # stable PR identity; the observed outcome confirmed closed-unmerged.
     assert len(github.close_calls) == 1
@@ -750,7 +804,7 @@ def test_a_pr_observed_merged_after_cancellation_preserves_the_archived_outcome(
     assert github.close_calls == []
     assert outcome.close_intent is not None
     assert outcome.close_intent.status is TaskPullRequestCloseIntentStatus.NO_ACTION
-    assert _count(conn, _ARCHIVE_WRITE) == 1
+    assert _count(conn, _COMMIT_WRITE) == 1
 
 
 def test_an_already_closed_unmerged_pr_records_no_action_with_no_write(
@@ -760,8 +814,7 @@ def test_an_already_closed_unmerged_pr_records_no_action_with_no_write(
     blocked = _task_values(status="blocked")
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     reconcile = _ReconcileStub(
         _reconciled(pull_request=_pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
     )
@@ -791,7 +844,7 @@ def test_a_read_failure_still_cancels_with_a_durable_unresolved_obligation(
     outcome = _cancel_call(_pool(conn), github)
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     # The unresolved obligation is durably observable and stays pending: no
     # outcome is fabricated and no blind replay happens here.
     assert outcome.close_intent is not None
@@ -908,7 +961,7 @@ def test_a_pre_delivery_credential_failure_keeps_the_obligation_pending(
 
     outcome = _cancel_call(_pool(conn), github)
 
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     # The admitted close request never went out: the pending obligation
     # stays observable for the later reconciliation machinery.
     assert outcome.close_intent is not None
@@ -932,7 +985,7 @@ def test_an_unsettled_interruption_vetoes_cancel(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(ConflictError, match="not settled"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -945,7 +998,7 @@ def test_a_failed_or_unknown_interruption_vetoes_cancel(monkeypatch: pytest.Monk
         with pytest.raises(ConflictError, match="not settled"):
             _cancel_call(_pool(conn), _CloseGithub())
 
-        assert _count(conn, _ARCHIVE_WRITE) == 0
+        assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_an_open_execution_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -961,7 +1014,7 @@ def test_an_open_execution_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ConflictError, match="open execution"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_pending_runtime_request_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -977,7 +1030,7 @@ def test_a_pending_runtime_request_vetoes_cancel(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(ConflictError, match="pending runtime request"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 # --- F7-prep (issue #278): exceptional BLOCKED gates and the completed veto -------
@@ -1144,15 +1197,14 @@ def test_cancel_resolves_each_current_exceptional_blocked_gate_cancelled(
         _script_authorization(conn, row=blocked)
         _script_authorization(conn, row=blocked)
         _script_exceptional_gate_resolution(conn, row=blocked, gate_type=gate_type)
-        conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+        conn.on(_COMMIT_WRITE, _committed_cancelled_row())
         conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
-        conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
         _wire(monkeypatch, block=_unresolved_block())
 
         outcome = _cancel_call(_pool(conn), _CloseGithub())
 
         assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-        assert outcome.task.status is TaskStatus.CANCELLED
+        assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
         assert outcome.owner_gate is not None
         gate_updates = [
             params for sql, params in conn.executed if "update openorc.owner_gates" in sql
@@ -1160,7 +1212,7 @@ def test_cancel_resolves_each_current_exceptional_blocked_gate_cancelled(
         assert len(gate_updates) == 1
         assert gate_updates[0] is not None
         assert gate_updates[0][0] == "cancelled"
-        assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+        assert _event_types(conn) == ["owner_gate_resolved"]
 
 
 def test_a_wrong_kind_current_gate_on_a_blocked_task_refuses(
@@ -1179,7 +1231,7 @@ def test_a_wrong_kind_current_gate_on_a_blocked_task_refuses(
     with pytest.raises(ConflictError, match="exceptional blocked-task gate"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1196,7 +1248,7 @@ def test_a_blocked_gate_bound_to_a_resolved_block_refuses(
     with pytest.raises(StaleOperationError, match="block subject has already resolved"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1213,7 +1265,7 @@ def test_a_blocked_gate_bound_to_a_missing_block_refuses(
     with pytest.raises(NotFoundError, match="block subject is not available"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_superseded_blocked_gate_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1230,7 +1282,7 @@ def test_a_superseded_blocked_gate_refuses(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(StaleOperationError, match="no longer the task's current gate"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1259,7 +1311,7 @@ def test_the_delegating_gate_composition_refuses_a_blocked_task(
             owner_gate_id=_GATE_ID,
         )
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _count(conn, _GATE_UPDATE) == 0
     assert _event_types(conn) == []
 
@@ -1275,7 +1327,7 @@ def test_a_claimed_send_dispatch_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(ConflictError, match="unsettled runtime send claim"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1302,7 +1354,7 @@ def test_a_claimed_planning_revise_dispatch_on_its_current_subject_vetoes_cancel
     with pytest.raises(ConflictError, match="unsettled runtime send claim"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_superseded_planning_revise_claim_permits_cancel(
@@ -1314,8 +1366,7 @@ def test_a_superseded_planning_revise_claim_permits_cancel(
     blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         send_claims=[
@@ -1331,7 +1382,7 @@ def test_a_superseded_planning_revise_claim_permits_cancel(
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_a_claimed_pr_compose_dispatch_without_a_canonical_pr_vetoes_cancel(
@@ -1347,7 +1398,7 @@ def test_a_claimed_pr_compose_dispatch_without_a_canonical_pr_vetoes_cancel(
     with pytest.raises(ConflictError, match="unsettled runtime send claim"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_claimed_pr_compose_dispatch_with_a_canonical_pr_permits_cancel(
@@ -1357,8 +1408,7 @@ def test_a_claimed_pr_compose_dispatch_with_a_canonical_pr_permits_cancel(
     blocked = _task_values(status="blocked")
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         send_claims=[_send_claim(TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH)],
@@ -1372,7 +1422,7 @@ def test_a_claimed_pr_compose_dispatch_with_a_canonical_pr_permits_cancel(
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
     assert outcome.close_intent is None
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_terminal_send_claims_permits_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1380,8 +1430,7 @@ def test_terminal_send_claims_permits_cancel(monkeypatch: pytest.MonkeyPatch) ->
     blocked = _task_values(status="blocked")
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         send_claims=[
@@ -1399,7 +1448,7 @@ def test_terminal_send_claims_permits_cancel(monkeypatch: pytest.MonkeyPatch) ->
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_an_unsettled_planning_bootstrap_vetoes_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1410,7 +1459,7 @@ def test_an_unsettled_planning_bootstrap_vetoes_cancel(monkeypatch: pytest.Monke
     with pytest.raises(ConflictError, match="planning bootstrap is unsettled"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_published_plan_revision_resolves_the_bootstrap_permit(
@@ -1420,14 +1469,13 @@ def test_a_published_plan_revision_resolves_the_bootstrap_permit(
     blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(monkeypatch, bootstrap_evidence=SimpleNamespace(stage=None, claim_token=uuid4()))
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_an_unfinalized_review_iteration_on_the_current_subject_vetoes_cancel(
@@ -1443,7 +1491,7 @@ def test_an_unfinalized_review_iteration_on_the_current_subject_vetoes_cancel(
     with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1466,7 +1514,7 @@ def test_an_escalated_post_send_uncertain_review_failure_vetoes_cancel(
     with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_an_escalated_known_failed_review_failure_vetoes_cancel(
@@ -1488,7 +1536,7 @@ def test_an_escalated_known_failed_review_failure_vetoes_cancel(
     with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_an_escalated_review_failure_on_a_different_block_vetoes_cancel(
@@ -1518,7 +1566,7 @@ def test_an_escalated_review_failure_on_a_different_block_vetoes_cancel(
     with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_pr_review_iteration_on_the_current_head_vetoes_cancel(
@@ -1539,7 +1587,7 @@ def test_a_pr_review_iteration_on_the_current_head_vetoes_cancel(
     with pytest.raises(ConflictError, match="outstanding reviewer review dispatch"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_positively_proven_pre_send_review_failure_permits_cancel(
@@ -1553,9 +1601,8 @@ def test_a_positively_proven_pre_send_review_failure_permits_cancel(
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
     _script_exceptional_gate_resolution(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
     _wire(
         monkeypatch,
         loops=[_planning_loop()],
@@ -1572,7 +1619,7 @@ def test_a_positively_proven_pre_send_review_failure_permits_cancel(
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
     assert outcome.owner_gate is not None
-    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+    assert _event_types(conn) == ["owner_gate_resolved"]
 
 
 def test_a_finalized_newer_iteration_supersedes_the_unfinalized_attempt_permit(
@@ -1586,8 +1633,7 @@ def test_a_finalized_newer_iteration_supersedes_the_unfinalized_attempt_permit(
     blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         loops=[_planning_loop()],
@@ -1597,7 +1643,7 @@ def test_a_finalized_newer_iteration_supersedes_the_unfinalized_attempt_permit(
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_a_finalized_review_iteration_permits_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1605,8 +1651,7 @@ def test_a_finalized_review_iteration_permits_cancel(monkeypatch: pytest.MonkeyP
     blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         loops=[_planning_loop()],
@@ -1616,7 +1661,7 @@ def test_a_finalized_review_iteration_permits_cancel(monkeypatch: pytest.MonkeyP
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_a_review_iteration_on_a_moved_on_subject_permits_cancel(
@@ -1626,8 +1671,7 @@ def test_a_review_iteration_on_a_moved_on_subject_permits_cancel(
     blocked = _task_values(status="blocked", current_plan_revision=_REVISION_ID)
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     _wire(
         monkeypatch,
         loops=[_planning_loop()],
@@ -1637,7 +1681,7 @@ def test_a_review_iteration_on_a_moved_on_subject_permits_cancel(
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _event_types(conn) == []
 
 
 def test_cancel_is_inapplicable_during_autonomous_progression(
@@ -1651,7 +1695,7 @@ def test_cancel_is_inapplicable_during_autonomous_progression(
         with pytest.raises(ConflictError, match="autonomous progression"):
             _cancel_call(_pool(conn), _CloseGithub())
 
-        assert _count(conn, _ARCHIVE_WRITE) == 0
+        assert _count(conn, _COMMIT_WRITE) == 0
         assert _event_types(conn) == []
 
 
@@ -1663,7 +1707,7 @@ def test_cancel_of_an_archived_task_is_stale(monkeypatch: pytest.MonkeyPatch) ->
     with pytest.raises(StaleOperationError):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_a_stale_token_cancels_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1674,7 +1718,7 @@ def test_a_stale_token_cancels_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(StaleOperationError):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1722,7 +1766,7 @@ def test_a_merge_confirmed_under_the_final_lock_routes_to_completion(
     assert len(completion_calls) == 1
     # No Owner CANCELLED claim, no close obligation, no archival.
     assert github.close_calls == []
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _count(conn, _CLOSE_INTENT_INSERT) == 0
     assert _event_types(conn) == []
 
@@ -1864,10 +1908,9 @@ def test_the_complete_implementing_abort_settlement_path_cancels_with_terminal_a
     _script_authorization(conn2, row=blocked)
     _script_authorization(conn2, row=blocked)
     _script_exceptional_gate_resolution(conn2, row=blocked, gate_type="owner_abort")
-    conn2.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn2.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn2.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
     conn2.on(_EVENT_INSERT, _event_returned_row("execution_cancelled"))
-    conn2.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
 
     outcome = cancel_task(
         _pool(conn2),
@@ -1877,21 +1920,18 @@ def test_the_complete_implementing_abort_settlement_path_cancels_with_terminal_a
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_CANCELLED_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     assert outcome.owner_gate is not None
     # The exact affected Execution is finalized terminal CANCELLED in the
     # same decision transaction: exactly one guarded transition, no other
     # status ever touched, and the three audit facts commit together.
     assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
     assert execution.status is ExecutionStatus.CANCELLED
-    assert _event_types(conn2) == [
-        "owner_gate_resolved",
-        "execution_cancelled",
-        "task_cancelled",
-    ]
+    assert _event_types(conn2) == ["owner_gate_resolved", "execution_cancelled"]
 
 
 def _settled_episode_intent(*, session_id: Any, block_id: Any | None = _BLOCK_ID) -> Any:
@@ -1945,7 +1985,7 @@ def test_a_historical_settlement_cannot_authorize_cancelling_later_work(
     with pytest.raises(ConflictError, match="open execution"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1971,7 +2011,7 @@ def test_a_legacy_unlinked_settled_intent_cannot_authorize_cancellation(
     with pytest.raises(ConflictError, match="open execution"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -1996,7 +2036,7 @@ def test_a_settled_interruption_of_another_session_cannot_cover_an_open_executio
     with pytest.raises(ConflictError, match="open execution"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -2032,22 +2072,17 @@ def test_a_settled_cost_limit_interruption_follows_the_same_cancel_accounting(
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
     _script_exceptional_gate_resolution(conn, row=blocked, gate_type="cost_limit")
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
     conn.on(_EVENT_INSERT, _event_returned_row("execution_cancelled"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     assert outcome.owner_gate is not None
     assert transitions == [(execution.id, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLED)]
-    assert _event_types(conn) == [
-        "owner_gate_resolved",
-        "execution_cancelled",
-        "task_cancelled",
-    ]
+    assert _event_types(conn) == ["owner_gate_resolved", "execution_cancelled"]
 
 
 def test_a_concurrently_finalized_accounted_execution_is_a_truthful_no_op(
@@ -2095,17 +2130,16 @@ def test_a_concurrently_finalized_accounted_execution_is_a_truthful_no_op(
     _script_authorization(conn, row=blocked)
     _script_authorization(conn, row=blocked)
     _script_exceptional_gate_resolution(conn, row=blocked, gate_type="owner_abort")
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row())
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row())
     conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_resolved"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
 
     outcome = _cancel_call(_pool(conn), _CloseGithub())
 
     assert outcome.kind is TaskCancellationOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
     # The genuinely finalized historical Execution records no second
     # cancellation event.
-    assert _event_types(conn) == ["owner_gate_resolved", "task_cancelled"]
+    assert _event_types(conn) == ["owner_gate_resolved"]
 
 
 def test_an_unresolved_accounted_execution_rejection_fails_closed(
@@ -2145,7 +2179,7 @@ def test_an_unresolved_accounted_execution_rejection_fails_closed(
     with pytest.raises(ConflictError, match="could not be applied"):
         _cancel_call(_pool(conn), _CloseGithub())
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     # The decision transaction rolls back everything it executed — the fake
     # connection records the statements, the durable graph never commits
     # them: no execution event, no terminal archival event, no close intent.
@@ -2160,6 +2194,7 @@ def _closure_call(pool: DatabasePool) -> Any:
         pool,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
 
@@ -2205,25 +2240,21 @@ def test_a_confirmed_closed_unmerged_observation_cancels_the_current_task(
         conn,
         row=_task_values(status="waiting_for_owner", current_gate_id=_GATE_ID),
     )
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(origin="github_closed_unmerged"))
     _wire(monkeypatch)
     _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
 
     outcome = _closure_call(_pool(conn))
 
     assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
-    assert outcome.task.terminal_cause is TaskTerminalCause.PR_CLOSED_UNMERGED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_origin.value == "github_closed_unmerged"
     assert outcome.pull_request is not None
     assert outcome.pull_request.state is TaskPullRequestState.CLOSED
     assert outcome.closed_loops == ()
     assert _count(conn, _GATE_UPDATE) == 0
     assert _count(conn, _CLOSE_INTENT_INSERT) == 0
-    assert _event_types(conn) == ["task_cancelled"]
-    (terminal_event,) = _event_params_of_type(conn, "task_cancelled")
-    assert terminal_event[3] == "github"
-    assert terminal_event[4] is None
+    assert _event_types(conn) == []
 
 
 @pytest.mark.parametrize(
@@ -2248,15 +2279,14 @@ def test_the_trusted_closure_admits_every_non_archived_status(
     _script_closure_authorization(
         conn, row=_task_values(status=status, queued=(status == "queued"))
     )
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(origin="github_closed_unmerged"))
     _wire(monkeypatch)
     _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
 
     outcome = _closure_call(_pool(conn))
 
     assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
 
 
 def test_the_trusted_closure_closes_open_review_loops(
@@ -2265,8 +2295,7 @@ def test_the_trusted_closure_closes_open_review_loops(
     loops = [SimpleNamespace(id=_LOOP_ID, purpose="pr_review", iteration_limit=5)]
     conn = ScriptedConnection()
     _script_closure_authorization(conn, row=_task_values(status="reviewing"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(origin="github_closed_unmerged"))
     _wire(monkeypatch, loops=loops)
     _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
 
@@ -2286,8 +2315,7 @@ def test_outstanding_runtime_work_does_not_veto_the_external_closure(
     # F4c cleanup waits for safe accounting independently.
     conn = ScriptedConnection()
     _script_closure_authorization(conn, row=_task_values(status="implementing"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(origin="github_closed_unmerged"))
     _wire(
         monkeypatch,
         interrupt_intents=[SimpleNamespace(status=TaskInterruptIntentStatus.UNSETTLED)],
@@ -2299,7 +2327,7 @@ def test_outstanding_runtime_work_does_not_veto_the_external_closure(
     outcome = _closure_call(_pool(conn))
 
     assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
-    assert outcome.task.status is TaskStatus.CANCELLED
+    assert outcome.task.terminalization_outcome is TaskStatus.CANCELLED
 
 
 def test_an_open_canonical_pull_request_causes_no_terminal_effect(
@@ -2313,7 +2341,7 @@ def test_an_open_canonical_pull_request_causes_no_terminal_effect(
     with pytest.raises(StaleOperationError):
         _closure_call(_pool(conn))
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -2334,7 +2362,7 @@ def test_a_confirmed_merged_canonical_pull_request_refuses_the_closure_cancellat
     with pytest.raises(StaleOperationError):
         _closure_call(_pool(conn))
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -2354,17 +2382,16 @@ def test_an_already_archived_task_is_the_idempotent_no_op(
 
     assert outcome.kind is TaskPrClosureOutcomeKind.ALREADY_TERMINAL
     assert outcome.task.status is TaskStatus(status)
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
-def test_a_newly_applied_closure_arranges_one_best_effort_cleanup_submission(
+def test_a_newly_applied_closure_arranges_one_terminal_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = ScriptedConnection()
     _script_closure_authorization(conn, row=_task_values(status="implementing"))
-    conn.on(_ARCHIVE_WRITE, _archived_cancelled_row(cause="pr_closed_unmerged"))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_cancelled"))
+    conn.on(_COMMIT_WRITE, _committed_cancelled_row(origin="github_closed_unmerged"))
     _wire(monkeypatch)
     _lock_evidence(monkeypatch, _pull_request(state=TaskPullRequestState.CLOSED, merged_at=None))
     submissions: list[tuple[Any, Any]] = []
@@ -2372,24 +2399,24 @@ def test_a_newly_applied_closure_arranges_one_best_effort_cleanup_submission(
     class _RecordingSubmission:
         def submit(
             self, *, workspace_id: Any, task_id: Any
-        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+        ) -> TerminalFinalizationSubmissionOutcome:
             submissions.append((workspace_id, task_id))
-            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+            return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
     outcome = cancel_task_for_confirmed_pr_closure(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
-        terminal_cleanup_submission=_RecordingSubmission(),
+        terminal_finalization_submission=_RecordingSubmission(),
     )
 
     assert outcome.kind is TaskPrClosureOutcomeKind.CANCELLED
-    # Exactly one best-effort post-archival arrangement for the newly
-    # applied terminal outcome — the archival itself is untouched.
+    # Exactly one bounded terminal finalization arrangement for the newly
+    # committed terminalization — the decision itself is untouched.
     assert submissions == [(_WORKSPACE_ID, _TASK_ID)]
 
 
-def test_an_already_terminal_replay_arranges_no_cleanup_submission(
+def test_an_already_terminal_replay_arranges_no_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = ScriptedConnection()
@@ -2401,20 +2428,19 @@ def test_an_already_terminal_replay_arranges_no_cleanup_submission(
     class _RecordingSubmission:
         def submit(
             self, *, workspace_id: Any, task_id: Any
-        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+        ) -> TerminalFinalizationSubmissionOutcome:
             submissions.append((workspace_id, task_id))
-            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+            return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
     outcome = cancel_task_for_confirmed_pr_closure(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
-        terminal_cleanup_submission=_RecordingSubmission(),
+        terminal_finalization_submission=_RecordingSubmission(),
     )
 
     assert outcome.kind is TaskPrClosureOutcomeKind.ALREADY_TERMINAL
-    # Duplicate terminal observations never intentionally initiate fresh
-    # cleanup attempts.
+    # Duplicate terminal observations never arrange a second finalization.
     assert submissions == []
 
 
@@ -2429,7 +2455,7 @@ def test_a_missing_canonical_pull_request_fails_closed(
     with pytest.raises(NotFoundError):
         _closure_call(_pool(conn))
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 
@@ -2446,7 +2472,7 @@ def test_a_cross_workspace_canonical_pull_request_fails_closed(
     with pytest.raises(NotFoundError):
         _closure_call(_pool(conn))
 
-    assert _count(conn, _ARCHIVE_WRITE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _event_types(conn) == []
 
 

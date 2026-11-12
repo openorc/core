@@ -87,6 +87,7 @@ from openorc.services.task_pr_composition import (
     ProducerRuntimeAttachmentFactory,
     compose_and_publish_task_pr,
 )
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from tests.fakes.agent_runtime import (
     ControlRealization,
     FakeAgentRuntimeAdapter,
@@ -249,7 +250,7 @@ _GATE_READ = _sql_has("from openorc.owner_gates where id")
 _SESSION_READ = _sql_has("from openorc.task_agent_sessions")
 _EVENTS_BY_SUBJECT = _sql_has("from openorc.workflow_events", "subject_id = %s")
 _STATUS_UPDATE = _sql_has("update openorc.tasks set status", "queued_at = case")
-_ARCHIVE_UPDATE = _sql_has("update openorc.tasks set status", "archived_at = now()")
+_COMMIT_WRITE = _sql_has("update openorc.tasks", "terminalization_outcome = %s")
 _LOOPS_READ = _sql_has("from openorc.review_loops", "status = %s")
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
 _GATES_INSERT = _sql_has("insert into openorc.owner_gates")
@@ -269,6 +270,9 @@ def _task_row(
     archived_at: Any = None,
     terminal_cause: Any = None,
     gate_id: Any = None,
+    terminalization_outcome: Any = None,
+    terminalization_origin: Any = None,
+    terminalization_established_at: Any = None,
 ) -> tuple[Any, ...]:
     return task_row(
         id=_TASK_ID,
@@ -283,6 +287,9 @@ def _task_row(
         created_at=_OBSERVED,
         updated_at=_OBSERVED,
         terminal_cause=terminal_cause,
+        terminalization_outcome=terminalization_outcome,
+        terminalization_origin=terminalization_origin,
+        terminalization_established_at=terminalization_established_at,
     )
 
 
@@ -836,7 +843,7 @@ def _script_continuation(
         conn.on(_PR_READ, observed_pr_row)
         conn.on(_LOOPS_READ, [])
         conn.on(
-            _ARCHIVE_UPDATE,
+            _COMMIT_WRITE,
             _task_row(
                 status="cancelled",
                 state_token=_ROTATED_TOKEN,
@@ -845,6 +852,13 @@ def _script_continuation(
             ),
         )
     conn.on_repeat(_EVENT_INSERT, _event_row())
+
+
+class _AcceptedFinalization:
+    """The wired finalization seam: accepted delivery, no in-process fallback."""
+
+    def submit(self, *, workspace_id: Any, task_id: Any) -> Any:
+        return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
 
 def _compose_call(
@@ -867,6 +881,7 @@ def _compose_call(
         task_id=_TASK_ID,
         owner_gate_id=owner_gate_id,
         expected_state_token=expected_state_token,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
 
@@ -1435,8 +1450,10 @@ def test_a_confirmed_closed_unmerged_publication_cancels_the_task_terminally(
     assert adapter.realized_controls() == ()
     assert _count(conn, _BLOCK_INSERT) == 0
     assert _count(conn, _STATUS_UPDATE) == 0
-    assert _count(conn, _ARCHIVE_UPDATE) == 1
-    assert _event_types(conn) == ["task_cancelled"]
+    assert _count(conn, _COMMIT_WRITE) == 1
+    # The terminal task_cancelled event commits with the finalizer's
+    # archival, never with the cancellation decision.
+    assert _event_types(conn) == []
 
 
 def test_a_confirmed_merge_refuses_without_false_recovery_state(
