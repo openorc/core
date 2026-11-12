@@ -105,7 +105,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final
+from typing import Final
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -149,7 +149,7 @@ from openorc.domain.tasks import (
     Task,
     TaskPlanningBootstrapStage,
     TaskStatus,
-    TaskTerminalCause,
+    TaskTerminalizationOrigin,
 )
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import blocks as block_records
@@ -192,12 +192,12 @@ from openorc.services.task_subject_guards import (
     require_current_task,
     require_owner_gate_unresolved_block_subject,
 )
-from openorc.services.task_terminal_cleanup import submit_terminal_checkout_cleanup
+from openorc.services.task_terminal_finalization import (
+    TerminalFinalizationSubmission,
+    arrange_task_terminal_finalization,
+)
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
-
-if TYPE_CHECKING:
-    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
 
 __all__ = [
     "TaskCancellationComposition",
@@ -278,9 +278,12 @@ class _CloseObligation(StrEnum):
 class TaskCancellationOutcomeKind(StrEnum):
     """The classified outcome of one unified Cancel command.
 
-    ``cancelled`` applied the terminal archival (with its gate resolution,
-    loop closures, and close obligation as applicable); ``completed``
-    routed to E10a's shared completion because the canonical PR was already
+    ``cancelled`` committed the exact-Task terminalization (with its gate
+    resolution, loop closures, and close obligation as applicable) — the
+    mandatory terminal finalization then carries the bounded optional
+    cleanup and the archival, and the authorized CANCELLED outcome is not
+    reported as committed until that archival commits; ``completed`` routed
+    to E10a's shared completion because the canonical PR was already
     authoritatively confirmed merged at the point of decision.
     """
 
@@ -312,10 +315,12 @@ class TaskCancellationComposition:
 class TaskPrClosureOutcomeKind(StrEnum):
     """The classified outcome of one trusted PR-closure cancellation.
 
-    ``cancelled`` applied the terminal archival with its GITHUB-provenance
-    event and canonical terminal cause. ``already_terminal`` is the
-    idempotent no-op for an already archived Task — whatever its terminal
-    outcome, archived history is immutable and nothing is rewritten.
+    ``cancelled`` committed the exact-Task terminalization with its
+    GITHUB-provenance decision; the terminal finalizer archives it with the
+    canonical ``pr_closed_unmerged`` terminal cause. ``already_terminal``
+    is the idempotent no-op for an already-committed or already-archived
+    Task — whatever its terminal outcome, terminal history is immutable and
+    nothing is rewritten.
     """
 
     CANCELLED = "cancelled"
@@ -340,8 +345,9 @@ class _CancelComposition:
     owner_gate: OwnerGate | None
     closed_loops: tuple[ReviewLoop, ...]
     close_intent: TaskPullRequestCloseIntent | None
-    # Whether this invocation applied the archival: False only for the
-    # trusted GitHub-observation path's idempotent already-archived no-op.
+    # Whether this invocation applied the terminalization commitment: False
+    # only for the trusted GitHub-observation path's idempotent
+    # already-committed/already-archived no-ops.
     applied: bool = True
     # The canonical PR evidence the trusted path proved under its row lock
     # (the Owner paths carry their own pre/post-decision observations).
@@ -741,7 +747,6 @@ def _cancel_composition(
     preflight_pull_request_id: UUID | None = None,
     trusted_pr_closure: bool = False,
     waiting_for_owner_only: bool = False,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
 ) -> _CancelComposition:
     """The ONE shared atomic cancellation composition (issues #228 §3, #229 §2).
 
@@ -784,7 +789,7 @@ def _cancel_composition(
         owner_expected_token: UUID
         if trusted_pr_closure:
             actor = _GITHUB_ACTOR
-            terminal_cause: TaskTerminalCause | None = TaskTerminalCause.PR_CLOSED_UNMERGED
+            terminal_origin = TaskTerminalizationOrigin.GITHUB_CLOSED_UNMERGED
             # The account-wide Owner-mutation barrier (#97), derived from
             # durable Workspace ownership rather than an authenticated
             # caller: the FIRST lock acquisition of this write phase.
@@ -801,7 +806,7 @@ def _cancel_composition(
                 )
             owner_expected_token = expected_state_token
             actor = event_coordination.owner_actor(profile_id)
-            terminal_cause = None
+            terminal_origin = TaskTerminalizationOrigin.OWNER_CANCELLED
             require_account_operational(transaction_pool, profile_id=profile_id)
             require_workspace_task(
                 transaction_pool,
@@ -1015,22 +1020,35 @@ def _cancel_composition(
             # a truthful no-op, never a retry.
             if closed is not None:
                 closed_loops.append(closed)
-        archived = task_records.archive_task(
+        committed = task_records.commit_task_terminalization(
             transaction_pool,
             task_id,
             expected_state_token=working_token,
-            terminal_status=TaskStatus.CANCELLED,
-            terminal_cause=terminal_cause,
+            terminal_outcome=TaskStatus.CANCELLED,
+            origin=terminal_origin,
         )
-        if archived is None:
+        if committed is None:
+            # The conditional write rejected: classify from the current
+            # locked durable state. An already-committed terminalization is
+            # the trusted path's idempotent duplicate-observation no-op and
+            # the Owner path's raced-terminalization stale refusal; anything
+            # else fails closed as a stale cancellation.
+            recommitted = task_records.get_task_for_update(transaction_pool, task_id)
+            if recommitted is not None and recommitted.terminalization_outcome is not None:
+                if trusted_pr_closure:
+                    return _CancelComposition(
+                        task=recommitted,
+                        owner_gate=None,
+                        closed_loops=(),
+                        close_intent=None,
+                        applied=False,
+                        pull_request=pull_request,
+                    )
+                raise StaleOperationError(
+                    "the task's terminalization was committed concurrently; "
+                    "the cancellation is stale"
+                )
             raise StaleOperationError("the task could not be cancelled; the cancellation is stale")
-        event_coordination.record_task_terminal_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            actor=actor,
-            terminal_status=TaskStatus.CANCELLED,
-        )
         close_intent: TaskPullRequestCloseIntent | None = None
         if close_obligation is not _CloseObligation.NONE:
             if profile_id is None:
@@ -1041,7 +1059,7 @@ def _cancel_composition(
                     "the close obligation requires the accountable owner profile"
                 )
             surviving = get_task_pull_request_for_task(transaction_pool, task_id=task_id)
-            if surviving is None or surviving.workspace_id != archived.workspace_id:
+            if surviving is None or surviving.workspace_id != committed.workspace_id:
                 raise ConflictError(
                     "the canonical pull request record moved during cancellation; "
                     "the cancellation is stale"
@@ -1056,21 +1074,12 @@ def _cancel_composition(
                 requested_by_profile_id=profile_id,
             )
     composition = _CancelComposition(
-        task=archived,
+        task=committed,
         owner_gate=cancelled_gate,
         closed_loops=tuple(closed_loops),
         close_intent=close_intent,
         pull_request=pull_request,
     )
-    if composition.applied:
-        # The committed post-archival point: one best-effort F10 cleanup
-        # submission strictly after the terminal outcome is durable (issue
-        # #256) — never for the already-archived replay no-op, never inside
-        # the transaction, and never delaying or reversing the archival,
-        # the issue release, or the PR-close obligation recorded above.
-        submit_terminal_checkout_cleanup(
-            terminal_cleanup_submission, workspace_id=workspace_id, task_id=task_id
-        )
     return composition
 
 
@@ -1083,7 +1092,7 @@ def cancel_task_composition(
     expected_state_token: UUID,
     owner_gate_id: UUID,
     expected_gate_type: OwnerGateType | None = None,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> TaskCancellationComposition:
     """The shared database-only cancellation composition for gate entrypoints.
 
@@ -1098,9 +1107,11 @@ def cancel_task_composition(
     close obligation this delegating entrypoint deliberately lacks (it
     performs no external call and records no PR-close obligation — those
     gate states carry no canonical pull request in the v1 flow, and no
-    GitHub artifact is ever touched). A newly applied archival forwards the
-    optionally supplied F10 cleanup submission seam (issue #256) through
-    the shared composition's post-commit arrangement.
+    GitHub artifact is ever touched). A newly applied terminalization
+    forwards the optionally supplied finalization submission seam (issue
+    #317) through the shared composition's post-commit arrangement: the
+    bounded terminal finalization carries the optional cleanup and the
+    mandatory archival.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _COMPOSITION_SPAN_NAME) as span:
         annotate_span(
@@ -1119,8 +1130,14 @@ def cancel_task_composition(
             close_obligation=_CloseObligation.NONE,
             expected_gate_type=expected_gate_type,
             waiting_for_owner_only=True,
-            terminal_cleanup_submission=terminal_cleanup_submission,
         )
+        if composition.applied:
+            arrange_task_terminal_finalization(
+                pool,
+                terminal_finalization_submission,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
         return TaskCancellationComposition(
             task=composition.task,
             owner_gate=composition.owner_gate,
@@ -1406,7 +1423,7 @@ def cancel_task(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> TaskCancellationOutcome:
     """Cancel the Task from a current safely inactive state (issue #228).
 
@@ -1416,9 +1433,13 @@ def cancel_task(
     decision routes to E10a's shared completion path instead of an Owner
     ``CANCELLED`` claim, and a read failure still allows cancellation with a
     durable unresolved PR-close obligation. One shared short transaction
-    then applies the whole terminal composition atomically, and the one-shot
-    closure attempt follows strictly after the commit. Stale, archived,
-    already-terminal, autonomous-phase, and unaccounted-runtime requests
+    then applies the whole terminalization decision atomically — the exact
+    current gate's CANCELLED resolution, the accounted-runtime veto's
+    Execution finalizations, the ReviewLoop closures, the exact-Task
+    terminalization commitment, and the durable close obligation — and the
+    one-shot closure attempt and the bounded terminal finalization handoff
+    follow strictly after the commit. Stale, archived, already-terminal,
+    autonomous-phase, and unaccounted-runtime requests
     mutate nothing. A newly applied terminal outcome forwards the optionally
     supplied F10 cleanup submission seam (issue #256) through the shared
     composition's / completion seam's post-commit arrangement.
@@ -1485,7 +1506,7 @@ def cancel_task(
                         pool,
                         workspace_id=workspace_id,
                         task_id=task_id,
-                        terminal_cleanup_submission=terminal_cleanup_submission,
+                        terminal_finalization_submission=terminal_finalization_submission,
                     )
                     return TaskCancellationOutcome(
                         kind=TaskCancellationOutcomeKind.COMPLETED,
@@ -1507,7 +1528,6 @@ def cancel_task(
                 owner_gate_id=None,
                 close_obligation=close_obligation,
                 preflight_pull_request_id=preflight_pull_request_id,
-                terminal_cleanup_submission=terminal_cleanup_submission,
             )
         except _ConfirmedMergeAtDecision:
             # The durable canonical PR became confirmed merged between the
@@ -1518,7 +1538,7 @@ def cancel_task(
                 pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                terminal_cleanup_submission=terminal_cleanup_submission,
+                terminal_finalization_submission=terminal_finalization_submission,
             )
             return TaskCancellationOutcome(
                 kind=TaskCancellationOutcomeKind.COMPLETED,
@@ -1543,6 +1563,20 @@ def cancel_task(
             )
             if observed is not None:
                 final_pull_request = observed
+        # --- Phase D: the bounded terminal finalization handoff, strictly
+        # after the commit and the closure attempt (issue #317). The
+        # finalizer owns the optional bounded cleanup and the mandatory
+        # archival; a known-refused delivery falls back in-process to the
+        # same authoritative archive-only finalization, so the committed
+        # terminalization always reaches archival through an observed
+        # delivery path. ---
+        if composition.applied:
+            arrange_task_terminal_finalization(
+                pool,
+                terminal_finalization_submission,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
         return TaskCancellationOutcome(
             kind=TaskCancellationOutcomeKind.CANCELLED,
             task=composition.task,
@@ -1558,7 +1592,7 @@ def cancel_task_for_confirmed_pr_closure(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> TaskPrClosureOutcome:
     """Cancel the still-current Task whose canonical PR is confirmed closed-unmerged.
 
@@ -1574,24 +1608,27 @@ def cancel_task_for_confirmed_pr_closure(
 
     On the still-current, locked, non-archived Task — whatever its status,
     including autonomous progression and ``BLOCKED`` — one atomic
-    composition through the shared E10b archival core closes every OPEN
-    ReviewLoop, archives the Task ``CANCELLED`` through the guarded
-    archival primitive with the canonical ``pr_closed_unmerged`` terminal
-    cause, and commits the terminal ``TASK_CANCELLED`` (GITHUB) exactly
-    once. A pending OwnerGate is never resolved as if its Owner chose
-    Cancel: the gate row stays untouched pending history and the archival
-    clears the current-gate pointer. No PR-close intent is recorded and no
-    close request is made — the external closure already happened.
+    composition through the shared E10b decision core closes every OPEN
+    ReviewLoop and commits the exact-Task terminalization ``CANCELLED``
+    with its GITHUB-provenance decision exactly once; the terminal
+    finalizer then archives it with the canonical ``pr_closed_unmerged``
+    terminal cause and the terminal ``TASK_CANCELLED`` (GITHUB) event. A
+    pending OwnerGate is never resolved as if its Owner chose Cancel: the
+    gate row stays untouched pending history and the archival clears the
+    current-gate pointer. No PR-close intent is recorded and no close
+    request is made — the external closure already happened.
 
     The evidence is serialized against concurrent observed-snapshot
     reconciliation: the canonical PR row is locked ``FOR UPDATE`` and held
-    through the archival, so a B7 write phase can never commit a confirmed
-    merge between the evidence decision and the cancellation; a raced
-    confirmed merge (or any other non-evidence durable state) refuses
-    fail-closed and applies nothing. Archived history is immutable — an
-    already-archived Task (``CANCELLED`` by Owner/GitHub or ``COMPLETED``
-    by merge) is the idempotent ``ALREADY_TERMINAL`` no-op, so duplicate
-    webhook/sweep deliveries produce at most one archival and event set.
+    through the terminalization commitment, so a B7 write phase can never
+    commit a confirmed merge between the evidence decision and the
+    cancellation; a raced confirmed merge (or any other non-evidence
+    durable state) refuses fail-closed and applies nothing. Terminal
+    history is immutable — an already-committed or already-archived Task
+    (``CANCELLED`` by Owner/GitHub or ``COMPLETED`` by merge) is the
+    idempotent ``ALREADY_TERMINAL`` no-op, so duplicate webhook/sweep
+    deliveries produce at most one terminalization, archival, and event
+    set.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -1608,8 +1645,14 @@ def cancel_task_for_confirmed_pr_closure(
             task_id=task_id,
             close_obligation=_CloseObligation.NONE,
             trusted_pr_closure=True,
-            terminal_cleanup_submission=terminal_cleanup_submission,
         )
+        if composition.applied:
+            arrange_task_terminal_finalization(
+                pool,
+                terminal_finalization_submission,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
         return TaskPrClosureOutcome(
             kind=(
                 TaskPrClosureOutcomeKind.CANCELLED

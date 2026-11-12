@@ -95,6 +95,11 @@ def _task_row(archived: bool) -> tuple[Any, ...]:
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 

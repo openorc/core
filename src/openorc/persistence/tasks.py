@@ -41,6 +41,7 @@ from openorc.domain.tasks import (
     TaskPlanningBootstrapStage,
     TaskStatus,
     TaskTerminalCause,
+    TaskTerminalizationOrigin,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
@@ -51,8 +52,10 @@ __all__ = [
     "acknowledge_source_requirements_fingerprint",
     "bind_canonical_branch",
     "block_task_with_exceptional_gate",
-    "create_task",
     "claim_task_planning_bootstrap",
+    "claim_task_terminal_cleanup_send",
+    "commit_task_terminalization",
+    "create_task",
     "find_current_task_by_branch",
     "find_current_task_for_issue",
     "get_task",
@@ -67,6 +70,7 @@ __all__ = [
     "record_planning_bootstrap_stage",
     "set_current_plan_revision",
     "set_current_owner_gate",
+    "settle_task_terminal_cleanup_send",
     "update_task_status",
 ]
 
@@ -75,7 +79,9 @@ _TASK_COLUMNS = (
     "status, archived_at, canonical_feature_branch, state_token, "
     "current_plan_revision_id, current_owner_gate_id, "
     "source_requirements_fingerprint, queued_at, created_at, updated_at, "
-    "terminal_cause, authorized_task_budget_usd, effective_cost_threshold_usd"
+    "terminal_cause, authorized_task_budget_usd, effective_cost_threshold_usd, "
+    "terminalization_outcome, terminalization_origin, terminalization_established_at, "
+    "cleanup_send_claimed_at, cleanup_send_settled_at"
 )
 
 
@@ -101,6 +107,11 @@ def _task_from_row(row: Sequence[Any]) -> Task:
         terminal_cause=None if row[15] is None else TaskTerminalCause(row[15]),
         authorized_task_budget_usd=row[16],
         effective_cost_threshold_usd=row[17],
+        terminalization_outcome=None if row[18] is None else TaskStatus(row[18]),
+        terminalization_origin=(None if row[19] is None else TaskTerminalizationOrigin(row[19])),
+        terminalization_established_at=(None if row[20] is None else normalize_utc(row[20])),
+        cleanup_send_claimed_at=None if row[21] is None else normalize_utc(row[21]),
+        cleanup_send_settled_at=None if row[22] is None else normalize_utc(row[22]),
     )
 
 
@@ -631,6 +642,99 @@ def archive_task(
                 task_id,
                 expected_state_token,
             ),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def commit_task_terminalization(
+    pool: DatabasePool,
+    task_id: UUID,
+    *,
+    expected_state_token: UUID,
+    terminal_outcome: TaskStatus,
+    origin: TaskTerminalizationOrigin,
+) -> Task | None:
+    """Commit one Task's set-once pre-archival terminalization (issue #317).
+
+    The exact-Task commitment every shared terminal authority writes
+    atomically with its existing decision composition, in place of the
+    archival it used to inline: sets ``terminalization_outcome`` (must be a
+    terminal status), ``terminalization_origin`` (the accountable authority
+    echo the finalizer cannot safely re-derive), and the DB-clock
+    ``terminalization_established_at`` in one statement, rotating
+    ``state_token`` so every in-flight ordinary command goes stale by the
+    existing token discipline. The commitment is never cleared afterwards —
+    it stays as truthful history after the finalizer's archival.
+
+    The update is conditional on ``expected_state_token``, a non-archived
+    row, and a NULL commitment: a ``None`` result means the token no longer
+    matches, the Task is missing/already archived, or the terminalization is
+    already committed (a duplicate terminal observation) — the service layer
+    classifies the current locked durable state into the typed vocabulary.
+    """
+    if not isinstance(terminal_outcome, TaskStatus) or not terminal_outcome.is_terminal:
+        raise TaskDomainError(
+            "commit_task_terminalization requires a terminal outcome (cancelled or completed)"
+        )
+    if not isinstance(origin, TaskTerminalizationOrigin):
+        raise TaskDomainError("commit_task_terminalization requires a TaskTerminalizationOrigin")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set terminalization_outcome = %s, terminalization_origin = %s, "
+            "terminalization_established_at = now(), "
+            "state_token = gen_random_uuid(), updated_at = now() "
+            "where id = %s and state_token = %s and archived_at is null "
+            "and terminalization_outcome is null "
+            f"returning {_TASK_COLUMNS}",
+            (terminal_outcome.value, origin.value, task_id, expected_state_token),
+        ).fetchone()
+    return None if row is None else _task_from_row(row)
+
+
+def claim_task_terminal_cleanup_send(pool: DatabasePool, task_id: UUID) -> datetime | None:
+    """Take the one-shot claim of the optional cleanup send (issue #317).
+
+    The compare-and-set the terminal finalizer takes BEFORE the external
+    Cline call, so a concurrent or duplicate finalizer can never double-send:
+    exactly one invocation observes the NULL -> claimed transition, and every
+    later one sees the claim and never re-attempts. The claim requires a
+    committed, non-archived terminalization and an unclaimed send. Returns
+    the DB-clock claim timestamp, or ``None`` when the Task is missing, not
+    committed, already archived, or already claimed (a rejected no-op that
+    must not be retried blindly).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set cleanup_send_claimed_at = now(), updated_at = now() "
+            "where id = %s and terminalization_outcome is not null "
+            "and archived_at is null and cleanup_send_claimed_at is null "
+            "returning cleanup_send_claimed_at",
+            (task_id,),
+        ).fetchone()
+    return None if row is None else normalize_utc(row[0])
+
+
+def settle_task_terminal_cleanup_send(pool: DatabasePool, task_id: UUID) -> Task | None:
+    """Settle the claimed cleanup send exactly once (issue #317).
+
+    Stamps ``cleanup_send_settled_at`` from the DB clock to close the
+    bounded response-or-timeout window of the in-flight cleanup attempt:
+    from this point a competing finalizer may proceed to terminal archival
+    without ending a session mid-attempt. The settle requires the claim and
+    applies exactly once. Returns the updated Task, or ``None`` when the
+    Task is missing, unclaimed, or already settled (a rejected no-op that
+    must not be retried blindly).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.tasks "
+            "set cleanup_send_settled_at = now(), updated_at = now() "
+            "where id = %s and cleanup_send_claimed_at is not null "
+            "and cleanup_send_settled_at is null "
+            f"returning {_TASK_COLUMNS}",
+            (task_id,),
         ).fetchone()
     return None if row is None else _task_from_row(row)
 

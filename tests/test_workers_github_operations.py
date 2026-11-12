@@ -43,7 +43,7 @@ from openorc.workers.invocation import (
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
 from openorc.workers.queues import queue_name
-from openorc.workers.task_cleanup_operations import F1TerminalCheckoutCleanupSubmission
+from openorc.workers.task_cleanup_operations import F1TerminalFinalizationSubmission
 
 
 def _settings(*, execution_mode: ExecutionMode = ExecutionMode.REGULAR) -> Settings:
@@ -84,14 +84,14 @@ class _GitHubServiceHarness:
         github: Any,
         *,
         delivery_guid: str,
-        terminal_cleanup_submission: Any = None,
+        terminal_finalization_submission: Any = None,
     ) -> None:
         self.dispatch_calls.append(
             {
                 "pool": pool,
                 "github": github,
                 "delivery_guid": delivery_guid,
-                "terminal_cleanup_submission": terminal_cleanup_submission,
+                "terminal_finalization_submission": terminal_finalization_submission,
             }
         )
         self.dispatch_started.set()
@@ -105,7 +105,7 @@ class _GitHubServiceHarness:
         settings: Settings,
         *,
         sweep_tick: int | None,
-        terminal_cleanup_submission: Any = None,
+        terminal_finalization_submission: Any = None,
     ) -> None:
         self.sweep_calls.append(
             {
@@ -113,7 +113,7 @@ class _GitHubServiceHarness:
                 "github": github,
                 "settings": settings,
                 "sweep_tick": sweep_tick,
-                "terminal_cleanup_submission": terminal_cleanup_submission,
+                "terminal_finalization_submission": terminal_finalization_submission,
             }
         )
         self.sweep_started.set()
@@ -213,8 +213,8 @@ def _assert_forwarded_cleanup_submission(
     service call carries it unchanged, and the service arranges it
     strictly post-commit for a newly applied terminal outcome only.
     """
-    bridge = call.pop("terminal_cleanup_submission")
-    assert isinstance(bridge, F1TerminalCheckoutCleanupSubmission)
+    bridge = call.pop("terminal_finalization_submission")
+    assert isinstance(bridge, F1TerminalFinalizationSubmission)
     assert bridge._submitter is harness.recording_submitter
 
 

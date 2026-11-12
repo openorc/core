@@ -1,29 +1,30 @@
-"""F10 post-terminal Producer checkout cleanup (issue #256).
+"""F10 terminal Producer checkout cleanup (issue #256, reworked by issue #317).
 
-After a Task has been authoritatively archived as ``COMPLETED`` or
-``CANCELLED``, arrange ONE best-effort attempt to remove its original
-dedicated Cline Producer checkout by reconstructing the SAME original bound
-Producer session in ACT at the original repository base (outside the
-checkout) and realizing the canonical ``CLEANUP_WORKSPACE`` control for the
-single exact checkout. The Producer deletes the checkout with its own
-tools; Core never touches the filesystem.
+Before a Task's terminal archival commits, the terminal finalizer arranges
+ONE bounded attempt to remove its original dedicated Cline Producer checkout
+by reconstructing the SAME original bound Producer session in ACT at the
+original repository base (outside the checkout) and realizing the canonical
+``CLEANUP_WORKSPACE`` control for the single exact checkout. The Producer
+deletes the checkout with its own tools; Core never touches the filesystem.
 
-This module is deliberately NOT a durable one-shot/recovery workflow: no
-cleanup obligation/claim/outcome persistence, no guaranteed delivery or
-exactly-once execution across crashes or duplicate accepted deliveries, no
-deferred cleanup, and no retry or later wakeup. A skipped, failed, or
-uncertain cleanup accepts the stale directory and leaves the archived Task
-and its history untouched.
+This module deliberately carries no durable cleanup obligation/claim/outcome
+record of its own: the one-shot send claim, the bounded response-or-timeout
+window, and the pre-archival terminalization commitment live on the Task row
+(issue #317) and are owned by the shared terminal finalization service
+(:mod:`openorc.services.task_terminal_finalization`), which is this module's
+only caller. A skipped, failed, uncertain, or timed-out cleanup accepts the
+stale directory and never blocks the mandatory archival. No retry, later
+wakeup, or recovery follows a contained failure; the system-wide silent
+worker death limitation is recorded on issue #317, never solved here.
 
 Boundary rules enforced here:
 
-- **Terminal outcome first.** Submission is arranged only for a newly
-  applied terminal archival outcome through
-  :func:`submit_terminal_checkout_cleanup` — never from an
-  already-archived replay, never inside the archival transaction, and
-  never delaying or reversing terminalization, issue release, or PR-close
-  handling. Submission refusal or uncertainty is contained: the stale
-  checkout is accepted.
+- **Committed terminalization first.** Execution runs only for a Task whose
+  exact-Task terminalization commitment is durable and whose archival has
+  not committed — the cleanup is the Producer session's last bounded
+  interaction BEFORE archival. A late or duplicate observation (including
+  one arriving after archival) is the accepted no-op: it never initiates a
+  fresh attempt.
 - **Exact destructive target.** The checkout passed to cleanup is derived
   ONLY from the original bound Producer ``TaskAgentSession``
   ``effective_config_snapshot`` and the persisted Task identity
@@ -38,8 +39,8 @@ Boundary rules enforced here:
   claimed runtime-send claims) as a narrow pre-send guard. Lack of
   positive safety evidence is a skip — never a poll, retry, or recovery
   workflow. Owner Cancel's preterminal runtime-work veto is NOT imposed on
-  GitHub-confirmed terminalization: an external archival while Producer
-  work remains outstanding simply skips cleanup.
+  GitHub-confirmed terminalization: an external terminalization while
+  Producer work remains outstanding simply skips cleanup.
 - **No replacement sessions.** Only the original READY binding's external
   session identity is reconstructed; a lost/ended/missing binding is a
   skip, never a new session or a resumed implementation.
@@ -61,7 +62,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from openorc.domain.connections import WorkflowRole
@@ -70,7 +71,6 @@ from openorc.domain.intents import TaskInterruptIntentStatus
 from openorc.domain.runtime_requests import RuntimeRequestStatus
 from openorc.domain.send_claims import TaskRuntimeSendClaimStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
-from openorc.domain.tasks import TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
@@ -93,22 +93,13 @@ __all__ = [
     "TerminalCheckoutCleanupDisposition",
     "TerminalCheckoutCleanupExecution",
     "TerminalCheckoutCleanupRuntime",
-    "TerminalCheckoutCleanupSubmission",
-    "TerminalCheckoutCleanupSubmissionOutcome",
     "execute_terminal_checkout_cleanup",
-    "submit_terminal_checkout_cleanup",
 ]
 
 logger = logging.getLogger(__name__)
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_terminal_cleanup"
-_SUBMIT_SPAN_NAME = "task_terminal_cleanup.submit_terminal_checkout_cleanup"
 _EXECUTE_SPAN_NAME = "task_terminal_cleanup.execute_terminal_checkout_cleanup"
-
-# The terminal archival statuses that authorize the one cleanup attempt.
-_TERMINAL_CLEANUP_STATUSES: Final[frozenset[TaskStatus]] = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.CANCELLED}
-)
 
 # The Execution statuses whose runtime work is still outstanding (the same
 # conservative open-work vocabulary the shared cancellation veto reads).
@@ -123,35 +114,6 @@ _OPEN_EXECUTION_STATUSES: Final[frozenset[ExecutionStatus]] = frozenset(
 
 _CLEANUP_OPERATION: Final = "CLEANUP"
 _ACCEPTED_CLEANUP_STATUSES: Final[frozenset[str]] = frozenset({"COMPLETED", "FAILED"})
-
-
-class TerminalCheckoutCleanupSubmissionOutcome(StrEnum):
-    """The bounded submission outcome of one post-terminal cleanup arrangement.
-
-    Mirrors the F1 submission vocabulary: acceptance only means the attempt
-    MAY run. A known refusal or uncertain outcome is contained by the
-    caller — the stale checkout is accepted, nothing is recorded, and no
-    replay is arranged.
-    """
-
-    ACCEPTED_FOR_DELIVERY = "accepted_for_delivery"
-    KNOWN_REFUSED = "known_refused"
-    UNCERTAIN = "uncertain"
-
-
-class TerminalCheckoutCleanupSubmission(Protocol):
-    """The transport-facing post-terminal cleanup submission seam.
-
-    Implemented by the worker layer over the executing process's active F1
-    :class:`~openorc.workers.invocation.OperationSubmitter` (the bounded
-    local executor in regular execution mode, the canonical queue
-    submission in queue mode). The seam owns no durable state and makes no
-    Task-state or authorization decision.
-    """
-
-    def submit(
-        self, *, workspace_id: UUID, task_id: UUID
-    ) -> TerminalCheckoutCleanupSubmissionOutcome: ...
 
 
 class TerminalCheckoutCleanupDisposition(StrEnum):
@@ -176,40 +138,6 @@ class TerminalCheckoutCleanupExecution:
     """The typed outcome of one cleanup execution attempt."""
 
     disposition: TerminalCheckoutCleanupDisposition
-
-
-def submit_terminal_checkout_cleanup(
-    submission: TerminalCheckoutCleanupSubmission | None,
-    *,
-    workspace_id: UUID,
-    task_id: UUID,
-) -> TerminalCheckoutCleanupSubmissionOutcome | None:
-    """Arrange one best-effort post-terminal cleanup submission.
-
-    The shared post-commit hook the terminal service seams call strictly
-    after their archival transaction commits, only for a newly applied
-    terminal outcome. ``None`` (no submission capability wired) is a
-    silent skip. Every failure is contained: a submission error is an
-    unknown outcome, never a known non-delivery, never raised into the
-    terminal flow, and never recorded — the stale checkout is accepted.
-    """
-    if submission is None:
-        return None
-    with application_span(_SERVICE_TRACER_SCOPE, _SUBMIT_SPAN_NAME) as span:
-        annotate_span(
-            span,
-            operation=_SUBMIT_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-        try:
-            return submission.submit(workspace_id=workspace_id, task_id=task_id)
-        except Exception as error:  # noqa: BLE001 - contained with safe classification
-            logger.warning(
-                "terminal checkout cleanup submission failed (error type %s)",
-                type(error).__name__,
-            )
-            return TerminalCheckoutCleanupSubmissionOutcome.UNCERTAIN
 
 
 class TerminalCheckoutCleanupRuntime(ABC):
@@ -282,17 +210,16 @@ def execute_terminal_checkout_cleanup(
     workspace_id: UUID,
     task_id: UUID,
 ) -> TerminalCheckoutCleanupExecution:
-    """Run one best-effort terminal checkout cleanup attempt (issue #256).
+    """Run one bounded terminal checkout cleanup attempt (issue #256, #317).
 
-    Rechecks every current terminal, identity, and safety fact from
-    durable state — the invocation payload carries only the scoped
-    Workspace/Task identifiers, so a replayed or delayed execution is
-    harmless and a duplicate terminal observation never re-attempts
-    unsafely. Skips (bounded dispositions) are legitimate outcomes, not
-    failures: no cleanup state is recorded, the archived Task and its
-    history are never touched, and no gate, block, escalation, or retry
-    ever follows. No database transaction is held across the runtime
-    realization.
+    Rechecks every current terminalization, identity, and safety fact from
+    durable state — the caller carries only the scoped Workspace/Task
+    identifiers, so a replayed or delayed execution is harmless and a
+    duplicate terminal observation never re-attempts unsafely. Skips
+    (bounded dispositions) are legitimate outcomes, not failures: no
+    cleanup state is recorded here, the Task and its history are never
+    touched, and no gate, block, escalation, or retry ever follows. No
+    database transaction is held across the runtime realization.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _EXECUTE_SPAN_NAME) as span:
         annotate_span(
@@ -302,17 +229,19 @@ def execute_terminal_checkout_cleanup(
             task_id=str(task_id),
         )
 
-        # --- Current terminal-subject recheck: the exact archived Task. ---
+        # --- Current terminal-subject recheck: the committed terminalization. ---
         task = task_records.get_task(pool, task_id)
         if (
             task is None
             or task.workspace_id != workspace_id
-            or task.archived_at is None
-            or task.status not in _TERMINAL_CLEANUP_STATUSES
+            or task.terminalization_outcome is None
+            or task.archived_at is not None
         ):
-            # A stale, duplicate, or non-terminal observation: the accepted
-            # no-op. Duplicate terminal observations never intentionally
-            # initiate fresh attempts.
+            # A stale, duplicate, or non-committed observation — including a
+            # late one arriving after the archival already committed: the
+            # accepted no-op. Duplicate terminal observations never
+            # intentionally initiate fresh attempts, and a cleanup is never
+            # initiated after archival.
             return TerminalCheckoutCleanupExecution(
                 disposition=TerminalCheckoutCleanupDisposition.SKIPPED_NO_TERMINAL_SUBJECT
             )
@@ -353,7 +282,7 @@ def _realize_checked_cleanup(
 ) -> TerminalCheckoutCleanupExecution:
     """Derive the exact target, guard, compose, and realize the cleanup.
 
-    All durable reads here are plain post-archival reads: no transaction is
+    All durable reads here are plain current durable reads: no transaction is
     held, and the runtime realization runs with no database transaction
     open.
     """

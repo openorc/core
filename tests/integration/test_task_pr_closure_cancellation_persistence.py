@@ -285,19 +285,17 @@ def test_archived_completed_history_is_never_rewritten_by_a_later_closure(
 def test_a_late_audit_failure_rolls_the_whole_closure_back(
     conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openorc.services import task_cancellation
-
     facts = _closure_fixture(conn)
     pool = facts["pool"]
 
     def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("forced late cancellation-audit failure")
 
-    monkeypatch.setattr(
-        task_cancellation.event_coordination,
-        "record_task_terminal_event",
-        _boom,
-    )
+    # The decision transaction's final write is the exact-Task
+    # terminalization commitment (issue #317): forcing it to fail proves the
+    # whole trusted closure rolls back atomically. The terminal event and
+    # the archival belong to the finalizer's own transaction now.
+    monkeypatch.setattr(task_repositories, "commit_task_terminalization", _boom)
 
     with pytest.raises(RuntimeError, match="forced late cancellation-audit failure"):
         cancel_task_for_confirmed_pr_closure(

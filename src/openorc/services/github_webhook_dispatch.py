@@ -86,7 +86,7 @@ from openorc.services.errors import (
 from openorc.services.github_webhook_intake import GitHubWebhookIntake, intake_github_webhook
 
 if TYPE_CHECKING:
-    from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmission
+    from openorc.services.task_terminal_finalization import TerminalFinalizationSubmission
 
 __all__ = [
     "EnqueueOutcome",
@@ -289,7 +289,7 @@ def dispatch_github_webhook_delivery(
     github: GitHubAppClient,
     *,
     delivery_guid: str,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubWebhookDispatchResult:
     """Dispatch one accepted delivery into authoritative reconciliation (#120).
 
@@ -345,7 +345,7 @@ def dispatch_github_webhook_delivery(
                         workspace_id=persisted_route.workspace_id,
                         repository_id=persisted_route.repository_id,
                     ),
-                    terminal_cleanup_submission=terminal_cleanup_submission,
+                    terminal_finalization_submission=terminal_finalization_submission,
                 ),
             )
             for persisted_route in routes
@@ -432,7 +432,7 @@ def _dispatch_route(
     *,
     delivery: GitHubWebhookDelivery,
     route: GitHubWebhookResolvedRoute,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubWebhookDispatchRouteStatus:
     """Invoke the one authoritative capability the routing target names.
 
@@ -455,7 +455,7 @@ def _dispatch_route(
             github,
             delivery=delivery,
             route=route,
-            terminal_cleanup_submission=terminal_cleanup_submission,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
     if target is GitHubWebhookRoutingTarget.CHECKS:
         return _dispatch_checks(pool, github, route=route)
@@ -622,7 +622,7 @@ def _dispatch_pull_request(
     *,
     delivery: GitHubWebhookDelivery,
     route: GitHubWebhookResolvedRoute,
-    terminal_cleanup_submission: TerminalCheckoutCleanupSubmission | None = None,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubWebhookDispatchRouteStatus:
     """Route a PR identity/head or PR-state notification into B7 reconciliation.
 
@@ -684,7 +684,7 @@ def _dispatch_pull_request(
                     pool,
                     workspace_id=route.workspace_id,
                     task_id=task_id,
-                    terminal_cleanup_submission=terminal_cleanup_submission,
+                    terminal_finalization_submission=terminal_finalization_submission,
                 )
             elif (
                 reconciliation.pull_request.state is TaskPullRequestState.CLOSED
@@ -702,7 +702,7 @@ def _dispatch_pull_request(
                     pool,
                     workspace_id=route.workspace_id,
                     task_id=task_id,
-                    terminal_cleanup_submission=terminal_cleanup_submission,
+                    terminal_finalization_submission=terminal_finalization_submission,
                 )
     except NotFoundError:
         # The canonical subject disappeared between the lookup and the

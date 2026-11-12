@@ -135,7 +135,7 @@ from openorc.workers.invocation import (
     TaskSessionResumePayload,
     WorkflowRoleRef,
 )
-from openorc.workers.task_cleanup_operations import F1TerminalCheckoutCleanupSubmission
+from openorc.workers.task_cleanup_operations import F1TerminalFinalizationSubmission
 
 __all__ = [
     "build_task_workflow_handlers",
@@ -819,7 +819,7 @@ def _compose_task_authorized_merge_retry(
         expected_state_token=UUID(payload.expected_state_token),
         retry_attempt_id=UUID(payload.retry_attempt_id),
         attempt_evidence=attempt_evidence,
-        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
             dependencies.continuation_submitter()
         ),
     )
@@ -893,7 +893,7 @@ def _compose_task_pr_composition(
         owner_gate_id=owner_gate_id,
         expected_state_token=expected_state_token,
         attempt_evidence=attempt_evidence,
-        terminal_cleanup_submission=F1TerminalCheckoutCleanupSubmission(
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
             dependencies.continuation_submitter()
         ),
     )

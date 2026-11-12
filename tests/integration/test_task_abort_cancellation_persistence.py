@@ -729,7 +729,11 @@ def test_a_late_cancellation_failure_rolls_the_whole_composition_back(
     def _boom(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("forced late cancellation failure")
 
-    monkeypatch.setattr(event_coordination, "record_task_terminal_event", _boom)
+    # The decision transaction's final write is the exact-Task
+    # terminalization commitment (issue #317): forcing it to fail proves the
+    # whole decision composition rolls back atomically. The terminal event
+    # and the archival belong to the finalizer's own transaction now.
+    monkeypatch.setattr(task_repositories, "commit_task_terminalization", _boom)
     github = _stub_close_machinery(
         monkeypatch,
         pr_id=facts["pr_id"],

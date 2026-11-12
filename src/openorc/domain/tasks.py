@@ -67,6 +67,7 @@ __all__ = [
     "TaskPlanningBootstrapStage",
     "TaskStatus",
     "TaskTerminalCause",
+    "TaskTerminalizationOrigin",
     "task_field_names",
 ]
 
@@ -149,6 +150,26 @@ class TaskTerminalCause(StrEnum):
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
 
 
+class TaskTerminalizationOrigin(StrEnum):
+    """The settled v1 terminalization-origin vocabulary (issue #317).
+
+    The durable, minimal provenance echo of the authority that committed a
+    Task's pre-archival terminalization: the exact authority whose existing
+    shared composition decided the terminal outcome. It is the smallest fact
+    the terminal finalizer cannot safely re-derive from the decision records
+    alone (an Owner-attributed cancellation and a GitHub-confirmed
+    closed-unmerged cancellation can leave indistinguishable durable PR facts
+    at finalization time), and it selects the terminal event's truthful actor
+    provenance and the archived terminal cause. It never replaces the decision
+    records: they remain the accountable audit of actor, gate, ReviewLoop, and
+    PR-close provenance, and no second source of terminal truth is created.
+    """
+
+    OWNER_CANCELLED = "owner_cancelled"
+    GITHUB_CLOSED_UNMERGED = "github_closed_unmerged"
+    GITHUB_CONFIRMED_MERGED = "github_confirmed_merged"
+
+
 def _require_positive_int(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise TaskDomainError(f"Task.{name} must be a positive integer")
@@ -218,6 +239,25 @@ class Task:
     # as an exact decimal, never a binary float, and never rewritten by
     # anything but a later fully guarded Continue of the next episode.
     effective_cost_threshold_usd: Decimal | None = None
+    # The exact-Task terminalization commitment (issue #317): the set-once,
+    # pre-archival commitment every shared terminal authority commits
+    # atomically with its existing decision composition. It is the explicit
+    # authority/currentness barrier across ordinary Task interactions and
+    # preserves the authorized terminal outcome across the bounded optional
+    # cleanup interaction; the terminal finalizer archives exactly this
+    # outcome with the truthful actor provenance and terminal cause. The
+    # facts stay as truthful history after archival and are never cleared.
+    terminalization_outcome: TaskStatus | None = None
+    terminalization_origin: TaskTerminalizationOrigin | None = None
+    terminalization_established_at: datetime | None = None
+    # The minimal one-shot evidence of the optional Cline checkout-cleanup
+    # send (issue #317): the claim is taken before the external call so a
+    # concurrent or duplicate finalizer can never double-send, and the settle
+    # stamps the bounded response-or-timeout window's conclusion. An
+    # unsettled claim defers terminal archival to the in-flight attempt; a
+    # silently dead worker leaves it unsettled — the accepted v1 limitation.
+    cleanup_send_claimed_at: datetime | None = None
+    cleanup_send_settled_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _require_positive_int(self.github_issue_id, "github_issue_id")
@@ -245,6 +285,40 @@ class Task:
                 raise TaskDomainError(
                     "a terminal cause belongs only to an archived cancelled attempt"
                 )
+        # The exact-Task terminalization commitment (issue #317): outcome,
+        # origin, and establishment timestamp are present or absent together;
+        # a committed outcome is always a terminal status; the one-shot
+        # cleanup evidence never exists without a committed terminalization,
+        # and a settled send always carries its claim. The commitment may
+        # coexist with an archived row (it stays as truthful history) and is
+        # never cleared.
+        if (self.terminalization_outcome is None) != (self.terminalization_origin is None) or (
+            self.terminalization_outcome is None
+        ) != (self.terminalization_established_at is None):
+            raise TaskDomainError(
+                "Task.terminalization_outcome, terminalization_origin, and "
+                "terminalization_established_at are present or absent together"
+            )
+        if self.terminalization_outcome is not None:
+            if (
+                not isinstance(self.terminalization_outcome, TaskStatus)
+                or not self.terminalization_outcome.is_terminal
+            ):
+                raise TaskDomainError(
+                    "Task.terminalization_outcome must be None or a terminal TaskStatus"
+                )
+            if not isinstance(self.terminalization_origin, TaskTerminalizationOrigin):
+                raise TaskDomainError(
+                    "Task.terminalization_origin must be None or a TaskTerminalizationOrigin"
+                )
+        if self.cleanup_send_claimed_at is not None and self.terminalization_outcome is None:
+            raise TaskDomainError(
+                "Task.cleanup_send_claimed_at requires a committed terminalization"
+            )
+        if self.cleanup_send_settled_at is not None and self.cleanup_send_claimed_at is None:
+            raise TaskDomainError(
+                "Task.cleanup_send_settled_at requires its one-shot cleanup send claim"
+            )
         if self.canonical_feature_branch is not None and (
             not isinstance(self.canonical_feature_branch, str)
             or not self.canonical_feature_branch.strip()

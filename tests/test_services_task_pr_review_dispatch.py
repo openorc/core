@@ -230,6 +230,11 @@ def _task_row(
     canonical_branch: Any = _BRANCH,
     workspace_id: Any = _WORKSPACE_ID,
     current_gate_id: Any = None,
+    terminalization_outcome: Any = None,
+    terminalization_origin: Any = None,
+    terminalization_established_at: Any = None,
+    cleanup_send_claimed_at: Any = None,
+    cleanup_send_settled_at: Any = None,
 ) -> tuple[Any, ...]:
     return task_row(
         id=_TASK_ID,
@@ -244,6 +249,11 @@ def _task_row(
         source_requirements_fingerprint="a" * 64,
         created_at=_OBSERVED,
         updated_at=_OBSERVED,
+        terminalization_outcome=terminalization_outcome,
+        terminalization_origin=terminalization_origin,
+        terminalization_established_at=terminalization_established_at,
+        cleanup_send_claimed_at=cleanup_send_claimed_at,
+        cleanup_send_settled_at=cleanup_send_settled_at,
     )
 
 

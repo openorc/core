@@ -86,7 +86,7 @@ from openorc.services.task_operational_failure_triage import (
     OperationalFailureDisposition,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
-from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupSubmissionOutcome
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from tests.test_services_task_pr_review_decision import (
     _EVENT_INSERT,
     _GATE_INSERT,
@@ -141,7 +141,7 @@ _RETRY_GATE_ID = uuid4()
 
 _BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
 _LOOP_CLOSE = _sql_has("update openorc.review_loops")
-_ARCHIVE_UPDATE = _sql_has("update openorc.tasks", "archived_at = now()")
+_COMMIT_WRITE = _sql_has("update openorc.tasks", "terminalization_outcome = %s")
 
 _BLOCK_GATE_ID = uuid4()
 
@@ -202,10 +202,43 @@ def _pr_row_values(
     )
 
 
-def _archived_task_row(*, state_token: Any) -> tuple[Any, ...]:
-    row = list(_task_row(status="completed", state_token=state_token, current_gate_id=None))
+class _AcceptedFinalization:
+    """The wired finalization seam: accepted delivery, no in-process fallback."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, Any]] = []
+
+    def submit(self, *, workspace_id: Any, task_id: Any) -> Any:
+        self.calls.append((workspace_id, task_id))
+        return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+
+def _archived_completed_row(*, state_token: Any) -> tuple[Any, ...]:
+    """The already-archived COMPLETED history row (idempotent no-op subject)."""
+    row = list(
+        _task_row(
+            status="completed",
+            state_token=state_token,
+            current_gate_id=None,
+            terminalization_outcome="completed",
+            terminalization_origin="github_confirmed_merged",
+            terminalization_established_at=_OBSERVED,
+        )
+    )
     row[6] = _OBSERVED  # archived_at
     return tuple(row)
+
+
+def _committed_completed_row(*, state_token: Any) -> tuple[Any, ...]:
+    """The commitment write's returned row: pre-terminal status, outcome set."""
+    return _task_row(
+        status="reviewing",
+        state_token=state_token,
+        current_gate_id=None,
+        terminalization_outcome="completed",
+        terminalization_origin="github_confirmed_merged",
+        terminalization_established_at=_OBSERVED,
+    )
 
 
 def _waiting_task_row(
@@ -409,8 +442,7 @@ def _script_completion(
         _TASK_READ,
         _task_row(status="waiting_for_owner", state_token=task_token, current_gate_id=None),
     )
-    conn.on(_ARCHIVE_UPDATE, _archived_task_row(state_token=_COMPLETED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_completed"))
+    conn.on(_COMMIT_WRITE, _committed_completed_row(state_token=_COMPLETED_TOKEN))
     conn.on(_EVENT_INSERT, _event_returned_row("pr_merged"))
 
 
@@ -647,10 +679,11 @@ def test_owner_merge_command_completes_the_task_atomically(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.COMPLETED
-    assert outcome.task.status is TaskStatus.COMPLETED
+    assert outcome.task.terminalization_outcome is TaskStatus.COMPLETED
     assert outcome.merge_commit_sha == _MERGE_COMMIT_SHA
     # Exactly one merge request with the gate's accepted SHA and the
     # approving Profile, carrying the durable claim-revalidation hook.
@@ -666,7 +699,6 @@ def test_owner_merge_command_completes_the_task_atomically(
     assert _event_types(conn) == [
         "owner_gate_resolved",
         "merge_requested",
-        "task_completed",
         "pr_merged",
     ]
 
@@ -698,13 +730,14 @@ def test_confirmed_merged_pr_at_preflight_completes_without_consuming_the_gate(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.COMPLETED
     # No issue-open guard read, no merge request, and no gate consumption.
     assert github.issue_calls == []
     assert merge.calls == []
-    assert _event_types(conn) == ["task_completed", "pr_merged"]
+    assert _event_types(conn) == ["pr_merged"]
     assert _count(conn, _GATE_UPDATE) == 0
 
 
@@ -761,6 +794,7 @@ def test_changed_head_blocks_stale_operation_where_current(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
@@ -986,6 +1020,7 @@ def test_github_policy_rejection_installs_a_new_exact_head_gate(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.RETRY_GATE_INSTALLED
@@ -1028,6 +1063,7 @@ def test_pre_delivery_failure_records_no_github_refusal_but_installs_the_retry_g
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.RETRY_GATE_INSTALLED
@@ -1068,6 +1104,7 @@ def test_uncertain_outcome_blocks_and_is_never_repeated(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
@@ -1125,6 +1162,7 @@ def test_confirmed_merge_with_failed_reconciliation_completes_without_repeating(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.COMPLETED
@@ -1173,6 +1211,7 @@ def test_confirmed_merge_with_unconfirmed_reconciliation_blocks_with_evidence(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
@@ -1264,6 +1303,7 @@ def test_head_mismatch_after_send_blocks_stale_operation(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION
@@ -1286,16 +1326,16 @@ def test_completion_is_an_idempotent_noop_after_archival() -> None:
     pool = _pool(conn)
     conn.on(_WORKSPACE_READ, _ws_row())
     conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
-    conn.on(_TASK_READ_LOCKED, _archived_task_row(state_token=_COMPLETED_TOKEN))
+    conn.on(_TASK_READ_LOCKED, _archived_completed_row(state_token=_COMPLETED_TOKEN))
     conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
 
     outcome = complete_confirmed_task_merge(pool, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
 
     assert outcome.kind is TaskMergeCompletionKind.ALREADY_COMPLETED
-    assert outcome.task.status is TaskStatus.COMPLETED
+    assert outcome.task.terminalization_outcome is TaskStatus.COMPLETED
     # No second archival, loop closure, or event set.
     assert _count(conn, _EVENT_INSERT) == 0
-    assert _count(conn, _ARCHIVE_UPDATE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
     assert _count(conn, _LOOP_CLOSE) == 0
 
 
@@ -1314,7 +1354,7 @@ def test_completion_never_resurrects_archived_cancelled_history() -> None:
         complete_confirmed_task_merge(pool, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
 
     assert _count(conn, _EVENT_INSERT) == 0
-    assert _count(conn, _ARCHIVE_UPDATE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_completion_fails_closed_when_the_canonical_pr_is_not_merged() -> None:
@@ -1329,7 +1369,7 @@ def test_completion_fails_closed_when_the_canonical_pr_is_not_merged() -> None:
         complete_confirmed_task_merge(pool, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
 
     assert _count(conn, _EVENT_INSERT) == 0
-    assert _count(conn, _ARCHIVE_UPDATE) == 0
+    assert _count(conn, _COMMIT_WRITE) == 0
 
 
 def test_completion_archives_a_blocked_task_and_leaves_no_actionable_gate() -> None:
@@ -1344,17 +1384,21 @@ def test_completion_archives_a_blocked_task_and_leaves_no_actionable_gate() -> N
     conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
     conn.on(_LOOPS_LIST, [])
     conn.on(_TASK_READ, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_ARCHIVE_UPDATE, _archived_task_row(state_token=_COMPLETED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_completed"))
+    conn.on(_COMMIT_WRITE, _committed_completed_row(state_token=_COMPLETED_TOKEN))
     conn.on(_EVENT_INSERT, _event_returned_row("pr_merged"))
 
-    outcome = complete_confirmed_task_merge(pool, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+    outcome = complete_confirmed_task_merge(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        terminal_finalization_submission=_AcceptedFinalization(),
+    )
 
     assert outcome.kind is TaskMergeCompletionKind.COMPLETED
-    assert outcome.task.status is TaskStatus.COMPLETED
+    assert outcome.task.terminalization_outcome is TaskStatus.COMPLETED
     # A pre-E9 external merge may have no PR-review loop: none is manufactured.
     assert _count(conn, _LOOP_CLOSE) == 0
-    assert _event_types(conn) == ["task_completed", "pr_merged"]
+    assert _event_types(conn) == ["pr_merged"]
 
 
 def test_a_newly_applied_completion_arranges_one_best_effort_cleanup_submission() -> None:
@@ -1369,23 +1413,22 @@ def test_a_newly_applied_completion_arranges_one_best_effort_cleanup_submission(
     conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
     conn.on(_LOOPS_LIST, [])
     conn.on(_TASK_READ, _task_row(status="blocked", state_token=_BLOCKED_TOKEN))
-    conn.on(_ARCHIVE_UPDATE, _archived_task_row(state_token=_COMPLETED_TOKEN))
-    conn.on(_EVENT_INSERT, _event_returned_row("task_completed"))
+    conn.on(_COMMIT_WRITE, _committed_completed_row(state_token=_COMPLETED_TOKEN))
     conn.on(_EVENT_INSERT, _event_returned_row("pr_merged"))
     submissions: list[tuple[Any, Any]] = []
 
     class _RecordingSubmission:
         def submit(
             self, *, workspace_id: Any, task_id: Any
-        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+        ) -> TerminalFinalizationSubmissionOutcome:
             submissions.append((workspace_id, task_id))
-            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+            return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
     outcome = complete_confirmed_task_merge(
         pool,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
-        terminal_cleanup_submission=_RecordingSubmission(),
+        terminal_finalization_submission=_RecordingSubmission(),
     )
 
     assert outcome.kind is TaskMergeCompletionKind.COMPLETED
@@ -1399,22 +1442,22 @@ def test_an_already_completed_replay_arranges_no_cleanup_submission() -> None:
     pool = _pool(conn)
     conn.on(_WORKSPACE_READ, _ws_row())
     conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
-    conn.on(_TASK_READ_LOCKED, _archived_task_row(state_token=_COMPLETED_TOKEN))
+    conn.on(_TASK_READ_LOCKED, _archived_completed_row(state_token=_COMPLETED_TOKEN))
     conn.on(_PR_READ, _pr_row_values(state="closed", merged_at=_OBSERVED))
     submissions: list[tuple[Any, Any]] = []
 
     class _RecordingSubmission:
         def submit(
             self, *, workspace_id: Any, task_id: Any
-        ) -> TerminalCheckoutCleanupSubmissionOutcome:
+        ) -> TerminalFinalizationSubmissionOutcome:
             submissions.append((workspace_id, task_id))
-            return TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+            return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
     outcome = complete_confirmed_task_merge(
         pool,
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
-        terminal_cleanup_submission=_RecordingSubmission(),
+        terminal_finalization_submission=_RecordingSubmission(),
     )
 
     assert outcome.kind is TaskMergeCompletionKind.ALREADY_COMPLETED
@@ -1609,6 +1652,7 @@ def test_send_transport_uncertainty_receives_one_level_2_retry_authorization(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.RETRY_AUTHORIZED
@@ -1687,6 +1731,7 @@ def test_send_unsupported_uncertainty_escalates_through_f3_installation(
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
@@ -1757,6 +1802,7 @@ def test_send_uncertainty_with_unavailable_reconciliation_escalates_never_author
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
@@ -1812,6 +1858,7 @@ def test_send_uncertainty_with_a_changed_head_routes_through_the_staleness_conse
         task_id=_TASK_ID,
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=_AcceptedFinalization(),
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_STALE_OPERATION

@@ -35,9 +35,7 @@ from openorc.services.errors import ApplicationError
 from openorc.services.task_terminal_cleanup import (
     TerminalCheckoutCleanupDisposition,
     TerminalCheckoutCleanupRuntime,
-    TerminalCheckoutCleanupSubmissionOutcome,
     execute_terminal_checkout_cleanup,
-    submit_terminal_checkout_cleanup,
 )
 
 _WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000001")
@@ -49,14 +47,16 @@ _OWNER_LOGIN = "octocat"
 _REPOSITORY_NAME = "admitted-repo"
 
 
-def _archived_task(*, status: TaskStatus = TaskStatus.COMPLETED) -> SimpleNamespace:
+def _committed_task(*, status: TaskStatus = TaskStatus.WAITING_FOR_OWNER) -> SimpleNamespace:
+    """A Task whose exact-Task terminalization is committed and not yet archived."""
     return SimpleNamespace(
         id=_TASK_ID,
         workspace_id=_WORKSPACE_ID,
         repository_id=_REPOSITORY_ID,
         github_issue_number=4311,
         status=status,
-        archived_at=SimpleNamespace(year=2026),
+        archived_at=None,
+        terminalization_outcome=status,
     )
 
 
@@ -201,11 +201,11 @@ class _RuntimeUncertainError(Exception):
 # --- the happy paths: one attempt for the exact checkout -------------------------
 
 
-def test_a_newly_completed_task_attempts_cleanup_for_the_exact_snapshot_derived_checkout(
+def test_a_committed_completion_attempts_cleanup_for_the_exact_snapshot_derived_checkout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     facts = _RecordFacts(
-        task=_archived_task(), binding=_ready_producer_binding(), repository=_repository()
+        task=_committed_task(), binding=_ready_producer_binding(), repository=_repository()
     )
     _install_facts(monkeypatch, facts)
     runtime = _RecordingRuntime(results=[_workspace_result()])
@@ -231,11 +231,11 @@ def test_a_newly_completed_task_attempts_cleanup_for_the_exact_snapshot_derived_
     assert interaction.issue_number == 4311
 
 
-def test_a_newly_cancelled_task_attempts_the_same_cleanup(
+def test_a_committed_cancellation_attempts_the_same_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     facts = _RecordFacts(
-        task=_archived_task(status=TaskStatus.CANCELLED),
+        task=_committed_task(status=TaskStatus.CANCELLED),
         binding=_ready_producer_binding(),
         repository=_repository(),
     )
@@ -282,10 +282,24 @@ def test_a_newly_cancelled_task_attempts_the_same_cleanup(
                     workspace_id=_WORKSPACE_ID,
                     status=TaskStatus.REVIEWING,
                     archived_at=None,
+                    terminalization_outcome=None,
                 )
             },
             TerminalCheckoutCleanupDisposition.SKIPPED_NO_TERMINAL_SUBJECT,
-            id="not-archived-nonterminal",
+            id="not-committed-nonterminal",
+        ),
+        pytest.param(
+            {
+                "task": SimpleNamespace(
+                    id=_TASK_ID,
+                    workspace_id=_WORKSPACE_ID,
+                    status=TaskStatus.CANCELLED,
+                    archived_at=SimpleNamespace(year=2026),
+                    terminalization_outcome=TaskStatus.CANCELLED,
+                )
+            },
+            TerminalCheckoutCleanupDisposition.SKIPPED_NO_TERMINAL_SUBJECT,
+            id="archived-late-observation",
         ),
         pytest.param(
             {"binding": None},
@@ -327,7 +341,7 @@ def test_non_applicable_or_unsafe_subjects_skip_without_any_runtime_effect(
     expected_disposition: TerminalCheckoutCleanupDisposition,
 ) -> None:
     overrides: dict[str, Any] = {
-        "task": _archived_task(),
+        "task": _committed_task(),
         "binding": _ready_producer_binding(),
         "repository": _repository(),
     }
@@ -375,7 +389,7 @@ def test_outstanding_producer_work_evidence_skips_the_destructive_attempt(
     family: str,
 ) -> None:
     facts = _RecordFacts(
-        task=_archived_task(),
+        task=_committed_task(),
         binding=_ready_producer_binding(),
         repository=_repository(),
         **outstanding,
@@ -403,7 +417,7 @@ def test_a_failing_runtime_realization_is_contained(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     facts = _RecordFacts(
-        task=_archived_task(), binding=_ready_producer_binding(), repository=_repository()
+        task=_committed_task(), binding=_ready_producer_binding(), repository=_repository()
     )
     _install_facts(monkeypatch, facts)
     runtime = _RecordingRuntime(results=[_RuntimeUncertainError("the outcome is unknown")])
@@ -419,7 +433,7 @@ def test_an_unusable_workspace_result_is_contained_and_never_re_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     facts = _RecordFacts(
-        task=_archived_task(), binding=_ready_producer_binding(), repository=_repository()
+        task=_committed_task(), binding=_ready_producer_binding(), repository=_repository()
     )
     _install_facts(monkeypatch, facts)
     runtime = _RecordingRuntime(results=[_workspace_result(operation="PREPARE")])
@@ -435,7 +449,7 @@ def test_an_unusable_workspace_result_is_contained_and_never_re_sent(
 def test_a_missing_repository_record_is_contained_as_a_skip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    facts = _RecordFacts(task=_archived_task(), binding=_ready_producer_binding(), repository=None)
+    facts = _RecordFacts(task=_committed_task(), binding=_ready_producer_binding(), repository=None)
     _install_facts(monkeypatch, facts)
     runtime = _RecordingRuntime()
 
@@ -449,68 +463,10 @@ def test_a_missing_repository_record_is_contained_as_a_skip(
     assert runtime.calls == []
 
 
-# --- the submission helper: bounded, contained, never recorded --------------------
-
-
-class _RecordingSubmission:
-    def __init__(self, outcome: Any = None) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.outcome = outcome
-        self.error: Exception | None = None
-
-    def submit(self, *, workspace_id: UUID, task_id: UUID) -> Any:
-        self.calls.append({"workspace_id": workspace_id, "task_id": task_id})
-        if self.error is not None:
-            raise self.error
-        return self.outcome
-
-
-@pytest.mark.parametrize(
-    ("outcome", "expected"),
-    [
-        pytest.param(
-            TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY,
-            TerminalCheckoutCleanupSubmissionOutcome.ACCEPTED_FOR_DELIVERY,
-            id="accepted",
-        ),
-        pytest.param(
-            TerminalCheckoutCleanupSubmissionOutcome.KNOWN_REFUSED,
-            TerminalCheckoutCleanupSubmissionOutcome.KNOWN_REFUSED,
-            id="refused",
-        ),
-        pytest.param(
-            TerminalCheckoutCleanupSubmissionOutcome.UNCERTAIN,
-            TerminalCheckoutCleanupSubmissionOutcome.UNCERTAIN,
-            id="uncertain",
-        ),
-    ],
-)
-def test_the_submission_helper_passes_the_actual_outcome_through(
-    outcome: TerminalCheckoutCleanupSubmissionOutcome,
-    expected: TerminalCheckoutCleanupSubmissionOutcome,
-) -> None:
-    submission = _RecordingSubmission(outcome=outcome)
-
-    result = submit_terminal_checkout_cleanup(
-        submission, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert result is expected
-    assert submission.calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
-
-
-def test_a_failing_submission_is_an_uncertain_outcome_and_never_raises() -> None:
-    submission = _RecordingSubmission()
-    submission.error = RuntimeError("transport exploded")
-
-    result = submit_terminal_checkout_cleanup(
-        submission, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert result is TerminalCheckoutCleanupSubmissionOutcome.UNCERTAIN
-
-
-def test_an_unwired_submission_is_a_silent_skip() -> None:
-    assert (
-        submit_terminal_checkout_cleanup(None, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID) is None
-    )
+# --- the finalization arrangement seam --------------------------------------------
+#
+# The post-commitment arrangement (accepted/refused/uncertain delivery, the
+# known-refusal archive-only fallback, and the unwired-seam fallback) is the
+# shared terminal finalization service's contract, owned by
+# tests/test_services_task_terminal_finalization.py. The cleanup execution
+# service above is its one cleanup realization seam.
