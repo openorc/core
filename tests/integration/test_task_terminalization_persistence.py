@@ -259,11 +259,14 @@ def test_the_commitment_check_constraints_enforce_the_coherence_invariants(
 ) -> None:
     workspace_id, repository_id = _ownership_chain(conn)
     task_id = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
-    # The savepoint keeps the per-test transaction usable after the violation.
     # The assignments come from this module's own parametrize table; the cast
     # is the driver's injection-safe contract for composed statement text.
     statement = cast(LiteralString, f"update openorc.tasks set {assignments} where id = %s")
-    with conn.transaction(), pytest.raises(CheckViolation):
+    # Context exit order is load-bearing: conn.transaction() is the INNERMOST
+    # context, so the CheckViolation reaches psycopg's transaction exit FIRST,
+    # which rolls back to the savepoint and re-raises for pytest.raises to
+    # catch — keeping the per-test transaction usable afterwards.
+    with pytest.raises(CheckViolation), conn.transaction():
         conn.execute(statement, (task_id,))
     # Nothing partial persisted: the row keeps its pre-commitment shape.
     facts = _task_facts(conn, task_id)
@@ -500,12 +503,15 @@ def test_concurrent_finalizations_archive_exactly_once(
     workspace_id, repository_id = _ownership_chain(conn)
     task_id = _insert_task(conn, workspace_id=workspace_id, repository_id=repository_id)
     connection_id = _insert_connection(conn, workspace_id=workspace_id)
+    # Both active bindings exist before the racers run, so the concurrent
+    # finalizations race the full archival + session-end + capacity release.
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+    _admit_sessions(pool, workspace_id=workspace_id, task_id=task_id, connection_id=connection_id)
     token_row = conn.execute(
         "select state_token from openorc.tasks where id = %s", (task_id,)
     ).fetchone()
     assert token_row is not None
     conn.commit()  # publish the subject for the racer connections
-    pool = cast(DatabasePool, _SingleConnectionPool(conn))
     _commit_terminalization(pool, task_id=task_id, token=token_row[0])
 
     def racer() -> Any:
