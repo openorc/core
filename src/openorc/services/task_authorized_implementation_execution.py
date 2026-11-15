@@ -116,6 +116,7 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
+from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
@@ -1040,7 +1041,105 @@ def _resolve_settlement_subjects(
         return None
     if subject.remediation_attempt is (execution.review_iteration_id is None):
         return None
+    if subject.remediation_attempt:
+        if not _remediation_subject_still_current(
+            transaction_pool, task=locked, execution=execution
+        ):
+            return None
+    elif not _implementation_subject_still_current(transaction_pool, task=locked):
+        return None
     return locked, execution
+
+
+def _implementation_subject_still_current(transaction_pool: DatabasePool, *, task: Task) -> bool:
+    """Re-prove the E5 implementation authorization subject under the lock.
+
+    The same subject contract the dispatch and the Level 2 verification
+    prove: the Task carries no current gate, its current plan revision is
+    present and current, and exactly one approved
+    ``IMPLEMENTATION_AUTHORIZATION`` gate is bound to that revision in the
+    Task's gate history. A moved-on authorization subject can never settle a
+    detached result.
+    """
+    if task.current_owner_gate_id is not None or task.current_plan_revision_id is None:
+        return False
+    try:
+        revision = require_current_plan_revision(
+            transaction_pool, task=task, plan_revision_id=task.current_plan_revision_id
+        )
+    except NotFoundError:
+        return False
+    approved_gates = [
+        gate
+        for gate in gate_records.list_task_owner_gates(transaction_pool, task_id=task.id)
+        if gate.workspace_id == task.workspace_id
+        and gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION
+        and gate.status is OwnerGateStatus.APPROVED
+        and gate.plan_revision_id == revision.id
+    ]
+    return len(approved_gates) == 1
+
+
+def _remediation_subject_still_current(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    execution: Execution,
+) -> bool:
+    """Re-prove the E9 remediation subject under the lock.
+
+    The same subject contract the dispatch and the Level 2 verification
+    prove: the claimed CHANGES_REQUESTED iteration still sits in its
+    open PR-review loop with no later iteration, and the canonical
+    TaskPullRequest still carries exactly that iteration's reviewed head
+    with the iteration still the last finalized result on it. A moved PR
+    head or a superseded iteration can never settle a detached result.
+    """
+    if execution.review_iteration_id is None:  # narrowed by the subject shape check
+        return False
+    iteration = review_records.get_review_iteration(
+        transaction_pool, review_iteration_id=execution.review_iteration_id
+    )
+    if (
+        iteration is None
+        or iteration.task_id != task.id
+        or iteration.workspace_id != task.workspace_id
+        or iteration.outcome is not ReviewOutcome.CHANGES_REQUESTED
+    ):
+        return False
+    loop = review_records.get_review_loop(transaction_pool, review_loop_id=iteration.review_loop_id)
+    if (
+        loop is None
+        or loop.task_id != task.id
+        or loop.workspace_id != task.workspace_id
+        or loop.purpose is not ReviewLoopPurpose.PR_REVIEW
+        or loop.status is not ReviewLoopStatus.OPEN
+    ):
+        return False
+    iterations = review_records.list_review_loop_iterations(
+        transaction_pool, review_loop_id=loop.id
+    )
+    if any(other.iteration_number > iteration.iteration_number for other in iterations):
+        return False
+    pull_request = pull_request_records.get_task_pull_request_for_task(
+        transaction_pool, task_id=task.id
+    )
+    if (
+        pull_request is None
+        or pull_request.workspace_id != task.workspace_id
+        or pull_request.task_id != task.id
+        or pull_request.head_sha != iteration.reviewed_head_sha
+        or pull_request.id != iteration.task_pull_request_id
+    ):
+        return False
+    finalized_on_head = [
+        other
+        for other in iterations
+        if other.outcome is not None
+        and other.task_pull_request_id == pull_request.id
+        and other.reviewed_head_sha == pull_request.head_sha
+    ]
+    return bool(finalized_on_head) and finalized_on_head[-1].id == iteration.id
 
 
 def settle_observed_implementation_result(

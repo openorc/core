@@ -25,6 +25,14 @@
 --   across Connections must never be treated as one session.
 -- - The acknowledged ``runId`` binds at most once per session binding
 --   (same scoping principle).
+-- - The explicitly observed contradictory-run-identity marker
+--   (``contradicted_at``) is set once on an outstanding admitted receipt
+--   when a ``run.started`` observation carries a concretely different run
+--   identity; a contradicted receipt can never settle, so the correlation
+--   stays honestly unresolved instead of inventing a match.
+-- - Stale-replay rejection reads the durable consumed-sequence markers the
+--   settled receipts already record in their outcomes; no separate ledger
+--   exists.
 -- - ``openorc.task_hub_run_early_completions`` is the smallest safe handoff
 --   for the admission race: a terminal observation that resolves to a
 --   receipt still ``claimed`` (acknowledgement not yet persisted) is staged
@@ -75,6 +83,7 @@ create table openorc.task_hub_run_receipts (
         'claimed', 'admitted', 'settled', 'refused'
     )),
     outcome jsonb not null default '{}'::jsonb check (jsonb_typeof(outcome) = 'object'),
+    contradicted_at timestamptz,
     claimed_at timestamptz not null default now(),
     admitted_at timestamptz,
     settled_at timestamptz,
@@ -101,7 +110,11 @@ create table openorc.task_hub_run_receipts (
     check (
         (status = 'settled') = (outcome ? 'settlement')
         and (status = 'refused') = (outcome ? 'refusal_kind')
-    )
+    ),
+    -- The explicitly observed contradictory-run-identity marker (issue #322)
+    -- is set once on an outstanding admitted receipt and permanently blocks
+    -- its settlement: a contradicted correlation is never a match.
+    check (contradicted_at is null or status = 'admitted')
 );
 
 -- The single-outstanding-run invariant: at most one unsettled

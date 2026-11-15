@@ -27,6 +27,7 @@ from psycopg.errors import UniqueViolation
 
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.hub_runs import (
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
@@ -43,6 +44,8 @@ from openorc.domain.operational_failures import (
     OriginalAttemptKind,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.pull_requests import TaskPullRequestState
+from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.models import ImplementationResult
 from openorc.services import task_hub_run_correlation as correlation_module
@@ -69,6 +72,11 @@ _EXTERNAL_SESSION = "ext-session-1"
 _RECEIPT_ID = uuid4()
 _EXECUTION_ID = uuid4()
 _STATE_TOKEN = uuid4()
+_REVISION_ID = uuid4()
+_ITERATION_ID = uuid4()
+_LOOP_ID = uuid4()
+_PR_ID = uuid4()
+_HEAD_SHA = "b" * 40
 _RUN_ID = "hub-run-1"
 _STAGED_ID = uuid4()
 _RESULT_CANDIDATE = json.dumps(
@@ -206,6 +214,8 @@ def _receipt_row(
     status: str = "claimed",
     run_id: str | None = None,
     outcome: dict[str, Any] | None = None,
+    operation: str = "implementation_execution",
+    contradicted: bool = False,
 ) -> tuple[Any, ...]:
     admitted_at = _OBSERVED if status in ("admitted", "settled") else None
     settled_at = _OBSERVED if status in ("settled", "refused") else None
@@ -214,13 +224,14 @@ def _receipt_row(
         _WORKSPACE_ID,
         _TASK_ID,
         _SESSION_ID,
-        PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
+        operation,
         "execution",
         _EXECUTION_ID,
         "implementation_result",
         run_id,
         status,
         outcome if outcome is not None else {},
+        _OBSERVED if contradicted else None,
         _OBSERVED,
         admitted_at,
         settled_at,
@@ -250,6 +261,7 @@ def _execution_row(
     status: str = "running",
     implementation_result: Any = None,
     producer_session_id: UUID | None = None,
+    review_iteration_id: UUID | None = None,
 ) -> tuple[Any, ...]:
     return (
         _EXECUTION_ID,
@@ -262,7 +274,7 @@ def _execution_row(
         _OBSERVED,
         implementation_result,
         _OBSERVED,
-        None,
+        review_iteration_id,
     )
 
 
@@ -286,6 +298,10 @@ def _event_row(
 
 def _admitted_row() -> tuple[Any, ...]:
     return _receipt_row(status="admitted", run_id=_RUN_ID)
+
+
+def _remediation_admitted_row() -> tuple[Any, ...]:
+    return _receipt_row(status="admitted", run_id=_RUN_ID, operation="pr_remediation_execution")
 
 
 def _settled_row(label: str, *, sequence: int | None = 41) -> tuple[Any, ...]:
@@ -368,7 +384,127 @@ def _script_task_lock(conn: ScriptedConnection, *, status: str = "implementing")
             status=status,
             state_token=_STATE_TOKEN,
             source_requirements_fingerprint="a" * 64,
-            current_plan_revision_id=uuid4(),
+            current_plan_revision_id=_REVISION_ID,
+        ),
+    )
+
+
+def _script_last_consumed_sequence(conn: ScriptedConnection, value: int | None) -> None:
+    conn.on(
+        _sql_has("select max((outcome ->> 'consumed_sequence')::bigint)"),
+        None if value is None else [value],
+    )
+
+
+def _script_implementation_subject(conn: ScriptedConnection, *, gate_count: int = 1) -> None:
+    """Script the E5 authorization-subject reproof reads: the current plan
+    revision and the Task's gate history."""
+    conn.on(
+        _sql_has("from openorc.plan_revisions where id = %s"),
+        (
+            _REVISION_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            1,
+            "# plan",
+            "c" * 40,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _sql_has("from openorc.owner_gates"),
+        [
+            (
+                uuid4(),
+                _WORKSPACE_ID,
+                _TASK_ID,
+                OwnerGateType.IMPLEMENTATION_AUTHORIZATION.value,
+                OwnerGateStatus.APPROVED.value,
+                _REVISION_ID,
+                None,
+                None,
+                None,
+                _OBSERVED,
+                _OBSERVED,
+            )
+        ]
+        * gate_count,
+    )
+
+
+def _script_remediation_subject(conn: ScriptedConnection, *, head_sha: str) -> None:
+    """``head_sha`` is the canonical PR's CURRENT reconciled head; the claimed
+    iteration always reviews ``_HEAD_SHA``, so a moved head is scriptable."""
+    """Script the E9 remediation-subject reproof reads: the claimed
+    iteration, its open PR-review loop, the loop's iterations, and the
+    canonical TaskPullRequest with its reconciled head."""
+    conn.on(
+        _sql_has("from openorc.review_iterations where id = %s"),
+        (
+            _ITERATION_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            _LOOP_ID,
+            1,
+            None,
+            _PR_ID,
+            _HEAD_SHA,
+            ReviewOutcome.CHANGES_REQUESTED.value,
+            "summary",
+            [{"summary": "finding", "details": "details"}],
+            _OBSERVED,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _sql_has("from openorc.review_loops where id = %s"),
+        (
+            _LOOP_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            ReviewLoopPurpose.PR_REVIEW.value,
+            3,
+            ReviewLoopStatus.OPEN.value,
+            None,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _sql_has("from openorc.review_iterations", "review_loop_id = %s"),
+        [
+            (
+                _ITERATION_ID,
+                _WORKSPACE_ID,
+                _TASK_ID,
+                _LOOP_ID,
+                1,
+                None,
+                _PR_ID,
+                _HEAD_SHA,
+                ReviewOutcome.CHANGES_REQUESTED.value,
+                "summary",
+                [{"summary": "finding", "details": "details"}],
+                _OBSERVED,
+                _OBSERVED,
+            )
+        ],
+    )
+    conn.on(
+        _sql_has("from openorc.task_pull_requests where task_id = %s"),
+        (
+            _PR_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            uuid4(),
+            5001,
+            7,
+            "feat/branch",
+            "main",
+            head_sha,
+            TaskPullRequestState.OPEN.value,
+            None,
+            _OBSERVED,
+            _OBSERVED,
         ),
     )
 
@@ -547,6 +683,7 @@ def test_attach_consumes_the_staged_completion_and_settles_the_validated_result(
     _script_staged(conn, _staged_row(candidate=_RESULT_CANDIDATE))
     _script_execution_read(conn, _execution_row())
     _script_task_lock(conn)
+    _script_implementation_subject(conn)
     _script_execution_lock(conn, _execution_row())
     _script_complete_execution(conn)
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
@@ -586,6 +723,7 @@ def test_attach_consumes_the_staged_failure_and_reports_level_2(
     _script_staged(conn, _staged_row(kind="run.failed"))
     _script_execution_read(conn, _execution_row())
     _script_task_lock(conn)
+    _script_implementation_subject(conn)
     _script_execution_lock(conn, _execution_row())
     _script_fail_execution(conn)
     _script_event_insert(
@@ -625,7 +763,7 @@ def test_attach_consumes_the_staged_failure_and_reports_level_2(
     assert settle_at < delete_at
 
 
-def test_attach_consumes_an_invalid_staged_candidate_conservatively(
+def test_attach_routes_a_malformed_staged_result_through_the_failure_path(
     triage: _RecordingTriage,
 ) -> None:
     conn = ScriptedConnection()
@@ -633,6 +771,15 @@ def test_attach_consumes_an_invalid_staged_candidate_conservatively(
     _script_attach(conn, _admitted_row())
     _script_staged(conn, _staged_row(candidate="not a formal response"))
     _script_execution_read(conn, _execution_row())
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row())
+    _script_fail_execution(conn)
+    _script_event_insert(
+        conn, event_type=WorkflowEventType.EXECUTION_FAILED, failure_kind="malformed_run_result"
+    )
+    _script_settle(conn, _settled_row("observed_failure"))
+    _script_current_task(conn)
     _script_consume(conn)
     outcome = attach_acknowledged_hub_run(
         _pool(conn),
@@ -641,16 +788,50 @@ def test_attach_consumes_an_invalid_staged_candidate_conservatively(
         receipt_id=_RECEIPT_ID,
         run_id=_RUN_ID,
     )
-    assert outcome.kind is HubRunSettlementKind.LEFT_UNRESOLVED
+    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.ADMITTED
-    assert triage.calls == []
-    assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
-    assert not any("update openorc.executions" in sql for sql, _ in conn.executed)
+    assert outcome.receipt.status is TaskHubRunReceiptStatus.SETTLED
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
+    assert triage.calls[0]["report"].effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert any("set status = 'settled'" in sql for sql in executed)
     assert any(
-        sql.startswith("delete from openorc.task_hub_run_early_completions")
-        for sql, _ in conn.executed
+        sql.startswith("delete from openorc.task_hub_run_early_completions") for sql in executed
     )
+
+
+def test_settlement_routes_a_resultless_completion_through_the_failure_path(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_execution_read(conn, _execution_row())
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row())
+    _script_fail_execution(conn)
+    _script_event_insert(
+        conn, event_type=WorkflowEventType.EXECUTION_FAILED, failure_kind="malformed_run_result"
+    )
+    _script_settle(conn, _settled_row("observed_failure", sequence=None))
+    _script_current_task(conn)
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=ObservedHubRunCompletion(
+            external_session_id=_EXTERNAL_SESSION,
+            kind=HubRunObservationKind.RUN_COMPLETED,
+            sequence=None,
+            result_candidate=None,
+        ),
+    )
+    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
 
 
 # --- the settlement entry ------------------------------------------------------------
@@ -692,6 +873,7 @@ def test_settlement_stages_an_early_completion_for_a_claimed_receipt() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _receipt_row())
+    _script_last_consumed_sequence(conn, None)
     _script_stage_insert(conn, _staged_row(candidate=_RESULT_CANDIDATE))
     outcome = settle_observed_hub_run_completion(
         _pool(conn),
@@ -717,6 +899,7 @@ def test_settlement_rejects_a_duplicate_early_completion() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _receipt_row())
+    _script_last_consumed_sequence(conn, None)
     _script_stage_insert(conn, UniqueViolation())
     outcome = settle_observed_hub_run_completion(
         _pool(conn),
@@ -733,8 +916,10 @@ def test_settlement_settles_the_single_outstanding_run_without_run_started(
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
     _script_execution_read(conn, _execution_row())
     _script_task_lock(conn)
+    _script_implementation_subject(conn)
     _script_execution_lock(conn, _execution_row())
     _script_complete_execution(conn)
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
@@ -757,8 +942,10 @@ def test_settlement_classifies_an_observed_failure_through_the_typed_path(
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
     _script_execution_read(conn, _execution_row())
     _script_task_lock(conn)
+    _script_implementation_subject(conn)
     _script_execution_lock(conn, _execution_row())
     _script_fail_execution(conn)
     _script_event_insert(
@@ -788,6 +975,7 @@ def test_settlement_leaves_a_concrete_attribution_conflict_unresolved(
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
     _script_execution_read(conn, _execution_row(producer_session_id=uuid4()))
     outcome = settle_observed_hub_run_completion(
         _pool(conn),
@@ -814,6 +1002,7 @@ def test_status_classification_routes_the_exact_failed_run(
     )
     _script_receipt_for_update(conn, _admitted_row())
     _script_task_lock(conn)
+    _script_implementation_subject(conn)
     _script_execution_lock(conn, _execution_row())
     _script_fail_execution(conn)
     _script_event_insert(
@@ -892,7 +1081,7 @@ def test_status_classification_leaves_a_missing_record_unresolved() -> None:
 # --- the read-only run-start corroboration -------------------------------------------
 
 
-def test_start_identity_corroboration_is_read_only() -> None:
+def test_start_identity_corroboration_is_read_only_and_never_required() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn, repeat=True)
     _script_outstanding_receipt(conn, _admitted_row(), repeat=True)
@@ -905,16 +1094,6 @@ def test_start_identity_corroboration_is_read_only() -> None:
             request_id=_RUN_ID,
         )
         is HubRunStartCorroboration.CORROBORATED
-    )
-    assert (
-        check_hub_run_start_identity(
-            _pool(conn),
-            workspace_id=_WORKSPACE_ID,
-            connection_id=_CONNECTION_ID,
-            external_session_id=_EXTERNAL_SESSION,
-            request_id="hub-run-other",
-        )
-        is HubRunStartCorroboration.CONTRADICTED
     )
     assert not any(
         " ".join(sql.split()).startswith(("update ", "insert ", "delete "))
@@ -948,3 +1127,167 @@ def test_start_identity_is_unattributable_before_admission_and_unowned_without_a
         )
         is HubRunStartCorroboration.UNOWNED
     )
+
+
+# --- the stale-replay safeguard ------------------------------------------------------
+
+
+def test_settlement_rejects_a_stale_replay_after_a_consumed_settlement(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, 41)
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_COMPLETION_OBSERVATION,
+    )
+    assert outcome.kind is HubRunSettlementKind.REJECTED_STALE
+    assert outcome.receipt is not None
+    assert outcome.receipt.status is TaskHubRunReceiptStatus.ADMITTED
+    assert triage.calls == []
+    # The stale duplicate never reaches the attempt: no execution reads, no
+    # settlement, no staging.
+    assert not any("from openorc.executions" in sql for sql, _ in conn.executed)
+    assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
+    assert not any(
+        "insert into openorc.task_hub_run_early_completions" in sql for sql, _ in conn.executed
+    )
+
+
+def test_settlement_accepts_a_fresher_completion_after_a_consumed_settlement(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, 41)
+    _script_execution_read(conn, _execution_row())
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row())
+    _script_complete_execution(conn)
+    _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
+    _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT, sequence=43))
+    fresher = ObservedHubRunCompletion(
+        external_session_id=_EXTERNAL_SESSION,
+        kind=HubRunObservationKind.RUN_COMPLETED,
+        sequence=43,
+        result_candidate=_RESULT_CANDIDATE,
+    )
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=fresher,
+    )
+    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] == 43
+
+
+# --- the explicit contradiction marker -----------------------------------------------
+
+
+def test_settlement_leaves_a_contradicted_receipt_unresolved(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(
+        conn, _receipt_row(contradicted=True, run_id=_RUN_ID, status="admitted")
+    )
+    _script_last_consumed_sequence(conn, None)
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_COMPLETION_OBSERVATION,
+    )
+    assert outcome.kind is HubRunSettlementKind.LEFT_UNRESOLVED
+    assert outcome.receipt is not None
+    assert outcome.receipt.contradicted_at is not None
+    assert triage.calls == []
+    assert not any("from openorc.executions" in sql for sql, _ in conn.executed)
+    assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
+
+
+def test_start_identity_records_the_contradiction_marker() -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    conn.on(
+        _sql_has("set contradicted_at = now()"),
+        _receipt_row(status="admitted", run_id=_RUN_ID, contradicted=True),
+    )
+    assert (
+        check_hub_run_start_identity(
+            _pool(conn),
+            workspace_id=_WORKSPACE_ID,
+            connection_id=_CONNECTION_ID,
+            external_session_id=_EXTERNAL_SESSION,
+            request_id="hub-run-other",
+        )
+        is HubRunStartCorroboration.CONTRADICTED
+    )
+    marker_sql, marker_params = next(
+        (sql, params)
+        for sql, params in conn.executed
+        if "set contradicted_at = now()" in " ".join(sql.split())
+    )
+    assert marker_params is not None and marker_params[0] == _RECEIPT_ID
+
+
+# --- the family authorization-subject reproof ----------------------------------------
+
+
+def test_settlement_leaves_a_moved_remediation_head_a_truthful_no_op(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _remediation_admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_execution_read(conn, _execution_row(review_iteration_id=_ITERATION_ID))
+    _script_task_lock(conn, status="reviewing")
+    _script_execution_lock(conn, _execution_row(review_iteration_id=_ITERATION_ID))
+    _script_remediation_subject(conn, head_sha="c" * 40)
+    _script_settle(conn, _settled_row("result_not_applied"))
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_COMPLETION_OBSERVATION,
+    )
+    assert outcome.kind is HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == "result_not_applied"
+    assert triage.calls == []
+    assert not any("update openorc.executions" in sql for sql, _ in conn.executed)
+
+
+def test_settlement_settles_a_current_remediation_result(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _remediation_admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_execution_read(conn, _execution_row(review_iteration_id=_ITERATION_ID))
+    _script_task_lock(conn, status="reviewing")
+    _script_execution_lock(conn, _execution_row(review_iteration_id=_ITERATION_ID))
+    _script_remediation_subject(conn, head_sha=_HEAD_SHA)
+    _script_complete_execution(conn)
+    _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
+    _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT))
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_COMPLETION_OBSERVATION,
+    )
+    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert triage.calls == []

@@ -50,6 +50,7 @@ from openorc.persistence.hub_runs import (
     create_task_hub_run_receipt,
     get_outstanding_task_hub_run_receipt,
     get_task_hub_run_early_completion_for_update,
+    mark_task_hub_run_receipt_contradicted,
     refuse_task_hub_run_receipt,
     settle_task_hub_run_receipt,
     stage_task_hub_run_early_completion,
@@ -373,6 +374,49 @@ def test_the_subject_foreign_keys_reject_cross_task_subjects(conn: Connection[An
             original_attempt_id=uuid.uuid4(),
             expected_formal_family="implementation_result",
         )
+
+
+def test_the_contradiction_marker_blocks_settlement(conn: Connection[Any]) -> None:
+    task_id, workspace_id = _insert_task_chain(conn)
+    session_id = _insert_producer_session(conn, workspace_id, task_id)
+    pool = _SingleConnectionPool(conn)
+    receipt = _create_receipt(pool, workspace_id, task_id, session_id)
+    attach_task_hub_run_acknowledgement(
+        pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        run_id="run-1",
+    )
+    marked = mark_task_hub_run_receipt_contradicted(
+        pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+    )
+    assert marked is not None and marked.contradicted_at is not None
+    # A repeated contradiction is a rejected no-op; the marker is set once.
+    assert (
+        mark_task_hub_run_receipt_contradicted(
+            pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+        )
+        is None
+    )
+    # A contradicted correlation can never settle: the settlement CAS refuses
+    # it, so the outstanding run stays honestly unresolved.
+    assert (
+        settle_task_hub_run_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome={"settlement": "validated_result"},
+        )
+        is None
+    )
 
 
 def test_the_coherence_and_outcome_label_checks_reject_incoherent_rows(

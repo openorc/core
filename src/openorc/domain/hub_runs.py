@@ -27,7 +27,11 @@ ledger.
   backstop; the external identifier is never the scope: different
   Connections own independent external-session namespaces, so resolution
   always happens within the authenticated Connection/Workspace scope
-  against the binding row.
+  against the binding row. Stale replays are rejected against the durable
+  consumed-sequence markers the settled receipts already record, and an
+  explicitly observed contradictory run identity sets the receipt's
+  set-once ``contradicted_at`` marker, permanently blocking that receipt's
+  settlement.
 - ``outcome`` is a small canonical JSON object of safe machine facts only —
   the settlement/refusal label and the consumed Hub sequence marker when the
   observation carried one. Prompts, plan text, review content, reasoning,
@@ -213,6 +217,7 @@ class TaskHubRunReceipt:
     run_id: str | None
     status: TaskHubRunReceiptStatus
     outcome: Mapping[str, object]
+    contradicted_at: datetime | None
     claimed_at: datetime
     admitted_at: datetime | None
     settled_at: datetime | None
@@ -238,6 +243,7 @@ class TaskHubRunReceipt:
         if not isinstance(self.outcome, Mapping):
             raise ValueError("TaskHubRunReceipt.outcome must be a mapping")
         object.__setattr__(self, "outcome", canonical_intent_outcome(self.outcome))
+        _require_instant(self.contradicted_at, "contradicted_at", nullable=True)
         _require_instant(self.claimed_at, "claimed_at")
         _require_instant(self.admitted_at, "admitted_at", nullable=True)
         _require_instant(self.settled_at, "settled_at", nullable=True)
@@ -246,6 +252,10 @@ class TaskHubRunReceipt:
 
     def _require_status_coherence(self) -> None:
         """The exact forward-only lifecycle coherence per status."""
+        # The explicit contradiction marker exists only on an outstanding
+        # admitted receipt and permanently blocks its settlement.
+        if self.contradicted_at is not None and self.status is not TaskHubRunReceiptStatus.ADMITTED:
+            raise ValueError("only an admitted hub-run receipt can carry the contradiction marker")
         if self.status is TaskHubRunReceiptStatus.CLAIMED:
             if (
                 self.run_id is not None

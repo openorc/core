@@ -56,11 +56,13 @@ __all__ = [
     "attach_task_hub_run_acknowledgement",
     "consume_task_hub_run_early_completion",
     "create_task_hub_run_receipt",
+    "get_last_consumed_hub_run_sequence",
     "get_outstanding_task_hub_run_receipt",
     "get_outstanding_task_hub_run_receipt_for_update",
     "get_task_hub_run_early_completion_for_update",
     "get_task_hub_run_receipt",
     "get_task_hub_run_receipt_for_update",
+    "mark_task_hub_run_receipt_contradicted",
     "refuse_task_hub_run_receipt",
     "settle_task_hub_run_receipt",
     "stage_task_hub_run_early_completion",
@@ -69,7 +71,8 @@ __all__ = [
 _RECEIPT_COLUMNS = (
     "id, workspace_id, task_id, task_agent_session_id, operation, "
     "original_attempt_kind, original_attempt_id, expected_formal_family, "
-    "run_id, status, outcome, claimed_at, admitted_at, settled_at, updated_at"
+    "run_id, status, outcome, contradicted_at, claimed_at, admitted_at, "
+    "settled_at, updated_at"
 )
 
 _EARLY_COMPLETION_COLUMNS = (
@@ -96,10 +99,11 @@ def _receipt_from_row(row: Sequence[Any]) -> TaskHubRunReceipt:
         run_id=row[8],
         status=TaskHubRunReceiptStatus(row[9]),
         outcome=row[10],
-        claimed_at=normalize_utc(row[11]),
-        admitted_at=None if row[12] is None else normalize_utc(row[12]),
-        settled_at=None if row[13] is None else normalize_utc(row[13]),
-        updated_at=normalize_utc(row[14]),
+        contradicted_at=None if row[11] is None else normalize_utc(row[11]),
+        claimed_at=normalize_utc(row[12]),
+        admitted_at=None if row[13] is None else normalize_utc(row[13]),
+        settled_at=None if row[14] is None else normalize_utc(row[14]),
+        updated_at=normalize_utc(row[15]),
     )
 
 
@@ -307,10 +311,70 @@ def settle_task_hub_run_receipt(
             "update openorc.task_hub_run_receipts "
             "set status = 'settled', outcome = %s, settled_at = now(), updated_at = now() "
             "where id = %s and task_id = %s and workspace_id = %s and status = 'admitted' "
+            "and contradicted_at is null "
             f"returning {_RECEIPT_COLUMNS}",
             (Jsonb(canonical_outcome), receipt_id, task_id, workspace_id),
         ).fetchone()
     return None if row is None else _receipt_from_row(row)
+
+
+def mark_task_hub_run_receipt_contradicted(
+    pool: DatabasePool,
+    *,
+    receipt_id: UUID,
+    task_id: UUID,
+    workspace_id: UUID,
+) -> TaskHubRunReceipt | None:
+    """Set the explicit contradictory-run-identity marker exactly once.
+
+    An explicitly observed ``run.started`` identity that concretely differs
+    from the outstanding acknowledged run makes that receipt's correlation
+    unsafe: the set-once marker permanently blocks its settlement (the
+    settlement CAS refuses a contradicted receipt), so the correlation stays
+    honestly unresolved instead of inventing a match. ``None`` means the
+    receipt is missing, out of scope, not admitted, or already marked — a
+    rejected no-op that is never retried blindly.
+    """
+    _require_uuid(receipt_id, "receipt_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(workspace_id, "workspace_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_hub_run_receipts "
+            "set contradicted_at = now(), updated_at = now() "
+            "where id = %s and task_id = %s and workspace_id = %s "
+            "and status = 'admitted' and contradicted_at is null "
+            f"returning {_RECEIPT_COLUMNS}",
+            (receipt_id, task_id, workspace_id),
+        ).fetchone()
+    return None if row is None else _receipt_from_row(row)
+
+
+def get_last_consumed_hub_run_sequence(
+    pool: DatabasePool, *, task_agent_session_id: UUID
+) -> int | None:
+    """Return the session's highest consumed terminal-event sequence marker.
+
+    The stale-replay evidence: every settled receipt of the binding records
+    the durable Hub-log sequence of the terminal observation it consumed.
+    A newly observed terminal event whose sequence is at or below that
+    marker is an already-consumed or stale duplicate notification, never a
+    fresh completion. ``None`` means the session has no consumed sequence
+    marker yet (no rejection evidence — a sequence-less observation cannot
+    be ordered and is never rejected by this check).
+    """
+    _require_uuid(task_agent_session_id, "task_agent_session_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select max((outcome ->> 'consumed_sequence')::bigint) "
+            "from openorc.task_hub_run_receipts "
+            "where task_agent_session_id = %s and status = 'settled' "
+            "and outcome ? 'consumed_sequence'",
+            (task_agent_session_id,),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def refuse_task_hub_run_receipt(

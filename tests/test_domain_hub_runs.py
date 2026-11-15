@@ -44,6 +44,7 @@ def _receipt(
     admitted_at: object = None,
     settled_at: object = None,
     outcome: Any = None,
+    contradicted_at: object = None,
     expected_formal_family: str = "implementation_result",
     operation: Any = None,
     original_attempt_kind: Any = None,
@@ -69,6 +70,7 @@ def _receipt(
         run_id=run_id,  # type: ignore[arg-type]
         status=status,
         outcome=outcome if outcome is not None else {},
+        contradicted_at=contradicted_at,  # type: ignore[arg-type]
         claimed_at=claimed_at if claimed_at is not None else _OBSERVED,  # type: ignore[arg-type]
         admitted_at=admitted_at,  # type: ignore[arg-type]
         settled_at=settled_at,  # type: ignore[arg-type]
@@ -96,6 +98,7 @@ def test_claimed_receipt_is_the_valid_default() -> None:
             "run_id",
             "status",
             "outcome",
+            "contradicted_at",
             "claimed_at",
             "admitted_at",
             "settled_at",
@@ -233,6 +236,30 @@ def test_identity_and_instant_validation_fails_closed() -> None:
         _receipt(status=TaskHubRunReceiptStatus.ADMITTED, run_id=" ", admitted_at=_OBSERVED)
     with pytest.raises(ValueError, match="timezone-aware"):
         _receipt(claimed_at=datetime(2026, 11, 15, 9, 0, 0))
+
+
+def test_only_an_admitted_receipt_carries_the_contradiction_marker() -> None:
+    receipt = _receipt(
+        status=TaskHubRunReceiptStatus.ADMITTED,
+        run_id="run-1",
+        admitted_at=_OBSERVED,
+        contradicted_at=_OBSERVED,
+    )
+    assert receipt.contradicted_at == _OBSERVED
+    with pytest.raises(ValueError, match="contradiction marker"):
+        _receipt(
+            status=TaskHubRunReceiptStatus.CLAIMED,
+            contradicted_at=_OBSERVED,
+        )
+    with pytest.raises(ValueError, match="contradiction marker"):
+        _receipt(
+            status=TaskHubRunReceiptStatus.SETTLED,
+            run_id="run-1",
+            admitted_at=_OBSERVED,
+            settled_at=_OBSERVED,
+            outcome={SETTLEMENT_OUTCOME_LABEL_KEY: SETTLEMENT_VALIDATED_RESULT},
+            contradicted_at=_OBSERVED,
+        )
 
 
 def test_the_observation_values_validate_their_shapes() -> None:

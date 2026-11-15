@@ -20,11 +20,16 @@ authoritative ``TaskAgentSession`` binding (external identifiers are never a
 cross-Connection match), then attributed by the serial correlation rule: at
 most one unsettled OpenOrc-dispatched Hub run exists per exact binding (the
 durable partial unique index is the backstop), so a fresh terminal event for
-that session attributes to the outstanding acknowledged run. An observed
-``run.started`` ``requestId`` equal to the acknowledged ``runId``
-corroborates the binding but is never required; an explicitly observed
-contradictory identity or another concrete attribution conflict leaves the
-event unresolved rather than inventing a match.
+that session attributes to the outstanding acknowledged run. Stale replays
+are rejected at this boundary against the durable consumed-sequence markers
+the session's settled receipts already record — a delayed duplicate of a
+prior run's notification can never be attributed to the next outstanding
+run. An observed ``run.started`` ``requestId`` equal to the acknowledged
+``runId`` corroborates the binding but is never required; an explicitly
+observed contradictory identity is recorded as the receipt's set-once
+contradiction marker (permanently blocking that receipt's settlement), and
+any other concrete attribution conflict leaves the event unresolved rather
+than inventing a match.
 
 Admission race — a terminal event that resolves to a receipt still
 ``claimed`` (acknowledgement not yet persisted) is durably staged on that
@@ -37,18 +42,23 @@ before attaching leaves the accepted v1 unresolved state).
 
 Settlement routing — a successfully attributed completion must carry a
 genuine native ``AgentResult``, pass the shared formal contract for the
-receipt's expected family, and undergo the current-subject reproof before
-the workflow transition; validated results, genuine observed failures, and
-protocol failures route through the existing owning continuation/failure
-services (the shared execution finalize, the truthful ``failed_final``
-finalization with the ``observed_run_failure`` audit kind, and the Level 2
-operation-failure report with ``KNOWN_FAILED`` evidence — never a
-safe-retry classification). Settlement is atomic (one composition) and
-idempotent (forward-only conditional writes; duplicates and stale
-notifications are rejected no-ops via the receipt lifecycle and the consumed
-sequence marker). A completion whose candidate is missing or fails the
-shared contract leaves the receipt conservatively admitted and the attempt
-unresolved — exactly the existing post-effect discipline.
+receipt's expected family, and undergo the full current-subject reproof
+(including the family's authorization subject: the E5 approved
+implementation gate over the current plan revision, or the E9 claimed
+iteration still addressing the canonical PR's current reconciled head)
+before the workflow transition. Validated results complete the attempt
+through the shared finalize; genuine observed failures and positively
+established malformed-result protocol failures (an attributed completion
+whose native result is missing or fails the shared contract) finalize the
+still-running attempt truthfully (``failed_final`` with the
+``observed_run_failure`` / ``malformed_run_result`` audit kind) and report
+through the existing Level 2 operation-failure path with ``KNOWN_FAILED``
+evidence — never a safe-retry classification. Settlement is atomic (one
+composition) and idempotent (forward-only conditional writes; duplicates,
+stale notifications, and contradicted receipts are rejected no-ops via the
+receipt lifecycle, the consumed sequence marker, and the contradiction
+marker). Only genuinely missing or unattributable terminal evidence stays
+unresolved.
 
 Status-only reconciliation — at existing bounded reconciliation points, the
 exact acknowledged ``runId`` reported ``failed`` by ``run.list`` classifies
@@ -186,6 +196,13 @@ _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperati
 # The Hub's own status token that positively classifies a failed run.
 _RUN_LIST_FAILED_STATUS: Final[str] = "failed"
 
+# The safe failure-classification token the settlement records for a
+# positively established malformed-result protocol failure: an attributed
+# completion whose native result is missing or fails the shared formal
+# contract (post-dispatch evidence — never a pre-effect classification, and
+# therefore never a safe-retry basis).
+_MALFORMED_RUN_RESULT_FAILURE_KIND: Final[str] = "malformed_run_result"
+
 # The openorc actor of the settlement's Level 2 report: the classification is
 # OpenOrc's own typed observation, never a runtime- or Owner-attributed
 # decision.
@@ -205,6 +222,7 @@ class HubRunSettlementKind(StrEnum):
     SETTLED_RESULT_NOT_APPLIED = "settled_result_not_applied"
     LEFT_UNRESOLVED = "left_unresolved"
     REJECTED_DUPLICATE = "rejected_duplicate"
+    REJECTED_STALE = "rejected_stale"
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,11 +469,19 @@ def _route_observed_terminal(
 ) -> HubRunSettlementOutcome:
     """Route one attributed terminal observation through its owning services.
 
-    Called inside the caller's composition with the receipt row locked. The
-    receipt's operation family selects the routing; a family without
-    detached settlement routing yet is a fail-closed conflict (its own
-    detached migration wires it), never a silent no-op.
+    Called inside the caller's composition with the receipt row locked. A
+    receipt carrying the explicitly observed contradiction marker is never a
+    settlement match — the observation is left unresolved. The receipt's
+    operation family selects the routing; a family without detached
+    settlement routing yet is a fail-closed conflict (its own detached
+    migration wires it), never a silent no-op.
     """
+    if receipt.contradicted_at is not None:
+        logger.warning(
+            "the outstanding run's correlation was explicitly contradicted by an "
+            "observed run identity; the terminal observation is left unresolved"
+        )
+        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
     if receipt.operation in _EXECUTION_SETTLEMENT_FAMILIES:
         return _route_execution_terminal(
             transaction_pool,
@@ -515,31 +541,42 @@ def _route_execution_terminal(
             task_id=task_id,
             receipt=receipt,
             sequence=sequence,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=OBSERVED_RUN_FAILURE_KIND,
         )
-    if result_candidate is None:
-        logger.warning(
-            "the observed hub-run completion carries no native result; the attempt "
-            "remains unresolved and the receipt stays conservatively admitted"
-        )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
-    try:
-        parsed = parse_formal_response(
-            result_candidate, expected_family=receipt.expected_formal_family
-        )
-    except ProtocolError:
-        logger.warning(
-            "the observed hub-run completion failed the shared formal contract; "
-            "the attempt remains unresolved and the receipt stays conservatively admitted"
-        )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    # A genuinely attributed completion must carry a usable formal result. A
+    # missing candidate, a shared-contract rejection, or an unexpected
+    # family type is a positively established protocol failure of the run —
+    # routed through the existing typed operation-failure machinery (never
+    # silently unresolved evidence, never a safe retry) — while a validated
+    # result completes the still-running attempt through the shared finalize.
+    parsed: FormalResponse | None
+    if result_candidate is not None:
+        try:
+            parsed = parse_formal_response(
+                result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            parsed = None
+    else:
+        parsed = None
     if not isinstance(parsed, ImplementationResult):
-        # The family pairing is enforced at record time; this is the
-        # fail-closed backstop, never a reinterpretation.
+        # The family pairing is enforced at record time; an unexpected type
+        # is the same fail-closed protocol classification, never a
+        # reinterpretation.
         logger.warning(
-            "the observed hub-run completion was not the expected formal result "
-            "family; the attempt remains unresolved"
+            "the observed hub-run completion carries no usable formal result for its "
+            "expected family; classifying the positively established protocol failure"
         )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        return _settle_execution_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            sequence=sequence,
+            error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
+            failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
+        )
     finalized = settle_observed_implementation_result(
         transaction_pool,
         workspace_id=workspace_id,
@@ -580,18 +617,22 @@ def _settle_execution_failure(
     task_id: UUID,
     receipt: TaskHubRunReceipt,
     sequence: int | None,
+    error_code: OperationalFailureCode,
+    failure_kind: str,
 ) -> HubRunSettlementOutcome:
-    """Settle one positively observed genuine run failure.
+    """Settle one positively established genuine run failure.
 
     The still-running attempt finalizes ``failed_final`` with the truthful
-    ``observed_run_failure`` audit atomically with the receipt's settlement,
+    failure-classification audit atomically with the receipt's settlement,
     and the failure reports through the existing typed operation-failure
-    path (Level 2): ``KNOWN_FAILED`` evidence is never a safe-retry
-    classification, so the disposition is the policy's own bounded decision
-    (escalation, no automatic redispatch). The report is a typed no-op when
-    it no longer addresses current work. An attempt already resolved by
-    another authority records only the truthful ``result_not_applied``
-    settlement — no failure is fabricated against resolved history.
+    path (Level 2) with the caller's stable code — an observed run failure
+    or a positively established malformed-result protocol failure.
+    ``KNOWN_FAILED`` evidence is never a safe-retry classification, so the
+    disposition is the policy's own bounded decision (escalation, no
+    automatic redispatch). The report is a typed no-op when it no longer
+    addresses current work. An attempt already resolved by another
+    authority records only the truthful ``result_not_applied`` settlement —
+    no failure is fabricated against resolved history.
     """
     finalized = finalize_observed_implementation_failure(
         transaction_pool,
@@ -599,7 +640,7 @@ def _settle_execution_failure(
         task_id=task_id,
         execution_id=receipt.original_attempt_id,
         subject=_EXECUTION_FAMILY_SUBJECTS[receipt.operation],
-        failure_kind=OBSERVED_RUN_FAILURE_KIND,
+        failure_kind=failure_kind,
     )
     if finalized is None:
         settled = hub_run_records.settle_task_hub_run_receipt(
@@ -638,7 +679,7 @@ def _settle_execution_failure(
     report = OperationalFailureReport(
         reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
         reporting_attempt_id=receipt.original_attempt_id,
-        error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+        error_code=error_code,
         effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
         diagnostic_context={"observation": "hub_run_failure"},
     )
@@ -719,6 +760,24 @@ def settle_observed_hub_run_completion(
                 return HubRunSettlementOutcome(
                     kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                 )
+            if observation.sequence is not None:
+                # The stale-replay safeguard: a terminal event at or below the
+                # binding's highest consumed sequence marker is an
+                # already-consumed or stale duplicate of a prior run's
+                # notification, never a fresh completion for the outstanding
+                # run. A sequence-less observation carries no ordering
+                # evidence and is never rejected by this check.
+                consumed = hub_run_records.get_last_consumed_hub_run_sequence(
+                    transaction_pool, task_agent_session_id=binding.id
+                )
+                if consumed is not None and observation.sequence <= consumed:
+                    logger.info(
+                        "the observed hub-run completion is at or below the session's "
+                        "consumed sequence marker; the stale duplicate is rejected"
+                    )
+                    return HubRunSettlementOutcome(
+                        kind=HubRunSettlementKind.REJECTED_STALE, receipt=receipt
+                    )
             if receipt.status is TaskHubRunReceiptStatus.CLAIMED:
                 try:
                     hub_run_records.stage_task_hub_run_early_completion(
@@ -829,6 +888,8 @@ def classify_acknowledged_hub_run_status(
                 task_id=task_id,
                 receipt=locked,
                 sequence=None,
+                error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+                failure_kind=OBSERVED_RUN_FAILURE_KIND,
             )
         if outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE:
             return HubRunStatusClassification(
@@ -854,13 +915,18 @@ def check_hub_run_start_identity(
     external_session_id: str,
     request_id: str | None,
 ) -> HubRunStartCorroboration:
-    """Read-only corroboration of one observed ``run.started`` identity.
+    """Classify one observed ``run.started`` identity and record contradictions.
 
     The observed ``requestId`` equal to the outstanding acknowledged run
-    identity corroborates the binding; a concretely different identity is
-    an explicitly observed contradiction, logged selectively, never mutated
-    against, and never a settlement match. Read-only: corroboration is
-    never required and never durable state.
+    identity corroborates the binding. A concretely different identity is an
+    explicitly observed contradiction: it is logged selectively and recorded
+    as the receipt's set-once ``contradicted_at`` marker, permanently
+    blocking that receipt's settlement so the correlation stays honestly
+    unresolved instead of inventing a match — the observation prevents
+    subsequent settlement rather than being discarded. ``UNATTRIBUTABLE``:
+    the receipt is still claimed (no acknowledged identity yet) or the start
+    carried no request identity. ``UNOWNED``: no OpenOrc-dispatched run is
+    outstanding for the resolved binding.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(connection_id, "connection_id")
@@ -888,6 +954,13 @@ def check_hub_run_start_identity(
         return HubRunStartCorroboration.CORROBORATED
     logger.warning(
         "the observed run start carries a concretely different identity than the "
-        "outstanding acknowledged run; the event is not a settlement match"
+        "outstanding acknowledged run; recording the contradiction marker and "
+        "leaving the correlation unresolved"
+    )
+    hub_run_records.mark_task_hub_run_receipt_contradicted(
+        pool,
+        receipt_id=receipt.id,
+        task_id=receipt.task_id,
+        workspace_id=receipt.workspace_id,
     )
     return HubRunStartCorroboration.CONTRADICTED
