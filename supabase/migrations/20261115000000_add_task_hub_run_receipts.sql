@@ -79,7 +79,7 @@ create table openorc.task_hub_run_receipts (
     original_attempt_id uuid not null,
     expected_formal_family text not null,
     run_id text,
-    status text not null check (status in (
+    status text not null default 'claimed' check (status in (
         'claimed', 'admitted', 'settled', 'refused'
     )),
     outcome jsonb not null default '{}'::jsonb check (jsonb_typeof(outcome) = 'object'),
