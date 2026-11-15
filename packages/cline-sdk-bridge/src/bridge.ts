@@ -11,9 +11,14 @@
  *
  * Wire methods (fixed): `connect`, `start`, `send`, `stop`, `abort`, `get`,
  * `read_messages`, `list_history`, `get_accumulated_usage`, `subscribe`,
- * `unsubscribe`, `dispose`. Asynchronous SDK events are emitted as
- * `cline.event` notifications carrying the subscription handle, exact event
- * session identity, safe machine kind, and the unchanged JSON payload.
+ * `unsubscribe`, `dispose`, plus the Hub-native admission/observation methods
+ * `enqueue`, `list_runs`, and `subscribe_hub` (issue #321). Asynchronous SDK
+ * session events are emitted as `cline.event` notifications carrying the
+ * subscription handle, exact event session identity, safe machine kind, and
+ * the unchanged JSON payload; asynchronous Hub event envelopes are emitted as
+ * `cline.hub_event` notifications carrying the subscription handle and the
+ * envelope's own session identity, event name, durable-log sequence, and
+ * unchanged payload.
  */
 
 import {
@@ -26,16 +31,30 @@ import {
 import {
   validateAbortParams,
   validateConnectParams,
+  validateEnqueueParams,
+  validateListRunsParams,
   validateSendParams,
   validateStartParams,
   validateSubscribeParams,
   validateUnsubscribeParams,
 } from "./params.js";
 import { errorResponseFrame, eventNotificationFrame, LineSplitter, parseLine, responseFrame } from "./protocol.js";
-import type { JsonObject, JsonValue, WireRemoteConfig, WireSessionEventParams } from "./types.js";
+import type {
+  JsonObject,
+  JsonValue,
+  WireHubEventParams,
+  WireRemoteConfig,
+  WireRunAdmission,
+  WireSessionEventParams,
+} from "./types.js";
+import { isJsonObject } from "./types.js";
 
 /** Notification method carrying asynchronous SDK session events. */
 export const EVENT_NOTIFICATION_METHOD = "cline.event";
+
+/** Notification method carrying asynchronous Hub event envelopes (issue
+ * #321). Fields are the Hub envelope's own values, forwarded verbatim. */
+export const HUB_EVENT_NOTIFICATION_METHOD = "cline.hub_event";
 
 /** SDK start config mapped from the D2 construction bundle.
  *
@@ -76,6 +95,16 @@ export interface SdkSessionEvent {
   payload: unknown;
 }
 
+/** Raw Hub event envelope observed through the structural hub surface
+ * (issue #321). Carries only the envelope's own fields — session identity,
+ * durable-log sequence, event name, payload — never invented identity. */
+export interface SdkHubEvent {
+  event: string;
+  sessionId?: string;
+  sequence?: number;
+  payload?: unknown;
+}
+
 /** Structural SDK client surface the bridge consumes (fake-friendly).
  *
  * Implementations return SDK-native values; the bridge converts them to
@@ -92,6 +121,22 @@ export interface BridgeSdkClient {
   listHistory(): Promise<unknown[]>;
   getAccumulatedUsage(sessionId: string): Promise<unknown>;
   subscribe(listener: (event: SdkSessionEvent) => void, options?: { sessionId?: string }): () => void;
+  /** Hub-native nonblocking run admission (issue #321): the official
+   * `NodeHubClient.command("run.enqueue", {prompt}, sessionId)` surface.
+   * Resolves with the raw ok-reply payload for bridge-side verification;
+   * native refusals, transport failures, and timeouts are thrown uncaught
+   * for boundary classification. Deliberately distinct from `send`. */
+  enqueue(input: { sessionId: string; prompt: string }): Promise<unknown>;
+  /** Status-only Hub `run.list` observation: resolves with the raw ok-reply
+   * payload for bridge-side `runs` extraction. */
+  listRuns(sessionId: string | null): Promise<unknown>;
+  /** Hub-event envelope subscription through the same hub client; async
+   * because the hub attachment itself is established lazily on first hub
+   * operation. */
+  subscribeHub(
+    listener: (event: SdkHubEvent) => void,
+    options?: { sessionId?: string },
+  ): Promise<() => void>;
   dispose(): Promise<void>;
 }
 
@@ -200,6 +245,12 @@ export class BridgeCore {
         return await this.subscribe(params);
       case "unsubscribe":
         return await this.unsubscribe(params);
+      case "enqueue":
+        return await this.enqueue(params);
+      case "list_runs":
+        return await this.listRuns(params);
+      case "subscribe_hub":
+        return await this.subscribeHub(params);
       case "dispose":
         return await this.dispose();
       default:
@@ -342,6 +393,49 @@ export class BridgeCore {
     return null;
   }
 
+  /** Hub-native nonblocking run admission (issue #321). The wire result is
+   * the verified ack `{run_id, accepted_at, queue_position}` — transport
+   * evidence for later exact correlation, never a workflow decision. */
+  private async enqueue(params: unknown): Promise<JsonValue> {
+    const request = validateEnqueueParams(params);
+    const client = this.requireClient();
+    return await this.guarded("enqueue", async () => {
+      const payload = await client.enqueue({ sessionId: request.session_id, prompt: request.prompt });
+      return verifyRunAdmission(payload);
+    });
+  }
+
+  /** Status-only Hub `run.list` observation (issue #321); records stay
+   * opaque and the bridge never interprets run state. */
+  private async listRuns(params: unknown): Promise<JsonValue> {
+    const request = validateListRunsParams(params);
+    const client = this.requireClient();
+    return await this.guarded("list_runs", async () => {
+      const payload = await client.listRuns(request.session_id);
+      return extractRunRecords(payload);
+    });
+  }
+
+  /** Hub-event envelope subscription (issue #321). Shares the subscription
+   * registry and idempotent `unsubscribe` with session subscriptions; the
+   * async hub attach happens inside the client surface. */
+  private async subscribeHub(params: unknown): Promise<JsonValue> {
+    const request = validateSubscribeParams(params);
+    const client = this.requireClient();
+    this.subscriptionCounter += 1;
+    const subscription: BridgeSubscription = {
+      id: `sub-${this.subscriptionCounter}`,
+      filter: request.session_id,
+      sdkUnsubscribe: () => undefined,
+    };
+    subscription.sdkUnsubscribe = await client.subscribeHub(
+      (event) => this.forwardHubEvent(subscription, event),
+      request.session_id !== null ? { sessionId: request.session_id } : undefined,
+    );
+    this.subscriptions.set(subscription.id, subscription);
+    return { subscription_id: subscription.id };
+  }
+
   private async dispose(): Promise<JsonValue> {
     this.clearSubscriptions();
     const client = this.client;
@@ -409,6 +503,32 @@ export class BridgeCore {
     };
     this.writeFrame(eventNotificationFrame(EVENT_NOTIFICATION_METHOD, params));
   }
+
+  private forwardHubEvent(subscription: BridgeSubscription, event: SdkHubEvent): void {
+    if (typeof event.event !== "string" || event.event.length === 0) {
+      return;
+    }
+    const sessionId = event.sessionId;
+    const hasSessionId = typeof sessionId === "string" && sessionId.length > 0;
+    // Session identity comes from the Hub envelope itself, never from the
+    // payload; a filtered subscription drops envelopes it cannot attribute.
+    if (subscription.filter !== null && (!hasSessionId || sessionId !== subscription.filter)) {
+      return;
+    }
+    const payload = event.payload;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      return;
+    }
+    const params: WireHubEventParams = {
+      subscription_id: subscription.id,
+      session_id: hasSessionId ? (sessionId as string) : null,
+      kind: event.event,
+      sequence:
+        typeof event.sequence === "number" && Number.isFinite(event.sequence) ? event.sequence : null,
+      payload: toPlainJson(payload) as JsonObject,
+    };
+    this.writeFrame(eventNotificationFrame(HUB_EVENT_NOTIFICATION_METHOD, params));
+  }
 }
 
 function requireSessionIdParam(params: unknown): string {
@@ -420,6 +540,51 @@ function requireSessionIdParam(params: unknown): string {
     throw new WireProtocolError("invalid_params");
   }
   return sessionId;
+}
+
+/** Verify one Hub `run.enqueue` admission acknowledgement (issue #321).
+ *
+ * The Hub's ok reply must carry the qualified ack shape — non-empty `runId`,
+ * safe-integer `acceptedAt`, non-negative safe-integer `queuePosition`. Any
+ * other ok reply cannot carry a verified run handle, so the outcome stays an
+ * uncertain one (admission may still have happened); it is never reshaped
+ * into a refusal or a synthesized identity. */
+function verifyRunAdmission(payload: unknown): WireRunAdmission {
+  if (!isJsonObject(payload)) {
+    throw new WireBackendError({ kind: "uncertain_outcome" });
+  }
+  const runId = payload["runId"];
+  const acceptedAt = payload["acceptedAt"];
+  const queuePosition = payload["queuePosition"];
+  if (
+    typeof runId !== "string" ||
+    runId.trim().length === 0 ||
+    typeof acceptedAt !== "number" ||
+    !Number.isSafeInteger(acceptedAt) ||
+    typeof queuePosition !== "number" ||
+    !Number.isSafeInteger(queuePosition) ||
+    queuePosition < 0
+  ) {
+    throw new WireBackendError({ kind: "uncertain_outcome" });
+  }
+  return { run_id: runId, accepted_at: acceptedAt, queue_position: queuePosition };
+}
+
+/** Extract the status-only `runs` array from a Hub `run.list` ok reply.
+ *
+ * The qualified reply payload is `{runs: [...]}`. A missing or malformed
+ * array is an unavailable observation — never an empty list, which would be
+ * false "no runs" evidence downstream — so it fails as an uncertain
+ * outcome. Records stay opaque. */
+function extractRunRecords(payload: unknown): JsonValue {
+  if (!isJsonObject(payload)) {
+    throw new WireBackendError({ kind: "uncertain_outcome" });
+  }
+  const runs = payload["runs"];
+  if (!Array.isArray(runs) || !runs.every(isJsonObject)) {
+    throw new WireBackendError({ kind: "uncertain_outcome" });
+  }
+  return runs as JsonValue;
 }
 
 /** Convert an SDK-native value to plain JSON. Dates serialize as ISO strings;

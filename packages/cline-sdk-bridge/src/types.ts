@@ -78,6 +78,29 @@ export type WireSessionEventParams = {
   payload: JsonObject;
 };
 
+/** Wire params of the asynchronous `cline.hub_event` notification (issue
+ * #321). Every field is the Hub envelope's own value, forwarded verbatim:
+ * `session_id` is the envelope's session identity (null when the envelope
+ * carried none), `kind` the envelope event name, `sequence` the durable-log
+ * sequence when present. Run identity is never synthesized here. */
+export type WireHubEventParams = {
+  subscription_id: string;
+  session_id: string | null;
+  kind: string;
+  sequence: number | null;
+  payload: JsonObject;
+};
+
+/** Wire shape of the verified Hub `run.enqueue` admission acknowledgement
+ * (issue #321). The bridge maps the Hub's camelCase ack fields onto this
+ * shape only after verifying them; it is transport evidence for later exact
+ * correlation, never a workflow decision. */
+export type WireRunAdmission = {
+  run_id: string;
+  accepted_at: number;
+  queue_position: number;
+};
+
 export function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

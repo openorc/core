@@ -128,7 +128,38 @@ function closeCodeOf(error: unknown): number | undefined {
   return undefined;
 }
 
-/** Classify one native SDK failure for one bridge operation. */
+/** Bridge operations backed by Hub-native commands through the official
+ * `NodeHubClient` (issue #321). Their transport failures classify as
+ * uncertain outcomes, never as refusals. */
+export const HUB_COMMAND_OPERATIONS: ReadonlySet<string> = new Set([
+  "enqueue",
+  "list_runs",
+  "subscribe_hub",
+]);
+
+/** The pinned 0.0.90 `HubTransportErrorCode` union. These codes report the
+ * client transport, not a Hub answer, so hub-command failures carrying them
+ * are uncertain outcomes. */
+export const HUB_TRANSPORT_CODES: ReadonlySet<string> = new Set([
+  "hub_connect_timeout",
+  "hub_connect_failed",
+  "hub_connection_closed",
+  "hub_connection_not_open",
+]);
+
+/** Classify one native SDK failure for one bridge operation.
+ *
+ * Hub-command operations (`enqueue`, `list_runs`, `subscribe_hub`, issue
+ * #321) follow the three-way admission discipline: a positively received
+ * Hub refusal keeps its safe machine code, while a client-side dispatch
+ * timeout (`hub_command_timeout`, synthesized by the pinned SDK client) and
+ * any pinned Hub transport code (`hub_connect_timeout`, `hub_connect_failed`,
+ * `hub_connection_closed`, `hub_connection_not_open`) resolve as
+ * `uncertain_outcome` — a lost acknowledgement or transport loss after a
+ * possibly-dispatched command is never proof of non-delivery or refusal, and
+ * never authorizes a resend. Established session-operation and connect
+ * classification is unchanged.
+ */
 export function classifyNativeError(operation: string, error: unknown): WireBackendError {
   if (codeOf(error) === "session_not_found") {
     return new WireBackendError({ kind: "session_not_found" });
@@ -136,6 +167,17 @@ export function classifyNativeError(operation: string, error: unknown): WireBack
 
   const safeCode = safeCodeOf(error);
   if (safeCode !== undefined) {
+    if (safeCode === "hub_command_timeout") {
+      // A client-side dispatch timeout is never a Hub answer: the command
+      // may already have been admitted, so the outcome stays uncertain.
+      return new WireBackendError({ kind: "uncertain_outcome" });
+    }
+    if (HUB_COMMAND_OPERATIONS.has(operation) && HUB_TRANSPORT_CODES.has(safeCode)) {
+      // Hub transport failure around a possibly-dispatched hub command:
+      // admission and refusal are both unproven; downstream reconciles
+      // against public reads instead of resending.
+      return new WireBackendError({ kind: "uncertain_outcome" });
+    }
     const closeCode = closeCodeOf(error);
     const data: WireBackendErrorData = { kind: "sdk_operation_rejected", code: safeCode };
     if (closeCode !== undefined) {

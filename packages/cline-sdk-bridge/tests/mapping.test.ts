@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { FakeClineCoreClient, type RecordedCall } from "./helpers/fake-client.js";
 import { fixedFactory, requestLine, resultOf, startTestBridge, until } from "./helpers/test-bridge.js";
-import { buildRemoteOptions } from "../src/sdk-client.js";
+import { buildHubClientOptions, buildRemoteOptions } from "../src/sdk-client.js";
 import type { JsonObject } from "../src/types.js";
 
 const CONNECT = { endpoint: "wss://hub.example/remote", client_identity: "openorc-core/test", auth_token: "tok" };
@@ -150,6 +150,30 @@ describe("connect remote-options mapping", () => {
   it("omits authToken when the D2 config carries none", () => {
     const options = buildRemoteOptions({ endpoint: "wss://hub.example/remote", client_identity: "openorc-core/test" });
     expect(options.endpoint).toBe("wss://hub.example/remote");
+    expect(options.clientType).toBe("openorc-core/test");
+    expect(Object.hasOwn(options, "authToken")).toBe(false);
+  });
+});
+
+describe("hub client options mapping (issue #321)", () => {
+  it("maps the same admitted endpoint, auth, and identity onto the hub client", () => {
+    const options = buildHubClientOptions({
+      endpoint: "https://hub.example/ws",
+      client_identity: "openorc-core/test",
+      auth_token: "attach-token",
+      remote_options: { workspaceRoot: "/workspace", clientType: "overridden" },
+    });
+    // The endpoint is normalized to its WebSocket scheme for the hub client;
+    // explicit D2 fields stay authoritative after the verbatim spread.
+    expect(options.url).toBe("wss://hub.example/ws");
+    expect(options.clientType).toBe("openorc-core/test");
+    expect(options.authToken).toBe("attach-token");
+    expect((options as JsonObject).workspaceRoot).toBe("/workspace");
+  });
+
+  it("omits authToken when the D2 config carries none", () => {
+    const options = buildHubClientOptions({ endpoint: "wss://hub.example/remote", client_identity: "openorc-core/test" });
+    expect(options.url).toBe("wss://hub.example/remote");
     expect(options.clientType).toBe("openorc-core/test");
     expect(Object.hasOwn(options, "authToken")).toBe(false);
   });

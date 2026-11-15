@@ -34,7 +34,9 @@ from typing import Any
 
 __all__ = [
     "ClineConstructionMode",
+    "ClineHubEvent",
     "ClineRemoteConfig",
+    "ClineRunAdmission",
     "ClineSessionEvent",
     "ClineStartRequest",
     "ClineStartResult",
@@ -231,6 +233,35 @@ class ClineStartResult:
 
 
 @dataclass(frozen=True)
+class ClineRunAdmission:
+    """The verified Hub admission acknowledgement for one enqueued run.
+
+    ``run_id`` is the exact opaque external run identifier the Hub
+    acknowledged, ``accepted_at`` its admission timestamp, and
+    ``queue_position`` the acknowledged queue position. This is transport
+    evidence for later exact correlation — never a workflow decision, never
+    proof of execution, formal-result delivery, or success — and it is
+    deliberately distinct from a ``send`` outcome: Hub admission is decoupled
+    from execution, and accepted failed runs may emit no terminal event at
+    all.
+
+    All three fields are safe machine values carrying no prompt or
+    transcript content, so the representation carries them in full.
+    """
+
+    run_id: str
+    accepted_at: int
+    queue_position: int
+
+    def __post_init__(self) -> None:
+        _require_non_empty_string("ClineRunAdmission", "run_id", self.run_id)
+        if type(self.accepted_at) is not int:
+            raise ValueError("ClineRunAdmission.accepted_at must be an integer")
+        if type(self.queue_position) is not int or self.queue_position < 0:
+            raise ValueError("ClineRunAdmission.queue_position must be a non-negative integer")
+
+
+@dataclass(frozen=True)
 class ClineSessionEvent:
     """One forwarded ``CoreSessionEvent`` observation, retained verbatim.
 
@@ -254,6 +285,40 @@ class ClineSessionEvent:
         return (
             f"ClineSessionEvent(session_id={self.session_id!r}, "
             f"kind={self.kind!r}, payload=<withheld>)"
+        )
+
+
+@dataclass(frozen=True)
+class ClineHubEvent:
+    """One forwarded Hub event envelope observation, retained verbatim.
+
+    Every field is the Hub envelope's own value, forwarded without
+    interpretation: ``session_id`` is the envelope's own session identifier
+    (None when the envelope carried none — never derived from payload
+    contents), ``kind`` its event name, ``sequence`` its durable-log sequence
+    when the Hub provided one, and ``payload`` the opaque JSON event payload.
+    Terminal run events carry neither run nor request identity, and identity
+    is never synthesized here. The payload is excluded from ``repr`` because
+    its SDK-native contents may be sensitive.
+    """
+
+    session_id: str | None
+    kind: str
+    sequence: int | None
+    payload: JsonObject
+
+    def __post_init__(self) -> None:
+        if self.session_id is not None:
+            _require_non_empty_string("ClineHubEvent", "session_id", self.session_id)
+        _require_non_empty_string("ClineHubEvent", "kind", self.kind)
+        if self.sequence is not None and type(self.sequence) is not int:
+            raise ValueError("ClineHubEvent.sequence must be None or an integer")
+        _require_json_object("ClineHubEvent", "payload", self.payload)
+
+    def __repr__(self) -> str:
+        return (
+            f"ClineHubEvent(session_id={self.session_id!r}, "
+            f"kind={self.kind!r}, sequence={self.sequence!r}, payload=<withheld>)"
         )
 
 
