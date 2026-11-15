@@ -155,3 +155,24 @@ class MergeConfirmedReconciliationPendingError(ApplicationError):
         super().__init__(message)
         self.merge_commit_sha = merge_commit_sha
         self.expected_head_sha = expected_head_sha
+
+
+class HubObservationRegistrationRefusedError(ApplicationError):
+    """Positive hub-run observation could not be established for an exact
+    session (detached agent turns, issue #323).
+
+    The typed refusal the detached dispatch gates the Hub ``run.enqueue``
+    on: the pinned SDK cannot replay an arbitrary missed terminal result,
+    so a dispatch whose completion observation this observer owns must not
+    enqueue without an actively subscribed session. The refusal is a
+    positively proven pre-effect condition — the run was never enqueued —
+    and the caller routes it through the existing pre-effect failure
+    machinery instead of dispatching unobserved. ``reason`` is a safe
+    machine token from the observation service's closed refusal vocabulary;
+    no endpoint, credential, payload, or prompt material ever appears in
+    the message or the reason.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
