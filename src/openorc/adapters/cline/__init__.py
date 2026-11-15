@@ -54,6 +54,13 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
+from openorc.adapters.cline.hub_projection import (
+    ClineHubRunStartObservation,
+    HubRunProjectionError,
+    project_hub_run_start,
+    project_hub_run_statuses,
+    project_terminal_hub_run,
+)
 from openorc.adapters.cline.reconciliation import (
     ClineDispatchCheckpoint,
     ClineReconciliationResult,
@@ -91,6 +98,7 @@ __all__ = [
     "ClineDispatchCheckpoint",
     "ClineFinishActivity",
     "ClineHubEvent",
+    "ClineHubRunStartObservation",
     "ClineIterationActivity",
     "ClineNoticeActivity",
     "ClineNoticeCategory",
@@ -118,12 +126,16 @@ __all__ = [
     "ClineTurnFinishReason",
     "ClineUsageActivity",
     "ConnectionControlEndpointError",
+    "HubRunProjectionError",
     "JsonObject",
     "Subscription",
     "classify_backend_failure",
     "parse_control_endpoint_url",
+    "project_hub_run_start",
+    "project_hub_run_statuses",
     "project_qualifying_pulse",
     "project_session_event",
+    "project_terminal_hub_run",
     "project_usage_summary",
     "resolve_connection_control_endpoint",
 ]

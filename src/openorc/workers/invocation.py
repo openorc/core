@@ -59,6 +59,7 @@ from openorc.workers.bootstrap import create_redis_client
 from openorc.workers.queues import queue_name
 
 if TYPE_CHECKING:
+    from openorc.services.cline_hub_observation import HubRunObserver
     from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
     from openorc.services.task_planning_bootstrap import TaskBootstrapRuntimeComposition
     from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
@@ -1047,6 +1048,34 @@ UserTokenResolverProvider = Callable[[Settings], "ProfileUserAccessTokenResolver
 ReviewerNeutralDirectoryProvider = Callable[[Settings], str]
 ContinuationSubmitterProvider = Callable[[Settings], "OperationSubmitter"]
 TerminalCleanupRuntimeProvider = Callable[[Settings], "TerminalCheckoutCleanupRuntime"]
+HubRunObserverProvider = Callable[[Settings], "HubRunObserver"]
+
+
+class LateBoundHubRunObserver:
+    """The late-bound regular-mode hub-run-observation provider (issue #323).
+
+    The serving lifespan owns exactly one hub-run observation host per
+    regular-mode serving process; it binds that observer explicitly after
+    the dependencies object exists, exactly like the process's own
+    continuation submitter. Until bound, resolution fails closed; the
+    binding carries no credentials, live handles, or workflow authority.
+    Queue mode never binds one: no long-lived observer runs inside a queue
+    worker (issue #323 non-goal).
+    """
+
+    def __init__(self) -> None:
+        self._observer: HubRunObserver | None = None
+
+    def bind(self, observer: HubRunObserver) -> None:
+        """Bind the serving process's own hub-run observation host."""
+        self._observer = observer
+
+    def __call__(self, settings: Settings) -> HubRunObserver:
+        if self._observer is None:
+            raise ExecutionModeDependencyError(
+                "no process-local hub-run observer is bound for detached-run observation"
+            )
+        return self._observer
 
 
 class LateBoundProcessSubmitter:
@@ -1102,6 +1131,7 @@ class OperationDependencies:
     reviewer_neutral_directory_provider: ReviewerNeutralDirectoryProvider | None = None
     continuation_submitter_provider: ContinuationSubmitterProvider | None = None
     terminal_cleanup_runtime_provider: TerminalCleanupRuntimeProvider | None = None
+    hub_run_observer_provider: HubRunObserverProvider | None = None
 
     def database_pool(self) -> DatabasePool:
         """Resolve the executing process's database pool."""
@@ -1174,6 +1204,30 @@ class OperationDependencies:
             )
         provider.bind(submitter)
 
+    def hub_run_observer(self) -> HubRunObserver:
+        """Resolve the executing process's hub-run observation host."""
+        if self.hub_run_observer_provider is None:
+            raise ExecutionModeDependencyError(
+                "no hub-run observer provider is configured for operation dependencies"
+            )
+        return self.hub_run_observer_provider(self.settings)
+
+    def bind_regular_process_hub_run_observer(self, observer: HubRunObserver) -> None:
+        """Bind the serving process's own hub-run observation host (issue #323).
+
+        Regular-mode wiring only: the serving lifespan binds the one
+        observation host it constructed and started. A provider that is not
+        the late-bound process seam is a wiring error; queue mode never
+        binds an observer.
+        """
+        provider = self.hub_run_observer_provider
+        if not isinstance(provider, LateBoundHubRunObserver):
+            raise ExecutionModeDependencyError(
+                "operation dependencies are not wired with the late-bound "
+                "regular-mode hub-run observer"
+            )
+        provider.bind(observer)
+
 
 def build_default_operation_dependencies(settings: Settings) -> OperationDependencies:
     """Wire the real process-local providers for an executing process.
@@ -1208,6 +1262,7 @@ def build_default_operation_dependencies(settings: Settings) -> OperationDepende
         reviewer_neutral_directory_provider=default_reviewer_neutral_directory_provider,
         continuation_submitter_provider=continuation_provider,
         terminal_cleanup_runtime_provider=default_terminal_cleanup_runtime_provider,
+        hub_run_observer_provider=LateBoundHubRunObserver(),
     )
 
 

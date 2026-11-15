@@ -12,6 +12,7 @@ from openorc.api.app import app as module_app
 from openorc.api.app import create_app
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import shutdown_observability
+from openorc.services.cline_hub_observation import HubRunObserver
 from openorc.workers.invocation import (
     OperationInvocation,
     OperationKind,
@@ -50,6 +51,7 @@ def test_create_app_is_executor_free(settings_factory: Callable[..., Settings]) 
 
     assert not hasattr(app.state, "operation_executor")
     assert not hasattr(app.state, "operation_submitter")
+    assert not hasattr(app.state, "hub_run_observer")
 
 
 def test_healthz_returns_deterministic_payload(settings_factory: Callable[..., Settings]) -> None:
@@ -75,6 +77,11 @@ def test_lifespan_owns_exactly_one_executor_in_regular_mode(
         executor = app.state.operation_executor
         assert isinstance(executor, BoundedLocalExecutor)
         assert app.state.operation_submitter is executor
+        # The process-owned hub-run observation host (issue #323) is started
+        # beside the executor and disposed deterministically at teardown.
+        observer = app.state.hub_run_observer
+        assert isinstance(observer, HubRunObserver)
+        assert observer.disposed is False
         assert client.get("/healthz").status_code == 200
 
     # Teardown stopped admission: the executor refuses further submissions.
@@ -86,6 +93,7 @@ def test_lifespan_owns_exactly_one_executor_in_regular_mode(
     )
     assert refused.outcome is SubmissionOutcome.KNOWN_REFUSED
     assert refused.refusal_reason is SubmissionRefusalReason.EXECUTOR_SHUTTING_DOWN
+    assert observer.disposed is True
     shutdown_observability()
 
 
@@ -100,6 +108,8 @@ def test_lifespan_starts_no_executor_in_queue_mode(
     with TestClient(app) as client:
         assert app.state.operation_executor is None
         assert isinstance(app.state.operation_submitter, RQQueueOperationSubmission)
+        # No long-lived hub-run observer runs in queue mode (issue #323).
+        assert app.state.hub_run_observer is None
         assert client.get("/healthz").status_code == 200
 
     shutdown_observability()

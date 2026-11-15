@@ -18,6 +18,7 @@ from openorc.api.routers.health import router as health_router
 from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
+from openorc.services.cline_hub_observation import HubRunObserver
 from openorc.services.errors import ApplicationError
 from openorc.workers.invocation import (
     build_default_operation_dependencies,
@@ -39,22 +40,32 @@ def _serving_lifespan(
     including each reload subprocess, and never in a launcher parent.
 
     In regular execution mode the lifespan starts and owns exactly one
-    bounded local executor per serving process (issue #86); queue mode
-    starts no executor and never touches the queue backend. No executor is
-    created by module import, ``create_app()``, or a request. Observability
-    teardown deliberately performs no process-global shutdown; the terminal
-    flush is owned by the process-exit hook registered by initialization
-    (issue #108). Executor teardown stops new admission and drains within
-    the bounded default timeout, asserting nothing about any outstanding
-    operation's outcome.
+    bounded local executor per serving process (issue #86) and exactly one
+    process-owned hub-run observation host (issue #323) — started before the
+    executor so observation exists before any dispatch, and disposed after
+    the executor drained. Queue mode starts neither and never touches the
+    queue backend. No executor or observer is created by module import,
+    ``create_app()``, or a request. Observability teardown deliberately
+    performs no process-global shutdown; the terminal flush is owned by the
+    process-exit hook registered by initialization (issue #108). Executor
+    teardown stops new admission and drains within the bounded default
+    timeout, asserting nothing about any outstanding operation's outcome.
     """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         initialize_observability(settings, ObservabilitySurface.API)
         executor: BoundedLocalExecutor | None = None
+        observer: HubRunObserver | None = None
         if settings.execution_mode is ExecutionMode.REGULAR:
             dependencies = build_default_operation_dependencies(settings)
+            # The process-owned hub-run observation host (issue #323):
+            # started before any operation can dispatch and disposed after
+            # the executor drained, so a registration from an in-flight
+            # operation is still served during teardown.
+            observer = HubRunObserver(dependencies.database_pool)
+            observer.start()
+            dependencies.bind_regular_process_hub_run_observer(observer)
             executor = BoundedLocalExecutor(
                 workers=settings.local_executor_workers,
                 pending=settings.local_executor_pending,
@@ -66,12 +77,15 @@ def _serving_lifespan(
             # admitted back into the same bounded executor (issue #253).
             dependencies.bind_regular_process_submitter(executor)
         app.state.operation_executor = executor
+        app.state.hub_run_observer = observer
         app.state.operation_submitter = build_operation_submitter(settings, local_executor=executor)
         try:
             yield
         finally:
             if executor is not None:
                 executor.shutdown()
+            if observer is not None:
+                observer.dispose()
 
     return lifespan
 
