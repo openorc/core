@@ -2406,3 +2406,51 @@ def test_unproven_enqueue_rejection_leaves_the_receipt_claimed_and_uncertain() -
         sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
     ]
     assert len(inserts) == 1
+
+
+def test_recognized_hub_admission_refusal_marks_the_receipt_refused() -> None:
+    """Issue #324 review fix: a recognized Hub admission refusal
+    (``run_admission_rejected``/``hub_draining``) is a positively proven
+    pre-effect refusal — the dispatch classifies it known and marks the
+    initialization receipt REFUSED so a never-admitted run cannot hold the
+    session's single-outstanding slot."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    refused_row = _initialization_receipt_row(workspace_id, task_id, binding[0], status="refused")
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+        + [refused_row]
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [AgentRuntimeUnavailableError("the hub refused the enqueue ('run_admission_rejected')")],
+    )
+
+    with pytest.raises(ExternalOperationRejectedError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            adapter,  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    refusals = [sql for sql, _ in conn.executed if "set status = 'refused'" in sql]
+    assert len(refusals) == 1
+    # The admission attempt itself was made (and refused); the acknowledged
+    # correlation evidence is the refused receipt, and no attach followed.
+    assert len(adapter.admissions) == 1
+    assert not any(
+        "update openorc.task_hub_run_receipts" in sql and "set status = 'admitted'" in sql
+        for sql, _ in conn.executed
+    )

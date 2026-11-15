@@ -4204,3 +4204,21 @@ def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_a
 
     with pytest.raises(AgentRuntimeUnavailableError):
         adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
+    """Issue #324 review fix: ``run_admission_rejected`` and ``hub_draining``
+    are the Hub's positively identified admission refusals — the Hub answered
+    with a definitive rejection, so the run was never admitted and the
+    classification stays known, never an uncertainty that strands the
+    receipt."""
+    for code in ("run_admission_rejected", "hub_draining"):
+        backend = FakeClineSdkBackend()
+        resolver = ScriptedResolver(creation=_context())
+        backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+        adapter = ClineAdapter(backend, resolver)
+        adapter.allocate_detached_session(_creation_request())
+        backend.queue_enqueue("cline-session-9", ClineSdkOperationRejectedError(code))
+
+        with pytest.raises(AgentRuntimeUnavailableError):
+            adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)

@@ -79,6 +79,16 @@ EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset({"start", "send", "stop"
 # must never lose its outstanding correlation evidence (issue #324).
 _UNPROVEN_EFFECT_OPERATIONS: Final[frozenset[str]] = EFFECTFUL_OPERATIONS | {"enqueue"}
 
+# The Hub-run admission operation and the Hub's positively identified
+# admission refusals: the Hub answered with a definitive rejection of the
+# enqueue itself (run-queue capacity, a draining Hub), so the run was never
+# admitted — positive evidence of non-effect, classified known (issue #324).
+# Only the enqueue carries these codes.
+_HUB_RUN_ADMISSION: Final = "enqueue"
+_HUB_ADMISSION_REFUSED_CODES: Final[frozenset[str]] = frozenset(
+    {"run_admission_rejected", "hub_draining"}
+)
+
 
 def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> AgentRuntimeError:
     """Translate one #71 backend failure into the normalized #67 taxonomy."""
@@ -111,6 +121,11 @@ def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> 
             return AgentRuntimeUnavailableError(
                 f"the remote hub could not be reached for the {operation} ({error.code!r})"
             )
+        if operation == _HUB_RUN_ADMISSION and error.code in _HUB_ADMISSION_REFUSED_CODES:
+            # The Hub definitively refused the admission itself: the run was
+            # never admitted, so this is a positively proven pre-effect
+            # refusal — never an uncertainty that strands the receipt.
+            return AgentRuntimeUnavailableError(f"the hub refused the {operation} ({error.code!r})")
         if error.code == _HUB_CONNECTION_CLOSED:
             if operation in _UNPROVEN_EFFECT_OPERATIONS:
                 return AgentRuntimeUncertainOutcomeError(
