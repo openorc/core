@@ -48,6 +48,7 @@ from openorc.domain.hub_runs import (
 from openorc.domain.intents import canonical_intent_outcome
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.sessions import canonical_effective_config_snapshot
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
@@ -56,12 +57,15 @@ __all__ = [
     "attach_task_hub_run_acknowledgement",
     "consume_task_hub_run_early_completion",
     "create_task_hub_run_receipt",
+    "find_outstanding_session_initialization_receipt",
     "get_last_consumed_hub_run_sequence",
+    "get_latest_session_initialization_receipt",
     "get_outstanding_task_hub_run_receipt",
     "get_outstanding_task_hub_run_receipt_for_update",
     "get_task_hub_run_early_completion_for_update",
     "get_task_hub_run_receipt",
     "get_task_hub_run_receipt_for_update",
+    "list_outstanding_session_initialization_receipts",
     "mark_task_hub_run_receipt_contradicted",
     "refuse_task_hub_run_receipt",
     "settle_task_hub_run_receipt",
@@ -72,7 +76,19 @@ _RECEIPT_COLUMNS = (
     "id, workspace_id, task_id, task_agent_session_id, operation, "
     "original_attempt_kind, original_attempt_id, expected_formal_family, "
     "run_id, status, outcome, contradicted_at, claimed_at, admitted_at, "
-    "settled_at, updated_at"
+    "settled_at, updated_at, created_external_session_id, "
+    "effective_config_snapshot, created_session_provenance"
+)
+
+# The same receipt projection aliased for the establishment settlement's
+# binding join, where the authoritative ``task_agent_sessions`` row shares
+# the statement.
+_RECEIPT_COLUMNS_ALIASED = (
+    "r.id, r.workspace_id, r.task_id, r.task_agent_session_id, r.operation, "
+    "r.original_attempt_kind, r.original_attempt_id, r.expected_formal_family, "
+    "r.run_id, r.status, r.outcome, r.contradicted_at, r.claimed_at, "
+    "r.admitted_at, r.settled_at, r.updated_at, r.created_external_session_id, "
+    "r.effective_config_snapshot, r.created_session_provenance"
 )
 
 _EARLY_COMPLETION_COLUMNS = (
@@ -104,6 +120,9 @@ def _receipt_from_row(row: Sequence[Any]) -> TaskHubRunReceipt:
         admitted_at=None if row[13] is None else normalize_utc(row[13]),
         settled_at=None if row[14] is None else normalize_utc(row[14]),
         updated_at=normalize_utc(row[15]),
+        created_external_session_id=row[16],
+        effective_config_snapshot=row[17],
+        created_session_provenance=row[18],
     )
 
 
@@ -134,6 +153,9 @@ def create_task_hub_run_receipt(
     original_attempt_kind: OriginalAttemptKind,
     original_attempt_id: UUID,
     expected_formal_family: str,
+    created_external_session_id: str | None = None,
+    effective_config_snapshot: Mapping[str, object] | None = None,
+    created_session_provenance: Mapping[str, object] | None = None,
 ) -> TaskHubRunReceipt:
     """Insert one claimed Hub-run receipt exactly once, before any enqueue.
 
@@ -145,6 +167,13 @@ def create_task_hub_run_receipt(
     translate. The composite subject foreign keys keep every receipt in the
     same Task/Workspace scope; violations surface as
     ``ForeignKeyViolation``. ``claimed_at`` is database-stamped.
+
+    The detached session establishment (issue #324) passes its minimum
+    separate provisional establishment evidence: the allocation-returned
+    provisional external identity, the dispatch-composed non-secret
+    effective configuration snapshot, and the optional runtime-reported
+    provenance. Every other operation passes none; the table's conditional
+    coherence CHECKs enforce the per-operation shape either way.
     """
     _require_uuid(workspace_id, "workspace_id")
     _require_uuid(task_id, "task_id")
@@ -156,12 +185,36 @@ def create_task_hub_run_receipt(
         raise ValueError("create_task_hub_run_receipt requires an OriginalAttemptKind")
     if not isinstance(expected_formal_family, str) or not expected_formal_family.strip():
         raise ValueError("create_task_hub_run_receipt requires a non-empty formal family")
+    if created_external_session_id is not None and (
+        not isinstance(created_external_session_id, str) or not created_external_session_id.strip()
+    ):
+        raise ValueError(
+            "create_task_hub_run_receipt requires a non-empty provisional external "
+            "session identity when one is supplied"
+        )
+    if effective_config_snapshot is not None and not isinstance(effective_config_snapshot, Mapping):
+        raise ValueError(
+            "create_task_hub_run_receipt requires a mapping effective configuration "
+            "snapshot when one is supplied"
+        )
+    snapshot = (
+        None
+        if effective_config_snapshot is None
+        else dict(canonical_effective_config_snapshot(effective_config_snapshot))
+    )
+    provenance = (
+        None
+        if created_session_provenance is None
+        else dict(canonical_intent_outcome(created_session_provenance))
+    )
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.task_hub_run_receipts "
             "(workspace_id, task_id, task_agent_session_id, operation, "
-            "original_attempt_kind, original_attempt_id, expected_formal_family) "
-            "values (%s, %s, %s, %s, %s, %s, %s) "
+            "original_attempt_kind, original_attempt_id, expected_formal_family, "
+            "created_external_session_id, effective_config_snapshot, "
+            "created_session_provenance) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             f"returning {_RECEIPT_COLUMNS}",
             (
                 workspace_id,
@@ -171,6 +224,9 @@ def create_task_hub_run_receipt(
                 original_attempt_kind.value,
                 original_attempt_id,
                 expected_formal_family,
+                created_external_session_id,
+                Jsonb(snapshot) if snapshot is not None else None,
+                Jsonb(provenance) if provenance is not None else None,
             ),
         ).fetchone()
     assert row is not None
@@ -247,6 +303,107 @@ def get_outstanding_task_hub_run_receipt_for_update(
             (task_agent_session_id,),
         ).fetchone()
     return None if row is None else _receipt_from_row(row)
+
+
+def find_outstanding_session_initialization_receipt(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    created_external_session_id: str,
+) -> TaskHubRunReceipt | None:
+    """Resolve the outstanding initialization receipt of one provisional session.
+
+    The detached session establishment's settlement lookup (issue #324): a
+    CONNECTING binding deliberately carries no bound external identity, so
+    an observed terminal event for an initializing session resolves through
+    its outstanding ``session_initialization`` receipt's provisional
+    ``created_external_session_id`` instead. The resolution joins the
+    authoritative ``task_agent_sessions`` binding so the Workspace and
+    Connection scope is enforced by the binding's own columns — an external
+    identifier never matches across Connections. ``None`` means no
+    outstanding initialization receipt in this scope carries the provisional
+    identity: the observation is unowned and is classified by the calling
+    service, never guessed here.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(connection_id, "connection_id")
+    if not isinstance(created_external_session_id, str) or (
+        not created_external_session_id.strip()
+    ):
+        raise ValueError(
+            "created_external_session_id must be a non-empty opaque external-session identity"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_RECEIPT_COLUMNS_ALIASED} "
+            "from openorc.task_hub_run_receipts r "
+            "join openorc.task_agent_sessions s "
+            "on s.id = r.task_agent_session_id "
+            "and s.task_id = r.task_id and s.workspace_id = r.workspace_id "
+            "where r.workspace_id = %s and s.connection_id = %s "
+            "and r.created_external_session_id = %s "
+            "and r.operation = 'session_initialization' "
+            "and r.status in ('claimed', 'admitted') "
+            "order by r.claimed_at, r.id",
+            (workspace_id, connection_id, created_external_session_id),
+        ).fetchone()
+    return None if row is None else _receipt_from_row(row)
+
+
+def get_latest_session_initialization_receipt(
+    pool: DatabasePool,
+    *,
+    task_agent_session_id: UUID,
+) -> TaskHubRunReceipt | None:
+    """Return the binding's most recent initialization receipt, any status.
+
+    The claimed-bootstrap disposition's establishment provenance read (issue
+    #324): a READY binding whose latest initialization receipt is settled
+    was established by the detached machinery and is provably past its
+    initialization; a READY binding with no initialization receipt at all
+    was established by the blocking handshake (or predates the receipt
+    vocabulary), and its post-establishment bootstrap work stays honestly
+    unprovable. ``None`` means the binding never carried an initialization
+    receipt.
+    """
+    _require_uuid(task_agent_session_id, "task_agent_session_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_RECEIPT_COLUMNS} from openorc.task_hub_run_receipts "
+            "where task_agent_session_id = %s "
+            "and operation = 'session_initialization' "
+            "order by claimed_at desc, id desc "
+            "limit 1",
+            (task_agent_session_id,),
+        ).fetchone()
+    return None if row is None else _receipt_from_row(row)
+
+
+def list_outstanding_session_initialization_receipts(
+    pool: DatabasePool,
+    *,
+    task_id: UUID,
+) -> list[TaskHubRunReceipt]:
+    """List a Task's outstanding initialization receipts, ordered stably.
+
+    The pending-interaction projection's detached-establishment read (issue
+    #324): the outstanding ``session_initialization`` receipts are the
+    durable proof that enqueued initialization turns are still unobserved.
+    Deterministically ordered for stable reads; an empty list is the honest
+    no-outstanding-initialization fact.
+    """
+    _require_uuid(task_id, "task_id")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_RECEIPT_COLUMNS} from openorc.task_hub_run_receipts "
+            "where task_id = %s "
+            "and operation = 'session_initialization' "
+            "and status in ('claimed', 'admitted') "
+            "order by claimed_at, id",
+            (task_id,),
+        ).fetchall()
+    return [_receipt_from_row(row) for row in rows]
 
 
 def attach_task_hub_run_acknowledgement(

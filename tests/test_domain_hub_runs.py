@@ -85,6 +85,9 @@ def test_claimed_receipt_is_the_valid_default() -> None:
     assert receipt.admitted_at is None
     assert receipt.settled_at is None
     assert receipt.outcome == {}
+    assert receipt.created_external_session_id is None
+    assert receipt.effective_config_snapshot is None
+    assert receipt.created_session_provenance is None
     assert task_hub_run_receipt_field_names() == frozenset(
         {
             "id",
@@ -103,6 +106,9 @@ def test_claimed_receipt_is_the_valid_default() -> None:
             "admitted_at",
             "settled_at",
             "updated_at",
+            "created_external_session_id",
+            "effective_config_snapshot",
+            "created_session_provenance",
         }
     )
 

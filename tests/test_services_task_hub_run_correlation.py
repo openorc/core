@@ -29,8 +29,10 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.hub_runs import (
+    SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
+    SETTLEMENT_RESULT_NOT_APPLIED,
     SETTLEMENT_VALIDATED_RESULT,
     HubRunObservationKind,
     ObservedHubRunCompletion,
@@ -216,9 +218,14 @@ def _receipt_row(
     outcome: dict[str, Any] | None = None,
     operation: str = "implementation_execution",
     contradicted: bool = False,
+    created_external_session_id: str | None = None,
 ) -> tuple[Any, ...]:
     admitted_at = _OBSERVED if status in ("admitted", "settled") else None
     settled_at = _OBSERVED if status in ("settled", "refused") else None
+    initialization = operation == "session_initialization"
+    snapshot: dict[str, Any] | None = (
+        {"adapter": "clin", "configuration": {}} if initialization else None
+    )
     return (
         _RECEIPT_ID,
         _WORKSPACE_ID,
@@ -236,6 +243,9 @@ def _receipt_row(
         admitted_at,
         settled_at,
         _OBSERVED,
+        created_external_session_id if initialization else None,
+        snapshot,
+        None,
     )
 
 
@@ -324,6 +334,20 @@ def _script_binding_lookup(
     register(
         _sql_has("from openorc.task_agent_sessions", "connection_id = %s"),
         _session_row() if found else None,
+    )
+
+
+def _script_initialization_receipt_lookup(
+    conn: ScriptedConnection,
+    result: Any,
+) -> None:
+    """Script the establishment fallback's provisional-identity lookup."""
+    conn.on(
+        _sql_has(
+            "from openorc.task_hub_run_receipts r",
+            "created_external_session_id = %s",
+        ),
+        result,
     )
 
 
@@ -840,6 +864,10 @@ def test_settlement_routes_a_resultless_completion_through_the_failure_path(
 def test_settlement_resolves_within_the_authenticated_connection_scope() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn, found=False)
+    # The establishment fallback's provisional-identity lookup (issue #324)
+    # is equally Connection-scoped: no outstanding initialization receipt
+    # resolves a cross-Connection identifier either.
+    _script_initialization_receipt_lookup(conn, None)
     outcome = settle_observed_hub_run_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
@@ -852,7 +880,10 @@ def test_settlement_resolves_within_the_authenticated_connection_scope() -> None
     # The external identifier never matches across Connections: the lookup is
     # scoped to the authenticated Workspace and Connection.
     assert "workspace_id = %s and connection_id = %s and external_session_id = %s" in normalized
-    assert len(conn.executed) == 1
+    fallback_sql = " ".join(conn.executed[1][0].split())
+    assert "s.connection_id = %s" in fallback_sql
+    assert "r.created_external_session_id = %s" in fallback_sql
+    assert len(conn.executed) == 2
 
 
 def test_settlement_is_unowned_without_an_outstanding_receipt() -> None:
@@ -1291,3 +1322,355 @@ def test_settlement_settles_a_current_remediation_result(
     )
     assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
     assert triage.calls == []
+
+
+# --- the establishment (session initialization) settlement, issue #324 ----------
+
+
+_BARRIER_ROW = (None, None, None)  # account-operational barrier: no attempt state
+_READY_PAYLOAD_CANDIDATE = json.dumps(
+    {"type": "session_ready", "schema_version": 1, "status": "READY"}
+)
+_GARBAGE_CANDIDATE = "the agent is still working, no formal object yet"
+
+
+def _initialization_receipt_row(
+    *,
+    status: str = "admitted",
+    external_session_id: str = "ext-init-1",
+    outcome: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    run_id = _RUN_ID if status in ("admitted", "settled") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        _STATE_TOKEN,
+        "session_ready",
+        run_id,
+        status,
+        outcome if outcome is not None else {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        external_session_id,
+        {"adapter": "cline", "configuration": {}},
+        {"reported_provider": "fake-provider"},
+    )
+
+
+def _settled_initialization_row(label: str, *, sequence: int | None = 7) -> tuple[Any, ...]:
+    outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
+    if sequence is not None:
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = sequence
+    return _initialization_receipt_row(status="settled", outcome=outcome)
+
+
+def _connecting_binding_row(external_session_id: str | None = None) -> tuple[Any, ...]:
+    base = list(_session_row())
+    base[5] = external_session_id
+    base[6] = "connecting"
+    base[7] = None
+    base[11] = None
+    return tuple(base)
+
+
+def _ready_binding_row(external_session_id: str) -> tuple[Any, ...]:
+    base = list(_session_row())
+    base[5] = external_session_id
+    base[6] = "ready"
+    return tuple(base)
+
+
+def _script_binding_by_id(conn: ScriptedConnection, row: Any) -> None:
+    conn.on(_sql_has("from openorc.task_agent_sessions", "where id = %s"), row)
+
+
+def _script_workspace_read(conn: ScriptedConnection) -> None:
+    conn.on(
+        _sql_has("from openorc.workspaces", "where id = %s"),
+        (_WORKSPACE_ID, uuid4(), "platform", _OBSERVED, _OBSERVED, 5, "", None),
+    )
+
+
+def _script_barrier(conn: ScriptedConnection) -> None:
+    conn.on(_sql_has("from openorc.profiles", "for key share"), _BARRIER_ROW)
+
+
+def _script_initialize(conn: ScriptedConnection, ready_row: Any) -> None:
+    conn.on(
+        _sql_has(
+            "update openorc.task_agent_sessions",
+            "set external_session_id = %s",
+        ),
+        ready_row,
+    )
+
+
+def _establishment_observation(
+    *,
+    kind: HubRunObservationKind = HubRunObservationKind.RUN_COMPLETED,
+    result_candidate: str | None = _READY_PAYLOAD_CANDIDATE,
+) -> ObservedHubRunCompletion:
+    return ObservedHubRunCompletion(
+        external_session_id="ext-init-1",
+        kind=kind,
+        sequence=7,
+        result_candidate=result_candidate,
+    )
+
+
+def test_initialization_settlement_finalizes_ready_atomically_with_the_receipt(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row())
+    _script_receipt_for_update(conn, _initialization_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_binding_by_id(conn, _connecting_binding_row())
+    _script_workspace_read(conn)
+    _script_barrier(conn)
+    _script_initialize(
+        conn,
+        _ready_binding_row("ext-init-1"),
+    )
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_VALIDATED_RESULT))
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(),
+    )
+
+    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.operation.value == "session_initialization"
+    # The one atomic READY write carries the provisional external identity,
+    # the receipt's stored snapshot, and the reported provenance.
+    initialize_writes = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "update openorc.task_agent_sessions set external_session_id" in sql
+    ]
+    assert len(initialize_writes) == 1
+    (_sql, params) = initialize_writes[0]
+    assert params is not None
+    # (external_session_id, snapshot, provider, model, version, task, role)
+    assert params[0] == "ext-init-1"
+    assert params[2] == "fake-provider"
+    settle_writes = [sql for sql, _ in conn.executed if "set status = 'settled'" in sql]
+    assert len(settle_writes) == 1
+    assert triage.calls == []
+
+
+def test_initialization_failure_settles_truthfully_and_reports_level_2(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row())
+    _script_receipt_for_update(conn, _initialization_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_binding_by_id(conn, _connecting_binding_row())
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_current_task(conn, status="planning")
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(kind=HubRunObservationKind.RUN_FAILED),
+    )
+
+    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    # The binding is never rewritten: an observed initialization failure
+    # leaves the binding CONNECTING, never LOST.
+    assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
+    assert len(triage.calls) == 1
+    operation = triage.calls[0]["operation"]
+    assert operation.family.value == "planning_bootstrap_prepare"
+    assert operation.original_attempt_kind.value == "planning_bootstrap_claim"
+    assert triage.calls[0]["report"].effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+    assert triage.calls[0]["report"].error_code.value == "external_operation_failed"
+
+
+def test_invalid_initialization_response_is_a_positively_established_protocol_failure(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row())
+    _script_receipt_for_update(conn, _initialization_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_binding_by_id(conn, _connecting_binding_row())
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_current_task(conn, status="planning")
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(result_candidate=_GARBAGE_CANDIDATE),
+    )
+
+    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
+    assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
+
+
+def test_initialization_completion_before_the_acknowledgement_is_staged(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row(status="claimed"))
+    _script_receipt_for_update(conn, _initialization_receipt_row(status="claimed"))
+    _script_last_consumed_sequence(conn, None)
+    staged_id = uuid4()
+    conn.on(
+        _sql_has("insert into openorc.task_hub_run_early_completions"),
+        (
+            staged_id,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            _RECEIPT_ID,
+            HubRunObservationKind.RUN_COMPLETED.value,
+            7,
+            _READY_PAYLOAD_CANDIDATE,
+            _OBSERVED,
+        ),
+    )
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(),
+    )
+
+    # The early result is staged on the claimed receipt and consumed exactly
+    # once by the acknowledgement attach: never ignored, never duplicated.
+    assert outcome.kind is HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT
+    inserts = [
+        sql
+        for sql, _ in conn.executed
+        if "insert into openorc.task_hub_run_early_completions" in sql
+    ]
+    assert len(inserts) == 1
+
+
+def test_moved_on_binding_settles_the_validated_result_as_not_applied(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row())
+    _script_receipt_for_update(conn, _initialization_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_binding_by_id(conn, _ready_binding_row("ext-init-1"))
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_RESULT_NOT_APPLIED))
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(),
+    )
+
+    assert outcome.kind is HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
+
+
+def test_exact_role_isolation_the_reviewer_settlement_never_touches_the_producer(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn, found=False)
+    _script_initialization_receipt_lookup(conn, _initialization_receipt_row())
+    _script_receipt_for_update(conn, _initialization_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    reviewer_binding = list(_connecting_binding_row())
+    reviewer_binding[3] = WorkflowRole.REVIEWER.value
+    _script_binding_by_id(conn, tuple(reviewer_binding))
+    _script_workspace_read(conn)
+    _script_barrier(conn)
+    ready_row = list(_ready_binding_row("ext-init-1"))
+    ready_row[3] = WorkflowRole.REVIEWER.value
+    _script_initialize(conn, tuple(ready_row))
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_VALIDATED_RESULT))
+
+    outcome = settle_observed_hub_run_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        observation=_establishment_observation(),
+    )
+
+    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    initialize_writes = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "update openorc.task_agent_sessions set external_session_id" in sql
+    ]
+    assert len(initialize_writes) == 1
+    (_sql, params) = initialize_writes[0]
+    assert params is not None
+    # The resolution addressed the receipt's own binding: the Reviewer role,
+    # never the Producer binding.
+    assert params[6] == WorkflowRole.REVIEWER.value
+
+
+def test_establishment_status_only_completed_is_never_success_evidence(
+    triage: _RecordingTriage,
+) -> None:
+    """Issue #324: a no-prompt ``interactive`` session may carry a Cline
+    ``completed``/``endedAt`` record before readiness; the status-only
+    ``run.list`` consultation never treats it as ``session_ready`` or as a
+    settled initialization."""
+    conn = ScriptedConnection()
+    conn.on(
+        _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
+        _initialization_receipt_row(),
+    )
+    classification = classify_acknowledged_hub_run_status(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="completed")],
+    )
+    assert classification.kind is HubRunStatusClassificationKind.NEVER_SUCCESS_EVIDENCE
+    assert triage.calls == []
+    assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
+
+
+def test_establishment_status_only_failed_record_routes_the_establishment_failure(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    conn.on_repeat(
+        _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
+        _initialization_receipt_row(),
+    )
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_current_task(conn, status="planning")
+    classification = classify_acknowledged_hub_run_status(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="failed")],
+    )
+    assert classification.kind is HubRunStatusClassificationKind.CLASSIFIED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["operation"].family.value == "planning_bootstrap_prepare"

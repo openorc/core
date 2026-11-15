@@ -26,6 +26,7 @@ from openorc.workers.invocation import (
     build_production_handlers,
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
+from openorc.workers.task_workflow import bootstrap_readiness_continuation_trigger
 
 API_TITLE = "OpenOrc API"
 
@@ -62,8 +63,18 @@ def _serving_lifespan(
             # The process-owned hub-run observation host (issue #323):
             # started before any operation can dispatch and disposed after
             # the executor drained, so a registration from an in-flight
-            # operation is still served during teardown.
-            observer = HubRunObserver(dependencies.database_pool)
+            # operation is still served during teardown. Its post-commit
+            # bootstrap continuation trigger (issue #324) resumes the
+            # detached-established planning bootstrap when the observed
+            # initialization completions settle readiness; the trigger
+            # resolves the continuation submitter lazily so the binding
+            # order of executor and observer does not matter.
+            observer = HubRunObserver(
+                dependencies.database_pool,
+                bootstrap_continuation_trigger=bootstrap_readiness_continuation_trigger(
+                    dependencies
+                ),
+            )
             observer.start()
             dependencies.bind_regular_process_hub_run_observer(observer)
             executor = BoundedLocalExecutor(

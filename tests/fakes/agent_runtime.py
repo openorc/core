@@ -60,6 +60,8 @@ from uuid import UUID
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.errors import AgentRuntimeError, AgentSessionNotFoundError
 from openorc.adapters.agent_runtime.results import (
+    AgentRunAdmission,
+    AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
     AgentTextResponse,
@@ -249,6 +251,12 @@ class FakeAgentRuntimeAdapter(AgentRuntimeAdapter):
         self._creation_requests: list[AgentSessionCreationRequest] = []
         self._sends: list[SendRecord] = []
         self._controls: list[ControlRecord] = []
+        # The detached session establishment capability (issue #324).
+        self._detached_allocation_outcomes: list[ScriptedOutcome] = []
+        self._admission_outcomes: list[ScriptedOutcome] = []
+        self._detached_allocations: list[AgentSessionCreationRequest] = []
+        self._detached_admissions: list[tuple[str, str]] = []
+        self._admission_number = 0
 
     # --- scripting ---
 
@@ -257,6 +265,19 @@ class FakeAgentRuntimeAdapter(AgentRuntimeAdapter):
         candidate (traveling through the shared #67 → #65 funnel) or a
         normalized #67 error instance."""
         self._creation_outcomes.append(outcome)
+
+    def queue_detached_allocation(self, outcome: ScriptedOutcome) -> None:
+        """Queue the next detached allocation outcome: a normalized #67 error
+        instance, or ``None``-equivalent success (the default when nothing is
+        queued)."""
+        self._detached_allocation_outcomes.append(outcome)
+
+    def queue_detached_admission(self, outcome: ScriptedOutcome) -> None:
+        """Queue the next detached initialization admission outcome: a raw
+        ``session_ready`` candidate (only its presence proves a normalizable
+        admission; no readiness is implied) or a normalized #67 error
+        instance."""
+        self._admission_outcomes.append(outcome)
 
     def queue_send(self, external_session_id: str, outcome: ScriptedOutcome) -> None:
         """Queue the next send outcome for one created session: a raw
@@ -350,6 +371,61 @@ class FakeAgentRuntimeAdapter(AgentRuntimeAdapter):
             reported_model=self._reported_model,
             reported_runtime_version=self._reported_runtime_version,
         )
+
+    # --- detached session establishment capability (issue #324) ---
+
+    def allocate_detached_session(
+        self, request: AgentSessionCreationRequest
+    ) -> AgentSessionAllocation:
+        """Allocate the fresh session with no model-backed turn and no readiness."""
+        self._detached_allocations.append(request)
+        if self._lifecycle is not None:
+            self._lifecycle.append("allocate_detached_session")
+        if self._detached_allocation_outcomes:
+            outcome = self._detached_allocation_outcomes.pop(0)
+            if isinstance(outcome, AgentRuntimeError):
+                raise outcome
+        self._session_number += 1
+        external_session_id = f"fake-session-{self._session_number}"
+        self._sessions[external_session_id] = _FakeSession(
+            role=request.role,
+            workspace_id=request.workspace_id,
+            task_id=request.task_id,
+            initialization="",
+        )
+        return AgentSessionAllocation(
+            external_session_id=external_session_id,
+            reported_provider=self._reported_provider,
+            reported_model=self._reported_model,
+            reported_runtime_version=self._reported_runtime_version,
+        )
+
+    def admit_initialization_run(self, session_id: str, initialization: str) -> AgentRunAdmission:
+        """Admit the composed initialization verbatim as one detached run."""
+        session = self._sessions.get(session_id)
+        if session is None or session.lost:
+            raise AgentSessionNotFoundError(
+                "the exact addressed external session is not live on this runtime"
+            )
+        self._detached_admissions.append((session_id, initialization))
+        if self._lifecycle is not None:
+            self._lifecycle.append("admit_initialization_run")
+        session.initialization = initialization
+        if self._admission_outcomes:
+            outcome = self._admission_outcomes.pop(0)
+            if isinstance(outcome, AgentRuntimeError):
+                raise outcome
+        self._admission_number += 1
+        return AgentRunAdmission(run_id=f"fake-run-{self._admission_number}")
+
+    def detached_allocation_requests(self) -> tuple[AgentSessionCreationRequest, ...]:
+        """Every detached allocation attempt in order, exactly as received."""
+        return tuple(self._detached_allocations)
+
+    def detached_admissions(self) -> tuple[tuple[str, str], ...]:
+        """Every detached admission in order as ``(external_session_id,
+        initialization)`` pairs, exactly as received."""
+        return tuple(self._detached_admissions)
 
     def send(
         self,

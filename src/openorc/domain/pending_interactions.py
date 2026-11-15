@@ -58,6 +58,13 @@ class PendingTaskRuntimeInteractionOperation(StrEnum):
 
     PLANNING_BOOTSTRAP_PREPARE = "planning_bootstrap_prepare"
     PLANNING_BOOTSTRAP_TRANSITION = "planning_bootstrap_transition"
+    # Detached session establishment (issue #324): the initialization turn
+    # whose outstanding ``session_initialization`` hub-run receipt proves the
+    # enqueued initialization is still unobserved. It is a receipt-operation
+    # vocabulary member and a pending-interaction shape; it is not a Level 2
+    # operational-failure family — establishment failures report under the
+    # bootstrap claim's established family exactly as the blocking path did.
+    SESSION_INITIALIZATION = "session_initialization"
     INITIAL_PLAN_DISPATCH = "initial_plan_dispatch"
     PLANNING_REVISE_DISPATCH = "planning_revise_dispatch"
     REVIEWER_REVIEW = "reviewer_review"

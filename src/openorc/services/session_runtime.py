@@ -65,6 +65,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Final, Protocol, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
@@ -74,11 +76,16 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
+    AgentRunAdmission,
+    AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
 )
 from openorc.domain.connections import AdapterType, WorkflowRole
+from openorc.domain.hub_runs import TaskHubRunReceipt
+from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Workspace
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import (
     TaskAgentSession,
     TaskAgentSessionDomainError,
@@ -88,6 +95,10 @@ from openorc.domain.sessions import (
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
+from openorc.persistence.hub_runs import (
+    get_outstanding_task_hub_run_receipt,
+    refuse_task_hub_run_receipt,
+)
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import (
@@ -98,11 +109,16 @@ from openorc.persistence.sessions import (
 )
 from openorc.persistence.tasks import get_task, lock_workspace_task_arbitration
 from openorc.protocol.initialization_assets import compose_initialization
+from openorc.protocol.models import SESSION_READY_FAMILY
+from openorc.services import task_hub_run_correlation as hub_run_correlation
+from openorc.services.cline_hub_observation import HubObservationRefusalReason
 from openorc.services.errors import (
     ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
+    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
 )
@@ -111,11 +127,16 @@ from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
     "ConnectionNotEstablishableError",
+    "DispatchedSessionEstablishment",
+    "EstablishmentObservationRegistrar",
+    "InitializationReadinessOutcome",
     "SessionContinuityConflictError",
     "SessionEstablishmentRecoveryRequiredError",
     "SessionTerminalConflictError",
+    "dispatch_task_agent_session_establishment",
     "end_task_agent_session",
     "establish_task_agent_session",
+    "finalize_observed_initialization_readiness",
     "record_task_agent_session_lost",
 ]
 
@@ -312,6 +333,91 @@ def _assemble_effective_config_snapshot(
         ) from error
 
 
+@dataclass(frozen=True, slots=True)
+class InitializationReadinessOutcome:
+    """The result of one READY finalization attempt (issue #324).
+
+    ``applied`` is ``True`` when this finalization won the conditional write
+    and installed the immutable initialization facts; ``False`` marks the
+    idempotent reclassification — the same exact READY identity was already
+    installed concurrently and nothing is rewritten. Any other reloaded
+    state raises the module's continuity/terminal conflicts.
+    """
+
+    binding: TaskAgentSession
+    applied: bool
+
+
+def _finalize_ready_binding_in_transaction(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    role: WorkflowRole,
+    external_session_id: str,
+    snapshot: Mapping[str, object],
+    reported_provider: str | None,
+    reported_model: str | None,
+    reported_runtime_version: str | None,
+) -> InitializationReadinessOutcome:
+    """Finalize the exact CONNECTING binding to READY within the caller's tx.
+
+    The shared core of both READY finalizations: the blocking creation's
+    phase 4 (issue #130) and the detached initialization settlement's
+    readiness finalization (issue #324). The derived account-operational
+    barrier (#97) runs before the write, so READY is never finalized past a
+    claimed account deletion. The existing atomic persistence primitive is
+    the only writer: it applies only while the binding is CONNECTING with a
+    NULL identity, installs the exact external session identity, the
+    non-secret effective configuration snapshot, and the reported provenance
+    atomically, and stamps ``initialized_at``.
+
+    A rejected conditional write is reclassified from the reloaded binding:
+    the same exact READY identity is idempotent success, a different READY
+    identity is a continuity conflict, LOST/ENDED are terminal conflicts, and
+    a missing/mis-scoped binding fails closed.
+    """
+    workspace = _require_workspace(transaction_pool, workspace_id)
+    require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
+    initialized = initialize_task_agent_session(
+        transaction_pool,
+        task_id=task_id,
+        role=role,
+        external_session_id=external_session_id,
+        effective_config_snapshot=dict(snapshot),
+        reported_provider=reported_provider,
+        reported_model=reported_model,
+        reported_runtime_version=reported_runtime_version,
+    )
+    if initialized is not None:
+        return InitializationReadinessOutcome(initialized, applied=True)
+    existing = _reload_scoped_binding(
+        transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
+    )
+    if existing.lifecycle_status is TaskSessionLifecycleStatus.READY:
+        if existing.external_session_id == external_session_id:
+            # A concurrent finalization of the SAME identity won the
+            # conditional write: idempotent success, never a rewrite.
+            return InitializationReadinessOutcome(existing, applied=False)
+        raise SessionContinuityConflictError(
+            "the task/role session binding is already initialized with a different external session"
+        )
+    if existing.lifecycle_status in (
+        TaskSessionLifecycleStatus.LOST,
+        TaskSessionLifecycleStatus.ENDED,
+    ):
+        raise SessionTerminalConflictError(
+            "the task/role session binding became a terminal historical "
+            "session before READY finalization"
+        )
+    # The conditional write rejected the CONNECTING binding, yet the
+    # reloaded binding is still CONNECTING: an unexpected durable-state
+    # invariant failure that fails closed.
+    raise ConflictError(
+        "the task/role session binding did not finalize READY from its expected CONNECTING state"
+    )
+
+
 def _finalize_ready_binding(
     pool: DatabasePool,
     *,
@@ -324,61 +430,21 @@ def _finalize_ready_binding(
     """Finalize the exact CONNECTING binding to READY exactly once.
 
     One short database-only write transaction (the runtime creation already
-    happened and is never undone). The derived account-operational barrier
-    (#97) is the FIRST lock acquisition, so READY is never finalized past a
-    claimed account deletion. The existing atomic persistence primitive is the
-    only writer: it applies only while the binding is CONNECTING with a NULL
-    identity, installs the exact external session identity, the non-secret
-    effective configuration snapshot, and the reported provenance atomically,
-    and stamps ``initialized_at``.
-
-    A rejected conditional write is reclassified from the reloaded binding:
-    the same exact READY identity is idempotent success, a different READY
-    identity is a continuity conflict, LOST/ENDED are terminal conflicts, and
-    a missing/mis-scoped binding fails closed.
+    happened and is never undone) around the shared READY-finalization core.
     """
     with composed_transaction(pool) as transaction_pool:
-        workspace = _require_workspace(transaction_pool, workspace_id)
-        require_account_operational(transaction_pool, profile_id=workspace.owner_profile_id)
-        initialized = initialize_task_agent_session(
+        outcome = _finalize_ready_binding_in_transaction(
             transaction_pool,
+            workspace_id=workspace_id,
             task_id=task_id,
             role=role,
             external_session_id=created.external_session_id,
-            effective_config_snapshot=dict(snapshot),
+            snapshot=snapshot,
             reported_provider=created.reported_provider,
             reported_model=created.reported_model,
             reported_runtime_version=created.reported_runtime_version,
         )
-        if initialized is not None:
-            return initialized
-        existing = _reload_scoped_binding(
-            transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
-        )
-        if existing.lifecycle_status is TaskSessionLifecycleStatus.READY:
-            if existing.external_session_id == created.external_session_id:
-                # A concurrent finalization of the SAME identity won the
-                # conditional write: idempotent success, never a rewrite.
-                return existing
-            raise SessionContinuityConflictError(
-                "the task/role session binding is already initialized with a "
-                "different external session"
-            )
-        if existing.lifecycle_status in (
-            TaskSessionLifecycleStatus.LOST,
-            TaskSessionLifecycleStatus.ENDED,
-        ):
-            raise SessionTerminalConflictError(
-                "the task/role session binding became a terminal historical "
-                "session before READY finalization"
-            )
-        # The conditional write rejected the CONNECTING binding, yet the
-        # reloaded binding is still CONNECTING: an unexpected durable-state
-        # invariant failure that fails closed.
-        raise ConflictError(
-            "the task/role session binding did not finalize READY from its "
-            "expected CONNECTING state"
-        )
+        return outcome.binding
 
 
 def establish_task_agent_session(
@@ -536,6 +602,491 @@ def establish_task_agent_session(
                 "its known runtime readiness; authoritative recovery is "
                 "required and no second session is created"
             ) from error
+
+
+class DetachedInitializationRuntime(Protocol):
+    """The structural detached-initialization capability of one runtime.
+
+    Runtime-neutral typing for the detached session establishment dispatch
+    (issue #324): concrete adapters implement the two capability methods
+    structurally (the universal ``AgentRuntimeAdapter`` surface is never
+    expanded), and application services duck-type the capability before
+    dispatching. A runtime without the capability is never dispatched
+    detached — it keeps the existing blocking readiness handshake.
+    """
+
+    def allocate_detached_session(
+        self, request: AgentSessionCreationRequest
+    ) -> AgentSessionAllocation:
+        """Allocate the fresh external session; no model turn, no readiness."""
+        ...
+
+    def admit_initialization_run(self, session_id: str, initialization: str) -> AgentRunAdmission:
+        """Admit the composed canonical initialization as one detached run."""
+        ...
+
+
+class EstablishmentObservationRegistrar(Protocol):
+    """The structural registration seam of the process's Hub-run observer.
+
+    The positively-required pre-enqueue gate (issue #323): the establishment
+    dispatch registers the exact created external session before any
+    enqueue, so the pinned SDK's unreplayable terminal result can never be
+    dispatched without active observation. Failures are the observer's typed
+    refusals, routed through the pre-effect failure machinery.
+    """
+
+    def register_establishment_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Register one CONNECTING binding's initialization for observation."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedSessionEstablishment:
+    """One detached initialization dispatch outcome (issue #324).
+
+    The authoritative binding is returned exactly as the durable state now
+    reads: CONNECTING with a NULL external identity while the initialization
+    run is outstanding (the receipt carries the separate provisional
+    establishment evidence), or READY when a staged early completion already
+    settled within this dispatch. ``receipt`` is the binding's outstanding
+    initialization receipt, or ``None`` only for the idempotent
+    already-READY re-entry with nothing outstanding.
+    """
+
+    task_agent_session: TaskAgentSession
+    receipt: TaskHubRunReceipt | None
+
+
+_DISPATCH_SPAN_NAME: Final = "session_runtime.dispatch_task_agent_session_establishment"
+_READINESS_FINALIZE_SPAN_NAME: Final = "session_runtime.finalize_observed_initialization_readiness"
+
+
+def _require_detached_capability(adapter: AgentRuntimeAdapter) -> DetachedInitializationRuntime:
+    """Fail closed unless the adapter implements the detached capability."""
+    allocate = getattr(adapter, "allocate_detached_session", None)
+    admit = getattr(adapter, "admit_initialization_run", None)
+    if not callable(allocate) or not callable(admit):
+        raise InvalidCommandError(
+            "the runtime adapter does not implement the detached initialization capability"
+        )
+    return cast(DetachedInitializationRuntime, adapter)
+
+
+def _require_observation_registrar(
+    observation_registrar: object,
+) -> EstablishmentObservationRegistrar:
+    """Fail closed unless the registrar seam is usable."""
+    register = getattr(observation_registrar, "register_establishment_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the establishment observation registrar does not implement the "
+            "establishment registration seam"
+        )
+    return cast(EstablishmentObservationRegistrar, observation_registrar)
+
+
+def dispatch_task_agent_session_establishment(
+    pool: DatabasePool,
+    adapter: AgentRuntimeAdapter,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    role: WorkflowRole,
+    effective_configuration: Mapping[str, object],
+    original_attempt_kind: OriginalAttemptKind,
+    original_attempt_id: UUID,
+    observation_registrar: EstablishmentObservationRegistrar,
+) -> DispatchedSessionEstablishment:
+    """Dispatch one admitted Task/role binding's initialization as a detached run.
+
+    The detached counterpart of the #130 readiness establishment (issue
+    #324): the same phase 1 binding validation and phase 2 composition, then
+    the initialization becomes one enqueued, independently completed agent
+    turn — one promptless ``start`` of the v1 ``interactive`` construction
+    bundle, one positively-required observation registration, and one
+    ``run.enqueue`` admission of the composed canonical initialization
+    verbatim. No ``send`` and no prompt-inside-``start`` shortcut exists in
+    this path, and no database transaction is ever held across a runtime
+    call.
+
+    Durable semantics:
+
+    - The receipt is the minimum separate provisional establishment
+      evidence, committed with the provisional external identity and the
+      dispatch-composed non-secret configuration snapshot strictly before
+      any enqueue. The authoritative binding stays CONNECTING with a NULL
+      external identity: Hub admission is never readiness, never a bound
+      identity, and never a durable final binding.
+    - An outstanding initialization receipt makes this dispatch an
+      idempotent no-op (the same receipt returned): a repeated bootstrap can
+      never create or enqueue twice. A refused/failed receipt while
+      CONNECTING is the caller's unresolved-establishment classification,
+      not a re-dispatch authorization.
+    - A positively identified refusal (unavailable before effect, Hub
+      rejection, exact-session absence) marks the receipt refused and raises
+      the typed known-failure error; an uncertain allocation or admission
+      leaves the receipt conservatively claimed and raises the typed
+      uncertain error with zero blind replay. Either way the binding remains
+      CONNECTING and is never marked LOST for mere Hub/transport
+      unavailability.
+    - An early completion that arrived before the acknowledgement is staged
+      on the receipt and routed through the ordinary settlement inside the
+      acknowledgement attach, so a validated ``session_ready`` observed
+      before the ``runId`` was persisted is never ignored or duplicated.
+
+    On success the caller owns the post-dispatch sequencing (the bootstrap
+    continuation resumes when the observation settles readiness); the
+    dispatching worker returns without waiting for ``session_ready``.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
+        # Command-shape validation runs INSIDE the use-case span and BEFORE
+        # telemetry annotation: malformed caller-supplied values raise
+        # InvalidCommandError with their raw values never entering telemetry.
+        _require_uuid_command_field(workspace_id, "workspace_id")
+        _require_uuid_command_field(task_id, "task_id")
+        _require_workflow_role(role)
+        _require_runtime_adapter(adapter)
+        _require_effective_configuration(effective_configuration)
+        _require_uuid_command_field(original_attempt_id, "original_attempt_id")
+        if not isinstance(original_attempt_kind, OriginalAttemptKind):
+            raise InvalidCommandError(
+                "dispatch_task_agent_session_establishment requires an OriginalAttemptKind"
+            )
+        registrar = _require_observation_registrar(observation_registrar)
+        runtime = _require_detached_capability(adapter)
+        annotate_span(
+            span,
+            operation=_DISPATCH_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+            workflow_role=role.value,
+        )
+
+        # --- Phase 1: exact admitted-binding validation (short reads, no
+        # locks held, no external I/O). The derived account-operational
+        # barrier (#97) is the FIRST lock acquisition. ---
+        workspace = _require_workspace(pool, workspace_id)
+        require_account_operational(pool, profile_id=workspace.owner_profile_id)
+        _require_scoped_task(pool, workspace_id=workspace_id, task_id=task_id)
+        binding = _require_scoped_binding(
+            pool, workspace_id=workspace_id, task_id=task_id, role=role
+        )
+        # A changed role-binding route is future admission state (issue
+        # #189): it never invalidates this already-admitted
+        # Task/role/Connection, and this operation never re-points the
+        # binding to the new route.
+        if binding.lifecycle_status is TaskSessionLifecycleStatus.READY:
+            # Exact already-READY binding: idempotent success with no
+            # runtime call and no rewrite of the immutable initialization
+            # facts.
+            return DispatchedSessionEstablishment(
+                binding,
+                get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=binding.id),
+            )
+        if binding.lifecycle_status in (
+            TaskSessionLifecycleStatus.LOST,
+            TaskSessionLifecycleStatus.ENDED,
+        ):
+            raise SessionTerminalConflictError(
+                "the existing task/role session binding is a terminal historical session"
+            )
+        connection = get_connection(pool, binding.connection_id)
+        if connection is None or connection.workspace_id != workspace_id:
+            raise NotFoundError("the requested connection is not available in this workspace")
+        if not connection.enabled:
+            raise ConnectionNotEstablishableError(
+                "the connection routed for this role is currently disabled"
+            )
+
+        # --- Replay guard: a durably dispatched establishment is never
+        # re-created or re-enqueued; the outstanding receipt is the proof. ---
+        outstanding = get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=binding.id)
+        if outstanding is not None:
+            return DispatchedSessionEstablishment(binding, outstanding)
+
+        # --- Phase 2: composition (no transaction, no external I/O). The
+        # canonical #66 initialization is composed through the protocol
+        # boundary and the non-secret snapshot is assembled deliberately. ---
+        initialization = compose_initialization(role.value, workspace.guidance)
+        snapshot = _assemble_effective_config_snapshot(connection.adapter, effective_configuration)
+        request = AgentSessionCreationRequest(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=role,
+            initialization=initialization,
+        )
+
+        # --- Phase 3a: allocation (external, no transaction held). One
+        # promptless ``start`` of the complete construction bundle; an
+        # allocated-but-unconfirmed external identity, never readiness. ---
+        try:
+            allocation = runtime.allocate_detached_session(request)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached session allocation ended with an uncertain "
+                "outcome; the binding remains CONNECTING and no second "
+                "allocation is ever attempted"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the detached session allocation is unknown; "
+                "the binding remains CONNECTING and the establishment is "
+                "never re-created"
+            ) from error
+        except AgentRuntimeError as error:
+            raise ExternalOperationFailedError(
+                "the detached session allocation failed before any effect; "
+                "the binding remains CONNECTING"
+            ) from error
+
+        return _admit_detached_initialization(
+            pool,
+            registrar=registrar,
+            runtime=runtime,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=role,
+            binding=binding,
+            initialization=initialization,
+            snapshot=snapshot,
+            allocation=allocation,
+            original_attempt_kind=original_attempt_kind,
+            original_attempt_id=original_attempt_id,
+        )
+
+
+def _admit_detached_initialization(
+    pool: DatabasePool,
+    *,
+    registrar: EstablishmentObservationRegistrar,
+    runtime: DetachedInitializationRuntime,
+    workspace_id: UUID,
+    task_id: UUID,
+    role: WorkflowRole,
+    binding: TaskAgentSession,
+    initialization: str,
+    snapshot: Mapping[str, object],
+    allocation: AgentSessionAllocation,
+    original_attempt_kind: OriginalAttemptKind,
+    original_attempt_id: UUID,
+) -> DispatchedSessionEstablishment:
+    """Record the provisional receipt, register observation, admit, attach."""
+    # --- Phase 3b: the provisional establishment receipt (one short
+    # transaction, strictly before any enqueue). The admission race and the
+    # single-outstanding-run invariant are durable from the first possible
+    # effect. ---
+    try:
+        receipt = hub_run_correlation.record_task_hub_run_receipt(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            task_agent_session_id=binding.id,
+            operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+            original_attempt_kind=original_attempt_kind,
+            original_attempt_id=original_attempt_id,
+            expected_formal_family=SESSION_READY_FAMILY,
+            created_external_session_id=allocation.external_session_id,
+            effective_config_snapshot=dict(snapshot),
+            created_session_provenance=_reported_provenance(allocation),
+        )
+    except ApplicationError:
+        raise
+    except Exception as error:
+        raise SessionEstablishmentRecoveryRequiredError(
+            "the detached establishment receipt could not be durably "
+            "recorded after its known session allocation; authoritative "
+            "recovery is required and no second session is created"
+        ) from error
+
+    # --- Phase 3c: observation registration — the positively-required
+    # pre-enqueue gate. A refusal is a proven pre-effect failure: the
+    # just-recorded receipt is marked refused so a never-dispatched run
+    # cannot hold the session's single-outstanding slot. A typed observer
+    # refusal propagates unchanged with its own safe reason; any other
+    # failure is typed into the same refusal with the safe generic token. ---
+    try:
+        registrar.register_establishment_session(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            task_agent_session_id=binding.id,
+            connection_id=binding.connection_id,
+            external_session_id=allocation.external_session_id,
+        )
+    except HubObservationRegistrationRefusedError:
+        _refuse_dispatched_receipt_quietly(
+            pool, receipt, refusal_kind="observation_registration_refused"
+        )
+        raise
+    except Exception as error:
+        _refuse_dispatched_receipt_quietly(
+            pool, receipt, refusal_kind="observation_registration_refused"
+        )
+        raise HubObservationRegistrationRefusedError(
+            "the initialization observation registration failed before any "
+            "enqueue; the dispatch is a proven pre-effect failure",
+            reason=HubObservationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+        ) from error
+
+    # --- Phase 3d: admission (external, no transaction held). One
+    # ``run.enqueue`` of the composed canonical initialization verbatim. ---
+    try:
+        admission = runtime.admit_initialization_run(allocation.external_session_id, initialization)
+    except AgentRuntimeUncertainOutcomeError as error:
+        logger.warning(
+            "the detached initialization admission ended with an uncertain "
+            "outcome; the receipt stays conservatively claimed and is never "
+            "re-dispatched"
+        )
+        raise ExternalOperationUncertainError(
+            "the outcome of the initialization admission is unknown; the "
+            "receipt stays conservatively claimed and the establishment is "
+            "never re-dispatched"
+        ) from error
+    except AgentRuntimeError as error:
+        # A positively identified refusal (unreachable before effect, Hub
+        # rejection, exact-session absence): proven pre-effect, so the
+        # receipt is marked refused and the dispatch fails known.
+        _refuse_dispatched_receipt_quietly(pool, receipt, refusal_kind="admission_refused")
+        raise ExternalOperationRejectedError(
+            "the initialization admission was refused before any effect; "
+            "the receipt is refused and the binding remains CONNECTING"
+        ) from error
+
+    # --- Phase 3e: the acknowledgement attach (one short transaction). A
+    # staged early completion is consumed exactly once here and routed
+    # through the ordinary settlement, so a validated ``session_ready`` that
+    # finished before the acknowledgement was persisted is correlated, never
+    # ignored or duplicated. ---
+    try:
+        outcome = hub_run_correlation.attach_acknowledged_hub_run(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt_id=receipt.id,
+            run_id=admission.run_id,
+        )
+    except ApplicationError:
+        raise
+    except Exception as error:
+        raise SessionEstablishmentRecoveryRequiredError(
+            "the initialization acknowledgement could not be durably "
+            "attached after its known admission; authoritative recovery is "
+            "required and the establishment is never re-dispatched"
+        ) from error
+    reloaded = _require_scoped_binding(pool, workspace_id=workspace_id, task_id=task_id, role=role)
+    return DispatchedSessionEstablishment(reloaded, outcome.receipt)
+
+
+def _reported_provenance(allocation: AgentSessionAllocation) -> dict[str, object] | None:
+    """Assemble the optional safe provenance facts of one allocation."""
+    provenance: dict[str, object] = {}
+    if allocation.reported_provider is not None:
+        provenance["reported_provider"] = allocation.reported_provider
+    if allocation.reported_model is not None:
+        provenance["reported_model"] = allocation.reported_model
+    if allocation.reported_runtime_version is not None:
+        provenance["reported_runtime_version"] = allocation.reported_runtime_version
+    return provenance or None
+
+
+def _refuse_dispatched_receipt_quietly(
+    pool: DatabasePool, receipt: TaskHubRunReceipt, *, refusal_kind: str
+) -> None:
+    """Mark a claimed receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises; the claimed receipt stays the honest
+    unresolved-establishment state under the accepted v1 recovery bounds and
+    the failure is logged selectively.
+    """
+    try:
+        refused = refuse_task_hub_run_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused initialization receipt could not be durably marked "
+            "(%s); the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        return
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the initialization receipt was no longer claimed when its "
+            "pre-effect refusal was recorded"
+        )
+
+
+def finalize_observed_initialization_readiness(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    role: WorkflowRole,
+    external_session_id: str,
+    effective_configuration: Mapping[str, object],
+    reported_provider: str | None = None,
+    reported_model: str | None = None,
+    reported_runtime_version: str | None = None,
+) -> InitializationReadinessOutcome:
+    """Bind the validated initialization's READY facts within the caller's tx.
+
+    The detached initialization settlement's readiness finalization (issue
+    #324): the existing lifecycle service's atomic CONNECTING -> READY
+    transition, driven from the settlement composition with the receipt
+    locked. The immutable external session identity, the dispatch-composed
+    non-secret effective configuration snapshot, and the initialized
+    timestamp move atomically exactly once; a reloaded same-identity READY
+    binding is the idempotent reclassification (``applied=False``), a
+    different identity raises the continuity conflict, and a LOST/ENDED
+    binding raises the terminal conflict — fail closed, never a rewrite,
+    never a replacement session.
+
+    ``effective_configuration`` is the receipt's stored dispatch-composed
+    canonical snapshot passed through verbatim — the fresh construction and
+    the durable READY snapshot agree by construction, and the settlement
+    never re-derives configuration from mutable state.
+
+    All command-shape validation happens inside the use-case span and before
+    telemetry annotation (the #109 service-span contract).
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _READINESS_FINALIZE_SPAN_NAME) as span:
+        _require_uuid_command_field(workspace_id, "workspace_id")
+        _require_uuid_command_field(task_id, "task_id")
+        _require_workflow_role(role)
+        if not isinstance(external_session_id, str) or not external_session_id.strip():
+            raise InvalidCommandError("external_session_id must be a non-empty string")
+        _require_effective_configuration(effective_configuration)
+        annotate_span(
+            span,
+            operation=_READINESS_FINALIZE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+            workflow_role=role.value,
+        )
+        return _finalize_ready_binding_in_transaction(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=role,
+            external_session_id=external_session_id,
+            snapshot=dict(effective_configuration),
+            reported_provider=reported_provider,
+            reported_model=reported_model,
+            reported_runtime_version=reported_runtime_version,
+        )
 
 
 def record_task_agent_session_lost(

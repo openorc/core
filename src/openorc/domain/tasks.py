@@ -112,7 +112,11 @@ class TaskPlanningBootstrapStage(StrEnum):
     The minimal durable stage/settlement evidence (issue #87) beside the E1b
     one-shot ``planning_bootstrap_claim_token`` (issue #203): a claimed
     bootstrap whose stage is still ``None`` has an outstanding PREPARE/control
-    (or an unresolved establishment); ``prepared`` records the validated
+    (or an unresolved establishment); ``prepare_dispatched`` (issue #324)
+    records that the PREPARE control was durably claimed for dispatch
+    strictly before its runtime send — the replay guard that keeps a
+    possibly-delivered control from ever being re-dispatched by a replayed
+    or raced post-readiness continuation; ``prepared`` records the validated
     ``workspace_result`` settlement of the PREPARE control; and
     ``ready_for_planning`` records the settled planning-context transition —
     a continuation waiting for the first PLAN dispatch. The stages are
@@ -120,6 +124,7 @@ class TaskPlanningBootstrapStage(StrEnum):
     rotate ``state_token`` and never admit a second bootstrap.
     """
 
+    PREPARE_DISPATCHED = "prepare_dispatched"
     PREPARED = "prepared"
     READY_FOR_PLANNING = "ready_for_planning"
 

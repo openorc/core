@@ -21,6 +21,11 @@ domain vocabulary.
   close/end/session-status polling operation is ever added; runtime-specific
   cancel/resume, inspection, telemetry, and lifecycle mechanics stay
   optional/local and never expand this interface.
+- Detached initialization (issue #324) is an optional runtime capability,
+  not a universal operation: `AgentSessionAllocation`/`AgentRunAdmission`
+  are typed normalized results for the allocation-then-admit establishment
+  steps concrete adapters may implement locally, and the universal surface
+  stays untouched.
 - No provider/model selection, no Cline modes or any runtime's native action
   vocabulary, no telemetry streams, no approvals, no filesystem/Git
   operations, and no capability marketplace on the universal interface.

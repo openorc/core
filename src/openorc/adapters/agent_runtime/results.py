@@ -24,6 +24,8 @@ from uuid import UUID
 from openorc.domain.connections import WorkflowRole
 
 __all__ = [
+    "AgentRunAdmission",
+    "AgentSessionAllocation",
     "AgentSessionCreated",
     "AgentSessionCreationRequest",
     "AgentTextResponse",
@@ -85,6 +87,57 @@ class AgentSessionCreated:
             value = getattr(self, name)
             if value is not None and not (isinstance(value, str) and value.strip()):
                 raise ValueError(f"AgentSessionCreated.{name} must be None or a non-empty string")
+
+
+@dataclass(frozen=True)
+class AgentSessionAllocation:
+    """One allocated-but-not-readied external Task/role session (issue #324).
+
+    The detached session establishment's allocation step: the exact opaque
+    external session identity the runtime created for the fresh isolated
+    context — plus the same nullable opaque runtime-reported provenance
+    observations ``AgentSessionCreated`` carries — with NO readiness
+    implied. The initialization turn has not been admitted yet, no
+    ``session_ready`` has been validated, and the allocation is deliberately
+    not a successful ``create_session`` result. The caller records it as
+    provisional establishment evidence while the authoritative binding stays
+    CONNECTING.
+    """
+
+    external_session_id: str
+    reported_provider: str | None = None
+    reported_model: str | None = None
+    reported_runtime_version: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.external_session_id, str) or (not self.external_session_id.strip()):
+            raise ValueError(
+                "AgentSessionAllocation.external_session_id must be a non-empty string"
+            )
+        for name in ("reported_provider", "reported_model", "reported_runtime_version"):
+            value = getattr(self, name)
+            if value is not None and not (isinstance(value, str) and value.strip()):
+                raise ValueError(
+                    f"AgentSessionAllocation.{name} must be None or a non-empty string"
+                )
+
+
+@dataclass(frozen=True)
+class AgentRunAdmission:
+    """One admitted detached initialization run (issue #324).
+
+    ``run_id`` is the exact opaque native run identifier the runtime's
+    nonblocking admission acknowledged. It is transport evidence for later
+    exact correlation — never a workflow decision, never proof of execution,
+    formal-result delivery, or success. Admission is deliberately distinct
+    from a ``send`` outcome and from readiness.
+    """
+
+    run_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not self.run_id.strip():
+            raise ValueError("AgentRunAdmission.run_id must be a non-empty string")
 
 
 @dataclass(frozen=True)

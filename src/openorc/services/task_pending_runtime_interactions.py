@@ -51,6 +51,7 @@ from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.executions import list_task_executions
+from openorc.persistence.hub_runs import list_outstanding_session_initialization_receipts
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import get_task_pull_request_for_task
 from openorc.persistence.sessions import get_task_agent_session
@@ -84,9 +85,12 @@ def _bootstrap_interaction(
     evidence (issue #87), and only in the active phase the bootstrap
     service itself requires (``PLANNING``):
 
-    - no settled stage and no published plan revision: the formal PREPARE
-      control's validated workspace result is still outstanding — the
-      conservatively outstanding establishment/preparation work;
+    - no settled stage and no published plan revision: the bootstrap's
+      outstanding runtime work — the detached initialization while an
+      outstanding ``session_initialization`` receipt proves an enqueued
+      initialization turn is still unobserved (issue #324), and otherwise
+      the formal PREPARE control whose validated workspace result is still
+      outstanding;
     - stage ``prepared``: the PREPARE result already validated, but the
       separate effectful planning-context transition it authorizes has not
       settled — the outstanding ``planning_bootstrap_transition`` work. A
@@ -129,7 +133,27 @@ def _bootstrap_interaction(
             },
             started_at=evidence.stage_settled_at,
         )
-    # No settled stage: the formal PREPARE control itself is outstanding.
+    # No settled stage: the bootstrap's outstanding runtime work is either
+    # the detached initialization (an outstanding ``session_initialization``
+    # receipt proves the enqueued initialization turn is still unobserved,
+    # issue #324) or, once every establishment settled, the formal PREPARE
+    # control itself.
+    initialization_receipts = list_outstanding_session_initialization_receipts(
+        pool, task_id=task.id
+    )
+    if initialization_receipts:
+        return PendingTaskRuntimeInteraction(
+            operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+            workspace_id=workspace_id,
+            task_id=task.id,
+            role=WorkflowRole.PRODUCER,
+            task_agent_session_id=None if producer is None else producer.id,
+            subject={
+                "planning_bootstrap_claim_token": str(evidence.claim_token),
+                "formal_result_outstanding": True,
+            },
+            started_at=initialization_receipts[0].claimed_at,
+        )
     return PendingTaskRuntimeInteraction(
         operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
         workspace_id=workspace_id,

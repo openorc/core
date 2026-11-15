@@ -130,6 +130,8 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
+    AgentRunAdmission,
+    AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
     AgentTextResponse,
@@ -588,6 +590,95 @@ class ClineAdapter(AgentRuntimeAdapter):
             self._session_locks.setdefault(session_id, threading.Lock())
             self._known_identity[session_id] = identity
             return AgentSessionCreated(external_session_id=session_id)
+
+    def allocate_detached_session(
+        self, request: AgentSessionCreationRequest
+    ) -> AgentSessionAllocation:
+        """Allocate the fresh isolated external Cline session, no model turn.
+
+        The detached session establishment's allocation step (issue #324):
+        the same construction-context resolution, validation, and complete
+        construction bundle as ``create_session`` — the fresh Producer =
+        native ACT at the authorized existing repository base, the fresh
+        Reviewer = native PLAN at a neutral non-repository directory —
+        through one public ``ClineCore.start`` **without any prompt** and
+        with the v1 ``interactive`` construction flag. It performs no
+        ``send``, admits no run, validates no ``session_ready``, and implies
+        no readiness: the exact returned external session ID is the
+        allocated-but-unconfirmed context the caller records as provisional
+        establishment evidence while the authoritative binding stays
+        CONNECTING. Later exact-session operations address the allocation
+        through the same identity/lock registration the ready path uses.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.allocate_detached_session") as span:
+            annotate_span(
+                span,
+                operation="cline_adapter.allocate_detached_session",
+                workspace_id=str(request.workspace_id),
+                task_id=str(request.task_id),
+                workflow_role=request.role.value,
+            )
+            context = self._construction_contexts.resolve_construction_context(
+                request.workspace_id, request.task_id, request.role
+            )
+            identity = context.identity
+            if (
+                identity.workspace_id != request.workspace_id
+                or identity.task_id != request.task_id
+                or identity.role is not request.role
+            ):
+                raise AgentRuntimeConfigurationRejectedError(
+                    "the resolved construction context does not address the "
+                    "requested exact Task/role"
+                )
+            _require_construction_inputs(context)
+            mode = (
+                ClineConstructionMode.ACT
+                if request.role is WorkflowRole.PRODUCER
+                else ClineConstructionMode.PLAN
+            )
+            start_request = _build_start_request(context, mode=mode)
+            allocated = self._backend_operation("start", lambda: self._backend.start(start_request))
+            session_id = allocated.session_id
+            self._session_locks.setdefault(session_id, threading.Lock())
+            self._known_identity[session_id] = identity
+            return AgentSessionAllocation(external_session_id=session_id)
+
+    def admit_initialization_run(self, session_id: str, initialization: str) -> AgentRunAdmission:
+        """Admit the canonical initialization as one nonblocking Hub run.
+
+        The detached session establishment's admission step (issue #324):
+        one public Hub ``run.enqueue`` of the composed canonical
+        initialization content verbatim on the exact allocated external
+        session — deliberately never a ``ClineCore.send`` and never a
+        prompt-inside-``start`` shortcut. The acknowledged native ``runId``
+        is transport evidence for later exact correlation, never a workflow
+        decision and never readiness: accepted failed runs may emit no
+        terminal event, and an uncertain admission (timeout, transport
+        loss) never authorizes a resend. Exact-session discipline applies:
+        the addressed session must be one this adapter established.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.admit_initialization_run") as span:
+            annotate_span(span, operation="cline_adapter.admit_initialization_run")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not isinstance(initialization, str) or not initialization.strip():
+                raise ValueError("initialization must be a non-empty string")
+            # Exact-session discipline for the provisional window: a
+            # CONNECTING binding deliberately carries no durable external
+            # identity yet, so the allocation this adapter instance just
+            # performed is the only exact-session proof available. The
+            # durable construction-context resolver takes over after READY.
+            if session_id not in self._known_identity:
+                raise AgentRuntimeConfigurationRejectedError(
+                    "the addressed external session was not allocated by this adapter instance"
+                )
+            admission = self._backend_operation(
+                "enqueue",
+                lambda: self._backend.enqueue(session_id, initialization),
+                session_id=session_id,
+            )
+            return AgentRunAdmission(run_id=admission.run_id)
 
     def send(
         self,
