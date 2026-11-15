@@ -168,7 +168,7 @@ describe("hub client options mapping (issue #321)", () => {
     expect(options.url).toBe("wss://hub.example/ws");
     expect(options.clientType).toBe("openorc-core/test");
     expect(options.authToken).toBe("attach-token");
-    expect((options as JsonObject).workspaceRoot).toBe("/workspace");
+    expect(options).toHaveProperty("workspaceRoot", "/workspace");
   });
 
   it("omits authToken when the D2 config carries none", () => {
