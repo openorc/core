@@ -94,6 +94,13 @@ create table openorc.task_hub_run_receipts (
     foreign key (task_agent_session_id, task_id, workspace_id)
         references openorc.task_agent_sessions (id, task_id, workspace_id)
         on delete cascade,
+    -- The composite identity hook the staged early completions reference:
+    -- PostgreSQL requires the referenced column combination to carry a
+    -- matching unique constraint (the same established pattern as the
+    -- ``unique (id, task_id, workspace_id)`` identities on
+    -- task_agent_sessions, review_iterations, and owner_gates that the F2
+    -- claims' composite subject foreign keys hook onto).
+    unique (id, task_id, workspace_id),
     -- The exact forward-only lifecycle coherence per status.
     check (
         (status = 'claimed'
