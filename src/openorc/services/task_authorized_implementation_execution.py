@@ -153,10 +153,16 @@ from openorc.services.workspace_authorization import require_workspace_task
 __all__ = [
     "ActivitySubscriptionFactory",
     "AuthorizedImplementationExecution",
+    "IMPLEMENTATION_SETTLEMENT_SUBJECT",
+    "OBSERVED_RUN_FAILURE_KIND",
+    "ObservedExecutionSettlementSubject",
     "ProducerRuntimeAttachmentFactory",
     "QualifyingActivityPulse",
+    "REMEDIATION_SETTLEMENT_SUBJECT",
     "complete_resumed_implementation_result",
     "execute_authorized_implementation",
+    "finalize_observed_implementation_failure",
+    "settle_observed_implementation_result",
 ]
 
 logger = logging.getLogger(__name__)
@@ -952,3 +958,188 @@ def complete_resumed_implementation_result(
         transaction_pool, task=task, execution=execution, result=result
     )
     return task, finalized
+
+
+# --- detached Hub-run settlement (issue #322) --------------------------------------
+
+
+# The safe failure-classification token the detached-run settlement records
+# for a positively observed genuine run failure: the run executed and failed
+# (post-dispatch evidence — never a pre-effect classification, and therefore
+# never a safe-retry basis).
+OBSERVED_RUN_FAILURE_KIND: Final[str] = "observed_run_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedExecutionSettlementSubject:
+    """The family-specific subject contract one execution settlement proves.
+
+    Both execution families complete through the same shared finalize, but
+    their eligible Task status and attempt shape differ: the E6
+    implementation attempt runs on an ``implementing`` Task and claims no
+    review iteration; the E9 PR-remediation attempt runs on a ``reviewing``
+    Task and is exactly the durably claimed remediation attempt of one
+    finalized CHANGES_REQUESTED iteration.
+    """
+
+    expected_task_status: TaskStatus
+    remediation_attempt: bool
+
+
+IMPLEMENTATION_SETTLEMENT_SUBJECT: Final[ObservedExecutionSettlementSubject] = (
+    ObservedExecutionSettlementSubject(
+        expected_task_status=TaskStatus.IMPLEMENTING, remediation_attempt=False
+    )
+)
+REMEDIATION_SETTLEMENT_SUBJECT: Final[ObservedExecutionSettlementSubject] = (
+    ObservedExecutionSettlementSubject(
+        expected_task_status=TaskStatus.REVIEWING, remediation_attempt=True
+    )
+)
+
+
+def _resolve_settlement_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    subject: ObservedExecutionSettlementSubject,
+) -> tuple[Task, Execution] | None:
+    """Re-prove the settlement subject set from durable state under the lock.
+
+    The detached settlement is not a fresh authorized command — the receipt
+    binds an already-authorized, already-dispatched attempt — so the reproof
+    proves exactly the facts the shared finalize requires: the addressed
+    Task/Workspace scope exists, is neither archived nor terminalization-
+    committed, carries the family's eligible status, and the addressed
+    Execution is still that Task's attempt in the same scope with the
+    family's attempt shape. Any moved-on subject is a truthful ``None`` (the
+    observation can no longer apply to current work), never an exception and
+    never a rewritten history.
+    """
+    if not isinstance(subject, ObservedExecutionSettlementSubject):
+        raise InvalidCommandError(
+            "the observed-execution settlement requires its typed subject contract"
+        )
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        return None
+    if locked.archived_at is not None or locked.terminalization_outcome is not None:
+        return None
+    if locked.status is not subject.expected_task_status:
+        return None
+    execution = execution_records.get_execution_for_update(
+        transaction_pool, execution_id=execution_id
+    )
+    if (
+        execution is None
+        or execution.workspace_id != workspace_id
+        or execution.task_id != locked.id
+    ):
+        return None
+    if subject.remediation_attempt is (execution.review_iteration_id is None):
+        return None
+    return locked, execution
+
+
+def settle_observed_implementation_result(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    subject: ObservedExecutionSettlementSubject,
+    result: ImplementationResult,
+) -> Execution | None:
+    """Complete one running implementation-family attempt from an observed
+    result.
+
+    The detached-run settlement's owning-service composition (issue #322):
+    the correlation seam funnels the attributed terminal observation through
+    the shared formal validation and hands the validated
+    ``ImplementationResult`` here; the settlement subject set is re-proven
+    from durable state under the Task row lock, and the validated result
+    completes the still-running attempt through the one shared finalize.
+    ``None`` means the subject set has moved on (archived, committed, moved
+    status, or a no-longer-running attempt): the observation can no longer
+    apply and nothing is rewritten. A concurrent finalize wins the
+    conditional write and this composition fails closed.
+    """
+    if not isinstance(result, ImplementationResult):
+        raise InvalidCommandError(
+            "settle_observed_implementation_result requires an ImplementationResult"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        subjects = _resolve_settlement_subjects(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            execution_id=execution_id,
+            subject=subject,
+        )
+        if subjects is None:
+            return None
+        task, execution = subjects
+        return _finalize_implementation_attempt(
+            transaction_pool, task=task, execution=execution, result=result
+        )
+
+
+def finalize_observed_implementation_failure(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    execution_id: UUID,
+    subject: ObservedExecutionSettlementSubject,
+    failure_kind: str,
+) -> Execution | None:
+    """Finalize one running implementation-family attempt as positively
+    failed.
+
+    The detached-run settlement's owning-service failure composition
+    (issue #322): the attributed terminal observation positively establishes
+    that the run failed (a terminal failure event, or the exact acknowledged
+    ``runId`` reported ``failed`` by status-only ``run.list``). The
+    settlement subject set is re-proven from durable state under the Task
+    row lock, the still-running attempt finalizes ``failed_final`` with the
+    safe ``execution_failed`` audit committing atomically, and the attempt
+    is never rewritten afterwards. ``None`` means the subject set has moved
+    on: no failure is fabricated against resolved history.
+    """
+    if not isinstance(failure_kind, str) or not failure_kind.strip():
+        raise InvalidCommandError(
+            "finalize_observed_implementation_failure requires a failure kind"
+        )
+    with composed_transaction(pool) as transaction_pool:
+        subjects = _resolve_settlement_subjects(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            execution_id=execution_id,
+            subject=subject,
+        )
+        if subjects is None:
+            return None
+        task, execution = subjects
+        if execution.status is not ExecutionStatus.RUNNING:
+            return None
+        finalized = execution_records.update_execution_status(
+            transaction_pool,
+            execution_id=execution.id,
+            expected_status=ExecutionStatus.RUNNING,
+            next_status=ExecutionStatus.FAILED_FINAL,
+        )
+        if finalized is None:
+            # Already finalized concurrently: never duplicate the audit.
+            return None
+        event_coordination.record_execution_failed_event(
+            transaction_pool,
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+            execution_id=execution.id,
+            actor=event_coordination.producer_actor(execution.producer_session_id),
+            failure_kind=failure_kind,
+        )
+        return finalized
