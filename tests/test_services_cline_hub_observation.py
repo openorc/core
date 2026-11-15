@@ -16,6 +16,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -254,6 +255,9 @@ def _admitted_receipt_row() -> tuple[Any, ...]:
         _OBSERVED,
         None,
         _OBSERVED,
+        None,
+        None,
+        None,
     )
 
 
@@ -271,6 +275,7 @@ class _SettleRecorder:
     """Records the settlement-seam deliveries and answers a fixed outcome."""
 
     outcome_kind: HubRunSettlementKind
+    receipt: Any = None
     calls: list[tuple[UUID, UUID, ObservedHubRunCompletion]] = field(default_factory=list)
 
     def __call__(
@@ -282,7 +287,7 @@ class _SettleRecorder:
         observation: ObservedHubRunCompletion,
     ) -> HubRunSettlementOutcome:
         self.calls.append((workspace_id, connection_id, observation))
-        return HubRunSettlementOutcome(kind=self.outcome_kind, receipt=None)
+        return HubRunSettlementOutcome(kind=self.outcome_kind, receipt=self.receipt)
 
 
 @dataclass
@@ -523,6 +528,9 @@ def test_a_terminal_event_before_the_acknowledgement_is_staged_and_observation_i
         None,
         None,
         _OBSERVED,
+        None,
+        None,
+        None,
     )
     _script_outstanding_receipts(conn, receipts)
     conn.on_repeat(
@@ -924,3 +932,180 @@ def test_known_attachment_configuration_failures_are_typed_registration_refusals
 
     # Every refusal was pre-subscription: no backend was ever constructed or dialed.
     assert backend.calls() == ()
+
+
+# --- establishment registration and the continuation trigger (issue #324) -------
+
+
+class _EstablishmentReceiptRows:
+    """The scripted establishment receipts keyed by provisional external id."""
+
+    def __init__(self, rows: dict[str, tuple[Any, ...]]) -> None:
+        self.rows = rows
+
+    def handler(self, conn: ScriptedConnection) -> tuple[Any, ...] | None:
+        _sql, params = conn.executed[-1]
+        assert params is not None
+        return self.rows.get(cast(str, params[2]))
+
+
+def _establishment_receipt_row(
+    task_agent_session_id: UUID, external_session_id: str
+) -> tuple[Any, ...]:
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        task_agent_session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        uuid4(),
+        "session_ready",
+        None,
+        TaskHubRunReceiptStatus.CLAIMED.value,
+        {},
+        None,
+        _OBSERVED,
+        None,
+        None,
+        _OBSERVED,
+        external_session_id,
+        {"adapter": "cline", "configuration": {}},
+        None,
+    )
+
+
+def _script_establishment_receipts(
+    conn: ScriptedConnection, rows: _EstablishmentReceiptRows
+) -> None:
+    conn.on_repeat(
+        _sql_has("from openorc.task_hub_run_receipts r", "created_external_session_id = %s"),
+        rows.handler,
+    )
+
+
+class _RecordingTrigger:
+    """Records the post-commit bootstrap continuation trigger invocations."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, UUID]] = []
+
+    def __call__(self, *, workspace_id: UUID, task_id: UUID) -> None:
+        self.calls.append({"workspace_id": workspace_id, "task_id": task_id})
+
+
+def _make_trigger_observer(
+    conn: ScriptedConnection,
+    *,
+    backends: list[FakeClineSdkBackend],
+    trigger: _RecordingTrigger,
+) -> HubRunObserver:
+    pool = _pool(conn)
+    pending = list(backends)
+    observer = HubRunObserver(
+        lambda: pool,
+        backend_factory=lambda: pending.pop(0),
+        runtime_credential_resolver=_fake_credential_resolver,
+        bootstrap_continuation_trigger=trigger,
+    )
+    observer.start()
+    return observer
+
+
+def test_establishment_registration_proves_the_provisional_identity_and_subscribes() -> None:
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_establishment_receipts(
+        conn,
+        _EstablishmentReceiptRows(
+            rows={"ext-init-9": _establishment_receipt_row(_SESSION_ID, "ext-init-9")}
+        ),
+    )
+    observer = _make_observer(conn, backends=[backend])
+
+    observer.register_establishment_session(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=_SESSION_ID,
+        connection_id=_CONNECTION_ID,
+        external_session_id="ext-init-9",
+    )
+
+    assert len(_subscribe_calls(backend)) == 1
+
+
+def test_establishment_registration_refuses_without_a_matching_receipt() -> None:
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_establishment_receipts(
+        conn,
+        _EstablishmentReceiptRows(
+            rows={"ext-init-9": _establishment_receipt_row(_SESSION_ID, "ext-init-9")}
+        ),
+    )
+    observer = _make_observer(conn, backends=[backend])
+
+    with pytest.raises(HubObservationRegistrationRefusedError) as refused:
+        observer.register_establishment_session(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            connection_id=_CONNECTION_ID,
+            external_session_id="ext-init-other",
+        )
+
+    assert refused.value.reason == HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED
+    assert _subscribe_calls(backend) == []
+
+
+def test_validated_establishment_settlement_fires_the_continuation_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trigger = _RecordingTrigger()
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    settle = _SettleRecorder(
+        outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=cast(
+            Any,
+            SimpleNamespace(operation=SimpleNamespace(value="session_initialization")),
+        ),
+    )
+    observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
+    _register(observer)
+    monkeypatch.setattr(
+        observation_module, "settle_observed_hub_run_completion", settle, raising=True
+    )
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+    assert trigger.calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_execution_settlement_never_fires_the_continuation_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trigger = _RecordingTrigger()
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    settle = _SettleRecorder(
+        outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=cast(Any, _admitted_receipt_row()),
+    )
+    observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
+    _register(observer)
+    monkeypatch.setattr(
+        observation_module, "settle_observed_hub_run_completion", settle, raising=True
+    )
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+    assert trigger.calls == []

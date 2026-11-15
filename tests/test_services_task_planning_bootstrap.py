@@ -36,6 +36,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeTimeoutError,
     AgentRuntimeUnavailableError,
 )
+from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
@@ -54,6 +55,8 @@ from openorc.services.task_planning_bootstrap import (
     PlanningBootstrapUnresolvedError,
     TaskBootstrapEstablishmentLease,
     TaskBootstrapRuntimeComposition,
+    TaskPlanningBootstrapDispatchOutcome,
+    TaskPlanningPreparationOutcome,
     WorkspacePreparationFailedError,
     prepare_task_for_planning,
 )
@@ -391,8 +394,16 @@ def _entry_results(
     claim_write_result: tuple[Any, ...] | None,
     post_claim_task_row: tuple[Any, ...] | None,
     claim_attempted: bool = True,
+    classifier_results: Sequence[Any] = (),
+    claim_evidence_row: tuple[Any, ...] | None = None,
 ) -> list[Any]:
-    """The entry/claim transaction's canned statement sequence, in order."""
+    """The entry/claim transaction's canned statement sequence, in order.
+
+    ``claim_evidence_row`` (claimed entries only) plays back the disposition
+    matrix's stage-evidence read; ``classifier_results`` plays back its
+    outstanding-initialization-receipt reads in the exact order the
+    classifier issues them.
+    """
     results: list[Any] = [
         _BARRIER_ROW,  # require_account_operational
         None,  # the per-Workspace arbitration advisory lock
@@ -403,10 +414,17 @@ def _entry_results(
         producer_row,
         reviewer_row,
     ]
-    if claim_attempted:
-        # The exactly-once claim write executes (its result may be a
-        # rejected None); the post-claim Task re-read follows only a
-        # successful claim.
+    if claim is not None:
+        # The claimed-bootstrap disposition matrix (issue #324) reads the
+        # stage evidence and the durable establishment receipts inside the
+        # same transaction.
+        results.append(claim_evidence_row)
+        results.extend(classifier_results)
+    if claim_attempted and claim is None:
+        # The exactly-once claim write executes only on the one provably safe
+        # first establishment (its result may be a rejected None); the
+        # post-claim Task re-read follows only a successful claim. A claimed
+        # entry never writes.
         results.append(claim_write_result)
         if claim_write_result is not None:
             assert post_claim_task_row is not None
@@ -582,6 +600,10 @@ class _Bootstrap:
                 self.connection_row,
                 self.repository_row,
             ),
+            # The detached bootstrap's durable PREPARE-dispatch marker
+            # (issue #324): the stage evidence advances to
+            # ``prepare_dispatched`` strictly before the PREPARE send.
+            True,
             # The F2 stage evidence (issue #87): the PREPARE control's
             # validated result settles the forward-only ``prepared`` stage,
             # and the settled planning-context transition settles
@@ -657,17 +679,18 @@ def test_successful_bootstrap_claims_once_establishes_prepares_and_transitions()
     # establishment phase's own workspace reads follow it.
     assert establish_workspace_reads[1] > claim_updates[0]
 
-    # The two forward-only stage settlements (issue #87): ``prepared`` after
-    # the validated workspace result, ``ready_for_planning`` after the
-    # planning-context transition — bound to the exact claim identity, and
-    # never a state-token rotation or a second claim.
+    # The three forward-only stage settlements: the durable PREPARE-dispatch
+    # marker (issue #324) strictly before the send, ``prepared`` after the
+    # validated workspace result (issue #87), and ``ready_for_planning``
+    # after the planning-context transition — bound to the exact claim
+    # identity, and never a state-token rotation or a second claim.
     stage_writes = [
         index
         for index, (sql, _params) in enumerate(conn.executed)
         if "planning_bootstrap_stage = %s" in sql
     ]
-    assert len(stage_writes) == 2
-    assert claim_updates[0] < stage_writes[0] < stage_writes[1]
+    assert len(stage_writes) == 3
+    assert claim_updates[0] < stage_writes[0] < stage_writes[1] < stage_writes[2]
 
     # Exactly the two role-session READY finalizations, and no other
     # session write.
@@ -778,6 +801,8 @@ def test_reentry_after_uncertain_creation_with_the_refreshed_token_has_zero_effe
         reviewer_row=env.reviewer_connecting_row,
         claim_write_result=None,
         post_claim_task_row=None,
+        claim_evidence_row=(uuid.uuid4(), None, None, None),
+        classifier_results=(None, None),  # no outstanding initialization receipts
     )
     second_runtime = _ScriptedBootstrapRuntime(
         {
@@ -841,6 +866,12 @@ def test_mixed_entry_fails_closed_in_both_orientations() -> None:
         reviewer_row=ready_first.reviewer_connecting_row,
         claim_write_result=None,
         post_claim_task_row=None,
+        claim_evidence_row=(uuid.uuid4(), None, None, None),
+        classifier_results=(
+            None,
+            None,
+            None,  # the READY binding carries no initialization receipt either
+        ),
     )
     runtime = _ScriptedBootstrapRuntime(
         {
@@ -870,6 +901,12 @@ def test_mixed_entry_fails_closed_in_both_orientations() -> None:
         reviewer_row=connecting_first.reviewer_ready_row,
         claim_write_result=None,
         post_claim_task_row=None,
+        claim_evidence_row=(uuid.uuid4(), None, None, None),
+        classifier_results=(
+            None,
+            None,
+            None,  # the READY binding carries no initialization receipt either
+        ),
     )
     runtime = _ScriptedBootstrapRuntime(
         {
@@ -901,6 +938,13 @@ def test_both_ready_entry_fails_closed_without_any_prepare() -> None:
             reviewer_row=env.reviewer_ready_row,
             claim_write_result=None,
             post_claim_task_row=None,
+            claim_evidence_row=(uuid.uuid4(), None, None, None),
+            classifier_results=(
+                None,
+                None,
+                None,  # neither READY binding carries an initialization receipt
+                None,
+            ),
         )
     )
     runtime = env.runtime()
@@ -1211,6 +1255,13 @@ def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() ->
             reviewer_row=failing.reviewer_ready_row,
             claim_write_result=None,
             post_claim_task_row=None,
+            claim_evidence_row=(uuid.uuid4(), None, None, None),
+            classifier_results=(
+                None,
+                None,
+                None,  # neither READY binding carries an initialization receipt
+                None,
+            ),
         )
     )
     with (
@@ -1233,3 +1284,334 @@ def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() ->
 
 
 # __CHUNK_APPEND_MARKER__
+
+
+# --- the detached establishment dispatch and readiness resumption (issue #324) ---
+
+
+def _detached_initialization_receipt_row(
+    workspace_id: Any, task_id: Any, session_id: Any
+) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        task_id,
+        session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        uuid.uuid4(),
+        "session_ready",
+        None,
+        "claimed",
+        {},
+        None,
+        _OBSERVED,
+        None,
+        None,
+        _OBSERVED,
+        "ext-init-9",
+        {"adapter": "cline", "configuration": {}},
+        None,
+    )
+
+
+def _settled_initialization_receipt_row(
+    workspace_id: Any, task_id: Any, session_id: Any, external_session_id: str
+) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        task_id,
+        session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        uuid.uuid4(),
+        "session_ready",
+        "run-324",
+        "settled",
+        {"settlement": "validated_result", "consumed_sequence": 7},
+        None,
+        _OBSERVED,
+        _OBSERVED,
+        _OBSERVED,
+        _OBSERVED,
+        external_session_id,
+        {"adapter": "cline", "configuration": {}},
+        None,
+    )
+
+
+def _dispatch_phase_results(
+    env: _Bootstrap,
+    binding_row: tuple[Any, ...],
+    *,
+    receipt_row: tuple[Any, ...] | None,
+) -> list[Any]:
+    """One detached dispatch's canned sequence: phase-1 reads, the replay
+    guard's outstanding-receipt read, the receipt insert, the attach (lock,
+    runId attach, staged read), and the post-attach binding reload."""
+    results: list[Any] = [
+        _ws_row(env.workspace_id, env.owner_profile_id),
+        _BARRIER_ROW,
+        _task_row(env.workspace_id),
+        binding_row,
+        env.connection_row,
+        None,  # no outstanding receipt
+    ]
+    if receipt_row is not None:
+        results.append(receipt_row)
+        results.append(receipt_row)  # the attach's for-update lock
+        results.append(receipt_row)  # the runId attach returns the admitted row
+        results.append(None)  # no staged early completion
+        results.append(binding_row)  # the post-attach binding reload
+    return results
+
+
+def test_detached_bootstrap_dispatches_and_returns_without_waiting() -> None:
+    env = _Bootstrap()
+    producer_receipt = _detached_initialization_receipt_row(
+        env.workspace_id, env.task_id, env.producer_connecting_row[0]
+    )
+    reviewer_receipt = _detached_initialization_receipt_row(
+        env.workspace_id, env.task_id, env.reviewer_connecting_row[0]
+    )
+    results = [
+        *env.entry_results(),
+        # Producer dispatch phase.
+        *_dispatch_phase_results(env, env.producer_connecting_row, receipt_row=producer_receipt),
+        # Reviewer dispatch phase.
+        *_dispatch_phase_results(env, env.reviewer_connecting_row, receipt_row=reviewer_receipt),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    triggers: list[tuple[Any, Any]] = []
+
+    outcome = prepare_task_for_planning(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        task_id=env.task_id,
+        profile_id=env.owner_profile_id,
+        expected_state_token=env.pre_claim_token,
+        reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+        observation_registrar=_RecordingRegistrar(),
+        bootstrap_continuation_trigger=lambda **kw: triggers.append(
+            (kw["workspace_id"], kw["task_id"])
+        ),
+    )
+
+    # The dispatched suspension: no READY binding, no PREPARE, no transition,
+    # and the trigger fired for the post-dispatch resumption check.
+    assert isinstance(outcome, TaskPlanningBootstrapDispatchOutcome)
+    assert outcome.task.state_token == env.post_claim_token
+    assert runtime.interaction_leases == []
+    assert runtime.transitions == []
+    assert triggers == [(env.workspace_id, env.task_id)]
+    # Both roles dispatched: the fake adapters record the detached capability
+    # calls, never the blocking handshake.
+    producer = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    reviewer = runtime.fake_adapter(WorkflowRole.REVIEWER)
+    assert len(producer.detached_allocation_requests()) == 1
+    assert len(producer.detached_admissions()) == 1
+    assert len(reviewer.detached_allocation_requests()) == 1
+    assert len(reviewer.detached_admissions()) == 1
+    for adapter in (producer, reviewer):
+        assert adapter.creation_requests() == ()
+        assert adapter.submitted_sends() == ()
+    inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(inserts) == 2
+
+
+def test_in_progress_replay_dispatches_nothing() -> None:
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_receipt = _detached_initialization_receipt_row(
+        env.workspace_id, env.task_id, env.producer_connecting_row[0]
+    )
+    results = _entry_results(
+        env.workspace_id,
+        env.owner_profile_id,
+        env.post_claim_task_row,
+        claim=(claim_token,),
+        producer_row=env.producer_connecting_row,
+        reviewer_row=env.reviewer_connecting_row,
+        claim_write_result=None,
+        post_claim_task_row=None,
+        claim_evidence_row=(claim_token, _OBSERVED, None, None),
+        classifier_results=(producer_receipt, producer_receipt),
+    )
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+
+    outcome = prepare_task_for_planning(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        task_id=env.task_id,
+        profile_id=env.owner_profile_id,
+        expected_state_token=env.post_claim_token,
+        reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+        observation_registrar=_RecordingRegistrar(),
+        bootstrap_continuation_trigger=lambda **kw: None,
+    )
+
+    # The claimed in-progress bootstrap is an idempotent no-effect replay:
+    # no establishment lease, no runtime call, no durable write.
+    assert isinstance(outcome, TaskPlanningBootstrapDispatchOutcome)
+    assert outcome.claim_token == claim_token
+    assert runtime.establishment_leases == []
+    assert runtime.interaction_leases == []
+    assert runtime.transitions == []
+    for adapter in runtime.fake_adapters():
+        assert adapter.detached_allocation_requests() == ()
+        assert adapter.creation_requests() == ()
+    assert _statement_indices(conn, "update openorc.") == []
+
+
+def test_readiness_resumed_continuation_proceeds_to_prepare() -> None:
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,  # no outstanding producer receipt
+                None,  # no outstanding reviewer receipt
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        # The establishment loop skips both READY bindings; the pre-PREPARE
+        # recheck, the durable base recovery, and the post-PREPARE tail follow.
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        True,  # the durable PREPARE-dispatch marker (issue #324)
+        True,  # the validated workspace result settles ``prepared``
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        True,  # the settled transition settles ``ready_for_planning``
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    # The detached establishments happened in an earlier process: seed the
+    # fake adapters with the allocated sessions the READY rows bind
+    # (fake-session-1 / fake-session-2 in creation order).
+    producer_adapter = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    reviewer_adapter = runtime.fake_adapter(WorkflowRole.REVIEWER)
+    producer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+    reviewer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.REVIEWER,
+            initialization="seed",
+        )
+    )
+
+    outcome = prepare_task_for_planning(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        task_id=env.task_id,
+        profile_id=env.owner_profile_id,
+        expected_state_token=env.post_claim_token,
+        reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+        observation_registrar=_RecordingRegistrar(),
+        bootstrap_continuation_trigger=lambda **kw: None,
+    )
+
+    # The readiness-resumed continuation proceeds past establishment: the
+    # durable PREPARE-dispatch marker was committed strictly before the send,
+    # and the prepared-for-planning handoff completes.
+    assert isinstance(outcome, TaskPlanningPreparationOutcome)
+    assert outcome.producer_session.external_session_id == "fake-session-1"
+    assert runtime.establishment_leases == []
+    assert runtime.interaction_leases == [(WorkflowRole.PRODUCER, "fake-session-1")]
+    stage_writes = [
+        index
+        for index, (sql, _params) in enumerate(conn.executed)
+        if "planning_bootstrap_stage = %s" in sql
+    ]
+    assert len(stage_writes) == 3
+
+
+def test_prepare_dispatched_stage_replay_fails_closed() -> None:
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    conn = ScriptedConnection(
+        _entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, "prepare_dispatched", _OBSERVED),
+            classifier_results=(),
+        )
+    )
+    runtime = env.runtime()
+
+    with pytest.raises(PlanningBootstrapUnresolvedError):
+        prepare_task_for_planning(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+            observation_registrar=_RecordingRegistrar(),
+            bootstrap_continuation_trigger=lambda **kw: None,
+        )
+
+    assert runtime.interaction_leases == []
+    assert runtime.transitions == []
+    assert _statement_indices(conn, "update openorc.") == []
+
+
+class _RecordingRegistrar:
+    def register_establishment_session(self, **kwargs: Any) -> None:
+        return None

@@ -55,6 +55,7 @@ from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
+from openorc.services.cline_hub_observation import HubRunObserver
 from openorc.services.cline_planning_bootstrap import ClineBootstrapRuntimeComposition
 from openorc.services.errors import ConflictError, NotFoundError, StaleOperationError
 from openorc.services.github_user_authorization import (
@@ -89,8 +90,12 @@ from openorc.services.task_plan_production import (
     produce_initial_task_plan,
 )
 from openorc.services.task_planning_bootstrap import (
+    ResumableBootstrapContinuation,
     TaskBootstrapRuntimeComposition,
+    TaskPlanningBootstrapDispatchOutcome,
+    TaskPlanningPreparationOutcome,
     _producer_snapshot_repository_base,
+    find_resumable_bootstrap_continuation,
     prepare_task_for_planning,
 )
 from openorc.services.task_planning_review_decision import (
@@ -116,6 +121,7 @@ from openorc.services.task_workflow_operation_coordinator import (
     coordinate_task_workflow_operation,
 )
 from openorc.workers.invocation import (
+    ExecutionMode,
     InvalidInvocationError,
     OperationDependencies,
     OperationHandler,
@@ -509,6 +515,58 @@ def submit_pr_composition_after_approval(
 # --- per-kind compositions ---------------------------------------------------
 
 
+def bootstrap_readiness_continuation_trigger(
+    dependencies: OperationDependencies,
+) -> Callable[..., None]:
+    """Build the post-commit bootstrap continuation trigger (issue #324).
+
+    The trigger owns the post-readiness resumption submission: it
+    re-derives the resumable classification from committed state on every
+    invocation and, only when the durable state proves it, submits the
+    existing ``TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN`` continuation with
+    the claim's rotated post-claim token through the executing process's
+    submission seam. Submission outcomes are transport information only,
+    never Task truth; a failed classification or submission leaves the
+    durable resumable state to the existing recovery semantics. Services
+    never build invocation payloads — this worker-layer builder does.
+    """
+
+    def trigger(*, workspace_id: UUID, task_id: UUID) -> None:
+        resumable = find_resumable_bootstrap_continuation(
+            dependencies.database_pool(),
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        if resumable is None:
+            return
+        _submit_readiness_resumed_bootstrap_continuation(dependencies, resumable)
+
+    return trigger
+
+
+def _submit_readiness_resumed_bootstrap_continuation(
+    dependencies: OperationDependencies,
+    resumable: ResumableBootstrapContinuation,
+) -> SubmissionResult:
+    """Submit the readiness-resumed planning bootstrap continuation."""
+    task = resumable.task
+    return _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
+            payload=TaskPlanningBootstrapAndInitialPlanPayload(
+                task=TaskScope(
+                    workspace_id=str(task.workspace_id),
+                    task_id=str(task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(resumable.owner_profile_id),
+                expected_state_token=str(task.state_token),
+            ),
+        ),
+    )
+
+
 def _compose_task_planning_bootstrap_and_initial_plan(
     payload: TaskPlanningBootstrapAndInitialPlanPayload,
     *,
@@ -522,6 +580,14 @@ def _compose_task_planning_bootstrap_and_initial_plan(
     a separate queued E2 unsound, so the coupled sequence executes in-process
     and the payload's exact post-start token authorizes the whole operation.
     On success the exact post-E2 token authorizes the first review round.
+
+    In regular mode the mandatory initialization is dispatched as detached
+    agent turns (issue #324): the preparation returns the dispatched
+    suspension, this composition returns without waiting for
+    ``session_ready``, and the observed completions settle readiness and
+    resume the bootstrap through the post-commit continuation trigger. The
+    queue-mode interim (until #328) keeps the blocking establishment and the
+    full in-process sequence.
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -532,6 +598,13 @@ def _compose_task_planning_bootstrap_and_initial_plan(
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
 
+    # The detached establishment needs the executing process's Hub-run
+    # observation host — a regular-mode process dependency (issue #323).
+    # Queue mode resolves none and keeps the blocking establishment interim.
+    observation_registrar: HubRunObserver | None = None
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        observation_registrar = dependencies.hub_run_observer()
+
     preparation = prepare_task_for_planning(
         pool,
         runtime_composition,
@@ -541,7 +614,16 @@ def _compose_task_planning_bootstrap_and_initial_plan(
         expected_state_token=expected_state_token,
         reviewer_neutral_directory=reviewer_neutral_directory,
         attempt_evidence=attempt_evidence,
+        observation_registrar=observation_registrar,
+        bootstrap_continuation_trigger=bootstrap_readiness_continuation_trigger(dependencies),
     )
+    if isinstance(preparation, TaskPlanningBootstrapDispatchOutcome):
+        # The detached establishment is durably dispatched: the worker
+        # returns without waiting for ``session_ready``. The observed
+        # completions own the resumption; submission outcomes are transport
+        # information only and the durable resumable state owns recovery.
+        return
+    assert isinstance(preparation, TaskPlanningPreparationOutcome)
     # The initial PLAN is produced in the prepared Producer session's
     # planning checkout, using the same logical invocation's preparation
     # outcome (never re-derived, never serialized).

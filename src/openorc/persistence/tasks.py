@@ -303,6 +303,7 @@ def record_planning_bootstrap_stage(
     ``state_token`` and composes no workflow transition. It applies only
     while the row is current (non-archived), claimed by the exact
     ``claim_token``, and still at the required prior stage (``None`` for
+    ``prepare_dispatched`` and ``prepared``; ``prepare_dispatched`` for
     ``prepared``; ``prepared`` for ``ready_for_planning``), so a raced or
     stale write is a rejected no-op (``False``) and stage history never
     regresses. ``None`` means the caller classifies the rejection.
@@ -314,8 +315,10 @@ def record_planning_bootstrap_stage(
     if not isinstance(stage, TaskPlanningBootstrapStage):
         raise TaskDomainError("stage must be a TaskPlanningBootstrapStage")
     expected_prior_stage: str | None
-    if stage is TaskPlanningBootstrapStage.PREPARED:
+    if stage is TaskPlanningBootstrapStage.PREPARE_DISPATCHED:
         expected_prior_stage = None
+    elif stage is TaskPlanningBootstrapStage.PREPARED:
+        expected_prior_stage = TaskPlanningBootstrapStage.PREPARE_DISPATCHED.value
     elif stage is TaskPlanningBootstrapStage.READY_FOR_PLANNING:
         expected_prior_stage = TaskPlanningBootstrapStage.PREPARED.value
     else:

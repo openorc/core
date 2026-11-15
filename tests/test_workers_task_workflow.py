@@ -27,6 +27,7 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import StaleOperationError
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
+from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_planning_review_decision import PlanningReviewDecision
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pr_review_decision import PrReviewDecision
@@ -158,6 +159,10 @@ def make_dependencies(
         "user_token_resolver_provider": lambda _settings: object(),
         "reviewer_neutral_directory_provider": lambda _settings: _NEUTRAL_DIRECTORY,
         "continuation_submitter_provider": lambda _settings: submitter,
+        # The regular-mode hub-run observation host (issue #323): a inert
+        # stand-in; the recorded service seams swallow the registrar and the
+        # continuation trigger without touching it.
+        "hub_run_observer_provider": lambda _settings: object(),
     }
     resolved.update(providers)
     return OperationDependencies(**resolved), submitter
@@ -261,9 +266,19 @@ def patched_workflow_environment(
 
 
 def fake_preparation() -> Any:
-    return SimpleNamespace(
-        producer_session=SimpleNamespace(external_session_id=_PRODUCER_EXTERNAL_SESSION_ID),
-        producer_checkout_directory=_CHECKOUT_DIRECTORY,
+    # The real prepared-outcome type: the composition distinguishes the
+    # detached dispatch suspension from the prepared handoff by type, and the
+    # duck-typed members the E2 production consumes stay SimpleNamespaces.
+    return cast(
+        Any,
+        TaskPlanningPreparationOutcome(
+            task=cast(Any, SimpleNamespace(state_token=_STATE_TOKEN)),  # type: ignore[arg-type]
+            producer_session=cast(
+                Any, SimpleNamespace(external_session_id=_PRODUCER_EXTERNAL_SESSION_ID)
+            ),
+            reviewer_session=cast(Any, SimpleNamespace(external_session_id=None)),
+            producer_checkout_directory=_CHECKOUT_DIRECTORY,
+        ),
     )
 
 
@@ -565,9 +580,14 @@ def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_t
         )
 
         # The exact bootstrap subjects and the deployment's reviewer-neutral
-        # directory reached the E1b service.
+        # directory reached the E1b service, with the process's observation
+        # host and the post-readiness continuation trigger wired (issue
+        # #324).
         assert prepare.call_count == 1
-        assert prepare.calls[0]["kwargs"] == {
+        passed_kwargs = dict(prepare.calls[0]["kwargs"])
+        assert passed_kwargs.pop("observation_registrar") is not None
+        assert callable(passed_kwargs.pop("bootstrap_continuation_trigger"))
+        assert passed_kwargs == {
             "workspace_id": _WORKSPACE_ID,
             "task_id": _TASK_ID,
             "profile_id": _PROFILE_ID,
@@ -1601,4 +1621,51 @@ def test_the_implementation_compositions_thread_the_attempt_evidence_collector_i
         assert presentations[0]["attempt_evidence"] is evidence
         assert presentations[0]["expected_state_token"] == execution.task.state_token
         assert presentations[0]["execution_id"] == _EXECUTION_ID
+    assert submitter.submissions == []
+
+
+# --- the post-readiness bootstrap continuation trigger (issue #324) -------------
+
+
+def test_readiness_trigger_submits_the_resumed_bootstrap_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies()
+    resumable = SimpleNamespace(
+        task=SimpleNamespace(workspace_id=_WORKSPACE_ID, id=_TASK_ID, state_token=_NEXT_TOKEN),
+        owner_profile_id=_PROFILE_ID,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "find_resumable_bootstrap_continuation",
+        lambda _pool, *, workspace_id, task_id: resumable,
+    )
+
+    trigger = task_workflow.bootstrap_readiness_continuation_trigger(dependencies)
+    trigger(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is task_workflow.OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    payload = submitted.payload
+    assert isinstance(payload, task_workflow.TaskPlanningBootstrapAndInitialPlanPayload)
+    assert payload.task.workspace_id == str(_WORKSPACE_ID)
+    assert payload.task.task_id == str(_TASK_ID)
+    assert payload.profile_id == str(_PROFILE_ID)
+    assert payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_readiness_trigger_submits_nothing_when_the_state_is_not_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies()
+    monkeypatch.setattr(
+        task_workflow,
+        "find_resumable_bootstrap_continuation",
+        lambda _pool, *, workspace_id, task_id: None,
+    )
+
+    trigger = task_workflow.bootstrap_readiness_continuation_trigger(dependencies)
+    trigger(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+
     assert submitter.submissions == []

@@ -479,25 +479,52 @@ def test_bootstrap_stage_evidence_is_forward_only_and_claim_bound(
     assert evidence.claimed_at is not None and evidence.claimed_at.tzinfo is not None
     assert evidence.stage is None and evidence.stage_settled_at is None
 
-    # ``prepared`` applies only from the unsettled stage under the exact
-    # claim token.
+    # The forward-only stage chain (issue #324) is
+    # None → prepare_dispatched → prepared → ready_for_planning:
+    # ``prepared`` no longer applies from the unsettled stage — the durable
+    # PREPARE-dispatch marker is committed strictly before the send, and a
+    # foreign claim identity never writes stage history.
     assert (
         record_planning_bootstrap_stage(
             pool,
             task_id=task_id,
             claim_token=uuid.uuid4(),
-            stage=TaskPlanningBootstrapStage.PREPARED,
+            stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
         )
         is False
     )  # a foreign claim identity never writes stage history
+    assert (
+        record_planning_bootstrap_stage(
+            pool,
+            task_id=task_id,
+            claim_token=claim_token,
+            stage=TaskPlanningBootstrapStage.PREPARED,
+        )
+        is False
+    )  # ``prepared`` requires the prepare_dispatched marker first
+    assert record_planning_bootstrap_stage(
+        pool,
+        task_id=task_id,
+        claim_token=claim_token,
+        stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+    )
+    # Stage history never regresses: the marker cannot be re-written, and
+    # ``prepared`` applies only from ``prepare_dispatched``.
+    assert (
+        record_planning_bootstrap_stage(
+            pool,
+            task_id=task_id,
+            claim_token=claim_token,
+            stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+        )
+        is False
+    )
     assert record_planning_bootstrap_stage(
         pool,
         task_id=task_id,
         claim_token=claim_token,
         stage=TaskPlanningBootstrapStage.PREPARED,
     )
-    # Stage history never regresses: ``prepared`` cannot be re-written, and
-    # ``ready_for_planning`` applies only from ``prepared``.
     assert (
         record_planning_bootstrap_stage(
             pool,

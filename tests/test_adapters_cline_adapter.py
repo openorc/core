@@ -88,7 +88,11 @@ from openorc.adapters.cline.reconciliation import (
     ClineSessionEvidence,
     classify_session_evidence,
 )
-from openorc.adapters.cline.values import ClineSessionEvent, ClineStartResult
+from openorc.adapters.cline.values import (
+    ClineRunAdmission,
+    ClineSessionEvent,
+    ClineStartResult,
+)
 from openorc.domain.connections import WorkflowRole
 from openorc.protocol.interaction import (
     CleanupWorkspaceInteraction,
@@ -4062,3 +4066,159 @@ def test_a_session_this_instance_never_sent_reads_not_in_flight() -> None:
 
     with pytest.raises(ValueError):
         adapter.has_send_in_flight("   ")
+
+
+# --- detached session establishment capability (issue #324) -------------------
+
+
+def test_allocate_detached_session_starts_without_any_turn_and_registers_the_identity() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+
+    allocated = adapter.allocate_detached_session(_creation_request())
+
+    assert allocated.external_session_id == "cline-session-9"
+    assert allocated.reported_provider is None
+    assert allocated.reported_model is None
+    assert allocated.reported_runtime_version is None
+    start_calls = [call for call in backend.calls() if call.operation == "start"]
+    assert len(start_calls) == 1
+    request = start_calls[0].request
+    assert request is not None
+    # The promptless detached start: the same complete v1 construction bundle
+    # (fresh Producer = native ACT, interactive), with no prompt anywhere in
+    # the bundle and no send.
+    assert request.mode is ClineConstructionMode.ACT
+    assert request.interactive is True
+    assert request.session_id is None
+    assert request.initial_messages is None
+    assert [call.operation for call in backend.calls()] == ["start"]
+
+
+def test_admit_initialization_run_enqueues_the_initialization_verbatim_without_any_send() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9", ClineRunAdmission(run_id="run-91", accepted_at=7, queue_position=0)
+    )
+
+    admitted = adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+    assert admitted.run_id == "run-91"
+    enqueue_calls = [call for call in backend.calls() if call.operation == "enqueue"]
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0].session_id == "cline-session-9"
+    assert enqueue_calls[0].prompt == _INITIALIZATION
+    # The detached handshake has no ClineCore.send shortcut.
+    assert [call.operation for call in backend.calls()] == ["start", "enqueue"]
+
+
+def test_admit_initialization_run_refuses_a_session_this_adapter_did_not_establish() -> None:
+    backend = FakeClineSdkBackend()
+    adapter = ClineAdapter(backend, ScriptedResolver(creation=_context()))
+
+    with pytest.raises(AgentRuntimeConfigurationRejectedError):
+        adapter.admit_initialization_run("cline-session-unknown", _INITIALIZATION)
+    assert backend.calls() == ()
+
+
+def test_admit_initialization_run_classifies_a_positive_hub_refusal_as_known_failure() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineSessionNotFoundError("session not found"),
+    )
+
+    with pytest.raises(AgentSessionNotFoundError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue("cline-session-9", ClineBackendUncertainOutcomeError())
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() -> None:
+    """Issue #324 review fix: ``enqueue`` is an effectful operation. An
+    unproven SDK rejection code establishes nothing about whether a run was
+    admitted, so the admission stays conservatively uncertain — never a
+    positively proven refusal."""
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineSdkOperationRejectedError("run_admission_unavailable"),
+    )
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_uncertain() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineSdkOperationRejectedError("hub_connection_closed"),
+    )
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_as_known() -> None:
+    """The positively proven refusals stay known: the exact session is not
+    live (the Hub definitively rejected the enqueue itself), the attachment
+    was unreachable before effect, and the bridge was not attached."""
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineRemoteAttachmentUnavailableError(),
+    )
+
+    with pytest.raises(AgentRuntimeUnavailableError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
+    """Issue #324 review fix: ``run_admission_rejected`` and ``hub_draining``
+    are the Hub's positively identified admission refusals — the Hub answered
+    with a definitive rejection, so the run was never admitted and the
+    classification stays known, never an uncertainty that strands the
+    receipt."""
+    for code in ("run_admission_rejected", "hub_draining"):
+        backend = FakeClineSdkBackend()
+        resolver = ScriptedResolver(creation=_context())
+        backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+        adapter = ClineAdapter(backend, resolver)
+        adapter.allocate_detached_session(_creation_request())
+        backend.queue_enqueue("cline-session-9", ClineSdkOperationRejectedError(code))
+
+        with pytest.raises(AgentRuntimeUnavailableError):
+            adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)

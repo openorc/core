@@ -58,6 +58,7 @@ from uuid import UUID
 from openorc.domain.intents import canonical_intent_outcome
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.sessions import canonical_effective_config_snapshot
 
 __all__ = [
     "HubRunObservationKind",
@@ -222,6 +223,14 @@ class TaskHubRunReceipt:
     admitted_at: datetime | None
     settled_at: datetime | None
     updated_at: datetime
+    # The detached session establishment's minimum separate provisional
+    # establishment evidence (issue #324). The authoritative binding carries
+    # no external identity while CONNECTING; the initialization receipt is
+    # the separate durable fact. Only a ``session_initialization`` receipt
+    # carries these; every other operation carries none of them.
+    created_external_session_id: str | None = None
+    effective_config_snapshot: Mapping[str, object] | None = None
+    created_session_provenance: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "task_agent_session_id"):
@@ -243,6 +252,38 @@ class TaskHubRunReceipt:
         if not isinstance(self.outcome, Mapping):
             raise ValueError("TaskHubRunReceipt.outcome must be a mapping")
         object.__setattr__(self, "outcome", canonical_intent_outcome(self.outcome))
+        # The provisional establishment evidence is coherent per operation
+        # (mirroring the migration's conditional CHECKs): an initialization
+        # receipt must carry the nonempty provisional identity and the
+        # canonical non-secret snapshot, and every other operation carries
+        # none of the three.
+        if self.operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION:
+            _require_nonblank_str(self.created_external_session_id, "created_external_session_id")
+            if self.effective_config_snapshot is None:
+                raise ValueError(
+                    "a session_initialization receipt carries its dispatch-composed "
+                    "effective configuration snapshot"
+                )
+            object.__setattr__(
+                self,
+                "effective_config_snapshot",
+                canonical_effective_config_snapshot(self.effective_config_snapshot),
+            )
+            if self.created_session_provenance is not None:
+                object.__setattr__(
+                    self,
+                    "created_session_provenance",
+                    canonical_intent_outcome(self.created_session_provenance),
+                )
+        elif (
+            self.created_external_session_id is not None
+            or self.effective_config_snapshot is not None
+            or self.created_session_provenance is not None
+        ):
+            raise ValueError(
+                "only a session_initialization hub-run receipt carries provisional "
+                "establishment evidence"
+            )
         _require_instant(self.contradicted_at, "contradicted_at", nullable=True)
         _require_instant(self.claimed_at, "claimed_at")
         _require_instant(self.admitted_at, "admitted_at", nullable=True)

@@ -103,6 +103,7 @@ from openorc.domain.operational_failures import (
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import executions as execution_records
@@ -116,6 +117,7 @@ from openorc.protocol.models import (
     IMPLEMENTATION_RESULT_FAMILY,
     FormalResponse,
     ImplementationResult,
+    SessionReady,
 )
 from openorc.protocol.parsing import parse_formal_response
 from openorc.services import event_coordination
@@ -318,6 +320,9 @@ def record_task_hub_run_receipt(
     original_attempt_kind: OriginalAttemptKind,
     original_attempt_id: UUID,
     expected_formal_family: str | None = None,
+    created_external_session_id: str | None = None,
+    effective_config_snapshot: Mapping[str, object] | None = None,
+    created_session_provenance: Mapping[str, object] | None = None,
 ) -> TaskHubRunReceipt:
     """Record the claim-to-run receipt companion of one committed one-shot claim.
 
@@ -331,6 +336,13 @@ def record_task_hub_run_receipt(
     migration wires its routing. A violated single-outstanding-run invariant
     (a concurrent second dispatch for the same session binding) is a typed
     conflict — fail closed, never a second outstanding run.
+
+    The detached session establishment (issue #324) passes its minimum
+    separate provisional establishment evidence (the provisional external
+    identity, the dispatch-composed non-secret snapshot, and the optional
+    reported provenance) on its ``session_initialization`` receipt; every
+    other operation passes none, and the coherence is enforced by the
+    migration's conditional CHECKs either way.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -356,6 +368,12 @@ def record_task_hub_run_receipt(
         raise InvalidCommandError(
             "the receipt requires its expected formal family to name a canonical v1 response family"
         )
+    if created_external_session_id is not None and (
+        operation is not PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION
+    ):
+        raise InvalidCommandError(
+            "only a session_initialization receipt carries provisional establishment evidence"
+        )
     try:
         return hub_run_records.create_task_hub_run_receipt(
             transaction_pool,
@@ -366,6 +384,9 @@ def record_task_hub_run_receipt(
             original_attempt_kind=original_attempt_kind,
             original_attempt_id=original_attempt_id,
             expected_formal_family=expected_formal_family,
+            created_external_session_id=created_external_session_id,
+            effective_config_snapshot=effective_config_snapshot,
+            created_session_provenance=created_session_provenance,
         )
     except UniqueViolation as error:
         raise ConflictError(
@@ -484,6 +505,16 @@ def _route_observed_terminal(
         return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
     if receipt.operation in _EXECUTION_SETTLEMENT_FAMILIES:
         return _route_execution_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            kind=kind,
+            sequence=sequence,
+            result_candidate=result_candidate,
+        )
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION:
+        return _route_establishment_terminal(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -701,6 +732,214 @@ def _settle_execution_failure(
     )
 
 
+# --- the establishment (session initialization) routing, issue #324 -------------
+
+
+def _route_establishment_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskHubRunReceipt,
+    kind: HubRunObservationKind,
+    sequence: int | None,
+    result_candidate: str | None,
+) -> HubRunSettlementOutcome:
+    """Route one attributed terminal observation onto the initialization run.
+
+    The binding congruence is proved first: the receipt's authoritative
+    binding must exist in the addressed scope, belong to the exact Task, and
+    be the CONNECTING binding the receipt was dispatched against. A concrete
+    attribution conflict leaves the observation unresolved — never a
+    fabricated match. A terminal failure settles the receipt truthfully (the
+    initialization genuinely failed; the binding stays CONNECTING, never
+    LOST) and reports through the existing Level 2 operation-failure path
+    under the bootstrap claim's established family. A completion funnels the
+    candidate through the shared formal contract: only a canonical
+    ``session_ready`` with the READY status finalizes the binding to READY
+    atomically with the receipt settlement, through the existing lifecycle
+    service. A missing candidate or a contract rejection is a positively
+    established protocol failure of the initialization — routed through the
+    same truthful failure path, never silently unresolved evidence, never a
+    safe retry.
+    """
+    # The lifecycle service is imported lazily: the establishment dispatch
+    # (session_runtime) composes this seam's record/attach helpers at module
+    # level, and this settlement routing composes its readiness finalizer —
+    # the same established deferred-import pattern as the composition seams.
+    from openorc.services.session_runtime import finalize_observed_initialization_readiness
+
+    binding = session_records.get_task_agent_session_by_id(
+        transaction_pool, task_agent_session_id=receipt.task_agent_session_id
+    )
+    if binding is None or binding.workspace_id != workspace_id or binding.task_id != task_id:
+        logger.warning(
+            "the observed initialization completion conflicts with the receipt's "
+            "session binding; the observation is left unresolved"
+        )
+        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if kind is HubRunObservationKind.RUN_FAILED:
+        return _settle_establishment_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            sequence=sequence,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=OBSERVED_RUN_FAILURE_KIND,
+        )
+    parsed: SessionReady | None
+    if result_candidate is not None:
+        try:
+            candidate = parse_formal_response(
+                result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            candidate = None
+        if isinstance(candidate, SessionReady) and candidate.status == "READY":
+            parsed = candidate
+        else:
+            parsed = None
+    else:
+        parsed = None
+    if parsed is None:
+        logger.warning(
+            "the observed initialization completion carries no valid READY "
+            "session_ready; classifying the positively established protocol failure"
+        )
+        return _settle_establishment_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            sequence=sequence,
+            error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
+            failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
+        )
+    if binding.lifecycle_status is not TaskSessionLifecycleStatus.CONNECTING:
+        # The receipt is outstanding only against the CONNECTING binding it
+        # dispatched; a moved-on binding is the honest result-not-applied
+        # settlement, never a rewrite of initialized history.
+        logger.warning(
+            "the initialization receipt's binding already moved past CONNECTING; "
+            "settling the validated result as not applied"
+        )
+        settled = hub_run_records.settle_task_hub_run_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, sequence),
+        )
+        return HubRunSettlementOutcome(
+            kind=HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    provenance = receipt.created_session_provenance or {}
+    finalized = finalize_observed_initialization_readiness(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=binding.role,
+        external_session_id=receipt.created_external_session_id or "",
+        effective_configuration=dict(receipt.effective_config_snapshot or {}),
+        reported_provider=_safe_provenance_str(provenance, "reported_provider"),
+        reported_model=_safe_provenance_str(provenance, "reported_model"),
+        reported_runtime_version=_safe_provenance_str(provenance, "reported_runtime_version"),
+    )
+    label = SETTLEMENT_VALIDATED_RESULT if finalized.applied else SETTLEMENT_RESULT_NOT_APPLIED
+    settled = hub_run_records.settle_task_hub_run_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(label, sequence),
+    )
+    return HubRunSettlementOutcome(
+        kind=(
+            HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+            if finalized.applied
+            else HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+        ),
+        receipt=settled,
+        formal_result=parsed,
+    )
+
+
+def _safe_provenance_str(provenance: Mapping[str, object], key: str) -> str | None:
+    """Read one optional safe string provenance fact."""
+    value = provenance.get(key)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _settle_establishment_failure(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskHubRunReceipt,
+    sequence: int | None,
+    error_code: OperationalFailureCode,
+    failure_kind: str,
+) -> HubRunSettlementOutcome:
+    """Settle one positively established genuine initialization failure.
+
+    The receipt settles truthfully (``observed_failure``) and the failure
+    reports through the existing typed operation-failure path (Level 2)
+    under the bootstrap claim's established family — the same family the
+    blocking establishment's failures have always reported under. The
+    binding stays CONNECTING (never LOST for an observed run failure) and
+    the establishment is never re-dispatched: the initialize-once discipline
+    leaves the durable unresolved state to the existing recovery semantics.
+    The report is a typed no-op when it no longer addresses current work.
+    """
+    settled = hub_run_records.settle_task_hub_run_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, sequence),
+    )
+    current = task_records.get_task(transaction_pool, task_id=task_id)
+    if current is None or current.workspace_id != workspace_id:
+        # Unreachable for a Task-scoped receipt; kept explicit for fail-closed
+        # safety.
+        raise NotFoundError("the requested task is not available in this workspace")
+    operation = OperationalFailureOperation(
+        family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+        original_attempt_kind=receipt.original_attempt_kind,
+        original_attempt_id=receipt.original_attempt_id,
+        subject=canonical_failure_subject(
+            {
+                "planning_bootstrap_claim_token": str(receipt.original_attempt_id),
+                "task_agent_session_id": str(receipt.task_agent_session_id),
+            }
+        ),
+    )
+    report = OperationalFailureReport(
+        reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+        reporting_attempt_id=receipt.original_attempt_id,
+        error_code=error_code,
+        effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
+        diagnostic_context={"observation": "hub_run_initialization_failure"},
+    )
+    disposition = triage_operational_failure(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=current.state_token,
+        expected_status=TaskStatus.PLANNING,
+        expected_current_owner_gate_id=None,
+        actor=_OPENORC_ACTOR,
+        operation=operation,
+        report=report,
+    )
+    return HubRunSettlementOutcome(
+        kind=HubRunSettlementKind.SETTLED_OBSERVED_FAILURE,
+        receipt=settled,
+        disposition=disposition,
+    )
+
+
 # --- the public settlement and reconciliation entries ---------------------------
 
 
@@ -741,13 +980,58 @@ def settle_observed_hub_run_completion(
             external_session_id=observation.external_session_id,
         )
         if binding is None:
-            logger.info(
-                "the observed hub-run completion resolves to no session binding in "
-                "this connection scope; the observation is unowned"
+            # The bound-identity resolution missed. A CONNECTING binding
+            # deliberately carries no external identity, so the observation
+            # may belong to an initializing session: resolve the outstanding
+            # ``session_initialization`` receipt whose provisional
+            # ``created_external_session_id`` matches, still strictly within
+            # this authenticated Workspace/Connection scope. An
+            # initialization receipt is resolved by its binding's row
+            # identity from here on — the same serial-correlation machinery.
+            initialization_receipt = (
+                hub_run_records.find_outstanding_session_initialization_receipt(
+                    pool,
+                    workspace_id=workspace_id,
+                    connection_id=connection_id,
+                    created_external_session_id=observation.external_session_id,
+                )
             )
-            return HubRunSettlementOutcome(
-                kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
-            )
+            if initialization_receipt is None:
+                logger.info(
+                    "the observed hub-run completion resolves to no session binding in "
+                    "this connection scope; the observation is unowned"
+                )
+                return HubRunSettlementOutcome(
+                    kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
+                )
+            with composed_transaction(pool) as transaction_pool:
+                locked = hub_run_records.get_task_hub_run_receipt_for_update(
+                    transaction_pool, receipt_id=initialization_receipt.id
+                )
+                if (
+                    locked is None
+                    or locked.workspace_id != workspace_id
+                    or locked.status
+                    not in (
+                        TaskHubRunReceiptStatus.CLAIMED,
+                        TaskHubRunReceiptStatus.ADMITTED,
+                    )
+                ):
+                    logger.info(
+                        "the observed initialization completion has no outstanding "
+                        "receipt in this connection scope; the observation is unowned"
+                    )
+                    return HubRunSettlementOutcome(
+                        kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
+                    )
+                return _settle_locked_receipt(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=locked.task_id,
+                    task_agent_session_id=locked.task_agent_session_id,
+                    receipt=locked,
+                    observation=observation,
+                )
         with composed_transaction(pool) as transaction_pool:
             receipt = hub_run_records.get_outstanding_task_hub_run_receipt_for_update(
                 transaction_pool, task_agent_session_id=binding.id
@@ -760,56 +1044,82 @@ def settle_observed_hub_run_completion(
                 return HubRunSettlementOutcome(
                     kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                 )
-            if observation.sequence is not None:
-                # The stale-replay safeguard: a terminal event at or below the
-                # binding's highest consumed sequence marker is an
-                # already-consumed or stale duplicate of a prior run's
-                # notification, never a fresh completion for the outstanding
-                # run. A sequence-less observation carries no ordering
-                # evidence and is never rejected by this check.
-                consumed = hub_run_records.get_last_consumed_hub_run_sequence(
-                    transaction_pool, task_agent_session_id=binding.id
-                )
-                if consumed is not None and observation.sequence <= consumed:
-                    logger.info(
-                        "the observed hub-run completion is at or below the session's "
-                        "consumed sequence marker; the stale duplicate is rejected"
-                    )
-                    return HubRunSettlementOutcome(
-                        kind=HubRunSettlementKind.REJECTED_STALE, receipt=receipt
-                    )
-            if receipt.status is TaskHubRunReceiptStatus.CLAIMED:
-                try:
-                    hub_run_records.stage_task_hub_run_early_completion(
-                        transaction_pool,
-                        receipt_id=receipt.id,
-                        task_id=receipt.task_id,
-                        workspace_id=receipt.workspace_id,
-                        kind=observation.kind,
-                        sequence=observation.sequence,
-                        result_candidate=observation.result_candidate,
-                    )
-                except UniqueViolation:
-                    logger.info(
-                        "a second early completion for the same outstanding receipt "
-                        "is a rejected duplicate"
-                    )
-                    return HubRunSettlementOutcome(
-                        kind=HubRunSettlementKind.REJECTED_DUPLICATE, receipt=receipt
-                    )
-                return HubRunSettlementOutcome(
-                    kind=HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT,
-                    receipt=receipt,
-                )
-            return _route_observed_terminal(
+            return _settle_locked_receipt(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=receipt.task_id,
+                task_agent_session_id=binding.id,
                 receipt=receipt,
+                observation=observation,
+            )
+
+
+def _settle_locked_receipt(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_agent_session_id: UUID,
+    receipt: TaskHubRunReceipt,
+    observation: ObservedHubRunCompletion,
+) -> HubRunSettlementOutcome:
+    """Settle one locked outstanding receipt against one terminal observation.
+
+    The shared post-lock settlement of both resolutions — the bound-external
+    -identity lookup and the initialization receipt's provisional-identity
+    lookup (issue #324). The stale-replay safeguard reads the binding's
+    consumed-sequence markers; a claimed receipt stages the observation for
+    its acknowledgement attach; an admitted receipt routes through the
+    owning services and settles.
+    """
+    if observation.sequence is not None:
+        # The stale-replay safeguard: a terminal event at or below the
+        # binding's highest consumed sequence marker is an already-consumed
+        # or stale duplicate of a prior run's notification, never a fresh
+        # completion for the outstanding run. A sequence-less observation
+        # carries no ordering evidence and is never rejected by this check.
+        consumed = hub_run_records.get_last_consumed_hub_run_sequence(
+            transaction_pool, task_agent_session_id=task_agent_session_id
+        )
+        if consumed is not None and observation.sequence <= consumed:
+            logger.info(
+                "the observed hub-run completion is at or below the session's "
+                "consumed sequence marker; the stale duplicate is rejected"
+            )
+            return HubRunSettlementOutcome(
+                kind=HubRunSettlementKind.REJECTED_STALE, receipt=receipt
+            )
+    if receipt.status is TaskHubRunReceiptStatus.CLAIMED:
+        try:
+            hub_run_records.stage_task_hub_run_early_completion(
+                transaction_pool,
+                receipt_id=receipt.id,
+                task_id=receipt.task_id,
+                workspace_id=receipt.workspace_id,
                 kind=observation.kind,
                 sequence=observation.sequence,
                 result_candidate=observation.result_candidate,
             )
+        except UniqueViolation:
+            logger.info(
+                "a second early completion for the same outstanding receipt is a rejected duplicate"
+            )
+            return HubRunSettlementOutcome(
+                kind=HubRunSettlementKind.REJECTED_DUPLICATE, receipt=receipt
+            )
+        return HubRunSettlementOutcome(
+            kind=HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT,
+            receipt=receipt,
+        )
+    return _route_observed_terminal(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        receipt=receipt,
+        kind=observation.kind,
+        sequence=observation.sequence,
+        result_candidate=observation.result_candidate,
+    )
 
 
 def classify_acknowledged_hub_run_status(
@@ -882,7 +1192,12 @@ def classify_acknowledged_hub_run_status(
                 return HubRunStatusClassification(
                     kind=HubRunStatusClassificationKind.NOT_CLASSIFIABLE, receipt=receipt
                 )
-            outcome = _settle_execution_failure(
+            failure_route = (
+                _settle_establishment_failure
+                if locked.operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION
+                else _settle_execution_failure
+            )
+            outcome = failure_route(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,

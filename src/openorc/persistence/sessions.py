@@ -82,6 +82,7 @@ __all__ = [
     "ensure_task_agent_session",
     "find_task_agent_session_binding",
     "get_task_agent_session",
+    "get_task_agent_session_by_id",
     "get_task_agent_session_for_update",
     "initialize_task_agent_session",
     "list_active_task_agent_sessions",
@@ -201,6 +202,27 @@ def get_task_agent_session(
             f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
             "where task_id = %s and role = %s",
             (task_id, role.value),
+        ).fetchone()
+    return None if row is None else _session_from_row(row)
+
+
+def get_task_agent_session_by_id(
+    pool: DatabasePool, *, task_agent_session_id: UUID
+) -> TaskAgentSession | None:
+    """Return one session binding by its exact durable row identity, or None.
+
+    The detached session establishment's settlement read (issue #324): the
+    initialization receipt carries the binding's row identity (never a
+    role), and the readiness finalization resolves the addressed binding by
+    that exact identity before addressing it by its Task/role. The caller
+    owns every scope and workflow classification.
+    """
+    if not isinstance(task_agent_session_id, UUID):
+        raise TaskAgentSessionDomainError("task_agent_session_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions where id = %s",
+            (task_agent_session_id,),
         ).fetchone()
     return None if row is None else _session_from_row(row)
 

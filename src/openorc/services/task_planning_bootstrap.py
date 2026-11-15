@@ -80,9 +80,10 @@ from __future__ import annotations
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 from uuid import UUID
 
@@ -105,7 +106,11 @@ from openorc.domain.tasks import (
 )
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
-from openorc.persistence.ownership import get_repository
+from openorc.persistence.hub_runs import (
+    get_latest_session_initialization_receipt,
+    get_outstanding_task_hub_run_receipt,
+)
+from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.persistence.tasks import (
@@ -132,7 +137,11 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.session_runtime import establish_task_agent_session
+from openorc.services.session_runtime import (
+    EstablishmentObservationRegistrar,
+    dispatch_task_agent_session_establishment,
+    establish_task_agent_session,
+)
 from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
@@ -141,11 +150,14 @@ from openorc.services.workspace_authorization import require_workspace_task
 __all__ = [
     "PlanningBootstrapTerminalConflictError",
     "PlanningBootstrapUnresolvedError",
+    "ResumableBootstrapContinuation",
     "TaskBootstrapEstablishmentLease",
     "TaskBootstrapRuntimeComposition",
+    "TaskPlanningBootstrapDispatchOutcome",
     "TaskPlanningPreparationOutcome",
     "WorkspacePreparationFailedError",
     "complete_resumed_bootstrap_prepare",
+    "find_resumable_bootstrap_continuation",
     "prepare_task_for_planning",
 ]
 
@@ -287,6 +299,203 @@ class TaskPlanningPreparationOutcome:
     producer_session: TaskAgentSession
     reviewer_session: TaskAgentSession
     producer_checkout_directory: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningBootstrapDispatchOutcome:
+    """The detached establishment's dispatched suspension (issue #324).
+
+    Safe, non-secret facts only: the current post-claim Task (whose state
+    token is the claim's rotation), the exactly-once claim identity, and that
+    rotated token. Both initialization turns are durably enqueued (or one
+    role already READY while the other's receipt is outstanding); the
+    dispatching worker returns without waiting for ``session_ready``, and
+    the observed completions settle readiness and resume the bootstrap
+    through the post-commit continuation trigger. No runtime result, no
+    bound external identity, and no PREPARE has happened.
+    """
+
+    task: Task
+    claim_token: UUID
+    post_claim_token: UUID
+
+
+class _ClaimedBootstrapDisposition(StrEnum):
+    """The claimed-bootstrap disposition matrix (issue #324).
+
+    Read off the durable establishment receipts, binding lifecycle, and
+    settled stage evidence alone:
+
+    - ``resumable``: every establishment settled into READY with nothing
+      outstanding and no PREPARE yet dispatched — the readiness-resumed
+      continuation proceeds past establishment;
+    - ``in_progress``: every non-READY binding carries an outstanding
+      initialization receipt — the establishments are durably dispatched and
+      their completions own the resumption; a replayed invocation
+      dispatches nothing;
+    - ``unresolved_connecting``: a CONNECTING binding with no outstanding
+      initialization receipt — the prior creation/admission outcome is
+      unknowable from durable state, or its dispatch was refused or
+      positively failed; another creation can never be proven safe;
+    - ``unresolved_past_establishment``: settled stage evidence past
+      establishment — whether the outstanding bootstrap work ran is
+      unprovable.
+
+    Both unresolved variants fail closed with zero runtime effects for
+    Owner/recovery handling.
+    """
+
+    RESUMABLE = "resumable"
+    IN_PROGRESS = "in_progress"
+    UNRESOLVED_CONNECTING = "unresolved_connecting"
+    UNRESOLVED_PAST_ESTABLISHMENT = "unresolved_past_establishment"
+
+    def message(
+        self,
+        *,
+        producer: TaskAgentSession,
+        reviewer: TaskAgentSession,
+    ) -> str:
+        """The typed fail-closed reason for the unresolved dispositions."""
+        if self is _ClaimedBootstrapDisposition.UNRESOLVED_CONNECTING:
+            return (
+                "a previous planning-bootstrap claim exists and its session "
+                "establishment is unresolved; another creation cannot be "
+                "proven safe and is never re-dispatched"
+            )
+        return (
+            "a previous planning-bootstrap claim exists and its continuation "
+            "is already past establishment; whether the outstanding bootstrap "
+            "work ran is unprovable and is never replayed"
+        )
+
+
+def _classify_claimed_bootstrap(
+    transaction_pool: DatabasePool,
+    *,
+    producer: TaskAgentSession,
+    reviewer: TaskAgentSession,
+    stage: TaskPlanningBootstrapStage | None,
+) -> _ClaimedBootstrapDisposition:
+    """Classify one claimed bootstrap from the durable facts alone.
+
+    The stage evidence past establishment is the existing fail-closed
+    unresolved classification (whether the outstanding bootstrap work ran is
+    unprovable). With no settled stage, every binding must be provably
+    dispatched by the detached establishment machinery — CONNECTING with an
+    outstanding ``session_initialization`` receipt, or READY with a settled
+    one (its initialization receipt is the establishment provenance) —
+    before the bootstrap can be trusted as in-progress or resumable. A READY
+    binding with no initialization receipt was established by the blocking
+    handshake (or predates the receipt vocabulary): its post-establishment
+    bootstrap work stays honestly unprovable, exactly as before issue #324.
+    """
+    if stage is not None:
+        return _ClaimedBootstrapDisposition.UNRESOLVED_PAST_ESTABLISHMENT
+    producer_receipt = get_outstanding_task_hub_run_receipt(
+        transaction_pool, task_agent_session_id=producer.id
+    )
+    reviewer_receipt = get_outstanding_task_hub_run_receipt(
+        transaction_pool, task_agent_session_id=reviewer.id
+    )
+    producer_dispatched = producer_receipt is not None or (
+        producer.lifecycle_status is TaskSessionLifecycleStatus.READY
+        and get_latest_session_initialization_receipt(
+            transaction_pool, task_agent_session_id=producer.id
+        )
+        is not None
+    )
+    reviewer_dispatched = reviewer_receipt is not None or (
+        reviewer.lifecycle_status is TaskSessionLifecycleStatus.READY
+        and get_latest_session_initialization_receipt(
+            transaction_pool, task_agent_session_id=reviewer.id
+        )
+        is not None
+    )
+    if not producer_dispatched or not reviewer_dispatched:
+        return _ClaimedBootstrapDisposition.UNRESOLVED_CONNECTING
+    if (
+        producer.lifecycle_status is TaskSessionLifecycleStatus.READY
+        and reviewer.lifecycle_status is TaskSessionLifecycleStatus.READY
+    ):
+        return _ClaimedBootstrapDisposition.RESUMABLE
+    return _ClaimedBootstrapDisposition.IN_PROGRESS
+
+
+@dataclass(frozen=True, slots=True)
+class ResumableBootstrapContinuation:
+    """The post-readiness resumable bootstrap continuation (issue #324).
+
+    Safe, non-secret facts only: the current Task carrying the claim's
+    rotated post-claim token, and the Workspace Owner accountable for the
+    resumed continuation's authorization. Presence means the durable state
+    proves the resumable classification; the F1 boundary owns the submission
+    (services never build RQ/invocation payloads).
+    """
+
+    task: Task
+    owner_profile_id: UUID
+
+
+def find_resumable_bootstrap_continuation(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+) -> ResumableBootstrapContinuation | None:
+    """Classify the post-readiness resumable bootstrap state, read-only.
+
+    The post-commit classification the continuation trigger runs (issue
+    #324): the Task must be current and coarse-``planning`` under its
+    exactly-once claim with no settled stage, both role bindings READY with
+    nothing outstanding, and the Workspace must resolve its accountable
+    Owner. ``None`` means the durable state is not (or no longer) the
+    resumable post-readiness state and the trigger submits nothing — the
+    decision is re-derived from committed state on every trigger, never
+    assumed. No transaction is held across the caller's submission.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    with composed_transaction(pool) as transaction_pool:
+        task = get_task(transaction_pool, task_id=task_id)
+        if task is None or task.workspace_id != workspace_id:
+            return None
+        if task.status is not TaskStatus.PLANNING:
+            return None
+        evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+        if evidence is None or evidence.stage is not None:
+            return None
+        producer = get_task_agent_session(
+            transaction_pool, task_id=task_id, role=WorkflowRole.PRODUCER
+        )
+        reviewer = get_task_agent_session(
+            transaction_pool, task_id=task_id, role=WorkflowRole.REVIEWER
+        )
+        if (
+            producer is None
+            or reviewer is None
+            or producer.lifecycle_status is not TaskSessionLifecycleStatus.READY
+            or reviewer.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        ):
+            return None
+        if (
+            get_outstanding_task_hub_run_receipt(
+                transaction_pool, task_agent_session_id=producer.id
+            )
+            is not None
+            or get_outstanding_task_hub_run_receipt(
+                transaction_pool, task_agent_session_id=reviewer.id
+            )
+            is not None
+        ):
+            return None
+        workspace = get_workspace(transaction_pool, workspace_id=workspace_id)
+        if workspace is None:
+            return None
+        return ResumableBootstrapContinuation(
+            task=task,
+            owner_profile_id=workspace.owner_profile_id,
+        )
 
 
 def _require_uuid_command(value: object, name: str) -> UUID:
@@ -536,20 +745,38 @@ def prepare_task_for_planning(
     expected_state_token: UUID,
     reviewer_neutral_directory: str,
     attempt_evidence: InvocationAttemptEvidence | None = None,
-) -> TaskPlanningPreparationOutcome:
+    observation_registrar: EstablishmentObservationRegistrar | None = None,
+    bootstrap_continuation_trigger: Callable[..., None] | None = None,
+) -> TaskPlanningPreparationOutcome | TaskPlanningBootstrapDispatchOutcome:
     """Run the one logical planning-bootstrap continuation for the Task.
 
     The continuation consumes the exact E1a handoff context: a current,
     non-archived Task in coarse ``planning`` whose admission reserved both
     the Producer and the Reviewer roles, addressed under the Workspace/Task
-    Owner scope with the exact current ``state_token``. It finishes both
-    role sessions' READY establishment, prepares the Producer's isolated
-    Task checkout through the typed PREPARE control, moves the exact
-    existing Producer session into that checkout for ordinary planning, and
-    returns the prepared-for-planning outcome. It never admits capacity a
-    second time, never rebinds a route, never recreates a Task, never
-    replaces a session, never clones in Core, and never sends a PLAN
-    control.
+    Owner scope with the exact current ``state_token``.
+
+    Two outcomes are possible (issue #324):
+
+    - :class:`TaskPlanningPreparationOutcome` — the established
+      prepared-for-planning handoff: both role sessions READY, the typed
+      PREPARE control's validated ``workspace_result`` settled, and the
+      existing Producer session moved into its Task checkout. The blocking
+      establishment path returns this directly; the detached path returns it
+      from the readiness-resumed continuation.
+    - :class:`TaskPlanningBootstrapDispatchOutcome` — the detached
+      establishment's dispatched suspension: both initialization turns are
+      durably enqueued (or one role already READY while the other is
+      outstanding), the worker returns without waiting for ``session_ready``,
+      and the observed completions settle readiness and resume the
+      bootstrap through the post-commit continuation trigger.
+
+    It never admits capacity a second time, never rebinds a route, never
+    recreates a Task, never replaces a session, never clones in Core, and
+    never sends a PLAN control. With an ``observation_registrar`` the
+    initialization is dispatched through the detached establishment
+    machinery (one promptless ``start`` plus one ``run.enqueue`` admission
+    each); without one — the queue-mode interim until #328 — the existing
+    blocking readiness handshake is used unchanged.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _PREPARE_SPAN_NAME) as span:
         _require_uuid_command(workspace_id, "workspace_id")
@@ -558,6 +785,13 @@ def prepare_task_for_planning(
         _require_uuid_command(expected_state_token, "expected_state_token")
         runtime_composition = _require_runtime_composition(runtime)
         reviewer_neutral_directory = _require_reviewer_neutral_directory(reviewer_neutral_directory)
+        if observation_registrar is not None and not callable(
+            getattr(observation_registrar, "register_establishment_session", None)
+        ):
+            raise InvalidCommandError(
+                "the establishment observation registrar does not implement the "
+                "establishment registration seam"
+            )
         annotate_span(
             span,
             operation=_PREPARE_SPAN_NAME,
@@ -613,55 +847,69 @@ def prepare_task_for_planning(
                     "session; the bootstrap continuation cannot proceed"
                 )
             if existing_claim is not None:
-                # A previous claim held the bootstrap: its establishment is
-                # unresolved (the creation outcome is unknowable from durable
-                # state) or its continuation is already past establishment.
-                # Either way, no runtime effect is ever re-dispatched here.
-                if (
-                    producer.lifecycle_status is TaskSessionLifecycleStatus.CONNECTING
-                    or reviewer.lifecycle_status is TaskSessionLifecycleStatus.CONNECTING
-                ):
-                    raise PlanningBootstrapUnresolvedError(
-                        "a previous planning-bootstrap claim exists and its session "
-                        "establishment is unresolved; another creation cannot be "
-                        "proven safe and is never re-dispatched"
+                # A previous claim held the bootstrap. The claimed-bootstrap
+                # disposition matrix (issue #324) classifies from the
+                # durable establishment receipts and stage evidence alone;
+                # no runtime effect is ever re-dispatched here.
+                evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+                disposition = _classify_claimed_bootstrap(
+                    transaction_pool,
+                    producer=producer,
+                    reviewer=reviewer,
+                    stage=None if evidence is None else evidence.stage,
+                )
+                if disposition is _ClaimedBootstrapDisposition.IN_PROGRESS:
+                    # Every non-READY binding carries an outstanding
+                    # initialization receipt: the establishments are durably
+                    # dispatched and their completions own the resumption.
+                    # This replayed invocation dispatches nothing, never
+                    # re-creates, and never re-enqueues.
+                    if attempt_evidence is not None:
+                        # The claimed bootstrap's original identity travels
+                        # on the no-effect replay for the coordinator's
+                        # records.
+                        attempt_evidence.record_task_token(task.state_token)
+                    return TaskPlanningBootstrapDispatchOutcome(
+                        task=task,
+                        claim_token=existing_claim,
+                        post_claim_token=task.state_token,
                     )
-                raise PlanningBootstrapUnresolvedError(
-                    "a previous planning-bootstrap claim exists and both sessions "
-                    "are ready; whether workspace preparation already ran is "
-                    "unprovable and is never replayed"
+                if disposition is _ClaimedBootstrapDisposition.RESUMABLE:
+                    # Every establishment settled into READY with nothing
+                    # outstanding and no PREPARE yet dispatched: the
+                    # readiness-resumed continuation proceeds past
+                    # establishment.
+                    claim_token = existing_claim
+                    post_claim_token = task.state_token
+                else:
+                    raise PlanningBootstrapUnresolvedError(
+                        disposition.message(producer=producer, reviewer=reviewer)
+                    )
+            else:
+                # The one provably safe first establishment: the one-shot
+                # claim fact is absent, so no bootstrap claim ever succeeded
+                # and no creation was ever dispatched for either binding.
+                # The claim is written exactly once, conditionally on the
+                # caller's exact token, BEFORE any runtime effect; the
+                # continuation binds its later rechecks to its own claim
+                # identity.
+                claim_token = uuid.uuid4()
+                post_claim_token = claim_task_planning_bootstrap(
+                    transaction_pool,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    claim_token=claim_token,
                 )
-            if producer.lifecycle_status is not TaskSessionLifecycleStatus.CONNECTING or (
-                reviewer.lifecycle_status is not TaskSessionLifecycleStatus.CONNECTING
-            ):
-                # Unreachable invariant: READY requires a prior claim. A
-                # divergence is never guessed around.
-                raise ConflictError(
-                    "the task's admitted session bindings are not in the claimed bootstrap state"
-                )
-            # The one provably safe first establishment: the one-shot claim
-            # fact is absent, so no bootstrap claim ever succeeded and no
-            # creation was ever dispatched for either binding. The claim is
-            # written exactly once, conditionally on the caller's exact
-            # token, BEFORE any runtime effect; the continuation binds its
-            # later rechecks to its own claim identity.
-            claim_token = uuid.uuid4()
-            post_claim_token = claim_task_planning_bootstrap(
-                transaction_pool,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                claim_token=claim_token,
-            )
-            if post_claim_token is None:
-                # A concurrent continuation won the exactly-once claim: this
-                # invocation dispatches nothing and never retries.
-                raise StaleOperationError(
-                    "the task state moved on during the planning-bootstrap claim; "
-                    "the bootstrap is stale or already claimed"
-                )
-            task = get_task(transaction_pool, task_id=task_id)
-            if task is None:
-                raise NotFoundError("the requested task is not available in this workspace")
+                if post_claim_token is None:
+                    # A concurrent continuation won the exactly-once claim:
+                    # this invocation dispatches nothing and never retries.
+                    raise StaleOperationError(
+                        "the task state moved on during the planning-bootstrap claim; "
+                        "the bootstrap is stale or already claimed"
+                    )
+                task = get_task(transaction_pool, task_id=task_id)
+                if task is None:
+                    raise NotFoundError("the requested task is not available in this workspace")
 
         if attempt_evidence is not None:
             # The F5b coordinator's handoff facts: the post-claim token this
@@ -681,9 +929,14 @@ def prepare_task_for_planning(
         }
         # --- Phase 2: establishment (external, no transaction open). Per
         # role, branch on durable lifecycle BEFORE any lease acquisition: an
-        # already-READY binding is reused with no runtime effect, and a
-        # CONNECTING binding is established exactly once through #130 with
-        # the lease's selected configuration. ---
+        # already-READY binding is reused with no runtime effect. With an
+        # observation registrar the CONNECTING binding's initialization is
+        # dispatched through the detached establishment machinery (one
+        # promptless ``start``, one observation registration, one
+        # ``run.enqueue`` admission each — issue #324); without one, the
+        # queue-mode interim, it is established exactly once through the
+        # blocking #130 readiness handshake. ---
+        dispatched_detached = False
         for role in (WorkflowRole.PRODUCER, WorkflowRole.REVIEWER):
             binding = bindings[role]
             if binding.lifecycle_status is TaskSessionLifecycleStatus.READY:
@@ -698,15 +951,53 @@ def prepare_task_for_planning(
                 role=role,
                 working_directory=working_directory,
             ) as lease:
-                established = establish_task_agent_session(
-                    pool,
-                    lease.adapter,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    role=role,
-                    effective_configuration=lease.selected_configuration,
-                )
-            bindings[role] = established
+                if observation_registrar is not None:
+                    dispatched = dispatch_task_agent_session_establishment(
+                        pool,
+                        lease.adapter,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        role=role,
+                        effective_configuration=lease.selected_configuration,
+                        original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+                        original_attempt_id=claim_token,
+                        observation_registrar=observation_registrar,
+                    )
+                    bindings[role] = dispatched.task_agent_session
+                    dispatched_detached = True
+                else:
+                    established = establish_task_agent_session(
+                        pool,
+                        lease.adapter,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        role=role,
+                        effective_configuration=lease.selected_configuration,
+                    )
+                    bindings[role] = established
+        if dispatched_detached:
+            # The detached path never waits for ``session_ready`` in the
+            # dispatching worker. Both initialization turns are durably
+            # enqueued (or already settled); the observed completions settle
+            # readiness and resume the bootstrap. When every establishment
+            # already settled within this dispatch, the post-commit trigger
+            # submits the readiness-resumed continuation now; otherwise the
+            # later observed completion triggers it.
+            if bootstrap_continuation_trigger is not None:
+                try:
+                    bootstrap_continuation_trigger(workspace_id=workspace_id, task_id=task_id)
+                except Exception as error:  # noqa: BLE001 - contained trigger
+                    logger.warning(
+                        "the bootstrap continuation trigger failed after the "
+                        "detached establishment dispatch (%s); the durable "
+                        "resumable state owns recovery",
+                        type(error).__name__,
+                    )
+            return TaskPlanningBootstrapDispatchOutcome(
+                task=task,
+                claim_token=claim_token,
+                post_claim_token=post_claim_token,
+            )
 
         # --- Phase 3: pre-PREPARE recheck (one short transaction): the exact
         # Task/token/claim currentness and the exact READY-binding identity,
@@ -743,7 +1034,23 @@ def prepare_task_for_planning(
             raise ConflictError(f"the selected task checkout directory {failure}")
 
         # --- Phase 4: one typed PREPARE to the exact bound Producer session
-        # (external, no transaction open). ---
+        # (external, no transaction open). The durable PREPARE-dispatch
+        # marker (issue #324) is committed strictly before the send: a
+        # replayed or raced post-readiness continuation can never re-dispatch
+        # a possibly-delivered control, and the send's outcome — whatever it
+        # is — leaves the honest ``prepare_dispatched`` stage evidence for
+        # the existing fail-closed recovery semantics. ---
+        if not record_planning_bootstrap_stage(
+            pool,
+            task_id=task_id,
+            claim_token=claim_token,
+            stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+        ):
+            raise ConflictError(
+                "the planning-bootstrap stage did not advance to its PREPARE-dispatch "
+                "marker; the PREPARE control is never re-dispatched against moved-on "
+                "bootstrap state"
+            )
         interaction = PrepareWorkspaceInteraction(
             repository_full_name=(f"{repository.metadata.owner_login}/{repository.metadata.name}"),
             issue_number=task.github_issue_number,

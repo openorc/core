@@ -79,7 +79,10 @@ from openorc.domain.hub_runs import (
     TaskHubRunReceiptStatus,
 )
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.hub_runs import get_outstanding_task_hub_run_receipt
+from openorc.persistence.hub_runs import (
+    find_outstanding_session_initialization_receipt,
+    get_outstanding_task_hub_run_receipt,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import find_task_agent_session_binding
 from openorc.services.cline_attachment import OPENORC_CLIENT_IDENTITY
@@ -101,7 +104,15 @@ from openorc.services.task_hub_run_correlation import (
     settle_observed_hub_run_completion,
 )
 
+# The post-commit bootstrap continuation trigger of the process wiring
+# (issue #324): invoked after an establishment settlement has committed a
+# validated READY finalization, it owns the resumption classification and
+# the continuation submission through the existing F1 boundary. Never
+# invoked inside a database transaction; never a workflow authority.
+BootstrapContinuationTrigger = Callable[..., None]
+
 __all__ = [
+    "BootstrapContinuationTrigger",
     "HubObservationRefusalReason",
     "HubRunObserver",
 ]
@@ -115,6 +126,7 @@ RuntimeCredentialResolver = Callable[..., tuple[Connection, ControlEndpointSecre
 
 _TRACER_SCOPE: Final[str] = "openorc.services.cline_hub_observation"
 _REGISTER_SPAN_NAME: Final[str] = "hub_run_observation.register_session"
+_REGISTER_ESTABLISHMENT_SPAN_NAME: Final[str] = "hub_run_observation.register_establishment_session"
 _INGEST_SPAN_NAME: Final[str] = "hub_run_observation.ingest_hub_event"
 _RECONNECT_SPAN_NAME: Final[str] = "hub_run_observation.reconnect_connection"
 _CONNECT_OPERATION: Final[str] = "connect"
@@ -154,6 +166,10 @@ class HubObservationRefusalReason(StrEnum):
     SESSION_BINDING_UNRESOLVED = "session_binding_unresolved"
     OBSERVATION_ATTACHMENT_FAILED = "observation_attachment_failed"
     OBSERVATION_SUBSCRIPTION_FAILED = "observation_subscription_failed"
+    # The detached establishment dispatch's typed carrier for a registration
+    # failure that is not one of the observer's own classified refusals
+    # (issue #324): the same proven pre-effect condition, one safe token.
+    OBSERVATION_REGISTRATION_FAILED = "observation_registration_failed"
 
 
 class _SessionObservation:
@@ -220,10 +236,12 @@ class HubRunObserver:
         runtime_credential_resolver: RuntimeCredentialResolver = (
             resolve_connection_runtime_credential
         ),
+        bootstrap_continuation_trigger: BootstrapContinuationTrigger | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
         self._backend_factory = backend_factory
         self._credential_resolver = runtime_credential_resolver
+        self._bootstrap_continuation_trigger = bootstrap_continuation_trigger
         self._lock = threading.Lock()
         self._started = False
         self._disposed = False
@@ -347,6 +365,73 @@ class HubRunObserver:
                 logger.warning(
                     "hub-run observation registration resolved no matching session "
                     "binding in its connection scope"
+                )
+                raise self._refusal(HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED)
+            self._register_proven_session(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=task_agent_session_id,
+                connection_id=connection_id,
+                external_session_id=external_session_id,
+            )
+
+    def register_establishment_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Establish the positive observation of one initializing session.
+
+        The detached session establishment's pre-enqueue gate (issue #324): a
+        CONNECTING binding deliberately carries no bound external identity,
+        so this registration proves the identity through the binding's
+        outstanding ``session_initialization`` receipt instead — the receipt
+        must be outstanding in this authenticated Workspace/Connection scope
+        and carry exactly the provisional ``created_external_session_id``
+        being registered. Every expected failure raises the same
+        :class:`HubObservationRegistrationRefusedError` refusal taxonomy;
+        the enqueue must not proceed without the observation. A repeated
+        registration renews the lifecycle lease and reuses the live
+        subscription exactly like the established-session gate.
+        """
+        for name, value in (
+            ("workspace_id", workspace_id),
+            ("task_id", task_id),
+            ("task_agent_session_id", task_agent_session_id),
+            ("connection_id", connection_id),
+        ):
+            if not isinstance(value, UUID):
+                raise InvalidCommandError(f"{name} must be a UUID")
+        if not isinstance(external_session_id, str) or not external_session_id.strip():
+            raise InvalidCommandError("external_session_id must be a non-empty string")
+        with application_span(_TRACER_SCOPE, _REGISTER_ESTABLISHMENT_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_REGISTER_ESTABLISHMENT_SPAN_NAME,
+                workspace_id=str(workspace_id),
+                task_id=str(task_id),
+                connection_id=str(connection_id),
+            )
+            self._require_running()
+            receipt = find_outstanding_session_initialization_receipt(
+                self._pool_provider(),
+                workspace_id=workspace_id,
+                connection_id=connection_id,
+                created_external_session_id=external_session_id,
+            )
+            if (
+                receipt is None
+                or receipt.task_id != task_id
+                or receipt.task_agent_session_id != task_agent_session_id
+            ):
+                logger.warning(
+                    "establishment observation registration resolved no outstanding "
+                    "initialization receipt carrying the provisional identity in "
+                    "its connection scope"
                 )
                 raise self._refusal(HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED)
             self._register_proven_session(
@@ -724,6 +809,29 @@ class HubRunObserver:
                 return
         if outcome.kind in _CLEANUP_SETTLEMENT_KINDS:
             self._cleanup_after_settlement(entry, lease)
+        if (
+            outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+            and outcome.receipt is not None
+            and outcome.receipt.operation.value == "session_initialization"
+            and self._bootstrap_continuation_trigger is not None
+        ):
+            # The validated READY finalization of an initialization run
+            # committed (issue #324): the post-commit bootstrap continuation
+            # trigger owns the resumption classification and submission.
+            # Strictly post-commit, contained, never a workflow authority;
+            # a failed submission leaves the durable resumable state to the
+            # existing recovery semantics.
+            try:
+                self._bootstrap_continuation_trigger(
+                    workspace_id=entry.workspace_id, task_id=entry.task_id
+                )
+            except Exception as error:  # noqa: BLE001 - best-effort trigger
+                logger.warning(
+                    "the bootstrap continuation trigger failed (%s) after the "
+                    "validated initialization settlement for task session %s",
+                    type(error).__name__,
+                    entry.task_agent_session_id,
+                )
 
     def _route_start_observation(
         self, entry: _SessionObservation, start: ClineHubRunStartObservation

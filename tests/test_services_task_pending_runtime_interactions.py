@@ -10,7 +10,7 @@ an idle READY session, an archived Task, or a terminal Task.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -36,6 +36,7 @@ _REPOSITORY_ID = uuid4()
 _STATE_TOKEN = uuid4()
 _PRODUCER_SESSION_ID = uuid4()
 _REVIEWER_SESSION_ID = uuid4()
+_RECEIPT_ID = uuid4()
 _CONNECTION_ID = uuid4()
 _CLAIM_ID = uuid4()
 _LOOP_ID = uuid4()
@@ -283,11 +284,30 @@ _TASK_READ = _sql_has("from openorc.tasks where id = %s")
 _EVIDENCE_READ = _sql_has("planning_bootstrap_claim_token")
 _CLAIMS_LIST = _sql_has("from openorc.task_runtime_send_claims where task_id")
 _SESSION_READ = _sql_has("from openorc.task_agent_sessions where task_id")
+_RECEIPT_OUTSTANDING_READ = _sql_has("from openorc.task_hub_run_receipts")
 _LOOPS_LIST = _sql_has("from openorc.review_loops where task_id")
 _ITERATION_READ = _sql_has("from openorc.review_iterations where id = %s")
 _ITERATIONS_LIST = _sql_has("from openorc.review_iterations where review_loop_id")
 _EXECUTIONS_LIST = _sql_has("from openorc.executions where task_id")
 _PR_READ = _sql_has("from openorc.task_pull_requests where task_id")
+
+
+def _receipt_read_sequence(results: Sequence[Any]) -> Any:
+    """Play back successive outstanding-receipt reads in call order.
+
+    The bootstrap projection's initialization-receipt reads (issue #324)
+    issue the same SQL per binding with different parameters; this scripted
+    callable returns the next canned result for each read, repeating the
+    last one once the list is exhausted.
+    """
+    counter = {"consumed": 0}
+
+    def _select(_conn: ScriptedConnection) -> Any:
+        index = counter["consumed"]
+        counter["consumed"] += 1
+        return results[index if index < len(results) else -1]
+
+    return _select
 
 
 def _script_projection(
@@ -303,11 +323,19 @@ def _script_projection(
     pr_row: Any = None,
     producer_session: Any = None,
     reviewer_session: Any = None,
+    receipt_reads: Sequence[Any] | None = None,
 ) -> None:
-    """Script one read-only projection composition, in call order."""
+    """Script one read-only projection composition, in call order.
+
+    ``receipt_reads`` plays back the bootstrap projection's outstanding
+    initialization-receipt reads (issue #324) in call order — one per
+    binding, Producer first.
+    """
     conn.on(_TASK_READ, task)
     conn.on_repeat(_EVIDENCE_READ, evidence)
     conn.on_repeat(_CLAIMS_LIST, claims or [])
+    if receipt_reads is not None:
+        conn.on_repeat(_RECEIPT_OUTSTANDING_READ, _receipt_read_sequence(receipt_reads))
     if iteration is not None:
         conn.on_repeat(_ITERATION_READ, iteration)
     if producer_session is not None:
@@ -455,6 +483,7 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
         task=_task_row(status="planning", current_plan_revision_id=None),
         evidence=(_STATE_TOKEN, _OBSERVED, None, None),
         producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+        receipt_reads=[None, None],
     )
     (interaction,) = list_pending_task_runtime_interactions(
         _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
@@ -475,6 +504,7 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
         task=_task_row(status="planning", current_plan_revision_id=None),
         evidence=(_STATE_TOKEN, None, None, None),
         producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+        receipt_reads=[None, None],
     )
     (residue,) = list_pending_task_runtime_interactions(
         _pool(conn2), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
@@ -493,6 +523,58 @@ def test_unstaged_bootstrap_is_outstanding_and_resolved_is_not() -> None:
             _pool(conn3), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
         )
         == []
+    )
+
+
+def test_outstanding_initialization_receipts_project_the_detached_establishment() -> None:
+    """Issue #324: a stage-less claimed bootstrap whose initialization turns
+    are durably enqueued projects the detached establishment interaction —
+    the PREPARE control has not been sent and is never reported outstanding
+    while the initialization is still unobserved."""
+    receipt_row = _initialization_receipt_row(_PRODUCER_SESSION_ID)
+    conn = ScriptedConnection()
+    _script_projection(
+        conn,
+        task=_task_row(status="planning", current_plan_revision_id=None),
+        evidence=(_STATE_TOKEN, _OBSERVED, None, None),
+        producer_session=_session_row("producer", _PRODUCER_SESSION_ID),
+        receipt_reads=[[receipt_row]],
+    )
+    (interaction,) = list_pending_task_runtime_interactions(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+    assert interaction.operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION
+    assert interaction.task_agent_session_id == _PRODUCER_SESSION_ID
+    assert interaction.started_at == receipt_row[12]
+    assert interaction.subject == {
+        "planning_bootstrap_claim_token": str(_STATE_TOKEN),
+        "formal_result_outstanding": True,
+    }
+
+
+def _initialization_receipt_row(task_agent_session_id: Any) -> tuple[Any, ...]:
+    """One claimed ``session_initialization`` receipt row in the projection's
+    19-column read order."""
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        task_agent_session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        _STATE_TOKEN,
+        "session_ready",
+        None,
+        "claimed",
+        {},
+        None,
+        _OBSERVED,
+        None,
+        None,
+        _OBSERVED,
+        "ext-session-7",
+        {"adapter": "clin", "configuration": {}},
+        None,
     )
 
 

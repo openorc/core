@@ -41,6 +41,8 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
+    AgentRunAdmission,
+    AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
 )
@@ -52,6 +54,8 @@ from openorc.adapters.cline import (
 )
 from openorc.adapters.cline.values import ClineStartResult
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.hub_runs import TaskHubRunReceiptStatus
+from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import (
     TASK_ID,
@@ -65,7 +69,9 @@ from openorc.services.cline_construction import DurableClineConstructionContextR
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
+    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
 )
@@ -74,6 +80,7 @@ from openorc.services.session_runtime import (
     SessionContinuityConflictError,
     SessionEstablishmentRecoveryRequiredError,
     SessionTerminalConflictError,
+    dispatch_task_agent_session_establishment,
     end_task_agent_session,
     establish_task_agent_session,
     record_task_agent_session_lost,
@@ -1944,3 +1951,506 @@ def test_fresh_cline_construction_fails_closed_on_an_ineligible_admitted_connect
 
     # The refusal happened in the resolver: no backend effect at all.
     assert backend.calls() == ()
+
+
+# --- the detached session establishment dispatch (issue #324) ------------------
+
+
+class _DetachedAdapterDouble(AgentRuntimeAdapter):
+    """A detached-capable adapter double: the two capability methods are
+    scripted; the blocking universal operations assert they are never used."""
+
+    def __init__(
+        self,
+        allocation: AgentSessionAllocation,
+        admission_outcomes: list[Any],
+        *,
+        allocation_error: Exception | None = None,
+        lifecycle: list[str] | None = None,
+    ) -> None:
+        self._allocation = allocation
+        self._admission_outcomes = list(admission_outcomes)
+        self._allocation_error = allocation_error
+        self.allocation_requests: list[AgentSessionCreationRequest] = []
+        self.admissions: list[tuple[str, str]] = []
+        self.lifecycle = lifecycle if lifecycle is not None else []
+
+    def allocate_detached_session(self, request: AgentSessionCreationRequest) -> Any:
+        self.allocation_requests.append(request)
+        self.lifecycle.append("allocate")
+        if self._allocation_error is not None:
+            raise self._allocation_error
+        return self._allocation
+
+    def admit_initialization_run(self, session_id: str, initialization: str) -> Any:
+        self.admissions.append((session_id, initialization))
+        self.lifecycle.append("admit")
+        outcome = self._admission_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def create_session(self, request: AgentSessionCreationRequest) -> Any:
+        raise AssertionError("the detached dispatch never performs the blocking handshake")
+
+    def send(self, session_id: str, message: str, *, expected_family: Any = None) -> Any:
+        raise AssertionError("the detached dispatch never performs a blocking send")
+
+    def realize_control(self, session_id: str, interaction: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the detached dispatch never realizes controls")
+
+
+class _RecordingRegistrar:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._error = error
+
+    def register_establishment_session(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+
+
+def _initialization_receipt_row(
+    workspace_id: Any,
+    task_id: Any,
+    session_id: Any,
+    *,
+    status: str = "claimed",
+    run_id: str | None = None,
+    external_session_id: str = "ext-9",
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status == "admitted" else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        task_id,
+        session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        uuid.uuid4(),
+        "session_ready",
+        run_id,
+        status,
+        {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        external_session_id,
+        {"adapter": "cline", "configuration": {}},
+        None,
+    )
+
+
+def _dispatch_results(
+    workspace_id: Any,
+    owner_profile_id: Any,
+    task_id: Any,
+    connection_id: Any,
+    *,
+    binding_row: tuple[Any, ...],
+    connection_row: tuple[Any, ...] | None = None,
+    outstanding_receipt: tuple[Any, ...] | None = None,
+    receipt_row: tuple[Any, ...] | None = None,
+    attach_receipt_rows: list[tuple[Any, ...]] | None = None,
+    final_binding_row: tuple[Any, ...] | None = None,
+) -> list[_CannedResult]:
+    """The detached dispatch's canned statement sequence, in order."""
+    results: list[_CannedResult] = [
+        _ws_row(workspace_id, owner_profile_id),
+        _BARRIER_ROW,
+        _task_row(workspace_id),
+        binding_row,
+        connection_row
+        if connection_row is not None
+        else _connection_row(workspace_id, connection_id),
+        outstanding_receipt,  # the replay guard's outstanding-receipt read
+    ]
+    if receipt_row is not None:
+        results.append(receipt_row)  # the provisional receipt insert
+    if attach_receipt_rows is not None:
+        # The acknowledgement attach: lock, runId attach, staged read.
+        results.extend(attach_receipt_rows)
+        results.append(None)  # no staged early completion
+    if final_binding_row is not None:
+        results.append(final_binding_row)  # the post-attach binding reload
+    return results
+
+
+def _dispatch_kwargs(
+    workspace_id: Any,
+    task_id: Any,
+    *,
+    effective_configuration: Any = None,
+) -> dict[str, Any]:
+    return {
+        "workspace_id": workspace_id,
+        "task_id": task_id,
+        "role": WorkflowRole.PRODUCER,
+        "effective_configuration": (
+            {} if effective_configuration is None else effective_configuration
+        ),
+        "original_attempt_kind": OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+        "original_attempt_id": uuid.uuid4(),
+    }
+
+
+def test_detached_dispatch_enqueues_the_initialization_and_leaves_connecting() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+            attach_receipt_rows=[
+                receipt_row,
+                _initialization_receipt_row(
+                    workspace_id, task_id, binding[0], status="admitted", run_id="run-324"
+                ),
+            ],
+            final_binding_row=binding,
+        )
+    )
+    registrar = _RecordingRegistrar()
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [AgentRunAdmission(run_id="run-324")],
+    )
+
+    outcome = dispatch_task_agent_session_establishment(
+        _pool(conn),
+        adapter,  # type: ignore[arg-type]
+        **_dispatch_kwargs(workspace_id, task_id),
+        observation_registrar=registrar,  # type: ignore[arg-type]
+    )
+
+    # The binding stays CONNECTING with a NULL external identity: Hub
+    # admission is never readiness and never a bound identity.
+    assert outcome.task_agent_session.external_session_id is None
+    assert outcome.task_agent_session.lifecycle_status is TaskSessionLifecycleStatus.CONNECTING
+    assert outcome.receipt is not None
+    # The acknowledgement attach consumed no staged completion: the receipt
+    # is admitted with its acknowledged runId, and the binding is untouched.
+    assert outcome.receipt.status is TaskHubRunReceiptStatus.ADMITTED
+    assert outcome.receipt.run_id == "run-324"
+    assert outcome.receipt.created_external_session_id == "ext-9"
+    # The promptless allocation and the verbatim enqueue; never a send.
+    assert adapter.allocation_requests[0].initialization != ""
+    assert adapter.admissions == [("ext-9", adapter.allocation_requests[0].initialization)]
+    assert adapter.lifecycle == ["allocate", "admit"]
+    # The positively-required pre-enqueue observation registration.
+    assert registrar.calls == [
+        {
+            "workspace_id": workspace_id,
+            "task_id": task_id,
+            "task_agent_session_id": binding[0],
+            "connection_id": connection_id,
+            "external_session_id": "ext-9",
+        }
+    ]
+    inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(inserts) == 1
+
+
+def test_repeated_detached_dispatch_is_an_idempotent_no_op() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    outstanding = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            outstanding_receipt=outstanding,
+        )
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [],
+    )
+
+    outcome = dispatch_task_agent_session_establishment(
+        _pool(conn),
+        adapter,  # type: ignore[arg-type]
+        **_dispatch_kwargs(workspace_id, task_id),
+        observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+    )
+
+    # The outstanding receipt is the proof: no second allocation, enqueue,
+    # registration, or insert ever happens.
+    assert outcome.receipt is not None
+    assert outcome.receipt.status is TaskHubRunReceiptStatus.CLAIMED
+    assert outcome.receipt.created_external_session_id == "ext-9"
+    assert adapter.allocation_requests == []
+    assert adapter.admissions == []
+    assert not any("insert into openorc.task_hub_run_receipts" in sql for sql, _ in conn.executed)
+
+
+def test_detached_dispatch_refusal_marks_the_receipt_refused() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    refused_row = _initialization_receipt_row(workspace_id, task_id, binding[0], status="refused")
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+        + [refused_row]  # the pre-effect refusal record
+    )
+
+    with pytest.raises(ExternalOperationRejectedError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            _DetachedAdapterDouble(
+                AgentSessionAllocation(external_session_id="ext-9"),
+                [AgentSessionNotFoundError("session not found")],
+            ),  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    refusals = [sql for sql, _ in conn.executed if "set status = 'refused'" in sql]
+    assert len(refusals) == 1
+
+
+def test_detached_dispatch_uncertain_admission_keeps_the_receipt_claimed() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            _DetachedAdapterDouble(
+                AgentSessionAllocation(external_session_id="ext-9"),
+                [AgentRuntimeTimeoutError("the admission timed out")],
+            ),  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    # The receipt stays conservatively claimed: an uncertain admission is
+    # never reclassified and never re-dispatched.
+    assert not any("set status = 'refused'" in sql for sql, _ in conn.executed)
+
+
+def test_registration_refusal_is_a_proven_pre_effect_failure() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    refused_row = _initialization_receipt_row(workspace_id, task_id, binding[0], status="refused")
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+        + [refused_row]
+    )
+
+    with pytest.raises(HubObservationRegistrationRefusedError):
+        adapter = _DetachedAdapterDouble(
+            AgentSessionAllocation(external_session_id="ext-9"),
+            [],
+        )
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            adapter,  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(
+                error=HubObservationRegistrationRefusedError(
+                    "at capacity", reason="observer_at_capacity"
+                )
+            ),  # type: ignore[arg-type]
+        )
+
+    # The enqueue never happened and the receipt was marked refused so a
+    # never-dispatched run cannot hold the session's single-outstanding slot.
+    assert adapter.admissions == []
+    inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(inserts) == 1
+    refusals = [sql for sql, _ in conn.executed if "set status = 'refused'" in sql]
+    assert len(refusals) == 1
+
+
+def test_already_ready_dispatch_is_idempotent_success() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
+    conn = ScriptedConnection(
+        [
+            _ws_row(workspace_id, owner_profile_id),
+            _BARRIER_ROW,
+            _task_row(workspace_id),
+            ready_row,
+            None,  # the idempotent re-entry's outstanding-receipt read
+        ]
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [],
+    )
+
+    outcome = dispatch_task_agent_session_establishment(
+        _pool(conn),
+        adapter,  # type: ignore[arg-type]
+        **_dispatch_kwargs(workspace_id, task_id),
+        observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+    )
+
+    assert outcome.task_agent_session.external_session_id == "ext-1"
+    assert outcome.receipt is None
+    assert adapter.allocation_requests == []
+
+
+def test_unproven_enqueue_rejection_leaves_the_receipt_claimed_and_uncertain() -> None:
+    """Issue #324 review fix: ``enqueue`` is effectful, so an unproven SDK
+    rejection of the admission is an uncertain outcome — the receipt stays
+    conservatively claimed (never REFUSED) because a run may have been
+    admitted while the correlation evidence must stay outstanding."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [
+            AgentRuntimeDeliveryUncertainError(
+                "the enqueue outcome is unknown whether it took effect"
+            )
+        ],
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            adapter,  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    # The unproven rejection never reclassifies the receipt: no refusal write
+    # exists and the claimed receipt stays the outstanding correlation
+    # evidence.
+    assert not any("set status = 'refused'" in sql for sql, _ in conn.executed)
+    inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(inserts) == 1
+
+
+def test_recognized_hub_admission_refusal_marks_the_receipt_refused() -> None:
+    """Issue #324 review fix: a recognized Hub admission refusal
+    (``run_admission_rejected``/``hub_draining``) is a positively proven
+    pre-effect refusal — the dispatch classifies it known and marks the
+    initialization receipt REFUSED so a never-admitted run cannot hold the
+    session's single-outstanding slot."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    refused_row = _initialization_receipt_row(workspace_id, task_id, binding[0], status="refused")
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+        + [refused_row]
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [AgentRuntimeUnavailableError("the hub refused the enqueue ('run_admission_rejected')")],
+    )
+
+    with pytest.raises(ExternalOperationRejectedError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            adapter,  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    refusals = [sql for sql, _ in conn.executed if "set status = 'refused'" in sql]
+    assert len(refusals) == 1
+    # The admission attempt itself was made (and refused); the acknowledged
+    # correlation evidence is the refused receipt, and no attach followed.
+    assert len(adapter.admissions) == 1
+    assert not any(
+        "update openorc.task_hub_run_receipts" in sql and "set status = 'admitted'" in sql
+        for sql, _ in conn.executed
+    )
