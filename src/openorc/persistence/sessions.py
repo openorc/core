@@ -80,6 +80,7 @@ __all__ = [
     "checkpoint_task_agent_session_cost",
     "count_active_task_agent_sessions_by_connection",
     "ensure_task_agent_session",
+    "find_task_agent_session_binding",
     "get_task_agent_session",
     "get_task_agent_session_for_update",
     "initialize_task_agent_session",
@@ -254,6 +255,42 @@ def list_task_agent_sessions_by_external_session_id(
             (external_session_id,),
         ).fetchall()
     return [_session_from_row(row) for row in rows]
+
+
+def find_task_agent_session_binding(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    external_session_id: str,
+) -> TaskAgentSession | None:
+    """Resolve the exact session binding of one external session identity.
+
+    The scoped resolution the detached Hub-run settlement uses (issue #322):
+    an external session identifier belongs to an external runtime namespace,
+    so the lookup always runs within the authenticated Workspace and
+    Connection scope of the observation and returns the one authoritative
+    binding whose ``(Connection, external_session_id)`` identity matches —
+    the schema's partial unique index guarantees at most one. A different
+    Connection's coincidental identifier never resolves here. ``None`` means
+    no binding in this scope carries the identity: the observation is
+    unowned and is classified by the calling service, never guessed here.
+    """
+    if not isinstance(workspace_id, UUID) or not isinstance(connection_id, UUID):
+        raise TaskAgentSessionDomainError(
+            "find_task_agent_session_binding requires UUID workspace and connection identities"
+        )
+    if not isinstance(external_session_id, str) or not external_session_id.strip():
+        raise TaskAgentSessionDomainError(
+            "external_session_id must be a non-empty opaque external-session identity"
+        )
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_SESSION_COLUMNS} from openorc.task_agent_sessions "
+            "where workspace_id = %s and connection_id = %s and external_session_id = %s",
+            (workspace_id, connection_id, external_session_id),
+        ).fetchone()
+    return None if row is None else _session_from_row(row)
 
 
 def initialize_task_agent_session(
