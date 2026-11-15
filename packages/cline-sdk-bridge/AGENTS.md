@@ -43,7 +43,7 @@ Documentation defines the candidate public contract. Source inspection/live prob
 
 ## It may own
 
-Official SDK invocation, request/reply correlation, plain-JSON translation, SDK connection lifecycle, public session/message/history reads, asynchronous ClineCore event forwarding, usage/runtime-state forwarding, and the SDK control/reconstruction calls required by the backend contract.
+Official SDK invocation, request/reply correlation, plain-JSON translation, SDK connection lifecycle, public session/message/history reads, asynchronous ClineCore event forwarding, usage/runtime-state forwarding, and the SDK control/reconstruction calls required by the backend contract. For issue #321 it also owns official public Hub command invocation and Hub event envelope observation through the officially exported `NodeHubClient` for nonblocking `run.enqueue` admission, status-only `run.list` reads, and envelope forwarding — reusing the admitted endpoint, authentication, and exact session identity, never constructing a delivery mode into a hub command payload, and never treating a client-side dispatch timeout (`hub_command_timeout`) or a Hub transport failure as a refusal (both are uncertain outcomes that never authorize a resend).
 
 ## It must never own
 

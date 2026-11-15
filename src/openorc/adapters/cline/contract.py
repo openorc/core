@@ -45,6 +45,11 @@ Operation semantics (exactly the qualified v1 surface):
   prompt verbatim. Its result is the SDK-native plain-JSON ``AgentResult``
   (or None for the SDK's legitimate undefined response), never parsed into
   OpenOrc meaning here.
+- ``enqueue`` (issue #321) admits one nonblocking Hub-native run through the
+  public SDK Hub command surface and returns the verified acknowledgement.
+  It is transport evidence for later exact correlation, never a workflow
+  decision: admission is neither delivery nor execution, and an uncertain
+  outcome never authorizes a resend.
 - ``stop`` releases the runtime incarnation for serialized same-ID
   reconstruction; ``abort`` interrupts active work. They are distinct
   operations, and neither implies deleting or replacing an OpenOrc Task
@@ -56,6 +61,11 @@ Operation semantics (exactly the qualified v1 surface):
   and usage observations are non-authoritative: interpretation belongs to
   reconciliation/observation work, and usage may reset across Hub
   lifetimes.
+- ``list_runs`` (issue #321) exposes the attachment's status-only Hub run
+  records as opaque observations, and ``subscribe_hub`` (issue #321)
+  forwards Hub event envelopes with envelope-owned session identity, event
+  name, durable-log sequence, and unchanged payload. Both are transport
+  observations only.
 - ``subscribe`` receives session-scoped or unfiltered ``CoreSessionEvent``
   observations, retaining the session ID, event kind, and JSON payload.
   The returned handle supports explicit idempotent unsubscribe. This is an
@@ -80,7 +90,9 @@ from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from openorc.adapters.cline.values import (
+    ClineHubEvent,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
     ClineStartResult,
@@ -119,6 +131,22 @@ class ClineSdkBackend(Protocol):
         """
         ...
 
+    def enqueue(self, session_id: str, prompt: str) -> ClineRunAdmission:
+        """Admit one nonblocking Hub-native run on the exact session ID.
+
+        Returns the verified Hub acknowledgement (:class:`ClineRunAdmission`)
+        — transport evidence for later exact correlation, never a workflow
+        decision. Admission is neither delivery nor execution: accepted
+        failed runs may emit no terminal event, and a lost acknowledgement or
+        timeout is never proof of non-delivery or permission to resend. A
+        positively identified Hub refusal raises
+        :class:`ClineSdkOperationRejectedError` carrying the Hub's machine
+        code; uncertain outcomes stay
+        :class:`ClineBackendUncertainOutcomeError`. Deliberately distinct
+        from ``send`` and from any OpenOrc queue mode.
+        """
+        ...
+
     def stop(self, session_id: str) -> None:
         """Release the runtime incarnation for serialized same-ID
         reconstruction. Distinct from ``abort``; no session deletion."""
@@ -144,6 +172,18 @@ class ClineSdkBackend(Protocol):
         Non-authoritative."""
         ...
 
+    def list_runs(self, session_id: str | None) -> list[JsonObject]:
+        """Observe the attachment's status-only Hub run records, opaque and
+        uninterpreted.
+
+        ``session_id`` filters to the exact session, or None lists across
+        the attachment. Records are status observations, never workflow
+        evidence by themselves; a missing or malformed observation fails as
+        an uncertain outcome instead of returning an empty list, because an
+        empty list must never become false "no runs" evidence downstream.
+        """
+        ...
+
     def get_accumulated_usage(self, session_id: str) -> JsonObject | None:
         """Read the session's accumulated usage observation, or None where
         the SDK permits absence. May reset across Hub lifetimes."""
@@ -157,6 +197,22 @@ class ClineSdkBackend(Protocol):
         """Forward session-scoped (or, with None, unfiltered) session
         events to the listener; explicit idempotent unsubscribe via the
         returned handle; no replay promise."""
+        ...
+
+    def subscribe_hub(
+        self,
+        session_id: str | None,
+        listener: Callable[[ClineHubEvent], None],
+    ) -> Subscription:
+        """Forward Hub event envelopes — session-scoped or, with None,
+        unfiltered — to the listener.
+
+        Every delivered :class:`ClineHubEvent` carries the Hub envelope's
+        own session identity, event name, durable-log sequence when present,
+        and unchanged payload; identity is never synthesized. Same explicit
+        idempotent unsubscribe via the returned handle and no replay promise
+        as ``subscribe``.
+        """
         ...
 
     def dispose(self) -> None:

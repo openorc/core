@@ -26,9 +26,11 @@ import pytest
 from openorc.adapters.cline import (
     ClineBackendUncertainOutcomeError,
     ClineConstructionMode,
+    ClineHubEvent,
     ClineRemoteAttachmentRejectedError,
     ClineRemoteAttachmentUnavailableError,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSdkBackend,
     ClineSdkBackendError,
     ClineSdkOperationRejectedError,
@@ -41,14 +43,17 @@ from tests.fakes.cline_sdk_backend import (
     OP_ABORT,
     OP_CONNECT,
     OP_DISPOSE,
+    OP_ENQUEUE,
     OP_GET,
     OP_GET_ACCUMULATED_USAGE,
     OP_LIST_HISTORY,
+    OP_LIST_RUNS,
     OP_READ_MESSAGES,
     OP_SEND,
     OP_START,
     OP_STOP,
     OP_SUBSCRIBE,
+    OP_SUBSCRIBE_HUB,
     FakeBackendCall,
     FakeClineSdkBackend,
 )
@@ -556,3 +561,93 @@ def test_operation_gates_hold_a_call_open_until_released() -> None:
     # runs freely.
     backend.send(session_id, "free prompt")
     assert [call.operation for call in backend.calls()] == [OP_START, OP_SEND, OP_SEND]
+
+
+def test_enqueue_default_scripted_and_list_runs_status_bookkeeping() -> None:
+    fake = FakeClineSdkBackend()
+    assert isinstance(fake, ClineSdkBackend)
+    fake.start(_start_request(session_id="sess-1"))
+
+    with pytest.raises(ClineSessionNotFoundError):
+        fake.enqueue("sess-unknown", "turn")  # positive absence on this instance
+    fake.queue_enqueue("sess-1", ClineSdkOperationRejectedError("run_admission_rejected"))
+    with pytest.raises(ClineSdkOperationRejectedError) as refused:
+        fake.enqueue("sess-1", "refused turn")
+    assert refused.value.code == "run_admission_rejected"
+    admission = fake.enqueue("sess-1", "accepted turn")
+    assert admission == ClineRunAdmission(
+        run_id="hub-run-1", accepted_at=1794712612935, queue_position=0
+    )
+
+    runs = fake.list_runs("sess-1")
+    assert runs == [
+        {
+            "runId": "hub-run-1",
+            "sessionId": "sess-1",
+            "state": "queued",
+            "acceptedAt": 1794712612935,
+            "queuePosition": 0,
+        }
+    ]
+    assert fake.list_runs(None) == runs
+    assert fake.list_runs("sess-other") == []
+
+    calls = fake.calls()
+    enqueue_calls = [call for call in calls if call.operation == OP_ENQUEUE]
+    assert len(enqueue_calls) == 3
+    assert enqueue_calls[-1].session_id == "sess-1"
+    assert "accepted turn" not in repr(enqueue_calls[-1])  # prompts stay out of representations
+    list_calls = [call for call in calls if call.operation == OP_LIST_RUNS]
+    assert [call.session_id for call in list_calls] == ["sess-1", None, "sess-other"]
+
+
+def test_subscribe_hub_filtering_and_unsubscribe_are_deterministic() -> None:
+    fake = FakeClineSdkBackend()
+    received: list[ClineHubEvent] = []
+    subscription = fake.subscribe_hub("sess-1", received.append)
+    other: list[ClineHubEvent] = []
+    unfiltered = fake.subscribe_hub(None, other.append)
+
+    fake.emit_hub(
+        ClineHubEvent(
+            session_id="sess-1", kind="run.started", sequence=1, payload={"requestId": "r1"}
+        )
+    )
+    fake.emit_hub(ClineHubEvent(session_id=None, kind="usage.updated", sequence=None, payload={}))
+    # A session-filtered subscription never receives an envelope it cannot
+    # attribute; an unfiltered one receives everything in order.
+    assert [event.kind for event in received] == ["run.started"]
+    assert [event.kind for event in other] == ["run.started", "usage.updated"]
+
+    subscription.unsubscribe()
+    subscription.unsubscribe()  # idempotent
+    fake.emit_hub(ClineHubEvent(session_id="sess-1", kind="run.completed", sequence=2, payload={}))
+    assert [event.kind for event in received] == ["run.started"]
+    assert [event.kind for event in other][-1] == "run.completed"
+
+    unfiltered.unsubscribe()
+    assert [call.operation for call in fake.calls() if call.operation == OP_SUBSCRIBE_HUB] == [
+        OP_SUBSCRIBE_HUB,
+        OP_SUBSCRIBE_HUB,
+    ]
+
+
+def test_hub_value_types_reject_malformed_fields() -> None:
+    malformed_admissions: list[dict[str, Any]] = [
+        {"run_id": "", "accepted_at": 1, "queue_position": 0},
+        {"run_id": "r", "accepted_at": 1.5, "queue_position": 0},
+        {"run_id": "r", "accepted_at": True, "queue_position": 0},
+        {"run_id": "r", "accepted_at": 1, "queue_position": -1},
+    ]
+    for fields in malformed_admissions:
+        with pytest.raises(ValueError):
+            ClineRunAdmission(**fields)
+    malformed_events: list[dict[str, Any]] = [
+        {"session_id": "s", "kind": "", "sequence": None, "payload": {}},
+        {"session_id": "", "kind": "run.started", "sequence": None, "payload": {}},
+        {"session_id": None, "kind": "run.started", "sequence": 1.5, "payload": {}},
+        {"session_id": None, "kind": "run.started", "sequence": None, "payload": []},
+    ]
+    for fields in malformed_events:
+        with pytest.raises(ValueError):
+            ClineHubEvent(**fields)

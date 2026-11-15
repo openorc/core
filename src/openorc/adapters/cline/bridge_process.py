@@ -41,6 +41,15 @@ Failure discipline (conservative outcome classification):
   spans, or logs. stdout frames are never logged; the child's stderr is
   discarded (``/dev/null``) and never treated as diagnostic text.
 
+Hub-native admission and observation operations (issue #321) transport the
+public SDK Hub command surface verbatim: ``enqueue`` returns the verified
+nonblocking acknowledgement as transport evidence for later exact
+correlation, ``list_runs`` forwards status-only run records, and
+``subscribe_hub`` forwards Hub event envelopes with envelope-owned
+identity. Admission is never delivery or execution; transport losses and
+dispatch timeouts resolve as uncertain outcomes, never as refusals, and
+never authorize a resend.
+
 Concurrency discipline: request frames are written atomically under a
 short write lock (never held while awaiting a reply), a dedicated reader
 thread matches replies to their exact per-generation request IDs as they
@@ -78,7 +87,9 @@ from openorc.adapters.cline.errors import (
     ClineSessionNotFoundError,
 )
 from openorc.adapters.cline.values import (
+    ClineHubEvent,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
     ClineStartResult,
@@ -94,13 +105,16 @@ _TRACER_SCOPE = "openorc.adapters.cline.bridge_process"
 _CONNECT_SPAN_NAME = "cline_bridge.connect"
 _START_SPAN_NAME = "cline_bridge.start"
 _SEND_SPAN_NAME = "cline_bridge.send"
+_ENQUEUE_SPAN_NAME = "cline_bridge.enqueue"
 _STOP_SPAN_NAME = "cline_bridge.stop"
 _ABORT_SPAN_NAME = "cline_bridge.abort"
 _GET_SPAN_NAME = "cline_bridge.get"
 _READ_MESSAGES_SPAN_NAME = "cline_bridge.read_messages"
 _LIST_HISTORY_SPAN_NAME = "cline_bridge.list_history"
+_LIST_RUNS_SPAN_NAME = "cline_bridge.list_runs"
 _GET_ACCUMULATED_USAGE_SPAN_NAME = "cline_bridge.get_accumulated_usage"
 _SUBSCRIBE_SPAN_NAME = "cline_bridge.subscribe"
+_SUBSCRIBE_HUB_SPAN_NAME = "cline_bridge.subscribe_hub"
 _UNSUBSCRIBE_SPAN_NAME = "cline_bridge.unsubscribe"
 _DISPOSE_SPAN_NAME = "cline_bridge.dispose"
 
@@ -256,6 +270,33 @@ def _decode_result(method: str, value: Any) -> Any:
             if isinstance(subscription_id, str) and subscription_id.strip():
                 return subscription_id
         return _INVALID_RESULT
+    if method == "subscribe_hub":
+        if isinstance(value, dict):
+            subscription_id = value.get("subscription_id")
+            if isinstance(subscription_id, str) and subscription_id.strip():
+                return subscription_id
+        return _INVALID_RESULT
+    if method == "enqueue":
+        if not isinstance(value, dict):
+            return _INVALID_RESULT
+        run_id = value.get("run_id")
+        accepted_at = value.get("accepted_at")
+        queue_position = value.get("queue_position")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return _INVALID_RESULT
+        # Exact-type checks exclude booleans and floats: the bridge verifies
+        # safe integers, and anything else cannot carry a verified handle.
+        if type(accepted_at) is not int:
+            return _INVALID_RESULT
+        if type(queue_position) is not int or queue_position < 0:
+            return _INVALID_RESULT
+        return ClineRunAdmission(
+            run_id=run_id, accepted_at=accepted_at, queue_position=queue_position
+        )
+    if method == "list_runs":
+        if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+            return list(value)
+        return _INVALID_RESULT
     return _INVALID_RESULT
 
 
@@ -296,7 +337,7 @@ def _default_entrypoint_path() -> Path:
     return repository_root / "packages" / "cline-sdk-bridge" / "dist" / "cli.js"
 
 
-class _SubscriptionEntry:
+class _SubscriptionEntry[EventT: (ClineSessionEvent, ClineHubEvent)]:
     """One local registration of a wire subscription ID to its listener."""
 
     __slots__ = ("active", "filter_session_id", "listener", "subscription_id")
@@ -305,7 +346,7 @@ class _SubscriptionEntry:
         self,
         subscription_id: str,
         filter_session_id: str | None,
-        listener: Callable[[ClineSessionEvent], None],
+        listener: Callable[[EventT], None],
     ) -> None:
         self.subscription_id = subscription_id
         self.filter_session_id = filter_session_id
@@ -355,11 +396,11 @@ class _BridgeAttachment:
         self._child_shutdown = False
         self._next_request_number = 0
         self._pending: dict[str, _PendingCall] = {}
-        self._subscriptions: dict[str, _SubscriptionEntry] = {}
+        self._subscriptions: dict[str, _SubscriptionEntry[Any]] = {}
         self._closing = threading.Event()
-        self._dispatch_queue: queue.Queue[tuple[_SubscriptionEntry, ClineSessionEvent]] = (
-            queue.Queue(maxsize=_DISPATCH_QUEUE_BOUND)
-        )
+        self._dispatch_queue: queue.Queue[
+            tuple[_SubscriptionEntry[Any], ClineSessionEvent | ClineHubEvent]
+        ] = queue.Queue(maxsize=_DISPATCH_QUEUE_BOUND)
         self._reader = threading.Thread(
             target=self._reader_loop, name=f"openorc-cline-bridge-reader-{generation}", daemon=True
         )
@@ -464,7 +505,9 @@ class _BridgeAttachment:
         for entry in entries:
             entry.active = False
 
-    def offer_event(self, entry: _SubscriptionEntry, event: ClineSessionEvent) -> None:
+    def offer_event(
+        self, entry: _SubscriptionEntry[Any], event: ClineSessionEvent | ClineHubEvent
+    ) -> None:
         """Hand one event to the bounded dispatcher; never block the reader."""
         # Bounded dispatch: a dropped event is lost telemetry, never authority.
         with suppress(queue.Full):
@@ -564,10 +607,14 @@ class _BridgeAttachment:
         return True
 
     def _handle_notification(self, frame: dict[str, Any]) -> None:
+        """Route one event notification to its exact subscription."""
+        if frame.get("method") == "cline.event":
+            self._handle_session_notification(frame.get("params"))
+        elif frame.get("method") == "cline.hub_event":
+            self._handle_hub_notification(frame.get("params"))
+
+    def _handle_session_notification(self, params: Any) -> None:
         """Route one ``cline.event`` notification to its exact subscription."""
-        if frame.get("method") != "cline.event":
-            return
-        params = frame.get("params")
         if not isinstance(params, dict):
             return
         subscription_id = params.get("subscription_id")
@@ -589,6 +636,34 @@ class _BridgeAttachment:
         if entry is not None and entry.active:
             self.offer_event(
                 entry, ClineSessionEvent(session_id=session_id, kind=kind, payload=payload)
+            )
+
+    def _handle_hub_notification(self, params: Any) -> None:
+        """Route one ``cline.hub_event`` notification to its exact
+        subscription with the Hub envelope's own identity (issue #321)."""
+        if not isinstance(params, dict):
+            return
+        subscription_id = params.get("subscription_id")
+        session_id = params.get("session_id")
+        kind = params.get("kind")
+        sequence = params.get("sequence")
+        payload = params.get("payload")
+        if not (
+            isinstance(subscription_id, str)
+            and subscription_id.strip()
+            and isinstance(kind, str)
+            and kind.strip()
+            and isinstance(payload, dict)
+            and (session_id is None or (isinstance(session_id, str) and session_id.strip()))
+            and (sequence is None or type(sequence) is int)
+        ):
+            return
+        with self._lock:
+            entry = self._subscriptions.get(subscription_id)
+        if entry is not None and entry.active:
+            self.offer_event(
+                entry,
+                ClineHubEvent(session_id=session_id, kind=kind, sequence=sequence, payload=payload),
             )
 
     def _dispatcher_loop(self) -> None:
@@ -870,6 +945,19 @@ class ClineBridgeProcessBackend:
             assert outcome is None or isinstance(outcome, dict)  # reader-validated invariant
             return outcome
 
+    def enqueue(self, session_id: str, prompt: str) -> ClineRunAdmission:
+        """Admit one nonblocking Hub-native run on the exact session ID.
+
+        Admission, not execution: the verified acknowledgement is transport
+        evidence for later exact correlation, never a workflow decision, and
+        an uncertain outcome never authorizes a resend."""
+        with application_span(_TRACER_SCOPE, _ENQUEUE_SPAN_NAME) as span:
+            annotate_span(span, operation=_ENQUEUE_SPAN_NAME)
+            attachment = self._require_attached()
+            outcome = self._rpc(attachment, "enqueue", {"session_id": session_id, "prompt": prompt})
+            assert isinstance(outcome, ClineRunAdmission)  # reader-validated invariant
+            return outcome
+
     def stop(self, session_id: str) -> None:
         """Release the runtime incarnation for same-ID reconstruction."""
         with application_span(_TRACER_SCOPE, _STOP_SPAN_NAME) as span:
@@ -914,6 +1002,17 @@ class ClineBridgeProcessBackend:
             assert isinstance(outcome, list)  # reader-validated invariant
             return outcome
 
+    def list_runs(self, session_id: str | None) -> list[JsonObject]:
+        """Observe the attachment's status-only Hub run records, opaque and
+        uninterpreted; an absent or malformed observation fails as an
+        uncertain outcome instead of an empty-list "no runs" evidence."""
+        with application_span(_TRACER_SCOPE, _LIST_RUNS_SPAN_NAME) as span:
+            annotate_span(span, operation=_LIST_RUNS_SPAN_NAME)
+            attachment = self._require_attached()
+            outcome = self._rpc(attachment, "list_runs", {"session_id": session_id})
+            assert isinstance(outcome, list)  # reader-validated invariant
+            return outcome
+
     def get_accumulated_usage(self, session_id: str) -> JsonObject | None:
         """Read the session's accumulated usage observation, or None."""
         with application_span(_TRACER_SCOPE, _GET_ACCUMULATED_USAGE_SPAN_NAME) as span:
@@ -940,7 +1039,31 @@ class ClineBridgeProcessBackend:
             attachment = self._require_attached()
             subscription_id = self._rpc(attachment, "subscribe", {"session_id": session_id})
             assert isinstance(subscription_id, str)  # reader-validated invariant
-            entry = _SubscriptionEntry(subscription_id, session_id, listener)
+            entry: _SubscriptionEntry[ClineSessionEvent] = _SubscriptionEntry(
+                subscription_id, session_id, listener
+            )
+            attachment.register_subscription(entry)
+            return Subscription(cancel=lambda: attachment.unsubscribe(subscription_id))
+
+    def subscribe_hub(
+        self,
+        session_id: str | None,
+        listener: Callable[[ClineHubEvent], None],
+    ) -> Subscription:
+        """Subscribe to Hub event envelopes — session-scoped or unfiltered.
+
+        Returns the D2 ``Subscription`` handle whose idempotent
+        ``unsubscribe`` issues D3's wire-only ``unsubscribe``. Old handles
+        never resurrect onto a replaced attachment; fresh explicit
+        subscription is required after reconnection."""
+        with application_span(_TRACER_SCOPE, _SUBSCRIBE_HUB_SPAN_NAME) as span:
+            annotate_span(span, operation=_SUBSCRIBE_HUB_SPAN_NAME)
+            attachment = self._require_attached()
+            subscription_id = self._rpc(attachment, "subscribe_hub", {"session_id": session_id})
+            assert isinstance(subscription_id, str)  # reader-validated invariant
+            entry: _SubscriptionEntry[ClineHubEvent] = _SubscriptionEntry(
+                subscription_id, session_id, listener
+            )
             attachment.register_subscription(entry)
             return Subscription(cancel=lambda: attachment.unsubscribe(subscription_id))
 

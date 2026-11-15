@@ -30,9 +30,11 @@ from openorc.adapters.cline import (
     ClineBridgeProcessBackend,
     ClineBridgeProtocolError,
     ClineConstructionMode,
+    ClineHubEvent,
     ClineRemoteAttachmentRejectedError,
     ClineRemoteAttachmentUnavailableError,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSdkBackend,
     ClineSdkOperationRejectedError,
     ClineSessionEvent,
@@ -102,8 +104,9 @@ def next_outcome(method):
 
 
 sessions = {}
-counters = {"session": 0, "subscription": 0}
+counters = {"session": 0, "subscription": 0, "hub_subscription": 0, "run": 0}
 subscriptions = []
+hub_subscriptions = []
 NOT_FOUND = {"error": {"kind": "session_not_found"}}
 
 
@@ -145,6 +148,30 @@ def deliver(entry, event):
 def broadcast(event):
     for entry in list(subscriptions):
         deliver(entry, event)
+
+
+def deliver_hub(entry, envelope):
+    if not entry["active"]:
+        return
+    event_session = envelope.get("session_id")
+    if entry["filter"] is not None and (event_session is None or entry["filter"] != event_session):
+        return
+    write_frame({
+        "jsonrpc": "2.0",
+        "method": "cline.hub_event",
+        "params": {
+            "subscription_id": entry["id"],
+            "session_id": event_session,
+            "kind": envelope["kind"],
+            "sequence": envelope.get("sequence"),
+            "payload": envelope["payload"],
+        },
+    })
+
+
+def broadcast_hub(envelope):
+    for entry in list(hub_subscriptions):
+        deliver_hub(entry, envelope)
 
 
 def apply(method, request_id, fallback):
@@ -204,6 +231,21 @@ def handle(method, params, request_id):
         record({"method": "send", "args": params})
         apply(method, request_id, lambda: session_value(params["session_id"], None))
         return
+    if method == "enqueue":
+        record({"method": "enqueue", "args": params})
+
+        def enqueue_fallback():
+            if params.get("session_id") not in sessions:
+                return NOT_FOUND
+            counters["run"] += 1
+            return {
+                "run_id": "hub-run-%d" % counters["run"],
+                "accepted_at": 1794712612934 + counters["run"],
+                "queue_position": 0,
+            }
+
+        apply(method, request_id, enqueue_fallback)
+        return
     if method == "stop":
         record({"method": "stop", "args": params})
         apply(method, request_id, lambda: session_value(params["session_id"], None))
@@ -223,6 +265,10 @@ def handle(method, params, request_id):
         return
     if method == "list_history":
         record({"method": "list_history", "args": params})
+        apply(method, request_id, lambda: [])
+        return
+    if method == "list_runs":
+        record({"method": "list_runs", "args": params})
         apply(method, request_id, lambda: [])
         return
     if method == "get_accumulated_usage":
@@ -247,6 +293,22 @@ def handle(method, params, request_id):
             timer.start()
         respond(request_id, result={"subscription_id": subscription_id})
         return
+    if method == "subscribe_hub":
+        record({"method": "subscribe_hub", "args": params})
+        counters["hub_subscription"] += 1
+        subscription_id = "hub-sub-%d" % counters["hub_subscription"]
+        hub_subscriptions.append(
+            {"id": subscription_id, "filter": params.get("session_id"), "active": True}
+        )
+        for hub_event in script.get("hub_events", []):
+            if hub_event.get("after_subscribe_hub") != counters["hub_subscription"]:
+                continue
+            delay = (hub_event.get("delay_ms") or 10) / 1000.0
+            timer = threading.Timer(delay, broadcast_hub, args=(hub_event["envelope"],))
+            timer.daemon = True
+            timer.start()
+        respond(request_id, result={"subscription_id": subscription_id})
+        return
     if method == "unsubscribe":
         record({"method": "unsubscribe", "args": params})
         for entry in subscriptions:
@@ -257,6 +319,8 @@ def handle(method, params, request_id):
     if method == "dispose":
         record({"method": "dispose", "args": params})
         for entry in subscriptions:
+            entry["active"] = False
+        for entry in hub_subscriptions:
             entry["active"] = False
         respond(request_id, result=None)
         return
@@ -1151,3 +1215,160 @@ def test_real_python_to_node_bridge_seam(node_seam: tuple[list[str], dict[str, s
         starts[1]["args"]["initialMessages"] == messages
     )  # nested raw payload round-trips losslessly through the real child
     assert not any(call["method"] in ("dispose", "unsubscribe") for call in calls)
+
+
+def test_enqueue_returns_the_verified_admission(tmp_path: Path) -> None:
+    script = {
+        "outcomes": {
+            "enqueue": [
+                {"ok": {"run_id": "hub-run-9", "accepted_at": 1794712612935, "queue_position": 2}}
+            ]
+        }
+    }
+    command, child_env, record_path = _scripted_child(tmp_path, "enqueue", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    backend.start(_start_request(session_id="sess-1"))
+    admission = backend.enqueue("sess-1", "detached turn")
+    assert admission == ClineRunAdmission(
+        run_id="hub-run-9", accepted_at=1794712612935, queue_position=2
+    )
+    backend.dispose()
+
+    calls = [call for call in _recorded_calls(record_path) if call["method"] == "enqueue"]
+    assert calls[0]["args"] == {"session_id": "sess-1", "prompt": "detached turn"}
+
+
+def test_enqueue_maps_refusal_uncertainty_and_session_absence(tmp_path: Path) -> None:
+    script = {
+        "outcomes": {
+            "enqueue": [
+                {"error": {"kind": "sdk_operation_rejected", "code": "run_admission_rejected"}},
+                {"error": {"kind": "uncertain_outcome"}},
+                {"error": {"kind": "session_not_found"}},
+            ]
+        }
+    }
+    command, child_env, _ = _scripted_child(tmp_path, "enqueue-kinds", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    backend.start(_start_request(session_id="sess-1"))
+    with pytest.raises(ClineSdkOperationRejectedError) as refused:
+        backend.enqueue("sess-1", "turn")
+    assert refused.value.code == "run_admission_rejected"
+    with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.enqueue("sess-1", "turn")
+    with pytest.raises(ClineSessionNotFoundError):
+        backend.enqueue("sess-1", "turn")
+    backend.dispose()
+
+
+def test_list_runs_returns_status_only_records_opaquely(tmp_path: Path) -> None:
+    records = [
+        {"runId": "r1", "state": "queued", "acceptedAt": 1794712612934},
+        {"runId": "r2", "state": "failed", "error": "session not found"},
+    ]
+    script = {"outcomes": {"list_runs": [{"ok": records}]}}
+    command, child_env, record_path = _scripted_child(tmp_path, "list-runs", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    assert backend.list_runs("sess-1") == records
+    assert backend.list_runs(None) == []  # unscripted default is the empty runs array
+    backend.dispose()
+
+    calls = [call for call in _recorded_calls(record_path) if call["method"] == "list_runs"]
+    assert calls[0]["args"] == {"session_id": "sess-1"}
+    assert calls[1]["args"] == {"session_id": None}
+
+
+def test_list_runs_malformed_observation_is_uncertain_not_empty_evidence(tmp_path: Path) -> None:
+    script = {"outcomes": {"list_runs": [{"ok": {}}]}}
+    command, child_env, _ = _scripted_child(tmp_path, "list-runs-bad", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    with pytest.raises(ClineBackendUncertainOutcomeError):
+        backend.list_runs(None)
+    backend.dispose()
+
+
+def test_subscribe_hub_forwards_hub_event_envelopes_with_envelope_identity(tmp_path: Path) -> None:
+    script = {
+        "hub_events": [
+            {
+                "after_subscribe_hub": 1,
+                "delay_ms": 10,
+                "envelope": {
+                    "session_id": "sess-1",
+                    "kind": "run.started",
+                    "sequence": 7,
+                    "payload": {"requestId": "hub-run-1"},
+                },
+            },
+            {
+                "after_subscribe_hub": 1,
+                "delay_ms": 20,
+                "envelope": {
+                    "session_id": "sess-2",
+                    "kind": "run.started",
+                    "sequence": 8,
+                    "payload": {"requestId": "hub-run-2"},
+                },
+            },
+            {
+                "after_subscribe_hub": 1,
+                "delay_ms": 30,
+                "envelope": {
+                    "session_id": "sess-1",
+                    "kind": "run.completed",
+                    "sequence": 9,
+                    "payload": {"reason": "finished", "result": {"text": "done"}},
+                },
+            },
+        ]
+    }
+    command, child_env, record_path = _scripted_child(tmp_path, "hub-events", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    received: list[ClineHubEvent] = []
+    subscription = backend.subscribe_hub("sess-1", received.append)
+    _wait_until(lambda: len(received) >= 2)
+    subscription.unsubscribe()
+    backend.dispose()
+
+    assert received[0].session_id == "sess-1"  # the envelope's own session identity
+    assert received[0].kind == "run.started"
+    assert received[0].sequence == 7
+    assert received[0].payload == {"requestId": "hub-run-1"}
+    # The terminal envelope passes through verbatim: no run or request
+    # identity is synthesized from result contents.
+    assert received[1] == ClineHubEvent(
+        session_id="sess-1",
+        kind="run.completed",
+        sequence=9,
+        payload={"reason": "finished", "result": {"text": "done"}},
+    )
+    calls = [call for call in _recorded_calls(record_path) if call["method"] == "subscribe_hub"]
+    assert calls[0]["args"] == {"session_id": "sess-1"}
+
+
+def test_subscribe_hub_unfiltered_receives_identity_less_envelopes(tmp_path: Path) -> None:
+    script = {
+        "hub_events": [
+            {
+                "after_subscribe_hub": 1,
+                "delay_ms": 10,
+                "envelope": {"kind": "usage.updated", "payload": {"tokens": 5}},
+            }
+        ]
+    }
+    command, child_env, _ = _scripted_child(tmp_path, "hub-events-unfiltered", script)
+    backend = _make_backend(command, child_env)
+    backend.connect(_remote_config())
+    received: list[ClineHubEvent] = []
+    subscription = backend.subscribe_hub(None, received.append)
+    _wait_until(lambda: len(received) >= 1)
+    subscription.unsubscribe()
+    backend.dispose()
+    assert received[0] == ClineHubEvent(
+        session_id=None, kind="usage.updated", sequence=None, payload={"tokens": 5}
+    )

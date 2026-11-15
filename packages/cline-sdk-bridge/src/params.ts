@@ -138,6 +138,26 @@ export function validateSendParams(params: unknown): { session_id: string; promp
   return { session_id: requireSessionId(object), prompt: requireString(object, "prompt") };
 }
 
+/** `enqueue` params (issue #321): exact target session ID and verbatim
+ * prompt for nonblocking Hub admission. The bridge maps this onto exactly
+ * `{prompt}` on the Hub envelope — no delivery mode is ever constructed or
+ * forwarded. Deliberately distinct from `send`. */
+export function validateEnqueueParams(params: unknown): { session_id: string; prompt: string } {
+  const object = requireObject(params);
+  return { session_id: requireSessionId(object), prompt: requireString(object, "prompt") };
+}
+
+/** `list_runs` params (issue #321): optional exact session ID filter; null
+ * lists the attachment's runs across sessions. Status-only observation. */
+export function validateListRunsParams(params: unknown): { session_id: string | null } {
+  const object = requireObject(params);
+  const value = object["session_id"];
+  if (value === undefined || value === null) {
+    return { session_id: null };
+  }
+  return { session_id: requireSessionId(object) };
+}
+
 /** `abort` params: exact target session ID with optional opaque reason. */
 export function validateAbortParams(params: unknown): { session_id: string; reason?: string | null } {
   const object = requireObject(params);

@@ -9,7 +9,7 @@
  * bridge boundary classification is exercised end to end.
  */
 
-import type { BridgeSdkClient, SdkSessionEvent, SdkStartInput, SdkStartResult } from "../../src/bridge.js";
+import type { BridgeSdkClient, SdkHubEvent, SdkSessionEvent, SdkStartInput, SdkStartResult } from "../../src/bridge.js";
 import type { JsonObject } from "../../src/types.js";
 
 export interface ScriptedOutcome {
@@ -60,7 +60,13 @@ export class FakeClineCoreClient implements BridgeSdkClient {
     listener: (event: SdkSessionEvent) => void;
     active: boolean;
   }> = [];
+  private readonly hubSubscriptions: Array<{
+    filter: string | null;
+    listener: (event: SdkHubEvent) => void;
+    active: boolean;
+  }> = [];
   private nextSessionNumber = 0;
+  private nextHubRunNumber = 0;
 
   script(method: string, outcomes: ScriptedOutcome[]): void {
     this.scripts.set(method, [...outcomes]);
@@ -210,10 +216,57 @@ export class FakeClineCoreClient implements BridgeSdkClient {
     }
   }
 
+  async enqueue(input: { sessionId: string; prompt: string }): Promise<unknown> {
+    this.record("enqueue", input);
+    return await this.apply("enqueue", () => {
+      this.requireKnown(input.sessionId);
+      this.nextHubRunNumber += 1;
+      return {
+        runId: `hub-run-${this.nextHubRunNumber}`,
+        acceptedAt: 1794712612934 + this.nextHubRunNumber,
+        queuePosition: 0,
+      };
+    });
+  }
+
+  async listRuns(sessionId: string | null): Promise<unknown> {
+    this.record("list_runs", { session_id: sessionId });
+    return await this.apply("list_runs", () => ({ runs: [] }));
+  }
+
+  async subscribeHub(
+    listener: (event: SdkHubEvent) => void,
+    options?: { sessionId?: string },
+  ): Promise<() => void> {
+    this.record("subscribe_hub", { filter: options?.sessionId ?? null });
+    const entry = { filter: options?.sessionId ?? null, listener, active: true };
+    this.hubSubscriptions.push(entry);
+    return () => {
+      entry.active = false;
+    };
+  }
+
+  /** Synchronous test-side Hub-envelope delivery in subscription order,
+   * shaped exactly like the pinned NodeHubClient envelope observations. */
+  emitHub(event: SdkHubEvent): void {
+    for (const entry of this.hubSubscriptions) {
+      if (!entry.active) {
+        continue;
+      }
+      if (entry.filter !== null && event.sessionId !== entry.filter) {
+        continue;
+      }
+      entry.listener(event);
+    }
+  }
+
   async dispose(): Promise<void> {
     this.record("dispose", {});
     this.disposeCount += 1;
     for (const entry of this.subscriptions) {
+      entry.active = false;
+    }
+    for (const entry of this.hubSubscriptions) {
       entry.active = false;
     }
   }
@@ -223,6 +276,36 @@ export class FakeClineCoreClient implements BridgeSdkClient {
 export function sessionNotFoundError(sessionId: string): Error {
   const error = new Error(`session not found: ${sessionId}`);
   (error as { code?: string }).code = "session_not_found";
+  return error;
+}
+
+/** A native-shaped Hub command refusal (HubCommandError): the Hub answered
+ * ok=false with a machine code. */
+export function hubCommandRefusal(code: string, command = "run.enqueue"): Error {
+  const error = new Error(`Hub command ${command} failed`);
+  (error as { code?: string }).code = code;
+  (error as { command?: string }).command = command;
+  return error;
+}
+
+/** A native-shaped Hub dispatch timeout: the pinned SDK client synthesizes
+ * the `hub_command_timeout` code when it gives up waiting for a reply. */
+export function hubCommandTimeoutError(command = "run.enqueue"): Error {
+  const error = new Error(`Hub command ${command} timed out`);
+  (error as { code?: string }).code = "hub_command_timeout";
+  (error as { command?: string }).command = command;
+  return error;
+}
+
+/** A native-shaped Hub transport failure (HubTransportError): the client
+ * transport failed and pending commands are rejected with it after possible
+ * dispatch. */
+export function hubTransportError(code: string, closeCode?: number): Error {
+  const error = new Error(`hub transport failure: ${code}`);
+  (error as { code?: string }).code = code;
+  if (closeCode !== undefined) {
+    (error as { details?: { closeCode?: number } }).details = { closeCode };
+  }
   return error;
 }
 

@@ -75,7 +75,9 @@ from dataclasses import dataclass
 
 from openorc.adapters.cline.errors import ClineSdkBackendError, ClineSessionNotFoundError
 from openorc.adapters.cline.values import (
+    ClineHubEvent,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
     ClineStartResult,
@@ -91,19 +93,26 @@ __all__ = [
 OP_ABORT = "abort"
 OP_CONNECT = "connect"
 OP_DISPOSE = "dispose"
+OP_ENQUEUE = "enqueue"
 OP_GET = "get"
 OP_GET_ACCUMULATED_USAGE = "get_accumulated_usage"
 OP_LIST_HISTORY = "list_history"
+OP_LIST_RUNS = "list_runs"
 OP_READ_MESSAGES = "read_messages"
 OP_SEND = "send"
 OP_START = "start"
 OP_STOP = "stop"
 OP_SUBSCRIBE = "subscribe"
+OP_SUBSCRIBE_HUB = "subscribe_hub"
 
 # Bounded release wait of one registered operation gate. It exists purely as
 # a deadlock guard so a misbehaving test fails on its own assertions instead
 # of hanging the suite; it is never a timing assertion.
 _GATE_RELEASE_TIMEOUT_SECONDS = 10.0
+
+# Deterministic admission-timestamp base for unscripted ``enqueue`` defaults,
+# mirroring the epoch-millisecond shape the qualified Hub acknowledges.
+_FAKE_ACCEPTED_AT_EPOCH_MS = 1794712612934
 
 
 @dataclass(frozen=True)
@@ -143,10 +152,22 @@ class FakeBackendCall:
 
 @dataclass
 class _SubscriptionEntry:
-    """One active event subscription tracked by the fake."""
+    """One active session-event subscription tracked by the fake."""
 
     session_id: str | None
     listener: Callable[[ClineSessionEvent], None]
+    active: bool = True
+
+    def cancel(self) -> None:
+        self.active = False
+
+
+@dataclass
+class _HubSubscriptionEntry:
+    """One active Hub event-envelope subscription tracked by the fake."""
+
+    session_id: str | None
+    listener: Callable[[ClineHubEvent], None]
     active: bool = True
 
     def cancel(self) -> None:
@@ -168,17 +189,24 @@ class FakeClineSdkBackend:
 
     def __init__(self) -> None:
         self._allocated = 0
+        self._admitted = 0
         self._sessions: dict[str, list[JsonObject]] = {}
+        self._runs: list[JsonObject] = []
         self._calls: list[FakeBackendCall] = []
         self._subscriptions: list[_SubscriptionEntry] = []
+        self._hub_subscriptions: list[_HubSubscriptionEntry] = []
         self._connect_scripts: deque[ClineSdkBackendError] = deque()
         self._start_scripts: deque[ClineStartResult | ClineSdkBackendError] = deque()
         self._send_scripts: dict[str, deque[JsonObject | None | ClineSdkBackendError]] = {}
+        self._enqueue_scripts: dict[str, deque[ClineRunAdmission | ClineSdkBackendError]] = {}
         self._stop_scripts: dict[str, deque[ClineSdkBackendError]] = {}
         self._abort_scripts: dict[str, deque[ClineSdkBackendError]] = {}
         self._get_scripts: dict[str, deque[JsonObject | None | ClineSdkBackendError]] = {}
         self._read_scripts: dict[str, deque[list[JsonObject] | ClineSdkBackendError]] = {}
         self._list_history_scripts: deque[list[JsonObject] | ClineSdkBackendError] = deque()
+        self._list_runs_scripts: dict[
+            str | None, deque[list[JsonObject] | ClineSdkBackendError]
+        ] = {}
         self._usage_scripts: dict[str, deque[JsonObject | None | ClineSdkBackendError]] = {}
         self._gates: deque[_GateEntry] = deque()
 
@@ -225,6 +253,18 @@ class FakeClineSdkBackend:
     ) -> None:
         """Script one FIFO usage outcome for the exact session ID."""
         self._usage_scripts.setdefault(session_id, deque()).append(outcome)
+
+    def queue_enqueue(
+        self, session_id: str, outcome: ClineRunAdmission | ClineSdkBackendError
+    ) -> None:
+        """Script one FIFO ``enqueue`` outcome for the exact session ID."""
+        self._enqueue_scripts.setdefault(session_id, deque()).append(outcome)
+
+    def queue_list_runs(
+        self, session_id: str | None, outcome: list[JsonObject] | ClineSdkBackendError
+    ) -> None:
+        """Script one FIFO ``list_runs`` outcome for the exact filter."""
+        self._list_runs_scripts.setdefault(session_id, deque()).append(outcome)
 
     # -- deterministic operation gates (test-only, FIFO) --------------------
 
@@ -275,6 +315,18 @@ class FakeClineSdkBackend:
         (an unfiltered subscription receives every event).
         """
         for entry in tuple(self._subscriptions):
+            if entry.active and (entry.session_id is None or entry.session_id == event.session_id):
+                entry.listener(event)
+
+    def emit_hub(self, event: ClineHubEvent) -> None:
+        """Deliver one deterministic Hub event envelope to active hub
+        subscriptions (issue #321).
+
+        Synchronous, in subscription order, filtered by the envelope's own
+        session identity (a None filter receives every envelope, including
+        ones without session identity).
+        """
+        for entry in tuple(self._hub_subscriptions):
             if entry.active and (entry.session_id is None or entry.session_id == event.session_id):
                 entry.listener(event)
 
@@ -335,6 +387,38 @@ class FakeClineSdkBackend:
             )
         return None
 
+    def enqueue(self, session_id: str, prompt: str) -> ClineRunAdmission:
+        self._calls.append(FakeBackendCall(OP_ENQUEUE, session_id=session_id, prompt=prompt))
+        scripted = self._enqueue_scripts.get(session_id)
+        if scripted:
+            outcome = scripted.popleft()
+            if isinstance(outcome, ClineSdkBackendError):
+                raise outcome
+            admission = outcome
+        else:
+            if session_id not in self._sessions:
+                raise ClineSessionNotFoundError(
+                    f"session {session_id!r} is not known to this backend instance"
+                )
+            self._admitted += 1
+            admission = ClineRunAdmission(
+                run_id=f"hub-run-{self._admitted}",
+                accepted_at=_FAKE_ACCEPTED_AT_EPOCH_MS + self._admitted,
+                queue_position=0,
+            )
+        # The fake's own status-only bookkeeping of admitted runs; status
+        # records stay opaque observations for ``list_runs`` defaults.
+        self._runs.append(
+            {
+                "runId": admission.run_id,
+                "sessionId": session_id,
+                "state": "queued",
+                "acceptedAt": admission.accepted_at,
+                "queuePosition": admission.queue_position,
+            }
+        )
+        return admission
+
     def stop(self, session_id: str) -> None:
         self._calls.append(FakeBackendCall(OP_STOP, session_id=session_id))
         scripted = self._stop_scripts.get(session_id)
@@ -394,6 +478,18 @@ class FakeClineSdkBackend:
             return copy.deepcopy(outcome)
         return []
 
+    def list_runs(self, session_id: str | None) -> list[JsonObject]:
+        self._calls.append(FakeBackendCall(OP_LIST_RUNS, session_id=session_id))
+        scripted = self._list_runs_scripts.get(session_id)
+        if scripted:
+            outcome = scripted.popleft()
+            if isinstance(outcome, ClineSdkBackendError):
+                raise outcome
+            return copy.deepcopy(outcome)
+        if session_id is None:
+            return copy.deepcopy(self._runs)
+        return copy.deepcopy([run for run in self._runs if run.get("sessionId") == session_id])
+
     def get_accumulated_usage(self, session_id: str) -> JsonObject | None:
         self._calls.append(FakeBackendCall(OP_GET_ACCUMULATED_USAGE, session_id=session_id))
         scripted = self._usage_scripts.get(session_id)
@@ -416,7 +512,17 @@ class FakeClineSdkBackend:
         self._subscriptions.append(entry)
         return Subscription(entry.cancel)
 
+    def subscribe_hub(
+        self, session_id: str | None, listener: Callable[[ClineHubEvent], None]
+    ) -> Subscription:
+        self._calls.append(FakeBackendCall(OP_SUBSCRIBE_HUB, session_id=session_id))
+        entry = _HubSubscriptionEntry(session_id=session_id, listener=listener)
+        self._hub_subscriptions.append(entry)
+        return Subscription(entry.cancel)
+
     def dispose(self) -> None:
         self._calls.append(FakeBackendCall(OP_DISPOSE))
         for entry in self._subscriptions:
+            entry.active = False
+        for entry in self._hub_subscriptions:
             entry.active = False

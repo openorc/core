@@ -25,13 +25,33 @@ session ownership. See `AGENTS.md` for the binding boundary rules.
   carries protocol frames only (all `console.*` output is silenced).
 - Request methods: `connect`, `start`, `send`, `stop`, `abort`, `get`,
   `read_messages`, `list_history`, `get_accumulated_usage`, `subscribe`,
-  `unsubscribe`, `dispose`. Parameters are the flattened D2 wire shapes
-  (`ClineRemoteConfig` for `connect`, `ClineStartRequest` for `start`).
+  `unsubscribe`, `dispose`, plus the Hub-native admission/observation methods
+  `enqueue`, `list_runs`, and `subscribe_hub` (issue #321). Parameters are the
+  flattened D2 wire shapes (`ClineRemoteConfig` for `connect`,
+  `ClineStartRequest` for `start`).
 - `subscribe` returns `{"subscription_id": "<bridge-local opaque id>"}`;
   asynchronous SDK events are emitted as `cline.event` notifications with
-  `{subscription_id, session_id, kind, payload}`. `unsubscribe` is wire-only,
-  idempotent, and stops only its own handle (realizing D2's
+  `{subscription_id, session_id, kind, payload}`. `subscribe_hub` returns the
+  same handle shape and asynchronous Hub event envelopes are emitted as
+  `cline.hub_event` notifications with
+  `{subscription_id, session_id, kind, sequence, payload}` — every field is
+  the Hub envelope's own value, forwarded verbatim. `unsubscribe` is
+  wire-only, idempotent, and stops only its own handle (realizing D2's
   `Subscription.unsubscribe()`, which cannot cross JSON).
+- `enqueue` (issue #321) is nonblocking Hub-native run admission through the
+  public `NodeHubClient.command("run.enqueue", {prompt}, sessionId)` surface:
+  the bridge forwards exactly `{prompt}` on the Hub envelope (no delivery
+  mode is ever constructed), verifies the ack, and answers with
+  `{run_id, accepted_at, queue_position}` — transport evidence for later
+  exact correlation, never a workflow decision. `list_runs` answers with the
+  status-only `runs` array from the `run.list` reply, opaque and
+  uninterpreted; a missing or malformed array is an `uncertain_outcome`
+  error, never an empty list. Admission is neither delivery nor execution;
+  dispatch timeouts (`hub_command_timeout`) and Hub transport failures
+  (`hub_connection_closed` and the other pinned transport codes) classify as
+  `uncertain_outcome` for these hub operations — never as refusals, and
+  never authorizing a resend. Positive Hub refusals keep their safe machine
+  code (for example `run_admission_rejected`, `hub_draining`).
 - Responses preserve request IDs, including out-of-order completion. Event
   notifications and responses may interleave; every stdout line is one
   complete frame.
@@ -62,6 +82,15 @@ session ownership. See `AGENTS.md` for the binding boundary rules.
   disposes the previous attachment and creates a replacement; the bridge
   never launches/restarts a Hub, discovers credentials, or falls back to
   `auto`/`local` execution.
+- The hub-native operations (issue #321) run through one officially exported
+  `NodeHubClient` per attachment, constructed lazily on the first hub
+  operation from the same admitted endpoint, authentication, and client
+  identity as the `ClineCore` attachment, reused for the attachment
+  lifetime, and disposed with it. The pinned SDK's declaration file cannot
+  re-export the class through `@cline/sdk` under this package's NodeNext
+  resolution, so `sdk-client.ts` extracts the public constructor and URL
+  normalizer through the package namespace with one documented boundary
+  cast; no new dependency, no private shape, and no tsconfig change.
 - `start` maps the complete D2 construction bundle onto
   `ClineCore.start({config, interactive, toolPolicies, initialMessages?})`:
   `providerId`, `modelId`, `config.mode` (`plan`/`act`), additive

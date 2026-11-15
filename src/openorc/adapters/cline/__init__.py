@@ -63,7 +63,9 @@ from openorc.adapters.cline.reconciliation import (
 )
 from openorc.adapters.cline.values import (
     ClineConstructionMode,
+    ClineHubEvent,
     ClineRemoteConfig,
+    ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
     ClineStartResult,
@@ -88,6 +90,7 @@ __all__ = [
     "ClineConstructionMode",
     "ClineDispatchCheckpoint",
     "ClineFinishActivity",
+    "ClineHubEvent",
     "ClineIterationActivity",
     "ClineNoticeActivity",
     "ClineNoticeCategory",
@@ -95,6 +98,7 @@ __all__ = [
     "ClineRemoteAttachmentRejectedError",
     "ClineRemoteAttachmentUnavailableError",
     "ClineRemoteConfig",
+    "ClineRunAdmission",
     "ClineRuntimeEndedActivity",
     "ClineRuntimeErrorActivity",
     "ClineRuntimeStatusActivity",
