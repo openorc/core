@@ -41,6 +41,7 @@ from openorc.services.errors import (
     ConflictError,
     HubObservationRegistrationRefusedError,
     InvalidCommandError,
+    NotFoundError,
 )
 from openorc.services.task_hub_run_correlation import (
     HubRunSettlementKind,
@@ -871,3 +872,55 @@ def test_disposal_stops_observation_idempotently(monkeypatch: pytest.MonkeyPatch
     assert after_disposal.value.reason == HubObservationRefusalReason.OBSERVER_UNAVAILABLE
     with pytest.raises(ConflictError):
         observer.start()
+
+
+def test_known_attachment_configuration_failures_are_typed_registration_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
+    _script_bindings(conn, bindings)
+    backend = FakeClineSdkBackend()
+    pool = _pool(conn)
+    resolver_outcomes: list[Exception] = [
+        NotFoundError("the requested connection is not available in this workspace"),
+        ConflictError("the connection is disabled; its credential cannot be used"),
+    ]
+
+    def refusing_resolver(pool: DatabasePool, *, workspace_id: UUID, connection_id: UUID) -> Any:
+        outcome = resolver_outcomes.pop(0)
+        assert isinstance(outcome, Exception)
+        raise outcome
+
+    observer = HubRunObserver(
+        lambda: pool,
+        backend_factory=lambda: backend,
+        runtime_credential_resolver=refusing_resolver,
+    )
+    observer.start()
+
+    # A known, positively established pre-subscription configuration failure
+    # is the typed registration refusal the dispatch gates the enqueue on —
+    # never a workflow conflict escaping the observation host.
+    for _ in range(2):
+        with pytest.raises(HubObservationRegistrationRefusedError) as refused:
+            _register(observer)
+        assert refused.value.reason == HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+
+    # The same contract covers the host's own endpoint validation: a stored
+    # but unattachable connection refuses positively before any dial.
+    def unattachable_resolver(
+        pool: DatabasePool, *, workspace_id: UUID, connection_id: UUID
+    ) -> Any:
+        return (
+            _FakeConnection(adapter=AdapterType.CLINE, safe_config={}),
+            ControlEndpointSecret("observation-attach-token"),
+        )
+
+    monkeypatch.setattr(observer, "_credential_resolver", unattachable_resolver, raising=True)
+    with pytest.raises(HubObservationRegistrationRefusedError) as unattachable:
+        _register(observer)
+    assert unattachable.value.reason == HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+
+    # Every refusal was pre-subscription: no backend was ever constructed or dialed.
+    assert backend.calls() == ()

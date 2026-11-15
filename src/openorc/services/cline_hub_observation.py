@@ -17,10 +17,10 @@ remain the only intended callers of the registration seam.
   pinned SDK cannot replay an arbitrary missed terminal result, so a
   dispatch whose completion observation this observer owns must not enqueue
   without an actively subscribed exact session. Every failure to establish
-  that observation — observer unavailable, capacity exhausted, attachment
-  or subscription failure, unresolvable binding — is a typed refusal the
-  dispatch routes through the existing pre-effect failure machinery; a
-  refusal never degrades into unobserved dispatch.
+  that observation — observer unavailable, capacity exhausted, attachment,
+  attachment-configuration, or subscription failure, unresolvable binding —
+  is a typed refusal the dispatch routes through the existing pre-effect
+  failure machinery; a refusal never degrades into unobserved dispatch.
 - Verified terminal observations route through the settlement seam within
   the observation's own authenticated Connection/Workspace scope; the Hub
   envelope's own session identity is authoritative and no identity is ever
@@ -91,6 +91,7 @@ from openorc.services.errors import (
     ConflictError,
     HubObservationRegistrationRefusedError,
     InvalidCommandError,
+    NotFoundError,
 )
 from openorc.services.task_hub_run_correlation import (
     HubRunSettlementKind,
@@ -300,10 +301,15 @@ class HubRunObserver:
 
         The pre-enqueue gate of the detached dispatch: returns only once the
         exact external session is actively subscribed through the
-        connection's current trusted attachment. Every failure raises
-        :class:`HubObservationRegistrationRefusedError` — the enqueue must
-        not proceed without the observation, because the pinned SDK cannot
-        replay an arbitrary missed terminal result.
+        connection's current trusted attachment. Every expected failure
+        raises :class:`HubObservationRegistrationRefusedError` — the enqueue
+        must not proceed without the observation, because the pinned SDK
+        cannot replay an arbitrary missed terminal result; known
+        attachment-configuration refusals (a missing, cross-Workspace,
+        disabled, or non-Cline connection; an unusable credential reference;
+        a missing or malformed control endpoint) are typed into the same
+        refusal, and unexpected exceptions propagate unchanged for the
+        caller's own failure machinery.
 
         The durable binding is proven within the authenticated
         Workspace/Connection scope before any secret access or dial; a
@@ -469,26 +475,44 @@ class HubRunObserver:
         return backend
 
     def _fresh_attach(self, *, workspace_id: UUID, connection_id: UUID) -> ClineSdkBackend:
-        """Resolve current credentials, dial the Hub, and install the backend."""
-        credential_connection, secret = self._credential_resolver(
-            self._pool_provider(), workspace_id=workspace_id, connection_id=connection_id
-        )
-        if credential_connection.adapter is not AdapterType.CLINE:
-            # Defensive durable-state invariant: a non-Cline connection has
-            # no Hub to observe and is never guessed around.
-            raise ConflictError(
-                "the connection routed for this task/role is not an enabled Cline connection"
-            )
-        selection = dict(credential_connection.safe_config)
+        """Resolve current credentials, dial the Hub, and install the backend.
+
+        Known, positively established pre-subscription attachment and
+        configuration failures — a missing or cross-Workspace connection, a
+        disabled connection, an unusable credential reference, a missing or
+        malformed control endpoint — are typed into the registration refusal
+        the dispatch gates the enqueue on: they are proven pre-effect
+        conditions of the observation, never workflow conflicts escaping the
+        observation host and never uncertain outcomes. Unexpected exceptions
+        propagate unchanged.
+        """
         try:
-            endpoint = resolve_connection_control_endpoint(selection)
-        except ConnectionControlEndpointError as error:
-            raise ConflictError(str(error)) from error
-        if endpoint is None:
-            raise ConflictError(
-                "the connection has no configured control endpoint; it is stored but "
-                "not attachable until the Owner configures one"
+            credential_connection, secret = self._credential_resolver(
+                self._pool_provider(), workspace_id=workspace_id, connection_id=connection_id
             )
+            if credential_connection.adapter is not AdapterType.CLINE:
+                # Defensive durable-state invariant: a non-Cline connection has
+                # no Hub to observe and is never guessed around.
+                raise ConflictError(
+                    "the connection routed for this task/role is not an enabled Cline connection"
+                )
+            selection = dict(credential_connection.safe_config)
+            try:
+                endpoint = resolve_connection_control_endpoint(selection)
+            except ConnectionControlEndpointError as error:
+                raise ConflictError(str(error)) from error
+            if endpoint is None:
+                raise ConflictError(
+                    "the connection has no configured control endpoint; it is stored but "
+                    "not attachable until the Owner configures one"
+                )
+        except (NotFoundError, ConflictError) as error:
+            logger.warning(
+                "hub-run observation attachment refused (%s) for connection %s",
+                type(error).__name__,
+                connection_id,
+            )
+            raise self._refusal(HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED) from None
         backend = self._backend_factory()
         try:
             backend.connect(
