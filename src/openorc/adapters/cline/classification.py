@@ -63,8 +63,21 @@ _NOT_ATTACHED: Final = "not_attached"
 
 # Operations whose effect is an external session allocation, an incarnation
 # change, or an activity interruption: a connection-level breakage during
-# them leaves the effect unknown.
+# them leaves the effect unknown, and the D6b in-memory latch records it
+# until its explicit settlement. The Hub-run admission (``enqueue``, issue
+# #321) is deliberately absent: its effect is Hub-side run admission whose
+# uncertainty is owned durably by the outstanding receipt at the correlation
+# seam (issue #322), so an unproven enqueue rejection classifies as
+# uncertain (see ``_UNPROVEN_EFFECT_OPERATIONS``) without ever latching the
+# session's D6b effects.
 EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset({"start", "send", "stop", "abort"})
+
+# The operations whose unproven rejection is conservatively uncertain: the
+# effectful operations plus the Hub-run admission, whose positive pre-effect
+# refusals (exact-session absence, unreachability, attachment rejection) stay
+# known while every unproven code stays uncertain. An admitted-unknown run
+# must never lose its outstanding correlation evidence (issue #324).
+_UNPROVEN_EFFECT_OPERATIONS: Final[frozenset[str]] = EFFECTFUL_OPERATIONS | {"enqueue"}
 
 
 def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> AgentRuntimeError:
@@ -99,7 +112,7 @@ def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> 
                 f"the remote hub could not be reached for the {operation} ({error.code!r})"
             )
         if error.code == _HUB_CONNECTION_CLOSED:
-            if operation in EFFECTFUL_OPERATIONS:
+            if operation in _UNPROVEN_EFFECT_OPERATIONS:
                 return AgentRuntimeUncertainOutcomeError(
                     f"the connection closed around the {operation}; its effect cannot be classified"
                 )
@@ -107,12 +120,13 @@ def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> 
                 f"the connection closed before the {operation} could be served ({error.code!r})"
             )
         # Any other code is forwarded by the pinned bridge without
-        # establishing whether the operation took effect. For effectful
-        # operations there is no positive evidence of non-effect, so the
-        # outcome stays conservatively uncertain (and latches same-ID
-        # reconstruction); a pure read can never take an external effect,
-        # so its answered-but-unusable response is a transport-class failure.
-        if operation in EFFECTFUL_OPERATIONS:
+        # establishing whether the operation took effect. For the unproven-
+        # effect operations there is no positive evidence of non-effect, so
+        # the outcome stays conservatively uncertain (an uncertain Hub-run
+        # admission keeps its outstanding receipt instead of latching the
+        # D6b effects); a pure read can never take an external effect, so
+        # its answered-but-unusable response is a transport-class failure.
+        if operation in _UNPROVEN_EFFECT_OPERATIONS:
             return AgentRuntimeUncertainOutcomeError(
                 f"the {operation} was rejected with an unproven effect ({error.code!r})"
             )

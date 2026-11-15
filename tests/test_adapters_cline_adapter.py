@@ -4152,3 +4152,55 @@ def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
         adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() -> None:
+    """Issue #324 review fix: ``enqueue`` is an effectful operation. An
+    unproven SDK rejection code establishes nothing about whether a run was
+    admitted, so the admission stays conservatively uncertain — never a
+    positively proven refusal."""
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineSdkOperationRejectedError("run_admission_unavailable"),
+    )
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_uncertain() -> None:
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineSdkOperationRejectedError("hub_connection_closed"),
+    )
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+
+
+def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_as_known() -> None:
+    """The positively proven refusals stay known: the exact session is not
+    live (the Hub definitively rejected the enqueue itself), the attachment
+    was unreachable before effect, and the bridge was not attached."""
+    backend = FakeClineSdkBackend()
+    resolver = ScriptedResolver(creation=_context())
+    backend.queue_start(ClineStartResult(session_id="cline-session-9"))
+    adapter = ClineAdapter(backend, resolver)
+    adapter.allocate_detached_session(_creation_request())
+    backend.queue_enqueue(
+        "cline-session-9",
+        ClineRemoteAttachmentUnavailableError(),
+    )
+
+    with pytest.raises(AgentRuntimeUnavailableError):
+        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)

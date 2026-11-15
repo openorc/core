@@ -2358,3 +2358,51 @@ def test_already_ready_dispatch_is_idempotent_success() -> None:
     assert outcome.task_agent_session.external_session_id == "ext-1"
     assert outcome.receipt is None
     assert adapter.allocation_requests == []
+
+
+def test_unproven_enqueue_rejection_leaves_the_receipt_claimed_and_uncertain() -> None:
+    """Issue #324 review fix: ``enqueue`` is effectful, so an unproven SDK
+    rejection of the admission is an uncertain outcome — the receipt stays
+    conservatively claimed (never REFUSED) because a run may have been
+    admitted while the correlation evidence must stay outstanding."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    binding = _session_row(workspace_id, task_id, "producer", connection_id)
+    receipt_row = _initialization_receipt_row(workspace_id, task_id, binding[0])
+    conn = ScriptedConnection(
+        _dispatch_results(
+            workspace_id,
+            owner_profile_id,
+            task_id,
+            connection_id,
+            binding_row=binding,
+            receipt_row=receipt_row,
+        )
+    )
+    adapter = _DetachedAdapterDouble(
+        AgentSessionAllocation(external_session_id="ext-9"),
+        [
+            AgentRuntimeDeliveryUncertainError(
+                "the enqueue outcome is unknown whether it took effect"
+            )
+        ],
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        dispatch_task_agent_session_establishment(
+            _pool(conn),
+            adapter,  # type: ignore[arg-type]
+            **_dispatch_kwargs(workspace_id, task_id),
+            observation_registrar=_RecordingRegistrar(),  # type: ignore[arg-type]
+        )
+
+    # The unproven rejection never reclassifies the receipt: no refusal write
+    # exists and the claimed receipt stays the outstanding correlation
+    # evidence.
+    assert not any("set status = 'refused'" in sql for sql, _ in conn.executed)
+    inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(inserts) == 1
