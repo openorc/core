@@ -80,7 +80,7 @@ from __future__ import annotations
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -143,6 +143,7 @@ from openorc.services.session_runtime import (
     establish_task_agent_session,
 )
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_subject_guards import require_current_task
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
@@ -746,7 +747,7 @@ def prepare_task_for_planning(
     reviewer_neutral_directory: str,
     attempt_evidence: InvocationAttemptEvidence | None = None,
     observation_registrar: EstablishmentObservationRegistrar | None = None,
-    bootstrap_continuation_trigger: Callable[..., None] | None = None,
+    completion_handoff: DetachedTurnCompletionHandoff | None = None,
 ) -> TaskPlanningPreparationOutcome | TaskPlanningBootstrapDispatchOutcome:
     """Run the one logical planning-bootstrap continuation for the Task.
 
@@ -980,15 +981,19 @@ def prepare_task_for_planning(
             # dispatching worker. Both initialization turns are durably
             # enqueued (or already settled); the observed completions settle
             # readiness and resume the bootstrap. When every establishment
-            # already settled within this dispatch, the post-commit trigger
-            # submits the readiness-resumed continuation now; otherwise the
-            # later observed completion triggers it.
-            if bootstrap_continuation_trigger is not None:
+            # already settled within this dispatch, the ONE post-commit
+            # completion handoff submits the readiness-resumed continuation
+            # now; otherwise the later observed completion triggers it.
+            if completion_handoff is not None:
                 try:
-                    bootstrap_continuation_trigger(workspace_id=workspace_id, task_id=task_id)
-                except Exception as error:  # noqa: BLE001 - contained trigger
+                    completion_handoff.handoff_settled_completion(
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+                    )
+                except Exception as error:  # noqa: BLE001 - contained handoff
                     logger.warning(
-                        "the bootstrap continuation trigger failed after the "
+                        "the detached-completion handoff failed after the "
                         "detached establishment dispatch (%s); the durable "
                         "resumable state owns recovery",
                         type(error).__name__,

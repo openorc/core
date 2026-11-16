@@ -58,8 +58,10 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import InteractionKind
@@ -70,10 +72,15 @@ from openorc.services.errors import (
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.task_authorized_implementation_execution import (
+    dispatch_authorized_implementation_detached,
     execute_authorized_implementation,
+)
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
 )
 from tests.fakes.agent_runtime import (
     ControlRealization,
@@ -1224,3 +1231,555 @@ def test_a_raced_duplicate_finalize_is_an_error_without_extra_events() -> None:
     assert len(runtime.submitted_sends()) == 1
     assert _count(conn, _EXECUTION_COMPLETE) == 1  # attempted, rejected as no-op
     assert _event_types(conn) == ["execution_started"]
+
+
+# --- the detached dispatch (issues #325/#333) --------------------------------------
+
+_RECEIPT_ID = uuid.uuid4()
+_TURN_REFERENCE = "fake-run-1"
+
+_RECEIPT_INSERT = _sql_has("insert into openorc.task_hub_run_receipts")
+_RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id = %s for update")
+_RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
+_RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
+_RECEIPT_SETTLE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'settled'")
+_EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
+_EARLY_COMPLETION_DELETE = _sql_has("delete from openorc.task_hub_run_early_completions")
+_EXECUTION_READ = _sql_lacks(_sql_has("from openorc.executions where id = %s"), "for update")
+_EXECUTION_READ_LOCKED = _sql_has("from openorc.executions", "for update")
+
+
+def _detached_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+    outcome: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "implementation_execution",
+        "execution",
+        _EXECUTION_ID,
+        "implementation_result",
+        admitted_turn_reference,
+        status,
+        outcome if outcome is not None else {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+class _RecordingRegistrar:
+    """Records the pre-admission observation registrations (issue #323 seam)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.registrations: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        connection_id: Any,
+        external_session_id: Any,
+    ) -> None:
+        self.registrations.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _RecordingHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #333)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+    ) -> None:
+        self.calls.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+        if self._error is not None:
+            raise self._error
+
+
+def _detached_runtime(
+    pool: FakePool,
+    *,
+    admission_error: AgentRuntimeError | None = None,
+) -> _ScriptedRealizeRuntime:
+    """One fake runtime holding the live Producer session, admission-ready."""
+    runtime = _ScriptedRealizeRuntime(pool)
+    runtime.queue_creation(session_ready_candidate())
+    created = runtime.create_session(
+        AgentSessionCreationRequest(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            role=WorkflowRole.PRODUCER,
+            initialization="prepared",
+        )
+    )
+    assert created.external_session_id == _EXTERNAL_SESSION_ID
+    runtime.script_realization(_EXTERNAL_SESSION_ID, ControlRealization.NATIVE_ONLY)
+    if admission_error is not None:
+        runtime.queue_detached_admission(admission_error)
+    return runtime
+
+
+def _arrange_detached(
+    conn: ScriptedConnection,
+    *,
+    admission_error: AgentRuntimeError | None = None,
+) -> tuple[FakePool, _ScriptedRealizeRuntime, _ProducerAttachment]:
+    pool = FakePool(conn)
+    runtime = _detached_runtime(pool, admission_error=admission_error)
+    attachment = _ProducerAttachment(runtime)
+    return pool, runtime, attachment
+
+
+def _dispatch_detached_call(
+    pool: DatabasePool,
+    *,
+    producer_runtime_factory: Any,  # noqa: ANN401 - typed at the service boundary
+    observation_registrar: Any,  # noqa: ANN401
+    completion_handoff: Any,  # noqa: ANN401
+    expected_state_token: Any = _STATE_TOKEN,
+    profile_id: Any = _OWNER_PROFILE_ID,
+) -> Any:  # noqa: ANN401 - the typed outcome
+    return dispatch_authorized_implementation_detached(
+        pool,
+        profile_id=profile_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=expected_state_token,
+        producer_runtime_factory=producer_runtime_factory,
+        observation_registrar=observation_registrar,
+        completion_handoff=completion_handoff,
+    )
+
+
+def _script_detached_admission(conn: ScriptedConnection) -> None:
+    """The reservation + R1 + the receipt commit + R2 + the ack attach.
+
+    The R2 block and the attach are scripted separately by the failure
+    tests that must break them; this helper covers the ordinary prefix and
+    the happy-path remainder.
+    """
+    _script_admission(conn)  # the reservation
+    _script_subject_reads(conn)  # R1
+    conn.on(_RECEIPT_INSERT, _detached_receipt_row())
+
+
+def _script_detached_attach(conn: ScriptedConnection, *, staged: Any = None) -> None:
+    """The acknowledgement attach (claimed → admitted, staged or plain)."""
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, staged)
+
+
+def test_the_detached_dispatch_records_registers_admits_and_attaches_exactly_once() -> None:
+    """One receipt, one registration, one admission, one attach: the worker
+    exits with the attempt conservatively claimed and never sends."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2 passes
+    _script_detached_attach(conn)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_EXECUTION_READ, _execution_row(status="running", last_activity=_OBSERVED))
+    pool, runtime, attachment = _arrange_detached(conn)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_detached_call(
+        cast(DatabasePool, pool),
+        producer_runtime_factory=attachment,
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+    )
+
+    # The attempt stayed conservatively running; the receipt is admitted
+    # with its acknowledged turn reference.
+    assert outcome.execution.status is ExecutionStatus.RUNNING
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.ADMITTED
+    assert outcome.receipt.admitted_turn_reference == _TURN_REFERENCE
+    assert (
+        outcome.receipt.operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    )
+    assert outcome.receipt.original_attempt_id == _EXECUTION_ID
+    # One registration on the exact bound producer session, before admission.
+    assert registrar.registrations == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _SESSION_ID,
+            "connection_id": _CONNECTION_ID,
+            "external_session_id": _EXTERNAL_SESSION_ID,
+        }
+    ]
+    (admission,) = runtime.detached_admissions()
+    assert admission[0] == _EXTERNAL_SESSION_ID
+    # No send, no finalize, no completion audit: the observed completion owns
+    # them. The handoff did not fire (nothing settled in-dispatch).
+    assert runtime.submitted_sends() == ()
+    assert _count(conn, _EXECUTION_COMPLETE) == 0
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
+    assert _event_types(conn) == ["execution_started"]
+    assert handoff.calls == []
+    # The attachment was acquired and disposed exactly once.
+    assert attachment.acquisitions == 1 and attachment.disposals == 1
+    assert pool.active_connections == 0
+
+
+def test_the_detached_dispatch_admits_the_persisted_acceptance_verbatim() -> None:
+    """The admitted content is the structural serialization of the persisted
+    accepted Reviewer envelope — the same message the blocking send carries."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2
+    _script_detached_attach(conn)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_EXECUTION_READ, _execution_row(status="running", last_activity=_OBSERVED))
+    pool, runtime, _attachment = _arrange_detached(conn)
+
+    _dispatch_detached_call(
+        cast(DatabasePool, pool),
+        producer_runtime_factory=_ProducerAttachment(runtime),
+        observation_registrar=_RecordingRegistrar(),
+        completion_handoff=_RecordingHandoff(),
+    )
+
+    (admission,) = runtime.detached_admissions()
+    assert admission[0] == _EXTERNAL_SESSION_ID
+    assert json.loads(admission[1]) == {
+        "type": "review_result",
+        "schema_version": 1,
+        "outcome": "accepted",
+        "summary": _SUMMARY,
+        "findings": [],
+    }
+
+
+def test_detached_authority_movement_before_admission_is_an_uncertainty() -> None:
+    """Authority moving on after realization — the R2 revalidation
+    immediately before the admission — is the ordinary dispatch's uncertain
+    classification: the attempt stays conservatively running, the receipt
+    stays conservatively claimed (never refused), nothing is finalized, and
+    nothing is re-dispatched."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn, task_row=_task_row(state_token=_TOKEN_2))  # R2 stale
+    pool, runtime, attachment = _arrange_detached(conn)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    # The registration already happened; the admission never did.
+    assert len(registrar.registrations) == 1
+    assert runtime.detached_admissions() == ()
+    assert runtime.submitted_sends() == ()
+    # No refusal, no finalize: the honest unresolved state.
+    assert _count(conn, _RECEIPT_REFUSE) == 0
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
+    assert _event_types(conn) == ["execution_started"]
+    assert handoff.calls == []
+
+
+def test_detached_known_realization_failure_refuses_the_receipt_and_finalizes() -> None:
+    """A positively proven pre-effect reconstruction failure refuses the
+    just-recorded receipt and finalizes the never-dispatched attempt
+    ``failed_transient`` — no registration, no admission, no send."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    conn.on(_EXECUTION_GUARDED_UPDATE, _execution_row(status="failed_transient"))
+    pool, runtime, attachment = _arrange_detached(conn)
+    runtime.queue_realize_error(AgentRuntimeUnavailableError("the runtime is unreachable"))
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationFailedError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    assert registrar.registrations == []
+    assert runtime.detached_admissions() == ()
+    assert runtime.submitted_sends() == ()
+    assert _count(conn, _RECEIPT_REFUSE) == 1
+    (update_params,) = [
+        params for sql, params in conn.executed if _EXECUTION_GUARDED_UPDATE(sql, None)
+    ]
+    assert update_params == ("failed_transient", _EXECUTION_ID, "running")
+    assert _event_types(conn) == ["execution_started", "execution_failed"]
+    (failed,) = _event_params_of_type(conn, "execution_failed")
+    assert failed[7].obj == {"failure_kind": "runtime_pre_effect"}
+    assert handoff.calls == []
+
+
+def test_detached_uncertain_realization_leaves_the_receipt_claimed() -> None:
+    """An uncertain reconstruction outcome is never a proven non-effect: the
+    receipt stays conservatively claimed and the attempt stays running."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    pool, runtime, attachment = _arrange_detached(conn)
+    runtime.queue_realize_error(
+        AgentRuntimeTimeoutError("the reconstruction exceeded its deadline")
+    )
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    assert registrar.registrations == []
+    assert runtime.detached_admissions() == ()
+    assert _count(conn, _RECEIPT_REFUSE) == 0
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
+    assert _event_types(conn) == ["execution_started"]
+    assert handoff.calls == []
+
+
+def test_detached_registration_refusal_refuses_the_receipt_and_finalizes() -> None:
+    """A positively-required observation registration refusal is a proven
+    pre-effect failure: the receipt is refused and the attempt finalizes
+    ``failed_transient`` — never an unobserved admission."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    conn.on(_EXECUTION_GUARDED_UPDATE, _execution_row(status="failed_transient"))
+    pool, _runtime, attachment = _arrange_detached(conn)
+    registrar = _RecordingRegistrar(
+        error=ObservationRegistrationRefusedError(
+            "the observer refused the registration",
+            reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+        )
+    )
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ObservationRegistrationRefusedError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    assert len(registrar.registrations) == 1
+    assert _count(conn, _RECEIPT_REFUSE) == 1
+    (update_params,) = [
+        params for sql, params in conn.executed if _EXECUTION_GUARDED_UPDATE(sql, None)
+    ]
+    assert update_params == ("failed_transient", _EXECUTION_ID, "running")
+    assert _event_types(conn) == ["execution_started", "execution_failed"]
+    assert handoff.calls == []
+
+
+def test_detached_admission_refusal_refuses_the_receipt_and_fails_known() -> None:
+    """A positively identified admission refusal is a proven pre-effect
+    failure: the receipt is refused and the dispatch fails known."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2 passes
+    conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    conn.on(_EXECUTION_GUARDED_UPDATE, _execution_row(status="failed_transient"))
+    pool, runtime, attachment = _arrange_detached(
+        conn,
+        admission_error=AgentRuntimeUnavailableError("the runtime refused the admission"),
+    )
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationFailedError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    assert len(registrar.registrations) == 1
+    assert _count(conn, _RECEIPT_REFUSE) == 1
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 1
+    assert _event_types(conn) == ["execution_started", "execution_failed"]
+    assert handoff.calls == []
+
+
+def test_detached_uncertain_admission_leaves_the_receipt_claimed() -> None:
+    """An uncertain admission outcome is never a proven non-delivery: the
+    receipt stays conservatively claimed and nothing is re-dispatched."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2 passes
+    pool, _runtime, attachment = _arrange_detached(
+        conn,
+        admission_error=AgentRuntimeTimeoutError("the admission exceeded its deadline"),
+    )
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+    assert len(registrar.registrations) == 1
+    assert _count(conn, _RECEIPT_REFUSE) == 0
+    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
+    assert _event_types(conn) == ["execution_started"]
+    assert handoff.calls == []
+
+
+_STAGED_ID = uuid.uuid4()
+
+
+def _staged_early_completion_row() -> tuple[Any, ...]:
+    return (
+        _STAGED_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _RECEIPT_ID,
+        "run.completed",
+        41,
+        json.dumps(_RESULT_CANDIDATE),
+        _OBSERVED,
+    )
+
+
+def test_a_detached_staged_early_completion_settles_in_dispatch_and_fires_the_handoff_once() -> (
+    None
+):
+    """A validated result that finished before the acknowledgement was
+    persisted is consumed exactly once by the attach, settles the attempt
+    through the shared finalize, and fires the ONE post-commit completion
+    handoff exactly once — no send, no second settlement, no duplicate."""
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2 passes
+    _script_detached_attach(conn, staged=_staged_early_completion_row())
+    # The settlement routing inside the attach: attribution, validation,
+    # the shared finalize, the receipt settlement, and the consumption.
+    conn.on(_EXECUTION_READ, _execution_row(status="running", last_activity=_OBSERVED))
+    conn.on(_EXECUTION_READ_LOCKED, _execution_row(status="running", last_activity=_OBSERVED))
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_REVISION_READ, _revision_row())
+    conn.on(_GATES_LIST, [_gate_row()])
+    conn.on(
+        _EXECUTION_COMPLETE,
+        _execution_row(status="succeeded", implementation_result=dict(_RESULT_CANDIDATE)),
+    )
+    conn.on(
+        _RECEIPT_SETTLE,
+        _detached_receipt_row(
+            status="settled",
+            admitted_turn_reference=_TURN_REFERENCE,
+            outcome={"settlement": "validated_result", "consumed_sequence": 41},
+        ),
+    )
+    conn.on(_EARLY_COMPLETION_DELETE, None)
+    # The post-dispatch reload reflects the settled durable state.
+    conn.on(_TASK_READ, _task_row())
+    conn.on(
+        _EXECUTION_READ,
+        _execution_row(status="succeeded", implementation_result=dict(_RESULT_CANDIDATE)),
+    )
+    pool, runtime, attachment = _arrange_detached(conn)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_detached_call(
+        cast(DatabasePool, pool),
+        producer_runtime_factory=attachment,
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+    )
+
+    # The attempt settled through the one shared finalize; the receipt is
+    # settled exactly once.
+    assert outcome.execution.status is ExecutionStatus.SUCCEEDED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
+    assert runtime.submitted_sends() == ()
+    assert _count(conn, _EXECUTION_COMPLETE) == 1
+    assert _count(conn, _RECEIPT_SETTLE) == 1
+    assert _count(conn, _EARLY_COMPLETION_DELETE) == 1
+    assert _event_types(conn) == ["execution_started", "execution_completed"]
+    # The ONE post-commit completion handoff fired exactly once with the
+    # implementation family.
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        }
+    ]
+
+
+def test_the_detached_dispatch_seams_fail_closed() -> None:
+    """A registrar or completion handoff that does not implement its seam is
+    rejected before any state is touched."""
+    conn = ScriptedConnection()
+    pool, _runtime, attachment = _arrange_detached(conn)
+
+    with pytest.raises(InvalidCommandError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=object(),
+            completion_handoff=_RecordingHandoff(),
+        )
+    with pytest.raises(InvalidCommandError):
+        _dispatch_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=_RecordingRegistrar(),
+            completion_handoff=object(),
+        )
+    # No reservation, no receipt, no runtime interaction.
+    assert conn.executed == []
