@@ -695,6 +695,7 @@ def _claim_row(
         None,
         _PR_GATE_ID,
         _HEAD_SHA,
+        None,
         status,
         {} if outcome is None else outcome,
         _CLAIM_AT,

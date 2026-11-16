@@ -42,10 +42,12 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+import openorc.services.task_planning_review_decision as decision_module
 from openorc.adapters.agent_runtime.errors import AgentRuntimeDeliveryUncertainError
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.github import (
@@ -55,7 +57,7 @@ from openorc.adapters.github import (
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.planning import PlanRevision
-from openorc.domain.reviews import ReviewLoopStatus
+from openorc.domain.reviews import ReviewIteration, ReviewLoop, ReviewLoopStatus
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence.pool import DatabasePool
@@ -65,7 +67,12 @@ from openorc.services.errors import (
     InvalidCommandError,
     StaleOperationError,
 )
-from openorc.services.task_plan_production import TaskPlanProductionOutcome
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_plan_production import (
+    PlanProductionObservationRegistrar,
+    ProducerRuntimeAttachmentFactory,
+    TaskPlanProductionOutcome,
+)
 from openorc.services.task_planning_review_decision import (
     PlanningReviewDecision,
     finalize_planning_review_decision,
@@ -267,6 +274,7 @@ def _claim_row(
         "planning_revise_dispatch",
         _PRODUCER_SESSION_ID,
         review_iteration_id,
+        None,
         None,
         None,
         status,
@@ -1798,3 +1806,144 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
     assert _event_types(conn) == ["plan_reviewed", "owner_gate_created"]
     assert _event_params_of_type(conn, "review_limit_reached") == []
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
+
+
+# --- the detached revise routing (issue #335) --------------------------------------
+
+
+def test_the_detached_revise_dependency_trio_is_all_or_nothing() -> None:
+    """A partial or malformed detached-revise dependency trio is a malformed
+    command that fails closed before any effect; an absent trio keeps the
+    blocking revise's attached-runtime requirement."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    factory = cast(
+        ProducerRuntimeAttachmentFactory,
+        lambda: None,  # noqa: E731 - shape only, never invoked
+    )
+    handoff = cast(
+        DetachedTurnCompletionHandoff,
+        SimpleNamespace(handoff_settled_completion=lambda **_: None),
+    )
+
+    # A partial trio fails closed.
+    with pytest.raises(InvalidCommandError, match="together"):
+        finalize_planning_review_decision(
+            pool,
+            None,
+            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=_dispatch_outcome(
+                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+            ),
+            producer_runtime_factory=factory,
+        )
+    # A malformed member fails closed.
+    with pytest.raises(InvalidCommandError, match="registrar"):
+        finalize_planning_review_decision(
+            pool,
+            None,
+            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=_dispatch_outcome(
+                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+            ),
+            producer_runtime_factory=factory,
+            observation_registrar=cast(PlanProductionObservationRegistrar, object()),
+            completion_handoff=handoff,
+        )
+    # Without the trio, the attached runtime is required.
+    with pytest.raises(InvalidCommandError, match="runtime"):
+        finalize_planning_review_decision(
+            pool,
+            None,
+            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+            dispatch=_dispatch_outcome(
+                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+            ),
+        )
+
+
+def test_a_routed_change_request_dispatches_detached_with_the_trio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the detached-revise trio supplied, the routed change request is
+    dispatched as one detached turn rooted at the persisted finalized
+    iteration — never routed through the in-process blocking revise — and
+    the outcome carries no in-process revision production (issue #335)."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    finalization = decision_module._Finalization(
+        decision_module._Phase1Decision.ROUTE_REVISION,
+        cast(ReviewIteration, SimpleNamespace(id=_ITERATION_1_ID)),
+        cast(PlanRevision, SimpleNamespace(id=_REVISION_1_ID)),
+        cast(ReviewLoop, SimpleNamespace(id=uuid.uuid4())),
+        cast(Task, SimpleNamespace(state_token=_STATE_TOKEN)),
+        None,
+    )
+    monkeypatch.setattr(
+        decision_module, "_finalize_decision_transaction", lambda *args, **kwargs: finalization
+    )
+    dispatched: list[dict[str, Any]] = []
+
+    def recording_dispatch(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(dict(kwargs))
+        return SimpleNamespace(
+            task=SimpleNamespace(state_token=_STATE_TOKEN),
+            send_claim=None,
+            receipt=None,
+            producer_session=None,
+        )
+
+    monkeypatch.setattr(decision_module, "dispatch_planning_revise_detached", recording_dispatch)
+
+    def refusing_blocking_revise(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the blocking revise must not run with the detached trio supplied")
+
+    monkeypatch.setattr(decision_module, "revise_task_plan", refusing_blocking_revise)
+
+    outcome = finalize_planning_review_decision(
+        pool,
+        None,
+        cast(GitHubAppClient, FakeGitHubClient(FakePool(conn))),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        dispatch=_dispatch_outcome(
+            iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+        ),
+        producer_runtime_factory=cast(
+            ProducerRuntimeAttachmentFactory,
+            lambda: None,
+        ),
+        observation_registrar=cast(
+            PlanProductionObservationRegistrar,
+            SimpleNamespace(register_session=lambda **_: None),
+        ),
+        completion_handoff=cast(
+            DetachedTurnCompletionHandoff,
+            SimpleNamespace(handoff_settled_completion=lambda **_: None),
+        ),
+    )
+
+    assert outcome.decision is PlanningReviewDecision.REVISION_ROUTED
+    assert outcome.revision_production is None
+    assert len(dispatched) == 1
+    assert dispatched[0]["prior_plan_revision_id"] == _REVISION_1_ID
+    assert dispatched[0]["review_iteration_id"] == _ITERATION_1_ID
+    assert dispatched[0]["expected_state_token"] == _STATE_TOKEN
+    assert callable(dispatched[0]["producer_runtime_factory"])
+    assert dispatched[0]["observation_registrar"] is not None
+    assert dispatched[0]["completion_handoff"] is not None

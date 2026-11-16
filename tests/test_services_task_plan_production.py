@@ -61,24 +61,39 @@ from openorc.adapters.github import (
     GitHubRequestRejectedError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.send_claims import (
+    TaskRuntimeSendClaim,
+    TaskRuntimeSendClaimKind,
+    TaskRuntimeSendClaimStatus,
+)
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.interaction import PlanReviewSubject, ReviseInteraction
+from openorc.protocol.interaction import PlanInteraction, PlanReviewSubject, ReviseInteraction
+from openorc.protocol.models import PlanResult
 from openorc.services.errors import (
     AuthorizationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
+)
 from openorc.services.task_plan_production import (
+    DispatchedPlanProduction,
     TaskPlanProductionOutcome,
+    dispatch_initial_plan_detached,
+    dispatch_planning_revise_detached,
     produce_initial_task_plan,
     revise_task_plan,
+    settle_observed_plan_result,
 )
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from tests.fakes.agent_runtime import (
@@ -404,6 +419,7 @@ def _claim_row(
     review_iteration_id: Any = None,
     owner_gate_id: Any = None,
     subject_head_sha: Any = None,
+    dispatch_repository_base_sha: Any = None,
     settled: bool = False,
     claim_id: Any = _CLAIM_ID,
 ) -> tuple[Any, ...]:
@@ -417,6 +433,7 @@ def _claim_row(
         review_iteration_id,
         owner_gate_id,
         subject_head_sha,
+        dispatch_repository_base_sha,
         status,
         {} if outcome is None else outcome,
         _CLAIM_AT,
@@ -2217,3 +2234,592 @@ def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() ->
     # The failure telemetry is a safe classification only: the description
     # is the exception type name, never arbitrary message content.
     assert failed_span.status.description == "AuthorizationError"
+
+
+# --- the detached plan-result dispatch and settlement (issues #325/#335) -------
+
+
+_RECEIPT_ID = uuid.uuid4()
+_TURN_REFERENCE = "fake-run-1"
+
+_RECEIPT_INSERT = _sql_has("insert into openorc.task_hub_run_receipts")
+_RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id = %s for update")
+_RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
+_RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
+_EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
+
+
+def _detached_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+    operation: str = "initial_plan_dispatch",
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    if status == "settled":
+        outcome: dict[str, Any] = {"settlement": "validated_result"}
+    elif status == "refused":
+        outcome = {"refusal_kind": "admission_refused"}
+    else:
+        outcome = {}
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _PRODUCER_SESSION_ID,
+        operation,
+        "runtime_send_claim",
+        _CLAIM_ID,
+        "plan_result",
+        admitted_turn_reference,
+        status,
+        outcome,
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+class _RecordingRegistrar:
+    """Records the pre-admission observation registrations (issue #323 seam)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.registrations: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        connection_id: Any,
+        external_session_id: Any,
+    ) -> None:
+        self.registrations.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _RecordingHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #335)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+    ) -> None:
+        self.calls.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _ProducerAttachment:
+    """The zero-arg producer attachment factory's yielded lease."""
+
+    def __init__(self, adapter: FakeAgentRuntimeAdapter) -> None:
+        self._adapter = adapter
+        self.acquisitions = 0
+
+    def __call__(self) -> Any:
+        @contextmanager
+        def lease() -> Iterator[FakeAgentRuntimeAdapter]:
+            self.acquisitions += 1
+            try:
+                yield self._adapter
+            finally:
+                self.acquisitions -= 1
+
+        return lease()
+def _detached_initial_runtime() -> FakeAgentRuntimeAdapter:
+    """A fake adapter holding the live prepared Producer session, admission-ready."""
+    return _prepared_producer_adapter([])
+
+
+def _dispatch_initial_call(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    runtime: FakeAgentRuntimeAdapter,
+    *,
+    registrar: _RecordingRegistrar,
+    handoff: _RecordingHandoff,
+    preparation: Any = _UNSET_PREPARATION,
+) -> Any:
+    return dispatch_initial_plan_detached(
+        cast(DatabasePool, pool),
+        github,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        profile_id=_OWNER_PROFILE_ID,
+        preparation=(preparation if preparation is not _UNSET_PREPARATION else _preparation()),
+        producer_runtime_factory=_ProducerAttachment(runtime),
+        observation_registrar=registrar,  # type: ignore[arg-type]
+        completion_handoff=handoff,  # type: ignore[arg-type]
+    )
+
+
+def _dispatch_revise_call(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    runtime: FakeAgentRuntimeAdapter,
+    *,
+    registrar: _RecordingRegistrar,
+    handoff: _RecordingHandoff,
+) -> Any:
+    return dispatch_planning_revise_detached(
+        cast(DatabasePool, pool),
+        github,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        profile_id=_OWNER_PROFILE_ID,
+        expected_state_token=_STATE_TOKEN,
+        prior_plan_revision_id=_REVISION_1_ID,
+        review_iteration_id=_ITERATION_ID,
+        producer_runtime_factory=_ProducerAttachment(runtime),
+        observation_registrar=registrar,  # type: ignore[arg-type]
+        completion_handoff=handoff,  # type: ignore[arg-type]
+    )
+
+
+def _known_nondelivery_update(sql: str, params: tuple[Any, ...] | None) -> bool:
+    lowered = " ".join(sql.split()).lower()
+    return (
+        "update openorc.task_runtime_send_claims" in lowered
+        and params is not None
+        and len(params) > 0
+        and params[0] == "known_nondelivery"
+    )
+
+
+def _script_claim_and_receipt(
+    conn: ScriptedConnection,
+    *,
+    task_row: tuple[Any, ...],
+    producer_row: tuple[Any, ...],
+    existing_claim: tuple[Any, ...] | None = None,
+    claim_row: tuple[Any, ...] | None = None,
+    receipt_row: tuple[Any, ...] | None = None,
+    iteration_row: tuple[Any, ...] | None = None,
+    loop_row: tuple[Any, ...] | None = None,
+    loop_iterations: list[tuple[Any, ...]] | None = None,
+) -> None:
+    """The claim+receipt dispatch transaction's canned sequence, in call order.
+
+    The locked Task re-read, the Producer binding reproof, the per-kind
+    subject reproof (the routed iteration for the REVISE kind), the
+    exact-subject pre-check (``None`` means unclaimed), the committed claim
+    row, and the committed detached-turn receipt companion."""
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_role_is(_sql_has("from openorc.task_agent_sessions"), "producer"), producer_row)
+    if iteration_row is not None:
+        conn.on(_sql_has("from openorc.review_iterations where id"), iteration_row)
+        conn.on(
+            _sql_has("from openorc.review_loops where id"),
+            loop_row if loop_row is not None else _loop_row(),
+        )
+        conn.on(
+            _sql_has("review_iterations where review_loop_id"),
+            loop_iterations if loop_iterations is not None else [iteration_row],
+        )
+    conn.on(_CLAIM_PRECHECK, existing_claim)
+    conn.on(_CLAIM_INSERT, claim_row if claim_row is not None else _claim_row())
+    conn.on(_RECEIPT_INSERT, receipt_row if receipt_row is not None else _detached_receipt_row())
+
+
+def _script_attach(conn: ScriptedConnection, *, staged: Any = None) -> None:
+    """The acknowledgement attach (claimed → admitted, staged or plain)."""
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, staged)
+
+
+def _claim_insert_params(conn: ScriptedConnection) -> tuple[Any, ...]:
+    for sql, params in conn.executed:
+        if _CLAIM_INSERT(sql, None):
+            assert params is not None
+            return params
+    raise AssertionError("no send-claim insert executed")
+
+
+def _receipt_insert_params(conn: ScriptedConnection) -> tuple[Any, ...]:
+    for sql, params in conn.executed:
+        if _RECEIPT_INSERT(sql, None):
+            assert params is not None
+            return params
+    raise AssertionError("no detached-turn receipt insert executed")
+
+
+def test_detached_initial_plan_dispatch_claims_records_registers_admits_and_attaches() -> None:
+    """The regular-mode initial PLAN is one admitted detached turn: the one-shot
+    claim (with its observed base context) and the ``plan_result`` receipt
+    commit together strictly before the positive observation registration
+    and the verbatim admission, and the dispatching call returns with the
+    claim conservatively claimed and no blocking send."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_claim_and_receipt(
+        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
+    )
+    _script_attach(env.conn)
+    env.conn.on(_TASK_READ, _task_row())  # the post-dispatch reload
+    runtime = _detached_initial_runtime()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_initial_call(
+        env.pool, env.github, runtime, registrar=registrar, handoff=handoff
+    )
+
+    assert isinstance(outcome, DispatchedPlanProduction)
+    assert outcome.send_claim.id == _CLAIM_ID
+    assert outcome.receipt.id == _RECEIPT_ID
+    assert outcome.producer_session.id == _PRODUCER_SESSION_ID
+    # The claim records the dispatch-observed repository-base context.
+    claim_params = _claim_insert_params(env.conn)
+    assert claim_params[-1] == _BASE_SHA
+    # The receipt companion expects the canonical plan_result family and
+    # roots at the runtime-send-claim identity.
+    receipt_params = _receipt_insert_params(env.conn)
+    assert receipt_params[3] == "initial_plan_dispatch"
+    assert receipt_params[4] == "runtime_send_claim"
+    assert receipt_params[6] == "plan_result"
+    # One positive observation registration on the exact bound session.
+    assert registrar.registrations == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _PRODUCER_SESSION_ID,
+            "connection_id": _CONNECTION_ID,
+            "external_session_id": _PRODUCER_EXTERNAL_ID,
+        }
+    ]
+    # The canonical PLAN instruction was admitted verbatim — the exact
+    # message the blocking send composes — and no blocking send ran.
+    assert runtime.detached_admissions() == (
+        (
+            _PRODUCER_EXTERNAL_ID,
+            PlanInteraction(
+                repository_full_name=_FULL_NAME,
+                issue_number=42,
+                guidance="",
+            ).render(),
+        ),
+    )
+    assert runtime.submitted_sends(_PRODUCER_EXTERNAL_ID) == ()
+    # Exactly one acknowledged admission attached; no handoff fired (the
+    # staged-early path is a separate case).
+    assert handoff.calls == []
+    assert env.pool.active_connections == 0
+
+
+def test_detached_initial_plan_registration_refusal_refuses_the_receipt_and_fails_known() -> None:
+    """A refused observation registration is a proven pre-effect failure: the
+    receipt is refused, the claim records its known non-delivery, and no
+    admission is ever attempted."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_claim_and_receipt(
+        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
+    )
+    env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    env.conn.on(_known_nondelivery_update, _claim_row(status="known_nondelivery"))
+    runtime = _detached_initial_runtime()
+    registrar = _RecordingRegistrar(
+        error=ObservationRegistrationRefusedError(
+            "refused", reason=ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
+        )
+    )
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationFailedError):
+        _dispatch_initial_call(env.pool, env.github, runtime, registrar=registrar, handoff=handoff)
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)
+    assert any(_known_nondelivery_update(sql, params) for sql, params in env.conn.executed)
+    # The refused dispatch never admitted a turn.
+    assert runtime.detached_admissions() == ()
+    assert handoff.calls == []
+
+
+def test_detached_initial_plan_admission_refusal_refuses_the_receipt_and_fails_known() -> None:
+    """A positively identified admission refusal is a proven pre-effect
+    failure: the receipt is refused, the claim records its known
+    non-delivery, and the typed rejection propagates."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_claim_and_receipt(
+        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
+    )
+    env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    env.conn.on(_known_nondelivery_update, _claim_row(status="known_nondelivery"))
+    runtime = _detached_initial_runtime()
+    runtime.queue_detached_admission(AgentRuntimeUnavailableError("the hub is unreachable"))
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationRejectedError):
+        _dispatch_initial_call(env.pool, env.github, runtime, registrar=registrar, handoff=handoff)
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)
+    assert any(_known_nondelivery_update(sql, params) for sql, params in env.conn.executed)
+    # The registration happened (it precedes the admission) and the
+    # observation never settled anything.
+    assert len(registrar.registrations) == 1
+    assert handoff.calls == []
+
+
+def test_detached_initial_plan_uncertain_admission_leaves_claim_and_receipt_claimed() -> None:
+    """An uncertain admission is never a proven non-delivery: the claim and
+    the receipt stay conservatively claimed and the instruction is never
+    re-dispatched."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    _script_claim_and_receipt(
+        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
+    )
+    runtime = _detached_initial_runtime()
+    runtime.queue_detached_admission(
+        AgentRuntimeDeliveryUncertainError("the admission outcome is unknown")
+    )
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _dispatch_initial_call(env.pool, env.github, runtime, registrar=registrar, handoff=handoff)
+
+    assert not any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)
+    assert not any(
+        _sql_has("update openorc.task_runtime_send_claims", "known_nondelivery")(sql, None)
+        for sql, _ in env.conn.executed
+    )
+    assert handoff.calls == []
+
+
+def test_a_claimed_initial_plan_subject_never_dispatches_again() -> None:
+    """A replayed or raced continuation against an already-claimed subject
+    fails closed before any receipt or runtime effect: the one-shot claim is
+    never re-dispatched."""
+    env = _Production()
+    _script_initial_entry(
+        env.conn,
+        task_row=_task_row(),
+        producer_row=_production_ready_row(),
+        reviewer_row=_review_ready_row(),
+    )
+    env.conn.on(_TASK_READ_LOCKED, _task_row())
+    env.conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    env.conn.on(_CLAIM_PRECHECK, _claim_row())
+    runtime = _detached_initial_runtime()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(StaleOperationError):
+        _dispatch_initial_call(env.pool, env.github, runtime, registrar=registrar, handoff=handoff)
+
+    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in env.conn.executed)
+    assert runtime.detached_admissions() == ()
+    assert registrar.registrations == []
+
+
+def test_detached_revise_dispatch_routes_the_persisted_findings_verbatim() -> None:
+    """The routed REVISE is one admitted detached turn whose instruction is
+    the persisted finalized change request rebuilt verbatim from durable
+    state — never an in-memory continuation object."""
+    env = _Production()
+    current_row = _task_row(current_plan_revision_id=_REVISION_1_ID)
+    iteration_row = _iteration_row()
+    _script_revise_entry(
+        env.conn,
+        task_row=current_row,
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        iteration_row=iteration_row,
+        loop_row=_loop_row(),
+        producer_row=_production_ready_row(),
+    )
+    _script_claim_and_receipt(
+        env.conn,
+        task_row=current_row,
+        producer_row=_production_ready_row(),
+        claim_row=_claim_row(
+            kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID
+        ),
+        receipt_row=_detached_receipt_row(operation="planning_revise_dispatch"),
+        iteration_row=iteration_row,
+    )
+    _script_attach(env.conn)
+    env.conn.on(_TASK_READ, current_row)  # the post-dispatch reload
+    runtime = _detached_initial_runtime()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_revise_call(
+        env.pool, env.github, runtime, registrar=registrar, handoff=handoff
+    )
+
+    assert isinstance(outcome, DispatchedPlanProduction)
+    # The receipt companion addresses the exact routed change request.
+    receipt_params = _receipt_insert_params(env.conn)
+    assert receipt_params[3] == "planning_revise_dispatch"
+    assert receipt_params[5] == _CLAIM_ID
+    assert receipt_params[6] == "plan_result"
+    # The persisted findings were serialized verbatim as the admission.
+    assert runtime.detached_admissions() == (
+        (_PRODUCER_EXTERNAL_ID, _REVIEW_RESULT_SERIALIZED),
+    )
+    assert runtime.submitted_sends(_PRODUCER_EXTERNAL_ID) == ()
+    assert handoff.calls == []
+
+
+def _settlement_claim(
+    *,
+    kind: TaskRuntimeSendClaimKind,
+    review_iteration_id: Any = None,
+    dispatch_repository_base_sha: Any = _BASE_SHA,
+) -> TaskRuntimeSendClaim:
+    return TaskRuntimeSendClaim(
+        id=_CLAIM_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        kind=kind,
+        task_agent_session_id=_PRODUCER_SESSION_ID,
+        review_iteration_id=review_iteration_id,
+        owner_gate_id=None,
+        subject_head_sha=None,
+        dispatch_repository_base_sha=dispatch_repository_base_sha,
+        status=TaskRuntimeSendClaimStatus.CLAIMED,
+        outcome={},
+        claimed_at=_CLAIM_AT,
+        settled_at=None,
+        updated_at=_CLAIM_AT,
+    )
+
+
+def test_settlement_of_the_observed_initial_plan_result_creates_revision_one_atomically() -> None:
+    """The owning-service settlement re-derives every subject from durable
+    state and reuses the one shared commit composition: the immutable
+    revision from the claim's recorded base context, the pointer/token
+    rotation, the event, and the send-claim settlement."""
+    conn = ScriptedConnection()
+    conn.on(_TASK_READ, _task_row())
+    conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "producer"),
+        _production_ready_row(),
+    )
+    conn.on(
+        _role_is(_sql_has("from openorc.task_agent_sessions"), "reviewer"),
+        _review_ready_row(),
+    )
+    _script_initial_finalize(
+        conn,
+        task_row=_task_row(),
+        history=[],
+        revision_row=_revision_row(revision_id=_REVISION_1_ID, number=1),
+        pointer_row=_updated_task_row(pointer=_REVISION_1_ID),
+    )
+    claim = _settlement_claim(kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH)
+
+    outcome = settle_observed_plan_result(
+        cast(DatabasePool, FakePool(conn)),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        send_claim=claim,
+        result=PlanResult(plan=_PLAN_TEXT),
+    )
+
+    assert isinstance(outcome, TaskPlanProductionOutcome)
+    assert outcome.plan_revision.repository_base_sha == _BASE_SHA
+    assert outcome.plan_revision.content == _PLAN_TEXT
+    assert outcome.task.state_token == _NEXT_TOKEN
+    # The send claim settled exactly once with the atomic resolution.
+    assert any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
+
+
+def test_settlement_of_a_moved_on_subject_never_publishes_a_revision() -> None:
+    """A validated result whose subject moved on (the Task left its coarse
+    planning state) can no longer apply: nothing is rewritten and the caller
+    settles the receipt as result-not-applied."""
+    conn = ScriptedConnection()
+    conn.on(_TASK_READ, _task_row(status="implementing"))
+    claim = _settlement_claim(kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH)
+
+    outcome = settle_observed_plan_result(
+        cast(DatabasePool, FakePool(conn)),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        send_claim=claim,
+        result=PlanResult(plan=_PLAN_TEXT),
+    )
+
+    assert outcome is None
+    _assert_no_consequential_write(conn)
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
+
+
+def test_settlement_of_a_claim_without_its_dispatch_base_fails_closed() -> None:
+    """A claimed plan dispatch without its recorded repository-base context
+    is an impossible durable state for any attributable receipt: the
+    settlement fails closed instead of fabricating audit context."""
+    conn = ScriptedConnection()
+    claim = _settlement_claim(
+        kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH, dispatch_repository_base_sha=None
+    )
+
+    with pytest.raises(InvalidCommandError):
+        settle_observed_plan_result(
+            cast(DatabasePool, FakePool(conn)),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            send_claim=claim,
+            result=PlanResult(plan=_PLAN_TEXT),
+        )
+
+    _assert_no_consequential_write(conn)
+

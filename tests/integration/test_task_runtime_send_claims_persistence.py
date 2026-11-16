@@ -34,7 +34,7 @@ from typing import Any
 
 import pytest
 from psycopg import Connection
-from psycopg.errors import ForeignKeyViolation, UniqueViolation
+from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
 from psycopg.types.json import Jsonb
 
 from openorc.domain.reviews import ReviewLoopPurpose
@@ -44,6 +44,7 @@ from openorc.persistence.planning import create_plan_revision
 from openorc.persistence.reviews import create_review_iteration, create_review_loop
 from openorc.persistence.send_claims import (
     create_task_runtime_send_claim,
+    get_task_runtime_send_claim,
     get_task_runtime_send_claim_for_subject,
     list_task_runtime_send_claims,
     record_task_runtime_send_claim_known_non_delivery,
@@ -570,3 +571,51 @@ def test_bootstrap_stage_evidence_is_forward_only_and_claim_bound(
         )
         is False
     )
+
+
+
+def test_plan_claims_carry_their_dispatch_repository_base_and_pr_compose_never_does(
+    conn: Connection[Any],
+) -> None:
+    task_id, workspace_id, _state_token = _insert_task_chain(conn)
+    session_id = _insert_producer_session(conn, workspace_id, task_id)
+    gate_id = _insert_approved_pr_gate(conn, workspace_id, task_id)
+    pool = _SingleConnectionPool(conn)
+
+    # The detached plan dispatches record their observed repository-base
+    # context on the claim row (issue #335); it reads back verbatim.
+    plan_claim = create_task_runtime_send_claim(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH,
+        task_agent_session_id=session_id,
+        dispatch_repository_base_sha=_HEAD_SHA,
+    )
+    assert plan_claim.dispatch_repository_base_sha == _HEAD_SHA
+    reloaded = get_task_runtime_send_claim(pool, claim_id=plan_claim.id)
+    assert reloaded is not None
+    assert reloaded.dispatch_repository_base_sha == _HEAD_SHA
+
+    # The PR_COMPOSE kind's subject head is the approved gate's
+    # subject_head_sha: a dispatch repository-base context is refused by the
+    # service boundary and by the database CHECK.
+    with pytest.raises(ValueError):
+        create_task_runtime_send_claim(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            kind=TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH,
+            task_agent_session_id=session_id,
+            owner_gate_id=gate_id,
+            subject_head_sha=_HEAD_SHA,
+            dispatch_repository_base_sha=_HEAD_SHA,
+        )
+    with pytest.raises(CheckViolation):
+        conn.execute(
+            "insert into openorc.task_runtime_send_claims "
+            "(workspace_id, task_id, kind, task_agent_session_id, owner_gate_id, "
+            "subject_head_sha, dispatch_repository_base_sha) "
+            "values (%s, %s, 'pr_compose_dispatch', %s, %s, %s, %s)",
+            (workspace_id, task_id, session_id, gate_id, _HEAD_SHA, _HEAD_SHA),
+        )
