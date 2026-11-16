@@ -120,11 +120,13 @@ from openorc.domain.operational_failures import (
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.send_claims import TaskRuntimeSendClaimStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
+from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
@@ -135,6 +137,7 @@ from openorc.protocol.models import (
     WORKSPACE_OPERATION_PREPARE,
     FormalResponse,
     ImplementationResult,
+    PlanResult,
     SessionReady,
     WorkspaceResult,
 )
@@ -208,12 +211,26 @@ _EXECUTION_FAMILY_SUBJECTS: Final[
     ),
 }
 
-# The Level 2 report's expected Task status per execution family, mirroring
+# The Level 2 report's expected Task status per settled family, mirroring
 # the owning dispatch services' subject contracts.
 _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperation, TaskStatus]] = {
     PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: TaskStatus.IMPLEMENTING,
     PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION: TaskStatus.REVIEWING,
+    PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH: TaskStatus.PLANNING,
+    PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: TaskStatus.PLANNING,
 }
+
+# The plan-result families with detached settlement routing in this seam
+# (issue #335): the Producer plan dispatches whose validated ``plan_result``
+# finalizes through the owning plan-production service's settlement.
+_PLAN_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
+    frozenset(
+        {
+            PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+            PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+        }
+    )
+)
 
 # The safe failure-classification token the settlement records for a
 # positively established malformed-result protocol failure: an attributed
@@ -589,9 +606,206 @@ def _route_observed_terminal(
             outcome=outcome,
             ordering_marker=ordering_marker,
         )
+    if receipt.operation in _PLAN_SETTLEMENT_FAMILIES:
+        return _route_plan_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
+        )
     raise ConflictError(
         "the receipt's operation family has no detached settlement routing yet; "
         "the observation is left unresolved"
+    )
+
+
+def _route_plan_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the plan dispatch claim.
+
+    The attribution congruence is proved first (issue #335): the claim must
+    exist in the addressed scope, still be conservatively claimed, carry the
+    receipt's exact family kind, and anchor to exactly the receipt's session
+    binding. A concrete attribution conflict leaves the observation
+    unresolved — never a fabricated match. A terminal failure settles the
+    receipt truthfully and reports through the existing typed
+    operation-failure path (Level 2) under the claim's own family — whose
+    dispositions are escalation or no-op, never a re-dispatch of the one-shot
+    claim. A completion funnels the candidate through the shared formal
+    contract; a validated ``plan_result`` finalizes through the owning
+    service's settlement (the immutable PlanRevision, the current-pointer and
+    token rotation, the send-claim settlement, and the audit event, all
+    atomic with the receipt's settlement), while a missing or
+    contract-failing candidate is a positively established protocol failure
+    of the turn.
+    """
+    # Deferred import: the owning service imports this module's dispatch
+    # mechanics at module level.
+    from openorc.services.task_plan_production import settle_observed_plan_result  # noqa: PLC0415
+
+    claim = send_claim_records.get_task_runtime_send_claim(
+        transaction_pool, claim_id=receipt.original_attempt_id
+    )
+    if (
+        claim is None
+        or claim.workspace_id != workspace_id
+        or claim.task_id != task_id
+        or claim.kind.value != receipt.operation.value
+        or claim.status is not TaskRuntimeSendClaimStatus.CLAIMED
+        or claim.task_agent_session_id != receipt.task_agent_session_id
+    ):
+        logger.warning(
+            "the observed terminal completion conflicts with the receipt's claim "
+            "binding; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
+        return _settle_plan_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=OBSERVED_RUN_FAILURE_KIND,
+        )
+    # A genuinely attributed completion must carry a usable formal result. A
+    # missing candidate, a shared-contract rejection, or an unexpected
+    # family type is a positively established protocol failure of the turn —
+    # routed through the existing typed operation-failure machinery (never
+    # silently unresolved evidence, never a safe retry) — while a validated
+    # result finalizes the one-shot claim through the owning service.
+    parsed: FormalResponse | None
+    if outcome.result_candidate is not None:
+        try:
+            parsed = parse_formal_response(
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            parsed = None
+    else:
+        parsed = None
+    if not isinstance(parsed, PlanResult):
+        logger.warning(
+            "the observed terminal completion carries no usable formal result for its "
+            "expected family; classifying the positively established protocol failure"
+        )
+        return _settle_plan_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
+            failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
+        )
+    finalized = settle_observed_plan_result(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        send_claim=claim,
+        result=parsed,
+    )
+    if finalized is None:
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, ordering_marker),
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=settled,
+        formal_result=parsed,
+    )
+
+
+def _settle_plan_failure(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    ordering_marker: int | None,
+    error_code: OperationalFailureCode,
+    failure_kind: str,
+) -> TurnSettlementOutcome:
+    """Settle one positively established genuine plan-dispatch turn failure.
+
+    The receipt settles truthfully (``observed_failure``) and the failure
+    reports through the existing typed operation-failure path (Level 2)
+    under the claim's own family — the same family the blocking dispatch's
+    failures have always reported under, whose dispositions are escalation
+    or no-op, never a re-dispatch of the one-shot claim. The claim itself
+    stays conservatively claimed: an observed run failure or a malformed
+    result is post-effect evidence, never a proven pre-effect non-delivery.
+    The report is a typed no-op when it no longer addresses current work.
+    """
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
+    )
+    current = task_records.get_task(transaction_pool, task_id=task_id)
+    if current is None or current.workspace_id != workspace_id:
+        # Unreachable for a Task-scoped receipt; kept explicit for fail-closed
+        # safety.
+        raise NotFoundError("the requested task is not available in this workspace")
+    operation = OperationalFailureOperation(
+        family=receipt.operation,
+        original_attempt_kind=receipt.original_attempt_kind,
+        original_attempt_id=receipt.original_attempt_id,
+        subject=canonical_failure_subject(
+            {
+                "claim_id": str(receipt.original_attempt_id),
+                "task_agent_session_id": str(receipt.task_agent_session_id),
+            }
+        ),
+    )
+    report = OperationalFailureReport(
+        reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+        reporting_attempt_id=receipt.original_attempt_id,
+        error_code=error_code,
+        effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
+        diagnostic_context={"observation": "observed_turn_failure"},
+    )
+    disposition = triage_operational_failure(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=current.state_token,
+        expected_status=_FAMILY_EXPECTED_TASK_STATUS[receipt.operation],
+        expected_current_owner_gate_id=None,
+        actor=_OPENORC_ACTOR,
+        operation=operation,
+        report=report,
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+        receipt=settled,
+        disposition=disposition,
     )
 
 

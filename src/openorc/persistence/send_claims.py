@@ -63,7 +63,8 @@ __all__ = [
 
 _CLAIM_COLUMNS = (
     "id, workspace_id, task_id, kind, task_agent_session_id, review_iteration_id, "
-    "owner_gate_id, subject_head_sha, status, outcome, claimed_at, settled_at, updated_at"
+    "owner_gate_id, subject_head_sha, dispatch_repository_base_sha, status, outcome, "
+    "claimed_at, settled_at, updated_at"
 )
 
 
@@ -82,12 +83,14 @@ def _claim_from_row(row: Sequence[Any]) -> TaskRuntimeSendClaim:
         review_iteration_id=row[5],
         owner_gate_id=row[6],
         subject_head_sha=row[7],
-        status=TaskRuntimeSendClaimStatus(row[8]),
-        outcome=row[9],
-        claimed_at=normalize_utc(row[10]),
-        settled_at=None if row[11] is None else normalize_utc(row[11]),
-        updated_at=normalize_utc(row[12]),
+        dispatch_repository_base_sha=row[8],
+        status=TaskRuntimeSendClaimStatus(row[9]),
+        outcome=row[10],
+        claimed_at=normalize_utc(row[11]),
+        settled_at=None if row[12] is None else normalize_utc(row[12]),
+        updated_at=normalize_utc(row[13]),
     )
+
 
 
 def _require_subject_form(
@@ -127,6 +130,7 @@ def create_task_runtime_send_claim(
     review_iteration_id: UUID | None = None,
     owner_gate_id: UUID | None = None,
     subject_head_sha: str | None = None,
+    dispatch_repository_base_sha: str | None = None,
 ) -> TaskRuntimeSendClaim:
     """Insert one claimed send identity exactly once, before any runtime effect.
 
@@ -137,6 +141,8 @@ def create_task_runtime_send_claim(
     alike — raises ``UniqueViolation``. The composite subject foreign keys
     keep every claimed subject in the same Task/Workspace scope; violations
     surface as ``ForeignKeyViolation``. ``claimed_at`` is database-stamped.
+    The detached plan dispatches record their observed repository-base
+    context here (issue #335); the PR_COMPOSE kind never carries one.
     """
     _require_uuid(workspace_id, "workspace_id")
     _require_uuid(task_id, "task_id")
@@ -152,12 +158,25 @@ def create_task_runtime_send_claim(
         not isinstance(subject_head_sha, str) or not subject_head_sha.strip()
     ):
         raise ValueError("send claim subject_head_sha must be None or a non-empty string")
+    if dispatch_repository_base_sha is not None and (
+        not isinstance(dispatch_repository_base_sha, str)
+        or not dispatch_repository_base_sha.strip()
+    ):
+        raise ValueError(
+            "send claim dispatch_repository_base_sha must be None or a non-empty string"
+        )
+    if kind is TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH and (
+        dispatch_repository_base_sha is not None
+    ):
+        raise ValueError(
+            "a pr_compose_dispatch claim carries no dispatch repository-base context"
+        )
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.task_runtime_send_claims "
             "(workspace_id, task_id, kind, task_agent_session_id, review_iteration_id, "
-            "owner_gate_id, subject_head_sha) "
-            "values (%s, %s, %s, %s, %s, %s, %s) "
+            "owner_gate_id, subject_head_sha, dispatch_repository_base_sha) "
+            "values (%s, %s, %s, %s, %s, %s, %s, %s) "
             f"returning {_CLAIM_COLUMNS}",
             (
                 workspace_id,
@@ -167,6 +186,7 @@ def create_task_runtime_send_claim(
                 review_iteration_id,
                 owner_gate_id,
                 subject_head_sha,
+                dispatch_repository_base_sha,
             ),
         ).fetchone()
     assert row is not None
