@@ -42,7 +42,6 @@ from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.models import ReviewFinding, ReviewResult
 from openorc.services import event_coordination
 from openorc.services.task_planning_review_decision import (
-    TaskPlanningReviewDispatchOutcome,
     finalize_planning_review_decision,
 )
 from openorc.services.task_planning_review_resolution import (
@@ -275,16 +274,6 @@ def _settlement_fixture(conn: Connection[Any]) -> tuple[DatabasePool, dict[str, 
     assert current_task is not None
     persisted_loop = review_repositories.get_review_loop(pool, review_loop_id=loop.id)
     assert persisted_loop is not None
-    dispatch = TaskPlanningReviewDispatchOutcome(
-        review_loop=persisted_loop,
-        review_iteration=attempt,
-        review_result=ReviewResult(
-            outcome="CHANGES_REQUESTED",
-            summary="Needs work",
-            findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
-        ),
-        reviewer_session=reviewer,
-    )
     decision = finalize_planning_review_decision(
         pool,
         cast(AgentRuntimeAdapter, FakeAgentRuntimeAdapter()),
@@ -293,7 +282,13 @@ def _settlement_fixture(conn: Connection[Any]) -> tuple[DatabasePool, dict[str, 
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=current_task.state_token,
-        dispatch=dispatch,
+        review_iteration_id=attempt.id,
+        review_result=ReviewResult(
+            outcome="CHANGES_REQUESTED",
+            summary="Needs work",
+            findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
+        ),
+        expected_reviewer_session_id=reviewer.id,
     )
     assert decision.resolution_gate is not None
     exhausted = task_repositories.get_task(pool, task_id)
@@ -370,9 +365,12 @@ def test_the_settled_acceptance_composition_commits_atomically(
 ) -> None:
     """One committed composition: the NEW finalized settlement iteration,
     the REVIEWER plan-review and settled-gate events with the settling
-    result's references, the one-shot ``SETTLED`` stamp with pointer clear
-    and token rotation, and the loop closure — the unchanged current
-    PlanRevision stays current and the exhausted history stays immutable."""
+    result's references, and the one-shot ``SETTLED`` stamp with pointer
+    clear and token rotation — the unchanged current PlanRevision stays
+    current, the exhausted history stays immutable, and the planning
+    ReviewLoop stays OPEN with no closure (issue #219: acceptance at any
+    round leaves the single planning loop OPEN; E5's Owner approval closes
+    it atomically)."""
     pool, facts = _settlement_fixture(conn)
 
     outcome = _settling_call(
@@ -396,8 +394,10 @@ def test_the_settled_acceptance_composition_commits_atomically(
     assert task.state_token != facts["state_token"]
     loop = review_repositories.get_review_loop(pool, review_loop_id=facts["loop_id"])
     assert loop is not None
-    assert loop.status is ReviewLoopStatus.CLOSED
-    assert loop.closed_at is not None
+    # Issue #219: acceptance — ordinary or Owner-mediated — leaves the single
+    # planning ReviewLoop OPEN; only E5's Owner approval closes it atomically.
+    assert loop.status is ReviewLoopStatus.OPEN
+    assert loop.closed_at is None
     iterations = review_repositories.list_review_loop_iterations(
         pool, review_loop_id=facts["loop_id"]
     )

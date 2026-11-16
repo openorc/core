@@ -41,7 +41,6 @@ from openorc.protocol.models import ReviewFinding, ReviewResult
 from openorc.services.errors import StaleOperationError
 from openorc.services.task_planning_review_decision import (
     PlanningReviewDecision,
-    TaskPlanningReviewDispatchOutcome,
     finalize_planning_review_decision,
 )
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter
@@ -266,15 +265,10 @@ def _decision_fixture(
     assert current_task is not None
     persisted_loop = review_repositories.get_review_loop(pool, review_loop_id=loop.id)
     assert persisted_loop is not None
-    dispatch = TaskPlanningReviewDispatchOutcome(
-        review_loop=persisted_loop,
-        review_iteration=attempt,
-        review_result=ReviewResult(
-            outcome="CHANGES_REQUESTED",
-            summary="Needs work",
-            findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
-        ),
-        reviewer_session=reviewer,
+    review_result = ReviewResult(
+        outcome="CHANGES_REQUESTED",
+        summary="Needs work",
+        findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
     )
     return pool, {
         "workspace_id": workspace_id,
@@ -283,8 +277,9 @@ def _decision_fixture(
         "revision_id": revision.id,
         "loop_id": loop.id,
         "attempt_id": attempt.id,
+        "review_result": review_result,
+        "reviewer_session_id": reviewer.id,
         "state_token": current_task.state_token,
-        "dispatch": dispatch,
     }
 
 
@@ -297,7 +292,9 @@ def _exhausting_decision(pool: DatabasePool, facts: dict[str, Any]) -> Any:
         workspace_id=facts["workspace_id"],
         task_id=facts["task_id"],
         expected_state_token=facts["state_token"],
-        dispatch=facts["dispatch"],
+        review_iteration_id=facts["attempt_id"],
+        review_result=facts["review_result"],
+        expected_reviewer_session_id=facts["reviewer_session_id"],
     )
 
 

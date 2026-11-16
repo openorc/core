@@ -51,8 +51,10 @@ from openorc.adapters.github import HttpGitHubUserTokenClient
 from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
+from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -93,6 +95,7 @@ from openorc.services.task_owner_resume import (
 from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
     dispatch_initial_plan_detached,
+    dispatch_planning_revise_detached,
     produce_initial_task_plan,
 )
 from openorc.services.task_planning_bootstrap import (
@@ -109,7 +112,10 @@ from openorc.services.task_planning_review_decision import (
     PlanningReviewDecision,
     finalize_planning_review_decision,
 )
-from openorc.services.task_planning_review_dispatch import dispatch_planning_review
+from openorc.services.task_planning_review_dispatch import (
+    dispatch_planning_review,
+    dispatch_planning_review_detached,
+)
 from openorc.services.task_pr_authorization import ApprovedPrAuthorization, open_pr_authorization
 from openorc.services.task_pr_composition import TaskPrPublished, compose_and_publish_task_pr
 from openorc.services.task_pr_remediation import TaskPrRemediationOutcome
@@ -532,9 +538,14 @@ class _DetachedCompletionHandoff:
     service under the F5b coordinator's typed failure handoff; the
     workspace-PREPARE route (issue #334) performs the settled bootstrap's
     same-session planning-context transition and arranges the next typed
-    initial-plan invocation; and the plan-result routes (issue #335) submit
+    initial-plan invocation; the plan-result routes (issue #335) submit
     the existing typed planning REVIEW round from committed state after a
-    settled initial-PLAN or REVISE result. A settled family without a wired
+    settled initial-PLAN or REVISE result; and the planning-REVIEW route
+    (issue #336) owns the settled review decision's workflow continuation
+    from committed state — the exact-plan IMPLEMENTATION_AUTHORIZATION
+    presentation on acceptance and the detached Producer REVISE dispatch on
+    an in-budget change request, with the exhausted REVIEW_RESOLUTION gate
+    owning its own Owner-mediated pause. A settled family without a wired
     route is a fail-closed conflict that its own detached migration wires; no
     gate or workflow policy lives here beyond the routing and the
     committed-state re-derivation itself.
@@ -570,6 +581,11 @@ class _DetachedCompletionHandoff:
             PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
         ):
             _handoff_plan_result_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        if operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
+            _handoff_review_result_completion(
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
             )
             return
@@ -790,6 +806,131 @@ def _handoff_plan_result_completion(
     )
 
 
+def _handoff_review_result_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The planning-REVIEW route: the decision's workflow continuation.
+
+    Re-derives the decision's durable continuation from committed state —
+    never from a transient settlement object (issue #336). A Task already
+    carrying a current owner gate is owned by that gate's own seam: the
+    exhausted/sticky change request's REVIEW_RESOLUTION gate stands and its
+    Owner-mediated resolution sends no Producer prompt. A still-``planning``
+    Task with a published current plan revision routes on the OPEN planning
+    loop's latest finalized iteration: an ACCEPTED review presents the
+    exact-plan IMPLEMENTATION_AUTHORIZATION gate through the existing
+    presentation service (never approved here), and an in-budget
+    CHANGES_REQUESTED dispatches the new authorized Producer REVISE as one
+    detached agent turn through the existing #335 service using the
+    persisted iteration — after which the plan-result handoff route submits
+    the next typed planning REVIEW from committed state. Every input is
+    re-derived from committed durable state; a failed or uncertain
+    continuation is transport information only, never Task truth, and never
+    permits a blind re-enqueue — the durable state owns recovery.
+    """
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    if task.current_owner_gate_id is not None:
+        # The exhausted/sticky change request's REVIEW_RESOLUTION gate (or
+        # any other owner gate) owns the workflow: no Producer prompt is
+        # sent and the Owner-mediated resolution is not a workflow operation.
+        return
+    if task.status is not TaskStatus.PLANNING or task.current_plan_revision_id is None:
+        # The settled decision's own durable continuations are the only
+        # authority; anything else is already resolved or owned by another
+        # path.
+        return
+    loops = [
+        loop
+        for loop in review_records.list_task_review_loops(pool, task_id=task.id)
+        if loop.workspace_id == workspace_id and loop.purpose is ReviewLoopPurpose.PLANNING
+    ]
+    if len(loops) != 1:
+        return
+    loop = loops[0]
+    if loop.status is not ReviewLoopStatus.OPEN:
+        return
+    iterations = review_records.list_review_loop_iterations(pool, review_loop_id=loop.id)
+    if not iterations or iterations[-1].outcome is None:
+        return
+    latest = iterations[-1]
+    if latest.plan_revision_id != task.current_plan_revision_id:
+        return
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:  # pragma: no cover - the Task's scope proved it
+        return
+    owner_profile_id = workspace.owner_profile_id
+    expected_state_token = task.state_token
+    prior_revision_id = task.current_plan_revision_id
+
+    if latest.outcome is ReviewOutcome.ACCEPTED:
+        # The ordinary authorized continuation of accepted formal review
+        # (issue #336): present the exact-plan IMPLEMENTATION_AUTHORIZATION
+        # gate under the F5b coordinator's typed failure handoff — the
+        # presentation's own durable attribution identity (the finalized
+        # ACCEPTED iteration, recorded by the service before its external
+        # source-requirements reconciliation) reaches the Level 2 triage, so
+        # a detected presentation failure receives its durable escalation
+        # disposition instead of stranding the accepted review. No Owner
+        # decision is required to present it, and approval never follows
+        # from Reviewer acceptance — the explicit E5 approval remains an
+        # Owner command outside this module. The shared source-requirements
+        # pre-check (issue #289) freshly verifies the authoritative issue
+        # before the gate is presented; a confirmed requirements change
+        # blocks the Task through the shared atomic drift-block path.
+        def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+            open_implementation_authorization(
+                pool,
+                dependencies.github_client(),
+                profile_id=owner_profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                attempt_evidence=evidence,
+            )
+
+        coordinate_task_workflow_operation(
+            pool,
+            expected_status=TaskStatus.PLANNING,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            profile_id=owner_profile_id,
+            expected_state_token=expected_state_token,
+            invoke_level_one=invoke_level_one,
+        )
+        return
+
+    def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+        dispatch_planning_revise_detached(
+            pool,
+            dependencies.github_client(),
+            workspace_id=workspace_id,
+            task_id=task_id,
+            profile_id=owner_profile_id,
+            expected_state_token=expected_state_token,
+            prior_plan_revision_id=prior_revision_id,
+            review_iteration_id=latest.id,
+            producer_runtime_factory=_producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=evidence,
+        )
+
+    coordinate_task_workflow_operation(
+        pool,
+        expected_status=TaskStatus.PLANNING,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=owner_profile_id,
+        expected_state_token=expected_state_token,
+        invoke_level_one=invoke_level_one,
+    )
+
+
 def _submit_readiness_resumed_bootstrap_continuation(
     dependencies: OperationDependencies,
     resumable: ResumableBootstrapContinuation,
@@ -942,29 +1083,31 @@ def _compose_task_planning_review(
     dependencies: OperationDependencies,
     attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
-    """Run one planning review round: E3a dispatch → E3b decision in-process.
+    """Run one planning review round.
 
-    The dispatch and its decision finalization are one logical invocation —
-    the reserved iteration's unfinalized ``ReviewResult`` is never durable
-    and never serialized. The round's exact plan-production subject is
-    re-derived from committed state under the payload's exact token. E3a
-    acquires the Reviewer runtime itself through the deferred session-
-    addressed attachment factory, strictly after its atomic ReviewIteration
-    reservation: an attachment failure is attributable to the exact reserved
-    iteration and reaches the Level 2 handoff with its own identity instead
-    of stranding the planning Task without a disposition (F5e, issue #268).
-    On an in-budget change request the merged E2 revise already ran inside
-    the decision, and the fresh post-revise token authorizes the next round;
-    on acceptance the exact-plan implementation gate is presented (never
-    approved); on exhaustion the REVIEW_RESOLUTION gate already stands.
+    Regular mode (issue #336): the REVIEW dispatch is itself one detached
+    agent turn — the composition re-derives the round's exact
+    plan-production subject from committed state under the payload's exact
+    token, reserves exactly one next-numbered unfinalized ReviewIteration
+    for that exact plan (the OPEN planning loop established on first review
+    with the Workspace's snapshotted budget), commits the iteration's
+    detached-turn receipt companion, and admits the composed canonical
+    REVIEW message verbatim on the exact READY Reviewer session before
+    returning. No ``send`` and no blocking wait exists here; the
+    independently observed completion settles the validated ``review_result``
+    through the owning E3b decision settlement, and the ONE post-commit
+    completion handoff owns the workflow continuation from committed state
+    (the exact-plan IMPLEMENTATION_AUTHORIZATION presentation on acceptance,
+    the detached Producer REVISE dispatch on an in-budget change request,
+    and nothing on exhaustion — the REVIEW_RESOLUTION gate already stands).
+    A stale, duplicate, or late REVIEW observation can never decide twice.
 
-    In regular mode the routed Producer revise is dispatched as one detached
-    agent turn (issue #335): the composition returns after the durable
-    admission — no ``send`` and no blocking wait — and the independently
-    observed completion settles the validated plan result, with the ONE
-    post-commit completion handoff submitting the next typed round from
-    committed state. The queue-mode interim (until #328) keeps the blocking
-    merged revise and the in-process next-round submission.
+    Queue mode keeps the blocking E3a dispatch and the in-process E3b
+    decision with the merged E2 revise until #328: on an in-budget change
+    request the fresh post-revise token authorizes the next round's
+    submission; on acceptance the exact-plan implementation gate is
+    presented (never approved); on exhaustion the REVIEW_RESOLUTION gate
+    already stands.
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -976,6 +1119,30 @@ def _compose_task_planning_review(
     production = _reload_plan_production_outcome(
         pool, workspace_id=workspace_id, task_id=task_id, expected_state_token=expected_state_token
     )
+    # The regular-mode REVIEW dispatch is itself one detached agent turn
+    # (issue #336): no Reviewer attachment is acquired in this composition
+    # and no decision runs in-process — the reserved ReviewIteration, its
+    # detached-turn receipt companion, and the verbatim admission commit
+    # here, and the independently observed completion owns the decision
+    # settlement with the ONE post-commit completion handoff owning the
+    # workflow continuation from committed state.
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        dispatch_planning_review_detached(
+            pool,
+            _reviewer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_production=production,
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=attempt_evidence,
+        )
+        return
+    # The blocking queue-mode interim (until #328): the blocking E3a Reviewer
+    # dispatch and the in-process E3b decision with the merged E2 revise.
     dispatch_outcome = dispatch_planning_review(
         pool,
         _reviewer_runtime_attachment_factory(
@@ -987,47 +1154,6 @@ def _compose_task_planning_review(
         plan_production=production,
         attempt_evidence=attempt_evidence,
     )
-    # The regular-mode decision routes an in-budget revision to the detached
-    # REVISE dispatch (issue #335): no Producer attachment is acquired here
-    # and no next round is submitted inline — the observed completion's
-    # handoff owns it from committed state.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        decision = finalize_planning_review_decision(
-            pool,
-            None,
-            github,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=production.task.state_token,
-            dispatch=dispatch_outcome,
-            producer_runtime_factory=_producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        if decision.decision is PlanningReviewDecision.REVISION_ROUTED:
-            # The detached revise is durably admitted: the worker returns
-            # without waiting for the plan result. The observed completion
-            # owns the settlement; submission outcomes are transport
-            # information only and the durable state owns recovery.
-            return
-        # Acceptance presents the exact-plan implementation gate; exhaustion
-        # ends at the already-installed REVIEW_RESOLUTION gate.
-        if decision.decision is PlanningReviewDecision.ACCEPTED_CLEAR:
-            open_implementation_authorization(
-                pool,
-                github,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=decision.task.state_token,
-            )
-        return
-    # The decision may route an in-budget revision to the merged E2 revise:
-    # the Producer session continues that revision in its planning checkout.
     with attach_cline_runtime(
         pool,
         workspace_id=workspace_id,
@@ -1049,7 +1175,9 @@ def _compose_task_planning_review(
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=production.task.state_token,
-            dispatch=dispatch_outcome,
+            review_iteration_id=dispatch_outcome.review_iteration.id,
+            review_result=dispatch_outcome.review_result,
+            expected_reviewer_session_id=dispatch_outcome.reviewer_session.id,
             attempt_evidence=attempt_evidence,
         )
     if decision.decision is PlanningReviewDecision.REVISION_ROUTED:

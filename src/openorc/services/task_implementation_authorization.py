@@ -108,6 +108,11 @@ from openorc.services.task_cancellation import cancel_task_composition
 
 if TYPE_CHECKING:
     from openorc.services.task_terminal_finalization import TerminalFinalizationSubmission
+from openorc.domain.operational_failures import (
+    ImplementationAuthorizationPresentationOperation,
+    OriginalAttemptKind,
+)
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_source_requirements import (
     compare_source_fingerprint_or_block,
     require_unchanged_durable_source_state,
@@ -329,6 +334,7 @@ def open_implementation_authorization(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> ImplementationGateOpened:
     """Present the exact current accepted plan's implementation gate.
 
@@ -398,6 +404,39 @@ def open_implementation_authorization(
                 raise ConflictError(
                     "the task carries no source requirements baseline; the "
                     "implementation authorization gate cannot be opened"
+                )
+            if attempt_evidence is not None and task.status is TaskStatus.PLANNING:
+                # The F5b handoff fact (issue #336): the ordinary E3b
+                # acceptance's durable attribution identity — the finalized
+                # ACCEPTED planning iteration the exact-plan gate presents
+                # from — derived here, strictly before the external
+                # source-requirements reconciliation can fail, so a detected
+                # presentation failure reports under the presentation's own
+                # family instead of stranding the accepted review. The E3c
+                # settlement path records no identity: its Owner-mediated
+                # acceptance is not this family's subject.
+                if task.current_plan_revision_id is None:
+                    raise ConflictError(
+                        "the task carries no current plan revision; the "
+                        "implementation authorization gate cannot be opened"
+                    )
+                loop = _require_open_planning_loop(
+                    transaction_pool, workspace_id=workspace_id, task_id=task_id
+                )
+                revision = require_current_plan_revision(
+                    transaction_pool,
+                    task=task,
+                    plan_revision_id=task.current_plan_revision_id,
+                )
+                iteration = _require_accepted_clearance(
+                    transaction_pool, loop=loop, revision=revision
+                )
+                attempt_evidence.record_task_token(task.state_token)
+                attempt_evidence.record_attempt(
+                    family=ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION,
+                    original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                    original_attempt_id=iteration.id,
+                    phase="implementation_authorization_presentation",
                 )
         # --- Phase B: the shared fresh source-requirements comparison. ---
         reconciliation = reconcile_repository_issue(

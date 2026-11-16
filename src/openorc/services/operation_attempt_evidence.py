@@ -40,6 +40,7 @@ from uuid import UUID
 
 from openorc.domain.operational_failures import (
     GitHubMergeOperation,
+    ImplementationAuthorizationPresentationOperation,
     OperationalFailureFamily,
     OriginalAttemptKind,
     PRAuthorizationPresentationOperation,
@@ -101,11 +102,13 @@ class InvocationAttemptEvidence:
                 PendingTaskRuntimeInteractionOperation,
                 GitHubMergeOperation,
                 PRAuthorizationPresentationOperation,
+                ImplementationAuthorizationPresentationOperation,
             ),
         ):
             raise TypeError(
                 "attempt family must be a PendingTaskRuntimeInteractionOperation, "
-                "a GitHubMergeOperation, or a PRAuthorizationPresentationOperation"
+                "a GitHubMergeOperation, a PRAuthorizationPresentationOperation, "
+                "or an ImplementationAuthorizationPresentationOperation"
             )
         if not isinstance(original_attempt_kind, OriginalAttemptKind):
             raise TypeError("attempt kind must be an OriginalAttemptKind")

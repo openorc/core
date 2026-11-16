@@ -819,7 +819,9 @@ def _wire_review_route(
         workspace_id,
         task_id,
         expected_state_token,
-        dispatch,
+        review_iteration_id,
+        review_result,
+        expected_reviewer_session_id,
         task_resume_intent_id=None,
     ):
         captured["runtimes"].append(runtime)
@@ -1035,9 +1037,6 @@ def test_review_result_settlement_rolls_back_with_the_finalization(
     from openorc.services import (
         task_planning_review_decision as decision_module,
     )
-    from openorc.services.task_planning_review_decision import (
-        TaskPlanningReviewDispatchOutcome,
-    )
 
     loop = _review_loop(ReviewLoopPurpose.PLANNING)
     iteration = _review_iteration()
@@ -1074,24 +1073,30 @@ def test_review_result_settlement_rolls_back_with_the_finalization(
         "require_current_task",
         lambda pool, *, workspace_id, task_id, expected_state_token: finalized_task,
     )
-    monkeypatch.setattr(decision_module, "_require_decision_subject", lambda task, attempt: None)
+    monkeypatch.setattr(
+        decision_module.review_records,
+        "get_review_iteration",
+        lambda pool, *, review_iteration_id: iteration,
+    )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_reserved_unfinalized_attempt",
+        lambda *, iteration, revision: iteration,
+    )
     monkeypatch.setattr(
         decision_module,
         "require_current_plan_revision",
         lambda pool, *, task, plan_revision_id: object(),
     )
     monkeypatch.setattr(
-        decision_module, "_require_decision_loop", lambda pool, *, workspace_id, attempt: loop
-    )
-    monkeypatch.setattr(
         decision_module,
-        "_require_reserved_unfinalized_attempt",
-        lambda pool, *, loop, attempt, revision: iteration,
+        "_require_decision_loop",
+        lambda pool, *, workspace_id, task_id, review_loop_id: loop,
     )
     monkeypatch.setattr(
         decision_module,
         "_require_decision_reviewer",
-        lambda pool, *, workspace_id, task_id, expected_session: _session(),
+        lambda pool, *, workspace_id, task_id, expected_session_id: _session(),
     )
     monkeypatch.setattr(
         decision_module.review_records,
@@ -1115,13 +1120,18 @@ def test_review_result_settlement_rolls_back_with_the_finalization(
         lambda pool, *args, **kwargs: external_calls.append(dict(kwargs)),
     )
 
-    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
-    dispatch = TaskPlanningReviewDispatchOutcome(
-        review_loop=loop,
-        review_iteration=iteration,
-        review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
-        reviewer_session=_session(),
+    monkeypatch.setattr(
+        decision_module.review_records,
+        "get_review_iteration",
+        lambda pool, *, review_iteration_id: iteration,
     )
+    monkeypatch.setattr(
+        decision_module,
+        "_require_reserved_unfinalized_attempt",
+        lambda *, iteration, revision: iteration,
+    )
+
+    record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
     with pytest.raises(StaleOperationError, match="no longer awaiting"):
         decision_module.finalize_planning_review_decision(
             _POOL,
@@ -1131,7 +1141,9 @@ def test_review_result_settlement_rolls_back_with_the_finalization(
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=dispatch,
+            review_iteration_id=iteration.id,
+            review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
+            expected_reviewer_session_id=_session().id,
             task_resume_intent_id=record.id,
         )
     assert settle_calls == [{"task_resume_intent_id": record.id}]
@@ -1146,9 +1158,6 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
     from openorc.protocol.models import ReviewResult
     from openorc.services import (
         task_planning_review_decision as decision_module,
-    )
-    from openorc.services.task_planning_review_decision import (
-        TaskPlanningReviewDispatchOutcome,
     )
 
     loop = _review_loop(ReviewLoopPurpose.PLANNING)
@@ -1208,7 +1217,11 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
         "require_current_task",
         lambda pool, *, workspace_id, task_id, expected_state_token: exhausted_task,
     )
-    monkeypatch.setattr(decision_module, "_require_decision_subject", lambda task, attempt: None)
+    monkeypatch.setattr(
+        decision_module.review_records,
+        "get_review_iteration",
+        lambda pool, *, review_iteration_id: iteration,
+    )
     monkeypatch.setattr(
         decision_module,
         "require_current_plan_revision",
@@ -1217,17 +1230,17 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
     monkeypatch.setattr(
         decision_module,
         "_require_decision_loop",
-        lambda pool, *, workspace_id, attempt: loop,
+        lambda pool, *, workspace_id, task_id, review_loop_id: loop,
     )
     monkeypatch.setattr(
         decision_module,
         "_require_reserved_unfinalized_attempt",
-        lambda pool, *, loop, attempt, revision: iteration,
+        lambda *, iteration, revision: iteration,
     )
     monkeypatch.setattr(
         decision_module,
         "_require_decision_reviewer",
-        lambda pool, *, workspace_id, task_id, expected_session: _session(),
+        lambda pool, *, workspace_id, task_id, expected_session_id: _session(),
     )
 
     record = _resume_record(TaskResumeIntentStatus.DISPATCHED)
@@ -1243,12 +1256,9 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=TaskPlanningReviewDispatchOutcome(
-                review_loop=loop,
-                review_iteration=iteration,
-                review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
-                reviewer_session=_session(),
-            ),
+            review_iteration_id=iteration.id,
+            review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="s", findings=()),
+            expected_reviewer_session_id=_session().id,
             task_resume_intent_id=record.id,
         )
     assert len(settle_depths) == 2

@@ -176,7 +176,6 @@ from openorc.services.task_planning_bootstrap import (
 )
 from openorc.services.task_planning_review_decision import (
     PlanningReviewDecision,
-    TaskPlanningReviewDispatchOutcome,
     finalize_planning_review_decision,
 )
 from openorc.services.task_pr_authorization import open_pr_authorization
@@ -1491,12 +1490,9 @@ def _route_resumed_review_result(
                 workspace_id=record.workspace_id,
                 task_id=record.task_id,
                 expected_state_token=authorized_token,
-                dispatch=TaskPlanningReviewDispatchOutcome(
-                    review_loop=loop,
-                    review_iteration=iteration,
-                    review_result=response,
-                    reviewer_session=reviewer_session,
-                ),
+                review_iteration_id=iteration.id,
+                review_result=response,
+                expected_reviewer_session_id=reviewer_session.id,
                 task_resume_intent_id=record.id,
             )
             if decision.decision is PlanningReviewDecision.REVISION_ROUTED:
