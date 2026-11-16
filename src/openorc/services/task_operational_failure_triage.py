@@ -1327,7 +1327,15 @@ def _verify_bootstrap_family(
     be the outstanding one. A prepared stage contradicts a PREPARE-control
     failure (its validated result already landed); a ready_for_planning
     stage or a published plan revision means the bootstrap resolved and no
-    report about it is current any more.
+    report about it is current any more. The durably dispatched PREPARE
+    state (issue #334) is still current failure work: the
+    ``prepare_dispatched`` marker commits strictly before the control's
+    runtime dispatch, and until a validated result settles the ``prepared``
+    stage the control's outcome is outstanding — a confirmed failure of a
+    dispatched PREPARE (a refused dispatch, an observed run failure, or a
+    failed workspace result) reports against it and escalates through the
+    existing disposition machinery instead of being silently rejected as
+    stale.
     """
     evidence = task_records.get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
     if evidence is None or evidence.claim_token != operation.original_attempt_id:
@@ -1341,8 +1349,12 @@ def _verify_bootstrap_family(
         if evidence.stage is not TaskPlanningBootstrapStage.PREPARED:
             return _stale_no_op()
     else:
-        # The PREPARE control is outstanding only while no stage has settled.
-        if evidence.stage is not None:
+        # The PREPARE control is outstanding while no stage has settled
+        # (not yet durably dispatched) and while its dispatch marker is the
+        # settled stage evidence (durably dispatched, result outstanding —
+        # issue #334). A later stage means the validated result already
+        # landed and no report about the control is current any more.
+        if evidence.stage not in (None, TaskPlanningBootstrapStage.PREPARE_DISPATCHED):
             return _stale_no_op()
     return _require_applicable_binding(
         transaction_pool,

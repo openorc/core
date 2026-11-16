@@ -1777,6 +1777,145 @@ def test_the_completion_handoff_presents_the_exact_head_pr_gate_for_the_implemen
     assert submitter.submissions == []
 
 
+def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The workspace-PREPARE route (issue #334): the settled ``prepared``
+    stage is the only authority — the transition continuation runs from
+    committed state and the next typed initial-plan invocation is submitted
+    with the fresh post-tail token through the shared continuation seam.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    claim_token = UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a")
+    evidence = SimpleNamespace(
+        claim_token=claim_token,
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    transitions: list[dict[str, Any]] = []
+
+    def recording_transition(
+        _pool: Any,
+        _composition: Any,
+        *,
+        workspace_id: Any,
+        profile_id: Any,
+        task_id: Any,
+        expected_state_token: Any,
+    ) -> Any:
+        transitions.append(
+            {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
+                "task_id": task_id,
+                "expected_state_token": expected_state_token,
+            }
+        )
+        return SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
+
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        recording_transition,
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+    )
+
+    assert transitions == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "profile_id": _PROFILE_ID,
+            "task_id": _TASK_ID,
+            "expected_state_token": _NEXT_TOKEN,
+        }
+    ]
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is task_workflow.OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    payload = submitted.payload
+    assert isinstance(payload, task_workflow.TaskPlanningBootstrapAndInitialPlanPayload)
+    assert payload.task.workspace_id == str(_WORKSPACE_ID)
+    assert payload.task.task_id == str(_TASK_ID)
+    assert payload.profile_id == str(_PROFILE_ID)
+    assert payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_completion_handoff_ignores_a_bootstrap_stage_that_is_not_prepared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durably dispatched (not yet settled) or already-transitioned stage
+
+    is not the settled handoff state: the route continues nothing and
+    submits nothing — the durable state owns every other path.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    evidence = SimpleNamespace(
+        claim_token=UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a"),
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    transitions: list[Any] = []
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        lambda *args, **kwargs: transitions.append(kwargs),
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+    )
+
+    assert transitions == []
+    assert submitter.submissions == []
+
+
 def test_the_completion_handoff_ignores_a_missing_implementation_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -352,19 +352,30 @@ def _resolve_bootstrap_report(
 
     The committed evidence is the Task's bootstrap claim/stage row: the
     reported claim token must be the Task's own claim, and the settled stage
-    must still match the reported family (stage unset for PREPARE, PREPARED
-    for the planning-context TRANSITION). A moved-past stage or a foreign
-    claim identity fails closed without triaging.
+    must still match the reported family (stage unset or the durably
+    dispatched ``prepare_dispatched`` marker for PREPARE, PREPARED for the
+    planning-context TRANSITION). A moved-past stage or a foreign claim
+    identity fails closed without triaging.
     """
     evidence = task_records.get_task_planning_bootstrap_evidence(pool, task_id=task_id)
     if evidence is None or evidence.claim_token != identity.original_attempt_id:
         return None
-    expected_stage = (
-        None
-        if identity.family is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE
-        else TaskPlanningBootstrapStage.PREPARED
-    )
-    if evidence.stage != expected_stage:
+    if identity.family is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE:
+        # The PREPARE control is outstanding while no stage has settled
+        # (not yet durably dispatched) and while its dispatch marker is the
+        # settled stage evidence (durably dispatched, result outstanding —
+        # issue #334). A later stage means the validated result already
+        # landed and no report about the control is current any more.
+        stage_current = evidence.stage in (
+            None,
+            TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+        )
+    else:
+        # The transition is outstanding only while the validated PREPARE
+        # result has settled the prepared stage and the effectful
+        # planning-context transition has not.
+        stage_current = evidence.stage is TaskPlanningBootstrapStage.PREPARED
+    if not stage_current:
         return None
     operation = OperationalFailureOperation(
         family=identity.family,

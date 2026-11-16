@@ -42,6 +42,7 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
+from openorc.protocol.interaction import PrepareWorkspaceInteraction
 from openorc.protocol.models import WORKSPACE_RESULT_FAMILY
 from openorc.services.errors import (
     ConflictError,
@@ -49,6 +50,7 @@ from openorc.services.errors import (
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.task_planning_bootstrap import (
@@ -59,7 +61,9 @@ from openorc.services.task_planning_bootstrap import (
     TaskPlanningBootstrapDispatchOutcome,
     TaskPlanningPreparationOutcome,
     WorkspacePreparationFailedError,
+    complete_settled_bootstrap_prepare_transition,
     prepare_task_for_planning,
+    settle_observed_bootstrap_prepare_result,
 )
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
 from tests.fakes.task_rows import task_row
@@ -1342,6 +1346,32 @@ def _settled_initialization_receipt_row(
     )
 
 
+def _detached_prepare_receipt_row(
+    env: _Bootstrap, session_id: Any, claim_token: Any
+) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        env.workspace_id,
+        env.task_id,
+        session_id,
+        "planning_bootstrap_prepare",
+        "planning_bootstrap_claim",
+        claim_token,
+        "workspace_result",
+        None,
+        "claimed",
+        {},
+        None,
+        _OBSERVED,
+        None,
+        None,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
 def _dispatch_phase_results(
     env: _Bootstrap,
     binding_row: tuple[Any, ...],
@@ -1472,7 +1502,8 @@ def test_in_progress_replay_dispatches_nothing() -> None:
     assert _statement_indices(conn, "update openorc.") == []
 
 
-def test_readiness_resumed_continuation_proceeds_to_prepare() -> None:
+def test_blocking_prepare_completes_the_bootstrap_without_a_registrar() -> None:
+    """The queue-mode interim (until #328): the blocking PREPARE unchanged."""
     env = _Bootstrap()
     claim_token = uuid.uuid4()
     producer_ready = env.producer_ready_row
@@ -1526,6 +1557,115 @@ def test_readiness_resumed_continuation_proceeds_to_prepare() -> None:
     ]
     conn = ScriptedConnection(results)
     runtime = env.runtime()
+    # The READY bindings address sessions the runtime already owns: seed the
+    # fake adapters with the allocated sessions the rows bind so the lease
+    # can queue the scripted control outcome against the exact session.
+    producer_adapter = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    reviewer_adapter = runtime.fake_adapter(WorkflowRole.REVIEWER)
+    producer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+    reviewer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.REVIEWER,
+            initialization="seed",
+        )
+    )
+
+    outcome = prepare_task_for_planning(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        task_id=env.task_id,
+        profile_id=env.owner_profile_id,
+        expected_state_token=env.post_claim_token,
+        reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+    )
+
+    # The blocking control completes the whole bootstrap: the durable
+    # PREPARE-dispatch marker was committed strictly before the send, and
+    # the prepared-for-planning handoff completes.
+    assert isinstance(outcome, TaskPlanningPreparationOutcome)
+    assert outcome.producer_session.external_session_id == "fake-session-1"
+    assert runtime.establishment_leases == []
+    assert runtime.interaction_leases == [(WorkflowRole.PRODUCER, "fake-session-1")]
+    assert runtime.transitions == [("fake-session-1", env.checkout_directory)]
+    stage_writes = [
+        index
+        for index, (sql, _params) in enumerate(conn.executed)
+        if "planning_bootstrap_stage = %s" in sql
+    ]
+    assert len(stage_writes) == 3
+
+
+def test_readiness_resumed_continuation_dispatches_the_detached_prepare() -> None:
+    """The regular-mode readiness-resumed continuation (issue #334).
+
+    The established bootstrap proceeds past establishment into the detached
+    workspace-preparation dispatch: the durable ``prepare_dispatched``
+    marker and the detached-turn receipt commit in one short transaction
+    strictly before the positive observation registration and the verbatim
+    admission of the rendered canonical control, and the dispatching
+    continuation returns without waiting for the workspace result.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    receipt_row = _detached_prepare_receipt_row(env, producer_ready[0], claim_token)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingCompletionHandoff()
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,  # no outstanding producer receipt
+                None,  # no outstanding reviewer receipt
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        # The establishment loop skips both READY bindings; the pre-PREPARE
+        # recheck and the durable base recovery follow.
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        # The detached PREPARE dispatch transaction: the stage evidence read,
+        # the durable PREPARE-dispatch marker, and the detached-turn receipt.
+        (claim_token, _OBSERVED, None, None),
+        True,
+        receipt_row,
+        # The acknowledgement attach: the for-update lock, the attach, and
+        # the staged early-completion read (none staged).
+        receipt_row,
+        receipt_row,
+        None,
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
     # The detached establishments happened in an earlier process: seed the
     # fake adapters with the allocated sessions the READY rows bind
     # (fake-session-1 / fake-session-2 in creation order).
@@ -1556,23 +1696,51 @@ def test_readiness_resumed_continuation_proceeds_to_prepare() -> None:
         profile_id=env.owner_profile_id,
         expected_state_token=env.post_claim_token,
         reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
-        observation_registrar=_RecordingRegistrar(),
-        completion_handoff=_RecordingCompletionHandoff(),
+        observation_registrar=registrar,
+        completion_handoff=handoff,
     )
 
-    # The readiness-resumed continuation proceeds past establishment: the
-    # durable PREPARE-dispatch marker was committed strictly before the send,
-    # and the prepared-for-planning handoff completes.
-    assert isinstance(outcome, TaskPlanningPreparationOutcome)
-    assert outcome.producer_session.external_session_id == "fake-session-1"
+    # The detached PREPARE is durably dispatched: the worker returns without
+    # waiting for the workspace result, and the observed completion owns the
+    # settlement and the resumption.
+    assert isinstance(outcome, TaskPlanningBootstrapDispatchOutcome)
+    assert outcome.claim_token == claim_token
+    assert outcome.post_claim_token == env.post_claim_token
     assert runtime.establishment_leases == []
     assert runtime.interaction_leases == [(WorkflowRole.PRODUCER, "fake-session-1")]
+    assert runtime.transitions == []
+    assert producer_adapter.detached_admissions() == (
+        (
+            "fake-session-1",
+            PrepareWorkspaceInteraction(
+                repository_full_name="octocat/hello-world",
+                issue_number=42,
+                task_uuid=env.task_id,
+                target_directory=env.checkout_directory,
+            ).render(),
+        ),
+    )
+    assert producer_adapter.submitted_sends() == ()
+    assert registrar.session_registrations == [
+        {
+            "workspace_id": env.workspace_id,
+            "task_id": env.task_id,
+            "task_agent_session_id": producer_ready[0],
+            "connection_id": env.connection_id,
+            "external_session_id": "fake-session-1",
+        }
+    ]
+    assert handoff.calls == []
     stage_writes = [
         index
         for index, (sql, _params) in enumerate(conn.executed)
         if "planning_bootstrap_stage = %s" in sql
     ]
-    assert len(stage_writes) == 3
+    assert len(stage_writes) == 1
+    receipt_inserts = [
+        sql for sql, _ in conn.executed if "insert into openorc.task_hub_run_receipts" in sql
+    ]
+    assert len(receipt_inserts) == 1
 
 
 def test_prepare_dispatched_stage_replay_fails_closed() -> None:
@@ -1591,7 +1759,9 @@ def test_prepare_dispatched_stage_replay_fails_closed() -> None:
             claim_write_result=None,
             post_claim_task_row=None,
             claim_evidence_row=(claim_token, _OBSERVED, "prepare_dispatched", _OBSERVED),
-            classifier_results=(),
+            classifier_results=(
+                None,  # no outstanding PLANNING_BOOTSTRAP_PREPARE receipt
+            ),
         )
     )
     runtime = env.runtime()
@@ -1614,6 +1784,442 @@ def test_prepare_dispatched_stage_replay_fails_closed() -> None:
     assert _statement_indices(conn, "update openorc.") == []
 
 
+def test_prepare_dispatched_with_outstanding_receipt_replays_without_effect() -> None:
+    """The durably dispatched PREPARE's outstanding receipt (issue #334).
+
+    A replayed continuation against a claimed/admitted PREPARE receipt is an
+    idempotent no-effect replay: the observed completion owns the
+    resumption, nothing is re-dispatched, and no durable write happens.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    receipt_row = _detached_prepare_receipt_row(env, producer_ready[0], claim_token)
+    conn = ScriptedConnection(
+        _entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, "prepare_dispatched", _OBSERVED),
+            classifier_results=(
+                receipt_row,  # the outstanding PLANNING_BOOTSTRAP_PREPARE receipt
+            ),
+        )
+    )
+    runtime = env.runtime()
+
+    outcome = prepare_task_for_planning(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        task_id=env.task_id,
+        profile_id=env.owner_profile_id,
+        expected_state_token=env.post_claim_token,
+        reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+        observation_registrar=_RecordingRegistrar(),
+        completion_handoff=_RecordingCompletionHandoff(),
+    )
+
+    assert isinstance(outcome, TaskPlanningBootstrapDispatchOutcome)
+    assert outcome.claim_token == claim_token
+    assert runtime.establishment_leases == []
+    assert runtime.interaction_leases == []
+    assert runtime.transitions == []
+    assert runtime.fake_adapter(WorkflowRole.PRODUCER).detached_admissions() == ()
+    assert _statement_indices(conn, "update openorc.") == []
+
+
+def _refused_receipt_row(receipt_row: tuple[Any, ...], refusal_kind: str) -> tuple[Any, ...]:
+    return (
+        *receipt_row[:9],
+        "refused",
+        {"refusal_kind": refusal_kind},
+        None,
+        _OBSERVED,
+        None,
+        _OBSERVED,  # the refusal instant
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def test_detached_prepare_registration_refusal_refuses_the_receipt() -> None:
+    """A registration refusal is a proven pre-effect failure (issue #334).
+
+    The just-recorded receipt is marked refused so a never-dispatched turn
+    cannot hold the session's single-outstanding slot, and the typed
+    pre-effect failure triages under the claim's own family.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    receipt_row = _detached_prepare_receipt_row(env, producer_ready[0], claim_token)
+
+    class _RefusingRegistrar(_RecordingRegistrar):
+        def register_session(self, **kwargs: Any) -> None:
+            raise ObservationRegistrationRefusedError(
+                "the observation host refused the registration",
+                reason="observer_unavailable",
+            )
+
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,
+                None,
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
+        True,  # the durable PREPARE-dispatch marker
+        receipt_row,  # the detached-turn receipt insert
+        _refused_receipt_row(receipt_row, "observation_registration_refused"),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    runtime.fake_adapter(WorkflowRole.PRODUCER).allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+
+    with pytest.raises(ExternalOperationFailedError):
+        prepare_task_for_planning(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+            observation_registrar=_RefusingRegistrar(),
+            completion_handoff=_RecordingCompletionHandoff(),
+        )
+
+    assert runtime.transitions == []
+    assert runtime.fake_adapter(WorkflowRole.PRODUCER).detached_admissions() == ()
+    refusal_updates = [
+        sql for sql, _ in conn.executed if "set status = 'refused'" in " ".join(sql.split())
+    ]
+    assert len(refusal_updates) == 1
+
+
+def test_detached_prepare_admission_refusal_refuses_the_receipt() -> None:
+    """A positively identified admission refusal is proven pre-effect.
+
+    The receipt is marked refused and the dispatch fails known through the
+    typed operational-failure class the coordinator triages; nothing is
+    ever re-dispatched.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    receipt_row = _detached_prepare_receipt_row(env, producer_ready[0], claim_token)
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,
+                None,
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
+        True,  # the durable PREPARE-dispatch marker
+        receipt_row,  # the detached-turn receipt insert
+        _refused_receipt_row(receipt_row, "admission_refused"),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    producer_adapter = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    producer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+    producer_adapter.queue_detached_admission(AgentRuntimeUnavailableError("refused"))
+
+    with pytest.raises(ExternalOperationFailedError):
+        prepare_task_for_planning(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+            observation_registrar=_RecordingRegistrar(),
+            completion_handoff=_RecordingCompletionHandoff(),
+        )
+
+    assert runtime.transitions == []
+    # The fake records the admission attempt the runtime refused.
+    assert len(producer_adapter.detached_admissions()) == 1
+    refusal_updates = [
+        sql for sql, _ in conn.executed if "set status = 'refused'" in " ".join(sql.split())
+    ]
+    assert len(refusal_updates) == 1
+
+
+def test_detached_prepare_uncertain_admission_keeps_the_receipt_claimed() -> None:
+    """An uncertain admission is never a re-dispatch authorization.
+
+    The receipt stays conservatively claimed (no refusal write), the typed
+    uncertainty propagates for the existing Level 2 machinery, and the
+    observed completion — if the turn actually runs — still owns the
+    settlement.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    receipt_row = _detached_prepare_receipt_row(env, producer_ready[0], claim_token)
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,
+                None,
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
+        True,  # the durable PREPARE-dispatch marker
+        receipt_row,  # the detached-turn receipt insert
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    producer_adapter = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    producer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+    producer_adapter.queue_detached_admission(AgentRuntimeTimeoutError("timed out"))
+
+    with pytest.raises(ExternalOperationUncertainError):
+        prepare_task_for_planning(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+            observation_registrar=_RecordingRegistrar(),
+            completion_handoff=_RecordingCompletionHandoff(),
+        )
+
+    assert runtime.transitions == []
+    refusal_updates = [
+        sql for sql, _ in conn.executed if "set status = 'refused'" in " ".join(sql.split())
+    ]
+    assert refusal_updates == []
+
+
+def test_settled_bootstrap_prepare_transition_completes_from_prepared_state() -> None:
+    """The observed-completion transition continuation (issue #334).
+
+    The settled ``prepared`` stage is the only authority: the continuation
+    re-derives the claim, both READY bindings, and the exact checkout from
+    committed state, performs the one planning-context transition, records
+    ``ready_for_planning``, and returns the prepared-for-planning outcome.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    results = [
+        (claim_token, _OBSERVED, "prepared", _OBSERVED),  # the settled stage evidence
+        producer_ready,  # the READY producer binding
+        reviewer_ready,  # the READY reviewer binding
+        env.connection_row,  # the snapshot base recovery
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        True,  # the settled transition settles ``ready_for_planning``
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+
+    outcome = complete_settled_bootstrap_prepare_transition(
+        _pool(conn),
+        runtime,
+        workspace_id=env.workspace_id,
+        profile_id=env.owner_profile_id,
+        task_id=env.task_id,
+        expected_state_token=env.post_claim_token,
+    )
+
+    assert isinstance(outcome, TaskPlanningPreparationOutcome)
+    assert outcome.producer_session.external_session_id == "fake-session-1"
+    assert runtime.transitions == [("fake-session-1", env.checkout_directory)]
+    stage_writes = [
+        index
+        for index, (sql, _params) in enumerate(conn.executed)
+        if "planning_bootstrap_stage = %s" in sql
+    ]
+    assert len(stage_writes) == 1
+
+
+def test_settled_bootstrap_prepare_transition_refuses_a_moved_on_stage() -> None:
+    """A stage other than the settled ``prepared`` handoff state fails closed.
+
+    The continuation never re-runs the workspace preparation and never
+    transitions from an unsettled or already-transitioned bootstrap.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            (claim_token, _OBSERVED, "prepare_dispatched", _OBSERVED),
+        ]
+    )
+    runtime = env.runtime()
+
+    with pytest.raises(ConflictError):
+        complete_settled_bootstrap_prepare_transition(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            profile_id=env.owner_profile_id,
+            task_id=env.task_id,
+            expected_state_token=env.post_claim_token,
+        )
+
+    assert runtime.transitions == []
+    assert _statement_indices(conn, "update openorc.") == []
+
+
+def test_settle_observed_bootstrap_prepare_result_records_the_prepared_stage() -> None:
+    """The settlement-owned stage recording (issue #334).
+
+    A current coarse-planning subject records the claim-bound forward-only
+    ``prepared`` stage; a moved-on subject (a published plan revision) is
+    the honest not-applied outcome.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            env.post_claim_task_row,
+            True,  # the forward-only ``prepared`` stage write
+        ]
+    )
+    assert (
+        settle_observed_bootstrap_prepare_result(
+            _pool(conn),
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            claim_token=claim_token,
+        )
+        is True
+    )
+
+    published = list(env.post_claim_task_row)
+    published[9] = uuid.uuid4()  # current_plan_revision_id
+    moved_conn = ScriptedConnection([tuple(published)])
+    assert (
+        settle_observed_bootstrap_prepare_result(
+            _pool(moved_conn),
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            claim_token=claim_token,
+        )
+        is False
+    )
+    assert _statement_indices(moved_conn, "update openorc.") == []
+
+
 class _RecordingCompletionHandoff:
     """Records the ONE post-commit completion handoff invocations (issue #333)."""
 
@@ -1627,5 +2233,11 @@ class _RecordingCompletionHandoff:
 
 
 class _RecordingRegistrar:
+    def __init__(self) -> None:
+        self.session_registrations: list[dict[str, Any]] = []
+
     def register_establishment_session(self, **kwargs: Any) -> None:
         return None
+
+    def register_session(self, **kwargs: Any) -> None:
+        self.session_registrations.append(dict(kwargs))

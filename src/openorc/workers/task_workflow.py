@@ -52,7 +52,7 @@ from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession
-from openorc.domain.tasks import TaskStatus
+from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.persistence import tasks as task_records
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -100,6 +100,7 @@ from openorc.services.task_planning_bootstrap import (
     TaskPlanningBootstrapDispatchOutcome,
     TaskPlanningPreparationOutcome,
     _producer_snapshot_repository_base,
+    complete_settled_bootstrap_prepare_transition,
     find_resumable_bootstrap_continuation,
     prepare_task_for_planning,
 )
@@ -527,10 +528,13 @@ class _DetachedCompletionHandoff:
     plugin/callback framework. The initialization route is the #324
     readiness-resumed bootstrap submission; the initial-IMPLEMENT route
     presents the exact-head PR authorization gate through the existing F5f
-    service under the F5b coordinator's typed failure handoff. A settled
-    family without a wired route is a fail-closed conflict that its own
-    detached migration wires; no gate or workflow policy lives here beyond
-    the routing and the committed-state re-derivation itself.
+    service under the F5b coordinator's typed failure handoff; the
+    workspace-PREPARE route (issue #334) performs the settled bootstrap's
+    same-session planning-context transition and arranges the next typed
+    initial-plan invocation. A settled family without a wired route is a
+    fail-closed conflict that its own detached migration wires; no gate or
+    workflow policy lives here beyond the routing and the committed-state
+    re-derivation itself.
     """
 
     def __init__(self, dependencies: OperationDependencies) -> None:
@@ -550,6 +554,11 @@ class _DetachedCompletionHandoff:
             return
         if operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION:
             _handoff_implementation_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        if operation is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE:
+            _handoff_bootstrap_prepare_completion(
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
             )
             return
@@ -644,6 +653,65 @@ def _handoff_implementation_completion(
         profile_id=owner_profile_id,
         expected_state_token=expected_state_token,
         invoke_level_one=invoke_level_one,
+    )
+
+
+def _handoff_bootstrap_prepare_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The workspace-PREPARE route: the planning-context transition continuation.
+
+    Re-derives the continuation's authority from committed state — the
+    settled ``prepared`` stage evidence is the only proof that the
+    attributable workspace result validated and settled — and, only when
+    the durable state proves it, invokes the owning bootstrap service's
+    transition continuation (the one same-session planning-context
+    reconstruction into the exact Task-UUID checkout and the
+    ``ready_for_planning`` settlement) and then submits the next typed
+    initial-plan invocation through the executing process's continuation
+    seam with the fresh post-tail token. Every input is re-derived from
+    committed durable state; a failed or uncertain routing or submission is
+    transport information only, never Task truth, and never permits a blind
+    re-enqueue — the durable state owns recovery.
+    """
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    if task.status is not TaskStatus.PLANNING or task.current_plan_revision_id is not None:
+        return
+    evidence = task_records.get_task_planning_bootstrap_evidence(pool, task_id=task_id)
+    if evidence is None or evidence.stage is not TaskPlanningBootstrapStage.PREPARED:
+        # The settled-and-untransitioned state is the only durable
+        # continuation authority; anything else is already resolved or
+        # owned by another path.
+        return
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:  # pragma: no cover - the Task's scope proved it
+        return
+    runtime_composition = dependencies.task_bootstrap_runtime_composition()
+    outcome = complete_settled_bootstrap_prepare_transition(
+        pool,
+        runtime_composition,
+        workspace_id=workspace_id,
+        profile_id=workspace.owner_profile_id,
+        task_id=task_id,
+        expected_state_token=task.state_token,
+    )
+    _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
+            payload=TaskPlanningBootstrapAndInitialPlanPayload(
+                task=TaskScope(
+                    workspace_id=str(task.workspace_id),
+                    task_id=str(task.id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(workspace.owner_profile_id),
+                expected_state_token=str(outcome.task.state_token),
+            ),
+        ),
     )
 
 
