@@ -50,8 +50,11 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.github import HttpGitHubUserTokenClient
 from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import TaskStatus
+from openorc.persistence import tasks as task_records
+from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
@@ -64,6 +67,7 @@ from openorc.services.github_user_authorization import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_authorized_implementation_execution import (
     ProducerRuntimeAttachmentFactory,
+    dispatch_authorized_implementation_detached,
     execute_authorized_implementation,
 )
 from openorc.services.task_authorized_implementation_retry import (
@@ -75,6 +79,7 @@ from openorc.services.task_authorized_merge_retry import (
 from openorc.services.task_authorized_pr_authorization_retry import (
     execute_authorized_pr_authorization_retry,
 )
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
@@ -515,33 +520,131 @@ def submit_pr_composition_after_approval(
 # --- per-kind compositions ---------------------------------------------------
 
 
-def bootstrap_readiness_continuation_trigger(
-    dependencies: OperationDependencies,
-) -> Callable[..., None]:
-    """Build the post-commit bootstrap continuation trigger (issue #324).
+class _DetachedCompletionHandoff:
+    """The ONE family-routed post-commit completion handoff (issue #333).
 
-    The trigger owns the post-readiness resumption submission: it
-    re-derives the resumable classification from committed state on every
-    invocation and, only when the durable state proves it, submits the
-    existing ``TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN`` continuation with
-    the claim's rotated post-claim token through the executing process's
-    submission seam. Submission outcomes are transport information only,
-    never Task truth; a failed classification or submission leaves the
-    durable resumable state to the existing recovery semantics. Services
-    never build invocation payloads — this worker-layer builder does.
+    An explicit narrow family route per settled operation family — never a
+    plugin/callback framework. The initialization route is the #324
+    readiness-resumed bootstrap submission; the initial-IMPLEMENT route
+    presents the exact-head PR authorization gate through the existing F5f
+    service under the F5b coordinator's typed failure handoff. A settled
+    family without a wired route is a fail-closed conflict that its own
+    detached migration wires; no gate or workflow policy lives here beyond
+    the routing and the committed-state re-derivation itself.
     """
 
-    def trigger(*, workspace_id: UUID, task_id: UUID) -> None:
-        resumable = find_resumable_bootstrap_continuation(
-            dependencies.database_pool(),
+    def __init__(self, dependencies: OperationDependencies) -> None:
+        self._dependencies = dependencies
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        operation: PendingTaskRuntimeInteractionOperation,
+    ) -> None:
+        if operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION:
+            _handoff_initialization_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        if operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION:
+            _handoff_implementation_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        raise ConflictError(
+            "the settled operation family has no detached completion handoff "
+            "route yet; its own detached migration wires it"
+        )
+
+
+def build_detached_completion_handoff(
+    dependencies: OperationDependencies,
+) -> DetachedTurnCompletionHandoff:
+    """Build the executing process's ONE post-commit completion handoff (#333).
+
+    The handoff owns the post-settlement resumption routing: it re-derives
+    the next-step authority and inputs from committed state on every
+    invocation and, only when the durable state proves it, submits typed F1
+    follow-on work or invokes the existing owning service. A failed or
+    uncertain follow-on submission is not success, is never retried here,
+    and never permits a blind re-enqueue: the durable state owns recovery.
+    Services never build invocation payloads — this worker-layer builder
+    does. Routing outcomes are transport information only, never Task truth.
+    """
+    return _DetachedCompletionHandoff(dependencies)
+
+
+def _handoff_initialization_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The initialization route: the #324 readiness-resumed bootstrap submission.
+
+    Re-derives the resumable classification from committed state and, only
+    when the durable state proves it, submits the existing
+    ``TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN`` continuation with the
+    claim's rotated post-claim token through the executing process's
+    submission seam.
+    """
+    resumable = find_resumable_bootstrap_continuation(
+        dependencies.database_pool(),
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    if resumable is None:
+        return
+    _submit_readiness_resumed_bootstrap_continuation(dependencies, resumable)
+
+
+def _handoff_implementation_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The initial-IMPLEMENT route: the exact-head PR authorization presentation.
+
+    Re-derives the presentation's authority from committed state — the fresh
+    Task token seed and the durable Workspace Owner identity (the only
+    Profile that can ever be authorized here) — and invokes the existing F5f
+    service under the F5b coordinator's typed failure handoff, so a failing
+    presentation triages exactly like the ordinary authorized continuation.
+    The service's own Phase-A admission re-derives the qualifying successful
+    Execution and every admission fact from durable state and refuses a
+    moved-on subject with a typed error before any GitHub I/O; the handoff's
+    callers contain it, and the durable state owns recovery. A successful
+    run receipt is never treated as proof of the subsequent GitHub/gate
+    effect: the presentation's own reconciliation is the only head source.
+    """
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:  # pragma: no cover - the Task's scope proved it
+        return
+    owner_profile_id = workspace.owner_profile_id
+    expected_state_token = task.state_token
+
+    def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+        open_pr_authorization(
+            pool,
+            dependencies.github_client(),
+            profile_id=owner_profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
+            expected_state_token=expected_state_token,
+            execution_id=None,
+            attempt_evidence=evidence,
         )
-        if resumable is None:
-            return
-        _submit_readiness_resumed_bootstrap_continuation(dependencies, resumable)
 
-    return trigger
+    coordinate_task_workflow_operation(
+        pool,
+        expected_status=TaskStatus.IMPLEMENTING,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=owner_profile_id,
+        expected_state_token=expected_state_token,
+        invoke_level_one=invoke_level_one,
+    )
 
 
 def _submit_readiness_resumed_bootstrap_continuation(
@@ -615,7 +718,7 @@ def _compose_task_planning_bootstrap_and_initial_plan(
         reviewer_neutral_directory=reviewer_neutral_directory,
         attempt_evidence=attempt_evidence,
         observation_registrar=observation_registrar,
-        bootstrap_continuation_trigger=bootstrap_readiness_continuation_trigger(dependencies),
+        completion_handoff=build_detached_completion_handoff(dependencies),
     )
     if isinstance(preparation, TaskPlanningBootstrapDispatchOutcome):
         # The detached establishment is durably dispatched: the worker
@@ -786,21 +889,52 @@ def _compose_task_authorized_implementation(
 
     The E6 service re-derives the exact approved gate/plan handoff from
     durable state (never caller-supplied) and reserves exactly one initial
-    implementation attempt. On the successful finalized execution, the
-    ordinary authorized continuation presents the exact-head
-    PR_AUTHORIZATION gate with the exact post-execution token and the
-    finalized Execution identity — no Owner decision is required to present
-    it, the service's existing GitHub authority checks (including the
-    direct ``github_source_changed`` block) pass through unchanged, and the
-    explicit E7 approval remains an Owner command outside this module.
+    implementation attempt.
+
+    In regular mode the implementation is dispatched as one detached agent
+    turn (issues #325/#333): the composition returns after the durable
+    admission — no ``send`` and no blocking wait — and the independently
+    observed completion settles the attempt through the shared finalize,
+    with the ONE post-commit completion handoff presenting the exact-head
+    PR_AUTHORIZATION gate from committed state. The queue-mode interim
+    (until #328) keeps the blocking composition: on the successful
+    finalized execution, the ordinary authorized continuation presents the
+    exact-head PR_AUTHORIZATION gate with the exact post-execution token
+    and the finalized Execution identity — no Owner decision is required to
+    present it, the service's existing GitHub authority checks (including
+    the direct ``github_source_changed`` block) pass through unchanged, and
+    the explicit E7 approval remains an Owner command outside this module.
     """
     pool = dependencies.database_pool()
-    github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
 
+    # The detached implementation dispatch needs the executing process's
+    # detached-turn observation host and the ONE post-commit completion
+    # handoff — regular-mode process dependencies (issues #323/#333). Queue
+    # mode resolves neither and keeps the blocking composition interim.
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        dispatch_authorized_implementation_detached(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            producer_runtime_factory=_producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=attempt_evidence,
+        )
+        # The detached dispatch is durably admitted: the worker returns
+        # without waiting for the implementation result. The observed
+        # completion owns the settlement; submission outcomes are transport
+        # information only and the durable state owns recovery.
+        return
+    github = dependencies.github_client()
     execution = execute_authorized_implementation(
         pool,
         profile_id=profile_id,

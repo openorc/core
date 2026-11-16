@@ -38,6 +38,7 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
@@ -1384,7 +1385,7 @@ def test_detached_bootstrap_dispatches_and_returns_without_waiting() -> None:
     ]
     conn = ScriptedConnection(results)
     runtime = env.runtime()
-    triggers: list[tuple[Any, Any]] = []
+    handoff = _RecordingCompletionHandoff()
 
     outcome = prepare_task_for_planning(
         _pool(conn),
@@ -1395,18 +1396,19 @@ def test_detached_bootstrap_dispatches_and_returns_without_waiting() -> None:
         expected_state_token=env.pre_claim_token,
         reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
         observation_registrar=_RecordingRegistrar(),
-        bootstrap_continuation_trigger=lambda **kw: triggers.append(
-            (kw["workspace_id"], kw["task_id"])
-        ),
+        completion_handoff=handoff,
     )
-
-    # The dispatched suspension: no READY binding, no PREPARE, no transition,
-    # and the trigger fired for the post-dispatch resumption check.
     assert isinstance(outcome, TaskPlanningBootstrapDispatchOutcome)
     assert outcome.task.state_token == env.post_claim_token
     assert runtime.interaction_leases == []
     assert runtime.transitions == []
-    assert triggers == [(env.workspace_id, env.task_id)]
+    assert handoff.calls == [
+        (
+            env.workspace_id,
+            env.task_id,
+            PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+        )
+    ]
     # Both roles dispatched: the fake adapters record the detached capability
     # calls, never the blocking handshake.
     producer = runtime.fake_adapter(WorkflowRole.PRODUCER)
@@ -1454,7 +1456,7 @@ def test_in_progress_replay_dispatches_nothing() -> None:
         expected_state_token=env.post_claim_token,
         reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
         observation_registrar=_RecordingRegistrar(),
-        bootstrap_continuation_trigger=lambda **kw: None,
+        completion_handoff=_RecordingCompletionHandoff(),
     )
 
     # The claimed in-progress bootstrap is an idempotent no-effect replay:
@@ -1555,7 +1557,7 @@ def test_readiness_resumed_continuation_proceeds_to_prepare() -> None:
         expected_state_token=env.post_claim_token,
         reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
         observation_registrar=_RecordingRegistrar(),
-        bootstrap_continuation_trigger=lambda **kw: None,
+        completion_handoff=_RecordingCompletionHandoff(),
     )
 
     # The readiness-resumed continuation proceeds past establishment: the
@@ -1604,12 +1606,24 @@ def test_prepare_dispatched_stage_replay_fails_closed() -> None:
             expected_state_token=env.post_claim_token,
             reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
             observation_registrar=_RecordingRegistrar(),
-            bootstrap_continuation_trigger=lambda **kw: None,
+            completion_handoff=_RecordingCompletionHandoff(),
         )
 
     assert runtime.interaction_leases == []
     assert runtime.transitions == []
     assert _statement_indices(conn, "update openorc.") == []
+
+
+class _RecordingCompletionHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #333)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, Any, Any]] = []
+
+    def handoff_settled_completion(
+        self, *, workspace_id: Any, task_id: Any, operation: Any
+    ) -> None:
+        self.calls.append((workspace_id, task_id, operation))
 
 
 class _RecordingRegistrar:

@@ -32,7 +32,7 @@ from openorc.workers.invocation import (
     build_production_handlers,
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
-from openorc.workers.task_workflow import bootstrap_readiness_continuation_trigger
+from openorc.workers.task_workflow import build_detached_completion_handoff
 
 API_TITLE = "OpenOrc API"
 
@@ -70,11 +70,12 @@ def _serving_lifespan(
             # started before any operation can dispatch and disposed after
             # the executor drained, so a registration from an in-flight
             # operation is still served during teardown. Its post-commit
-            # bootstrap continuation trigger (issue #324) resumes the
-            # detached-established planning bootstrap when the observed
-            # initialization completions settle readiness; the trigger
-            # resolves the continuation submitter lazily so the binding
-            # order of executor and observer does not matter.
+            # completion handoff (issues #324/#333) routes each settled
+            # validated completion by its explicit operation family — the
+            # detached-established planning bootstrap resumption and the
+            # initial-IMPLEMENT PR authorization presentation — resolving
+            # every dependency lazily so the binding order of executor and
+            # observer does not matter.
             observer = DetachedTurnObservationHost(
                 dependencies.database_pool,
                 observation_source=ClineHubTurnObservationSource(
@@ -82,9 +83,7 @@ def _serving_lifespan(
                 ),
                 runtime_credential_resolver=resolve_connection_runtime_credential,
                 control_endpoint_resolver=resolve_connection_control_endpoint,
-                bootstrap_continuation_trigger=bootstrap_readiness_continuation_trigger(
-                    dependencies
-                ),
+                completion_handoff=build_detached_completion_handoff(dependencies),
             )
             observer.start()
             dependencies.bind_regular_process_detached_turn_observer(observer)

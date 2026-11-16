@@ -23,8 +23,10 @@ import pytest
 
 from openorc.config import ConfigurationError, ExecutionMode, Settings
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
-from openorc.services.errors import StaleOperationError
+from openorc.services.errors import ConflictError, StaleOperationError
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
@@ -166,6 +168,26 @@ def make_dependencies(
     }
     resolved.update(providers)
     return OperationDependencies(**resolved), submitter
+
+
+def make_queue_dependencies(**providers: Any) -> tuple[OperationDependencies, FakeSubmitter]:
+    """Dependencies pinned to the queue-mode interim (until #328).
+
+    The blocking E6 composition and the blocking establishment are the
+    queue-mode interim behavior the regular-mode detached dispatch replaces;
+    these dependencies keep those compositions testable.
+    """
+    return make_dependencies(
+        settings=Settings(
+            environment="test",
+            api_host="127.0.0.1",
+            api_port=3999,
+            api_reload=False,
+            execution_mode=ExecutionMode.QUEUE,
+            valkey_url="redis://127.0.0.1:6379/9",
+        ),
+        **providers,
+    )
 
 
 @contextmanager
@@ -581,12 +603,12 @@ def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_t
 
         # The exact bootstrap subjects and the deployment's reviewer-neutral
         # directory reached the E1b service, with the process's observation
-        # host and the post-readiness continuation trigger wired (issue
-        # #324).
+        # host and the ONE post-commit completion handoff wired (issues
+        # #324/#333).
         assert prepare.call_count == 1
         passed_kwargs = dict(prepare.calls[0]["kwargs"])
         assert passed_kwargs.pop("observation_registrar") is not None
-        assert callable(passed_kwargs.pop("bootstrap_continuation_trigger"))
+        assert passed_kwargs.pop("completion_handoff") is not None
         assert passed_kwargs == {
             "workspace_id": _WORKSPACE_ID,
             "task_id": _TASK_ID,
@@ -766,7 +788,8 @@ def test_planning_review_exhaustion_ends_at_the_resolution_gate(
 def test_authorized_implementation_composition_presents_the_pr_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    """The queue-mode interim (until #328) keeps the blocking composition."""
+    dependencies, submitter = make_queue_dependencies()
     execution = fake_execution()
     execute = RecordingService(result=execution)
     open_pr = RecordingService(
@@ -1574,7 +1597,7 @@ def test_the_implementation_compositions_thread_the_attempt_evidence_collector_i
     thread the invocation's attempt-evidence collector into the E7
     presentation — the same application path, so an E7 failure after a
     successful E6 attributes truthfully in either composition."""
-    dependencies, submitter = make_dependencies()
+    dependencies, submitter = make_queue_dependencies()
     execution = fake_execution()
     evidence = InvocationAttemptEvidence()
     presentations: list[dict[str, Any]] = []
@@ -1624,10 +1647,10 @@ def test_the_implementation_compositions_thread_the_attempt_evidence_collector_i
     assert submitter.submissions == []
 
 
-# --- the post-readiness bootstrap continuation trigger (issue #324) -------------
+# --- the ONE post-commit completion handoff (issues #324/#333) -------------------
 
 
-def test_readiness_trigger_submits_the_resumed_bootstrap_continuation(
+def test_the_completion_handoff_submits_the_resumed_bootstrap_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dependencies, submitter = make_dependencies()
@@ -1641,8 +1664,12 @@ def test_readiness_trigger_submits_the_resumed_bootstrap_continuation(
         lambda _pool, *, workspace_id, task_id: resumable,
     )
 
-    trigger = task_workflow.bootstrap_readiness_continuation_trigger(dependencies)
-    trigger(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+    )
 
     assert len(submitter.submissions) == 1
     submitted = submitter.submissions[0]
@@ -1655,7 +1682,7 @@ def test_readiness_trigger_submits_the_resumed_bootstrap_continuation(
     assert payload.expected_state_token == str(_NEXT_TOKEN)
 
 
-def test_readiness_trigger_submits_nothing_when_the_state_is_not_resumable(
+def test_the_completion_handoff_submits_nothing_when_the_state_is_not_resumable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dependencies, submitter = make_dependencies()
@@ -1665,7 +1692,167 @@ def test_readiness_trigger_submits_nothing_when_the_state_is_not_resumable(
         lambda _pool, *, workspace_id, task_id: None,
     )
 
-    trigger = task_workflow.bootstrap_readiness_continuation_trigger(dependencies)
-    trigger(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+    )
 
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_refuses_a_family_without_a_wired_route() -> None:
+    dependencies, submitter = make_dependencies()
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+
+    with pytest.raises(ConflictError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+        )
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_presents_the_exact_head_pr_gate_for_the_implementation_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.IMPLEMENTING,
+        current_owner_gate_id=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    coordinated: list[dict[str, Any]] = []
+    presentations: list[dict[str, Any]] = []
+
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        coordinated.append(dict(kwargs))
+        kwargs["invoke_level_one"](InvocationAttemptEvidence())
+
+    def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+    monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+    )
+
+    # The presentation ran under the F5b coordinator with the fresh
+    # committed-state token seed and the durable Workspace Owner identity.
+    assert len(coordinated) == 1
+    assert coordinated[0]["expected_status"] is TaskStatus.IMPLEMENTING
+    assert coordinated[0]["profile_id"] == _PROFILE_ID
+    assert coordinated[0]["expected_state_token"] == _NEXT_TOKEN
+    # The existing F5f service was invoked exactly once with the re-derived
+    # authority; execution discovery is the service's own committed-state
+    # re-derivation.
+    assert len(presentations) == 1
+    assert presentations[0]["profile_id"] == _PROFILE_ID
+    assert presentations[0]["workspace_id"] == _WORKSPACE_ID
+    assert presentations[0]["task_id"] == _TASK_ID
+    assert presentations[0]["expected_state_token"] == _NEXT_TOKEN
+    assert presentations[0]["execution_id"] is None
+    assert presentations[0]["attempt_evidence"] is not None
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_ignores_a_missing_implementation_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies()
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: None,
+    )
+
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        raise AssertionError("the coordinator must not run for a missing task")
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+    )
+
+    assert submitter.submissions == []
+
+
+def test_authorized_implementation_composition_dispatches_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode E6 composition admits the detached turn and returns.
+
+    No blocking E6 execution and no inline PR-gate presentation happen in
+    the dispatching worker: the observed completion settles the attempt and
+    the ONE post-commit completion handoff owns the presentation.
+    """
+    dependencies, submitter = make_dependencies()
+    dispatched = SimpleNamespace(task=None, execution=None, producer_session=None, receipt=None)
+    dispatch = RecordingService(result=dispatched)
+    monkeypatch.setattr(
+        task_workflow, "dispatch_authorized_implementation_detached", dispatch, raising=True
+    )
+
+    def refusing_blocking_execution(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the blocking E6 composition must not run in regular mode")
+
+    presentations: list[dict[str, Any]] = []
+
+    def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        task_workflow, "execute_authorized_implementation", refusing_blocking_execution
+    )
+    monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr, raising=True)
+
+    task_workflow.execute_task_workflow_operation(
+        OperationInvocation(
+            kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
+            payload=TaskAuthorizedImplementationPayload(
+                task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+        dependencies=dependencies,
+    )
+
+    assert dispatch.call_count == 1
+    dispatch_kwargs = dispatch.calls[0]["kwargs"]
+    assert dispatch_kwargs["profile_id"] == _PROFILE_ID
+    assert dispatch_kwargs["workspace_id"] == _WORKSPACE_ID
+    assert dispatch_kwargs["task_id"] == _TASK_ID
+    assert dispatch_kwargs["expected_state_token"] == _STATE_TOKEN
+    assert callable(dispatch_kwargs["producer_runtime_factory"])
+    assert dispatch_kwargs["observation_registrar"] is not None
+    assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
+    # The blocking E6 service and the inline presentation never ran.
+    assert presentations == []
     assert submitter.submissions == []

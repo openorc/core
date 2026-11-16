@@ -32,6 +32,7 @@ from openorc.domain.detached_turns import (
     TaskDetachedTurnReceiptStatus,
     TurnEvidenceFamily,
 )
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_detached_turn_observation as observation_module
 from openorc.services.connection_credentials import ControlEndpointSecret
@@ -959,7 +960,7 @@ def test_known_attachment_configuration_failures_are_typed_registration_refusals
     assert backend.calls() == ()
 
 
-# --- establishment registration and the continuation trigger (issue #324) -------
+# --- establishment registration and the completion handoff (issues #324/#333) -----
 
 
 class _EstablishmentReceiptRows:
@@ -1009,21 +1010,29 @@ def _script_establishment_receipts(
     )
 
 
-class _RecordingTrigger:
-    """Records the post-commit bootstrap continuation trigger invocations."""
+class _RecordingHandoff:
+    """Records the post-commit completion handoff invocations (issue #333)."""
 
     def __init__(self) -> None:
-        self.calls: list[dict[str, UUID]] = []
+        self.calls: list[dict[str, Any]] = []
 
-    def __call__(self, *, workspace_id: UUID, task_id: UUID) -> None:
-        self.calls.append({"workspace_id": workspace_id, "task_id": task_id})
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        operation: PendingTaskRuntimeInteractionOperation,
+    ) -> None:
+        self.calls.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
 
 
-def _make_trigger_observer(
+def _make_handoff_observer(
     conn: ScriptedConnection,
     *,
     backends: list[FakeClineSdkBackend],
-    trigger: _RecordingTrigger,
+    handoff: _RecordingHandoff,
 ) -> DetachedTurnObservationHost:
     pool = _pool(conn)
     pending = list(backends)
@@ -1033,7 +1042,7 @@ def _make_trigger_observer(
         observation_source=source,
         runtime_credential_resolver=_fake_credential_resolver,
         control_endpoint_resolver=resolve_connection_control_endpoint,
-        bootstrap_continuation_trigger=trigger,
+        completion_handoff=handoff,
     )
     observer.start()
     return observer
@@ -1087,10 +1096,10 @@ def test_establishment_registration_refuses_without_a_matching_receipt() -> None
     assert _subscribe_calls(backend) == []
 
 
-def test_validated_establishment_settlement_fires_the_continuation_trigger(
+def test_validated_establishment_settlement_fires_the_completion_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trigger = _RecordingTrigger()
+    handoff = _RecordingHandoff()
     backend = FakeClineSdkBackend()
     conn = ScriptedConnection()
     _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
@@ -1099,36 +1108,55 @@ def test_validated_establishment_settlement_fires_the_continuation_trigger(
         outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=cast(
             Any,
-            SimpleNamespace(operation=SimpleNamespace(value="session_initialization")),
+            SimpleNamespace(
+                operation=PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION
+            ),
         ),
     )
-    observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
+    observer = _make_handoff_observer(conn, backends=[backend], handoff=handoff)
     _register(observer)
     monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
 
     backend.emit_hub(_terminal_event())
 
     assert len(settle.calls) == 1
-    assert trigger.calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+        }
+    ]
 
 
-def test_execution_settlement_never_fires_the_continuation_trigger(
+def test_validated_execution_settlement_fires_the_completion_handoff_with_its_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trigger = _RecordingTrigger()
+    handoff = _RecordingHandoff()
     backend = FakeClineSdkBackend()
     conn = ScriptedConnection()
     _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
     _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
     settle = _SettleRecorder(
         outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
-        receipt=cast(Any, _admitted_receipt_row()),
+        receipt=cast(
+            Any,
+            SimpleNamespace(
+                operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+            ),
+        ),
     )
-    observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
+    observer = _make_handoff_observer(conn, backends=[backend], handoff=handoff)
     _register(observer)
     monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
 
     backend.emit_hub(_terminal_event())
 
     assert len(settle.calls) == 1
-    assert trigger.calls == []
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        }
+    ]

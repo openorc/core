@@ -67,6 +67,15 @@ already-returned result — leaves the attempt conservatively ``running``
 error, and never resends, never fabricates success, and never grants retry
 permission. Settlement belongs to the later recovery layer (#85/#87–#89).
 
+The detached counterpart (issues #325/#333,
+``dispatch_authorized_implementation_detached``) runs the same Phase 1
+reservation and the same R1/R2 authority guards and failure
+classification, but replaces the blocking send with the receipt → realize
+→ register → admit → attach sequence and returns after the admission: the
+independently observed completion settles the attempt through the shared
+finalize, and the ONE post-commit completion handoff routes the
+continuation from committed state.
+
 The activity marker (issue #90's consumer) is advisory only: the caller's
 optional runtime-neutral qualifying-activity subscription (issue #246)
 delivers zero-argument pulses — the supplying runtime adapter enforces exact
@@ -87,10 +96,11 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
-from typing import Final, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import DetachedTurnRuntime
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -99,6 +109,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import OriginalAttemptKind
@@ -120,6 +131,7 @@ from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import ImplementInteraction
 from openorc.protocol.models import (
@@ -130,11 +142,14 @@ from openorc.protocol.models import (
 )
 from openorc.services import event_coordination
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
@@ -144,6 +159,7 @@ from openorc.services.review_result_envelope import (
     serialize_review_result,
 )
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
@@ -151,16 +167,22 @@ from openorc.services.task_subject_guards import (
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
+if TYPE_CHECKING:
+    from openorc.services.task_detached_turn_correlation import TurnSettlementOutcome
+
 __all__ = [
     "ActivitySubscriptionFactory",
     "AuthorizedImplementationExecution",
+    "DispatchedImplementationExecution",
     "IMPLEMENTATION_SETTLEMENT_SUBJECT",
+    "ImplementationObservationRegistrar",
     "OBSERVED_RUN_FAILURE_KIND",
     "ObservedExecutionSettlementSubject",
     "ProducerRuntimeAttachmentFactory",
     "QualifyingActivityPulse",
     "REMEDIATION_SETTLEMENT_SUBJECT",
     "complete_resumed_implementation_result",
+    "dispatch_authorized_implementation_detached",
     "execute_authorized_implementation",
     "finalize_observed_implementation_failure",
     "settle_observed_implementation_result",
@@ -175,6 +197,15 @@ _EXECUTE_SPAN_NAME: Final[str] = "task_authorized_implementation_execution.execu
 # audit context (no exception text or error content ever enters the event).
 _AUTHORITY_STALE_FAILURE_KIND: Final[str] = "authority_stale"
 _RUNTIME_PRE_EFFECT_FAILURE_KIND: Final[str] = "runtime_pre_effect"
+
+# Safe refusal-kind tokens for a receipt's durable refusal outcome after a
+# proven pre-effect detached-dispatch failure (no exception text or error
+# content ever enters durable state).
+_REALIZATION_REFUSAL_KIND: Final[str] = "realization_refused"
+_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+
+_DISPATCH_SPAN_NAME: Final[str] = "task_authorized_implementation_execution.dispatch_detached"
 
 # The qualifying-pulse marker write (issue #246) coalesces bursts of
 # content-free runtime-neutral pulses into a bounded write rate; the pulse
@@ -200,6 +231,30 @@ ActivitySubscriptionFactory = Callable[
 ]
 
 
+class ImplementationObservationRegistrar(Protocol):
+    """The structural registration seam of the process's detached-turn observer.
+
+    The positively-required pre-admission gate (issues #323/#333): the
+    detached implementation dispatch registers the exact bound external
+    session before any admission, so an unreplayable terminal result can
+    never be dispatched without active observation. Failures are the
+    observer's typed refusals, routed through the pre-effect failure
+    machinery.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Register one exact bound session for detached-turn observation."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class AuthorizedImplementationExecution:
     """The typed successful E6 outcome, suitable for E7 (issue #82).
@@ -216,6 +271,25 @@ class AuthorizedImplementationExecution:
     implementation_result: ImplementationResult
     producer_session: TaskAgentSession
     owner_gate: OwnerGate
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedImplementationExecution:
+    """The typed detached E6 dispatch outcome (issues #325/#333).
+
+    The authoritative facts exactly as the durable state reads after the
+    dispatch: the Task, the claimed (or already early-settled) Execution,
+    the original Producer binding, and the outstanding detached-turn receipt
+    binding the admitted turn. No transient success object is required after
+    the dispatching process exits — the independently observed completion
+    settles the attempt through the shared finalize, and the ONE post-commit
+    completion handoff routes the continuation from committed state.
+    """
+
+    task: Task
+    execution: Execution
+    producer_session: TaskAgentSession
+    receipt: TaskDetachedTurnReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +370,33 @@ def _require_activity_factory(value: object) -> ActivitySubscriptionFactory | No
             "subscription context manager for the exact bound Producer session"
         )
     return cast(ActivitySubscriptionFactory, value)
+
+
+def _require_observation_registrar(value: object) -> ImplementationObservationRegistrar:
+    """Fail closed unless the registrar implements the registration seam."""
+    register = getattr(value, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the implementation observation registrar does not implement the "
+            "detached-turn registration seam"
+        )
+    return cast(ImplementationObservationRegistrar, value)
+
+
+def _require_completion_handoff(value: object) -> DetachedTurnCompletionHandoff:
+    """Fail closed unless the completion handoff implements its seam."""
+    handoff = getattr(value, "handoff_settled_completion", None)
+    if not callable(handoff):
+        raise InvalidCommandError(
+            "the completion handoff does not implement the post-commit "
+            "detached-completion handoff seam"
+        )
+    return cast(DetachedTurnCompletionHandoff, value)
+
+
+def _implements_detached_admission(adapter: AgentRuntimeAdapter) -> bool:
+    """Whether the attached adapter implements the detached-turn admission."""
+    return callable(getattr(adapter, "admit_detached_turn", None))
 
 
 # --- subject derivation -----------------------------------------------------------
@@ -878,24 +979,14 @@ def execute_authorized_implementation(
             task_id=str(task_id),
         )
         # --- Phase 1: admission and the durable attempt reservation. ---
-        with composed_transaction(pool) as transaction_pool:
-            reserved = _reserve_initial_attempt(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-            )
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's reserved
-            # implementation Execution identity (#262).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
-                original_attempt_kind=OriginalAttemptKind.EXECUTION,
-                original_attempt_id=reserved.execution.id,
-                phase="authorized_implementation_execution",
-            )
-        message = serialize_review_result(reserved.accepted_review)
+        reserved, message = _reserve_authorized_attempt(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            attempt_evidence=attempt_evidence,
+        )
         # --- Phases 2 and 3: the authority-gated effects and the finalize. ---
         return _execute_external_phase(
             pool,
@@ -907,6 +998,494 @@ def execute_authorized_implementation(
             producer_factory=producer_factory,
             activity_factory=activity_factory,
         )
+
+
+def _reserve_authorized_attempt(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> tuple[_ReservedAttempt, str]:
+    """Phase 1 shared by both dispatch entries: the reservation and the message.
+
+    One short composed transaction reserves exactly one initial
+    implementation attempt; the F5b coordinator's handoff fact records the
+    reserved implementation Execution identity (#262); and the single
+    model-visible message is the structural serialization of the persisted
+    accepted Reviewer envelope.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        reserved = _reserve_initial_attempt(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+    if attempt_evidence is not None:
+        # The F5b coordinator's handoff fact: this invocation's reserved
+        # implementation Execution identity (#262).
+        attempt_evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=reserved.execution.id,
+            phase="authorized_implementation_execution",
+        )
+    return reserved, serialize_review_result(reserved.accepted_review)
+
+
+def _refuse_dispatched_receipt_quietly(
+    pool: DatabasePool, receipt: TaskDetachedTurnReceipt, *, refusal_kind: str
+) -> None:
+    """Mark a claimed receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises; the claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively. A refused receipt never ran, so it releases the
+    session's single-outstanding slot a never-dispatched turn must not hold.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused implementation receipt could not be durably marked "
+            "(%s); the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        return
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the implementation receipt was no longer claimed when its "
+            "pre-effect refusal was recorded"
+        )
+
+
+def dispatch_authorized_implementation_detached(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: ImplementationObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedImplementationExecution:
+    """Dispatch the E5-authorized initial implementation as one detached turn.
+
+    The detached counterpart of the ordinary E6 dispatch (issues #325/#333):
+    the same admission and durable attempt reservation, then the persisted
+    accepted Reviewer envelope becomes one admitted, independently completed
+    agent turn — one detached-turn receipt committed strictly before the
+    first runtime interaction, one native ``ImplementInteraction``
+    realization on the same external session ID (the serialized mode
+    reconstruction, never an extra prompt), one positively-required
+    pre-admission observation registration on the exact bound session, one
+    detached-turn admission of the composed envelope verbatim, and one
+    acknowledgement attach. No ``send`` and no blocking wait exists in this
+    path, and no database transaction is ever held across a runtime call.
+
+    The R1/R2 authority guards and the proven/uncertain failure
+    classification are exactly the ordinary dispatch's (issue #333 review):
+    authority moving on before realization finalizes the never-dispatched
+    attempt truthfully; authority moving on after realization — immediately
+    before the admission — is an uncertainty that leaves the attempt
+    conservatively running and the receipt conservatively claimed, never a
+    re-dispatch. Only positively proven pre-effect failures refuse the
+    receipt and finalize ``failed_transient``.
+
+    The dispatching worker returns after the acknowledgement attach. The
+    independently observed completion settles the attempt through the shared
+    finalize, and the ONE post-commit completion handoff routes the
+    continuation from committed state. When a staged early completion
+    already settled the attempt within this dispatch, the handoff is invoked
+    here strictly post-commit — exactly one of the dispatching path and the
+    observation path settles a given receipt, so the continuation fires
+    exactly once either way.
+    """
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    producer_factory = _require_producer_factory(producer_runtime_factory)
+    registrar = _require_observation_registrar(observation_registrar)
+    handoff = _require_completion_handoff(completion_handoff)
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_DISPATCH_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        # --- Phase 1: admission and the durable attempt reservation. ---
+        reserved, message = _reserve_authorized_attempt(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            attempt_evidence=attempt_evidence,
+        )
+        # --- the detached dispatch phase: the authority-gated admission
+        # effects and the receipt bookkeeping. ---
+        return _dispatch_detached_external_phase(
+            pool,
+            reserved=reserved,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            message=message,
+            producer_factory=producer_factory,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+
+
+def _dispatch_detached_external_phase(
+    pool: DatabasePool,
+    *,
+    reserved: _ReservedAttempt,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    message: str,
+    producer_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: ImplementationObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> DispatchedImplementationExecution:
+    """The authority-gated detached dispatch: receipt, ACT, register, admit."""
+    # Deferred import: the correlation seam imports this module's settlement
+    # compositions at module level.
+    from openorc.services.task_detached_turn_correlation import (  # noqa: PLC0415
+        TurnSettlementKind,
+        attach_acknowledged_turn,
+        record_task_detached_turn_receipt,
+    )
+
+    producer_external_session_id = reserved.producer_session.external_session_id
+    if producer_external_session_id is None:
+        # Narrowed by the subject loader; kept explicit for fail-closed safety.
+        raise ConflictError("the producer session binding carries no external session identity")
+    with ExitStack() as attachment_stack:
+        try:
+            runtime = attachment_stack.enter_context(producer_factory())
+        except ExternalOperationUncertainError:
+            # Uncertain attachment: the claimed attempt stays conservatively
+            # running (the potentially-dispatched record) and nothing resends.
+            raise
+        except ExternalOperationFailedError:
+            # A known attachment failure provably occurred before any effect.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        if not _implements_detached_admission(runtime):
+            # The attached runtime cannot admit detached turns: a proven
+            # pre-effect condition of this never-dispatched attempt.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationFailedError(
+                "the producer runtime does not implement the detached turn "
+                "capability; the dispatch failed before any effect"
+            )
+        detached_runtime = cast(DetachedTurnRuntime, runtime)
+        # --- R1: authority revalidation after acquisition, before any
+        # runtime interaction. ---
+        try:
+            with composed_transaction(pool) as transaction_pool:
+                _revalidate_reserved_subjects(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    reserved=reserved,
+                    require_ready_producer=True,
+                )
+        except (NotFoundError, ConflictError, StaleOperationError):
+            # Authority moved on during attachment, before any runtime effect:
+            # the never-dispatched attempt finalizes truthfully.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_FINAL,
+                failure_kind=_AUTHORITY_STALE_FAILURE_KIND,
+            )
+            raise
+        # --- the receipt: the claim's detached-turn companion, committed
+        # strictly before the first runtime interaction, so the admission
+        # race and the single-outstanding-turn invariant are durable from
+        # the first possible effect. ---
+        try:
+            receipt = record_task_detached_turn_receipt(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reserved.producer_session.id,
+                operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=reserved.execution.id,
+            )
+        except ApplicationError:
+            # A typed refusal (the single-outstanding-turn conflict among
+            # them) is a proven pre-effect failure of this never-dispatched
+            # attempt.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        except Exception as error:
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationFailedError(
+                "the detached implementation receipt could not be durably "
+                "recorded before any dispatch; the attempt failed before any "
+                "effect"
+            ) from error
+        # --- the serialized mode reconstruction (no model turn). The
+        # proven/uncertain classification is exactly the ordinary
+        # dispatch's. ---
+        try:
+            runtime.realize_control(producer_external_session_id, ImplementInteraction())
+        except AgentRuntimeUncertainOutcomeError as error:
+            # Uncertain reconstruction: the attempt stays conservatively
+            # running, the receipt stays conservatively claimed, and nothing
+            # is re-dispatched.
+            raise ExternalOperationUncertainError(
+                "the outcome of the native ACT reconstruction is unknown; the "
+                "implementation attempt remains unresolved and nothing is resent"
+            ) from error
+        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
+            # A transport or protocol failure can arise only after the ACT
+            # handoff has done work (issue #87): the reconstruction was
+            # delivered, so implementation work may have begun. The claimed
+            # attempt stays conservatively running — never a proven
+            # non-effect, never a safe retry.
+            logger.warning(
+                "the native ACT reconstruction ended with a post-send runtime "
+                "failure; the claimed attempt remains potentially dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the native ACT handoff was delivered but its response could "
+                "not be interpreted; the implementation attempt remains "
+                "potentially dispatched and is never resent"
+            ) from error
+        except AgentRuntimeError as error:
+            # The remaining normalized taxonomy classes (configuration
+            # rejection, runtime unavailability, and a not-live addressed
+            # session) are positively proven to precede any effect.
+            _refuse_dispatched_receipt_quietly(
+                pool, receipt, refusal_kind=_REALIZATION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationFailedError(
+                "the native ACT reconstruction failed before any implementation work was dispatched"
+            ) from error
+        # --- the positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect
+        # failure: the just-recorded receipt is marked refused so a
+        # never-dispatched turn cannot hold the session's
+        # single-outstanding slot. ---
+        try:
+            observation_registrar.register_session(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reserved.producer_session.id,
+                connection_id=reserved.producer_session.connection_id,
+                external_session_id=producer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError:
+            _refuse_dispatched_receipt_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        except Exception as error:
+            from openorc.services.task_detached_turn_observation import (  # noqa: PLC0415
+                ObservationRegistrationRefusalReason,
+            )
+
+            _refuse_dispatched_receipt_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ObservationRegistrationRefusedError(
+                "the implementation observation registration failed before "
+                "any admission; the dispatch is a proven pre-effect failure",
+                reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+            ) from error
+        # --- R2: the exact-subject revalidation immediately before the
+        # admission. Realization already touched the runtime session, so an
+        # effect may have begun: authority movement here is the ordinary
+        # dispatch's uncertain classification — the attempt stays
+        # conservatively running and the receipt stays conservatively
+        # claimed, and nothing is re-dispatched. ---
+        try:
+            with composed_transaction(pool) as transaction_pool:
+                _revalidate_reserved_subjects(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    reserved=reserved,
+                    require_ready_producer=True,
+                )
+        except (NotFoundError, ConflictError, StaleOperationError) as error:
+            raise ExternalOperationUncertainError(
+                "implementation authority moved on before the implementation "
+                "admission; the detached dispatch was refused and the attempt "
+                "remains unresolved"
+            ) from error
+        # --- the admission (external, no transaction held). One
+        # detached-turn admission of the composed canonical accepted-review
+        # envelope verbatim. ---
+        try:
+            admission = detached_runtime.admit_detached_turn(producer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached implementation admission ended with an uncertain "
+                "outcome; the receipt stays conservatively claimed and is "
+                "never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the implementation admission is unknown; the "
+                "receipt stays conservatively claimed and the attempt is "
+                "never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_dispatched_receipt_quietly(pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND)
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=reserved.execution.id,
+                producer_session_id=reserved.producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationRejectedError(
+                "the implementation admission was refused before any effect; "
+                "the receipt is refused and the attempt never dispatched"
+            ) from error
+        # --- the acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated result that finished
+        # before the acknowledgement was persisted is correlated, never
+        # ignored or duplicated. ---
+        try:
+            outcome: TurnSettlementOutcome = attach_acknowledged_turn(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                receipt_id=receipt.id,
+                admitted_turn_reference=admission.turn_reference,
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the implementation acknowledgement could not be durably "
+                "attached after its known admission; authoritative recovery "
+                "is required and the attempt is never re-dispatched"
+            ) from error
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the attempt within this
+        # dispatch (issues #324/#333): the ONE post-commit completion
+        # handoff owns the family routing. Strictly post-commit, contained,
+        # never a workflow authority; a failed routing leaves the durable
+        # state to the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch implementation completion handoff failed "
+                "(%s); the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    reloaded_execution = execution_records.get_execution(pool, execution_id=reserved.execution.id)
+    if reloaded_execution is None:  # pragma: no cover - just created
+        raise NotFoundError("the dispatched implementation attempt is not available")
+    return DispatchedImplementationExecution(
+        task=reloaded_task,
+        execution=reloaded_execution,
+        producer_session=reserved.producer_session,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+    )
 
 
 def complete_resumed_implementation_result(
@@ -1200,7 +1779,8 @@ def finalize_observed_implementation_failure(
     The detached-run settlement's owning-service failure composition
     (issue #322): the attributed terminal observation positively establishes
     that the run failed (a terminal failure event, or the exact acknowledged
-    ``runId`` reported ``failed`` by status-only ``run.list``). The
+    turn reference reported failed by a bounded status-only consultation).
+    The
     settlement subject set is re-proven from durable state under the Task
     row lock, the still-running attempt finalizes ``failed_final`` with the
     safe ``execution_failed`` audit committing atomically, and the attempt

@@ -96,6 +96,7 @@ from openorc.services.errors import (
     NotFoundError,
     ObservationRegistrationRefusedError,
 )
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_correlation import (
     TurnEvidenceClassifier,
     TurnSettlementKind,
@@ -105,14 +106,10 @@ from openorc.services.task_detached_turn_correlation import (
     settle_observed_turn_completion,
 )
 
-BootstrapContinuationTrigger = Callable[..., None]
-
 __all__ = [
-    "BootstrapContinuationTrigger",
     "DetachedTurnObservationSourceError",
     "DetachedTurnObservationHost",
     "DetachedTurnObservationSource",
-    "DetachedTurnObservationSourceError",
     "ObservationAttachmentInputs",
     "ObservationRegistrationRefusalReason",
 ]
@@ -311,13 +308,13 @@ class DetachedTurnObservationHost:
             resolve_connection_runtime_credential
         ),
         control_endpoint_resolver: EndpointResolver,
-        bootstrap_continuation_trigger: BootstrapContinuationTrigger | None = None,
+        completion_handoff: DetachedTurnCompletionHandoff | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
         self._source = observation_source
         self._credential_resolver = runtime_credential_resolver
         self._endpoint_resolver = control_endpoint_resolver
-        self._bootstrap_continuation_trigger = bootstrap_continuation_trigger
+        self._completion_handoff = completion_handoff
         self._lock = threading.Lock()
         self._started = False
         self._disposed = False
@@ -834,23 +831,23 @@ class DetachedTurnObservationHost:
         if (
             outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
             and outcome.receipt is not None
-            and outcome.receipt.operation.value == "session_initialization"
-            and self._bootstrap_continuation_trigger is not None
+            and self._completion_handoff is not None
         ):
-            # The validated READY finalization of an initialization run
-            # committed (issue #324): the post-commit bootstrap continuation
-            # trigger owns the resumption classification and submission.
-            # Strictly post-commit, contained, never a workflow authority;
-            # a failed submission leaves the durable resumable state to the
-            # existing recovery semantics.
+            # A validated result settlement committed (issues #324/#333):
+            # the ONE post-commit completion handoff owns the explicit
+            # family routing and the resumption. Strictly post-commit,
+            # contained, never a workflow authority; a failed routing
+            # leaves the durable state to the existing recovery semantics.
             try:
-                self._bootstrap_continuation_trigger(
-                    workspace_id=entry.workspace_id, task_id=entry.task_id
+                self._completion_handoff.handoff_settled_completion(
+                    workspace_id=entry.workspace_id,
+                    task_id=entry.task_id,
+                    operation=outcome.receipt.operation,
                 )
-            except Exception as error:  # noqa: BLE001 - best-effort trigger
+            except Exception as error:  # noqa: BLE001 - best-effort handoff
                 logger.warning(
-                    "the bootstrap continuation trigger failed (%s) after the "
-                    "validated initialization settlement for task session %s",
+                    "the detached-completion handoff failed (%s) after the "
+                    "validated settlement for task session %s",
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )

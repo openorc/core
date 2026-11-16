@@ -87,11 +87,13 @@ _SHARED_BOUNDARY_MODULES = (
     "src/openorc/adapters/agent_runtime/detached.py",
     "src/openorc/adapters/agent_runtime/results.py",
     "src/openorc/adapters/agent_runtime/errors.py",
+    "src/openorc/services/task_completion_handoff.py",
     "src/openorc/services/task_detached_turn_correlation.py",
     "src/openorc/services/task_detached_turn_observation.py",
     "src/openorc/services/session_runtime.py",
     "src/openorc/services/task_planning_bootstrap.py",
     "src/openorc/services/task_pending_runtime_interactions.py",
+    "src/openorc/services/task_authorized_implementation_execution.py",
     "src/openorc/workers/invocation.py",
     "src/openorc/workers/task_workflow.py",
 )
