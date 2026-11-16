@@ -245,7 +245,7 @@ def test_the_acknowledged_runid_binds_once_per_session(conn: Connection[Any]) ->
         workspace_id=workspace_id,
         admitted_turn_reference="run-2",
     )
-    assert rebound is not None and rebound.run_id == "run-2"
+    assert rebound is not None and rebound.admitted_turn_reference == "run-2"
 
 
 def test_the_forward_only_transitions_are_one_shot_no_ops_when_raced(

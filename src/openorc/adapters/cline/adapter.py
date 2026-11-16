@@ -650,15 +650,26 @@ class ClineAdapter(AgentRuntimeAdapter):
         The detached session establishment's admission step (issue #324)
         and the runtime-neutral detached-turn capability's admission seam
         (issue #348): one public Hub ``run.enqueue`` of the composed content
-        verbatim on the exact allocated external session — deliberately
+        verbatim on the exact addressed external session — deliberately
         never a ``ClineCore.send`` and never a prompt-inside-``start``
         shortcut. The acknowledged native ``runId`` is the turn reference
         the neutral ``AgentTurnAdmission`` carries back as transport
         evidence for later exact correlation, never a workflow decision and
         never readiness: accepted failed runs may emit no terminal event,
         and an uncertain admission (timeout, transport loss) never
-        authorizes a resend. Exact-session discipline applies: the
-        addressed session must be one this adapter established.
+        authorizes a resend.
+
+        Exact-session discipline has two positively proven paths. A session
+        this adapter instance allocated in-process carries the provisional
+        establishment proof (a CONNECTING binding deliberately has no bound
+        external identity yet, so the allocation registry is the only
+        exact-session proof available there). Any other addressed session
+        must be an existing durably bound session: the durable
+        construction-context resolver positively establishes its exact bound
+        Task/role identity or fails closed, so a fresh adapter attachment
+        can admit an authorized detached turn into an existing READY session
+        without any reconstruction. An unbound or foreign identifier is
+        never guessed around.
         """
         with application_span(_TRACER_SCOPE, "cline_adapter.admit_detached_turn") as span:
             annotate_span(span, operation="cline_adapter.admit_detached_turn")
@@ -666,15 +677,12 @@ class ClineAdapter(AgentRuntimeAdapter):
                 raise ValueError("session_id must be a non-empty string")
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("content must be a non-empty string")
-            # Exact-session discipline for the provisional window: a
-            # CONNECTING binding deliberately carries no durable external
-            # identity yet, so the allocation this adapter instance just
-            # performed is the only exact-session proof available. The
-            # durable construction-context resolver takes over after READY.
             if session_id not in self._known_identity:
-                raise AgentRuntimeConfigurationRejectedError(
-                    "the addressed external session was not allocated by this adapter instance"
-                )
+                # The durable bound-session resolver is the sole authority
+                # for a session this instance did not allocate in-process;
+                # this instance's memory is never a substitute for it and a
+                # resolver miss fails closed before any runtime effect.
+                self._resolve_bound_context(session_id)
             admission = self._backend_operation(
                 "enqueue",
                 lambda: self._backend.enqueue(session_id, content),

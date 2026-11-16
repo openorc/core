@@ -31,6 +31,7 @@ from openorc.adapters.cline.hub_observation import (
 from openorc.domain.detached_turns import (
     DetachedTurnObservationSourceError,
     NativeTurnEvidence,
+    ObservationLease,
     TurnAttribution,
     TurnEvidenceFamily,
 )
@@ -149,6 +150,12 @@ def test_the_observation_delivers_only_qualified_turn_evidence_envelopes() -> No
     assert delivered[1].family is TurnEvidenceFamily.TURN_START
 
 
+class _ForeignLease(ObservationLease):
+    """A lease some other runtime integration issued."""
+
+    __slots__ = ()
+
+
 def test_the_observation_lease_releases_exactly_its_own_subscription() -> None:
     delivered: list[Any] = []
     backend = FakeClineSdkBackend()
@@ -162,7 +169,8 @@ def test_the_observation_lease_releases_exactly_its_own_subscription() -> None:
 
     source.release_observation(lease)
     source.release_observation(lease)  # idempotent
-    source.release_observation(cast(NativeTurnEvidence, object()))  # foreign: a no-op
+    # A lease some other integration issued is a no-op for this source.
+    source.release_observation(_ForeignLease())
 
     backend.emit_hub(_terminal_event())
     assert delivered == []

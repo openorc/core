@@ -13,6 +13,7 @@ and the existing workflow finalizer remain authoritative throughout.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +152,7 @@ class _BoundarySource:
         self,
         evidence: NativeTurnEvidence,
         *,
-        consumed_ordering_markers: tuple[int, ...],
+        consumed_ordering_markers: Sequence[int],
     ) -> TurnTerminalClassification:
         assert isinstance(evidence, _BoundaryEvidence)
         # The fake's own ordering rule: markers are small integers and a
