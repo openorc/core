@@ -40,6 +40,7 @@ from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskSessionLifecycleStatus
+from openorc.domain.tasks import TaskStatus
 from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import PrepareWorkspaceInteraction
@@ -53,6 +54,11 @@ from openorc.services.errors import (
     ObservationRegistrationRefusedError,
     StaleOperationError,
 )
+from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
+from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
+    triage_operational_failure,
+)
 from openorc.services.task_planning_bootstrap import (
     PlanningBootstrapTerminalConflictError,
     PlanningBootstrapUnresolvedError,
@@ -65,8 +71,12 @@ from openorc.services.task_planning_bootstrap import (
     prepare_task_for_planning,
     settle_observed_bootstrap_prepare_result,
 )
+from openorc.services.task_workflow_operation_coordinator import (
+    coordinate_task_workflow_operation,
+)
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
 from tests.fakes.task_rows import task_row
+from tests.test_services_task_pr_review_decision import _event_returned_row
 
 _OBSERVED = datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC)
 _BARRIER_ROW = (None, None, None)  # account-operational barrier: no attempt state
@@ -1655,6 +1665,7 @@ def test_readiness_resumed_continuation_dispatches_the_detached_prepare() -> Non
         *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
         # The detached PREPARE dispatch transaction: the stage evidence read,
         # the durable PREPARE-dispatch marker, and the detached-turn receipt.
+        (claim_token, _OBSERVED, None, None),  # the fail-closed pre-check's evidence read
         (claim_token, _OBSERVED, None, None),
         True,
         receipt_row,
@@ -1900,6 +1911,12 @@ def test_detached_prepare_registration_refusal_refuses_the_receipt() -> None:
             reviewer_ready,
         ),
         *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (
+            claim_token,
+            _OBSERVED,
+            None,
+            None,
+        ),  # the fail-closed pre-check's evidence read# the dispatch transaction's evidence read
         (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
         True,  # the durable PREPARE-dispatch marker
         receipt_row,  # the detached-turn receipt insert
@@ -1978,6 +1995,12 @@ def test_detached_prepare_admission_refusal_refuses_the_receipt() -> None:
             reviewer_ready,
         ),
         *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (
+            claim_token,
+            _OBSERVED,
+            None,
+            None,
+        ),  # the fail-closed pre-check's evidence read# the dispatch transaction's evidence read
         (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
         True,  # the durable PREPARE-dispatch marker
         receipt_row,  # the detached-turn receipt insert
@@ -2060,6 +2083,12 @@ def test_detached_prepare_uncertain_admission_keeps_the_receipt_claimed() -> Non
             reviewer_ready,
         ),
         *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        (
+            claim_token,
+            _OBSERVED,
+            None,
+            None,
+        ),  # the fail-closed pre-check's evidence read# the dispatch transaction's evidence read
         (claim_token, _OBSERVED, None, None),  # the dispatch transaction's evidence read
         True,  # the durable PREPARE-dispatch marker
         receipt_row,  # the detached-turn receipt insert
@@ -2218,6 +2247,233 @@ def test_settle_observed_bootstrap_prepare_result_records_the_prepared_stage() -
         is False
     )
     assert _statement_indices(moved_conn, "update openorc.") == []
+
+
+# --- the competing-dispatch guard and the coordinated transition failure --------
+
+
+def test_a_competing_continuation_fails_closed_at_an_already_dispatched_stage() -> None:
+    """The marker is the one-shot PREPARE guard across settled receipts.
+
+    A continuation that classified the claim resumable before a competing
+    continuation dispatched enters its dispatch transaction against the
+    already-committed ``prepare_dispatched`` stage — even after the first
+    receipt settled, failed, or was refused — and fails closed without
+    another receipt, marker write, registration, or admission.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    results = [
+        *_entry_results(
+            env.workspace_id,
+            env.owner_profile_id,
+            env.post_claim_task_row,
+            claim=(claim_token,),
+            producer_row=producer_ready,
+            reviewer_row=reviewer_ready,
+            claim_write_result=None,
+            post_claim_task_row=None,
+            claim_evidence_row=(claim_token, _OBSERVED, None, None),
+            classifier_results=(
+                None,
+                None,
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, producer_ready[0], "ext-p"
+                ),
+                _settled_initialization_receipt_row(
+                    env.workspace_id, env.task_id, reviewer_ready[0], "ext-r"
+                ),
+            ),
+        ),
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        *_base_repository_results(producer_ready, env.connection_row, env.repository_row),
+        # The competing continuation committed its dispatch meanwhile.
+        (claim_token, _OBSERVED, "prepare_dispatched", _OBSERVED),
+    ]
+    conn = ScriptedConnection(results)
+    runtime = env.runtime()
+    producer_adapter = runtime.fake_adapter(WorkflowRole.PRODUCER)
+    producer_adapter.allocate_detached_session(
+        AgentSessionCreationRequest(
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            role=WorkflowRole.PRODUCER,
+            initialization="seed",
+        )
+    )
+
+    with pytest.raises(ConflictError):
+        prepare_task_for_planning(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            reviewer_neutral_directory=_NEUTRAL_DIRECTORY,
+            observation_registrar=_RecordingRegistrar(),
+            completion_handoff=_RecordingCompletionHandoff(),
+        )
+
+    assert runtime.interaction_leases == []
+    assert runtime.transitions == []
+    assert producer_adapter.detached_admissions() == ()
+    assert not any("insert into openorc.task_hub_run_receipts" in sql for sql, _ in conn.executed)
+    assert _statement_indices(conn, "update openorc.") == []
+
+
+class _FailingTransitionRuntime(_ScriptedBootstrapRuntime):
+    """The scripted composition whose planning-context reconstruction fails."""
+
+    def enter_planning_checkout(
+        self,
+        pool: Any,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        external_session_id: str,
+        checkout_directory: str,
+    ) -> None:
+        raise AgentRuntimeUnavailableError("the runtime is unreachable for the reconstruction")
+
+
+def test_a_coordinated_reconstruction_failure_escalates_to_blocked() -> None:
+    """A positively detected reconstruction failure follows Level 1/2/3.
+
+    The observed-completion transition continuation runs under the F5b
+    coordinator: the failing reconstruction records the claim's transition
+    identity, the coordinator verifies it against the settled ``prepared``
+    stage, and the real F4 disposition escalates to the BLOCKED
+    installation — never an unreported failure stranded on a prepared
+    stage, and never an automatic replay.
+    """
+    env = _Bootstrap()
+    claim_token = uuid.uuid4()
+    producer_ready = env.producer_ready_row
+    reviewer_ready = env.reviewer_ready_row
+    evidence_row = (claim_token, _OBSERVED, "prepared", _OBSERVED)
+    episode_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    gate_id = uuid.uuid4()
+    planning_task_row = task_row(
+        id=env.task_id,
+        workspace_id=env.workspace_id,
+        status="planning",
+        state_token=env.post_claim_token,
+        source_requirements_fingerprint="a" * 64,
+    )
+    blocked_task_row = task_row(
+        id=env.task_id,
+        workspace_id=env.workspace_id,
+        status="blocked",
+        state_token=uuid.uuid4(),
+        current_owner_gate_id=gate_id,
+        source_requirements_fingerprint="a" * 64,
+    )
+    episode_row = (
+        episode_id,
+        env.workspace_id,
+        env.task_id,
+        "planning_bootstrap_transition",
+        "planning_bootstrap_claim",
+        claim_token,
+        {"task_id": str(env.task_id), "workspace_id": str(env.workspace_id)},
+        None,
+        _OBSERVED,
+    )
+    results = [
+        # The transition continuation's prologue transaction.
+        evidence_row,
+        producer_ready,
+        reviewer_ready,
+        env.connection_row,
+        # The post-PREPARE recheck, then the failing reconstruction.
+        *_recheck_results(
+            env.post_claim_task_row,
+            (claim_token,),
+            producer_ready,
+            reviewer_ready,
+        ),
+        # The coordinator's evidence resolution re-read.
+        evidence_row,
+        # The real F4 disposition: the locked decision flow and escalation.
+        planning_task_row,  # get_task_for_update
+        None,  # no episode rooted at the claim yet
+        None,  # no attempt by the reporting source
+        evidence_row,  # the transition family's stage verification
+        producer_ready,  # the applicable READY producer binding
+        episode_row,  # the episode insert
+        planning_task_row,  # the F3 composition's task re-lock
+        planning_task_row,  # the F3 composition's task re-read
+        (block_id, env.workspace_id, env.task_id, "unknown", {}, None, _OBSERVED),
+        (
+            gate_id,
+            env.workspace_id,
+            env.task_id,
+            "block_resolution",
+            "pending",
+            None,
+            None,
+            None,
+            block_id,
+            None,
+            _OBSERVED,
+        ),
+        blocked_task_row,  # the guarded blocked-Task mutation
+        _event_returned_row("task_blocked"),
+        _event_returned_row("owner_gate_created"),
+        (*episode_row[:7], block_id, _OBSERVED),  # the episode's escalation stamp
+    ]
+    conn = ScriptedConnection(results)
+    producer, reviewer = env.adapters()
+    runtime = _FailingTransitionRuntime(
+        {WorkflowRole.PRODUCER: producer, WorkflowRole.REVIEWER: reviewer},
+        selected_configuration=dict(_SELECTED_CONFIGURATION),
+    )
+    dispositions: list[Any] = []
+
+    def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+        complete_settled_bootstrap_prepare_transition(
+            _pool(conn),
+            runtime,
+            workspace_id=env.workspace_id,
+            profile_id=env.owner_profile_id,
+            task_id=env.task_id,
+            expected_state_token=env.post_claim_token,
+            attempt_evidence=evidence,
+        )
+
+    def recording_triage(pool: Any, **kwargs: Any) -> Any:
+        disposition = triage_operational_failure(pool, **kwargs)
+        dispositions.append(disposition)
+        return disposition
+
+    with pytest.raises(ExternalOperationFailedError):
+        coordinate_task_workflow_operation(
+            _pool(conn),
+            expected_status=TaskStatus.PLANNING,
+            workspace_id=env.workspace_id,
+            task_id=env.task_id,
+            profile_id=env.owner_profile_id,
+            expected_state_token=env.post_claim_token,
+            invoke_level_one=invoke_level_one,
+            triage=recording_triage,
+        )
+
+    assert len(dispositions) == 1
+    assert dispositions[0].kind is DispositionKind.BLOCKED
+    assert dispositions[0].installation is not None
+    assert dispositions[0].installation.task_block.id == block_id
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("ready_for_planning" in sql for sql in executed)
+    assert runtime.transitions == []
 
 
 class _RecordingCompletionHandoff:

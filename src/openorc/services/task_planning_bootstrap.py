@@ -1507,6 +1507,20 @@ def _dispatch_detached_bootstrap_prepare(
     if producer_external_session_id is None or not producer_external_session_id.strip():
         raise ConflictError("the producer session binding carries no external session identity")
 
+    # --- The fail-closed pre-check (one short transaction): an
+    # already-dispatched stage refuses before any runtime attachment, so a
+    # competing or replayed continuation never acquires the runtime lease
+    # for a dispatch it can never make. The authoritative guard remains the
+    # dispatch transaction's own atomic marker establishment below. ---
+    with composed_transaction(pool) as transaction_pool:
+        evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+        if evidence is None or evidence.claim_token != claim_token or evidence.stage is not None:
+            raise ConflictError(
+                "the planning-bootstrap stage already moved past its PREPARE "
+                "dispatch; the control is never re-dispatched against the "
+                "same one-shot claim"
+            )
+
     with runtime_composition.interaction_lease(
         pool,
         workspace_id=workspace_id,
@@ -1529,9 +1543,16 @@ def _dispatch_detached_bootstrap_prepare(
         # __PREPARE_DISPATCH_TRANSACTION__
 
         # --- The one short dispatch transaction: the durable
-        # PREPARE-dispatch marker (first dispatch only) and the
-        # detached-turn receipt companion, committed strictly before any
-        # runtime effect. ---
+        # PREPARE-dispatch marker (established exactly here, for the first
+        # time) and the detached-turn receipt companion, committed strictly
+        # before any runtime effect. An already-dispatched stage fails
+        # closed without another receipt or runtime admission: the
+        # single-outstanding-receipt constraint protects only unsettled
+        # receipts, so the marker itself is the one-shot guard that keeps a
+        # competing or replayed continuation from ever re-dispatching the
+        # control against the same claim — including after the first
+        # receipt settled, failed, or was refused, and after a Level 2/3
+        # blocking escalation. ---
         with composed_transaction(pool) as transaction_pool:
             evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
             if evidence is None or evidence.claim_token != claim_token:
@@ -1539,22 +1560,22 @@ def _dispatch_detached_bootstrap_prepare(
                     "the planning-bootstrap claim moved on before the detached "
                     "workspace-preparation dispatch; the control is never dispatched"
                 )
-            if evidence.stage is None:
-                if not record_planning_bootstrap_stage(
-                    transaction_pool,
-                    task_id=task_id,
-                    claim_token=claim_token,
-                    stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
-                ):
-                    raise ConflictError(
-                        "the planning-bootstrap stage did not advance to its "
-                        "PREPARE-dispatch marker; the PREPARE control is never "
-                        "dispatched against moved-on bootstrap state"
-                    )
-            elif evidence.stage is not TaskPlanningBootstrapStage.PREPARE_DISPATCHED:
+            if evidence.stage is not None:
                 raise ConflictError(
                     "the planning-bootstrap stage already moved past its "
-                    "PREPARE dispatch; the control is never re-dispatched"
+                    "PREPARE dispatch; the control is never re-dispatched "
+                    "against the same one-shot claim"
+                )
+            if not record_planning_bootstrap_stage(
+                transaction_pool,
+                task_id=task_id,
+                claim_token=claim_token,
+                stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+            ):
+                raise ConflictError(
+                    "the planning-bootstrap stage did not advance to its "
+                    "PREPARE-dispatch marker; the PREPARE control is never "
+                    "dispatched against moved-on bootstrap state"
                 )
             receipt = turn_correlation.record_task_detached_turn_receipt(
                 transaction_pool,
@@ -1701,6 +1722,7 @@ def complete_settled_bootstrap_prepare_transition(
     profile_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> TaskPlanningPreparationOutcome:
     """The observed-completion continuation of the settled bootstrap PREPARE.
 
@@ -1717,7 +1739,10 @@ def complete_settled_bootstrap_prepare_transition(
     Every input is re-derived from committed durable state — the settled
     ``prepared`` stage evidence is the only authority this continuation
     accepts, and a moved-on or unsettled stage fails closed without any
-    runtime effect.
+    runtime effect. With ``attempt_evidence`` the continuation records its
+    own transition-phase attempt identity before the reconstruction, so a
+    failing coordinated invocation reports under the bootstrap claim's
+    transition family exactly as the blocking path does.
     """
     with composed_transaction(pool) as transaction_pool:
         evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
@@ -1749,6 +1774,16 @@ def complete_settled_bootstrap_prepare_transition(
     checkout_failure = _canonical_absolute_path_failure(checkout_directory)
     if checkout_failure is not None:
         raise ConflictError(f"the selected task checkout directory {checkout_failure}")
+    if attempt_evidence is not None:
+        # The same claim identity advances to its transition phase before
+        # the reconstruction: the coordinator reports the phase the failing
+        # invocation reached (issue #262), exactly as the blocking tail does.
+        attempt_evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
+            original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+            original_attempt_id=claim_token,
+            phase="planning_bootstrap_transition",
+        )
     return _complete_prepared_bootstrap_transition(
         pool,
         runtime_composition,

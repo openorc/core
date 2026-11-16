@@ -665,14 +665,18 @@ def _handoff_bootstrap_prepare_completion(
     settled ``prepared`` stage evidence is the only proof that the
     attributable workspace result validated and settled — and, only when
     the durable state proves it, invokes the owning bootstrap service's
-    transition continuation (the one same-session planning-context
-    reconstruction into the exact Task-UUID checkout and the
-    ``ready_for_planning`` settlement) and then submits the next typed
-    initial-plan invocation through the executing process's continuation
-    seam with the fresh post-tail token. Every input is re-derived from
-    committed durable state; a failed or uncertain routing or submission is
-    transport information only, never Task truth, and never permits a blind
-    re-enqueue — the durable state owns recovery.
+    transition continuation under the F5b coordinator's typed failure
+    handoff (the one same-session planning-context reconstruction into the
+    exact Task-UUID checkout and the ``ready_for_planning`` settlement), so
+    a positively detected reconstruction failure reports under the
+    bootstrap claim's transition family exactly as the blocking path does —
+    never an unreported failure stranded on a prepared stage. On success the
+    route submits the next typed initial-plan invocation through the
+    executing process's continuation seam with the fresh post-tail token.
+    Every input is re-derived from committed durable state; a failed or
+    uncertain routing or submission is transport information only, never
+    Task truth, and never permits a blind re-enqueue — the durable state
+    owns recovery.
     """
     pool = dependencies.database_pool()
     task = task_records.get_task(pool, task_id=task_id)
@@ -690,13 +694,27 @@ def _handoff_bootstrap_prepare_completion(
     if workspace is None:  # pragma: no cover - the Task's scope proved it
         return
     runtime_composition = dependencies.task_bootstrap_runtime_composition()
-    outcome = complete_settled_bootstrap_prepare_transition(
+    expected_state_token = task.state_token
+
+    def invoke_level_one(attempt_evidence: InvocationAttemptEvidence) -> None:
+        complete_settled_bootstrap_prepare_transition(
+            pool,
+            runtime_composition,
+            workspace_id=workspace_id,
+            profile_id=workspace.owner_profile_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            attempt_evidence=attempt_evidence,
+        )
+
+    coordinate_task_workflow_operation(
         pool,
-        runtime_composition,
+        expected_status=TaskStatus.PLANNING,
         workspace_id=workspace_id,
-        profile_id=workspace.owner_profile_id,
         task_id=task_id,
-        expected_state_token=task.state_token,
+        profile_id=workspace.owner_profile_id,
+        expected_state_token=expected_state_token,
+        invoke_level_one=invoke_level_one,
     )
     _submit_continuation(
         dependencies,
@@ -709,7 +727,7 @@ def _handoff_bootstrap_prepare_completion(
                     role=WorkflowRoleRef.PRODUCER,
                 ),
                 profile_id=str(workspace.owner_profile_id),
-                expected_state_token=str(outcome.task.state_token),
+                expected_state_token=str(task.state_token),
             ),
         ),
     )

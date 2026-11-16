@@ -1815,6 +1815,7 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
         lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
     )
     transitions: list[dict[str, Any]] = []
+    coordinations: list[dict[str, Any]] = []
 
     def recording_transition(
         _pool: Any,
@@ -1824,6 +1825,7 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
         profile_id: Any,
         task_id: Any,
         expected_state_token: Any,
+        attempt_evidence: Any,
     ) -> Any:
         transitions.append(
             {
@@ -1831,6 +1833,7 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
                 "profile_id": profile_id,
                 "task_id": task_id,
                 "expected_state_token": expected_state_token,
+                "attempt_evidence": attempt_evidence,
             }
         )
         return SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
@@ -1841,6 +1844,22 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
         recording_transition,
     )
 
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        evidence = InvocationAttemptEvidence()
+        kwargs["invoke_level_one"](evidence)
+        coordinations.append(
+            {
+                "expected_status": kwargs["expected_status"],
+                "workspace_id": kwargs["workspace_id"],
+                "task_id": kwargs["task_id"],
+                "profile_id": kwargs["profile_id"],
+                "expected_state_token": kwargs["expected_state_token"],
+                "evidence": evidence,
+            }
+        )
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+
     handoff = task_workflow.build_detached_completion_handoff(dependencies)
     handoff.handoff_settled_completion(
         workspace_id=_WORKSPACE_ID,
@@ -1848,12 +1867,24 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
         operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
     )
 
+    # The transition continuation runs under the F5b coordinator's typed
+    # failure handoff with the committed-state currentness seed.
+    assert [{k: v for k, v in call.items() if k != "evidence"} for call in coordinations] == [
+        {
+            "expected_status": TaskStatus.PLANNING,
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "profile_id": _PROFILE_ID,
+            "expected_state_token": _NEXT_TOKEN,
+        }
+    ]
     assert transitions == [
         {
             "workspace_id": _WORKSPACE_ID,
             "profile_id": _PROFILE_ID,
             "task_id": _TASK_ID,
             "expected_state_token": _NEXT_TOKEN,
+            "attempt_evidence": coordinations[0]["evidence"],
         }
     ]
     assert len(submitter.submissions) == 1
@@ -1904,6 +1935,11 @@ def test_the_completion_handoff_ignores_a_bootstrap_stage_that_is_not_prepared(
         "complete_settled_bootstrap_prepare_transition",
         lambda *args, **kwargs: transitions.append(kwargs),
     )
+
+    def refusing_coordinate(pool: Any, **kwargs: Any) -> None:
+        raise AssertionError("the coordinator must not run for a non-prepared stage")
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", refusing_coordinate)
 
     handoff = task_workflow.build_detached_completion_handoff(dependencies)
     handoff.handoff_settled_completion(
