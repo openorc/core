@@ -43,11 +43,19 @@ every external runtime operation performed outside Postgres transactions:
 4. PREPARE phase (external, no transaction open) — one typed
    ``PrepareWorkspaceInteraction`` (#181) rendered from the authoritative
    repository address, GitHub issue number, Task UUID, and the selected
-   checkout path, realized on the exact bound Producer session through the
-   injected interaction lease; only the shared-parser-validated
-   ``WorkspaceResult`` reporting the requested operation as COMPLETED
-   enables planning, and every other outcome stops progression with the
-   partial facts retained;
+   checkout path. With an observation registrar the regular-mode path
+   (issue #334) dispatches it as ONE detached agent turn — the durable
+   ``prepare_dispatched`` marker and the detached-turn receipt commit in
+   one short transaction, the observation registers positively, the
+   rendered control is admitted verbatim, and the dispatching continuation
+   returns; the independently observed completion settles the receipt and
+   the ``prepared`` stage, and the ONE post-commit completion handoff owns
+   the planning-context transition and the next typed invocation. Without
+   one — the queue-mode interim until #328 — the control is realized on
+   the exact bound Producer session through the injected interaction lease
+   exactly as before; only the shared-parser-validated ``WorkspaceResult``
+   reporting the requested operation as COMPLETED enables planning, and
+   every other outcome stops progression with the partial facts retained;
 5. post-PREPARE recheck (one short transaction) — the same exact
    Task/token/claim/binding-identity currentness check;
 6. planning-context transition (external) — one runtime-neutral
@@ -80,14 +88,15 @@ from __future__ import annotations
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -96,6 +105,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
@@ -109,6 +119,7 @@ from openorc.persistence.connections import get_connection
 from openorc.persistence.detached_turns import (
     get_latest_session_initialization_receipt,
     get_outstanding_task_detached_turn_receipt,
+    refuse_task_detached_turn_receipt,
 )
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -127,12 +138,16 @@ from openorc.protocol.models import (
     WORKSPACE_RESULT_FAMILY,
     WorkspaceResult,
 )
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
@@ -158,6 +173,8 @@ __all__ = [
     "TaskPlanningPreparationOutcome",
     "WorkspacePreparationFailedError",
     "complete_resumed_bootstrap_prepare",
+    "complete_settled_bootstrap_prepare_transition",
+    "settle_observed_bootstrap_prepare_result",
     "find_resumable_bootstrap_continuation",
     "prepare_task_for_planning",
 ]
@@ -304,16 +321,18 @@ class TaskPlanningPreparationOutcome:
 
 @dataclass(frozen=True, slots=True)
 class TaskPlanningBootstrapDispatchOutcome:
-    """The detached establishment's dispatched suspension (issue #324).
+    """A detached bootstrap turn's dispatched suspension (issues #324/#334).
 
-    Safe, non-secret facts only: the current post-claim Task (whose state
-    token is the claim's rotation), the exactly-once claim identity, and that
-    rotated token. Both initialization turns are durably enqueued (or one
-    role already READY while the other's receipt is outstanding); the
-    dispatching worker returns without waiting for ``session_ready``, and
-    the observed completions settle readiness and resume the bootstrap
-    through the post-commit continuation trigger. No runtime result, no
-    bound external identity, and no PREPARE has happened.
+    Safe, non-secret facts only: the current Task, the exactly-once claim
+    identity, and the post-claim token. Either both initialization turns
+    are durably enqueued (or one role already READY while the other's
+    receipt is outstanding — issue #324) or the canonical PREPARE control
+    is durably enqueued on the original Producer session (issue #334); the
+    dispatching worker returns without waiting for the turn's completion,
+    and the observed completions settle the outstanding stage and resume
+    the bootstrap through the post-commit continuation trigger. No runtime
+    result, no bound external identity for a pending establishment, and no
+    validated workspace result has happened yet.
     """
 
     task: Task
@@ -322,7 +341,7 @@ class TaskPlanningBootstrapDispatchOutcome:
 
 
 class _ClaimedBootstrapDisposition(StrEnum):
-    """The claimed-bootstrap disposition matrix (issue #324).
+    """The claimed-bootstrap disposition matrix (issues #324/#334).
 
     Read off the durable establishment receipts, binding lifecycle, and
     settled stage evidence alone:
@@ -331,16 +350,24 @@ class _ClaimedBootstrapDisposition(StrEnum):
       outstanding and no PREPARE yet dispatched — the readiness-resumed
       continuation proceeds past establishment;
     - ``in_progress``: every non-READY binding carries an outstanding
-      initialization receipt — the establishments are durably dispatched and
-      their completions own the resumption; a replayed invocation
-      dispatches nothing;
+      initialization receipt, or the durably dispatched PREPARE's own
+      receipt is still outstanding — the enqueued turns are durably
+      dispatched and their completions own the resumption; a replayed
+      invocation dispatches nothing;
     - ``unresolved_connecting``: a CONNECTING binding with no outstanding
       initialization receipt — the prior creation/admission outcome is
       unknowable from durable state, or its dispatch was refused or
       positively failed; another creation can never be proven safe;
     - ``unresolved_past_establishment``: settled stage evidence past
-      establishment — whether the outstanding bootstrap work ran is
-      unprovable.
+      establishment without a provably safe resumption — a settled
+      PREPARE receipt without a newer stage, a settled ``prepared`` stage
+      whose transition is outstanding, or a published plan revision;
+      whether the outstanding bootstrap work ran is unprovable;
+    - ``plan_pending``: the bootstrap resolved through
+      ``ready_for_planning`` with no published plan revision — the
+      resubmitted continuation re-derives the prepared outcome from
+      committed durable state with zero bootstrap runtime effects and the
+      initial plan production proceeds from it (issue #334).
 
     Both unresolved variants fail closed with zero runtime effects for
     Owner/recovery handling.
@@ -350,6 +377,7 @@ class _ClaimedBootstrapDisposition(StrEnum):
     IN_PROGRESS = "in_progress"
     UNRESOLVED_CONNECTING = "unresolved_connecting"
     UNRESOLVED_PAST_ESTABLISHMENT = "unresolved_past_establishment"
+    PLAN_PENDING = "plan_pending"
 
     def message(
         self,
@@ -377,20 +405,48 @@ def _classify_claimed_bootstrap(
     producer: TaskAgentSession,
     reviewer: TaskAgentSession,
     stage: TaskPlanningBootstrapStage | None,
+    plan_revision_published: bool,
 ) -> _ClaimedBootstrapDisposition:
     """Classify one claimed bootstrap from the durable facts alone.
 
-    The stage evidence past establishment is the existing fail-closed
-    unresolved classification (whether the outstanding bootstrap work ran is
-    unprovable). With no settled stage, every binding must be provably
-    dispatched by the detached establishment machinery — CONNECTING with an
-    outstanding ``session_initialization`` receipt, or READY with a settled
-    one (its initialization receipt is the establishment provenance) —
-    before the bootstrap can be trusted as in-progress or resumable. A READY
-    binding with no initialization receipt was established by the blocking
-    handshake (or predates the receipt vocabulary): its post-establishment
-    bootstrap work stays honestly unprovable, exactly as before issue #324.
+    The stage evidence past establishment is evidence-based (issue #334): a
+    durably dispatched PREPARE whose own receipt is still outstanding is
+    in-progress work the observed completion owns — never re-dispatched —
+    while a settled PREPARE receipt without a newer stage, a settled
+    ``prepared`` stage, or a published plan revision stays the existing
+    fail-closed unresolved classification. A ``ready_for_planning`` stage
+    with no published plan revision is the resolved bootstrap whose
+    resubmitted continuation re-derives the prepared outcome from durable
+    state with zero runtime effects. With no settled stage, every binding
+    must be provably dispatched by the detached establishment machinery —
+    CONNECTING with an outstanding ``session_initialization`` receipt, or
+    READY with a settled one (its initialization receipt is the
+    establishment provenance) — before the bootstrap can be trusted as
+    in-progress or resumable. A READY binding with no initialization
+    receipt was established by the blocking handshake (or predates the
+    receipt vocabulary): its post-establishment bootstrap work stays
+    honestly unprovable, exactly as before issue #324.
     """
+    if stage is TaskPlanningBootstrapStage.READY_FOR_PLANNING:
+        if plan_revision_published:
+            # The bootstrap resolved and the initial plan already landed;
+            # the resubmitted continuation is stale.
+            return _ClaimedBootstrapDisposition.UNRESOLVED_PAST_ESTABLISHMENT
+        return _ClaimedBootstrapDisposition.PLAN_PENDING
+    if stage is TaskPlanningBootstrapStage.PREPARE_DISPATCHED:
+        producer_receipt = get_outstanding_task_detached_turn_receipt(
+            transaction_pool, task_agent_session_id=producer.id
+        )
+        if (
+            producer_receipt is not None
+            and producer_receipt.operation
+            is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE
+        ):
+            # The canonical PREPARE turn is durably enqueued and unobserved
+            # (issue #334): the observed completion owns the resumption and
+            # a replayed continuation dispatches nothing.
+            return _ClaimedBootstrapDisposition.IN_PROGRESS
+        return _ClaimedBootstrapDisposition.UNRESOLVED_PAST_ESTABLISHMENT
     if stage is not None:
         return _ClaimedBootstrapDisposition.UNRESOLVED_PAST_ESTABLISHMENT
     producer_receipt = get_outstanding_task_detached_turn_receipt(
@@ -858,13 +914,14 @@ def prepare_task_for_planning(
                     producer=producer,
                     reviewer=reviewer,
                     stage=None if evidence is None else evidence.stage,
+                    plan_revision_published=task.current_plan_revision_id is not None,
                 )
                 if disposition is _ClaimedBootstrapDisposition.IN_PROGRESS:
-                    # Every non-READY binding carries an outstanding
-                    # initialization receipt: the establishments are durably
-                    # dispatched and their completions own the resumption.
-                    # This replayed invocation dispatches nothing, never
-                    # re-creates, and never re-enqueues.
+                    # The establishments are durably dispatched (issue #324)
+                    # or the canonical PREPARE turn is durably enqueued and
+                    # unobserved (issue #334): the observed completions own
+                    # the resumption. This replayed invocation dispatches
+                    # nothing, never re-creates, and never re-enqueues.
                     if attempt_evidence is not None:
                         # The claimed bootstrap's original identity travels
                         # on the no-effect replay for the coordinator's
@@ -874,6 +931,39 @@ def prepare_task_for_planning(
                         task=task,
                         claim_token=existing_claim,
                         post_claim_token=task.state_token,
+                    )
+                if disposition is _ClaimedBootstrapDisposition.PLAN_PENDING:
+                    # The bootstrap resolved through ``ready_for_planning``
+                    # with no published plan revision (issue #334):
+                    # re-derive the prepared outcome from committed durable
+                    # state with zero bootstrap runtime effects and let the
+                    # composed initial plan production proceed from it.
+                    resolved_producer = _require_ready_binding(
+                        transaction_pool,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        role=WorkflowRole.PRODUCER,
+                    )
+                    resolved_reviewer = _require_ready_binding(
+                        transaction_pool,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        role=WorkflowRole.REVIEWER,
+                    )
+                    original_base = _producer_snapshot_repository_base(
+                        transaction_pool, resolved_producer, workspace_id=workspace_id
+                    )
+                    checkout_directory = f"{original_base}/{task.id}"
+                    checkout_failure = _canonical_absolute_path_failure(checkout_directory)
+                    if checkout_failure is not None:
+                        raise ConflictError(
+                            f"the selected task checkout directory {checkout_failure}"
+                        )
+                    return TaskPlanningPreparationOutcome(
+                        task=task,
+                        producer_session=resolved_producer,
+                        reviewer_session=resolved_reviewer,
+                        producer_checkout_directory=checkout_directory,
                     )
                 if disposition is _ClaimedBootstrapDisposition.RESUMABLE:
                     # Every establishment settled into READY with nothing
@@ -1045,6 +1135,36 @@ def prepare_task_for_planning(
         # a possibly-delivered control, and the send's outcome — whatever it
         # is — leaves the honest ``prepare_dispatched`` stage evidence for
         # the existing fail-closed recovery semantics. ---
+        repository_full_name = f"{repository.metadata.owner_login}/{repository.metadata.name}"
+        if observation_registrar is not None:
+            # The detached workspace-preparation dispatch (issue #334): the
+            # regular-mode path records the dispatch marker and the
+            # detached-turn receipt in one short transaction, registers the
+            # observation positively, and enqueues the rendered canonical
+            # control as one detached turn on the exact bound Producer
+            # session — then returns; the observed completion owns the
+            # settlement and the resumption. The queue-mode interim (until
+            # #328) keeps the blocking control below.
+            if completion_handoff is None:
+                raise InvalidCommandError(
+                    "the detached workspace-preparation dispatch requires "
+                    "its post-commit completion handoff"
+                )
+            return _dispatch_detached_bootstrap_prepare(
+                pool,
+                runtime_composition,
+                observation_registrar,
+                completion_handoff,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                claim_token=claim_token,
+                post_claim_token=post_claim_token,
+                task=task,
+                producer=producer,
+                repository_full_name=repository_full_name,
+                checkout_directory=checkout_directory,
+                attempt_evidence=attempt_evidence,
+            )
         if not record_planning_bootstrap_stage(
             pool,
             task_id=task_id,
@@ -1057,7 +1177,7 @@ def prepare_task_for_planning(
                 "bootstrap state"
             )
         interaction = PrepareWorkspaceInteraction(
-            repository_full_name=(f"{repository.metadata.owner_login}/{repository.metadata.name}"),
+            repository_full_name=repository_full_name,
             issue_number=task.github_issue_number,
             task_uuid=task.id,
             target_directory=checkout_directory,
@@ -1180,6 +1300,46 @@ def _complete_prepared_bootstrap_tail(
             phase="planning_bootstrap_transition",
         )
 
+    return _complete_prepared_bootstrap_transition(
+        pool,
+        runtime_composition,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        task_id=task_id,
+        claim_token=claim_token,
+        expected_state_token=expected_state_token,
+        producer=producer,
+        reviewer=reviewer,
+        checkout_directory=checkout_directory,
+        attempt_evidence=attempt_evidence,
+    )
+
+
+def _complete_prepared_bootstrap_transition(
+    pool: DatabasePool,
+    runtime_composition: TaskBootstrapRuntimeComposition,
+    *,
+    workspace_id: UUID,
+    profile_id: UUID,
+    task_id: UUID,
+    claim_token: UUID,
+    expected_state_token: UUID,
+    producer: TaskAgentSession,
+    reviewer: TaskAgentSession,
+    checkout_directory: str,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> TaskPlanningPreparationOutcome:
+    """The effectful planning-context transition of the settled bootstrap.
+
+    The post-PREPARE subject recheck, the one runtime-neutral
+    planning-context transition (external, no transaction open; no PLAN
+    control is ever sent here), the ``ready_for_planning`` settlement
+    evidence, and the final recheck. The stage recording lives with each
+    path's own settlement: the blocking/resume tail records ``prepared``
+    immediately before this transition, and the detached
+    observed-completion settlement recorded it inside its settlement
+    transaction (issue #334).
+    """
     _recheck_bootstrap_subject(
         pool,
         workspace_id=workspace_id,
@@ -1253,7 +1413,426 @@ def _complete_prepared_bootstrap_tail(
     )
 
 
+_PREPARE_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_PREPARE_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+
+
+def _refuse_dispatched_bootstrap_receipt_quietly(
+    pool: DatabasePool, receipt: TaskDetachedTurnReceipt, *, refusal_kind: str
+) -> None:
+    """Mark a claimed bootstrap receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises; the claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused bootstrap receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        return
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the bootstrap receipt was no longer claimed when its pre-effect refusal was recorded"
+        )
+
+
+def _dispatch_detached_bootstrap_prepare(
+    pool: DatabasePool,
+    runtime_composition: TaskBootstrapRuntimeComposition,
+    observation_registrar: EstablishmentObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    claim_token: UUID,
+    post_claim_token: UUID,
+    task: Task,
+    producer: TaskAgentSession,
+    repository_full_name: str,
+    checkout_directory: str,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> TaskPlanningBootstrapDispatchOutcome:
+    """Dispatch the canonical PREPARE control as one detached agent turn.
+
+    The detached counterpart of the blocking workspace-preparation phase
+    (issues #325/#334): the same composed canonical
+    ``PrepareWorkspaceInteraction`` becomes one admitted, independently
+    completed agent turn on the exact READY Producer session at the
+    immutable repository base — one positively-required observation
+    registration on the exact bound session, and one detached-turn
+    admission of the rendered control verbatim. No ``send`` and no blocking
+    wait exists in this path, and no database transaction is ever held
+    across a runtime call.
+
+    The durable PREPARE-dispatch marker (issue #324; first dispatch only —
+    a retried dispatch after a settled receipt keeps the already-recorded
+    marker) and the detached-turn receipt companion (``planning_bootstrap_prepare``
+    rooted at the one-shot claim identity, expecting the canonical
+    ``workspace_result`` family) commit in one short transaction strictly
+    before any runtime effect. The dispatching continuation returns after
+    the acknowledgement attach; the observed completion owns the
+    settlement, and the ONE post-commit completion handoff owns the
+    planning-context transition and the next typed invocation. A staged
+    early completion settled within this dispatch invokes the handoff here
+    strictly post-commit — exactly one of the dispatching path and the
+    observation path settles a given receipt.
+
+    Proven pre-effect failures refuse the receipt and raise the typed
+    operational-failure classes the F5b coordinator triages under the
+    claim's own family: a registration refusal or a positively identified
+    admission refusal is ``ExternalOperationFailedError`` (the control was
+    never delivered), and an uncertain admission is
+    ``ExternalOperationUncertainError`` with the receipt conservatively
+    claimed and never re-dispatched.
+    """
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the bootstrap observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    producer_external_session_id = producer.external_session_id
+    if producer_external_session_id is None or not producer_external_session_id.strip():
+        raise ConflictError("the producer session binding carries no external session identity")
+
+    # --- The fail-closed pre-check (one short transaction): an
+    # already-dispatched stage refuses before any runtime attachment, so a
+    # competing or replayed continuation never acquires the runtime lease
+    # for a dispatch it can never make. The authoritative guard remains the
+    # dispatch transaction's own atomic marker establishment below. ---
+    with composed_transaction(pool) as transaction_pool:
+        evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+        if evidence is None or evidence.claim_token != claim_token or evidence.stage is not None:
+            raise ConflictError(
+                "the planning-bootstrap stage already moved past its PREPARE "
+                "dispatch; the control is never re-dispatched against the "
+                "same one-shot claim"
+            )
+
+    with runtime_composition.interaction_lease(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        external_session_id=producer_external_session_id,
+    ) as adapter:
+        # The detached capability is duck-typed fail-closed BEFORE any
+        # durable dispatch effect: a runtime without it cannot serve the
+        # detached dispatch, and no receipt was ever recorded.
+        admit = getattr(adapter, "admit_detached_turn", None)
+        if not callable(admit):
+            raise InvalidCommandError(
+                "the runtime adapter does not implement the detached turn capability"
+            )
+        admit_detached_turn = cast(
+            Callable[[str, str], AgentTurnAdmission],
+            admit,
+        )
+        # __PREPARE_DISPATCH_TRANSACTION__
+
+        # --- The one short dispatch transaction: the durable
+        # PREPARE-dispatch marker (established exactly here, for the first
+        # time) and the detached-turn receipt companion, committed strictly
+        # before any runtime effect. An already-dispatched stage fails
+        # closed without another receipt or runtime admission: the
+        # single-outstanding-receipt constraint protects only unsettled
+        # receipts, so the marker itself is the one-shot guard that keeps a
+        # competing or replayed continuation from ever re-dispatching the
+        # control against the same claim — including after the first
+        # receipt settled, failed, or was refused, and after a Level 2/3
+        # blocking escalation. ---
+        with composed_transaction(pool) as transaction_pool:
+            evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+            if evidence is None or evidence.claim_token != claim_token:
+                raise ConflictError(
+                    "the planning-bootstrap claim moved on before the detached "
+                    "workspace-preparation dispatch; the control is never dispatched"
+                )
+            if evidence.stage is not None:
+                raise ConflictError(
+                    "the planning-bootstrap stage already moved past its "
+                    "PREPARE dispatch; the control is never re-dispatched "
+                    "against the same one-shot claim"
+                )
+            if not record_planning_bootstrap_stage(
+                transaction_pool,
+                task_id=task_id,
+                claim_token=claim_token,
+                stage=TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+            ):
+                raise ConflictError(
+                    "the planning-bootstrap stage did not advance to its "
+                    "PREPARE-dispatch marker; the PREPARE control is never "
+                    "dispatched against moved-on bootstrap state"
+                )
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer.id,
+                operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+                original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+                original_attempt_id=claim_token,
+                expected_formal_family=WORKSPACE_RESULT_FAMILY,
+            )
+
+        interaction = PrepareWorkspaceInteraction(
+            repository_full_name=repository_full_name,
+            issue_number=task.github_issue_number,
+            task_uuid=task.id,
+            target_directory=checkout_directory,
+        )
+
+        # __PREPARE_REGISTRATION_AND_ADMISSION__
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect
+        # failure: the just-recorded receipt is marked refused so a
+        # never-dispatched turn cannot hold the session's
+        # single-outstanding slot, and the typed pre-effect failure triages
+        # under the claim's own family (issue #334). ---
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer.id,
+                connection_id=producer.connection_id,
+                external_session_id=producer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_dispatched_bootstrap_receipt_quietly(
+                pool, receipt, refusal_kind=_PREPARE_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the workspace-preparation observation registration was "
+                "refused before any admission; the control never dispatched"
+            ) from error
+        except Exception as error:
+            from openorc.services.task_detached_turn_observation import (  # noqa: PLC0415
+                ObservationRegistrationRefusalReason,
+            )
+
+            _refuse_dispatched_bootstrap_receipt_quietly(
+                pool, receipt, refusal_kind=_PREPARE_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the workspace-preparation observation registration failed "
+                f"({ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value}) "
+                "before any admission; the control never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One
+        # detached-turn admission of the rendered canonical control
+        # verbatim. ---
+        try:
+            admission = admit_detached_turn(producer_external_session_id, interaction.render())
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached workspace-preparation admission ended with an "
+                "uncertain outcome; the receipt stays conservatively claimed "
+                "and is never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the workspace-preparation admission is "
+                "unknown; the receipt stays conservatively claimed and the "
+                "control is never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_dispatched_bootstrap_receipt_quietly(
+                pool, receipt, refusal_kind=_PREPARE_ADMISSION_REFUSAL_KIND
+            )
+            raise ExternalOperationRejectedError(
+                "the workspace-preparation admission was refused before any "
+                "effect; the receipt is refused and the control never "
+                "dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated workspace result that
+        # finished before the acknowledgement was persisted is correlated,
+        # never ignored or duplicated. ---
+        try:
+            outcome = turn_correlation.attach_acknowledged_turn(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                receipt_id=receipt.id,
+                admitted_turn_reference=admission.turn_reference,
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the workspace-preparation acknowledgement could not be "
+                "durably attached after its known admission; authoritative "
+                "recovery is required and the control is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the receipt and the prepared
+        # stage within this dispatch (issue #334): the ONE post-commit
+        # completion handoff owns the family routing. Strictly post-commit,
+        # contained, never a workflow authority; a failed routing leaves
+        # the durable state to the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch workspace-preparation completion handoff "
+                "failed (%s); the durable state owns recovery",
+                type(error).__name__,
+            )
+    return TaskPlanningBootstrapDispatchOutcome(
+        task=task,
+        claim_token=claim_token,
+        post_claim_token=post_claim_token,
+    )
+
+
 # __CHUNK_APPEND_MARKER__
+
+
+def complete_settled_bootstrap_prepare_transition(
+    pool: DatabasePool,
+    runtime_composition: TaskBootstrapRuntimeComposition,
+    *,
+    workspace_id: UUID,
+    profile_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> TaskPlanningPreparationOutcome:
+    """The observed-completion continuation of the settled bootstrap PREPARE.
+
+    The detached workspace-preparation settlement (issue #334) recorded the
+    validated result's ``prepared`` stage inside its own settlement
+    transaction; this continuation owns the effectful resumption from that
+    committed state: the exact READY bindings, the checkout directory from
+    the durable Producer snapshot, the post-PREPARE recheck, the one
+    runtime-neutral planning-context transition into the exact Task-UUID
+    checkout (no extra initialization, no mode-notice prompt; the runtime's
+    own same-session serialization refuses to displace admitted,
+    autonomous, uncertain, or competing same-session work), the
+    ``ready_for_planning`` settlement evidence, and the final recheck.
+    Every input is re-derived from committed durable state — the settled
+    ``prepared`` stage evidence is the only authority this continuation
+    accepts, and a moved-on or unsettled stage fails closed without any
+    runtime effect. With ``attempt_evidence`` the continuation records its
+    own transition-phase attempt identity before the reconstruction, so a
+    failing coordinated invocation reports under the bootstrap claim's
+    transition family exactly as the blocking path does.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        evidence = get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+        if evidence is None:
+            raise NotFoundError("the requested task's planning bootstrap is not available")
+        if evidence.stage is not TaskPlanningBootstrapStage.PREPARED:
+            raise ConflictError(
+                "the bootstrap's settled PREPARE stage is not the prepared "
+                "handoff state; the transition continuation is stale and "
+                "never re-runs the workspace preparation"
+            )
+        claim_token = evidence.claim_token
+        producer = _require_ready_binding(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=WorkflowRole.PRODUCER,
+        )
+        reviewer = _require_ready_binding(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=WorkflowRole.REVIEWER,
+        )
+        original_base = _producer_snapshot_repository_base(
+            transaction_pool, producer, workspace_id=workspace_id
+        )
+    checkout_directory = f"{original_base}/{task_id}"
+    checkout_failure = _canonical_absolute_path_failure(checkout_directory)
+    if checkout_failure is not None:
+        raise ConflictError(f"the selected task checkout directory {checkout_failure}")
+    if attempt_evidence is not None:
+        # The same claim identity advances to its transition phase before
+        # the reconstruction: the coordinator reports the phase the failing
+        # invocation reached (issue #262), exactly as the blocking tail does.
+        attempt_evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_TRANSITION,
+            original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+            original_attempt_id=claim_token,
+            phase="planning_bootstrap_transition",
+        )
+    return _complete_prepared_bootstrap_transition(
+        pool,
+        runtime_composition,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        task_id=task_id,
+        claim_token=claim_token,
+        expected_state_token=expected_state_token,
+        producer=producer,
+        reviewer=reviewer,
+        checkout_directory=checkout_directory,
+        attempt_evidence=None,
+    )
+
+
+def settle_observed_bootstrap_prepare_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    claim_token: UUID,
+) -> bool:
+    """Record the validated observed PREPARE result's ``prepared`` stage.
+
+    The detached workspace-preparation settlement's bootstrap-owned stage
+    settlement (issue #334), composed inside the settlement routing's own
+    transaction: the routing has already validated the attributable formal
+    result against the shared contract and its PREPARE/COMPLETED semantics,
+    and this is the owning service's claim-bound forward-only stage
+    recording — the durable proof that the attributable workspace result
+    validated and settled. A moved-on subject (a Task no longer in its
+    coarse planning state or one that already published a plan revision)
+    returns ``False`` — the routing settles the receipt as
+    result-not-applied instead of manufacturing stage history — and a
+    rejected forward-only write is ``False`` for the same reason. The stage
+    write never rotates the Task ``state_token`` and composes no workflow
+    transition.
+    """
+    task = get_task(transaction_pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if task.status is not TaskStatus.PLANNING or task.current_plan_revision_id is not None:
+        return False
+    return record_planning_bootstrap_stage(
+        transaction_pool,
+        task_id=task_id,
+        claim_token=claim_token,
+        stage=TaskPlanningBootstrapStage.PREPARED,
+    )
 
 
 def complete_resumed_bootstrap_prepare(

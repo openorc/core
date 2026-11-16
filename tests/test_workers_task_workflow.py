@@ -26,7 +26,11 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
-from openorc.services.errors import ConflictError, StaleOperationError
+from openorc.services.errors import (
+    ConflictError,
+    ExternalOperationFailedError,
+    StaleOperationError,
+)
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
@@ -1774,6 +1778,245 @@ def test_the_completion_handoff_presents_the_exact_head_pr_gate_for_the_implemen
     assert presentations[0]["expected_state_token"] == _NEXT_TOKEN
     assert presentations[0]["execution_id"] is None
     assert presentations[0]["attempt_evidence"] is not None
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The workspace-PREPARE route (issue #334): the settled ``prepared``
+    stage is the only authority — the transition continuation runs from
+    committed state and the next typed initial-plan invocation is submitted
+    with the fresh post-tail token through the shared continuation seam.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    claim_token = UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a")
+    evidence = SimpleNamespace(
+        claim_token=claim_token,
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    transitions: list[dict[str, Any]] = []
+    coordinations: list[dict[str, Any]] = []
+
+    def recording_transition(
+        _pool: Any,
+        _composition: Any,
+        *,
+        workspace_id: Any,
+        profile_id: Any,
+        task_id: Any,
+        expected_state_token: Any,
+        attempt_evidence: Any,
+    ) -> Any:
+        transitions.append(
+            {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
+                "task_id": task_id,
+                "expected_state_token": expected_state_token,
+                "attempt_evidence": attempt_evidence,
+            }
+        )
+        return SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
+
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        recording_transition,
+    )
+
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        evidence = InvocationAttemptEvidence()
+        kwargs["invoke_level_one"](evidence)
+        coordinations.append(
+            {
+                "expected_status": kwargs["expected_status"],
+                "workspace_id": kwargs["workspace_id"],
+                "task_id": kwargs["task_id"],
+                "profile_id": kwargs["profile_id"],
+                "expected_state_token": kwargs["expected_state_token"],
+                "evidence": evidence,
+            }
+        )
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+    )
+
+    # The transition continuation runs under the F5b coordinator's typed
+    # failure handoff with the committed-state currentness seed.
+    assert [{k: v for k, v in call.items() if k != "evidence"} for call in coordinations] == [
+        {
+            "expected_status": TaskStatus.PLANNING,
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "profile_id": _PROFILE_ID,
+            "expected_state_token": _NEXT_TOKEN,
+        }
+    ]
+    assert transitions == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "profile_id": _PROFILE_ID,
+            "task_id": _TASK_ID,
+            "expected_state_token": _NEXT_TOKEN,
+            "attempt_evidence": coordinations[0]["evidence"],
+        }
+    ]
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is task_workflow.OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
+    payload = submitted.payload
+    assert isinstance(payload, task_workflow.TaskPlanningBootstrapAndInitialPlanPayload)
+    assert payload.task.workspace_id == str(_WORKSPACE_ID)
+    assert payload.task.task_id == str(_TASK_ID)
+    assert payload.profile_id == str(_PROFILE_ID)
+    assert payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_completion_handoff_reports_a_failing_coordinated_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positively detected reconstruction failure in the coordinated
+
+    transition propagates from the coordinator unchanged after its typed
+    failure handoff: the observation host contains it, and the durable
+    state — the prepared stage with the Level 2/3 blocking consequence —
+    owns recovery. The BLOCKED disposition itself is proven at the service
+    level against the real coordinator and disposition machinery.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    evidence = SimpleNamespace(
+        claim_token=UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a"),
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ExternalOperationFailedError("the planning-context transition failed")
+        ),
+    )
+
+    def failing_coordinate(pool: Any, **kwargs: Any) -> None:
+        kwargs["invoke_level_one"](InvocationAttemptEvidence())
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", failing_coordinate)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(ExternalOperationFailedError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+        )
+
+    # A failed transition is never a submission authorization.
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_ignores_a_bootstrap_stage_that_is_not_prepared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durably dispatched (not yet settled) or already-transitioned stage
+
+    is not the settled handoff state: the route continues nothing and
+    submits nothing — the durable state owns every other path.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    evidence = SimpleNamespace(
+        claim_token=UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a"),
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARE_DISPATCHED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    transitions: list[Any] = []
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        lambda *args, **kwargs: transitions.append(kwargs),
+    )
+
+    def refusing_coordinate(pool: Any, **kwargs: Any) -> None:
+        raise AssertionError("the coordinator must not run for a non-prepared stage")
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", refusing_coordinate)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+    )
+
+    assert transitions == []
     assert submitter.submissions == []
 
 

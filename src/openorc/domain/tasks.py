@@ -114,9 +114,13 @@ class TaskPlanningBootstrapStage(StrEnum):
     bootstrap whose stage is still ``None`` has an outstanding PREPARE/control
     (or an unresolved establishment); ``prepare_dispatched`` (issue #324)
     records that the PREPARE control was durably claimed for dispatch
-    strictly before its runtime send — the replay guard that keeps a
+    strictly before its runtime dispatch — the replay guard that keeps a
     possibly-delivered control from ever being re-dispatched by a replayed
-    or raced post-readiness continuation; ``prepared`` records the validated
+    or raced post-readiness continuation. With the detached dispatch
+    (issue #334) the same marker is the outstanding PREPARE receipt's stage
+    evidence: until the observed completion settles the result, the marker
+    is the still-current failed-operation state the existing Level 2/3
+    family machinery recognizes; ``prepared`` records the validated
     ``workspace_result`` settlement of the PREPARE control; and
     ``ready_for_planning`` records the settled planning-context transition —
     a continuation waiting for the first PLAN dispatch. The stages are

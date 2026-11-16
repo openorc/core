@@ -74,10 +74,12 @@ reference routes a positively classified failure through the same typed
 operation-failure path; a completed status alone is never success or result
 evidence.
 
-v1 scope note: only the execution families (E6 implementation and E9
-PR-remediation) carry settlement routing here; the remaining operation
-families gain theirs with their own detached migrations (#325), and routing
-refuses them fail-closed until then.
+v1 scope note: the execution families (E6 implementation and E9
+PR-remediation), the session-initialization establishment (issue #324), and
+the detached workspace-preparation PREPARE control (issue #334) carry
+settlement routing here; the remaining operation families gain theirs with
+their own detached migrations (#325), and routing refuses them fail-closed
+until then.
 """
 
 from __future__ import annotations
@@ -119,7 +121,7 @@ from openorc.domain.operational_failures import (
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskSessionLifecycleStatus
-from openorc.domain.tasks import TaskStatus
+from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
@@ -130,9 +132,11 @@ from openorc.protocol.errors import ProtocolError
 from openorc.protocol.models import (
     FORMAL_RESPONSE_FAMILIES,
     IMPLEMENTATION_RESULT_FAMILY,
+    WORKSPACE_OPERATION_PREPARE,
     FormalResponse,
     ImplementationResult,
     SessionReady,
+    WorkspaceResult,
 )
 from openorc.protocol.parsing import parse_formal_response
 from openorc.services import event_coordination
@@ -576,6 +580,15 @@ def _route_observed_terminal(
             outcome=outcome,
             ordering_marker=ordering_marker,
         )
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE:
+        return _route_bootstrap_prepare_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
+        )
     raise ConflictError(
         "the receipt's operation family has no detached settlement routing yet; "
         "the observation is left unresolved"
@@ -922,7 +935,7 @@ def _safe_provenance_str(provenance: Mapping[str, object], key: str) -> str | No
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _settle_establishment_failure(
+def _settle_bootstrap_claim_failure(
     transaction_pool: DatabasePool,
     *,
     workspace_id: UUID,
@@ -931,17 +944,23 @@ def _settle_establishment_failure(
     ordering_marker: int | None,
     error_code: OperationalFailureCode,
     failure_kind: str,
+    diagnostic_observation: str,
 ) -> TurnSettlementOutcome:
-    """Settle one positively established genuine initialization failure.
+    """Settle one positively established genuine bootstrap-claim turn failure.
 
     The receipt settles truthfully (``observed_failure``) and the failure
     reports through the existing typed operation-failure path (Level 2)
     under the bootstrap claim's established family — the same family the
     blocking establishment's failures have always reported under. The
-    binding stays CONNECTING (never LOST for an observed turn failure) and
-    the establishment is never re-dispatched: the initialize-once discipline
-    leaves the durable unresolved state to the existing recovery semantics.
-    The report is a typed no-op when it no longer addresses current work.
+    establishment case keeps the binding CONNECTING (never LOST for an
+    observed turn failure) and the establishment is never re-dispatched:
+    the initialize-once discipline leaves the durable unresolved state to
+    the existing recovery semantics. The durably dispatched PREPARE state
+    (issue #334) is the family's still-current failed operation, so a
+    confirmed detached PREPARE failure escalates through the existing
+    disposition machinery to its blocking outcome instead of being silently
+    rejected as stale. The report is a typed no-op when it no longer
+    addresses current work.
     """
     settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
@@ -971,7 +990,7 @@ def _settle_establishment_failure(
         reporting_attempt_id=receipt.original_attempt_id,
         error_code=error_code,
         effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
-        diagnostic_context={"observation": "observed_turn_initialization_failure"},
+        diagnostic_context={"observation": diagnostic_observation},
     )
     disposition = triage_operational_failure(
         transaction_pool,
@@ -988,6 +1007,217 @@ def _settle_establishment_failure(
         kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
         receipt=settled,
         disposition=disposition,
+    )
+
+
+def _settle_establishment_failure(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    ordering_marker: int | None,
+    error_code: OperationalFailureCode,
+    failure_kind: str,
+) -> TurnSettlementOutcome:
+    """Settle one positively established genuine initialization failure.
+
+    The bootstrap-claim failure settlement with the establishment's own
+    diagnostic observation; the initialization's binding stays CONNECTING
+    and the establishment is never re-dispatched.
+    """
+    return _settle_bootstrap_claim_failure(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        receipt=receipt,
+        ordering_marker=ordering_marker,
+        error_code=error_code,
+        failure_kind=failure_kind,
+        diagnostic_observation="observed_turn_initialization_failure",
+    )
+
+
+# --- the detached workspace-preparation (PREPARE) routing, issue #334 ----------
+
+
+# The canonical COMPLETED status value of the shared ``workspace_result``
+# family contract (issue #181): the typed result vocabulary the settlement
+# classifies the validated result's reported operation outcome against.
+_WORKSPACE_RESULT_COMPLETED: Final = "COMPLETED"
+
+# The safe failure-classification token the settlement records for a
+# validated workspace result that honestly reports the requested workspace
+# preparation as failed (or the wrong operation): the turn completed and
+# delivered its formal result, and the result itself is the positive
+# failure evidence.
+_FAILED_WORKSPACE_RESULT_FAILURE_KIND: Final[str] = "failed_workspace_result"
+
+
+def _route_bootstrap_prepare_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the PREPARE control.
+
+    The claim congruence is proved first: the Task's bootstrap evidence must
+    exist in the addressed scope with exactly the receipt's claim identity,
+    the Task must still be current coarse-planning work without a published
+    plan revision, and the stage evidence must still be the outstanding
+    PREPARE state (unsettled, or the durably dispatched
+    ``prepare_dispatched`` marker — issue #334). A moved-on subject is the
+    honest result-not-applied settlement, never a rewrite of stage history.
+    A terminal failure settles the receipt truthfully (``observed_failure``)
+    and reports through the existing Level 2 operation-failure path under
+    the bootstrap claim's family. A completion funnels the candidate through
+    the shared formal contract: a validated ``workspace_result`` reporting
+    the requested PREPARE operation as COMPLETED records the claim-bound
+    ``prepared`` stage — through the owning bootstrap service's settlement,
+    atomically with the receipt settlement — while a validated result
+    reporting the operation as failed (or the wrong operation) is the
+    agent's positively established failure, routed through the same truthful
+    failure path. A missing candidate or a contract rejection is a
+    positively established protocol failure of the turn. Every failure path
+    escalates through the existing disposition machinery (the bootstrap
+    claim has no legitimate new-attempt path) and never a safe retry.
+    """
+    # The owning bootstrap service is imported lazily: the bootstrap
+    # continuation composes this seam's record/attach helpers at module
+    # level, and this settlement routing composes the bootstrap's own stage
+    # settlement — the same established deferred-import pattern as the
+    # composition seams.
+    from openorc.services.task_planning_bootstrap import (
+        settle_observed_bootstrap_prepare_result,
+    )
+
+    current = task_records.get_task(transaction_pool, task_id=task_id)
+    if current is None or current.workspace_id != workspace_id:
+        logger.warning(
+            "the observed workspace-preparation completion conflicts with the "
+            "receipt's task; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    evidence = task_records.get_task_planning_bootstrap_evidence(transaction_pool, task_id=task_id)
+    if (
+        evidence is None
+        or evidence.claim_token != receipt.original_attempt_id
+        or current.status is not TaskStatus.PLANNING
+        or current.current_plan_revision_id is not None
+        or evidence.stage not in (None, TaskPlanningBootstrapStage.PREPARE_DISPATCHED)
+    ):
+        # A moved-on subject: the bootstrap resolved past the outstanding
+        # PREPARE work (or the claim identity moved on), so the observation
+        # settles as not applied instead of manufacturing stage history.
+        logger.warning(
+            "the workspace-preparation receipt's subject moved on; settling "
+            "the validated observation as not applied"
+        )
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
+        return _settle_bootstrap_claim_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=OBSERVED_RUN_FAILURE_KIND,
+            diagnostic_observation="observed_turn_prepare_failure",
+        )
+    # __PREPARE_ROUTING_RESULT__
+
+    parsed: WorkspaceResult | None
+    if outcome.result_candidate is not None:
+        try:
+            candidate = parse_formal_response(
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            candidate = None
+        parsed = candidate if isinstance(candidate, WorkspaceResult) else None
+    else:
+        parsed = None
+    if parsed is None:
+        logger.warning(
+            "the observed workspace-preparation completion carries no usable "
+            "formal result for its expected family; classifying the positively "
+            "established protocol failure"
+        )
+        return _settle_bootstrap_claim_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
+            failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
+            diagnostic_observation="observed_turn_prepare_failure",
+        )
+    if (
+        parsed.operation != WORKSPACE_OPERATION_PREPARE
+        or parsed.status != _WORKSPACE_RESULT_COMPLETED
+    ):
+        # The agent's validated honest report: the requested workspace
+        # preparation did not complete. The same truthful failure path as
+        # the blocking control's WorkspacePreparationFailedError — never a
+        # prepared stage, never a new turn authorization.
+        logger.warning(
+            "the observed workspace-preparation result reports the requested "
+            "preparation as not completed; classifying the positively "
+            "established failure"
+        )
+        return _settle_bootstrap_claim_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=_FAILED_WORKSPACE_RESULT_FAILURE_KIND,
+            diagnostic_observation="observed_turn_prepare_failure",
+        )
+    applied = settle_observed_bootstrap_prepare_result(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        claim_token=evidence.claim_token,
+    )
+    if not applied:
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, ordering_marker),
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=settled,
+        formal_result=parsed,
     )
 
 

@@ -90,7 +90,8 @@ def _bootstrap_interaction(
       outstanding ``session_initialization`` receipt proves an enqueued
       initialization turn is still unobserved (issue #324), and otherwise
       the formal PREPARE control whose validated workspace result is still
-      outstanding;
+      outstanding (the same shape while the durably dispatched control's
+      own detached-turn receipt is outstanding — issue #334);
     - stage ``prepared``: the PREPARE result already validated, but the
       separate effectful planning-context transition it authorizes has not
       settled — the outstanding ``planning_bootstrap_transition`` work. A

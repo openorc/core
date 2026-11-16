@@ -1897,3 +1897,206 @@ def test_a_presentation_report_with_a_crossed_runtime_code_escalates() -> None:
     assert result.kind is DispositionKind.BLOCKED
     assert result.installation is not None
     assert result.installation.task_block.id == _BLOCK_ID
+
+
+# --- the planning-bootstrap family verification (issue #334) --------------------
+
+
+def _bootstrap_operation(claim_token: Any) -> Any:
+    return _operation(
+        family=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+        kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
+        original_id=claim_token,
+    )
+
+
+def _bootstrap_report(
+    claim_token: Any,
+    *,
+    code: OperationalFailureCode = OperationalFailureCode.RUNTIME_PROTOCOL,
+    evidence: FailureEffectEvidence = FailureEffectEvidence.KNOWN_FAILED,
+) -> Any:
+    return _report(code=code, evidence=evidence, reporting_id=claim_token)
+
+
+def _script_dispatched_prepare_escalation(
+    conn: ScriptedConnection,
+    claim_token: Any,
+    *,
+    stage: str | None = "prepare_dispatched",
+    session_lifecycle: str = "ready",
+) -> None:
+    _script_escalation(
+        conn,
+        task_row=_task(status="planning"),
+        session_row=None,
+        extra_setup=lambda c: (
+            c.on(
+                _BOOTSTRAP_EVIDENCE,
+                (claim_token, _NOW, stage, _NOW),
+            ),
+            c.on(
+                _SESSION_LOCKED,
+                _session_row(
+                    "producer",
+                    _PRODUCER_SESSION_ID,
+                    "fake-session-0",
+                    lifecycle=session_lifecycle,
+                ),
+            ),
+        ),
+    )
+
+
+def test_a_confirmed_dispatched_prepare_failure_escalates_to_blocked() -> None:
+    """The durably dispatched PREPARE is the still-current failed operation
+
+    (issue #334): a confirmed failure of the enqueued control reports under
+    the claim's own family and escalates through the existing disposition
+    machinery to the BLOCKED installation — never a stale no-op that
+    strands the failed bootstrap without its blocking consequence.
+    """
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    _script_dispatched_prepare_escalation(conn, claim_token)
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(claim_token),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+    episode_params = next(params for sql, params in conn.executed if _EPISODE_INSERT(sql, None))
+    assert episode_params is not None
+    assert episode_params[2] == "planning_bootstrap_prepare"
+    assert episode_params[3] == "planning_bootstrap_claim"
+    assert episode_params[4] == claim_token
+
+
+def test_a_dispatched_prepare_uncertainty_escalates_to_blocked() -> None:
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    _script_dispatched_prepare_escalation(conn, claim_token)
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(
+            claim_token,
+            code=OperationalFailureCode.EXTERNAL_OPERATION_UNCERTAIN,
+            evidence=FailureEffectEvidence.EFFECT_UNCLASSIFIED,
+        ),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+
+
+def test_a_lost_producer_binding_escalates_with_the_session_lost_reason() -> None:
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    _script_dispatched_prepare_escalation(
+        conn,
+        claim_token,
+        session_lifecycle="lost",
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(
+            claim_token,
+            code=OperationalFailureCode.AGENT_SESSION_LOST,
+        ),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    block_params = next(params for sql, params in conn.executed if _BLOCK_INSERT(sql, None))
+    assert block_params is not None
+    assert block_params[2] == "agent_session_lost"
+
+
+def test_a_settled_prepared_stage_makes_the_prepare_report_stale() -> None:
+    """A validated result already landed: no report about the control is
+
+    current any more — the stale no-op is preserved after successful
+    preparation.
+    """
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    conn.on(_TASK_LOCKED, _task(status="planning"))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _BOOTSTRAP_EVIDENCE,
+        (claim_token, _NOW, "prepared", _NOW),
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(claim_token),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_a_ready_for_planning_stage_makes_the_prepare_report_stale() -> None:
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    conn.on(_TASK_LOCKED, _task(status="planning"))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _BOOTSTRAP_EVIDENCE,
+        (claim_token, _NOW, "ready_for_planning", _NOW),
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(claim_token),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_a_published_plan_revision_makes_the_prepare_report_stale() -> None:
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    conn.on(_TASK_LOCKED, _task(status="planning", plan_revision=_REVISION_ID))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _BOOTSTRAP_EVIDENCE,
+        (claim_token, _NOW, "prepare_dispatched", _NOW),
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(claim_token),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE
+
+
+def test_a_mismatched_claim_identity_makes_the_prepare_report_stale() -> None:
+    conn = ScriptedConnection()
+    claim_token = uuid4()
+    conn.on(_TASK_LOCKED, _task(status="planning"))
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(
+        _BOOTSTRAP_EVIDENCE,
+        (uuid4(), _NOW, "prepare_dispatched", _NOW),
+    )
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_bootstrap_operation(claim_token),
+        report=_bootstrap_report(claim_token),
+    )
+    assert result.kind is DispositionKind.NO_OP
+    assert result.no_op_reason is NoOpReason.STALE

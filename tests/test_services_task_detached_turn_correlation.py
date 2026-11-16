@@ -55,11 +55,12 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.models import ImplementationResult
+from openorc.protocol.models import ImplementationResult, WorkspaceResult
 from openorc.services import task_detached_turn_correlation as correlation_module
 from openorc.services.errors import ConflictError, InvalidCommandError, StaleOperationError
 from openorc.services.task_detached_turn_correlation import (
     TurnSettlementKind,
+    TurnSettlementOutcome,
     TurnStartCorroboration,
     TurnStatusClassificationKind,
     attach_acknowledged_turn,
@@ -1787,3 +1788,224 @@ def test_establishment_status_only_failed_record_routes_the_establishment_failur
     assert classification.kind is TurnStatusClassificationKind.CLASSIFIED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["operation"].family.value == "planning_bootstrap_prepare"
+
+
+# --- the detached workspace-preparation (PREPARE) settlement (issue #334) -------
+
+
+_PREPARE_CLAIM_TOKEN = uuid4()
+
+
+def _prepare_receipt_row(
+    *,
+    status: str = "admitted",
+    outcome: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "planning_bootstrap_prepare",
+        "planning_bootstrap_claim",
+        _PREPARE_CLAIM_TOKEN,
+        "workspace_result",
+        _TURN_REFERENCE if status in ("admitted", "settled") else None,
+        status,
+        outcome if outcome is not None else {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def _prepare_settled_row(label: str, *, marker: int | None = 41) -> tuple[Any, ...]:
+    outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
+    if marker is not None:
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
+    return _prepare_receipt_row(status="settled", outcome=outcome)
+
+
+def _workspace_result_candidate(operation: str = "PREPARE", status: str = "COMPLETED") -> str:
+    return json.dumps(
+        {
+            "type": "workspace_result",
+            "schema_version": 1,
+            "operation": operation,
+            "status": status,
+            "summary": "Reported by the scripted runtime.",
+        }
+    )
+
+
+def _script_planning_task(conn: ScriptedConnection) -> None:
+    """Script the current coarse-planning Task read (repeatable)."""
+    conn.on_repeat(
+        _sql_has_not("from openorc.tasks where id = %s", absent="planning_bootstrap"),
+        task_row(
+            id=_TASK_ID,
+            workspace_id=_WORKSPACE_ID,
+            status="planning",
+            state_token=_STATE_TOKEN,
+            source_requirements_fingerprint="a" * 64,
+            current_plan_revision_id=None,
+        ),
+    )
+
+
+def _script_bootstrap_evidence(conn: ScriptedConnection, *, stage: str | None) -> None:
+    conn.on(
+        _sql_has("planning_bootstrap_claim_token", "planning_bootstrap_stage"),
+        (
+            _PREPARE_CLAIM_TOKEN,
+            _OBSERVED,
+            stage,
+            _OBSERVED,
+        ),
+    )
+
+
+def _prepare_settlement_flow(
+    triage: _RecordingTriage,
+    *,
+    stage: str | None = "prepare_dispatched",
+    candidate: str | None,
+    kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
+    settle_label: str = SETTLEMENT_VALIDATED_RESULT,
+) -> tuple[ScriptedConnection, TurnSettlementOutcome]:
+    conn = ScriptedConnection()
+    _script_planning_task(conn)
+    _script_bootstrap_evidence(conn, stage=stage)
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _prepare_receipt_row())
+    _script_receipt_for_update(conn, _prepare_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    conn.on(
+        _sql_has("update openorc.tasks", "planning_bootstrap_stage = %s"),
+        True,
+    )
+    _script_settle(conn, _prepare_settled_row(settle_label))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(kind=kind, marker=41, candidate=candidate),
+    )
+    return conn, outcome
+
+
+def test_validated_prepare_result_records_the_prepared_stage_with_the_receipt(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        candidate=_workspace_result_candidate(),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.operation.value == "planning_bootstrap_prepare"
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
+    assert isinstance(outcome.formal_result, WorkspaceResult)
+    assert triage.calls == []
+    stage_writes = [
+        params
+        for sql, params in conn.executed
+        if "planning_bootstrap_stage = %s" in " ".join(sql.split())
+    ]
+    assert len(stage_writes) == 1
+    assert "prepared" in str(stage_writes[0])
+
+
+def test_moved_on_bootstrap_settles_the_validated_result_as_not_applied(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        stage="prepared",
+        candidate=_workspace_result_candidate(),
+        settle_label=SETTLEMENT_RESULT_NOT_APPLIED,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
+
+
+def test_failed_prepare_terminal_settles_observed_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        candidate=None,
+        kind=DetachedTurnObservationKind.FAILED,
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    operation = triage.calls[0]["operation"]
+    assert operation.family.value == "planning_bootstrap_prepare"
+    assert operation.original_attempt_id == _PREPARE_CLAIM_TOKEN
+    assert triage.calls[0]["report"].error_code.value == "external_operation_failed"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
+
+
+def test_failed_workspace_result_settles_observed_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        candidate=_workspace_result_candidate(status="FAILED"),
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code.value == "external_operation_failed"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
+
+
+def test_wrong_operation_result_settles_observed_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        candidate=_workspace_result_candidate(operation="CLEANUP"),
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code.value == "external_operation_failed"
+
+
+def test_malformed_result_settles_the_protocol_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _prepare_settlement_flow(
+        triage,
+        candidate="{not a formal response}",
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
