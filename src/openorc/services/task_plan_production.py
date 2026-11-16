@@ -892,7 +892,10 @@ def _validate_revision_production_subjects(
     prior_plan_revision_id: UUID,
     review_iteration_id: UUID,
 ) -> tuple[
-    Task, planning_records.PlanRevision, ReviewIteration, TaskAgentSession,
+    Task,
+    planning_records.PlanRevision,
+    ReviewIteration,
+    TaskAgentSession,
     ResolvedRepositoryInstallationRoute,
 ]:
     """The shared entry subject/session validation of the revision production.
@@ -1599,6 +1602,8 @@ def complete_resumed_initial_plan_result(
         )
         settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
     return outcome
+
+
 # --- the detached plan-result production dispatch (issues #325/#335) -----------
 
 
@@ -1656,12 +1661,8 @@ class DispatchedPlanProduction:
 _REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
 _ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
 
-_DISPATCH_INITIAL_SPAN_NAME: Final[str] = (
-    "task_plan_production.dispatch_initial_plan_detached"
-)
-_DISPATCH_REVISE_SPAN_NAME: Final[str] = (
-    "task_plan_production.dispatch_planning_revise_detached"
-)
+_DISPATCH_INITIAL_SPAN_NAME: Final[str] = "task_plan_production.dispatch_initial_plan_detached"
+_DISPATCH_REVISE_SPAN_NAME: Final[str] = "task_plan_production.dispatch_planning_revise_detached"
 
 
 def _refuse_plan_dispatch_quietly(
@@ -1712,6 +1713,7 @@ def _refuse_plan_dispatch_quietly(
             "the claimed claim stays the honest unresolved state",
             type(error).__name__,
         )
+
 
 def _dispatch_plan_turn(
     pool: DatabasePool,
@@ -1999,6 +2001,7 @@ def dispatch_initial_plan_detached(
             attempt_evidence=attempt_evidence,
         )
 
+
 def dispatch_planning_revise_detached(
     pool: DatabasePool,
     github: GitHubAppClient,
@@ -2101,6 +2104,7 @@ def dispatch_planning_revise_detached(
             completion_handoff=completion_handoff,
             attempt_evidence=attempt_evidence,
         )
+
 
 # --- the detached settlement's owning-service finalization (issue #335) -------
 
@@ -2218,6 +2222,7 @@ def _require_settlement_binding(
     if binding.external_session_id is None:
         raise ConflictError(f"the {role.value} session binding has no external session identity")
     return binding
+
 
 def _settle_observed_initial_plan_result(
     transaction_pool: DatabasePool,
@@ -2358,8 +2363,6 @@ def _require_routed_iteration_revision(
         or iteration.plan_revision_id is None
     ):
         raise NotFoundError(
-            "the claimed change request's review iteration is not available "
-            "for this task"
+            "the claimed change request's review iteration is not available for this task"
         )
     return iteration.plan_revision_id
-

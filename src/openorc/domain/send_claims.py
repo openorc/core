@@ -198,9 +198,7 @@ class TaskRuntimeSendClaim:
         if self.subject_head_sha is not None:
             _require_nonblank_str(self.subject_head_sha, "subject_head_sha")
         if self.dispatch_repository_base_sha is not None:
-            _require_nonblank_str(
-                self.dispatch_repository_base_sha, "dispatch_repository_base_sha"
-            )
+            _require_nonblank_str(self.dispatch_repository_base_sha, "dispatch_repository_base_sha")
         # The closed source-subject form: exactly one subject shape per kind.
         if self.kind is TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH:
             if (

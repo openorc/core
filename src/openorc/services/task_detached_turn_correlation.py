@@ -223,13 +223,11 @@ _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperati
 # The plan-result families with detached settlement routing in this seam
 # (issue #335): the Producer plan dispatches whose validated ``plan_result``
 # finalizes through the owning plan-production service's settlement.
-_PLAN_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
-    frozenset(
-        {
-            PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
-            PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
-        }
-    )
+_PLAN_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = frozenset(
+    {
+        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+    }
 )
 
 # The safe failure-classification token the settlement records for a

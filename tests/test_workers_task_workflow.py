@@ -2236,9 +2236,7 @@ def test_planning_review_composition_dispatches_the_revise_detached_in_regular_m
     review_dispatch = RecordingService(result=fake_dispatch_outcome())
     monkeypatch.setattr(task_workflow, "dispatch_planning_review", review_dispatch, raising=True)
     production = fake_production(_STATE_TOKEN)
-    with patched_workflow_environment(
-        monkeypatch, reloaded_plan_production=production
-    ):
+    with patched_workflow_environment(monkeypatch, reloaded_plan_production=production):
         task_workflow.execute_task_workflow_operation(
             OperationInvocation(
                 kind=OperationKind.TASK_PLANNING_REVIEW,

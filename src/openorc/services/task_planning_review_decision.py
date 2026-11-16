@@ -234,11 +234,14 @@ def _require_detached_revise_dependencies(
     producer_runtime_factory: object,
     observation_registrar: object,
     completion_handoff: object,
-) -> tuple[
-    ProducerRuntimeAttachmentFactory,
-    PlanProductionObservationRegistrar,
-    DetachedTurnCompletionHandoff,
-] | None:
+) -> (
+    tuple[
+        ProducerRuntimeAttachmentFactory,
+        PlanProductionObservationRegistrar,
+        DetachedTurnCompletionHandoff,
+    ]
+    | None
+):
     """Resolve the optional detached-revise dependency trio, all-or-nothing.
 
     The regular-mode detached REVISE dispatch (issue #335) needs the
@@ -259,8 +262,7 @@ def _require_detached_revise_dependencies(
         )
     if not callable(producer_runtime_factory):
         raise InvalidCommandError(
-            "the detached revise dispatch requires a callable producer runtime "
-            "attachment factory"
+            "the detached revise dispatch requires a callable producer runtime attachment factory"
         )
     register = getattr(observation_registrar, "register_session", None)
     if not callable(register):

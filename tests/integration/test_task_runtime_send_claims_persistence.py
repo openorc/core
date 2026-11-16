@@ -573,7 +573,6 @@ def test_bootstrap_stage_evidence_is_forward_only_and_claim_bound(
     )
 
 
-
 def test_plan_claims_carry_their_dispatch_repository_base_and_pr_compose_never_does(
     conn: Connection[Any],
 ) -> None:

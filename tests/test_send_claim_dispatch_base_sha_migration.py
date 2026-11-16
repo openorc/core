@@ -35,8 +35,7 @@ def test_exactly_one_forward_only_migration_adds_the_column() -> None:
     claim_matches = sorted(MIGRATIONS_DIR.glob("*_add_task_runtime_send_claims.sql"))
     assert len(claim_matches) == 1
     assert (
-        "dispatch_repository_base_sha"
-        not in claim_matches[0].read_text(encoding="utf-8").lower()
+        "dispatch_repository_base_sha" not in claim_matches[0].read_text(encoding="utf-8").lower()
     )
 
 

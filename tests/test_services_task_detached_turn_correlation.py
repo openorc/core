@@ -2084,6 +2084,8 @@ def test_malformed_result_settles_the_protocol_failure_and_reports(
     assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
     executed = [" ".join(sql.split()) for sql, _ in conn.executed]
     assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
+
+
 # --- the plan-result routing (issue #335) ----------------------------------------
 
 

@@ -92,7 +92,6 @@ def _claim_from_row(row: Sequence[Any]) -> TaskRuntimeSendClaim:
     )
 
 
-
 def _require_subject_form(
     kind: TaskRuntimeSendClaimKind,
     *,
@@ -168,9 +167,7 @@ def create_task_runtime_send_claim(
     if kind is TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH and (
         dispatch_repository_base_sha is not None
     ):
-        raise ValueError(
-            "a pr_compose_dispatch claim carries no dispatch repository-base context"
-        )
+        raise ValueError("a pr_compose_dispatch claim carries no dispatch repository-base context")
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.task_runtime_send_claims "

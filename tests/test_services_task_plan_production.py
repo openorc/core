@@ -2353,6 +2353,8 @@ class _ProducerAttachment:
                 self.acquisitions -= 1
 
         return lease()
+
+
 def _detached_initial_runtime() -> FakeAgentRuntimeAdapter:
     """A fake adapter holding the live prepared Producer session, admission-ready."""
     return _prepared_producer_adapter([])
@@ -2487,9 +2489,7 @@ def test_detached_initial_plan_dispatch_claims_records_registers_admits_and_atta
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
-    _script_claim_and_receipt(
-        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
-    )
+    _script_claim_and_receipt(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     _script_attach(env.conn)
     env.conn.on(_TASK_READ, _task_row())  # the post-dispatch reload
     runtime = _detached_initial_runtime()
@@ -2553,9 +2553,7 @@ def test_detached_initial_plan_registration_refusal_refuses_the_receipt_and_fail
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
-    _script_claim_and_receipt(
-        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
-    )
+    _script_claim_and_receipt(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
     env.conn.on(_known_nondelivery_update, _claim_row(status="known_nondelivery"))
     runtime = _detached_initial_runtime()
@@ -2587,9 +2585,7 @@ def test_detached_initial_plan_admission_refusal_refuses_the_receipt_and_fails_k
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
-    _script_claim_and_receipt(
-        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
-    )
+    _script_claim_and_receipt(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
     env.conn.on(_known_nondelivery_update, _claim_row(status="known_nondelivery"))
     runtime = _detached_initial_runtime()
@@ -2619,9 +2615,7 @@ def test_detached_initial_plan_uncertain_admission_leaves_claim_and_receipt_clai
         producer_row=_production_ready_row(),
         reviewer_row=_review_ready_row(),
     )
-    _script_claim_and_receipt(
-        env.conn, task_row=_task_row(), producer_row=_production_ready_row()
-    )
+    _script_claim_and_receipt(env.conn, task_row=_task_row(), producer_row=_production_ready_row())
     runtime = _detached_initial_runtime()
     runtime.queue_detached_admission(
         AgentRuntimeDeliveryUncertainError("the admission outcome is unknown")
@@ -2688,9 +2682,7 @@ def test_detached_revise_dispatch_routes_the_persisted_findings_verbatim() -> No
         env.conn,
         task_row=current_row,
         producer_row=_production_ready_row(),
-        claim_row=_claim_row(
-            kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID
-        ),
+        claim_row=_claim_row(kind="planning_revise_dispatch", review_iteration_id=_ITERATION_ID),
         receipt_row=_detached_receipt_row(operation="planning_revise_dispatch"),
         iteration_row=iteration_row,
     )
@@ -2711,9 +2703,7 @@ def test_detached_revise_dispatch_routes_the_persisted_findings_verbatim() -> No
     assert receipt_params[5] == _CLAIM_ID
     assert receipt_params[6] == "plan_result"
     # The persisted findings were serialized verbatim as the admission.
-    assert runtime.detached_admissions() == (
-        (_PRODUCER_EXTERNAL_ID, _REVIEW_RESULT_SERIALIZED),
-    )
+    assert runtime.detached_admissions() == ((_PRODUCER_EXTERNAL_ID, _REVIEW_RESULT_SERIALIZED),)
     assert runtime.submitted_sends(_PRODUCER_EXTERNAL_ID) == ()
     assert handoff.calls == []
 
@@ -2822,4 +2812,3 @@ def test_settlement_of_a_claim_without_its_dispatch_base_fails_closed() -> None:
         )
 
     _assert_no_consequential_write(conn)
-
