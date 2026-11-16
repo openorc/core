@@ -866,21 +866,39 @@ def _handoff_review_result_completion(
     prior_revision_id = task.current_plan_revision_id
 
     if latest.outcome is ReviewOutcome.ACCEPTED:
-        # The ordinary authorized continuation of accepted formal review:
-        # present the exact-plan IMPLEMENTATION_AUTHORIZATION gate. No Owner
-        # decision is required to present it, and approval never follows from
-        # Reviewer acceptance — the explicit E5 approval remains an Owner
-        # command outside this module. The shared source-requirements
+        # The ordinary authorized continuation of accepted formal review
+        # (issue #336): present the exact-plan IMPLEMENTATION_AUTHORIZATION
+        # gate under the F5b coordinator's typed failure handoff — the
+        # presentation's own durable attribution identity (the finalized
+        # ACCEPTED iteration, recorded by the service before its external
+        # source-requirements reconciliation) reaches the Level 2 triage, so
+        # a detected presentation failure receives its durable escalation
+        # disposition instead of stranding the accepted review. No Owner
+        # decision is required to present it, and approval never follows
+        # from Reviewer acceptance — the explicit E5 approval remains an
+        # Owner command outside this module. The shared source-requirements
         # pre-check (issue #289) freshly verifies the authoritative issue
         # before the gate is presented; a confirmed requirements change
         # blocks the Task through the shared atomic drift-block path.
-        open_implementation_authorization(
+        def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+            open_implementation_authorization(
+                pool,
+                dependencies.github_client(),
+                profile_id=owner_profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                attempt_evidence=evidence,
+            )
+
+        coordinate_task_workflow_operation(
             pool,
-            dependencies.github_client(),
-            profile_id=owner_profile_id,
+            expected_status=TaskStatus.PLANNING,
             workspace_id=workspace_id,
             task_id=task_id,
+            profile_id=owner_profile_id,
             expected_state_token=expected_state_token,
+            invoke_level_one=invoke_level_one,
         )
         return
 

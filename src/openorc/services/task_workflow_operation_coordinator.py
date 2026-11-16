@@ -127,6 +127,7 @@ from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
+    ImplementationAuthorizationPresentationOperation,
     OperationalFailureCode,
     OperationalFailureFamily,
     OperationalFailureSourceKind,
@@ -135,6 +136,7 @@ from openorc.domain.operational_failures import (
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.reviews import ReviewOutcome
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.observability import annotate_span, application_span
@@ -826,6 +828,75 @@ def _resolve_pr_authorization_presentation_report(
     )
 
 
+def _resolve_implementation_authorization_presentation_report(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    identity: ProducedAttemptIdentity,
+    error: BaseException,
+) -> _ResolvedFailureReport | None:
+    """Verify and enrich one exact-plan presentation report (issue #336).
+
+    The episode roots at the finalized ACCEPTED planning ReviewIteration the
+    exact-plan IMPLEMENTATION_AUTHORIZATION gate presents from — the
+    decision's committed acceptance is the durable identity root, never a
+    contradiction of it. The committed evidence is that iteration row (same
+    scope, finalized ACCEPTED, bound to the Task's exact current plan
+    revision) plus the Task still ``planning`` with no current gate. That
+    state structurally proves ``PRE_EFFECT_NOT_APPLIED``: the presentation
+    commits exactly one durable effect — the guarded final composed
+    transaction whose gate becomes current and whose Task token rotates —
+    so the pre-gate state proves the effect never applied.
+
+    Any incoherent recorded identity (foreign scope, a non-ACCEPTED or
+    superseded iteration, moved-on Task, current gate) fails closed without
+    triaging.
+    """
+    if identity.original_attempt_kind is not OriginalAttemptKind.REVIEW_ITERATION:
+        return None
+    iteration = review_records.get_review_iteration(
+        pool, review_iteration_id=identity.original_attempt_id
+    )
+    if iteration is None or iteration.workspace_id != workspace_id or iteration.task_id != task_id:
+        return None
+    if iteration.outcome is not ReviewOutcome.ACCEPTED:
+        return None
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return None
+    if task.current_plan_revision_id is None:
+        return None
+    if iteration.plan_revision_id != task.current_plan_revision_id:
+        return None
+    if task.status is not TaskStatus.PLANNING or task.current_owner_gate_id is not None:
+        # The presentation effect applied, or the workflow moved on: the
+        # report no longer addresses outstanding pre-gate work.
+        return None
+    subject_identifiers: dict[str, object] = {
+        "workspace_id": workspace_id,
+        "task_id": task_id,
+        "review_iteration_id": iteration.id,
+        "plan_revision_id": iteration.plan_revision_id,
+    }
+    return _ResolvedFailureReport(
+        operation=OperationalFailureOperation(
+            family=identity.family,
+            original_attempt_kind=identity.original_attempt_kind,
+            original_attempt_id=identity.original_attempt_id,
+            subject=_canonical_operation_subject(subject_identifiers),
+        ),
+        report=OperationalFailureReport(
+            reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+            reporting_attempt_id=identity.original_attempt_id,
+            error_code=_pr_authorization_failure_code(error),
+            effect_evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+            effect_attempt_id=None,
+            diagnostic_context=_diagnostic_context(identity, error),
+        ),
+    )
+
+
 def _resolve_pr_authorization_retry_report(
     pool: DatabasePool,
     *,
@@ -937,6 +1008,12 @@ def _resolve_failure_report(
         )
     if family is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION:
         return _resolve_pr_authorization_presentation_report(
+            pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
+        )
+    if family is (
+        ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION
+    ):
+        return _resolve_implementation_authorization_presentation_report(
             pool, workspace_id=workspace_id, task_id=task_id, identity=identity, error=error
         )
     # The recorded identity names no supported v1 family: fail closed.

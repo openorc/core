@@ -30,15 +30,21 @@ exceptional TaskBlock (#258) that blocked the Task.
 - Operation families reuse the F2 pending-interaction operation vocabulary
   (the closed set of the automated workflow's claimed consequential
   interactions) plus — from F5d (issue #267) — the one explicit exact-head
-  GitHub merge family (:class:`GitHubMergeOperation`) and — from F5f (issue
+  GitHub merge family (:class:`GitHubMergeOperation`), — from F5f (issue
   #269) — the one explicit exact-head PR-authorization presentation family
-  (:class:`PRAuthorizationPresentationOperation`). A merge is never
-  mislabeled as a pending agent-runtime interaction, and no further parallel
-  vocabulary exists. The presentation family roots its episodes at the
-  existing successful E6 ``Execution`` UUID (``OriginalAttemptKind.EXECUTION``)
-  — never labelling that execution failed; the execution is the durable
-  identity/currentness root and the family carries the presentation
-  semantics.
+  (:class:`PRAuthorizationPresentationOperation`), and — from issue #336 —
+  the one explicit exact-plan implementation-authorization presentation
+  family (:class:`ImplementationAuthorizationPresentationOperation`). A
+  merge is never mislabeled as a pending agent-runtime interaction, and no
+  further parallel vocabulary exists. The PR-authorization presentation
+  family roots its episodes at the existing successful E6 ``Execution`` UUID
+  (``OriginalAttemptKind.EXECUTION``) — never labelling that execution
+  failed; the execution is the durable identity/currentness root and the
+  family carries the presentation semantics. The implementation-authorization
+  presentation family roots its episodes at the finalized ACCEPTED planning
+  ``ReviewIteration`` the exact-plan gate presents from
+  (``OriginalAttemptKind.REVIEW_ITERATION``) — the decision's committed
+  acceptance is the durable identity/currentness root.
 - ``OperationalFailureEpisode`` carries the episode's scope, family, original
   identity, canonical safe subject, and its terminal escalation disposition:
   ``escalated_task_block_id`` references the exact unresolved TaskBlock the
@@ -81,6 +87,7 @@ __all__ = [
     "OperationalFailureFamily",
     "OperationalFailureSourceKind",
     "OriginalAttemptKind",
+    "ImplementationAuthorizationPresentationOperation",
     "PRAuthorizationPresentationOperation",
     "canonical_bounded_failure_context",
     "canonical_failure_subject",
@@ -190,6 +197,30 @@ class GitHubMergeOperation(StrEnum):
     EXACT_HEAD_MERGE = "exact_head_merge"
 
 
+class ImplementationAuthorizationPresentationOperation(StrEnum):
+    """The closed vocabulary of exact-plan implementation-authorization
+    presentation operation families (issue #336).
+
+    A deliberate, single-member extension of the Level 2 operation families:
+    the OpenOrc-authorized presentation of the exact-plan
+    ``IMPLEMENTATION_AUTHORIZATION`` OwnerGate after a durably finalized
+    ACCEPTED planning review. It is deliberately NOT a member of the F2
+    pending-interaction runtime vocabulary — the presentation performs no
+    agent-runtime interaction — and it carries its own durable identity root:
+    the episode roots at the finalized ACCEPTED planning ``ReviewIteration``
+    the gate presents from under ``OriginalAttemptKind.REVIEW_ITERATION`` —
+    the decision's committed acceptance is the identity/currentness root,
+    and the pre-gate Task state is the repeat-safety proof (the
+    presentation's single durable effect installs the gate and rotates the
+    token, so a still-``planning`` no-current-gate Task proves the effect
+    never applied).
+    """
+
+    EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION = (
+        "exact_plan_implementation_authorization_presentation"
+    )
+
+
 class PRAuthorizationPresentationOperation(StrEnum):
     """The closed vocabulary of exact-head PR-authorization presentation
     operation families (F5f, issue #269).
@@ -219,6 +250,7 @@ OperationalFailureFamily = (
     PendingTaskRuntimeInteractionOperation
     | GitHubMergeOperation
     | PRAuthorizationPresentationOperation
+    | ImplementationAuthorizationPresentationOperation
 )
 """The closed union of Level 2 operation-family vocabularies (F5f, issue #269)."""
 
@@ -229,6 +261,7 @@ def operational_failure_family_from_value(
     PendingTaskRuntimeInteractionOperation
     | GitHubMergeOperation
     | PRAuthorizationPresentationOperation
+    | ImplementationAuthorizationPresentationOperation
 ):
     """Resolve one stored operation-family value to its closed-vocabulary member."""
     try:
@@ -241,6 +274,10 @@ def operational_failure_family_from_value(
         pass
     try:
         return PRAuthorizationPresentationOperation(value)
+    except ValueError:
+        pass
+    try:
+        return ImplementationAuthorizationPresentationOperation(value)
     except ValueError as error:
         raise OperationalFailureDomainError(
             "the operation family value is not a member of the closed vocabulary"
@@ -371,6 +408,7 @@ class OperationalFailureEpisode:
         PendingTaskRuntimeInteractionOperation
         | GitHubMergeOperation
         | PRAuthorizationPresentationOperation
+        | ImplementationAuthorizationPresentationOperation
     )
     original_attempt_kind: OriginalAttemptKind
     original_attempt_id: UUID
@@ -388,12 +426,14 @@ class OperationalFailureEpisode:
                 PendingTaskRuntimeInteractionOperation,
                 GitHubMergeOperation,
                 PRAuthorizationPresentationOperation,
+                ImplementationAuthorizationPresentationOperation,
             ),
         ):
             raise OperationalFailureDomainError(
                 "OperationalFailureEpisode.operation_family must be a "
                 "PendingTaskRuntimeInteractionOperation, a GitHubMergeOperation, "
-                "or a PRAuthorizationPresentationOperation"
+                "a PRAuthorizationPresentationOperation, or an "
+                "ImplementationAuthorizationPresentationOperation"
             )
         if not isinstance(self.original_attempt_kind, OriginalAttemptKind):
             raise OperationalFailureDomainError(

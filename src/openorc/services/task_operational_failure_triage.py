@@ -89,6 +89,7 @@ from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
+    ImplementationAuthorizationPresentationOperation,
     OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureDomainError,
@@ -366,6 +367,9 @@ _FAMILY_IDENTITY_KINDS: Mapping[OperationalFailureFamily, frozenset[OriginalAtte
             PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW: frozenset(
                 {OriginalAttemptKind.REVIEW_ITERATION}
             ),
+            ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION: (  # noqa: E501
+                frozenset({OriginalAttemptKind.REVIEW_ITERATION})
+            ),
             PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: frozenset(
                 {OriginalAttemptKind.EXECUTION}
             ),
@@ -490,11 +494,13 @@ def triage_operational_failure(
             PendingTaskRuntimeInteractionOperation,
             GitHubMergeOperation,
             PRAuthorizationPresentationOperation,
+            ImplementationAuthorizationPresentationOperation,
         ),
     ):
         raise InvalidCommandError(
             "operation.family must be a pending-interaction operation, the "
-            "exact-head GitHub merge family, or the exact-head PR-authorization "
+            "exact-head GitHub merge family, the exact-head PR-authorization "
+            "presentation family, or the exact-plan implementation-authorization "
             "presentation family"
         )
     if not isinstance(operation.original_attempt_kind, OriginalAttemptKind):
@@ -935,6 +941,16 @@ def _verify_family(
         )
     if family is PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION:
         return _verify_pr_authorization_presentation_family(
+            transaction_pool,
+            task=task,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            operation=operation,
+        )
+    if family is (
+        ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION
+    ):
+        return _verify_implementation_authorization_presentation_family(
             transaction_pool,
             task=task,
             workspace_id=workspace_id,
@@ -1429,6 +1445,61 @@ def _resolve_approved_implementation_gate(
     return gates[0]
 
 
+def _verify_implementation_authorization_presentation_family(
+    transaction_pool: DatabasePool,
+    *,
+    task: Task,
+    workspace_id: UUID,
+    task_id: UUID,
+    operation: OperationalFailureOperation,
+) -> _VerifiedFailure | OperationalFailureDisposition:
+    """Verify one exact-plan presentation family report against durable
+    authority (issue #336).
+
+    The episode roots at the finalized ACCEPTED planning ReviewIteration the
+    exact-plan IMPLEMENTATION_AUTHORIZATION gate presents from — expected
+    for this family and never the review family's unfinalized-iteration
+    subject, whose checks stay exactly intact for REVIEWER_REVIEW. The
+    report stays current only while that iteration is still finalized
+    ACCEPTED and bound to the Task's exact current plan revision, and the
+    Task is still in the pre-gate ``planning`` state with no current gate —
+    the structural pre-effect proof, since the presentation's single
+    durable effect would have installed the gate and rotated the token.
+    The presentation performs no runtime interaction: like the merge and
+    PR-authorization presentation families, there is no role/session
+    binding to verify, so session loss is never its blocking fact.
+    """
+    if operation.original_attempt_kind is not OriginalAttemptKind.REVIEW_ITERATION:
+        return _stale_no_op()
+    iteration = review_records.get_review_iteration(
+        transaction_pool, review_iteration_id=operation.original_attempt_id
+    )
+    if iteration is None or iteration.workspace_id != workspace_id or iteration.task_id != task_id:
+        return _stale_no_op()
+    if iteration.outcome is not ReviewOutcome.ACCEPTED:
+        # The accepted clearance is the presentation's authorization subject;
+        # a change-requested or otherwise-unfinalized iteration never roots
+        # this family's episode.
+        return _stale_no_op()
+    if task.status is not TaskStatus.PLANNING or task.current_owner_gate_id is not None:
+        return _stale_no_op()
+    if (
+        task.current_plan_revision_id is None
+        or iteration.plan_revision_id != task.current_plan_revision_id
+    ):
+        return _stale_no_op()
+    loop = review_records.get_review_loop(transaction_pool, review_loop_id=iteration.review_loop_id)
+    if (
+        loop is None
+        or loop.workspace_id != workspace_id
+        or loop.task_id != task_id
+        or loop.purpose is not ReviewLoopPurpose.PLANNING
+        or loop.status is not ReviewLoopStatus.OPEN
+    ):
+        return _stale_no_op()
+    return _VerifiedFailure(session_lost=False)
+
+
 def _verify_execution_family(
     transaction_pool: DatabasePool,
     *,
@@ -1452,6 +1523,8 @@ def _verify_execution_family(
       ReviewIteration's reviewed head — the head is the remediation subject.
 
     A succeeded attempt contradicts any failure report.
+
+
     """
     effect_execution_id = (
         report.effect_attempt_id
