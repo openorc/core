@@ -93,13 +93,29 @@ Phase composition (one operation):
    replacement attempt is created, and nothing is blindly resent. Only a
    schema-valid, exact-subject typed ``ReviewResult`` is ever returned to
    E3b.
+
+Detached regular-mode dispatch (issue #336): the same Phase-1 reservation
+(:func:`_reserve_review_attempt`, shared with the blocking entry) commits
+the reserved attempt, and the ONE detached-turn receipt companion of that
+exact iteration — operation ``reviewer_review``, attempt kind
+``review_iteration``, expecting the canonical ``review_result`` family —
+commits in one short transaction strictly before the positive observation
+registration and the verbatim admission of the composed canonical REVIEW
+message on the exact Reviewer session. No ``send`` and no blocking wait
+exists in this path, and the dispatching worker exits after the
+acknowledgement attach. The independently observed completion routes
+through the correlation seam to the owning E3b decision settlement;
+proven pre-effect failures refuse the receipt and report through the
+existing Level 1/2 machinery attributable to the reserved iteration, and
+an uncertain admission leaves the receipt conservatively claimed and is
+never re-dispatched.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
@@ -107,12 +123,14 @@ from uuid import UUID
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Repository
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -128,14 +146,18 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.interaction import PlanReviewSubject, ReviewInteraction
 from openorc.protocol.models import REVIEW_RESULT_FAMILY, ReviewResult
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
@@ -144,7 +166,12 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_abort import settle_observed_task_interrupt
-from openorc.services.task_plan_production import TaskPlanProductionOutcome
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
+from openorc.services.task_plan_production import (
+    PlanProductionObservationRegistrar,
+    TaskPlanProductionOutcome,
+)
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
@@ -153,13 +180,22 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "DispatchedPlanningReview",
     "ReviewerRuntimeAttachmentFactory",
     "TaskPlanningReviewDispatchOutcome",
     "dispatch_planning_review",
+    "dispatch_planning_review_detached",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_dispatch"
 _DISPATCH_SPAN_NAME = "task_planning_review_dispatch.dispatch_planning_review"
+_DISPATCH_DETACHED_SPAN_NAME = "task_planning_review_dispatch.dispatch_planning_review_detached"
+
+# Safe refusal-kind tokens for a receipt's durable refusal outcome after a
+# proven pre-effect detached-dispatch failure (no exception text or error
+# content ever enters durable state).
+_REGISTRATION_REFUSAL_KIND = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND = "admission_refused"
 
 logger = logging.getLogger(__name__)
 
@@ -628,74 +664,13 @@ def dispatch_planning_review(
         )
 
         # --- Phase 1: entry validation + atomic reservation (database only). ---
-        with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            # Serialize concurrent REVIEW dispatches for this Task on the
-            # Task row before any currentness decision (existing Task
-            # persistence; no new lock, index, or queue machinery).
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=production.task.state_token,
-            )
-            if task.status is not TaskStatus.PLANNING:
-                raise ConflictError("the addressed task is not in its coarse planning state")
-            _require_production_subject(task, production)
-            persisted_revision = require_current_plan_revision(
-                transaction_pool, task=task, plan_revision_id=production.plan_revision.id
-            )
-            _require_persisted_revision_coherence(persisted_revision, production.plan_revision)
-            reviewer = _require_ready_reviewer(
-                transaction_pool, workspace_id=workspace_id, task_id=task_id
-            )
-            workspace = get_workspace(transaction_pool, workspace_id)
-            if workspace is None:
-                raise NotFoundError("the requested workspace is not available")
-
-            workspace = get_workspace(transaction_pool, workspace_id)
-            if workspace is None:
-                raise NotFoundError("the requested workspace is not available")
-            repository = _require_task_repository(
-                transaction_pool,
-                workspace_id=workspace_id,
-                repository_id=task.repository_id,
-            )
-            loop = _require_or_establish_planning_loop(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                iteration_limit=workspace.review_iteration_limit,
-            )
-            locked_loop = review_records.get_review_loop(
-                transaction_pool, review_loop_id=loop.id, for_update=True
-            )
-            if locked_loop is None or locked_loop.id != loop.id:
-                raise StaleOperationError(
-                    "the planning review loop has moved on; the dispatch is stale"
-                )
-            iterations = review_records.list_review_loop_iterations(
-                transaction_pool, review_loop_id=loop.id
-            )
-            _require_no_unresolved_attempt(iterations)
-            _require_no_iteration_for_current_revision(iterations, persisted_revision)
-            reserved = _reserve_iteration(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                loop=loop,
-                iterations=iterations,
-                plan_revision_id=persisted_revision.id,
-            )
+        reserved = _reserve_review_attempt(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_production=production,
+        )
 
         if attempt_evidence is not None:
             # The F5b coordinator's handoff fact: this invocation's committed
@@ -705,27 +680,26 @@ def dispatch_planning_review(
             attempt_evidence.record_attempt(
                 family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
                 original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
-                original_attempt_id=reserved.id,
+                original_attempt_id=reserved.iteration.id,
                 phase="planning_review_dispatch",
             )
 
         # --- Phases 2 and 3: the deferred Reviewer attachment, the
         # post-attachment currentness proof, and the ONE REVIEW send — with
         # NO database transaction open across the attachment or the send. ---
-        repository_full_name = f"{repository.metadata.owner_login}/{repository.metadata.name}"
         subject = PlanReviewSubject(
-            plan_revision_id=str(persisted_revision.id),
-            repository_full_name=repository_full_name,
-            issue_number=task.github_issue_number,
-            plan=persisted_revision.content,
+            plan_revision_id=str(reserved.revision.id),
+            repository_full_name=reserved.repository_full_name,
+            issue_number=reserved.task.github_issue_number,
+            plan=reserved.revision.content,
         )
         interaction = ReviewInteraction(subject=subject)
         message = _compose_review_message(
-            repository_full_name=repository_full_name,
-            issue_number=task.github_issue_number,
-            revision=persisted_revision,
+            repository_full_name=reserved.repository_full_name,
+            issue_number=reserved.task.github_issue_number,
+            revision=reserved.revision,
         )
-        with reviewer_factory(reviewer) as runtime_adapter:
+        with reviewer_factory(reserved.reviewer) as runtime_adapter:
             # The attachment is acquired strictly after the reservation
             # commit, so a failure here is attributable to the exact reserved
             # ReviewIteration recorded above (issue #268). The post-attachment
@@ -735,14 +709,14 @@ def dispatch_planning_review(
                 pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                expected_state_token=production.task.state_token,
-                reserved_revision=persisted_revision,
-                reviewer_session=reviewer,
+                expected_state_token=reserved.task.state_token,
+                reserved_revision=reserved.revision,
+                reviewer_session=reserved.reviewer,
             )
             review_result = _realize_review_control(
                 pool,
                 runtime_adapter,
-                reviewer.external_session_id or "",
+                reserved.reviewer.external_session_id or "",
                 task_id=task_id,
                 interaction=interaction,
                 message=message,
@@ -754,8 +728,456 @@ def dispatch_planning_review(
         # transaction, rechecking the exact Task/token/current-plan/session
         # subject this dispatch proved.
         return TaskPlanningReviewDispatchOutcome(
-            review_loop=locked_loop,
-            review_iteration=reserved,
+            review_loop=reserved.loop,
+            review_iteration=reserved.iteration,
             review_result=review_result,
+            reviewer_session=reserved.reviewer,
+        )
+
+
+# --- the shared reservation and the detached regular-mode dispatch (issue #336) ---
+
+
+@dataclass(frozen=True, slots=True)
+class _ReservedReviewAttempt:
+    """The committed Phase-1 reservation facts both dispatch entries consume."""
+
+    task: Task
+    revision: PlanRevision
+    reviewer: TaskAgentSession
+    repository_full_name: str
+    loop: ReviewLoop
+    iteration: ReviewIteration
+
+
+def _reserve_review_attempt(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_production: TaskPlanProductionOutcome,
+) -> _ReservedReviewAttempt:
+    """Reserve exactly one next-numbered unfinalized ReviewIteration.
+
+    The shared Phase-1 entry validation and atomic reservation of both
+    dispatch entries (issues #209/#336): the account operational barrier,
+    exact Owner Workspace/Task scope, the Task row locked ``FOR UPDATE``
+    (serializing concurrent REVIEW dispatches for the same Task through
+    existing Task persistence), the exact current ``planning`` Task under
+    E2's post-update ``state_token``, the supplied PlanRevision proven to be
+    exactly the Task's current revision and content-identical to its
+    persisted row, the exact admitted READY Reviewer role/session resolved
+    from durable state, the durable Repository identity, and the
+    loop/iteration reservation — the OPEN planning loop established on
+    first review with the Workspace's snapshotted budget, the loop row
+    re-locked ``FOR UPDATE``, the no-unresolved-attempt and
+    no-iteration-for-current-revision guards, and the next-numbered
+    unfinalized iteration reserved atomically.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        require_workspace_task(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        # Serialize concurrent REVIEW dispatches for this Task on the
+        # Task row before any currentness decision (existing Task
+        # persistence; no new lock, index, or queue machinery).
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=plan_production.task.state_token,
+        )
+        if task.status is not TaskStatus.PLANNING:
+            raise ConflictError("the addressed task is not in its coarse planning state")
+        _require_production_subject(task, plan_production)
+        persisted_revision = require_current_plan_revision(
+            transaction_pool, task=task, plan_revision_id=plan_production.plan_revision.id
+        )
+        _require_persisted_revision_coherence(persisted_revision, plan_production.plan_revision)
+        reviewer = _require_ready_reviewer(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        workspace = get_workspace(transaction_pool, workspace_id)
+        if workspace is None:
+            raise NotFoundError("the requested workspace is not available")
+        repository = _require_task_repository(
+            transaction_pool,
+            workspace_id=workspace_id,
+            repository_id=task.repository_id,
+        )
+        loop = _require_or_establish_planning_loop(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            iteration_limit=workspace.review_iteration_limit,
+        )
+        locked_loop = review_records.get_review_loop(
+            transaction_pool, review_loop_id=loop.id, for_update=True
+        )
+        if locked_loop is None or locked_loop.id != loop.id:
+            raise StaleOperationError(
+                "the planning review loop has moved on; the dispatch is stale"
+            )
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        _require_no_unresolved_attempt(iterations)
+        _require_no_iteration_for_current_revision(iterations, persisted_revision)
+        reserved = _reserve_iteration(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            loop=loop,
+            iterations=iterations,
+            plan_revision_id=persisted_revision.id,
+        )
+    return _ReservedReviewAttempt(
+        task=task,
+        revision=persisted_revision,
+        reviewer=reviewer,
+        repository_full_name=f"{repository.metadata.owner_login}/{repository.metadata.name}",
+        loop=locked_loop,
+        iteration=reserved,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedPlanningReview:
+    """The typed detached planning-REVIEW dispatch outcome (issue #336).
+
+    The authoritative facts exactly as the durable state reads after the
+    dispatch: the post-dispatch Task (its token unrotated by the receipt),
+    the reserved unfinalized ReviewIteration whose receipt companion was
+    committed, the claimed detached-turn receipt, and the exact Reviewer
+    binding the canonical REVIEW instruction was admitted on. No runtime
+    result and no validated ``review_result`` exists yet: the independently
+    observed completion owns the decision settlement, and the ONE post-commit
+    completion handoff owns the workflow continuation.
+    """
+
+    task: Task
+    review_iteration: ReviewIteration
+    receipt: TaskDetachedTurnReceipt
+    reviewer_session: TaskAgentSession
+
+
+def _refuse_review_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed review receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises. The claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively. There is no send claim to mark — the reserved
+    ReviewIteration is the durable attempt identity.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused review-dispatch receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the review-dispatch receipt was no longer claimed when its pre-effect "
+            "refusal was recorded"
+        )
+
+
+def _dispatch_review_turn(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    reserved: _ReservedReviewAttempt,
+    message: str,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> DispatchedPlanningReview:
+    """Admit the canonical REVIEW instruction as one detached agent turn.
+
+    The shared detached-dispatch mechanics of the planning REVIEW family
+    (issue #336), mirroring the established detached-dispatch shape: the
+    runtime lease and the detached capability are acquired and duck-typed
+    fail-closed BEFORE any durable dispatch effect, the post-attachment
+    currentness proof re-proves the exact reserved subjects under the Task
+    row lock and closes before the receipt, the detached-turn receipt
+    companion of the exact reserved ReviewIteration commits in ONE short
+    transaction strictly before any runtime effect, one positively-required
+    observation registration gates the admission, one detached-turn
+    admission carries the composed canonical instruction verbatim, and the
+    acknowledgement attach consumes any staged early completion exactly
+    once. No ``send`` and no blocking wait exists in this path, and no
+    database transaction is ever held across a runtime call.
+
+    Proven pre-effect failures refuse the receipt and raise the typed
+    operational-failure classes the F5b coordinator triages under the
+    reserved iteration's own family. An uncertain admission leaves the
+    receipt conservatively claimed and is never re-dispatched. The
+    dispatching worker returns after the acknowledgement attach; the
+    observed completion owns the decision settlement.
+    """
+    reviewer = reserved.reviewer
+    reviewer_external_session_id = reviewer.external_session_id
+    if reviewer_external_session_id is None or not reviewer_external_session_id.strip():
+        raise ConflictError("the reviewer session binding carries no external session identity")
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the planning-review observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    with ExitStack() as attachment_stack:
+        runtime = attachment_stack.enter_context(reviewer_runtime_factory(reviewer))
+        # The detached capability is duck-typed fail-closed BEFORE any durable
+        # dispatch effect: a runtime without it cannot serve the detached
+        # dispatch, and no receipt was ever recorded.
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            raise ExternalOperationFailedError(
+                "the reviewer runtime does not implement the detached turn "
+                "capability; the review dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # The post-attachment currentness proof re-proves the reserved
+        # subjects under the Task row lock and closes before the receipt —
+        # the same proof the blocking send performs immediately before its
+        # one interaction send.
+        _revalidate_reserved_subjects(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=reserved.task.state_token,
+            reserved_revision=reserved.revision,
             reviewer_session=reviewer,
+        )
+
+        # --- The one short dispatch transaction: the detached-turn receipt
+        # companion of the exact reserved ReviewIteration, committed
+        # strictly before any runtime effect. The single-outstanding-receipt
+        # invariant and the receipt lifecycle are durable from here. ---
+        with composed_transaction(pool) as transaction_pool:
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reviewer.id,
+                operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.iteration.id,
+                expected_formal_family=REVIEW_RESULT_FAMILY,
+            )
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the just-recorded receipt is marked refused, so a never-dispatched
+        # turn cannot hold the session's single-outstanding slot. ---
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reviewer.id,
+                connection_id=reviewer.connection_id,
+                external_session_id=reviewer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_review_dispatch_quietly(pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND)
+            raise ExternalOperationFailedError(
+                "the planning-review observation registration was refused before "
+                "any admission; the instruction never dispatched"
+            ) from error
+        except Exception as error:
+            logger.warning(
+                "the planning-review observation registration failed "
+                "(%s) before any admission; the receipt is refused and the "
+                "instruction never dispatched",
+                type(error).__name__,
+            )
+            _refuse_review_dispatch_quietly(pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND)
+            raise ExternalOperationFailedError(
+                "the planning-review observation registration failed before any "
+                "admission; the instruction never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One
+        # detached-turn admission of the composed canonical instruction
+        # verbatim. ---
+        try:
+            admission = admit_detached_turn(reviewer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached planning-review admission ended with an uncertain "
+                "outcome; the receipt stays conservatively claimed and is never "
+                "re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the planning-review admission is unknown; the "
+                "receipt stays conservatively claimed and the instruction is "
+                "never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_review_dispatch_quietly(pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND)
+            raise ExternalOperationRejectedError(
+                "the planning-review admission was refused before any effect; "
+                "the receipt is refused and the instruction never dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated review result that finished
+        # before the acknowledgement was persisted is correlated, never
+        # ignored or duplicated. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the planning-review acknowledgement could not be durably "
+                "attached after its known admission; authoritative recovery "
+                "is required and the instruction is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the iteration and the receipt
+        # within this dispatch: the ONE post-commit completion handoff owns
+        # the family routing. Strictly post-commit, contained, never a
+        # workflow authority; a failed routing leaves the durable state to
+        # the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch planning-review completion handoff failed "
+                "(%s); the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return DispatchedPlanningReview(
+        task=reloaded_task,
+        review_iteration=reserved.iteration,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+        reviewer_session=reviewer,
+    )
+
+
+def dispatch_planning_review_detached(
+    pool: DatabasePool,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    plan_production: TaskPlanProductionOutcome,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPlanningReview:
+    """Dispatch one exact-plan REVIEW as one detached agent turn.
+
+    The detached counterpart of the ordinary REVIEW dispatch (issues
+    #325/#336): the same shared Phase-1 reservation — the exact current
+    PlanRevision, the exact admitted READY Reviewer session, the loop
+    guards, and the next-numbered unfinalized ReviewIteration committed
+    atomically — followed by the composed canonical REVIEW message admitted
+    verbatim as one independently completed agent turn on the exact
+    Reviewer session, with the iteration's detached-turn receipt companion
+    (expecting the canonical ``review_result`` family) committed strictly
+    before the positive observation registration and the admission. No
+    ``send`` and no blocking wait exists in this path, and the dispatching
+    worker returns after the acknowledgement attach. The independently
+    observed completion settles the validated ``review_result`` through the
+    owning E3b decision settlement, and the ONE post-commit completion
+    handoff owns the workflow continuation from committed state.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_DETACHED_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
+        production = _require_plan_production(plan_production)
+        annotate_span(
+            span,
+            operation=_DISPATCH_DETACHED_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: the shared entry validation + atomic reservation. ---
+        reserved = _reserve_review_attempt(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_production=production,
+        )
+
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # reserved review iteration identity (#262). Recorded immediately
+            # after the reservation commit, before anything below — the
+            # attachment acquisition included — can fail (issue #268).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.iteration.id,
+                phase="planning_review_dispatch",
+            )
+
+        message = _compose_review_message(
+            repository_full_name=reserved.repository_full_name,
+            issue_number=reserved.task.github_issue_number,
+            revision=reserved.revision,
+        )
+        return _dispatch_review_turn(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            reserved=reserved,
+            message=message,
+            reviewer_runtime_factory=reviewer_factory,
+            observation_registrar=observation_registrar,
+            completion_handoff=completion_handoff,
         )
