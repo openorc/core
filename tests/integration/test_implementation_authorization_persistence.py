@@ -37,7 +37,7 @@ from openorc.adapters.github import (
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.github_issues import github_issue_requirements_fingerprint
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
-from openorc.domain.tasks import TaskStatus
+from openorc.domain.tasks import TaskStatus, TaskTerminalizationOrigin
 from openorc.persistence import gates as gate_repositories
 from openorc.persistence import planning as planning_repositories
 from openorc.persistence import reviews as review_repositories
@@ -472,9 +472,11 @@ def test_a_late_approval_failure_rolls_the_whole_composition_back(
 def test_owner_cancel_resolves_and_archives_atomically(
     conn: Connection[Any],
 ) -> None:
-    """Cancellation stamps the gate CANCELLED with OWNER provenance (never
-    REJECTED), archives the Task with its safe OWNER terminal event, and
-    leaves the gate unapprovable afterwards."""
+    """Cancellation resolves the gate CANCELLED with OWNER provenance (never
+    REJECTED), commits the exact-Task terminalization commitment whose
+    archival finalizes the Task CANCELLED, and leaves the gate unapprovable
+    afterwards: the returned Task is the commitment carrier (issue #317) and
+    the archived final state is re-read from Postgres."""
     facts = _authorization_fixture(conn)
     pool = facts["pool"]
     presented = _open_call(pool, facts)
@@ -492,9 +494,25 @@ def test_owner_cancel_resolves_and_archives_atomically(
 
     assert cancelled.owner_gate.status is OwnerGateStatus.CANCELLED
     assert cancelled.owner_gate.decided_at is not None
-    assert cancelled.task.status is TaskStatus.CANCELLED
-    assert cancelled.task.archived_at is not None
+    # The returned Task is the terminalization commitment carrier (issue
+    # #317): the set-once committed outcome with its OWNER provenance,
+    # established strictly before the archival that finalizes it.
+    assert cancelled.task.terminalization_outcome is TaskStatus.CANCELLED
+    assert cancelled.task.terminalization_origin is TaskTerminalizationOrigin.OWNER_CANCELLED
+    assert cancelled.task.terminalization_established_at is not None
+    assert cancelled.task.archived_at is None
+    assert cancelled.task.status is TaskStatus.WAITING_FOR_OWNER
     assert cancelled.task.current_owner_gate_id is None
+    # The terminal finalization archives exactly the committed outcome: the
+    # final CANCELLED state is re-read from Postgres, with the commitment
+    # preserved as truthful history.
+    final_task = task_repositories.get_task(pool, facts["task_id"])
+    assert final_task is not None
+    assert final_task.status is TaskStatus.CANCELLED
+    assert final_task.archived_at is not None
+    assert final_task.terminalization_outcome is TaskStatus.CANCELLED
+    assert final_task.terminalization_origin is TaskTerminalizationOrigin.OWNER_CANCELLED
+    assert final_task.current_owner_gate_id is None
     assert (
         _row_count(
             conn,
