@@ -35,6 +35,7 @@ from openorc.domain.executions import ExecutionStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
+    ImplementationAuthorizationPresentationOperation,
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
@@ -42,6 +43,7 @@ from openorc.domain.operational_failures import (
     canonical_failure_subject,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.reviews import ReviewOutcome
 from openorc.domain.send_claims import TaskRuntimeSendClaimKind, TaskRuntimeSendClaimStatus
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.services import task_operational_failure_triage as triage_module
@@ -1485,5 +1487,140 @@ def test_a_presentation_retry_failure_without_the_consumption_stamp_fails_closed
         _coordinate(level_one=_presentation_retry_level_one(error), triage=triage)
 
     # Only the failure of an actually consumed attempt is reportable.
+    assert triage.call_count == 0
+    assert excinfo.value is error
+
+
+# --- issue #336: the exact-plan implementation-authorization presentation -----
+
+_IMPL_PRESENTATION_ITERATION_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-0000000000c1")
+
+
+def _accepted_clearance_iteration(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _IMPL_PRESENTATION_ITERATION_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "outcome": ReviewOutcome.ACCEPTED,
+        "plan_revision_id": _PLAN_REVISION_ID,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _planning_pre_gate_task(**overrides: Any) -> Any:
+    from types import SimpleNamespace
+
+    facts: dict[str, Any] = {
+        "id": _TASK_ID,
+        "workspace_id": _WORKSPACE_ID,
+        "status": TaskStatus.PLANNING,
+        "current_owner_gate_id": None,
+        "current_plan_revision_id": _PLAN_REVISION_ID,
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _patch_implementation_presentation_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    iteration: Any = None,
+    task: Any = None,
+) -> None:
+    """Substitute the exact-plan presentation resolver's focused durable reads."""
+    monkeypatch.setattr(
+        coordinator.review_records,
+        "get_review_iteration",
+        lambda _pool, *, review_iteration_id: (
+            iteration if iteration is not None and review_iteration_id == iteration.id else None
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task is not None and task_id == task.id else None,
+    )
+
+
+def _implementation_presentation_level_one(error: Exception) -> Any:
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_task_token(_PAYLOAD_TOKEN)
+        evidence.record_attempt(
+            family=ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION,
+            original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+            original_attempt_id=_IMPL_PRESENTATION_ITERATION_ID,
+            phase="implementation_authorization_presentation",
+        )
+        raise error
+
+    return level_one
+
+
+def test_an_implementation_presentation_failure_reaches_triage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detected exact-plan gate-presentation failure after the committed
+    accepted review reports truthful evidence through the presentation's own
+    family — the accepted iteration is the durable attribution identity, and
+    the report is never a silent stranding of the accepted review."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_implementation_presentation_reads(
+        monkeypatch, iteration=_accepted_clearance_iteration(), task=_planning_pre_gate_task()
+    )
+    error = ExternalOperationFailedError("the presentation reconciliation failed")
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(
+            level_one=_implementation_presentation_level_one(error),
+            triage=triage,
+            expected_status=TaskStatus.PLANNING,
+        )
+
+    assert triage.call_count == 1
+    call = triage.calls[0]
+    assert call["expected_state_token"] is _PAYLOAD_TOKEN
+    assert call["expected_status"] is TaskStatus.PLANNING
+    assert call["expected_current_owner_gate_id"] is None
+    operation = call["operation"]
+    expected_family = (  # noqa: E501
+        ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION
+    )
+    assert operation.family is expected_family
+    assert operation.original_attempt_kind is OriginalAttemptKind.REVIEW_ITERATION
+    assert operation.original_attempt_id == _IMPL_PRESENTATION_ITERATION_ID
+    # The constructed subject satisfies F4's own canonicalization contract.
+    canonical_failure_subject(dict(operation.subject))
+    report = call["report"]
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.ORIGINAL
+    assert report.reporting_attempt_id == _IMPL_PRESENTATION_ITERATION_ID
+    assert report.effect_attempt_id is None
+    assert report.effect_evidence is FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED
+    assert excinfo.value is error
+
+
+def test_an_implementation_presentation_failure_over_a_changes_requested_iteration_is_never_triaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The presentation family's episode root is the finalized ACCEPTED
+    iteration only: an incoherent recorded identity fails closed without
+    triaging — the review family's own checks stay exactly intact."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_implementation_presentation_reads(
+        monkeypatch,
+        iteration=_accepted_clearance_iteration(outcome=ReviewOutcome.CHANGES_REQUESTED),
+        task=_planning_pre_gate_task(),
+    )
+    error = ExternalOperationFailedError("the presentation reconciliation failed")
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(
+            level_one=_implementation_presentation_level_one(error),
+            triage=triage,
+            expected_status=TaskStatus.PLANNING,
+        )
+
     assert triage.call_count == 0
     assert excinfo.value is error

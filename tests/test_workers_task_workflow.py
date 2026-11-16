@@ -2274,3 +2274,347 @@ def test_planning_review_composition_dispatches_the_review_detached_in_regular_m
         # handoff own the continuation from committed state.
         assert finalize.call_count == 0
         assert submitter.submissions == []
+
+
+def test_the_completion_handoff_review_route_presents_the_implementation_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The planning-REVIEW route (issue #336): the settled accepted review's
+    committed state — a still-``planning`` Task with its accepted current
+    plan revision and no current gate — is the only presentation authority;
+    the exact-plan IMPLEMENTATION_AUTHORIZATION gate is presented (never
+    approved) and no Producer prompt is sent."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=_PR_RECORD_ID,
+        current_owner_gate_id=None,
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PLANNING,
+        status=ReviewLoopStatus.OPEN,
+    )
+    accepted = SimpleNamespace(
+        id=uuid4(), outcome=ReviewOutcome.ACCEPTED, plan_revision_id=_PR_RECORD_ID
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_task_review_loops",
+        lambda _pool, *, task_id: [loop] if task_id == _TASK_ID else [],
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_review_loop_iterations",
+        lambda _pool, *, review_loop_id: [accepted] if review_loop_id == loop.id else [],
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    presentations: list[dict[str, Any]] = []
+    coordinated: list[dict[str, Any]] = []
+
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        coordinated.append(dict(kwargs))
+        kwargs["invoke_level_one"](InvocationAttemptEvidence())
+
+    def recording_open_implementation(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+    monkeypatch.setattr(
+        task_workflow, "open_implementation_authorization", recording_open_implementation
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    # The presentation ran under the F5b coordinator with the fresh
+    # committed-state token seed and the durable Workspace Owner identity.
+    assert coordinated[0]["expected_status"] is TaskStatus.PLANNING
+    assert coordinated[0]["profile_id"] == _PROFILE_ID
+    assert coordinated[0]["expected_state_token"] == _NEXT_TOKEN
+    # The exact-plan gate was presented with the fresh committed-state token
+    # and the durable Workspace Owner identity — presenting, never approving,
+    # with the invocation's own attempt-evidence collector threaded through.
+    assert presentations == [
+        {
+            "profile_id": _PROFILE_ID,
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "expected_state_token": _NEXT_TOKEN,
+            "attempt_evidence": presentations[0]["attempt_evidence"],
+        }
+    ]
+    assert presentations[0]["attempt_evidence"] is not None
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_review_route_dispatches_the_revise_detached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The planning-REVIEW route (issue #336): an in-budget change request's
+    persisted iteration authorizes one new detached Producer REVISE through
+    the existing #335 service under the F5b coordinator — after which the
+    plan-result handoff route submits the next typed REVIEW round."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=_PR_RECORD_ID,
+        current_owner_gate_id=None,
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PLANNING,
+        status=ReviewLoopStatus.OPEN,
+    )
+    changes = SimpleNamespace(
+        id=uuid4(), outcome=ReviewOutcome.CHANGES_REQUESTED, plan_revision_id=_PR_RECORD_ID
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_task_review_loops",
+        lambda _pool, *, task_id: [loop] if task_id == _TASK_ID else [],
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_review_loop_iterations",
+        lambda _pool, *, review_loop_id: [changes] if review_loop_id == loop.id else [],
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    coordinated: list[dict[str, Any]] = []
+    dispatches: list[dict[str, Any]] = []
+
+    def recording_coordinate(pool: Any, **kwargs: Any) -> None:
+        coordinated.append(dict(kwargs))
+        kwargs["invoke_level_one"](InvocationAttemptEvidence())
+
+    def recording_dispatch(pool: Any, github: Any, **kwargs: Any) -> Any:
+        dispatches.append(dict(kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", recording_coordinate)
+    monkeypatch.setattr(task_workflow, "dispatch_planning_revise_detached", recording_dispatch)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    # The detached REVISE dispatch ran under the F5b coordinator with the
+    # persisted iteration as its authorization subject.
+    assert coordinated[0]["expected_status"] is TaskStatus.PLANNING
+    assert coordinated[0]["profile_id"] == _PROFILE_ID
+    assert coordinated[0]["expected_state_token"] == _NEXT_TOKEN
+    assert dispatches[0]["prior_plan_revision_id"] == _PR_RECORD_ID
+    assert dispatches[0]["review_iteration_id"] == changes.id
+    assert dispatches[0]["expected_state_token"] == _NEXT_TOKEN
+    assert dispatches[0]["attempt_evidence"] is not None
+    assert callable(dispatches[0]["producer_runtime_factory"])
+    # The revise dispatch is durably admitted; the next REVIEW round is the
+
+
+def test_the_completion_handoff_review_route_reports_a_failed_presentation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted route's gate presentation runs under the F5b coordinator
+    with the invocation's own attempt-evidence collector threaded through
+    (issue #336): a detected presentation failure reaches the Level 2 triage
+    under the presentation's own family with the accepted iteration as its
+    durable attribution identity — the recorded report is verified here, and
+    the coordinator re-raises the original error (its escalation disposition
+    is the triage's own tested contract) instead of silently stranding the
+    accepted review."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+    from openorc.services import task_workflow_operation_coordinator as coordinator_module
+
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=_PR_RECORD_ID,
+        current_owner_gate_id=None,
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PLANNING,
+        status=ReviewLoopStatus.OPEN,
+    )
+    accepted = SimpleNamespace(
+        id=uuid4(), outcome=ReviewOutcome.ACCEPTED, plan_revision_id=_PR_RECORD_ID
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_task_review_loops",
+        lambda _pool, *, task_id: [loop] if task_id == _TASK_ID else [],
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_review_loop_iterations",
+        lambda _pool, *, review_loop_id: [accepted] if review_loop_id == loop.id else [],
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    from openorc.domain.operational_failures import (
+        ImplementationAuthorizationPresentationOperation,
+        OriginalAttemptKind,
+    )
+
+    presentations: list[dict[str, Any]] = []
+
+    def failing_open_implementation(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        # The real service's Level 1 shape: the accepted iteration's identity
+        # is recorded into the invocation's evidence before the external
+        # source-requirements reconciliation can fail.
+        evidence = kwargs["attempt_evidence"]
+        assert evidence is not None
+        evidence.record_task_token(_NEXT_TOKEN)
+        evidence.record_attempt(
+            family=ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION,
+            original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+            original_attempt_id=accepted.id,
+            phase="implementation_authorization_presentation",
+        )
+        raise ExternalOperationFailedError("the presentation reconciliation failed")
+
+    monkeypatch.setattr(
+        task_workflow, "open_implementation_authorization", failing_open_implementation
+    )
+    reports: list[Any] = []
+
+    def recording_triage(_pool: Any, **kwargs: Any) -> Any:
+        reports.append(kwargs)
+        return SimpleNamespace(kind=SimpleNamespace(value="blocked"))
+
+    monkeypatch.setattr(coordinator_module, "triage_operational_failure", recording_triage)
+    # The coordinator's own identity verification reads the durable rows the
+    # service's recorded identity names; the accepted iteration and its
+    # current revision are the committed evidence.
+    monkeypatch.setattr(
+        coordinator_module.review_records,
+        "get_review_iteration",
+        lambda _pool, *, review_iteration_id: SimpleNamespace(
+            id=review_iteration_id,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            outcome=ReviewOutcome.ACCEPTED,
+            plan_revision_id=_PR_RECORD_ID,
+        ),
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(ExternalOperationFailedError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+        )
+
+    # The failing presentation was attempted exactly once with the collected
+    # evidence, and the typed report reached the Level 2 triage under the
+    # presentation's own family with the accepted iteration as the episode
+    # root — the durable escalation disposition, never a silent stranding.
+    assert len(presentations) == 1
+    evidence = presentations[0]["attempt_evidence"]
+    assert evidence is not None
+    assert len(reports) == 1
+    operation = reports[0]["operation"]
+    assert operation.family.value == "exact_plan_implementation_authorization_presentation"
+    assert operation.original_attempt_kind.value == "review_iteration"
+    assert reports[0]["expected_status"] is TaskStatus.PLANNING
+    assert submitter.submissions == []
+
+    # plan-result handoff route's own submission, never an inline one here.
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_review_route_ends_at_the_resolution_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exhausted or Owner-mediated change request's REVIEW_RESOLUTION gate
+    stands as the Task's current gate: the handoff route sends no Producer
+    prompt and the Owner-mediated resolution is not a workflow operation."""
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        current_plan_revision_id=_PR_RECORD_ID,
+        current_owner_gate_id=_OWNER_GATE_ID,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    presentations: list[Any] = []
+    dispatches: list[Any] = []
+    monkeypatch.setattr(
+        task_workflow,
+        "open_implementation_authorization",
+        lambda *args, **kwargs: presentations.append(kwargs),
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "dispatch_planning_revise_detached",
+        lambda *args, **kwargs: dispatches.append(kwargs),
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    assert presentations == []
+    assert dispatches == []
+    assert submitter.submissions == []

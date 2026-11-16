@@ -38,6 +38,7 @@ from openorc.domain.events import WorkflowEventActor
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
+    ImplementationAuthorizationPresentationOperation,
     OperationalFailureCode,
     OperationalFailureFamily,
     OperationalFailureSourceKind,
@@ -1899,6 +1900,167 @@ def test_a_presentation_report_with_a_crossed_runtime_code_escalates() -> None:
     assert result.kind is DispositionKind.BLOCKED
     assert result.installation is not None
     assert result.installation.task_block.id == _BLOCK_ID
+
+
+# --- the exact-plan implementation-authorization presentation family ----------
+# (issue #336)
+
+
+def _implementation_presentation_operation() -> OperationalFailureOperation:
+    return OperationalFailureOperation(
+        family=ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION,
+        original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+        original_attempt_id=_ITERATION_ID,
+        subject={"review_iteration_id": str(_ITERATION_ID)},
+    )
+
+
+def _implementation_presentation_report(
+    *, code: OperationalFailureCode = OperationalFailureCode.EXTERNAL_OPERATION_FAILED
+) -> OperationalFailureReport:
+    return OperationalFailureReport(
+        reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+        reporting_attempt_id=_ITERATION_ID,
+        error_code=code,
+        effect_evidence=FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED,
+        effect_attempt_id=None,
+        diagnostic_context={},
+    )
+
+
+def _accepted_iteration_row() -> tuple[Any, ...]:
+    # Domain coherence: an accepted iteration clears with zero findings.
+    return (
+        _ITERATION_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _LOOP_ID,
+        1,
+        _REVISION_ID,
+        None,
+        None,
+        "accepted",
+        "Looks good",
+        [],
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _script_implementation_presentation_escalation(conn: ScriptedConnection) -> None:
+    """The verified current report's escalation flow: F3 install + stamp."""
+    task_row = _task(status="planning", plan_revision=_REVISION_ID)
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    # The family verifier's reads: the finalized ACCEPTED iteration bound to
+    # the exact current plan revision, in its still-OPEN planning loop.
+    conn.on(_ITERATION_READ, _accepted_iteration_row())
+    conn.on(_LOOP_READ, _loop_row(status="open", purpose="planning"))
+    conn.on(
+        _EPISODE_INSERT,
+        _episode_row(
+            family="exact_plan_implementation_authorization_presentation",
+            kind="review_iteration",
+            original_id=_ITERATION_ID,
+        ),
+    )
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_TASK_PLAIN, task_row)
+    conn.on(
+        _BLOCK_INSERT,
+        (_BLOCK_ID, _WORKSPACE_ID, _TASK_ID, "external_operation_uncertain", {}, None, _OBSERVED),
+    )
+    conn.on(
+        _GATE_INSERT,
+        (
+            _NEW_GATE_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            "block_resolution",
+            "pending",
+            None,
+            None,
+            None,
+            _BLOCK_ID,
+            None,
+            _OBSERVED,
+        ),
+    )
+    conn.on(
+        _TASK_BLOCK_UPDATE,
+        _task(status="blocked", state_token=_ROTATED_TOKEN, current_gate=_NEW_GATE_ID),
+    )
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
+    conn.on(
+        _EPISODE_ESCALATE,
+        _episode_row(
+            family="exact_plan_implementation_authorization_presentation",
+            kind="review_iteration",
+            original_id=_ITERATION_ID,
+        ),
+    )
+
+
+def test_an_implementation_presentation_failure_escalates_through_f3() -> None:
+    """A current report over the finalized ACCEPTED iteration and the
+    still-pre-gate planning Task escalates through the safe F3 installation:
+    the durable disposition of a failed accepted-review gate presentation
+    (issue #336) — never a silent stranding, never a replay of the review."""
+    conn = ScriptedConnection()
+    _script_implementation_presentation_escalation(conn)
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_implementation_presentation_operation(),
+        report=_implementation_presentation_report(),
+    )
+    assert result.kind is DispositionKind.BLOCKED
+    assert result.installation is not None
+    assert result.installation.task_block.id == _BLOCK_ID
+
+
+def test_an_implementation_presentation_report_over_a_changes_requested_iteration_is_stale() -> (
+    None
+):
+    """The presentation family's episode root is the finalized ACCEPTED
+    iteration only: a report over a change-requested iteration is incoherent
+    and stale — the review family's own unfinalized-subject checks stay
+    exactly intact for REVIEWER_REVIEW."""
+    conn = ScriptedConnection()
+    task_row = _task(status="planning", plan_revision=_REVISION_ID)
+    conn.on(_TASK_LOCKED, task_row)
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    conn.on(_ITERATION_READ, _planning_iteration_row(outcome="changes_requested"))
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_implementation_presentation_operation(),
+        report=_implementation_presentation_report(),
+    )
+    assert result.kind is DispositionKind.NO_OP
+
+
+def test_an_implementation_presentation_report_over_a_gate_holding_task_is_stale() -> None:
+    """The presentation's single durable effect installs the gate and rotates
+    the token: a report against a Task that has moved past the pre-gate
+    planning state is stale — the structural repeat-safety proof."""
+    conn = ScriptedConnection()
+    conn.on(
+        _TASK_LOCKED,
+        _task(status="waiting_for_owner", plan_revision=_REVISION_ID, current_gate=_NEW_GATE_ID),
+    )
+    conn.on(_EPISODE_BY_ORIGINAL, None)
+    conn.on(_ATTEMPT_BY_SOURCE, None)
+    result = _triage(
+        conn,
+        status=TaskStatus.PLANNING,
+        operation=_implementation_presentation_operation(),
+        report=_implementation_presentation_report(),
+    )
+    assert result.kind is DispositionKind.NO_OP
 
 
 # --- the planning-bootstrap family verification (issue #334) --------------------
