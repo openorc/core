@@ -73,6 +73,7 @@ from openorc.adapters.cline.connection_endpoint import (
 )
 from openorc.adapters.cline.contract import ClineSdkBackend
 from openorc.adapters.cline.errors import ClineSdkBackendError
+from openorc.adapters.cline.hub_observation import OPENORC_CLIENT_IDENTITY
 from openorc.adapters.cline.values import ClineRemoteConfig
 from openorc.domain.connections import AdapterType, Connection, WorkflowRole
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
@@ -105,8 +106,6 @@ _CONNECT_OPERATION: Final = "connect"
 
 # The fixed non-secret OpenOrc client identity presented at Hub registration:
 # an attaching-client classification, never a credential and never per-tenant.
-OPENORC_CLIENT_IDENTITY: Final = "openorc-core"
-
 logger = logging.getLogger(__name__)
 
 

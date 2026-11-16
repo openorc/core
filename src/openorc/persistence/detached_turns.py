@@ -1,13 +1,16 @@
-"""Repositories for the durable Hub-run correlation/settlement seam
-(detached agent turns, issue #322).
+"""Repositories for the durable detached-turn correlation/settlement seam
+(detached agent turns, issues #322/#348).
 
 Explicit SQL repositories over the ``openorc`` schema for
-``openorc.task_hub_run_receipts`` — the durable claim-to-run receipt binding
+``openorc.task_hub_run_receipts`` — the durable claim-to-turn receipt binding
 an authorized one-shot claim identity to the exact authoritative
-``TaskAgentSession`` binding and, after admission, to the acknowledged
-native Hub ``runId`` — and for ``openorc.task_hub_run_early_completions``,
+``TaskAgentSession`` binding and, after admission, to the acknowledged opaque
+turn reference — and for ``openorc.task_hub_run_early_completions``,
 the smallest safe handoff for a terminal observation that arrives before its
-receipt's acknowledgement is persisted.
+receipt's acknowledgement is persisted. The historical table and column names
+are retained deliberately as stable physical encoding (issue #348): no
+runtime-specific schema change is ever required by the detached-turn
+boundary.
 
 The receipt lifecycle is enforced by conditional statements only:
 
@@ -25,7 +28,7 @@ The receipt lifecycle is enforced by conditional statements only:
   delete composed inside the acknowledgement attach's settlement.
 
 Rows map to transport-independent domain objects from
-:mod:`openorc.domain.hub_runs`; instants returned from Postgres are
+:mod:`openorc.domain.detached_turns`; instants returned from Postgres are
 normalized to timezone-aware UTC at this boundary, and outcomes pass through
 the shared domain canonicalizer with an explicit ``Jsonb`` adapter. No
 external call ever occurs inside these transactions.
@@ -34,16 +37,16 @@ external call ever occurs inside these transactions.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 from psycopg.types.json import Jsonb
 
-from openorc.domain.hub_runs import (
-    HubRunObservationKind,
-    TaskHubRunEarlyCompletion,
-    TaskHubRunReceipt,
-    TaskHubRunReceiptStatus,
+from openorc.domain.detached_turns import (
+    DetachedTurnObservationKind,
+    TaskDetachedTurnEarlyCompletion,
+    TaskDetachedTurnReceipt,
+    TaskDetachedTurnReceiptStatus,
 )
 from openorc.domain.intents import canonical_intent_outcome
 from openorc.domain.operational_failures import OriginalAttemptKind
@@ -53,23 +56,35 @@ from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
+# The stable storage encoding of the neutral terminal observation kinds:
+# OpenOrc's own durable tokens, unchanged since the receipts' introduction
+# (issue #322) and mapped at this boundary so a runtime integration's native
+# event vocabulary can never reach the stored encoding (issue #348).
+_OBSERVATION_KIND_TOKENS: Final[Mapping[DetachedTurnObservationKind, str]] = {
+    DetachedTurnObservationKind.COMPLETED: "run.completed",
+    DetachedTurnObservationKind.FAILED: "run.failed",
+}
+_OBSERVATION_KINDS_BY_TOKEN: Final[Mapping[str, DetachedTurnObservationKind]] = {
+    token: kind for kind, token in _OBSERVATION_KIND_TOKENS.items()
+}
+
 __all__ = [
-    "attach_task_hub_run_acknowledgement",
-    "consume_task_hub_run_early_completion",
-    "create_task_hub_run_receipt",
+    "attach_task_detached_turn_acknowledgement",
+    "consume_task_detached_turn_early_completion",
+    "create_task_detached_turn_receipt",
     "find_outstanding_session_initialization_receipt",
-    "get_last_consumed_hub_run_sequence",
+    "get_last_consumed_turn_ordering_marker",
     "get_latest_session_initialization_receipt",
-    "get_outstanding_task_hub_run_receipt",
-    "get_outstanding_task_hub_run_receipt_for_update",
-    "get_task_hub_run_early_completion_for_update",
-    "get_task_hub_run_receipt",
-    "get_task_hub_run_receipt_for_update",
+    "get_outstanding_task_detached_turn_receipt",
+    "get_outstanding_task_detached_turn_receipt_for_update",
+    "get_task_detached_turn_early_completion_for_update",
+    "get_task_detached_turn_receipt",
+    "get_task_detached_turn_receipt_for_update",
     "list_outstanding_session_initialization_receipts",
-    "mark_task_hub_run_receipt_contradicted",
-    "refuse_task_hub_run_receipt",
-    "settle_task_hub_run_receipt",
-    "stage_task_hub_run_early_completion",
+    "mark_task_detached_turn_receipt_contradicted",
+    "refuse_task_detached_turn_receipt",
+    "settle_task_detached_turn_receipt",
+    "stage_task_detached_turn_early_completion",
 ]
 
 _RECEIPT_COLUMNS = (
@@ -99,11 +114,19 @@ _EARLY_COMPLETION_COLUMNS = (
 
 def _require_uuid(value: object, name: str) -> None:
     if not isinstance(value, UUID):
-        raise ValueError(f"hub-run receipt {name} must be a UUID")
+        raise ValueError(f"detached-turn receipt {name} must be a UUID")
 
 
-def _receipt_from_row(row: Sequence[Any]) -> TaskHubRunReceipt:
-    return TaskHubRunReceipt(
+def _require_stored_observation_kind(token: object) -> DetachedTurnObservationKind:
+    """Translate one stored kind token into its neutral observation kind."""
+    kind = _OBSERVATION_KINDS_BY_TOKEN.get(token) if isinstance(token, str) else None
+    if kind is None:
+        raise ValueError("stored detached-turn early-completion kind is not a known token")
+    return kind
+
+
+def _receipt_from_row(row: Sequence[Any]) -> TaskDetachedTurnReceipt:
+    return TaskDetachedTurnReceipt(
         id=row[0],
         workspace_id=row[1],
         task_id=row[2],
@@ -112,8 +135,8 @@ def _receipt_from_row(row: Sequence[Any]) -> TaskHubRunReceipt:
         original_attempt_kind=OriginalAttemptKind(row[5]),
         original_attempt_id=row[6],
         expected_formal_family=row[7],
-        run_id=row[8],
-        status=TaskHubRunReceiptStatus(row[9]),
+        admitted_turn_reference=row[8],
+        status=TaskDetachedTurnReceiptStatus(row[9]),
         outcome=row[10],
         contradicted_at=None if row[11] is None else normalize_utc(row[11]),
         claimed_at=normalize_utc(row[12]),
@@ -126,14 +149,14 @@ def _receipt_from_row(row: Sequence[Any]) -> TaskHubRunReceipt:
     )
 
 
-def _early_completion_from_row(row: Sequence[Any]) -> TaskHubRunEarlyCompletion:
-    return TaskHubRunEarlyCompletion(
+def _early_completion_from_row(row: Sequence[Any]) -> TaskDetachedTurnEarlyCompletion:
+    return TaskDetachedTurnEarlyCompletion(
         id=row[0],
         workspace_id=row[1],
         task_id=row[2],
-        task_hub_run_receipt_id=row[3],
-        kind=HubRunObservationKind(row[4]),
-        sequence=row[5],
+        task_detached_turn_receipt_id=row[3],
+        kind=_require_stored_observation_kind(row[4]),
+        ordering_marker=row[5],
         result_candidate=row[6],
         staged_at=normalize_utc(row[7]),
     )
@@ -143,7 +166,7 @@ def _canonical_outcome(outcome: Mapping[str, object]) -> dict[str, object]:
     return dict(canonical_intent_outcome(outcome))
 
 
-def create_task_hub_run_receipt(
+def create_task_detached_turn_receipt(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
@@ -156,7 +179,7 @@ def create_task_hub_run_receipt(
     created_external_session_id: str | None = None,
     effective_config_snapshot: Mapping[str, object] | None = None,
     created_session_provenance: Mapping[str, object] | None = None,
-) -> TaskHubRunReceipt:
+) -> TaskDetachedTurnReceipt:
     """Insert one claimed Hub-run receipt exactly once, before any enqueue.
 
     Composed inside the owning service's claim transaction, this is the
@@ -180,21 +203,23 @@ def create_task_hub_run_receipt(
     _require_uuid(task_agent_session_id, "task_agent_session_id")
     _require_uuid(original_attempt_id, "original_attempt_id")
     if not isinstance(operation, PendingTaskRuntimeInteractionOperation):
-        raise ValueError("create_task_hub_run_receipt requires a pending-interaction operation")
+        raise ValueError(
+            "create_task_detached_turn_receipt requires a pending-interaction operation"
+        )
     if not isinstance(original_attempt_kind, OriginalAttemptKind):
-        raise ValueError("create_task_hub_run_receipt requires an OriginalAttemptKind")
+        raise ValueError("create_task_detached_turn_receipt requires an OriginalAttemptKind")
     if not isinstance(expected_formal_family, str) or not expected_formal_family.strip():
-        raise ValueError("create_task_hub_run_receipt requires a non-empty formal family")
+        raise ValueError("create_task_detached_turn_receipt requires a non-empty formal family")
     if created_external_session_id is not None and (
         not isinstance(created_external_session_id, str) or not created_external_session_id.strip()
     ):
         raise ValueError(
-            "create_task_hub_run_receipt requires a non-empty provisional external "
+            "create_task_detached_turn_receipt requires a non-empty provisional external "
             "session identity when one is supplied"
         )
     if effective_config_snapshot is not None and not isinstance(effective_config_snapshot, Mapping):
         raise ValueError(
-            "create_task_hub_run_receipt requires a mapping effective configuration "
+            "create_task_detached_turn_receipt requires a mapping effective configuration "
             "snapshot when one is supplied"
         )
     snapshot = (
@@ -233,7 +258,9 @@ def create_task_hub_run_receipt(
     return _receipt_from_row(row)
 
 
-def get_task_hub_run_receipt(pool: DatabasePool, *, receipt_id: UUID) -> TaskHubRunReceipt | None:
+def get_task_detached_turn_receipt(
+    pool: DatabasePool, *, receipt_id: UUID
+) -> TaskDetachedTurnReceipt | None:
     """Read one Hub-run receipt by its exact identity, or ``None``."""
     _require_uuid(receipt_id, "receipt_id")
     with transaction(pool) as conn:
@@ -244,9 +271,9 @@ def get_task_hub_run_receipt(pool: DatabasePool, *, receipt_id: UUID) -> TaskHub
     return None if row is None else _receipt_from_row(row)
 
 
-def get_task_hub_run_receipt_for_update(
+def get_task_detached_turn_receipt_for_update(
     pool: DatabasePool, *, receipt_id: UUID
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Read one Hub-run receipt under an exclusive row lock.
 
     Serves the acknowledgement attach and the settlement routing: the
@@ -264,13 +291,13 @@ def get_task_hub_run_receipt_for_update(
     return None if row is None else _receipt_from_row(row)
 
 
-def get_outstanding_task_hub_run_receipt(
+def get_outstanding_task_detached_turn_receipt(
     pool: DatabasePool, *, task_agent_session_id: UUID
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Return the session binding's single unsettled (claimed/admitted) receipt.
 
     The serial-correlation lookup: at most one unsettled OpenOrc-dispatched
-    Hub run exists per exact authoritative session binding (the partial
+    turn exists per exact authoritative session binding (the partial
     unique index is the durable backstop). ``None`` means no OpenOrc-run is
     outstanding for the binding — an observed terminal event for it is
     unowned and never attributed.
@@ -285,9 +312,9 @@ def get_outstanding_task_hub_run_receipt(
     return None if row is None else _receipt_from_row(row)
 
 
-def get_outstanding_task_hub_run_receipt_for_update(
+def get_outstanding_task_detached_turn_receipt_for_update(
     pool: DatabasePool, *, task_agent_session_id: UUID
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """The locked variant of the serial-correlation lookup.
 
     The settlement routing locks the outstanding receipt so its forward-only
@@ -311,7 +338,7 @@ def find_outstanding_session_initialization_receipt(
     workspace_id: UUID,
     connection_id: UUID,
     created_external_session_id: str,
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Resolve the outstanding initialization receipt of one provisional session.
 
     The detached session establishment's settlement lookup (issue #324): a
@@ -355,7 +382,7 @@ def get_latest_session_initialization_receipt(
     pool: DatabasePool,
     *,
     task_agent_session_id: UUID,
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Return the binding's most recent initialization receipt, any status.
 
     The claimed-bootstrap disposition's establishment provenance read (issue
@@ -384,7 +411,7 @@ def list_outstanding_session_initialization_receipts(
     pool: DatabasePool,
     *,
     task_id: UUID,
-) -> list[TaskHubRunReceipt]:
+) -> list[TaskDetachedTurnReceipt]:
     """List a Task's outstanding initialization receipts, ordered stably.
 
     The pending-interaction projection's detached-establishment read (issue
@@ -406,15 +433,15 @@ def list_outstanding_session_initialization_receipts(
     return [_receipt_from_row(row) for row in rows]
 
 
-def attach_task_hub_run_acknowledgement(
+def attach_task_detached_turn_acknowledgement(
     pool: DatabasePool,
     *,
     receipt_id: UUID,
     task_id: UUID,
     workspace_id: UUID,
-    run_id: str,
-) -> TaskHubRunReceipt | None:
-    """Attach one acknowledged native runId to a claimed receipt, exactly once.
+    admitted_turn_reference: str,
+) -> TaskDetachedTurnReceipt | None:
+    """Attach one acknowledged opaque turn reference to a claimed receipt, once.
 
     The one-shot CAS ``claimed`` → ``admitted``: applies only while the
     receipt is still claimed and the addressed Task/Workspace scope matches,
@@ -426,34 +453,34 @@ def attach_task_hub_run_acknowledgement(
     _require_uuid(receipt_id, "receipt_id")
     _require_uuid(task_id, "task_id")
     _require_uuid(workspace_id, "workspace_id")
-    if not isinstance(run_id, str) or not run_id.strip():
-        raise ValueError("hub-run receipt run_id must be a non-empty string")
+    if not isinstance(admitted_turn_reference, str) or not admitted_turn_reference.strip():
+        raise ValueError("detached-turn receipt admitted_turn_reference must be a non-empty string")
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.task_hub_run_receipts "
             "set status = 'admitted', run_id = %s, admitted_at = now(), updated_at = now() "
             "where id = %s and task_id = %s and workspace_id = %s and status = 'claimed' "
             f"returning {_RECEIPT_COLUMNS}",
-            (run_id, receipt_id, task_id, workspace_id),
+            (admitted_turn_reference, receipt_id, task_id, workspace_id),
         ).fetchone()
     return None if row is None else _receipt_from_row(row)
 
 
-def settle_task_hub_run_receipt(
+def settle_task_detached_turn_receipt(
     pool: DatabasePool,
     *,
     receipt_id: UUID,
     task_id: UUID,
     workspace_id: UUID,
     outcome: Mapping[str, object],
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Advance one admitted receipt to ``settled`` exactly once.
 
     The terminal record of one consumed terminal observation routed through
     the owning services: applies only while the receipt is still ``admitted``
     and the addressed Task/Workspace scope matches, stamps ``settled_at``
     and the canonical safe outcome (the settlement label plus the consumed
-    sequence marker when the observation carried one) together. ``None``
+    ordering marker when the observation carried one) together. ``None``
     means the receipt is missing, out of scope, or already terminal — a
     rejected no-op that is never retried blindly. A settlement that never
     commits — a crash or a rolled-back finalize composition — leaves the
@@ -475,17 +502,17 @@ def settle_task_hub_run_receipt(
     return None if row is None else _receipt_from_row(row)
 
 
-def mark_task_hub_run_receipt_contradicted(
+def mark_task_detached_turn_receipt_contradicted(
     pool: DatabasePool,
     *,
     receipt_id: UUID,
     task_id: UUID,
     workspace_id: UUID,
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Set the explicit contradictory-run-identity marker exactly once.
 
-    An explicitly observed ``run.started`` identity that concretely differs
-    from the outstanding acknowledged run makes that receipt's correlation
+    An explicitly observed contradictory turn identity that concretely
+    differs from the outstanding acknowledged reference makes that receipt's correlation
     unsafe: the set-once marker permanently blocks its settlement (the
     settlement CAS refuses a contradicted receipt), so the correlation stays
     honestly unresolved instead of inventing a match. ``None`` means the
@@ -507,18 +534,20 @@ def mark_task_hub_run_receipt_contradicted(
     return None if row is None else _receipt_from_row(row)
 
 
-def get_last_consumed_hub_run_sequence(
+def get_last_consumed_turn_ordering_marker(
     pool: DatabasePool, *, task_agent_session_id: UUID
 ) -> int | None:
-    """Return the session's highest consumed terminal-event sequence marker.
+    """Return the session's highest consumed terminal ordering marker.
 
     The stale-replay evidence: every settled receipt of the binding records
-    the durable Hub-log sequence of the terminal observation it consumed.
-    A newly observed terminal event whose sequence is at or below that
-    marker is an already-consumed or stale duplicate notification, never a
-    fresh completion. ``None`` means the session has no consumed sequence
-    marker yet (no rejection evidence — a sequence-less observation cannot
-    be ordered and is never rejected by this check).
+    the durable ordering token of the terminal observation it consumed, in
+    the runtime integration's own ordering semantics. A newly observed
+    terminal evidence item the integration classifies as not newer than
+    that marker is an already-consumed or stale duplicate notification,
+    never a fresh completion. ``None`` means the session has no consumed
+    ordering marker yet. The token's interpretation lives behind the
+    runtime integration's classification (issue #348); this repository owns
+    only its durable storage.
     """
     _require_uuid(task_agent_session_id, "task_agent_session_id")
     with transaction(pool) as conn:
@@ -534,18 +563,18 @@ def get_last_consumed_hub_run_sequence(
     return int(row[0])
 
 
-def refuse_task_hub_run_receipt(
+def refuse_task_detached_turn_receipt(
     pool: DatabasePool,
     *,
     receipt_id: UUID,
     task_id: UUID,
     workspace_id: UUID,
     refusal_kind: str,
-) -> TaskHubRunReceipt | None:
+) -> TaskDetachedTurnReceipt | None:
     """Advance one claimed receipt to ``refused`` exactly once.
 
     The truthful terminal record of a positively proven pre-effect admission
-    refusal: the run never became a Hub run, so it must not hold the
+    refusal: the turn was never admitted, so it must not hold the
     session's single-outstanding slot. Applies only while the receipt is
     still ``claimed`` and the addressed Task/Workspace scope matches.
     ``None`` means the receipt is missing, out of scope, or already terminal
@@ -555,7 +584,7 @@ def refuse_task_hub_run_receipt(
     _require_uuid(task_id, "task_id")
     _require_uuid(workspace_id, "workspace_id")
     if not isinstance(refusal_kind, str) or not refusal_kind.strip():
-        raise ValueError("hub-run receipt refusal_kind must be a non-empty string")
+        raise ValueError("detached-turn receipt refusal_kind must be a non-empty string")
     canonical_outcome = _canonical_outcome({"refusal_kind": refusal_kind})
     with transaction(pool) as conn:
         row = conn.execute(
@@ -568,36 +597,38 @@ def refuse_task_hub_run_receipt(
     return None if row is None else _receipt_from_row(row)
 
 
-def stage_task_hub_run_early_completion(
+def stage_task_detached_turn_early_completion(
     pool: DatabasePool,
     *,
     receipt_id: UUID,
     task_id: UUID,
     workspace_id: UUID,
-    kind: HubRunObservationKind,
-    sequence: int | None,
+    kind: DetachedTurnObservationKind,
+    ordering_marker: int | None,
     result_candidate: str | None,
-) -> TaskHubRunEarlyCompletion:
+) -> TaskDetachedTurnEarlyCompletion:
     """Stage one early terminal observation on its claimed receipt.
 
     The admission-race handoff: the observation arrived while the receipt
     was still claimed (acknowledgement not yet persisted). The insert is
     unique per receipt — a second terminal delivery for the same single
-    outstanding run raises ``UniqueViolation`` and is classified by the
+    outstanding turn raises ``UniqueViolation`` and is classified by the
     service layer as a duplicate, never consumed twice.
     """
     _require_uuid(receipt_id, "receipt_id")
     _require_uuid(task_id, "task_id")
     _require_uuid(workspace_id, "workspace_id")
-    if not isinstance(kind, HubRunObservationKind):
-        raise ValueError("stage_task_hub_run_early_completion requires an observation kind")
-    if sequence is not None and type(sequence) is not int:
-        raise ValueError("stage_task_hub_run_early_completion requires an integer sequence")
+    if not isinstance(kind, DetachedTurnObservationKind):
+        raise ValueError("stage_task_detached_turn_early_completion requires an observation kind")
+    if ordering_marker is not None and type(ordering_marker) is not int:
+        raise ValueError(
+            "stage_task_detached_turn_early_completion requires an integer ordering marker"
+        )
     if result_candidate is not None and (
         not isinstance(result_candidate, str) or not result_candidate.strip()
     ):
         raise ValueError(
-            "stage_task_hub_run_early_completion requires a non-empty result candidate"
+            "stage_task_detached_turn_early_completion requires a non-empty result candidate"
         )
     with transaction(pool) as conn:
         row = conn.execute(
@@ -609,8 +640,8 @@ def stage_task_hub_run_early_completion(
                 workspace_id,
                 task_id,
                 receipt_id,
-                kind.value,
-                sequence,
+                _OBSERVATION_KIND_TOKENS[kind],
+                ordering_marker,
                 result_candidate,
             ),
         ).fetchone()
@@ -618,9 +649,9 @@ def stage_task_hub_run_early_completion(
     return _early_completion_from_row(row)
 
 
-def get_task_hub_run_early_completion_for_update(
+def get_task_detached_turn_early_completion_for_update(
     pool: DatabasePool, *, receipt_id: UUID
-) -> TaskHubRunEarlyCompletion | None:
+) -> TaskDetachedTurnEarlyCompletion | None:
     """Read the receipt's staged early completion under an exclusive row lock.
 
     Serves the acknowledgement attach's consumption: the staged observation
@@ -638,7 +669,7 @@ def get_task_hub_run_early_completion_for_update(
     return None if row is None else _early_completion_from_row(row)
 
 
-def consume_task_hub_run_early_completion(
+def consume_task_detached_turn_early_completion(
     pool: DatabasePool, *, completion_id: UUID, receipt_id: UUID
 ) -> bool:
     """Delete one staged early completion exactly once.

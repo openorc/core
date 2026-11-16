@@ -31,6 +31,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeDeliveryUncertainError,
@@ -41,7 +42,6 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
-    AgentRunAdmission,
     AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
@@ -54,7 +54,7 @@ from openorc.adapters.cline import (
 )
 from openorc.adapters.cline.values import ClineStartResult
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.hub_runs import TaskHubRunReceiptStatus
+from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import (
@@ -71,9 +71,9 @@ from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationRejectedError,
     ExternalOperationUncertainError,
-    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
 )
 from openorc.services.session_runtime import (
     ConnectionNotEstablishableError,
@@ -1982,8 +1982,8 @@ class _DetachedAdapterDouble(AgentRuntimeAdapter):
             raise self._allocation_error
         return self._allocation
 
-    def admit_initialization_run(self, session_id: str, initialization: str) -> Any:
-        self.admissions.append((session_id, initialization))
+    def admit_detached_turn(self, session_id: str, content: str) -> Any:
+        self.admissions.append((session_id, content))
         self.lifecycle.append("admit")
         outcome = self._admission_outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -2125,7 +2125,7 @@ def test_detached_dispatch_enqueues_the_initialization_and_leaves_connecting() -
     registrar = _RecordingRegistrar()
     adapter = _DetachedAdapterDouble(
         AgentSessionAllocation(external_session_id="ext-9"),
-        [AgentRunAdmission(run_id="run-324")],
+        [AgentTurnAdmission(turn_reference="run-324")],
     )
 
     outcome = dispatch_task_agent_session_establishment(
@@ -2142,8 +2142,8 @@ def test_detached_dispatch_enqueues_the_initialization_and_leaves_connecting() -
     assert outcome.receipt is not None
     # The acknowledgement attach consumed no staged completion: the receipt
     # is admitted with its acknowledged runId, and the binding is untouched.
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.ADMITTED
-    assert outcome.receipt.run_id == "run-324"
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.ADMITTED
+    assert outcome.receipt.admitted_turn_reference == "run-324"
     assert outcome.receipt.created_external_session_id == "ext-9"
     # The promptless allocation and the verbatim enqueue; never a send.
     assert adapter.allocation_requests[0].initialization != ""
@@ -2197,7 +2197,7 @@ def test_repeated_detached_dispatch_is_an_idempotent_no_op() -> None:
     # The outstanding receipt is the proof: no second allocation, enqueue,
     # registration, or insert ever happens.
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.CLAIMED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.CLAIMED
     assert outcome.receipt.created_external_session_id == "ext-9"
     assert adapter.allocation_requests == []
     assert adapter.admissions == []
@@ -2293,7 +2293,7 @@ def test_registration_refusal_is_a_proven_pre_effect_failure() -> None:
         + [refused_row]
     )
 
-    with pytest.raises(HubObservationRegistrationRefusedError):
+    with pytest.raises(ObservationRegistrationRefusedError):
         adapter = _DetachedAdapterDouble(
             AgentSessionAllocation(external_session_id="ext-9"),
             [],
@@ -2303,7 +2303,7 @@ def test_registration_refusal_is_a_proven_pre_effect_failure() -> None:
             adapter,  # type: ignore[arg-type]
             **_dispatch_kwargs(workspace_id, task_id),
             observation_registrar=_RecordingRegistrar(
-                error=HubObservationRegistrationRefusedError(
+                error=ObservationRegistrationRefusedError(
                     "at capacity", reason="observer_at_capacity"
                 )
             ),  # type: ignore[arg-type]

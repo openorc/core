@@ -4097,7 +4097,7 @@ def test_allocate_detached_session_starts_without_any_turn_and_registers_the_ide
     assert [call.operation for call in backend.calls()] == ["start"]
 
 
-def test_admit_initialization_run_enqueues_the_initialization_verbatim_without_any_send() -> None:
+def test_admit_detached_turn_enqueues_the_initialization_verbatim_without_any_send() -> None:
     backend = FakeClineSdkBackend()
     resolver = ScriptedResolver(creation=_context())
     backend.queue_start(ClineStartResult(session_id="cline-session-9"))
@@ -4107,9 +4107,9 @@ def test_admit_initialization_run_enqueues_the_initialization_verbatim_without_a
         "cline-session-9", ClineRunAdmission(run_id="run-91", accepted_at=7, queue_position=0)
     )
 
-    admitted = adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+    admitted = adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
-    assert admitted.run_id == "run-91"
+    assert admitted.turn_reference == "run-91"
     enqueue_calls = [call for call in backend.calls() if call.operation == "enqueue"]
     assert len(enqueue_calls) == 1
     assert enqueue_calls[0].session_id == "cline-session-9"
@@ -4118,16 +4118,47 @@ def test_admit_initialization_run_enqueues_the_initialization_verbatim_without_a
     assert [call.operation for call in backend.calls()] == ["start", "enqueue"]
 
 
-def test_admit_initialization_run_refuses_a_session_this_adapter_did_not_establish() -> None:
+def test_admit_detached_turn_fails_closed_for_a_session_no_authority_establishes() -> None:
     backend = FakeClineSdkBackend()
-    adapter = ClineAdapter(backend, ScriptedResolver(creation=_context()))
+    resolver = ScriptedResolver(creation=_context())
+    adapter = ClineAdapter(backend, resolver)
 
+    # Neither the instance's own allocation registry nor the durable
+    # bound-session resolver positively establishes the addressed session:
+    # the admission fails closed before any runtime effect, never guessed
+    # around.
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
-        adapter.admit_initialization_run("cline-session-unknown", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-unknown", _INITIALIZATION)
+    assert resolver.bound_queries == ["cline-session-unknown"]
     assert backend.calls() == ()
 
 
-def test_admit_initialization_run_classifies_a_positive_hub_refusal_as_known_failure() -> None:
+def test_admit_detached_turn_admits_an_existing_bound_session_from_a_fresh_adapter() -> None:
+    backend = FakeClineSdkBackend()
+    backend.queue_enqueue(
+        "cline-session-1", ClineRunAdmission(run_id="run-77", accepted_at=7, queue_position=0)
+    )
+    resolver = ScriptedResolver(creation=_context())
+    resolver.set_bound("cline-session-1", _context())
+    adapter = ClineAdapter(backend, resolver)
+
+    # A fresh adapter attachment (as every BOUND runtime attachment
+    # constructs one) admits an authorized detached turn into the existing
+    # durably bound READY session: the durable bound-session resolver
+    # positively establishes the exact identity — no reconstruction, no
+    # start, no send.
+    admitted = adapter.admit_detached_turn("cline-session-1", _INITIALIZATION)
+
+    assert admitted.turn_reference == "run-77"
+    assert resolver.bound_queries == ["cline-session-1"]
+    enqueue_calls = [call for call in backend.calls() if call.operation == "enqueue"]
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0].session_id == "cline-session-1"
+    assert enqueue_calls[0].prompt == _INITIALIZATION
+    assert [call.operation for call in backend.calls()] == ["enqueue"]
+
+
+def test_admit_detached_turn_classifies_a_positive_hub_refusal_as_known_failure() -> None:
     backend = FakeClineSdkBackend()
     resolver = ScriptedResolver(creation=_context())
     backend.queue_start(ClineStartResult(session_id="cline-session-9"))
@@ -4139,10 +4170,10 @@ def test_admit_initialization_run_classifies_a_positive_hub_refusal_as_known_fai
     )
 
     with pytest.raises(AgentSessionNotFoundError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
-def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
+def test_admit_detached_turn_keeps_a_transport_loss_uncertain() -> None:
     backend = FakeClineSdkBackend()
     resolver = ScriptedResolver(creation=_context())
     backend.queue_start(ClineStartResult(session_id="cline-session-9"))
@@ -4151,10 +4182,10 @@ def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
     backend.queue_enqueue("cline-session-9", ClineBackendUncertainOutcomeError())
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
-def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() -> None:
+def test_admit_detached_turn_keeps_an_unproven_sdk_rejection_uncertain() -> None:
     """Issue #324 review fix: ``enqueue`` is an effectful operation. An
     unproven SDK rejection code establishes nothing about whether a run was
     admitted, so the admission stays conservatively uncertain — never a
@@ -4170,10 +4201,10 @@ def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() ->
     )
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
-def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_uncertain() -> None:
+def test_admit_detached_turn_keeps_a_connection_close_around_the_enqueue_uncertain() -> None:
     backend = FakeClineSdkBackend()
     resolver = ScriptedResolver(creation=_context())
     backend.queue_start(ClineStartResult(session_id="cline-session-9"))
@@ -4185,10 +4216,10 @@ def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_un
     )
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
-def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_as_known() -> None:
+def test_admit_detached_turn_still_classifies_a_proven_pre_effect_refusal_as_known() -> None:
     """The positively proven refusals stay known: the exact session is not
     live (the Hub definitively rejected the enqueue itself), the attachment
     was unreachable before effect, and the bridge was not attached."""
@@ -4203,7 +4234,7 @@ def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_a
     )
 
     with pytest.raises(AgentRuntimeUnavailableError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
@@ -4221,4 +4252,4 @@ def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
         backend.queue_enqueue("cline-session-9", ClineSdkOperationRejectedError(code))
 
         with pytest.raises(AgentRuntimeUnavailableError):
-            adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+            adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)

@@ -157,7 +157,7 @@ class MergeConfirmedReconciliationPendingError(ApplicationError):
         self.expected_head_sha = expected_head_sha
 
 
-class HubObservationRegistrationRefusedError(ApplicationError):
+class ObservationRegistrationRefusedError(ApplicationError):
     """Positive hub-run observation could not be established for an exact
     session (detached agent turns, issue #323).
 

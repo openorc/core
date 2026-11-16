@@ -24,7 +24,6 @@ from uuid import UUID
 from openorc.domain.connections import WorkflowRole
 
 __all__ = [
-    "AgentRunAdmission",
     "AgentSessionAllocation",
     "AgentSessionCreated",
     "AgentSessionCreationRequest",
@@ -120,24 +119,6 @@ class AgentSessionAllocation:
                 raise ValueError(
                     f"AgentSessionAllocation.{name} must be None or a non-empty string"
                 )
-
-
-@dataclass(frozen=True)
-class AgentRunAdmission:
-    """One admitted detached initialization run (issue #324).
-
-    ``run_id`` is the exact opaque native run identifier the runtime's
-    nonblocking admission acknowledged. It is transport evidence for later
-    exact correlation — never a workflow decision, never proof of execution,
-    formal-result delivery, or success. Admission is deliberately distinct
-    from a ``send`` outcome and from readiness.
-    """
-
-    run_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.run_id, str) or not self.run_id.strip():
-            raise ValueError("AgentRunAdmission.run_id must be a non-empty string")
 
 
 @dataclass(frozen=True)
