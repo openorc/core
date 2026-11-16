@@ -586,7 +586,7 @@ def test_seam_dispatches_the_registered_composition(monkeypatch: pytest.MonkeyPa
 def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_the_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    dependencies, submitter = make_queue_dependencies()
     preparation = fake_preparation()
     production = fake_production()
     prepare = RecordingService(result=preparation)
@@ -606,12 +606,14 @@ def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_t
         )
 
         # The exact bootstrap subjects and the deployment's reviewer-neutral
-        # directory reached the E1b service, with the process's observation
-        # host and the ONE post-commit completion handoff wired (issues
-        # #324/#333).
+        # directory reached the E1b service. The queue-mode interim keeps the
+        # blocking establishment: no observation host is wired, while the ONE
+        # post-commit completion handoff stays wired for the settled
+        # bootstrap families (issues #324/#333/#334; queue interim until
+        # #328).
         assert prepare.call_count == 1
         passed_kwargs = dict(prepare.calls[0]["kwargs"])
-        assert passed_kwargs.pop("observation_registrar") is not None
+        assert passed_kwargs.pop("observation_registrar") is None
         assert passed_kwargs.pop("completion_handoff") is not None
         assert passed_kwargs == {
             "workspace_id": _WORKSPACE_ID,
@@ -649,7 +651,7 @@ def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_t
 def test_planning_review_composition_runs_dispatch_and_decision_in_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    dependencies, submitter = make_queue_dependencies()
     production = fake_production(_STATE_TOKEN)
     routed_production = fake_production(_NEXT_TOKEN)
     dispatch = RecordingService(result=fake_dispatch_outcome())
@@ -1055,7 +1057,7 @@ def test_stale_published_subject_refuses_before_the_dispatch(
 def test_continuation_submission_refusal_or_uncertainty_does_not_fail_the_operation(
     monkeypatch: pytest.MonkeyPatch, outcome: SubmissionResult
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    dependencies, submitter = make_queue_dependencies()
     submitter.outcomes = [outcome]
     prepare = RecordingService(result=fake_preparation())
     produce = RecordingService(result=fake_production())
@@ -2099,3 +2101,165 @@ def test_authorized_implementation_composition_dispatches_detached_in_regular_mo
     # The blocking E6 service and the inline presentation never ran.
     assert presentations == []
     assert submitter.submissions == []
+
+
+def test_the_completion_handoff_submits_the_planning_review_after_a_plan_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plan-result routes (issue #335): a settled initial-PLAN or REVISE
+    result's committed revision is the only authority — the existing typed
+    planning REVIEW round is submitted from committed state with the freshly
+    reloaded post-revision token, for either plan family."""
+    dependencies, submitter = make_queue_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=uuid4(),
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    for operation in (
+        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+    ):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=operation,
+        )
+
+    assert len(submitter.submissions) == 2
+    for submitted in submitter.submissions:
+        assert submitted.kind is OperationKind.TASK_PLANNING_REVIEW
+        assert isinstance(submitted.payload, TaskPlanningReviewPayload)
+        assert submitted.payload.task == _TASK_SCOPE_REVIEWER
+        assert submitted.payload.profile_id == str(_PROFILE_ID)
+        assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_completion_handoff_plan_routes_are_noops_without_a_published_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A moved-on or revision-less durable state is never a continuation
+    authority: the plan-result routes submit nothing."""
+    dependencies, submitter = make_queue_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_STATE_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+    )
+
+    assert submitter.submissions == []
+
+
+def test_planning_bootstrap_composition_dispatches_the_initial_plan_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode bootstrap composition admits the initial PLAN as one
+    detached turn and returns: no blocking production and no inline review
+    submission happen in the dispatching worker (issue #335)."""
+    dependencies, submitter = make_dependencies()
+    dispatched = SimpleNamespace(task=None, send_claim=None, receipt=None, producer_session=None)
+    dispatch = RecordingService(result=dispatched)
+    monkeypatch.setattr(task_workflow, "dispatch_initial_plan_detached", dispatch, raising=True)
+
+    def refusing_blocking_production(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the blocking initial plan production must not run in regular mode")
+
+    monkeypatch.setattr(task_workflow, "produce_initial_task_plan", refusing_blocking_production)
+    prepare = RecordingService(result=fake_preparation())
+    with patched_workflow_environment(monkeypatch, prepare=prepare):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
+                payload=TaskPlanningBootstrapAndInitialPlanPayload(
+                    task=_TASK_SCOPE_PRODUCER,
+                    profile_id=str(_PROFILE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+    assert dispatch.call_count == 1
+    dispatch_kwargs = dispatch.calls[0]["kwargs"]
+    assert dispatch_kwargs["profile_id"] == _PROFILE_ID
+    assert dispatch_kwargs["workspace_id"] == _WORKSPACE_ID
+    assert dispatch_kwargs["task_id"] == _TASK_ID
+    assert callable(dispatch_kwargs["producer_runtime_factory"])
+    assert dispatch_kwargs["observation_registrar"] is not None
+    assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
+    # No inline planning-review submission: the observed completion's
+    # handoff owns it from committed state.
+    assert submitter.submissions == []
+
+
+def test_planning_review_composition_dispatches_the_revise_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode planning-review composition keeps the blocking E3a
+    dispatch and decision in-process (until #336) and dispatches the routed
+    Producer revise as one detached turn, returning without the inline
+    next-round submission (issue #335)."""
+    dependencies, submitter = make_dependencies()
+    decision = fake_planning_decision(
+        PlanningReviewDecision.REVISION_ROUTED, revision_production=None
+    )
+    finalize = RecordingService(result=decision)
+    monkeypatch.setattr(task_workflow, "finalize_planning_review_decision", finalize, raising=True)
+    review_dispatch = RecordingService(result=fake_dispatch_outcome())
+    monkeypatch.setattr(task_workflow, "dispatch_planning_review", review_dispatch, raising=True)
+    production = fake_production(_STATE_TOKEN)
+    with patched_workflow_environment(monkeypatch, reloaded_plan_production=production):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_PLANNING_REVIEW,
+                payload=TaskPlanningReviewPayload(
+                    task=_TASK_SCOPE_REVIEWER,
+                    profile_id=str(_PROFILE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+        # The E3a dispatch ran in-process against the reloaded production
+        # subject; the decision received the detached dependency trio and no
+        # attached runtime.
+        assert review_dispatch.call_count == 1
+        assert review_dispatch.calls[0]["kwargs"]["plan_production"] is production
+        assert finalize.call_count == 1
+        finalize_kwargs = finalize.calls[0]["kwargs"]
+        assert finalize.calls[0]["args"][1] is None
+        assert finalize.calls[0]["kwargs"]["expected_state_token"] == _STATE_TOKEN
+        assert callable(finalize_kwargs["producer_runtime_factory"])
+        assert finalize_kwargs["observation_registrar"] is not None
+        assert callable(finalize_kwargs["completion_handoff"].handoff_settled_completion)
+        # No inline next-round submission: the observed completion's handoff
+        # owns it from committed state after the decision's detached dispatch.
+        assert submitter.submissions == []

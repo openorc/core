@@ -207,6 +207,7 @@ def _claim_row(
         review_iteration_id,
         owner_gate_id,
         subject_head_sha,
+        None,
         status,
         {},
         _OBSERVED,

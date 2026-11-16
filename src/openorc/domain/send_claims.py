@@ -31,6 +31,13 @@ persistence owns durable representation.
   dispatch; and the approved ``PR_AUTHORIZATION`` OwnerGate plus its exact
   approved head SHA for the PR_COMPOSE dispatch. A ``PlanRevision`` is
   immutable produced output and is never a pre-send claim.
+- ``dispatch_repository_base_sha`` (issue #335) is the detached plan
+  dispatches' safe dispatch-context fact: the installation-authenticated
+  repository-base head the canonical instruction was dispatched against,
+  recorded in the claim transaction so the later database-only settlement
+  can create the immutable revision without any external I/O. Plan-kind
+  claims carry it from creation onward; pre-detached residue rows
+  legitimately predate it, and the PR_COMPOSE kind never carries one.
 
 This module carries transport-independent validation only.
 """
@@ -172,6 +179,7 @@ class TaskRuntimeSendClaim:
     review_iteration_id: UUID | None
     owner_gate_id: UUID | None
     subject_head_sha: str | None
+    dispatch_repository_base_sha: str | None
     status: TaskRuntimeSendClaimStatus
     outcome: Mapping[str, object]
     claimed_at: datetime
@@ -189,6 +197,8 @@ class TaskRuntimeSendClaim:
         _require_uuid(self.owner_gate_id, "owner_gate_id", nullable=True)
         if self.subject_head_sha is not None:
             _require_nonblank_str(self.subject_head_sha, "subject_head_sha")
+        if self.dispatch_repository_base_sha is not None:
+            _require_nonblank_str(self.dispatch_repository_base_sha, "dispatch_repository_base_sha")
         # The closed source-subject form: exactly one subject shape per kind.
         if self.kind is TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH:
             if (
@@ -218,6 +228,12 @@ class TaskRuntimeSendClaim:
                     "a pr_compose_dispatch claim addresses exactly one approved "
                     "PR_AUTHORIZATION gate and its exact approved head SHA"
                 )
+            if self.dispatch_repository_base_sha is not None:
+                raise ValueError(
+                    "a pr_compose_dispatch claim carries no dispatch repository-base "
+                    "context; its subject head is the approved gate's subject_head_sha"
+                )
+
         if not isinstance(self.outcome, Mapping):
             raise ValueError("TaskRuntimeSendClaim.outcome must be a mapping")
         object.__setattr__(self, "outcome", canonical_send_claim_outcome(self.outcome))

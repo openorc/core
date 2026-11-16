@@ -37,6 +37,7 @@ def _claim(
     review_iteration_id: object = None,
     owner_gate_id: object = None,
     subject_head_sha: object = None,
+    dispatch_repository_base_sha: object = None,
     outcome: Any = None,
     settled_at: object = None,
 ) -> TaskRuntimeSendClaim:
@@ -49,6 +50,7 @@ def _claim(
         review_iteration_id=review_iteration_id,  # type: ignore[arg-type]
         owner_gate_id=owner_gate_id,  # type: ignore[arg-type]
         subject_head_sha=subject_head_sha,  # type: ignore[arg-type]
+        dispatch_repository_base_sha=dispatch_repository_base_sha,  # type: ignore[arg-type]
         status=status,
         outcome=outcome if outcome is not None else {},
         claimed_at=_CLAIM_AT,

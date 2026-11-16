@@ -185,6 +185,7 @@ def _claim_row(
     review_iteration_id: Any = None,
     owner_gate_id: Any = None,
     subject_head_sha: Any = None,
+    dispatch_repository_base_sha: Any = None,
     outcome: Any = None,
 ) -> tuple[Any, ...]:
     settled_at = _OBSERVED if status != "claimed" else None
@@ -197,6 +198,7 @@ def _claim_row(
         review_iteration_id,
         owner_gate_id,
         subject_head_sha,
+        dispatch_repository_base_sha,
         status,
         outcome or {},
         _OBSERVED,

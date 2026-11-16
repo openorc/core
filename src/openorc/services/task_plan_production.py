@@ -85,14 +85,16 @@ logical invocation identity these operations provide.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import Final, NoReturn, Protocol, cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -110,6 +112,7 @@ from openorc.adapters.github import (
     GitHubRequestRejectedError,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.intents import TaskResumeIntentStatus
 from openorc.domain.operational_failures import OriginalAttemptKind
@@ -132,6 +135,7 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence import planning as planning_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.intents import record_task_resume_intent_outcome
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -150,14 +154,17 @@ from openorc.protocol.models import (
     ReviewResult,
 )
 from openorc.services import event_coordination
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
     ApplicationError,
     AuthorizationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.github_installation_route import (
@@ -168,6 +175,7 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_runtime_send_claims import (
     RUNTIME_PRE_EFFECT_FAILURE_KIND,
@@ -190,6 +198,9 @@ __all__ = [
     "complete_resumed_plan_revision_result",
     "produce_initial_task_plan",
     "revise_task_plan",
+    "dispatch_initial_plan_detached",
+    "dispatch_planning_revise_detached",
+    "settle_observed_plan_result",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_plan_production"
@@ -486,6 +497,24 @@ def _realize_plan_control(
     return outcome
 
 
+def _initial_plan_message(
+    task: Task,
+    workspace: Workspace,
+    repository_observation: GitHubRepositoryObservation,
+) -> str:
+    """Compose the ONE canonical PLAN instruction's message (issue #129).
+
+    The single composer both the blocking send and the detached admission
+    consume, so the detached turn carries the exact same canonical control
+    verbatim (issue #335).
+    """
+    return PlanInteraction(
+        repository_full_name=_repository_full_name(repository_observation),
+        issue_number=task.github_issue_number,
+        guidance=workspace.guidance,
+    ).render()
+
+
 def _send_initial_plan(
     pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
@@ -496,18 +525,17 @@ def _send_initial_plan(
     repository_observation: GitHubRepositoryObservation,
 ) -> PlanResult:
     """Construct and send the ONE canonical PLAN interaction (issue #129)."""
-    interaction = PlanInteraction(
-        repository_full_name=_repository_full_name(repository_observation),
-        issue_number=task.github_issue_number,
-        guidance=workspace.guidance,
-    )
     return _realize_plan_control(
         pool,
         runtime,
         session_id,
-        interaction,
+        PlanInteraction(
+            repository_full_name=_repository_full_name(repository_observation),
+            issue_number=task.github_issue_number,
+            guidance=workspace.guidance,
+        ),
         task_id=task.id,
-        message=interaction.render(),
+        message=_initial_plan_message(task, workspace, repository_observation),
     )
 
 
@@ -566,6 +594,9 @@ def _send_revision_plan(
         session_id,
         interaction,
         task_id=task.id,
+        # The single shared composer of the REVISE message (issues #129/#335):
+        # the persisted validated review result verbatim, structural
+        # serialization only — the detached admission carries the same bytes.
         message=serialize_review_result(review_result),
     )
 
@@ -785,6 +816,138 @@ def _commit_new_plan_revision_transaction(
     return TaskPlanProductionOutcome(plan_revision=revision, task=updated)
 
 
+def _validate_initial_production_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    preparation: TaskPlanningPreparationOutcome,
+) -> tuple[
+    Task, TaskAgentSession, TaskAgentSession, Workspace, ResolvedRepositoryInstallationRoute
+]:
+    """The shared entry subject/session validation of the initial production.
+
+    Both the blocking send and the detached dispatch (issue #335) re-derive
+    the exact same subjects in one short database-only transaction: the
+    account operational barrier, the exact Owner Workspace/Task scope, the
+    exact current ``planning`` Task under the prepared outcome's post-claim
+    token with no already-current PlanRevision, both exact READY prepared
+    bindings identity-matched against the outcome, the Workspace (for the
+    canonical instruction's guidance), and the durable Repository →
+    installation route for the repository-base observation.
+    """
+    require_account_operational(transaction_pool, profile_id=profile_id)
+    require_workspace_task(
+        transaction_pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=preparation.task.state_token,
+    )
+    if task.status is not TaskStatus.PLANNING:
+        raise ConflictError("the addressed task is not in its coarse planning state")
+    if task.current_plan_revision_id is not None:
+        raise ConflictError(
+            "the task already has a current plan revision; initial plan "
+            "production is not repeatable"
+        )
+    producer = _require_prepared_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        expected=preparation.producer_session,
+    )
+    reviewer = _require_prepared_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.REVIEWER,
+        expected=preparation.reviewer_session,
+    )
+    workspace = get_workspace(transaction_pool, workspace_id)
+    if workspace is None:
+        raise NotFoundError("the requested workspace is not available")
+    route = resolve_system_repository_installation_route(
+        transaction_pool,
+        workspace_id=workspace_id,
+        repository_id=task.repository_id,
+    )
+    return task, producer, reviewer, workspace, route
+
+
+def _validate_revision_production_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    expected_state_token: UUID,
+    prior_plan_revision_id: UUID,
+    review_iteration_id: UUID,
+) -> tuple[
+    Task,
+    planning_records.PlanRevision,
+    ReviewIteration,
+    TaskAgentSession,
+    ResolvedRepositoryInstallationRoute,
+]:
+    """The shared entry subject/session validation of the revision production.
+
+    Both the blocking send and the detached dispatch (issue #335) re-derive
+    the exact same subjects in one short database-only transaction: the
+    account operational barrier, the exact Owner Workspace/Task scope, the
+    exact current ``planning`` Task under the caller's token, the exact
+    current prior PlanRevision, the finalized ``CHANGES_REQUESTED`` planning
+    ReviewIteration still addressing it as its latest-numbered iteration
+    (issue #207), the exact READY Producer binding, and the durable
+    Repository → installation route for the repository-base observation.
+    """
+    require_account_operational(transaction_pool, profile_id=profile_id)
+    require_workspace_task(
+        transaction_pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.PLANNING:
+        raise ConflictError("the addressed task is not in its coarse planning state")
+    prior_revision = require_current_plan_revision(
+        transaction_pool, task=task, plan_revision_id=prior_plan_revision_id
+    )
+    iteration = _require_routed_review_iteration(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        review_iteration_id=review_iteration_id,
+        prior_revision=prior_revision,
+    )
+    producer = _require_ready_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+    )
+    route = resolve_system_repository_installation_route(
+        transaction_pool,
+        workspace_id=workspace_id,
+        repository_id=task.repository_id,
+    )
+    return task, prior_revision, iteration, producer, route
+
+
 def produce_initial_task_plan(
     pool: DatabasePool,
     runtime: AgentRuntimeAdapter,
@@ -824,47 +987,12 @@ def produce_initial_task_plan(
 
         # --- Phase 1: entry subject/session validation (database only). ---
         with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
+            task, producer, reviewer, workspace, route = _validate_initial_production_subjects(
                 transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
                 profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=preparation.task.state_token,
-            )
-            if task.status is not TaskStatus.PLANNING:
-                raise ConflictError("the addressed task is not in its coarse planning state")
-            if task.current_plan_revision_id is not None:
-                raise ConflictError(
-                    "the task already has a current plan revision; initial plan "
-                    "production is not repeatable"
-                )
-            producer = _require_prepared_binding(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                role=WorkflowRole.PRODUCER,
-                expected=preparation.producer_session,
-            )
-            reviewer = _require_prepared_binding(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                role=WorkflowRole.REVIEWER,
-                expected=preparation.reviewer_session,
-            )
-            workspace = get_workspace(transaction_pool, workspace_id)
-            if workspace is None:
-                raise NotFoundError("the requested workspace is not available")
-            route = resolve_system_repository_installation_route(
-                transaction_pool,
-                workspace_id=workspace_id,
-                repository_id=task.repository_id,
+                preparation=preparation,
             )
 
         # --- Phase 2: authoritative repository-base audit observation. ---
@@ -880,6 +1008,7 @@ def produce_initial_task_plan(
             task_id=task_id,
             expected_state_token=task.state_token,
             producer=producer,
+            repository_base_sha=base_sha,
         )
         if attempt_evidence is not None:
             # The F5b coordinator's handoff fact: this invocation's committed
@@ -980,41 +1109,16 @@ def revise_task_plan(
 
         # --- Phase 1: entry subject/session validation (database only). ---
         with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-            )
-            if task.status is not TaskStatus.PLANNING:
-                raise ConflictError("the addressed task is not in its coarse planning state")
-            prior_revision = require_current_plan_revision(
-                transaction_pool, task=task, plan_revision_id=prior_plan_revision_id
-            )
-            iteration = _require_routed_review_iteration(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                review_iteration_id=review_iteration_id,
-                prior_revision=prior_revision,
-            )
-            producer = _require_ready_binding(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                role=WorkflowRole.PRODUCER,
-            )
-            route = resolve_system_repository_installation_route(
-                transaction_pool,
-                workspace_id=workspace_id,
-                repository_id=task.repository_id,
+            task, prior_revision, iteration, producer, route = (
+                _validate_revision_production_subjects(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    profile_id=profile_id,
+                    expected_state_token=expected_state_token,
+                    prior_plan_revision_id=prior_plan_revision_id,
+                    review_iteration_id=review_iteration_id,
+                )
             )
 
         # --- Phase 2: authoritative repository-base audit observation. ---
@@ -1031,6 +1135,7 @@ def revise_task_plan(
             expected_state_token=task.state_token,
             producer=producer,
             review_iteration=iteration,
+            repository_base_sha=base_sha,
         )
         if attempt_evidence is not None:
             # The F5b coordinator's handoff fact: this invocation's committed
@@ -1497,3 +1602,767 @@ def complete_resumed_initial_plan_result(
         )
         settle_resumed_task_record(transaction_pool, task_resume_intent_id=task_resume_intent_id)
     return outcome
+
+
+# --- the detached plan-result production dispatch (issues #325/#335) -----------
+
+
+ProducerRuntimeAttachmentFactory = Callable[[], AbstractContextManager[AgentRuntimeAdapter]]
+
+
+class PlanProductionObservationRegistrar(Protocol):
+    """The structural registration seam of the process's detached-turn observer.
+
+    The same positively-required pre-admission gate the detached
+    establishment and implementation dispatches consume (issues
+    #323/#333/#334): the plan dispatch registers the exact bound external
+    session before any admission, so an unreplayable terminal ``plan_result``
+    can never be produced without active observation. Failures are the
+    observer's typed refusals, routed through the pre-effect failure
+    machinery.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Register one exact bound session for detached-turn observation."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedPlanProduction:
+    """The typed detached plan-production dispatch outcome (issues #325/#335).
+
+    The authoritative facts exactly as the durable state reads after the
+    dispatch: the post-claim Task (its token unrotated by the claim), the
+    committed one-shot send claim with its recorded repository-base context,
+    the claimed detached-turn receipt companion, and the exact Producer
+    binding the canonical instruction was admitted on. No runtime result, no
+    validated ``plan_result``, and no published PlanRevision exists yet: the
+    independently observed completion owns the settlement, and the ONE
+    post-commit completion handoff owns the follow-on planning REVIEW.
+    """
+
+    task: Task
+    send_claim: TaskRuntimeSendClaim
+    receipt: TaskDetachedTurnReceipt
+    producer_session: TaskAgentSession
+
+
+# Safe refusal-kind tokens for a receipt's durable refusal outcome after a
+# proven pre-effect detached-dispatch failure (no exception text or error
+# content ever enters durable state).
+_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+
+_DISPATCH_INITIAL_SPAN_NAME: Final[str] = "task_plan_production.dispatch_initial_plan_detached"
+_DISPATCH_REVISE_SPAN_NAME: Final[str] = "task_plan_production.dispatch_planning_revise_detached"
+
+
+def _refuse_plan_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    send_claim: TaskRuntimeSendClaim,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed plan receipt refused and its claim known-nondelivery.
+
+    Best-effort containment after a positively proven pre-effect failure: a
+    persistence failure here must never mask the typed refusal the caller
+    raises. The claimed receipt stays the honest unresolved state under the
+    accepted v1 recovery bounds and the failure is logged selectively.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused plan-dispatch receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the plan-dispatch receipt was no longer claimed when its pre-effect "
+            "refusal was recorded"
+        )
+    try:
+        record_send_claim_known_non_delivery(
+            pool,
+            claim=send_claim,
+            workspace_id=send_claim.workspace_id,
+            task_id=send_claim.task_id,
+            failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused plan-dispatch claim could not be durably marked (%s); "
+            "the claimed claim stays the honest unresolved state",
+            type(error).__name__,
+        )
+
+
+def _dispatch_plan_turn(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    producer: TaskAgentSession,
+    operation: PendingTaskRuntimeInteractionOperation,
+    compose_claim_and_receipt: Callable[
+        [DatabasePool], tuple[TaskRuntimeSendClaim, TaskDetachedTurnReceipt]
+    ],
+    message: str,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> DispatchedPlanProduction:
+    """Admit one canonical plan instruction as one detached agent turn.
+
+    The shared detached-dispatch mechanics of both plan families (issue
+    #335), mirroring the established detached-dispatch shape: the runtime
+    lease and the detached capability are acquired and duck-typed fail-closed
+    BEFORE any durable dispatch effect, the exact one-shot claim (with its
+    observed repository-base context) and the detached-turn receipt companion
+    commit in ONE short transaction strictly before any runtime effect, one
+    positively-required observation registration gates the admission, one
+    detached-turn admission carries the composed canonical instruction
+    verbatim, and the acknowledgement attach consumes any staged early
+    completion exactly once. No ``send`` and no blocking wait exists in this
+    path, and no database transaction is ever held across a runtime call.
+
+    Proven pre-effect failures refuse the receipt and record the claim's
+    known non-delivery, then raise the typed operational-failure classes the
+    F5b coordinator triages under the claim's own family. An uncertain
+    admission leaves the claim and receipt conservatively claimed and is
+    never re-dispatched. The dispatching worker returns after the
+    acknowledgement attach; the observed completion owns the settlement.
+    """
+    producer_external_session_id = producer.external_session_id
+    if producer_external_session_id is None or not producer_external_session_id.strip():
+        raise ConflictError("the producer session binding carries no external session identity")
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the plan-production observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    with ExitStack() as attachment_stack:
+        runtime = attachment_stack.enter_context(producer_runtime_factory())
+        # The detached capability is duck-typed fail-closed BEFORE any durable
+        # dispatch effect: a runtime without it cannot serve the detached
+        # dispatch, and no claim or receipt was ever recorded.
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            raise ExternalOperationFailedError(
+                "the producer runtime does not implement the detached turn "
+                "capability; the plan dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # --- The one short dispatch transaction: the exact pre-send claim
+        # (with its observed repository-base context) and the detached-turn
+        # receipt companion, committed atomically strictly before any runtime
+        # effect. A replayed or raced continuation never claims or dispatches
+        # again: the claim's one-shot subject guard and the
+        # single-outstanding-receipt invariant are durable from here. ---
+        with composed_transaction(pool) as transaction_pool:
+            send_claim, receipt = compose_claim_and_receipt(transaction_pool)
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # dispatch claim identity (#262).
+            attempt_evidence.record_attempt(
+                family=operation,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                phase=operation.value,
+            )
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the just-recorded receipt is marked refused and the claim records
+        # its known non-delivery, so a never-dispatched turn cannot hold the
+        # session's single-outstanding slot. ---
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer.id,
+                connection_id=producer.connection_id,
+                external_session_id=producer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_plan_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the plan-production observation registration was refused before "
+                "any admission; the instruction never dispatched"
+            ) from error
+        except Exception as error:
+            from openorc.services.task_detached_turn_observation import (  # noqa: PLC0415
+                ObservationRegistrationRefusalReason,
+            )
+
+            _refuse_plan_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the plan-production observation registration failed "
+                f"({ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value}) "
+                "before any admission; the instruction never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One
+        # detached-turn admission of the composed canonical instruction
+        # verbatim. ---
+        try:
+            admission = admit_detached_turn(producer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached plan-production admission ended with an uncertain "
+                "outcome; the claim and receipt stay conservatively claimed "
+                "and are never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the plan-production admission is unknown; the "
+                "claim and receipt stay conservatively claimed and the "
+                "instruction is never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_plan_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_ADMISSION_REFUSAL_KIND
+            )
+            raise ExternalOperationRejectedError(
+                "the plan-production admission was refused before any effect; "
+                "the receipt is refused and the instruction never dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated plan result that finished
+        # before the acknowledgement was persisted is correlated, never
+        # ignored or duplicated. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the plan-production acknowledgement could not be durably "
+                "attached after its known admission; authoritative recovery "
+                "is required and the instruction is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the claim and the receipt within
+        # this dispatch (issues #324/#333/#334): the ONE post-commit
+        # completion handoff owns the family routing. Strictly post-commit,
+        # contained, never a workflow authority; a failed routing leaves the
+        # durable state to the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=operation,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch plan-production completion handoff failed "
+                "(%s); the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return DispatchedPlanProduction(
+        task=reloaded_task,
+        send_claim=send_claim,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+        producer_session=producer,
+    )
+
+
+def dispatch_initial_plan_detached(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    preparation: TaskPlanningPreparationOutcome,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPlanProduction:
+    """Dispatch the first canonical PLAN as one detached agent turn.
+
+    The detached counterpart of the ordinary initial plan production (issues
+    #325/#335): the same entry validation, the same authoritative
+    repository-base observation, and the same one-shot INITIAL_PLAN_DISPATCH
+    claim — now committed together with its detached-turn receipt companion
+    and the observed repository-base context — followed by the canonical
+    ``PlanInteraction`` admitted verbatim as one independently completed
+    agent turn on the exact prepared Producer session in its planning
+    checkout. No ``send`` and no blocking wait exists in this path, and the
+    dispatching worker returns after the acknowledgement attach. The
+    independently observed completion settles the validated ``plan_result``
+    through :func:`settle_observed_plan_result`, and the ONE post-commit
+    completion handoff submits the existing typed planning REVIEW from
+    committed state.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_INITIAL_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(profile_id, "profile_id")
+        preparation = _require_preparation(preparation)
+        annotate_span(
+            span,
+            operation=_DISPATCH_INITIAL_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: entry subject/session validation (database only). ---
+        with composed_transaction(pool) as transaction_pool:
+            task, producer, reviewer, workspace, route = _validate_initial_production_subjects(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                profile_id=profile_id,
+                preparation=preparation,
+            )
+
+        # --- Phase 2: authoritative repository-base audit observation. ---
+        repository_observation, base_sha = _observe_repository_base(github, route)
+
+        def compose_claim_and_receipt(
+            transaction_pool: DatabasePool,
+        ) -> tuple[TaskRuntimeSendClaim, TaskDetachedTurnReceipt]:
+            send_claim = claim_initial_plan_send(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=task.state_token,
+                producer=producer,
+                repository_base_sha=base_sha,
+            )
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer.id,
+                operation=PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                expected_formal_family=PLAN_RESULT_FAMILY,
+            )
+            return send_claim, receipt
+
+        return _dispatch_plan_turn(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            producer=producer,
+            operation=PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+            compose_claim_and_receipt=compose_claim_and_receipt,
+            message=_initial_plan_message(task, workspace, repository_observation),
+            producer_runtime_factory=producer_runtime_factory,
+            observation_registrar=observation_registrar,
+            completion_handoff=completion_handoff,
+            attempt_evidence=attempt_evidence,
+        )
+
+
+def dispatch_planning_revise_detached(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    expected_state_token: UUID,
+    prior_plan_revision_id: UUID,
+    review_iteration_id: UUID,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPlanProduction:
+    """Dispatch one routed planning REVISE as one detached agent turn.
+
+    The detached counterpart of the ordinary revision production (issues
+    #325/#335): the same entry validation of the exact current prior
+    PlanRevision and its finalized ``CHANGES_REQUESTED`` planning
+    ReviewIteration (still the latest-numbered one addressing that exact
+    revision in the still-OPEN loop, issue #207), the same authoritative
+    repository-base observation, and the same one-shot
+    PLANNING_REVISE_DISPATCH claim — now committed together with its
+    detached-turn receipt companion and the observed repository-base
+    context — followed by the Reviewer's **persisted** findings, rebuilt
+    verbatim from durable state and structurally serialized, admitted as one
+    independently completed agent turn on the same Producer session. No
+    in-memory continuation object crosses the dispatch, no ``send`` and no
+    blocking wait exists in this path, and the dispatching worker returns
+    after the acknowledgement attach.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_REVISE_SPAN_NAME) as span:
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        _require_uuid_command(prior_plan_revision_id, "prior_plan_revision_id")
+        _require_uuid_command(review_iteration_id, "review_iteration_id")
+        annotate_span(
+            span,
+            operation=_DISPATCH_REVISE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: entry subject/session validation (database only). ---
+        with composed_transaction(pool) as transaction_pool:
+            task, _prior_revision, iteration, producer, route = (
+                _validate_revision_production_subjects(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    profile_id=profile_id,
+                    expected_state_token=expected_state_token,
+                    prior_plan_revision_id=prior_plan_revision_id,
+                    review_iteration_id=review_iteration_id,
+                )
+            )
+
+        # --- Phase 2: authoritative repository-base audit observation. ---
+        repository_observation, base_sha = _observe_repository_base(github, route)
+        review_result = _review_result_from_iteration(iteration)
+        message = serialize_review_result(review_result)
+
+        def compose_claim_and_receipt(
+            transaction_pool: DatabasePool,
+        ) -> tuple[TaskRuntimeSendClaim, TaskDetachedTurnReceipt]:
+            send_claim = claim_planning_revise_send(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=task.state_token,
+                producer=producer,
+                review_iteration=iteration,
+                repository_base_sha=base_sha,
+            )
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer.id,
+                operation=PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                expected_formal_family=PLAN_RESULT_FAMILY,
+            )
+            return send_claim, receipt
+
+        return _dispatch_plan_turn(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            producer=producer,
+            operation=PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+            compose_claim_and_receipt=compose_claim_and_receipt,
+            message=message,
+            producer_runtime_factory=producer_runtime_factory,
+            observation_registrar=observation_registrar,
+            completion_handoff=completion_handoff,
+            attempt_evidence=attempt_evidence,
+        )
+
+
+# --- the detached settlement's owning-service finalization (issue #335) -------
+
+
+def settle_observed_plan_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    send_claim: TaskRuntimeSendClaim,
+    result: PlanResult,
+) -> TaskPlanProductionOutcome | None:
+    """Finalize one observed plan result through the owning service.
+
+    The detached-run settlement's owning-service composition (issue #335):
+    the correlation seam funnels the attributed terminal observation through
+    the shared formal contract and hands the validated ``PlanResult`` here
+    inside its own settlement transaction. The settlement re-derives every
+    subject from durable state — the exact current ``planning`` Task, the
+    exact READY Producer binding the claim addressed (and, for the initial
+    family, the exact READY Reviewer binding), and for the revise family the
+    routed finalized change request still addressing the still-current prior
+    revision as its latest-numbered iteration — and reuses the one shared
+    commit composition: the next immutable PlanRevision created from the
+    claim's recorded repository-base context, the current-pointer and token
+    rotation, the audit event, and the send-claim settlement, all atomic.
+    ``None`` means the subject set has moved on: the observation can no
+    longer apply, nothing is rewritten, and the existing recovery semantics
+    own the conservative residue.
+    """
+    if not isinstance(result, PlanResult):
+        raise InvalidCommandError("settle_observed_plan_result requires a PlanResult")
+    if not isinstance(send_claim, TaskRuntimeSendClaim):
+        raise InvalidCommandError("settle_observed_plan_result requires a send claim")
+    try:
+        if send_claim.kind is TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH:
+            _require_claim_dispatch_base_sha(send_claim)
+            return _settle_observed_initial_plan_result(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                send_claim=send_claim,
+                result=result,
+            )
+        if send_claim.kind is TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH:
+            _require_claim_dispatch_base_sha(send_claim)
+            return _settle_observed_plan_revision_result(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                send_claim=send_claim,
+                result=result,
+            )
+        raise InvalidCommandError(
+            "the addressed send claim kind carries no detached plan-result settlement"
+        )
+    except (NotFoundError, ConflictError, StaleOperationError):
+        # The subject set moved on between the dispatch and the observed
+        # completion (a rotated token, a lost session, a superseded change
+        # request, a competing revision): the validated result can no longer
+        # apply, so nothing is rewritten and the receipt settles as
+        # result-not-applied. Never a fabricated revision, never a rewrite
+        # of moved-on history.
+        return None
+
+
+def _require_claim_dispatch_base_sha(send_claim: TaskRuntimeSendClaim) -> str:
+    """Require the claim's recorded repository-base dispatch context (#335).
+
+    A claimed plan-kind claim without the fact is impossible for any receipt
+    this settlement can attribute (the receipt is created only by the
+    dispatch that recorded it) — an unexpected durable-state invariant
+    failure that fails closed instead of fabricating audit context.
+    """
+    if send_claim.dispatch_repository_base_sha is None:
+        raise InvalidCommandError(
+            "the claimed plan dispatch carries no recorded repository-base "
+            "context; its settlement cannot establish the revision's audit context"
+        )
+    return send_claim.dispatch_repository_base_sha
+
+
+def _require_settlement_binding(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    role: WorkflowRole,
+    task_agent_session_id: UUID | None = None,
+) -> TaskAgentSession:
+    """Re-derive one exact settlement binding from durable state.
+
+    The binding must be the exact Task/role row — for the Producer, the
+    exact claim-addressed session — still READY with an external identity:
+    session loss and explicit ends do not rotate the Task token, so the
+    token alone cannot prove the session usable at settlement time. A
+    missing, moved, or non-READY binding is a moved-on subject (the
+    caller's ``None`` translation), never a replacement session.
+    """
+    binding = get_task_agent_session(transaction_pool, task_id=task_id, role=role)
+    if binding is None or binding.workspace_id != workspace_id or binding.task_id != task_id:
+        raise NotFoundError(
+            f"the claimed {role.value} session binding is not available for this task"
+        )
+    if task_agent_session_id is not None and binding.id != task_agent_session_id:
+        raise ConflictError(
+            f"the durable {role.value} session binding does not match the claimed "
+            "dispatch subject; the observed plan result can no longer apply"
+        )
+    if binding.lifecycle_status is not TaskSessionLifecycleStatus.READY:
+        raise ConflictError(
+            f"the claimed {role.value} session binding is not READY; the observed "
+            "plan result can no longer apply to the moved-on session"
+        )
+    if binding.external_session_id is None:
+        raise ConflictError(f"the {role.value} session binding has no external session identity")
+    return binding
+
+
+def _settle_observed_initial_plan_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    send_claim: TaskRuntimeSendClaim,
+    result: PlanResult,
+) -> TaskPlanProductionOutcome:
+    """Finalize the observed initial PLAN result as the Task's first revision.
+
+    The exact current ``planning`` Task must still carry no current plan
+    revision, and both the claimed Producer binding and the Task's current
+    Reviewer binding must still be READY: the same prepared-session
+    recheck the ordinary finalize composition performs.
+    """
+    task = task_records.get_task(transaction_pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if task.status is not TaskStatus.PLANNING or task.current_plan_revision_id is not None:
+        raise StaleOperationError(
+            "the task is no longer an unproduced planning subject; the observed "
+            "initial plan result can no longer apply"
+        )
+    producer = _require_settlement_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        task_agent_session_id=send_claim.task_agent_session_id,
+    )
+    reviewer = _require_settlement_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.REVIEWER,
+    )
+    return _commit_new_plan_revision_transaction(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=task.state_token,
+        plan_text=result.plan,
+        repository_base_sha=_require_claim_dispatch_base_sha(send_claim),
+        actor=_producer_actor(producer),
+        event_type=WorkflowEventType.PLAN_REVISION_CREATED,
+        prior_revision=None,
+        expected_review_iteration=None,
+        expected_producer_session=producer,
+        expected_reviewer_session=reviewer,
+        send_claim=send_claim,
+    )
+
+
+def _settle_observed_plan_revision_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    send_claim: TaskRuntimeSendClaim,
+    result: PlanResult,
+) -> TaskPlanProductionOutcome:
+    """Finalize the observed REVISE result as the Task's next revision.
+
+    The claim's routed finalized change request is re-derived from durable
+    state — never from any continuation object — and must still address the
+    Task's exact current prior revision as its latest-numbered iteration in
+    the still-OPEN planning loop (issue #207): a superseded result can never
+    publish a revision.
+    """
+    task = task_records.get_task(transaction_pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if task.status is not TaskStatus.PLANNING:
+        raise StaleOperationError(
+            "the task is no longer in its coarse planning state; the observed "
+            "revision result can no longer apply"
+        )
+    producer = _require_settlement_binding(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        task_agent_session_id=send_claim.task_agent_session_id,
+    )
+    assert send_claim.review_iteration_id is not None  # narrowed by the kind's subject form
+    prior_revision = require_current_plan_revision(
+        transaction_pool,
+        task=task,
+        plan_revision_id=_require_routed_iteration_revision(
+            transaction_pool, send_claim=send_claim
+        ),
+    )
+    iteration = _require_routed_review_iteration(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        review_iteration_id=send_claim.review_iteration_id,
+        prior_revision=prior_revision,
+    )
+    return _commit_new_plan_revision_transaction(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=task.state_token,
+        plan_text=result.plan,
+        repository_base_sha=_require_claim_dispatch_base_sha(send_claim),
+        actor=_producer_actor(producer),
+        event_type=WorkflowEventType.PLAN_REVISION_REVISED,
+        prior_revision=prior_revision,
+        expected_review_iteration=iteration,
+        expected_producer_session=producer,
+        expected_reviewer_session=None,
+        send_claim=send_claim,
+    )
+
+
+def _require_routed_iteration_revision(
+    transaction_pool: DatabasePool,
+    *,
+    send_claim: TaskRuntimeSendClaim,
+) -> UUID:
+    """Re-derive the prior revision the claimed change request addresses.
+
+    The persisted ReviewIteration is the only authority for the revision its
+    change request addresses (issue #335): the settlement never trusts any
+    continuation object, and a moved or missing iteration is a moved-on
+    subject the caller translates to the result-not-applied settlement.
+    """
+    assert send_claim.review_iteration_id is not None  # narrowed by the kind's subject form
+    iteration = review_records.get_review_iteration(
+        transaction_pool, review_iteration_id=send_claim.review_iteration_id
+    )
+    if (
+        iteration is None
+        or iteration.workspace_id != send_claim.workspace_id
+        or iteration.task_id != send_claim.task_id
+        or iteration.plan_revision_id is None
+    ):
+        raise NotFoundError(
+            "the claimed change request's review iteration is not available for this task"
+        )
+    return iteration.plan_revision_id

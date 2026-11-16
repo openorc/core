@@ -1902,6 +1902,81 @@ def _prepare_settlement_flow(
     return conn, outcome
 
 
+def test_a_validated_plan_result_finalizes_the_claim_and_the_receipt(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _plan_settlement_flow(triage, candidate=_PLAN_CANDIDATE)
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.operation.value == "initial_plan_dispatch"
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
+    assert outcome.formal_result is not None
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    # The immutable revision, the pointer/token rotation, and the send-claim
+    # settlement all committed inside the settlement's transaction.
+    assert any("insert into openorc.plan_revisions" in sql for sql in executed)
+    assert any("current_plan_revision_id" in sql for sql in executed)
+    assert any("update openorc.task_runtime_send_claims" in sql for sql in executed)
+
+
+def test_a_plan_completion_conflicting_with_the_claim_binding_is_left_unresolved(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _plan_settlement_flow(
+        triage,
+        candidate=_PLAN_CANDIDATE,
+        claim_row=_plan_claim_row(kind="planning_revise_dispatch"),
+    )
+
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("insert into openorc.plan_revisions" in sql for sql in executed)
+
+
+def test_a_failed_plan_terminal_settles_observed_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _plan_settlement_flow(
+        triage,
+        candidate=None,
+        kind=DetachedTurnObservationKind.FAILED,
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    operation = triage.calls[0]["operation"]
+    assert operation.family.value == "initial_plan_dispatch"
+    assert operation.original_attempt_kind.value == "runtime_send_claim"
+    assert operation.original_attempt_id == _CLAIM_ID
+    assert triage.calls[0]["report"].error_code.value == "external_operation_failed"
+    assert triage.calls[0]["expected_status"].value == "planning"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("insert into openorc.plan_revisions" in sql for sql in executed)
+
+
+def test_a_malformed_plan_result_classifies_the_protocol_failure_and_reports(
+    triage: _RecordingTriage,
+) -> None:
+    conn, outcome = _plan_settlement_flow(
+        triage,
+        candidate=_RESULT_CANDIDATE,
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["operation"].family.value == "initial_plan_dispatch"
+    assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("insert into openorc.plan_revisions" in sql for sql in executed)
+
+
 def test_validated_prepare_result_records_the_prepared_stage_with_the_receipt(
     triage: _RecordingTriage,
 ) -> None:
@@ -2009,3 +2084,166 @@ def test_malformed_result_settles_the_protocol_failure_and_reports(
     assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
     executed = [" ".join(sql.split()) for sql, _ in conn.executed]
     assert not any("planning_bootstrap_stage = %s" in sql for sql in executed)
+
+
+# --- the plan-result routing (issue #335) ----------------------------------------
+
+
+_CLAIM_ID = uuid4()
+_BASE_SHA = "d" * 40
+_PLAN_CANDIDATE = json.dumps(
+    {"type": "plan_result", "schema_version": 1, "plan": "# The detached plan.\n"}
+)
+
+
+def _plan_session_row(role: str) -> tuple[Any, ...]:
+    return (
+        _SESSION_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        role,
+        _CONNECTION_ID,
+        _EXTERNAL_SESSION,
+        "ready",
+        {"adapter": "cline"},
+        None,
+        None,
+        None,
+        _OBSERVED,
+        None,
+        _OBSERVED,
+        _OBSERVED,
+        None,
+        None,
+    )
+
+
+def _plan_claim_row(
+    *,
+    kind: str = "initial_plan_dispatch",
+    status: str = "claimed",
+) -> tuple[Any, ...]:
+    settled_at = _OBSERVED if status != "claimed" else None
+    return (
+        _CLAIM_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        kind,
+        _SESSION_ID,
+        _ITERATION_ID if kind == "planning_revise_dispatch" else None,
+        None,
+        None,
+        _BASE_SHA,
+        status,
+        {},
+        _OBSERVED,
+        settled_at,
+        _OBSERVED,
+    )
+
+
+def _plan_receipt_row(
+    *,
+    status: str = "admitted",
+    outcome: dict[str, Any] | None = None,
+    operation: str = "initial_plan_dispatch",
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        operation,
+        "runtime_send_claim",
+        _CLAIM_ID,
+        "plan_result",
+        _TURN_REFERENCE if status in ("admitted", "settled") else None,
+        status,
+        outcome if outcome is not None else {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def _plan_settled_row(label: str, *, marker: int | None = 41) -> tuple[Any, ...]:
+    outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
+    if marker is not None:
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
+    return _plan_receipt_row(status="settled", outcome=outcome)
+
+
+def _plan_settlement_flow(
+    triage: _RecordingTriage,
+    *,
+    candidate: str | None,
+    kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
+    settle_label: str = SETTLEMENT_VALIDATED_RESULT,
+    claim_row: tuple[Any, ...] | None = None,
+    operation: str = "initial_plan_dispatch",
+) -> tuple[ScriptedConnection, TurnSettlementOutcome]:
+    conn = ScriptedConnection()
+    _script_planning_task(conn)
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _plan_receipt_row(operation=operation))
+    _script_receipt_for_update(conn, _plan_receipt_row(operation=operation))
+    _script_last_consumed_sequence(conn, None)
+    conn.on(
+        _sql_has("from openorc.task_runtime_send_claims where id"),
+        claim_row if claim_row is not None else _plan_claim_row(),
+    )
+    # The owning settlement's and the commit composition's binding reproofs,
+    # in call order: the claimed Producer session, the Task's current
+    # Reviewer binding, then the commit's producer/reviewer rechecks.
+    for role in ("producer", "reviewer", "producer", "reviewer"):
+        conn.on(
+            _sql_has("from openorc.task_agent_sessions", "role = %s"),
+            _plan_session_row(role),
+        )
+    if settle_label == SETTLEMENT_VALIDATED_RESULT:
+        # The owning service's shared commit composition.
+        conn.on(_sql_has("from openorc.plan_revisions where task_id"), [])
+        conn.on(
+            _sql_has("insert into openorc.plan_revisions"),
+            (
+                _REVISION_ID,
+                _WORKSPACE_ID,
+                _TASK_ID,
+                1,
+                "# The detached plan.\n",
+                _BASE_SHA,
+                _OBSERVED,
+            ),
+        )
+        conn.on(
+            _sql_has("update openorc.tasks", "current_plan_revision_id"),
+            task_row(
+                id=_TASK_ID,
+                workspace_id=_WORKSPACE_ID,
+                status="planning",
+                state_token=_STATE_TOKEN,
+                source_requirements_fingerprint="a" * 64,
+                current_plan_revision_id=_REVISION_ID,
+            ),
+        )
+        _script_event_insert(conn, event_type=WorkflowEventType.PLAN_REVISION_CREATED)
+        conn.on(
+            _sql_has("update openorc.task_runtime_send_claims", "settled_at = now()"),
+            _plan_claim_row(status="settled"),
+        )
+    _script_settle(conn, _plan_settled_row(settle_label))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(kind=kind, marker=41, candidate=candidate),
+    )
+    return conn, outcome

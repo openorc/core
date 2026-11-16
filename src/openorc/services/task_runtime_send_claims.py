@@ -118,6 +118,19 @@ def _require_producer(value: object) -> TaskAgentSession:
     return value
 
 
+def _require_base_sha(value: object) -> None:
+    """Require the observed repository-base head of one plan dispatch (issue #335).
+
+    The detached settlement's database-only revision creation reads this
+    fact back from the claim row, so the claim service requires it at claim
+    time — the calling dispatch always observed it before claiming.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidCommandError(
+            "the plan dispatch claim requires its observed repository-base head"
+        )
+
+
 def _require_routed_iteration(value: object) -> ReviewIteration:
     """Require a finalized planning change request as the REVISE claim subject."""
     if not isinstance(value, ReviewIteration):
@@ -336,6 +349,7 @@ def claim_initial_plan_send(
     task_id: UUID,
     expected_state_token: UUID,
     producer: TaskAgentSession,
+    repository_base_sha: str,
 ) -> TaskRuntimeSendClaim:
     """Claim the one initial PLAN dispatch for the Task/Producer session.
 
@@ -344,15 +358,19 @@ def claim_initial_plan_send(
     and strictly before the PLAN send: the exact current ``planning`` Task
     at the caller's token (still no current plan revision), the exact
     prepared READY Producer binding, no existing claim for the subject, and
-    the committed claim row. The partial unique index on the kind is the
-    durable exactly-once backstop: a replayed or raced second claim for the
-    Task — whatever its prior outcome, even one whose worker died after
-    committing — fails closed here and never dispatches a runtime effect.
+    the committed claim row. The observed repository-base head is recorded
+    with the claim (issue #335): the detached settlement's database-only
+    revision creation reads it back instead of re-observing. The partial
+    unique index on the kind is the durable exactly-once backstop: a
+    replayed or raced second claim for the Task — whatever its prior
+    outcome, even one whose worker died after committing — fails closed
+    here and never dispatches a runtime effect.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(expected_state_token, "expected_state_token")
     _require_producer(producer)
+    _require_base_sha(repository_base_sha)
     with composed_transaction(pool) as transaction_pool:
         locked = _require_claim_current_task(
             transaction_pool,
@@ -384,6 +402,7 @@ def claim_initial_plan_send(
             task_id=task_id,
             kind=TaskRuntimeSendClaimKind.INITIAL_PLAN_DISPATCH,
             task_agent_session_id=producer.id,
+            dispatch_repository_base_sha=repository_base_sha,
         )
 
 
@@ -395,6 +414,7 @@ def claim_planning_revise_send(
     expected_state_token: UUID,
     producer: TaskAgentSession,
     review_iteration: ReviewIteration,
+    repository_base_sha: str,
 ) -> TaskRuntimeSendClaim:
     """Claim the planning REVISE dispatch for one exact finalized change request.
 
@@ -405,14 +425,15 @@ def claim_planning_revise_send(
     planning ReviewIteration still addressing the still-current prior
     revision as its latest-numbered iteration (issue #207), the exact
     prepared READY Producer binding, no existing claim for the iteration,
-    and the committed claim row. A distinct permitted next revision claims
-    its own row; a replayed or raced claim for the same iteration never
-    dispatches again.
+    and the committed claim row with the observed repository-base head
+    (issue #335). A distinct permitted next revision claims its own row; a
+    replayed or raced claim for the same iteration never dispatches again.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(expected_state_token, "expected_state_token")
     _require_producer(producer)
+    _require_base_sha(repository_base_sha)
     iteration = _require_routed_iteration(review_iteration)
     with composed_transaction(pool) as transaction_pool:
         locked = _require_claim_current_task(
@@ -446,6 +467,7 @@ def claim_planning_revise_send(
             kind=TaskRuntimeSendClaimKind.PLANNING_REVISE_DISPATCH,
             task_agent_session_id=producer.id,
             review_iteration_id=iteration.id,
+            dispatch_repository_base_sha=repository_base_sha,
         )
 
 

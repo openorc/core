@@ -262,6 +262,7 @@ def _claim_row(
         review_iteration_id,
         None,
         None,
+        None,
         status,
         {},
         _OBSERVED,

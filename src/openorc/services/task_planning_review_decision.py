@@ -113,8 +113,12 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_plan_production import (
+    PlanProductionObservationRegistrar,
+    ProducerRuntimeAttachmentFactory,
     TaskPlanProductionOutcome,
+    dispatch_planning_revise_detached,
     revise_task_plan,
     settle_resumed_task_record,
 )
@@ -224,6 +228,59 @@ def _require_runtime(value: object) -> AgentRuntimeAdapter:
     if not isinstance(value, AgentRuntimeAdapter):
         raise InvalidCommandError("runtime must be an AgentRuntimeAdapter")
     return value
+
+
+def _require_detached_revise_dependencies(
+    producer_runtime_factory: object,
+    observation_registrar: object,
+    completion_handoff: object,
+) -> (
+    tuple[
+        ProducerRuntimeAttachmentFactory,
+        PlanProductionObservationRegistrar,
+        DetachedTurnCompletionHandoff,
+    ]
+    | None
+):
+    """Resolve the optional detached-revise dependency trio, all-or-nothing.
+
+    The regular-mode detached REVISE dispatch (issue #335) needs the
+    executing process's producer attachment factory, observation registrar,
+    and ONE post-commit completion handoff together; a partial trio is a
+    malformed command that fails closed before any effect, and an absent
+    trio keeps the blocking revise's attached-runtime requirement. Every
+    member is duck-typed at the boundary so a malformed dependency can never
+    strand an already-finalized review.
+    """
+    provided = (producer_runtime_factory, observation_registrar, completion_handoff)
+    if all(value is None for value in provided):
+        return None
+    if any(value is None for value in provided):
+        raise InvalidCommandError(
+            "the detached revise dispatch requires its producer runtime factory, "
+            "observation registrar, and completion handoff together"
+        )
+    if not callable(producer_runtime_factory):
+        raise InvalidCommandError(
+            "the detached revise dispatch requires a callable producer runtime attachment factory"
+        )
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the detached revise observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    handoff = getattr(completion_handoff, "handoff_settled_completion", None)
+    if not callable(handoff):
+        raise InvalidCommandError(
+            "the detached revise completion handoff does not implement the "
+            "post-commit completion handoff seam"
+        )
+    return (
+        cast(ProducerRuntimeAttachmentFactory, producer_runtime_factory),
+        cast(PlanProductionObservationRegistrar, observation_registrar),
+        cast(DetachedTurnCompletionHandoff, completion_handoff),
+    )
 
 
 # The GitHub adapter capabilities the routing path of this seam actually
@@ -708,7 +765,7 @@ def _apply_decision(
 
 def finalize_planning_review_decision(
     pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
+    runtime: AgentRuntimeAdapter | None,
     github: GitHubAppClient,
     *,
     profile_id: UUID,
@@ -716,6 +773,9 @@ def finalize_planning_review_decision(
     task_id: UUID,
     expected_state_token: UUID,
     dispatch: TaskPlanningReviewDispatchOutcome,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory | None = None,
+    observation_registrar: PlanProductionObservationRegistrar | None = None,
+    completion_handoff: DetachedTurnCompletionHandoff | None = None,
     attempt_evidence: InvocationAttemptEvidence | None = None,
     task_resume_intent_id: UUID | None = None,
 ) -> TaskPlanningReviewDecisionOutcome:
@@ -738,15 +798,32 @@ def finalize_planning_review_decision(
     forwarded. On acceptance the loop stays OPEN (issue #219) and the
     accepted evidence is yielded for E5 without creating
     IMPLEMENTATION_AUTHORIZATION.
+
+    With the detached-revise dependency trio supplied (issue #335), the
+    routed change request is instead dispatched as one detached agent turn
+    on the exact bound Producer session — the Reviewer's **persisted**
+    findings, never an in-memory continuation object — and the outcome
+    carries no in-process revision production: the independently observed
+    completion settles the validated plan result and the ONE post-commit
+    completion handoff submits the next typed round from committed state.
+    The trio is all-or-nothing and duck-typed fail-closed; without it the
+    blocking revise keeps its attached ``runtime`` requirement.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DECISION_SPAN_NAME) as span:
         _require_uuid_command(profile_id, "profile_id")
         _require_uuid_command(workspace_id, "workspace_id")
         _require_uuid_command(task_id, "task_id")
         _require_uuid_command(expected_state_token, "expected_state_token")
-        runtime_adapter = _require_runtime(runtime)
         github_client = _require_github(github)
         attempt = _require_dispatch_outcome(dispatch)
+        detached_revise = _require_detached_revise_dependencies(
+            producer_runtime_factory, observation_registrar, completion_handoff
+        )
+        if detached_revise is None:
+            # The blocking revise keeps its attached-runtime requirement,
+            # validated before any effect so a malformed dependency can never
+            # strand an already-finalized review.
+            _require_runtime(runtime)
         annotate_span(
             span,
             operation=_DECISION_SPAN_NAME,
@@ -767,9 +844,43 @@ def finalize_planning_review_decision(
 
         # --- Phase 2: the external consequence, with NO transaction open. ---
         if finalization.decision is _Phase1Decision.ROUTE_REVISION:
+            if detached_revise is not None:
+                # The regular-mode detached REVISE dispatch (issue #335):
+                # the Reviewer's persisted findings become one admitted,
+                # independently completed agent turn on the exact bound
+                # Producer session, and the dispatching invocation returns
+                # after the durable admission. The observed completion owns
+                # the settlement; submission outcomes are transport
+                # information only and the durable state owns recovery.
+                assert producer_runtime_factory is not None
+                assert observation_registrar is not None
+                assert completion_handoff is not None
+                dispatch_planning_revise_detached(
+                    pool,
+                    github_client,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    profile_id=profile_id,
+                    expected_state_token=expected_state_token,
+                    prior_plan_revision_id=finalization.reviewed_revision.id,
+                    review_iteration_id=finalization.finalized_iteration.id,
+                    producer_runtime_factory=producer_runtime_factory,
+                    observation_registrar=observation_registrar,
+                    completion_handoff=completion_handoff,
+                    attempt_evidence=attempt_evidence,
+                )
+                return TaskPlanningReviewDecisionOutcome(
+                    decision=PlanningReviewDecision.REVISION_ROUTED,
+                    review_iteration=finalization.finalized_iteration,
+                    plan_revision=finalization.reviewed_revision,
+                    review_loop=finalization.loop,
+                    task=finalization.task,
+                    revision_production=None,
+                    resolution_gate=None,
+                )
             production = revise_task_plan(
                 pool,
-                runtime_adapter,
+                _require_runtime(runtime),
                 github_client,
                 workspace_id=workspace_id,
                 task_id=task_id,
