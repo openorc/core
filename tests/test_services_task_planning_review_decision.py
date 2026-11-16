@@ -42,12 +42,10 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-import openorc.services.task_planning_review_decision as decision_module
 from openorc.adapters.agent_runtime.errors import AgentRuntimeDeliveryUncertainError
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.github import (
@@ -67,20 +65,14 @@ from openorc.services.errors import (
     InvalidCommandError,
     StaleOperationError,
 )
-from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
-from openorc.services.task_plan_production import (
-    PlanProductionObservationRegistrar,
-    ProducerRuntimeAttachmentFactory,
-    TaskPlanProductionOutcome,
-)
+from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_review_decision import (
     PlanningReviewDecision,
     finalize_planning_review_decision,
+    settle_observed_planning_review,
 )
-from openorc.services.task_planning_review_dispatch import (
-    TaskPlanningReviewDispatchOutcome,
-    dispatch_planning_review,
-)
+from openorc.services.task_planning_review_dispatch import dispatch_planning_review
+from openorc.services.transaction_composition import composed_transaction
 from tests.fakes.agent_runtime import (
     FakeAgentRuntimeAdapter,
     accepted_review_result_candidate,
@@ -888,26 +880,24 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         rev3,
     ):
         conn.on(_REVISION_READ, row)
-    # Ordered iteration-history reads: dispatch, attempt recheck, budget
-    # recheck, revise supersession, the F2 claim's numbering recheck
-    # (issue #87), revise revalidation, per round.
+    # Ordered iteration-history reads: dispatch guard, budget recheck,
+    # revise supersession, the F2 claim's numbering recheck (issue #87),
+    # revise revalidation, per routed round; the exhausting round has no
+    # revise. The reserved-attempt recheck reads the iteration by id
+    # (issue #336), never this history listing.
     for rows in (
-        [],
-        [it1_unfin],
-        [it1_cr],
-        [it1_cr],
+        [],  # the round-1 dispatch guard
+        [it1_cr],  # the round-1 budget recheck
+        [it1_cr],  # the round-1 revise supersession
         [it1_cr],  # the round-1 claim's numbering recheck
-        [it1_cr],
-        [it1_cr],
-        [it1_cr, it2_unfin],
-        [it1_cr, it2_cr],
-        [it1_cr, it2_cr],
+        [it1_cr],  # the round-1 revise revalidation
+        [it1_cr],  # the round-2 dispatch guard
+        [it1_cr, it2_cr],  # the round-2 budget recheck
+        [it1_cr, it2_cr],  # the round-2 revise supersession
         [it1_cr, it2_cr],  # the round-2 claim's numbering recheck
-        [it1_cr, it2_cr],
-        [it1_cr, it2_cr],
-        [it1_cr, it2_cr, it3_unfin],
-        [it1_cr, it2_cr, it3_cr],
-        [it1_cr, it2_cr, it3_cr],
+        [it1_cr, it2_cr],  # the round-2 revise revalidation
+        [it1_cr, it2_cr],  # the round-3 dispatch guard
+        [it1_cr, it2_cr, it3_cr],  # the round-3 budget recheck
     ):
         conn.on(_ITERATIONS_LIST, rows)
     # Ordered gate-history reads: empty until the exhausting decision.
@@ -955,6 +945,8 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
     assert dispatch1.review_iteration.id == _ITERATION_1_ID
     assert dispatch1.review_iteration.outcome is None
     _script_finalize_result(conn, finalized_row=it1_cr, iterations_after=[it1_cr], gates=[])
+    conn.on(_ITERATION_READ, it1_unfin)
+    conn.on(_ITERATION_READ, it1_unfin)
     _script_revise_phase(
         conn,
         prior_revision_row=rev1,
@@ -972,7 +964,9 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_STATE_TOKEN,
-        dispatch=dispatch1,
+        review_iteration_id=dispatch1.review_iteration.id,
+        review_result=dispatch1.review_result,
+        expected_reviewer_session_id=dispatch1.reviewer_session.id,
     )
     assert decision1.decision is PlanningReviewDecision.REVISION_ROUTED
     assert decision1.review_iteration.id == _ITERATION_1_ID
@@ -1003,6 +997,8 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         plan_production=production2,
     )
     _script_finalize_result(conn, finalized_row=it2_cr, iterations_after=[it1_cr, it2_cr], gates=[])
+    conn.on(_ITERATION_READ, it2_unfin)
+    conn.on(_ITERATION_READ, it2_unfin)
     _script_revise_phase(
         conn,
         prior_revision_row=rev2,
@@ -1020,7 +1016,9 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_TOKEN_2,
-        dispatch=dispatch2,
+        review_iteration_id=dispatch2.review_iteration.id,
+        review_result=dispatch2.review_result,
+        expected_reviewer_session_id=dispatch2.reviewer_session.id,
     )
     assert decision2.decision is PlanningReviewDecision.REVISION_ROUTED
     production3 = decision2.revision_production
@@ -1044,6 +1042,8 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         task_id=_TASK_ID,
         plan_production=production3,
     )
+    conn.on(_ITERATION_READ, it3_unfin)
+    conn.on(_ITERATION_READ, it3_unfin)
     _script_finalize_result(
         conn,
         finalized_row=it3_cr,
@@ -1063,7 +1063,9 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_TOKEN_3,
-        dispatch=dispatch3,
+        review_iteration_id=dispatch3.review_iteration.id,
+        review_result=dispatch3.review_result,
+        expected_reviewer_session_id=dispatch3.reviewer_session.id,
     )
     assert decision3.decision is PlanningReviewDecision.EXHAUSTED
     assert decision3.resolution_gate is not None
@@ -1127,7 +1129,7 @@ def test_budget_two_routes_two_revisions_then_creates_the_resolution_gate() -> N
 
 
 def _loop_domain(*, limit: int = 2, status: str = "open") -> Any:
-    from openorc.domain.reviews import ReviewLoop, ReviewLoopPurpose, ReviewLoopStatus
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 
     return ReviewLoop(
         id=_LOOP_ID,
@@ -1142,7 +1144,6 @@ def _loop_domain(*, limit: int = 2, status: str = "open") -> Any:
 
 
 def _iteration_domain(*, iteration_id: Any, number: int, plan_revision_id: Any) -> Any:
-    from openorc.domain.reviews import ReviewIteration
 
     return ReviewIteration(
         id=iteration_id,
@@ -1158,22 +1159,6 @@ def _iteration_domain(*, iteration_id: Any, number: int, plan_revision_id: Any) 
         findings=None,
         decided_at=None,
         created_at=_OBSERVED,
-    )
-
-
-def _dispatch_outcome(*, iteration_id: Any, number: int, plan_revision_id: Any) -> Any:
-    """A hand-built E3a continuation input for refusal-path tests."""
-    return TaskPlanningReviewDispatchOutcome(
-        review_loop=_loop_domain(),
-        review_iteration=_iteration_domain(
-            iteration_id=iteration_id, number=number, plan_revision_id=plan_revision_id
-        ),
-        review_result=ReviewResult(outcome="CHANGES_REQUESTED", summary="Needs work", findings=()),
-        reviewer_session=_session_domain(
-            WorkflowRole.REVIEWER,
-            session_id=_REVIEWER_SESSION_ID,
-            external_id=_REVIEWER_EXTERNAL_ID,
-        ),
     )
 
 
@@ -1239,6 +1224,8 @@ def test_accepted_clearance_keeps_the_loop_open_and_yields_the_plan_evidence() -
         task_id=_TASK_ID,
         plan_production=_production_outcome(),
     )
+    conn.on(_ITERATION_READ, it1_unfin)
+    conn.on(_ITERATION_READ, it1_unfin)
     decision = finalize_planning_review_decision(
         pool,
         adapter,
@@ -1247,7 +1234,9 @@ def test_accepted_clearance_keeps_the_loop_open_and_yields_the_plan_evidence() -
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_STATE_TOKEN,
-        dispatch=dispatch,
+        review_iteration_id=dispatch.review_iteration.id,
+        review_result=dispatch.review_result,
+        expected_reviewer_session_id=dispatch.reviewer_session.id,
     )
 
     assert decision.decision is PlanningReviewDecision.ACCEPTED_CLEAR
@@ -1334,6 +1323,8 @@ def test_duplicate_finalization_applies_nothing() -> None:
         task_id=_TASK_ID,
         plan_production=_production_outcome(),
     )
+    conn.on(_ITERATION_READ, it1_unfin)
+    conn.on(_ITERATION_READ, it1_unfin)
     first = finalize_planning_review_decision(
         pool,
         adapter,
@@ -1342,10 +1333,14 @@ def test_duplicate_finalization_applies_nothing() -> None:
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_STATE_TOKEN,
-        dispatch=dispatch,
+        review_iteration_id=dispatch.review_iteration.id,
+        review_result=dispatch.review_result,
+        expected_reviewer_session_id=dispatch.reviewer_session.id,
     )
     assert first.decision is PlanningReviewDecision.ACCEPTED_CLEAR
 
+    conn.on(_ITERATION_READ, it1_acc)
+    conn.on(_ITERATION_READ, it1_acc)
     with pytest.raises(StaleOperationError):
         finalize_planning_review_decision(
             pool,
@@ -1355,7 +1350,9 @@ def test_duplicate_finalization_applies_nothing() -> None:
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=dispatch,
+            review_iteration_id=dispatch.review_iteration.id,
+            review_result=dispatch.review_result,
+            expected_reviewer_session_id=dispatch.reviewer_session.id,
         )
 
     assert _count(conn, _RESULT_UPDATE) == 1
@@ -1399,9 +1396,9 @@ def test_stale_token_finalization_refuses_before_any_effect() -> None:
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_TOKEN_5,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
+            review_iteration_id=_ITERATION_1_ID,
+            review_result=_CHANGES_REQUESTED_RESULT,
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
         )
 
     assert _count(conn, _RESULT_UPDATE) == 0
@@ -1411,9 +1408,9 @@ def test_stale_token_finalization_refuses_before_any_effect() -> None:
     assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 0
 
 
-def test_a_continuation_without_the_dispatch_outcome_cannot_record_a_verdict() -> None:
-    """Only the exact E3a continuation input authorizes a decision: a bare
-    typed result (or no continuation at all) records nothing — an
+def test_a_result_outside_the_validated_family_cannot_record_a_verdict() -> None:
+    """Only a validated typed ``ReviewResult`` authorizes a decision: a
+    non-result object is an invalid command before any effect — an
     unresolved REVIEW attempt is never treated as CHANGES_REQUESTED."""
     conn = ScriptedConnection()
     fake_pool = FakePool(conn)
@@ -1430,7 +1427,9 @@ def test_a_continuation_without_the_dispatch_outcome_cannot_record_a_verdict() -
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=None,  # type: ignore[arg-type]
+            review_iteration_id=_ITERATION_1_ID,
+            review_result=None,  # type: ignore[arg-type]
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
         )
     with pytest.raises(InvalidCommandError):
         finalize_planning_review_decision(
@@ -1441,10 +1440,12 @@ def test_a_continuation_without_the_dispatch_outcome_cannot_record_a_verdict() -
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=cast(
+            review_iteration_id=_ITERATION_1_ID,
+            review_result=cast(
                 Any,
-                ReviewResult(outcome="CHANGES_REQUESTED", summary="Needs work", findings=()),
+                {"outcome": "CHANGES_REQUESTED", "summary": "Needs work", "findings": []},
             ),
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
         )
 
     assert conn.executed == []
@@ -1459,6 +1460,178 @@ class _PartialGitHubClient:
         self, *, github_installation_id: int, github_repository_id: int
     ) -> None:
         return None
+
+
+_CHANGES_REQUESTED_RESULT = ReviewResult(
+    outcome="CHANGES_REQUESTED", summary="Needs work", findings=()
+)
+
+
+def _script_observed_review_settlement(
+    conn: ScriptedConnection,
+    *,
+    task_rows: list[tuple[Any, ...]],
+    locked_rows: list[tuple[Any, ...]],
+    iteration_reads: list[tuple[Any, ...]],
+    revision_reads: list[tuple[Any, ...]],
+    loop_row: tuple[Any, ...],
+    session_row: tuple[Any, ...],
+    finalized_row: tuple[Any, ...] | None,
+    iterations_after: list[tuple[Any, ...]],
+    gates: list[tuple[Any, ...]],
+) -> None:
+    """The settlement composition's subject reads, in call order (issue #336).
+
+    The settlement entry's own plain Task read, then the shared decision
+    composition's locked Task reads, the reserved-attempt re-derivations,
+    the current-revision proof, the re-locked OPEN planning loop, and the
+    exact READY Reviewer binding — followed, on the applying path, by the
+    one-shot result recording, the refreshed budget history, the durable
+    gate history, and the REVIEWER ``PLAN_REVIEWED`` event.
+    """
+    for row in task_rows:
+        conn.on(_TASK_READ, row)
+    for row in locked_rows:
+        conn.on(_TASK_READ_LOCKED, row)
+    for row in iteration_reads:
+        conn.on(_ITERATION_READ, row)
+    for row in revision_reads:
+        conn.on(_REVISION_READ, row)
+    conn.on(_LOOP_READ_LOCKED, loop_row)
+    conn.on(_SESSION_READ, session_row)
+    if finalized_row is not None:
+        conn.on(_RESULT_UPDATE, finalized_row)
+        conn.on(_ITERATIONS_LIST, iterations_after)
+        conn.on(_GATES_LIST, gates)
+        conn.on(_EVENT_INSERT, _event_row())
+
+
+def test_the_observed_review_result_settles_through_the_owning_service() -> None:
+    """The detached settlement entry finalizes the reserved attempt through
+    the same decision composition from durable inputs alone — no profile
+    barrier, no process-local outcome object, no attached adapter — and the
+    committed decision yields the accepted evidence for the ONE post-commit
+    handoff (issue #336)."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_ws_reads(conn, first_reads=0, first_limit=5, later_limit=5)
+    _script_repeating_reads(
+        conn,
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        producer_row=_session_row(
+            "producer", session_id=_PRODUCER_SESSION_ID, external_id=_PRODUCER_EXTERNAL_ID
+        ),
+        loop_row=_loop_row(limit=5),
+    )
+    t0 = _task_row()
+    rev1 = _revision_row(revision_id=_REVISION_1_ID, number=1, content=_PLAN_TEXT)
+    it1_unfin = _iteration_row(
+        iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+    )
+    it1_acc = _iteration_row(
+        iteration_id=_ITERATION_1_ID,
+        number=1,
+        plan_revision_id=_REVISION_1_ID,
+        outcome="accepted",
+        summary="Looks good",
+        findings=[],
+        decided_at=_OBSERVED,
+    )
+    _script_observed_review_settlement(
+        conn,
+        task_rows=[t0, t0],
+        locked_rows=[t0],
+        iteration_reads=[it1_unfin, it1_unfin],
+        revision_reads=[rev1],
+        loop_row=_loop_row(limit=5),
+        session_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        finalized_row=it1_acc,
+        iterations_after=[it1_acc],
+        gates=[],
+    )
+
+    with composed_transaction(pool) as transaction_pool:
+        outcome = settle_observed_planning_review(
+            transaction_pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            review_iteration_id=_ITERATION_1_ID,
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
+            result=ReviewResult(outcome="ACCEPTED", summary="Looks good", findings=()),
+        )
+
+    assert outcome is not None
+    assert outcome.decision is PlanningReviewDecision.ACCEPTED_CLEAR
+    assert outcome.review_iteration.id == _ITERATION_1_ID
+    assert outcome.plan_revision.id == _REVISION_1_ID
+    assert outcome.review_loop.status is ReviewLoopStatus.OPEN
+    assert outcome.task.status is TaskStatus.PLANNING
+    assert outcome.task.state_token == _STATE_TOKEN
+    assert outcome.revision_production is None
+    assert outcome.resolution_gate is None
+    assert _count(conn, _RESULT_UPDATE) == 1
+    assert _event_types(conn) == ["plan_reviewed"]
+    assert _count(conn, _GATE_INSERT) == 0
+    assert _count(conn, _TASK_WRITE) == 0
+
+
+def test_a_moved_on_observed_review_settles_result_not_applied() -> None:
+    """A validated result whose subject moved on between the dispatch and
+    the observed completion — here a rotated Task token — applies nothing:
+    the settlement returns None so the receipt settles result-not-applied,
+    and no verdict, event, or gate is ever fabricated (issue #336)."""
+    conn = ScriptedConnection()
+    pool = _pool(conn)
+    _script_ws_reads(conn, first_reads=0, first_limit=5, later_limit=5)
+    _script_repeating_reads(
+        conn,
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        producer_row=_session_row(
+            "producer", session_id=_PRODUCER_SESSION_ID, external_id=_PRODUCER_EXTERNAL_ID
+        ),
+        loop_row=_loop_row(limit=5),
+    )
+    t0 = _task_row()
+    rotated = _task_row(state_token=_TOKEN_5)
+    it1_unfin = _iteration_row(
+        iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
+    )
+    _script_observed_review_settlement(
+        conn,
+        task_rows=[t0, rotated],
+        locked_rows=[rotated],
+        iteration_reads=[it1_unfin],
+        revision_reads=[],
+        loop_row=_loop_row(limit=5),
+        session_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        finalized_row=None,
+        iterations_after=[],
+        gates=[],
+    )
+
+    with composed_transaction(pool) as transaction_pool:
+        outcome = settle_observed_planning_review(
+            transaction_pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            review_iteration_id=_ITERATION_1_ID,
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
+            result=_CHANGES_REQUESTED_RESULT,
+        )
+
+    assert outcome is None
+    assert _count(conn, _RESULT_UPDATE) == 0
+    assert _count(conn, _EVENT_INSERT) == 0
+    assert _count(conn, _GATE_INSERT) == 0
+    assert _count(conn, _TASK_WRITE) == 0
 
 
 def test_an_invalid_github_dependency_refuses_before_any_effect() -> None:
@@ -1480,9 +1653,9 @@ def test_an_invalid_github_dependency_refuses_before_any_effect() -> None:
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
+            review_iteration_id=_ITERATION_1_ID,
+            review_result=_CHANGES_REQUESTED_RESULT,
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
         )
     with pytest.raises(InvalidCommandError):
         finalize_planning_review_decision(
@@ -1493,9 +1666,9 @@ def test_an_invalid_github_dependency_refuses_before_any_effect() -> None:
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
+            review_iteration_id=_ITERATION_1_ID,
+            review_result=_CHANGES_REQUESTED_RESULT,
+            expected_reviewer_session_id=_REVIEWER_SESSION_ID,
         )
 
     assert conn.executed == []
@@ -1583,6 +1756,8 @@ def test_owner_mediated_history_immediately_reopens_resolution() -> None:
             current_plan_revision_id=_REVISION_2_ID,
         ),
     )
+    conn.on(_ITERATION_READ, it2_unfin)
+    conn.on(_ITERATION_READ, it2_unfin)
     decision = finalize_planning_review_decision(
         pool,
         adapter,
@@ -1591,7 +1766,9 @@ def test_owner_mediated_history_immediately_reopens_resolution() -> None:
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_TOKEN_2,
-        dispatch=dispatch,
+        review_iteration_id=dispatch.review_iteration.id,
+        review_result=dispatch.review_result,
+        expected_reviewer_session_id=dispatch.reviewer_session.id,
     )
 
     assert decision.decision is PlanningReviewDecision.EXHAUSTED
@@ -1644,6 +1821,8 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
     conn.on(_LOOPS_LIST, [])
     conn.on(_LOOP_INSERT, _loop_row(limit=2))
     conn.on(_ITERATION_INSERT, it1_unfin)
+    conn.on(_ITERATION_READ, it1_unfin)
+    conn.on(_ITERATION_READ, it1_unfin)
     conn.on(_ITERATION_READ, it1_cr)
     conn.on(_ITERATION_READ, it1_cr)  # the F2 claim's locked subject reproof
     conn.on(_ITERATIONS_LIST, [])
@@ -1681,7 +1860,9 @@ def test_uncertain_revision_production_propagates_and_is_never_resent() -> None:
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             expected_state_token=_STATE_TOKEN,
-            dispatch=dispatch,
+            review_iteration_id=dispatch.review_iteration.id,
+            review_result=dispatch.review_result,
+            expected_reviewer_session_id=dispatch.reviewer_session.id,
         )
 
     # The decision transaction's durable facts stand; the uncertain E2 send
@@ -1782,6 +1963,8 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
             current_plan_revision_id=_REVISION_2_ID,
         ),
     )
+    conn.on(_ITERATION_READ, it2_unfin)
+    conn.on(_ITERATION_READ, it2_unfin)
     decision = finalize_planning_review_decision(
         pool,
         adapter,
@@ -1790,7 +1973,9 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_TOKEN_2,
-        dispatch=dispatch,
+        review_iteration_id=dispatch.review_iteration.id,
+        review_result=dispatch.review_result,
+        expected_reviewer_session_id=dispatch.reviewer_session.id,
     )
 
     assert decision.decision is PlanningReviewDecision.EXHAUSTED
@@ -1809,141 +1994,3 @@ def test_implementation_gate_history_immediately_reopens_resolution() -> None:
 
 
 # --- the detached revise routing (issue #335) --------------------------------------
-
-
-def test_the_detached_revise_dependency_trio_is_all_or_nothing() -> None:
-    """A partial or malformed detached-revise dependency trio is a malformed
-    command that fails closed before any effect; an absent trio keeps the
-    blocking revise's attached-runtime requirement."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    factory = cast(
-        ProducerRuntimeAttachmentFactory,
-        lambda: None,  # noqa: E731 - shape only, never invoked
-    )
-    handoff = cast(
-        DetachedTurnCompletionHandoff,
-        SimpleNamespace(handoff_settled_completion=lambda **_: None),
-    )
-
-    # A partial trio fails closed.
-    with pytest.raises(InvalidCommandError, match="together"):
-        finalize_planning_review_decision(
-            pool,
-            None,
-            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
-            profile_id=_OWNER_PROFILE_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_STATE_TOKEN,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
-            producer_runtime_factory=factory,
-        )
-    # A malformed member fails closed.
-    with pytest.raises(InvalidCommandError, match="registrar"):
-        finalize_planning_review_decision(
-            pool,
-            None,
-            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
-            profile_id=_OWNER_PROFILE_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_STATE_TOKEN,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
-            producer_runtime_factory=factory,
-            observation_registrar=cast(PlanProductionObservationRegistrar, object()),
-            completion_handoff=handoff,
-        )
-    # Without the trio, the attached runtime is required.
-    with pytest.raises(InvalidCommandError, match="runtime"):
-        finalize_planning_review_decision(
-            pool,
-            None,
-            cast(GitHubAppClient, FakeGitHubClient(fake_pool)),
-            profile_id=_OWNER_PROFILE_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_STATE_TOKEN,
-            dispatch=_dispatch_outcome(
-                iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-            ),
-        )
-
-
-def test_a_routed_change_request_dispatches_detached_with_the_trio(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With the detached-revise trio supplied, the routed change request is
-    dispatched as one detached turn rooted at the persisted finalized
-    iteration — never routed through the in-process blocking revise — and
-    the outcome carries no in-process revision production (issue #335)."""
-    conn = ScriptedConnection()
-    pool = _pool(conn)
-    finalization = decision_module._Finalization(
-        decision_module._Phase1Decision.ROUTE_REVISION,
-        cast(ReviewIteration, SimpleNamespace(id=_ITERATION_1_ID)),
-        cast(PlanRevision, SimpleNamespace(id=_REVISION_1_ID)),
-        cast(ReviewLoop, SimpleNamespace(id=uuid.uuid4())),
-        cast(Task, SimpleNamespace(state_token=_STATE_TOKEN)),
-        None,
-    )
-    monkeypatch.setattr(
-        decision_module, "_finalize_decision_transaction", lambda *args, **kwargs: finalization
-    )
-    dispatched: list[dict[str, Any]] = []
-
-    def recording_dispatch(*args: Any, **kwargs: Any) -> Any:
-        dispatched.append(dict(kwargs))
-        return SimpleNamespace(
-            task=SimpleNamespace(state_token=_STATE_TOKEN),
-            send_claim=None,
-            receipt=None,
-            producer_session=None,
-        )
-
-    monkeypatch.setattr(decision_module, "dispatch_planning_revise_detached", recording_dispatch)
-
-    def refusing_blocking_revise(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("the blocking revise must not run with the detached trio supplied")
-
-    monkeypatch.setattr(decision_module, "revise_task_plan", refusing_blocking_revise)
-
-    outcome = finalize_planning_review_decision(
-        pool,
-        None,
-        cast(GitHubAppClient, FakeGitHubClient(FakePool(conn))),
-        profile_id=_OWNER_PROFILE_ID,
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=_STATE_TOKEN,
-        dispatch=_dispatch_outcome(
-            iteration_id=_ITERATION_1_ID, number=1, plan_revision_id=_REVISION_1_ID
-        ),
-        producer_runtime_factory=cast(
-            ProducerRuntimeAttachmentFactory,
-            lambda: None,
-        ),
-        observation_registrar=cast(
-            PlanProductionObservationRegistrar,
-            SimpleNamespace(register_session=lambda **_: None),
-        ),
-        completion_handoff=cast(
-            DetachedTurnCompletionHandoff,
-            SimpleNamespace(handoff_settled_completion=lambda **_: None),
-        ),
-    )
-
-    assert outcome.decision is PlanningReviewDecision.REVISION_ROUTED
-    assert outcome.revision_production is None
-    assert len(dispatched) == 1
-    assert dispatched[0]["prior_plan_revision_id"] == _REVISION_1_ID
-    assert dispatched[0]["review_iteration_id"] == _ITERATION_1_ID
-    assert dispatched[0]["expected_state_token"] == _STATE_TOKEN
-    assert callable(dispatched[0]["producer_runtime_factory"])
-    assert dispatched[0]["observation_registrar"] is not None
-    assert dispatched[0]["completion_handoff"] is not None

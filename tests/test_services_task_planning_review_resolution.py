@@ -919,7 +919,10 @@ def _script_sticky_followup(conn: ScriptedConnection) -> None:
     conn.on_repeat(_LOOPS_LIST, [_loop_row()])
     conn.on(_ITERATIONS_LIST, [it1, it2])  # dispatch's admission guards
     conn.on(_ITERATION_INSERT, it3_unfin)
-    conn.on(_ITERATIONS_LIST, [it1, it2, it3_unfin])  # the reserved attempt
+    # The reserved attempt is re-derived by id under the loop lock (issue
+    # #336): the pre-lock and post-lock reads, never this history listing.
+    conn.on(_ITERATION_READ, it3_unfin)
+    conn.on(_ITERATION_READ, it3_unfin)
     conn.on(_RESULT_UPDATE, it3)
     conn.on(_ITERATIONS_LIST, [it1, it2, it3])  # the budget facts
     conn.on(_GATES_LIST, [settled_gate])  # the settled gate keeps mediation sticky
@@ -981,7 +984,9 @@ def test_a_settled_gate_keeps_owner_mediation_sticky() -> None:
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         expected_state_token=_TOKEN_4,
-        dispatch=dispatch,
+        review_iteration_id=dispatch.review_iteration.id,
+        review_result=dispatch.review_result,
+        expected_reviewer_session_id=dispatch.reviewer_session.id,
     )
 
     assert decision.decision is PlanningReviewDecision.EXHAUSTED

@@ -53,6 +53,7 @@ from psycopg.errors import UniqueViolation
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeDeliveryUncertainError,
     AgentRuntimeUnavailableError,
+    AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
@@ -69,16 +70,25 @@ from openorc.protocol.models import ReviewResult
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
     StaleOperationError,
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
-from openorc.services.task_plan_production import TaskPlanProductionOutcome
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
+    ObservationRegistrationRefusedError,
+)
+from openorc.services.task_plan_production import (
+    TaskPlanProductionOutcome,
+)
 from openorc.services.task_planning_review_dispatch import (
+    DispatchedPlanningReview,
     TaskPlanningReviewDispatchOutcome,
     dispatch_planning_review,
+    dispatch_planning_review_detached,
 )
 from tests.fakes.agent_runtime import (
     FakeAgentRuntimeAdapter,
@@ -1535,3 +1545,306 @@ def test_a_moved_reviewer_binding_during_attachment_refuses_without_sending() ->
     _assert_no_verdict_recorded(env.conn)
     _assert_no_task_mutation(env.conn)
     assert env.pool.active_connections == 0
+
+
+# --- the detached regular-mode REVIEW dispatch (issue #336) --------------------
+
+_RECEIPT_ID = uuid.uuid4()
+_TURN_REFERENCE = "fake-run-1"
+
+_RECEIPT_INSERT = _sql_has("insert into openorc.task_hub_run_receipts")
+_RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id = %s for update")
+_RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
+_RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
+_EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
+
+
+def _detached_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    if status == "settled":
+        outcome: dict[str, Any] = {"settlement": "validated_result"}
+    elif status == "refused":
+        outcome = {"refusal_kind": "admission_refused"}
+    else:
+        outcome = {}
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _REVIEWER_SESSION_ID,
+        "reviewer_review",
+        "review_iteration",
+        _ITERATION_1_ID,
+        "review_result",
+        admitted_turn_reference,
+        status,
+        outcome,
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+class _RecordingRegistrar:
+    """Records the pre-admission observation registrations (issue #323 seam)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.registrations: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        connection_id: Any,
+        external_session_id: Any,
+    ) -> None:
+        self.registrations.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _RecordingHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #336)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+    ) -> None:
+        self.calls.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+
+
+def _receipt_insert_params(conn: ScriptedConnection) -> tuple[Any, ...]:
+    for sql, params in conn.executed:
+        if _RECEIPT_INSERT(sql, None):
+            assert params is not None
+            return params
+    raise AssertionError("no detached-turn receipt insert executed")
+
+
+def _script_attach(conn: ScriptedConnection) -> None:
+    """The acknowledgement attach (claimed → admitted, no staged completion)."""
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, None)
+
+
+def _run_detached(
+    env: _Dispatch,
+    *,
+    adapter: FakeAgentRuntimeAdapter,
+    registrar: Any,
+    handoff: Any,
+) -> Any:
+    return dispatch_planning_review_detached(
+        cast(DatabasePool, env.pool),
+        _ReviewerAttachment(adapter, env.conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        profile_id=_OWNER_PROFILE_ID,
+        plan_production=_production_outcome(),
+        observation_registrar=registrar,  # type: ignore[arg-type]
+        completion_handoff=handoff,  # type: ignore[arg-type]
+    )
+
+
+def test_the_detached_review_dispatch_reserves_records_registers_admits_and_attaches() -> None:
+    """The regular-mode REVIEW is one admitted detached turn: the reserved
+    iteration's ``review_result`` receipt companion commits strictly before
+    the positive observation registration and the verbatim admission, and
+    the dispatching call returns with no blocking send and no verdict."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        loop_row=_loop_row(limit=5),
+        iteration_row=_iteration_row(
+            iteration_id=_ITERATION_1_ID,
+            number=1,
+            plan_revision_id=_REVISION_1_ID,
+        ),
+    )
+    env.conn.on(_RECEIPT_INSERT, _detached_receipt_row())
+    _script_attach(env.conn)
+    env.conn.on(_TASK_READ, _task_row())  # the post-dispatch reload
+    runtime = env.prepared_reviewer_adapter([])
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _run_detached(env, adapter=runtime, registrar=registrar, handoff=handoff)
+
+    assert isinstance(outcome, DispatchedPlanningReview)
+    assert outcome.review_iteration.id == _ITERATION_1_ID
+    assert outcome.review_iteration.outcome is None
+    assert outcome.receipt.id == _RECEIPT_ID
+    assert outcome.reviewer_session.id == _REVIEWER_SESSION_ID
+    assert outcome.task.state_token == _STATE_TOKEN
+    # The receipt companion expects the canonical review_result family and
+    # roots at the reserved ReviewIteration identity.
+    receipt_params = _receipt_insert_params(env.conn)
+    assert receipt_params[3] == "reviewer_review"
+    assert receipt_params[4] == "review_iteration"
+    assert receipt_params[6] == "review_result"
+    # One positive observation registration on the exact bound Reviewer
+    # session.
+    assert registrar.registrations == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _REVIEWER_SESSION_ID,
+            "connection_id": _CONNECTION_ID,
+            "external_session_id": _REVIEWER_EXTERNAL_ID,
+        }
+    ]
+    # The canonical REVIEW instruction was admitted verbatim and no blocking
+    # send ran; E3a recorded no verdict, result, or Task mutation.
+    assert len(runtime.detached_admissions()) == 1
+    admitted_session, admitted_message = runtime.detached_admissions()[0]
+    assert admitted_session == _REVIEWER_EXTERNAL_ID
+    assert _FULL_NAME in admitted_message
+    assert len(runtime.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
+    assert env.pool.active_connections == 0
+    _assert_no_verdict_recorded(env.conn)
+    _assert_no_task_mutation(env.conn)
+
+
+def test_a_refused_observation_registration_refuses_the_receipt_before_any_admission() -> None:
+    """A positively refused pre-admission registration is a proven pre-effect
+    failure: the just-recorded receipt is marked refused so a never-dispatched
+    turn cannot hold the session's single-outstanding slot."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        loop_row=_loop_row(limit=5),
+        iteration_row=_iteration_row(
+            iteration_id=_ITERATION_1_ID,
+            number=1,
+            plan_revision_id=_REVISION_1_ID,
+        ),
+    )
+    env.conn.on(_RECEIPT_INSERT, _detached_receipt_row())
+    env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    runtime = env.prepared_reviewer_adapter([])
+
+    with pytest.raises(ExternalOperationFailedError, match="registration was refused"):
+        _run_detached(
+            env,
+            adapter=runtime,
+            registrar=_RecordingRegistrar(
+                error=ObservationRegistrationRefusedError(
+                    "refused",
+                    reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED,
+                )
+            ),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)
+    assert runtime.detached_admissions() == ()
+
+
+def test_a_refused_admission_refuses_the_receipt_and_never_repeats() -> None:
+    """A positively identified admission refusal is proven pre-effect: the
+    receipt is marked refused and the canonical instruction never dispatched."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        loop_row=_loop_row(limit=5),
+        iteration_row=_iteration_row(
+            iteration_id=_ITERATION_1_ID,
+            number=1,
+            plan_revision_id=_REVISION_1_ID,
+        ),
+    )
+    env.conn.on(_RECEIPT_INSERT, _detached_receipt_row())
+    env.conn.on(_RECEIPT_REFUSE, _detached_receipt_row(status="refused"))
+    runtime = env.prepared_reviewer_adapter([])
+    runtime.queue_detached_admission(AgentSessionNotFoundError("gone"))
+
+    with pytest.raises(ExternalOperationRejectedError):
+        _run_detached(
+            env,
+            adapter=runtime,
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)
+
+
+def test_an_uncertain_admission_leaves_the_receipt_claimed_and_never_repeats() -> None:
+    """An uncertain admission outcome stays conservatively claimed: the
+    receipt is never re-dispatched and the durable state owns recovery."""
+    env = _Dispatch()
+    _script_first_review_entry(
+        env.conn,
+        task_row=_task_row(),
+        reviewer_row=_session_row(
+            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
+        ),
+        revision_row=_revision_row(),
+        loop_row=_loop_row(limit=5),
+        iteration_row=_iteration_row(
+            iteration_id=_ITERATION_1_ID,
+            number=1,
+            plan_revision_id=_REVISION_1_ID,
+        ),
+    )
+    env.conn.on(_RECEIPT_INSERT, _detached_receipt_row())
+    runtime = env.prepared_reviewer_adapter([])
+    runtime.queue_detached_admission(AgentRuntimeDeliveryUncertainError("the outcome is unknown"))
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _run_detached(
+            env,
+            adapter=runtime,
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert not any(_RECEIPT_REFUSE(sql, None) for sql, _ in env.conn.executed)

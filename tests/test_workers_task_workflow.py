@@ -320,7 +320,9 @@ def fake_dispatch_outcome(state_token: UUID = _NEXT_TOKEN) -> Any:
         review_loop=SimpleNamespace(id=uuid4()),
         review_iteration=SimpleNamespace(id=uuid4()),
         review_result=SimpleNamespace(outcome="accepted"),
-        reviewer_session=SimpleNamespace(external_session_id=_REVIEWER_EXTERNAL_SESSION_ID),
+        reviewer_session=SimpleNamespace(
+            id=uuid4(), external_session_id=_REVIEWER_EXTERNAL_SESSION_ID
+        ),
         task=SimpleNamespace(state_token=state_token),
         pull_request=SimpleNamespace(id=_PR_RECORD_ID),
         reconciled_head_sha="a" * 40,
@@ -719,7 +721,9 @@ def test_planning_review_composition_runs_dispatch_and_decision_in_process(
 def test_planning_review_acceptance_presents_the_implementation_gate_without_approving_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    """The queue-mode interim (until #328/#336): the in-process decision's
+    accepted clearance presents the exact-plan gate in the composition."""
+    dependencies, submitter = make_queue_dependencies()
     decision_token = _NEXT_TOKEN
     open_implementation = RecordingService(
         result=SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
@@ -765,7 +769,9 @@ def test_planning_review_acceptance_presents_the_implementation_gate_without_app
 def test_planning_review_exhaustion_ends_at_the_resolution_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    """The queue-mode interim (until #328/#336): the exhausting decision's
+    REVIEW_RESOLUTION gate already stands and nothing further is sent."""
+    dependencies, submitter = make_queue_dependencies()
     finalize = RecordingService(
         result=fake_planning_decision(PlanningReviewDecision.EXHAUSTED, state_token=_NEXT_TOKEN)
     )
@@ -2220,21 +2226,23 @@ def test_planning_bootstrap_composition_dispatches_the_initial_plan_detached_in_
     assert submitter.submissions == []
 
 
-def test_planning_review_composition_dispatches_the_revise_detached_in_regular_mode(
+def test_planning_review_composition_dispatches_the_review_detached_in_regular_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The regular-mode planning-review composition keeps the blocking E3a
-    dispatch and decision in-process (until #336) and dispatches the routed
-    Producer revise as one detached turn, returning without the inline
-    next-round submission (issue #335)."""
+    """The regular-mode planning-review composition (issue #336): the REVIEW
+    dispatch is itself one detached agent turn — the reserved iteration, its
+    detached-turn receipt companion, and the verbatim admission commit in the
+    dispatch service, and the composition returns after the durable admission
+    without any blocking send, in-process decision, or inline submission."""
     dependencies, submitter = make_dependencies()
-    decision = fake_planning_decision(
-        PlanningReviewDecision.REVISION_ROUTED, revision_production=None
+    review_dispatch = RecordingService(
+        result=SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
     )
-    finalize = RecordingService(result=decision)
+    monkeypatch.setattr(
+        task_workflow, "dispatch_planning_review_detached", review_dispatch, raising=True
+    )
+    finalize = RecordingService(result=None)
     monkeypatch.setattr(task_workflow, "finalize_planning_review_decision", finalize, raising=True)
-    review_dispatch = RecordingService(result=fake_dispatch_outcome())
-    monkeypatch.setattr(task_workflow, "dispatch_planning_review", review_dispatch, raising=True)
     production = fake_production(_STATE_TOKEN)
     with patched_workflow_environment(monkeypatch, reloaded_plan_production=production):
         task_workflow.execute_task_workflow_operation(
@@ -2248,18 +2256,21 @@ def test_planning_review_composition_dispatches_the_revise_detached_in_regular_m
             ),
             dependencies=dependencies,
         )
-        # The E3a dispatch ran in-process against the reloaded production
-        # subject; the decision received the detached dependency trio and no
-        # attached runtime.
+
+        # The E3a detached dispatch ran against the reloaded production
+        # subject with the composed deferred Reviewer attachment factory
+        # (F5e), the process's observation registrar, and the ONE completion
+        # handoff.
         assert review_dispatch.call_count == 1
         assert review_dispatch.calls[0]["kwargs"]["plan_production"] is production
-        assert finalize.call_count == 1
-        finalize_kwargs = finalize.calls[0]["kwargs"]
-        assert finalize.calls[0]["args"][1] is None
-        assert finalize.calls[0]["kwargs"]["expected_state_token"] == _STATE_TOKEN
-        assert callable(finalize_kwargs["producer_runtime_factory"])
-        assert finalize_kwargs["observation_registrar"] is not None
-        assert callable(finalize_kwargs["completion_handoff"].handoff_settled_completion)
-        # No inline next-round submission: the observed completion's handoff
-        # owns it from committed state after the decision's detached dispatch.
+        assert review_dispatch.calls[0]["kwargs"]["profile_id"] == _PROFILE_ID
+        assert len(review_dispatch.calls[0]["args"]) == 2
+        assert review_dispatch.calls[0]["kwargs"]["observation_registrar"] is not None
+        assert callable(
+            review_dispatch.calls[0]["kwargs"]["completion_handoff"].handoff_settled_completion
+        )
+        # No blocking decision runs in the composition and no next round is
+        # submitted inline: the observed completion's settlement and the ONE
+        # handoff own the continuation from committed state.
+        assert finalize.call_count == 0
         assert submitter.submissions == []

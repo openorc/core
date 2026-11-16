@@ -42,7 +42,6 @@ from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.models import ReviewFinding, ReviewResult
 from openorc.services import event_coordination
 from openorc.services.task_planning_review_decision import (
-    TaskPlanningReviewDispatchOutcome,
     finalize_planning_review_decision,
 )
 from openorc.services.task_planning_review_resolution import (
@@ -275,16 +274,6 @@ def _settlement_fixture(conn: Connection[Any]) -> tuple[DatabasePool, dict[str, 
     assert current_task is not None
     persisted_loop = review_repositories.get_review_loop(pool, review_loop_id=loop.id)
     assert persisted_loop is not None
-    dispatch = TaskPlanningReviewDispatchOutcome(
-        review_loop=persisted_loop,
-        review_iteration=attempt,
-        review_result=ReviewResult(
-            outcome="CHANGES_REQUESTED",
-            summary="Needs work",
-            findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
-        ),
-        reviewer_session=reviewer,
-    )
     decision = finalize_planning_review_decision(
         pool,
         cast(AgentRuntimeAdapter, FakeAgentRuntimeAdapter()),
@@ -293,7 +282,13 @@ def _settlement_fixture(conn: Connection[Any]) -> tuple[DatabasePool, dict[str, 
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=current_task.state_token,
-        dispatch=dispatch,
+        review_iteration_id=attempt.id,
+        review_result=ReviewResult(
+            outcome="CHANGES_REQUESTED",
+            summary="Needs work",
+            findings=(ReviewFinding(summary="Clarify scope", details="Say which module."),),
+        ),
+        expected_reviewer_session_id=reviewer.id,
     )
     assert decision.resolution_gate is not None
     exhausted = task_repositories.get_task(pool, task_id)
