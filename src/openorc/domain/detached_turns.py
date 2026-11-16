@@ -64,7 +64,9 @@ from openorc.domain.sessions import canonical_effective_config_snapshot
 
 __all__ = [
     "DetachedTurnObservationKind",
+    "DetachedTurnObservationSourceError",
     "NativeTurnEvidence",
+    "ObservationLease",
     "ObservedTurnEvidence",
     "REFUSAL_OUTCOME_KIND_KEY",
     "SETTLEMENT_OBSERVED_FAILURE",
@@ -215,6 +217,40 @@ class TurnStatusEvidenceVerdict(StrEnum):
     FAILURE_EVIDENCE = "failure_evidence"
     COMPLETION_WITHOUT_RESULT_EVIDENCE = "completion_without_result_evidence"
     UNRESOLVED_EVIDENCE = "unresolved_evidence"
+
+
+class ObservationLease:
+    """Opaque handle of one established runtime session observation.
+
+    The runtime integration returns one lease per established session
+    observation and releases exactly that observation when the lease is
+    handed back; shared application code never inspects it. A lease whose
+    underlying attachment was dropped releases as a no-op.
+    """
+
+    __slots__ = ()
+
+
+class DetachedTurnObservationSourceError(Exception):
+    """A bounded, positively established failure of the observation source's
+    own transport mechanics (an attachment or a subscription).
+
+    The neutral contract error the concrete integration raises for its own
+    bounded transport failures; the reason is a safe machine token from the
+    closed vocabulary below and no native payload material ever appears in
+    the message or the reason.
+    """
+
+    ATTACHMENT_FAILED = "attachment_failed"
+    ATTACHMENT_UNAVAILABLE = "attachment_unavailable"
+    SUBSCRIPTION_FAILED = "subscription_failed"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"the detached-turn observation source failed ({reason})")
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return self.args[0]
 
 
 class NativeTurnEvidence:

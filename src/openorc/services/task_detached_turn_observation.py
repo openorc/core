@@ -1,87 +1,83 @@
-"""The process-owned Hub-run observation host (detached agent turns, issue #323).
+"""The process-owned detached-turn observation host (detached agent turns,
+issues #323/#348).
 
-The regular-mode application-lifecycle component that receives Hub run
+The regular-mode application-lifecycle component that receives detached-turn
 completions without keeping any OpenOrc local worker slot or bridge RPC
-blocked for the turn's lifetime. The observer is a process/application
--lifecycle concern owned by the serving lifespan; the shared settlement seam
-(:mod:`openorc.services.task_detached_turn_correlation`) remains the sole workflow
-authority, and the owning Level 1 dispatch services (migrated in issue #325)
-remain the only intended callers of the registration seam.
+blocked for the turn's lifetime. The host is a process/application-lifecycle
+concern owned by the serving lifespan; the shared settlement seam
+(:mod:`openorc.services.task_detached_turn_correlation`) remains the sole
+workflow authority, and the owning Level 1 dispatch services (migrated in
+issue #325) remain the only intended callers of the registration seam.
 
-- One observer owns the serving process's Hub-run observation resources: a
-  bounded registry of exact session subscriptions, each attached through the
-  same current trusted Connection/credential resolution the runtime
-  attachment composition uses. It is never a browser SSE surface, never an
+The host is runtime-neutral: it owns the bounded registry of exact-session
+observations, the registration gates and their typed refusals, the
+per-session lifecycle lease, the delivery routing into the settlement seam,
+the reconnection policy, and the #324 post-commit bootstrap continuation
+trigger. Every runtime-native mechanic — attachment, subscription, native
+evidence wrapping, and the classification of which native evidence proves or
+counters an admitted turn — lives behind the injected
+:class:`DetachedTurnObservationSource` port, implemented by the concrete
+runtime integration. The host never imports a runtime integration and never
+interprets native evidence.
+
+- One host owns the serving process's observation resources: a bounded
+  registry of exact session observations, each attached through the same
+  current trusted Connection/credential resolution the runtime attachment
+  composition uses. It is never a browser SSE surface, never an
   unauthenticated callback, and never a per-operation attachment.
-- ``register_session`` is the positively-required pre-enqueue gate: the
-  pinned SDK cannot replay an arbitrary missed terminal result, so a
-  dispatch whose completion observation this observer owns must not enqueue
-  without an actively subscribed exact session. Every failure to establish
-  that observation — observer unavailable, capacity exhausted, attachment,
-  attachment-configuration, or subscription failure, unresolvable binding —
-  is a typed refusal the dispatch routes through the existing pre-effect
-  failure machinery; a refusal never degrades into unobserved dispatch.
-- Verified terminal observations route through the settlement seam within
-  the observation's own authenticated Connection/Workspace scope; the Hub
-  envelope's own session identity is authoritative and no identity is ever
-  taken from payload contents, timestamps, or ``snapshot.prompt``.
-  Duplicate/late delivery is deduplicated at the durable seam boundary, and
-  ``run.started`` identities route through the read-only start
-  corroboration.
+- ``register_session`` is the positively-required pre-admission gate: the
+  runtime integration cannot replay an arbitrary missed terminal result, so
+  a dispatch whose completion observation this host owns must not admit a
+  turn without an actively observed exact session. Every failure to
+  establish that observation — host unavailable, capacity exhausted,
+  attachment, attachment-configuration, or subscription failure,
+  unresolvable binding — is a typed refusal the dispatch routes through the
+  existing pre-effect failure machinery; a refusal never degrades into
+  unobserved dispatch.
+- Delivered terminal observations route through the settlement seam within
+  the observation's own authenticated Connection/Workspace scope; the
+  evidence envelope's own session identity is authoritative and no identity
+  is ever taken from payload contents, timestamps, or snapshots. Duplicate
+  and late delivery is deduplicated at the durable seam boundary, and
+  turn-start observations route through the read-only start corroboration.
 - Post-settlement cleanup is coordinated with successor registration by one
   small per-session lifecycle lease: a successor's registration renews the
   session's observation lease, and a cleanup whose lease has since been
-  renewed leaves the live observation in place — Run A's cleanup can never
-  disconnect the observation Run B legitimately acquired after Run A's
-  atomic settlement released the outstanding-run constraint. #322's
-  single-outstanding-run invariant is relied upon unchanged.
+  renewed leaves the live observation in place — turn A's cleanup can never
+  disconnect the observation turn B legitimately acquired after turn A's
+  atomic settlement released the outstanding-turn constraint. The
+  single-outstanding-turn invariant is relied upon unchanged.
 - Reconnection is bounded and best-effort: when a connection's attachment
-  proves unusable the next registration re-attaches through a fresh
-  credential read, re-subscribes the registry's still-outstanding sessions,
-  and consults the status-only ``run.list`` read for outstanding admitted
-  receipts through the seam's classification — where status-only
-  ``completed`` is never success evidence and an unusable record fails
-  closed. There is no blanket polling, no idle-reset timer, no assumed
-  gap-free observer lifetime, and no invention of missing formal results:
-  an observer that died loses its in-memory registry by design, and
-  previously outstanding receipts stay unresolved under the accepted v1
-  fail-closed recovery bounds.
+  proves unusable the next registration re-attaches through a fresh trusted
+  read, re-establishes the registry's still-outstanding session
+  observations, and consults the integration's status-only evidence for
+  outstanding admitted receipts through the seam's classification — where a
+  completed status alone is never success evidence and an unusable record
+  fails closed. There is no blanket polling, no idle-reset timer, no assumed
+  gap-free host lifetime, and no invention of missing formal results: a host
+  that died loses its in-memory registry by design, and previously
+  outstanding receipts stay unresolved under the accepted v1 fail-closed
+  recovery bounds.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 from uuid import UUID
 
-from openorc.adapters.cline import (
-    ClineBridgeProcessBackend,
-    ClineHubEvent,
-    ClineRemoteConfig,
-    ClineSdkBackend,
-    ClineSdkBackendError,
-    JsonObject,
-    Subscription,
-    classify_backend_failure,
-    classify_hub_run_start,
-    classify_hub_run_statuses,
-    classify_terminal_hub_run,
-    hub_evidence_family,
-    resolve_connection_control_endpoint,
-)
-from openorc.adapters.cline.connection_endpoint import ConnectionControlEndpointError
 from openorc.domain.connections import AdapterType, Connection
 from openorc.domain.detached_turns import (
+    DetachedTurnObservationSourceError,
     NativeTurnEvidence,
+    ObservationLease,
     ObservedTurnEvidence,
     TaskDetachedTurnReceiptStatus,
-    TurnAttribution,
     TurnEvidenceFamily,
-    TurnStatusEvidenceVerdict,
-    TurnTerminalClassification,
 )
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.detached_turns import (
@@ -90,18 +86,18 @@ from openorc.persistence.detached_turns import (
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import find_task_agent_session_binding
-from openorc.services.cline_attachment import OPENORC_CLIENT_IDENTITY
 from openorc.services.connection_credentials import (
     ControlEndpointSecret,
     resolve_connection_runtime_credential,
 )
 from openorc.services.errors import (
     ConflictError,
-    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
 )
 from openorc.services.task_detached_turn_correlation import (
+    TurnEvidenceClassifier,
     TurnSettlementKind,
     TurnStatusClassificationKind,
     check_turn_start_identity,
@@ -109,38 +105,32 @@ from openorc.services.task_detached_turn_correlation import (
     settle_observed_turn_completion,
 )
 
-# The post-commit bootstrap continuation trigger of the process wiring
-# (issue #324): invoked after an establishment settlement has committed a
-# validated READY finalization, it owns the resumption classification and
-# the continuation submission through the existing F1 boundary. Never
-# invoked inside a database transaction; never a workflow authority.
 BootstrapContinuationTrigger = Callable[..., None]
 
 __all__ = [
     "BootstrapContinuationTrigger",
-    "HubObservationRefusalReason",
-    "HubRunObserver",
+    "DetachedTurnObservationSourceError",
+    "DetachedTurnObservationHost",
+    "DetachedTurnObservationSource",
+    "DetachedTurnObservationSourceError",
+    "ObservationAttachmentInputs",
+    "ObservationRegistrationRefusalReason",
 ]
 
 logger = logging.getLogger(__name__)
 
-#: The trusted credential-resolution seam of one observation attachment: the
-#: same current Workspace-scoped read the runtime attachment composition
-#: uses, injected as an explicitly named seam for composition and tests.
-RuntimeCredentialResolver = Callable[..., tuple[Connection, ControlEndpointSecret]]
+_TRACER_SCOPE: Final[str] = "openorc.services.task_detached_turn_observation"
+_REGISTER_SPAN_NAME: Final[str] = "detached_turn_observation.register_session"
+_REGISTER_ESTABLISHMENT_SPAN_NAME: Final[str] = (
+    "detached_turn_observation.register_establishment_session"
+)
+_INGEST_SPAN_NAME: Final[str] = "detached_turn_observation.ingest_turn_evidence"
+_RECONNECT_SPAN_NAME: Final[str] = "detached_turn_observation.reconnect_connection"
 
-_TRACER_SCOPE: Final[str] = "openorc.services.cline_hub_observation"
-_REGISTER_SPAN_NAME: Final[str] = "hub_run_observation.register_session"
-_REGISTER_ESTABLISHMENT_SPAN_NAME: Final[str] = "hub_run_observation.register_establishment_session"
-_INGEST_SPAN_NAME: Final[str] = "hub_run_observation.ingest_hub_event"
-_RECONNECT_SPAN_NAME: Final[str] = "hub_run_observation.reconnect_connection"
-_CONNECT_OPERATION: Final[str] = "connect"
-_SUBSCRIBE_OPERATION: Final[str] = "subscribe_hub"
-
-# The defensive host bound beyond the structural one: subscriptions exist
+# The defensive host bound beyond the structural one: observations exist
 # only for sessions with an outstanding receipt, themselves bounded by the
 # session admission capacity. A registration beyond the cap is the typed
-# refusal below — it blocks the enqueue rather than degrading observation.
+# refusal below — it blocks the admission rather than degrading observation.
 _MAX_CONCURRENT_SESSION_OBSERVATIONS: Final[int] = 128
 
 # The settlement classifications after which the session's observation has
@@ -158,7 +148,7 @@ _CLEANUP_SETTLEMENT_KINDS: Final[frozenset[TurnSettlementKind]] = frozenset(
 )
 
 
-class HubObservationRefusalReason(StrEnum):
+class ObservationRegistrationRefusalReason(StrEnum):
     """The closed vocabulary of positive-observation registration refusals.
 
     The safe machine tokens a dispatch's pre-effect failure evidence may
@@ -172,9 +162,96 @@ class HubObservationRefusalReason(StrEnum):
     OBSERVATION_ATTACHMENT_FAILED = "observation_attachment_failed"
     OBSERVATION_SUBSCRIPTION_FAILED = "observation_subscription_failed"
     # The detached establishment dispatch's typed carrier for a registration
-    # failure that is not one of the observer's own classified refusals
+    # failure that is not one of the host's own classified refusals
     # (issue #324): the same proven pre-effect condition, one safe token.
     OBSERVATION_REGISTRATION_FAILED = "observation_registration_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationAttachmentInputs:
+    """The neutral attachment inputs one observation connection needs.
+
+    ``endpoint`` is the runtime integration's own connection endpoint and
+    ``auth_token`` the current attach token resolved through the trusted
+    credential path. Sensitive: the token is excluded from ``repr`` and
+    never allowed into errors, logging, events, or call diagnostics.
+    """
+
+    endpoint: str
+    auth_token: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint, str) or not self.endpoint.strip():
+            raise ValueError("ObservationAttachmentInputs.endpoint must be a non-empty string")
+        if not isinstance(self.auth_token, str) or not self.auth_token.strip():
+            raise ValueError("ObservationAttachmentInputs.auth_token must be a non-empty string")
+
+    def __repr__(self) -> str:
+        return f"ObservationAttachmentInputs(endpoint={self.endpoint!r}, auth_token=<withheld>)"
+
+
+#: The trusted credential-resolution seam the composition injects: the same
+#: current Connection/credential read the runtime attachment composition
+#: uses, never an in-memory secret.
+RuntimeCredentialResolver = Callable[..., tuple[Connection, ControlEndpointSecret]]
+
+#: The adapter-owned endpoint resolution seam the composition injects: it
+#: reads the Connection's safe configuration and returns the configured
+#: endpoint, or ``None`` when none is configured; a malformed configuration
+#: raises a ``ValueError`` subclass.
+EndpointResolver = Callable[[Mapping[str, object]], str | None]
+
+
+class DetachedTurnObservationSource(TurnEvidenceClassifier, Protocol):
+    """The runtime integration's observation source port.
+
+    The concrete integration owns its per-connection attachment lifecycle,
+    its session subscriptions, the wrapping of its native events into
+    neutral evidence envelopes, and the native interpretation behind the
+    inherited :class:`TurnEvidenceClassifier` seam (issue #348). Failures of
+    its own bounded transport mechanics surface as the typed
+    :class:`DetachedTurnObservationSourceError`; unexpected exceptions
+    propagate unchanged for the caller's own failure machinery.
+    """
+
+    def attach_connection(
+        self, *, connection_id: UUID, inputs: ObservationAttachmentInputs
+    ) -> None:
+        """Establish the connection's observation attachment."""
+        ...
+
+    def connection_attached(self, connection_id: UUID) -> bool:
+        """Whether the connection currently has a live observation attachment."""
+        ...
+
+    def observe_session(
+        self,
+        *,
+        connection_id: UUID,
+        external_session_id: str,
+        deliver: Callable[[ObservedTurnEvidence], None],
+    ) -> ObservationLease:
+        """Establish the exact session's observation, delivering neutral
+        evidence envelopes to ``deliver``, and return its lease."""
+        ...
+
+    def release_observation(self, lease: ObservationLease) -> None:
+        """Release exactly the observation the lease was returned for."""
+        ...
+
+    def consult_status_evidence(
+        self, *, connection_id: UUID, external_session_id: str
+    ) -> NativeTurnEvidence:
+        """Pull one bounded status-only evidence consultation."""
+        ...
+
+    def drop_connection(self, connection_id: UUID) -> None:
+        """Discard an unusable connection attachment and its dead observations."""
+        ...
+
+    def dispose(self) -> None:
+        """Release every source resource; idempotent and terminal."""
+        ...
 
 
 class _SessionObservation:
@@ -189,7 +266,8 @@ class _SessionObservation:
         "connection_id",
         "external_session_id",
         "lifecycle_token",
-        "subscription",
+        "observation_lease",
+        "observed",
         "task_agent_session_id",
         "task_id",
         "workspace_id",
@@ -203,110 +281,70 @@ class _SessionObservation:
         task_agent_session_id: UUID,
         connection_id: UUID,
         external_session_id: str,
-        subscription: Subscription | None,
     ) -> None:
         self.workspace_id = workspace_id
         self.task_id = task_id
         self.task_agent_session_id = task_agent_session_id
         self.connection_id = connection_id
         self.external_session_id = external_session_id
-        self.subscription = subscription
+        self.observed = False
+        self.observation_lease: ObservationLease | None = None
         self.lifecycle_token = 0
 
 
-class _ClineHubEventEvidence(NativeTurnEvidence):
-    """Opaque carrier of one delivered Hub event envelope.
-
-    The envelope stays inside the Cline integration: shared application code
-    routes the neutral evidence envelope and hands this carrier back to this
-    integration's classifier, never inspecting or persisting its contents.
-    """
-
-    __slots__ = ("event",)
-
-    def __init__(self, event: ClineHubEvent) -> None:
-        self.event = event
-
-    def __repr__(self) -> str:
-        return "_ClineHubEventEvidence(<withheld>)"
-
-
-class _ClineStatusRecordsEvidence(NativeTurnEvidence):
-    """Opaque carrier of one status-only ``run.list`` record consultation.
-
-    The records stay inside the Cline integration and are interpreted only
-    by this integration's classifier; payload contents never enter
-    representations, errors, or logs.
-    """
-
-    __slots__ = ("records",)
-
-    def __init__(self, records: list[JsonObject]) -> None:
-        self.records = records
-
-    def __repr__(self) -> str:
-        return f"_ClineStatusRecordsEvidence({len(self.records)} records)"
-
-
-class _ConnectionAttachment:
-    """One attached backend shared by every observed session of a connection."""
-
-    __slots__ = ("backend",)
-
-    def __init__(self, backend: ClineSdkBackend) -> None:
-        self.backend: ClineSdkBackend | None = backend
-
-
-class HubRunObserver:
-    """The serving process's bounded Hub-run observation host.
+class DetachedTurnObservationHost:
+    """The serving process's bounded detached-turn observation host.
 
     Constructed and started exactly once by the regular-mode serving
     lifespan and disposed deterministically at its teardown; construction
-    creates no attachment, subscription, or connection. Attachments are
+    creates no attachment, observation, or connection. Attachments are
     established lazily per Connection on first registration and shared by
-    that connection's observed sessions.
+    that connection's observed sessions through the injected source.
     """
 
     def __init__(
         self,
         database_pool_provider: Callable[[], DatabasePool],
         *,
-        backend_factory: Callable[[], ClineSdkBackend] = ClineBridgeProcessBackend,
+        observation_source: DetachedTurnObservationSource,
         runtime_credential_resolver: RuntimeCredentialResolver = (
             resolve_connection_runtime_credential
         ),
+        control_endpoint_resolver: EndpointResolver,
         bootstrap_continuation_trigger: BootstrapContinuationTrigger | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
-        self._backend_factory = backend_factory
+        self._source = observation_source
         self._credential_resolver = runtime_credential_resolver
+        self._endpoint_resolver = control_endpoint_resolver
         self._bootstrap_continuation_trigger = bootstrap_continuation_trigger
         self._lock = threading.Lock()
         self._started = False
         self._disposed = False
         self._sessions: dict[UUID, _SessionObservation] = {}
-        self._connections: dict[UUID, _ConnectionAttachment] = {}
         self._attach_locks: dict[UUID, threading.Lock] = {}
 
     @property
     def disposed(self) -> bool:
-        """Whether this observer has been terminally disposed."""
+        """Whether this host has been terminally disposed."""
         with self._lock:
             return self._disposed
 
     def start(self) -> None:
-        """Mark the observer running; idempotent, creates nothing."""
+        """Mark the host running; idempotent, creates nothing."""
         with self._lock:
             if self._disposed:
-                raise ConflictError("the hub-run observer has been disposed and cannot restart")
+                raise ConflictError(
+                    "the detached-turn observation host has been disposed and cannot restart"
+                )
             self._started = True
 
     def dispose(self) -> None:
         """Release every observation resource; idempotent and terminal.
 
-        Stops admission first, then unsubscribes every session subscription
-        and disposes every connection attachment. Disposal never deletes or
-        replaces an external session and never implies any workflow
+        Stops admission first, then releases every session observation and
+        disposes the source's connection attachments. Disposal never deletes
+        or replaces an external session and never implies any workflow
         decision; outstanding receipts simply stay unobserved under the
         accepted v1 fail-closed recovery bounds.
         """
@@ -317,33 +355,13 @@ class HubRunObserver:
             self._started = False
             sessions = list(self._sessions.values())
             self._sessions.clear()
-            connections = list(self._connections.values())
-            self._connections.clear()
             self._attach_locks.clear()
         for entry in sessions:
-            subscription = entry.subscription
-            entry.subscription = None
-            if subscription is not None:
-                try:
-                    subscription.unsubscribe()
-                except Exception as error:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "hub-run observation unsubscribe failed during disposal (%s) "
-                        "for task session %s",
-                        type(error).__name__,
-                        entry.task_agent_session_id,
-                    )
-        for attachment in connections:
-            backend = attachment.backend
-            attachment.backend = None
-            if backend is not None:
-                try:
-                    backend.dispose()
-                except Exception as error:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "hub-run observation attachment disposal failed during disposal (%s)",
-                        type(error).__name__,
-                    )
+            lease = entry.observation_lease
+            entry.observation_lease = None
+            if lease is not None:
+                self._release_lease_quietly(lease)
+        self._source.dispose()
 
     def register_session(
         self,
@@ -354,14 +372,14 @@ class HubRunObserver:
         connection_id: UUID,
         external_session_id: str,
     ) -> None:
-        """Establish the positive Hub-run observation of one exact session.
+        """Establish the positive detached-turn observation of one exact session.
 
-        The pre-enqueue gate of the detached dispatch: returns only once the
-        exact external session is actively subscribed through the
+        The pre-admission gate of the detached dispatch: returns only once
+        the exact external session is actively observed through the
         connection's current trusted attachment. Every expected failure
-        raises :class:`HubObservationRegistrationRefusedError` — the enqueue
-        must not proceed without the observation, because the pinned SDK
-        cannot replay an arbitrary missed terminal result; known
+        raises :class:`ObservationRegistrationRefusedError` — the admission
+        must not proceed without the observation, because the runtime
+        integration cannot replay an arbitrary missed terminal result; known
         attachment-configuration refusals (a missing, cross-Workspace,
         disabled, or non-Cline connection; an unusable credential reference;
         a missing or malformed control endpoint) are typed into the same
@@ -372,8 +390,8 @@ class HubRunObserver:
         Workspace/Connection scope before any secret access or dial; a
         registration whose identity tuple does not match the authoritative
         binding fails closed. A repeated registration of an already-observed
-        session renews its lifecycle lease and reuses the live subscription
-        (the successor guard), never double-subscribing.
+        session renews its lifecycle lease and reuses the live observation
+        (the successor guard), never double-observing.
         """
         for name, value in (
             ("workspace_id", workspace_id),
@@ -402,10 +420,10 @@ class HubRunObserver:
             )
             if binding is None or binding.task_id != task_id or binding.id != task_agent_session_id:
                 logger.warning(
-                    "hub-run observation registration resolved no matching session "
+                    "detached-turn observation registration resolved no matching session "
                     "binding in its connection scope"
                 )
-                raise self._refusal(HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED)
+                raise self._refusal(ObservationRegistrationRefusalReason.SESSION_BINDING_UNRESOLVED)
             self._register_proven_session(
                 workspace_id=workspace_id,
                 task_id=task_id,
@@ -425,17 +443,18 @@ class HubRunObserver:
     ) -> None:
         """Establish the positive observation of one initializing session.
 
-        The detached session establishment's pre-enqueue gate (issue #324): a
-        CONNECTING binding deliberately carries no bound external identity,
-        so this registration proves the identity through the binding's
-        outstanding ``session_initialization`` receipt instead — the receipt
-        must be outstanding in this authenticated Workspace/Connection scope
-        and carry exactly the provisional ``created_external_session_id``
-        being registered. Every expected failure raises the same
-        :class:`HubObservationRegistrationRefusedError` refusal taxonomy;
-        the enqueue must not proceed without the observation. A repeated
+        The detached session establishment's pre-admission gate (issue
+        #324): a CONNECTING binding deliberately carries no bound external
+        identity, so this registration proves the identity through the
+        binding's outstanding ``session_initialization`` receipt instead —
+        the receipt must be outstanding in this authenticated
+        Workspace/Connection scope and carry exactly the provisional
+        ``created_external_session_id`` being registered. Every expected
+        failure raises the same
+        :class:`ObservationRegistrationRefusedError` refusal taxonomy; the
+        admission must not proceed without the observation. A repeated
         registration renews the lifecycle lease and reuses the live
-        subscription exactly like the established-session gate.
+        observation exactly like the established-session gate.
         """
         for name, value in (
             ("workspace_id", workspace_id),
@@ -472,7 +491,7 @@ class HubRunObserver:
                     "initialization receipt carrying the provisional identity in "
                     "its connection scope"
                 )
-                raise self._refusal(HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED)
+                raise self._refusal(ObservationRegistrationRefusalReason.SESSION_BINDING_UNRESOLVED)
             self._register_proven_session(
                 workspace_id=workspace_id,
                 task_id=task_id,
@@ -490,12 +509,12 @@ class HubRunObserver:
         connection_id: UUID,
         external_session_id: str,
     ) -> None:
-        """Attach and subscribe a registration whose binding is proven."""
+        """Attach and observe a registration whose binding is proven."""
         with self._lock:
             if self._disposed:
-                raise self._refusal(HubObservationRefusalReason.OBSERVER_UNAVAILABLE)
+                raise self._refusal(ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE)
             existing = self._sessions.get(task_agent_session_id)
-            if existing is not None and existing.subscription is not None:
+            if existing is not None and existing.observed:
                 # Successor registration: renew the lease and reuse the live
                 # observation; a settlement cleanup whose lease this renewal
                 # supersedes leaves the observation in place.
@@ -503,59 +522,58 @@ class HubRunObserver:
                 return
             if existing is None and len(self._sessions) >= _MAX_CONCURRENT_SESSION_OBSERVATIONS:
                 logger.warning(
-                    "hub-run observation registration refused: the observer is at "
+                    "detached-turn observation registration refused: the host is at "
                     "its concurrent session bound"
                 )
-                raise self._refusal(HubObservationRefusalReason.OBSERVER_AT_CAPACITY)
+                raise self._refusal(ObservationRegistrationRefusalReason.OBSERVER_AT_CAPACITY)
         with self._connection_attach_lock(connection_id):
             with self._lock:
                 if self._disposed:
-                    raise self._refusal(HubObservationRefusalReason.OBSERVER_UNAVAILABLE)
+                    raise self._refusal(ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE)
                 winner = self._sessions.get(task_agent_session_id)
-                if winner is not None and winner.subscription is not None:
+                if winner is not None and winner.observed:
                     return  # a concurrent registration established the observation
-            backend = self._ensure_connection_backend(
-                workspace_id=workspace_id, connection_id=connection_id
-            )
+            self._ensure_attachment(workspace_id=workspace_id, connection_id=connection_id)
             try:
-                subscription = backend.subscribe_hub(
-                    external_session_id, self._make_listener(task_agent_session_id)
+                lease = self._source.observe_session(
+                    connection_id=connection_id,
+                    external_session_id=external_session_id,
+                    deliver=self._make_listener(task_agent_session_id),
                 )
-            except ClineSdkBackendError as error:
-                failure = classify_backend_failure(error, operation=_SUBSCRIBE_OPERATION)
+            except DetachedTurnObservationSourceError as error:
                 logger.warning(
-                    "hub-run observation subscription failed (%s) for connection %s",
-                    type(failure).__name__,
+                    "detached-turn observation subscription failed (%s) for connection %s",
+                    error.reason,
                     connection_id,
                 )
-                # The failed subscribe proves the current attachment unusable:
+                # The failed observation proves the current attachment unusable:
                 # drop it so the next registration re-attaches through a fresh
                 # credential read and re-establishes every outstanding session.
-                self._drop_connection_backend(connection_id)
+                self._drop_attachment(connection_id)
                 raise self._refusal(
-                    HubObservationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
+                    ObservationRegistrationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
                 ) from None
-            self._install_subscription(
+            self._install_observation(
+                lease=lease,
                 task_agent_session_id=task_agent_session_id,
                 previous=existing,
                 workspace_id=workspace_id,
                 task_id=task_id,
                 connection_id=connection_id,
                 external_session_id=external_session_id,
-                subscription=subscription,
             )
 
     def _require_running(self) -> None:
-        """Fail the registration closed when the observer is not running."""
+        """Fail the registration closed when the host is not running."""
         with self._lock:
             if not self._started or self._disposed:
-                raise self._refusal(HubObservationRefusalReason.OBSERVER_UNAVAILABLE)
+                raise self._refusal(ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE)
 
     def _refusal(
-        self, reason: HubObservationRefusalReason
-    ) -> HubObservationRegistrationRefusedError:
-        return HubObservationRegistrationRefusedError(
-            "positive hub-run observation could not be established for the exact session",
+        self, reason: ObservationRegistrationRefusalReason
+    ) -> ObservationRegistrationRefusedError:
+        return ObservationRegistrationRefusedError(
+            "positive detached-turn observation could not be established for the exact session",
             reason=reason.value,
         )
 
@@ -573,42 +591,20 @@ class HubRunObserver:
                 self._attach_locks[connection_id] = attach_lock
             return attach_lock
 
-    def _ensure_connection_backend(
+    def _attachment_inputs(
         self, *, workspace_id: UUID, connection_id: UUID
-    ) -> ClineSdkBackend:
-        """Return the connection's live backend, freshly attaching when absent.
+    ) -> ObservationAttachmentInputs:
+        """Resolve the connection's current trusted attachment inputs.
 
-        Called under the connection's attach lock. A fresh attach resolves
-        the connection's current endpoint and credential through the same
-        trusted read the runtime attachment composition uses — never an
-        in-memory secret — and runs the bounded reconnect reconciliation for
-        the connection's still-registered sessions before returning.
-        """
-        with self._lock:
-            attachment = self._connections.get(connection_id)
-            backend = attachment.backend if attachment is not None else None
-        if backend is not None:
-            return backend
-        backend = self._fresh_attach(workspace_id=workspace_id, connection_id=connection_id)
-        with self._lock:
-            reconnected = any(
-                entry.connection_id == connection_id for entry in self._sessions.values()
-            )
-        if reconnected:
-            self._reconcile_reconnected_connection(backend, connection_id=connection_id)
-        return backend
-
-    def _fresh_attach(self, *, workspace_id: UUID, connection_id: UUID) -> ClineSdkBackend:
-        """Resolve current credentials, dial the Hub, and install the backend.
-
-        Known, positively established pre-subscription attachment and
-        configuration failures — a missing or cross-Workspace connection, a
+        The same trusted read the runtime attachment composition uses —
+        never an in-memory secret. Known, positively established
+        pre-attachment failures — a missing or cross-Workspace connection, a
         disabled connection, an unusable credential reference, a missing or
         malformed control endpoint — are typed into the registration refusal
-        the dispatch gates the enqueue on: they are proven pre-effect
+        the dispatch gates the admission on: they are proven pre-effect
         conditions of the observation, never workflow conflicts escaping the
-        observation host and never uncertain outcomes. Unexpected exceptions
-        propagate unchanged.
+        host and never uncertain outcomes. Unexpected exceptions propagate
+        unchanged.
         """
         try:
             credential_connection, secret = self._credential_resolver(
@@ -616,122 +612,109 @@ class HubRunObserver:
             )
             if credential_connection.adapter is not AdapterType.CLINE:
                 # Defensive durable-state invariant: a non-Cline connection has
-                # no Hub to observe and is never guessed around.
+                # nothing to observe and is never guessed around.
                 raise ConflictError(
                     "the connection routed for this task/role is not an enabled Cline connection"
                 )
-            selection = dict(credential_connection.safe_config)
-            try:
-                endpoint = resolve_connection_control_endpoint(selection)
-            except ConnectionControlEndpointError as error:
-                raise ConflictError(str(error)) from error
+            endpoint = self._endpoint_resolver(dict(credential_connection.safe_config))
             if endpoint is None:
                 raise ConflictError(
                     "the connection has no configured control endpoint; it is stored but "
                     "not attachable until the Owner configures one"
                 )
-        except (NotFoundError, ConflictError) as error:
+        except (NotFoundError, ConflictError, ValueError) as error:
             logger.warning(
-                "hub-run observation attachment refused (%s) for connection %s",
+                "detached-turn observation attachment refused (%s) for connection %s",
                 type(error).__name__,
                 connection_id,
             )
-            raise self._refusal(HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED) from None
-        backend = self._backend_factory()
+            raise self._refusal(
+                ObservationRegistrationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+            ) from None
+        return ObservationAttachmentInputs(
+            endpoint=endpoint,
+            auth_token=secret.secret_value(),
+        )
+
+    def _ensure_attachment(self, *, workspace_id: UUID, connection_id: UUID) -> None:
+        """Return with the connection's attachment live, freshly attaching when absent.
+
+        Called under the connection's attach lock. A fresh attach resolves
+        the connection's current attachment inputs through the trusted read
+        and runs the bounded reconnect reconciliation for the connection's
+        still-registered sessions before returning.
+        """
+        if self._source.connection_attached(connection_id):
+            return
+        inputs = self._attachment_inputs(workspace_id=workspace_id, connection_id=connection_id)
         try:
-            backend.connect(
-                ClineRemoteConfig(
-                    endpoint=endpoint,
-                    client_identity=OPENORC_CLIENT_IDENTITY,
-                    auth_token=secret.secret_value(),
-                )
-            )
-        except ClineSdkBackendError as error:
-            failure = classify_backend_failure(error, operation=_CONNECT_OPERATION)
+            self._source.attach_connection(connection_id=connection_id, inputs=inputs)
+        except DetachedTurnObservationSourceError as error:
             logger.warning(
-                "hub-run observation attachment failed (%s) for connection %s",
-                type(failure).__name__,
+                "detached-turn observation attachment failed (%s) for connection %s",
+                error.reason,
                 connection_id,
             )
-            try:
-                backend.dispose()
-            except Exception as dispose_error:  # noqa: BLE001 - best-effort teardown
-                logger.warning(
-                    "hub-run observation attachment disposal failed (%s)",
-                    type(dispose_error).__name__,
-                )
-            raise self._refusal(HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED) from None
+            refusal_reason = (
+                ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
+                if error.reason == DetachedTurnObservationSourceError.ATTACHMENT_UNAVAILABLE
+                else ObservationRegistrationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+            )
+            raise self._refusal(refusal_reason) from None
         with self._lock:
-            if self._disposed:
-                doomed = backend
-            else:
-                self._connections[connection_id] = _ConnectionAttachment(backend)
-                doomed = None
-        if doomed is not None:
-            try:
-                doomed.dispose()
-            except Exception as error:  # noqa: BLE001 - best-effort teardown
-                logger.warning(
-                    "hub-run observation attachment disposal failed (%s)",
-                    type(error).__name__,
-                )
-            raise self._refusal(HubObservationRefusalReason.OBSERVER_UNAVAILABLE)
-        return backend
+            reconnected = any(
+                entry.connection_id == connection_id for entry in self._sessions.values()
+            )
+        if reconnected:
+            self._reconcile_reconnected_connection(connection_id=connection_id)
 
-    def _drop_connection_backend(self, connection_id: UUID) -> None:
-        """Discard an unusable backend and its dead session subscriptions.
+    def _drop_attachment(self, connection_id: UUID) -> None:
+        """Discard an unusable attachment and its dead session observations.
 
         The next registration for this connection re-attaches through a
         fresh credential read and the bounded reconnect reconciliation
         re-establishes the still-outstanding sessions.
         """
         with self._lock:
-            attachment = self._connections.pop(connection_id, None)
-            backend = attachment.backend if attachment is not None else None
             for entry in self._sessions.values():
                 if entry.connection_id == connection_id:
-                    entry.subscription = None
-        if backend is not None:
-            try:
-                backend.dispose()
-            except Exception as error:  # noqa: BLE001 - best-effort teardown
-                logger.warning(
-                    "hub-run observation attachment disposal failed (%s)",
-                    type(error).__name__,
-                )
+                    entry.observed = False
+        self._source.drop_connection(connection_id)
 
-    def _install_subscription(
+    def _install_observation(
         self,
         *,
+        lease: ObservationLease,
         task_agent_session_id: UUID,
         previous: _SessionObservation | None,
         workspace_id: UUID,
         task_id: UUID,
         connection_id: UUID,
         external_session_id: str,
-        subscription: Subscription,
     ) -> None:
-        """Install a freshly subscribed observation, or discard a losing race.
+        """Install a freshly established observation, or discard a losing race.
 
         Called under the connection's attach lock; the registry transition
-        itself is guarded by the registry lock and never unsubscribes under
-        it. A concurrent registration that installed its own live
-        observation first, a disposal, or a late capacity breach discards
-        the newcomer's subscription.
+        itself is guarded by the registry lock and never releases an
+        observation under it. A concurrent registration that installed its
+        own live observation first, a disposal, or a late capacity breach
+        discards the newcomer's observation.
         """
-        doomed = subscription
-        doomed_reason: HubObservationRefusalReason | None = None
+        doomed = False
+        doomed_reason: ObservationRegistrationRefusalReason | None = None
         with self._lock:
             if self._disposed:
-                doomed_reason = HubObservationRefusalReason.OBSERVER_UNAVAILABLE
+                doomed = True
+                doomed_reason = ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
             else:
                 current = self._sessions.get(task_agent_session_id)
-                if current is not None and current.subscription is not None:
-                    doomed_reason = None  # a concurrent registration owns the observation
+                if current is not None and current.observed:
+                    doomed = True  # a concurrent registration owns the observation
                 elif (
                     previous is None and len(self._sessions) >= _MAX_CONCURRENT_SESSION_OBSERVATIONS
                 ):
-                    doomed_reason = HubObservationRefusalReason.OBSERVER_AT_CAPACITY
+                    doomed = True
+                    doomed_reason = ObservationRegistrationRefusalReason.OBSERVER_AT_CAPACITY
                 else:
                     if current is None:
                         current = _SessionObservation(
@@ -740,51 +723,53 @@ class HubRunObserver:
                             task_agent_session_id=task_agent_session_id,
                             connection_id=connection_id,
                             external_session_id=external_session_id,
-                            subscription=subscription,
                         )
                         self._sessions[task_agent_session_id] = current
-                    else:
-                        current.subscription = subscription
+                    current.observed = True
+                    current.observation_lease = lease
                     current.lifecycle_token += 1
-                    doomed = None
-        if doomed is None:
+        if not doomed:
             return
-        try:
-            doomed.unsubscribe()
-        except Exception as error:  # noqa: BLE001 - best-effort teardown
-            logger.warning(
-                "hub-run observation unsubscribe of a losing registration failed (%s)",
-                type(error).__name__,
-            )
+        self._release_lease_quietly(lease)
         if doomed_reason is None:
             return  # a concurrent registration owns the observation
-        if doomed_reason is HubObservationRefusalReason.OBSERVER_AT_CAPACITY:
+        if doomed_reason is ObservationRegistrationRefusalReason.OBSERVER_AT_CAPACITY:
             logger.warning(
-                "hub-run observation registration refused: the observer is at its "
+                "detached-turn observation registration refused: the host is at its "
                 "concurrent session bound"
             )
         raise self._refusal(doomed_reason)
 
-    def _make_listener(self, task_agent_session_id: UUID) -> Callable[[ClineHubEvent], None]:
-        """Build the contained ingest listener of one session subscription."""
+    def _release_lease_quietly(self, lease: ObservationLease) -> None:
+        """Release one observation lease; failures never mask the caller."""
+        try:
+            self._source.release_observation(lease)
+        except Exception as error:  # noqa: BLE001 - best-effort teardown
+            logger.warning(
+                "detached-turn observation release failed (%s)",
+                type(error).__name__,
+            )
 
-        def listener(event: ClineHubEvent) -> None:
+    def _make_listener(self, task_agent_session_id: UUID) -> Callable[[ObservedTurnEvidence], None]:
+        """Build the contained delivery listener of one session observation."""
+
+        def listener(evidence: ObservedTurnEvidence) -> None:
             try:
-                self._ingest_hub_event(task_agent_session_id, event)
-            except Exception as error:  # noqa: BLE001 - the bridge reader is protected
+                self._ingest_evidence(task_agent_session_id, evidence)
+            except Exception as error:  # noqa: BLE001 - the source reader is protected
                 logger.warning(
-                    "hub-run event ingestion ended unexpectedly (%s) for task session %s",
+                    "detached-turn evidence ingestion ended unexpectedly (%s) for task session %s",
                     type(error).__name__,
                     task_agent_session_id,
                 )
 
         return listener
 
-    def _ingest_hub_event(self, task_agent_session_id: UUID, event: ClineHubEvent) -> None:
-        """Route one delivered Hub envelope for its registered session.
+    def _ingest_evidence(self, task_agent_session_id: UUID, evidence: ObservedTurnEvidence) -> None:
+        """Route one delivered evidence envelope for its registered session.
 
         The envelope's own session identity is authoritative: a session-
-        scoped subscription must only deliver the exact session's envelopes,
+        scoped observation must only deliver the exact session's evidence,
         and a mismatched identity is never routed or attributed. The
         delivery-time lifecycle lease is captured under the registry lock so
         the post-settlement cleanup can detect a successor registration.
@@ -794,21 +779,13 @@ class HubRunObserver:
             if entry is None:
                 return  # disposed, superseded, or already cleaned up
             lease = entry.lifecycle_token
-        if event.session_id != entry.external_session_id:
+        if evidence.external_session_id != entry.external_session_id:
             logger.warning(
-                "a hub event envelope carried a foreign session identity for a "
-                "subscribed task session; it is not routed"
+                "a delivered evidence envelope carried a foreign session identity "
+                "for a registered task session; it is not routed"
             )
             return
-        family = hub_evidence_family(event)
-        if family is None or event.session_id is None:
-            return  # not a qualified, attributable turn observation; nothing is invented
-        evidence = ObservedTurnEvidence(
-            external_session_id=event.session_id,
-            family=family,
-            native_evidence=_ClineHubEventEvidence(event),
-        )
-        if family is TurnEvidenceFamily.TURN_TERMINAL:
+        if evidence.family is TurnEvidenceFamily.TURN_TERMINAL:
             self._route_terminal_observation(entry, lease, evidence)
             return
         self._route_start_observation(entry, evidence)
@@ -824,7 +801,7 @@ class HubRunObserver:
         The seam owns attribution, duplicate/stale rejection, staging for
         the admission race, formal validation, and every workflow
         consequence; this boundary only delivers the observation within its
-        authenticated scope and contains every failure so the bridge's
+        authenticated scope and contains every failure so the source's
         delivery thread is never disrupted. Cleanup after a terminal
         classification is guarded by the delivery-time lease: a successor
         registration that renewed the session's observation keeps it.
@@ -840,14 +817,14 @@ class HubRunObserver:
             try:
                 outcome = settle_observed_turn_completion(
                     self._pool_provider(),
-                    classifier=self,
+                    classifier=self._source,
                     workspace_id=entry.workspace_id,
                     connection_id=entry.connection_id,
                     evidence=evidence,
                 )
             except Exception as error:  # noqa: BLE001 - best-effort ingestion
                 logger.warning(
-                    "hub-run completion settlement failed (%s) for task session %s",
+                    "detached-turn completion settlement failed (%s) for task session %s",
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )
@@ -891,14 +868,14 @@ class HubRunObserver:
         try:
             check_turn_start_identity(
                 self._pool_provider(),
-                classifier=self,
+                classifier=self._source,
                 workspace_id=entry.workspace_id,
                 connection_id=entry.connection_id,
                 evidence=evidence,
             )
         except Exception as error:  # noqa: BLE001 - best-effort ingestion
             logger.warning(
-                "hub-run start corroboration failed (%s) for task session %s",
+                "detached-turn start corroboration failed (%s) for task session %s",
                 type(error).__name__,
                 entry.task_agent_session_id,
             )
@@ -909,44 +886,37 @@ class HubRunObserver:
         The lease captured at delivery time is compared under the registry
         lock: a registration that arrived between the settlement and this
         cleanup renewed the session's observation and the cleanup must not
-        disconnect it — the runs never overlapped, but the live observation
-        now belongs to the successor's authorized run.
+        disconnect it — the turns never overlapped, but the live observation
+        now belongs to the successor's authorized turn.
         """
-        subscription = self._detach_renewed_entry(entry, lease)
-        if subscription is None:
+        released = self._detach_renewed_entry(entry, lease)
+        if released is None:
             return
-        try:
-            subscription.unsubscribe()
-        except Exception as error:  # noqa: BLE001 - best-effort teardown
-            logger.warning(
-                "hub-run observation unsubscribe failed (%s) for task session %s",
-                type(error).__name__,
-                entry.task_agent_session_id,
-            )
+        self._release_lease_quietly(released)
 
-    def _detach_renewed_entry(self, entry: _SessionObservation, lease: int) -> Subscription | None:
+    def _detach_renewed_entry(
+        self, entry: _SessionObservation, lease: int
+    ) -> ObservationLease | None:
         """Detach the entry iff it is still the unrenewed observed session."""
         with self._lock:
             if self._sessions.get(entry.task_agent_session_id) is not entry:
                 return None
             if entry.lifecycle_token != lease:
                 return None  # a successor registration renewed the observation
-            subscription = entry.subscription
-            entry.subscription = None
+            lease_handle = entry.observation_lease
+            entry.observation_lease = None
             del self._sessions[entry.task_agent_session_id]
-            return subscription
+            return lease_handle
 
-    def _reconcile_reconnected_connection(
-        self, backend: ClineSdkBackend, *, connection_id: UUID
-    ) -> None:
+    def _reconcile_reconnected_connection(self, *, connection_id: UUID) -> None:
         """Re-establish observation after a fresh attachment replaced a dead one.
 
         Bounded by the registry's session entries; never a table scan and
-        never a poll. Each still-registered session is re-subscribed on the
+        never a poll. Each still-registered session is re-observed on the
         fresh attachment, entries whose receipt is no longer outstanding are
         released, and each outstanding admitted receipt's status-only
-        ``run.list`` record is consulted through the seam's classification —
-        where ``completed`` is never success evidence and ambiguity stays
+        evidence is consulted through the seam's classification — where a
+        completed status alone is never success evidence and ambiguity stays
         unresolved.
         """
         with self._lock:
@@ -954,84 +924,74 @@ class HubRunObserver:
                 entry for entry in self._sessions.values() if entry.connection_id == connection_id
             ]
         for entry in entries:
-            if entry.subscription is not None:
+            if entry.observed:
                 continue
             try:
-                subscription = backend.subscribe_hub(
-                    entry.external_session_id, self._make_listener(entry.task_agent_session_id)
+                lease = self._source.observe_session(
+                    connection_id=connection_id,
+                    external_session_id=entry.external_session_id,
+                    deliver=self._make_listener(entry.task_agent_session_id),
                 )
-            except ClineSdkBackendError as error:
-                failure = classify_backend_failure(error, operation=_SUBSCRIBE_OPERATION)
+            except DetachedTurnObservationSourceError as error:
                 logger.warning(
-                    "hub-run reconnect re-subscription failed (%s) for task session %s",
-                    type(failure).__name__,
+                    "detached-turn reconnect re-observation failed (%s) for task session %s",
+                    error.reason,
                     entry.task_agent_session_id,
                 )
                 continue
             with self._lock:
                 if self._disposed or self._sessions.get(entry.task_agent_session_id) is not entry:
-                    doomed = subscription
+                    doomed = lease
                 else:
-                    entry.subscription = subscription
+                    entry.observed = True
+                    entry.observation_lease = lease
                     doomed = None
             if doomed is not None:
-                try:
-                    doomed.unsubscribe()
-                except Exception as error:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "hub-run observation unsubscribe of a losing re-subscription failed (%s)",
-                        type(error).__name__,
-                    )
+                self._release_lease_quietly(doomed)
         for entry in entries:
-            self._reconcile_session_receipt(backend, entry)
+            self._reconcile_session_receipt(entry)
 
-    def _reconcile_session_receipt(
-        self, backend: ClineSdkBackend, entry: _SessionObservation
-    ) -> None:
-        """Recheck one entry's outstanding receipt and consult status-only reads."""
+    def _reconcile_session_receipt(self, entry: _SessionObservation) -> None:
+        """Recheck one entry's outstanding receipt and consult status evidence."""
         try:
             receipt = get_outstanding_task_detached_turn_receipt(
                 self._pool_provider(), task_agent_session_id=entry.task_agent_session_id
             )
         except Exception as error:  # noqa: BLE001 - best-effort reconciliation
             logger.warning(
-                "hub-run reconnect receipt recheck failed (%s) for task session %s",
+                "detached-turn reconnect receipt recheck failed (%s) for task session %s",
                 type(error).__name__,
                 entry.task_agent_session_id,
             )
             return
         if receipt is None:
-            # The run reached a terminal receipt while observation was down;
+            # The turn reached a terminal receipt while observation was down;
             # this entry observes nothing further.
-            subscription = self._detach_entry(entry)
-            if subscription is not None:
-                try:
-                    subscription.unsubscribe()
-                except Exception as error:  # noqa: BLE001 - best-effort teardown
-                    logger.warning(
-                        "hub-run observation unsubscribe failed (%s) for task session %s",
-                        type(error).__name__,
-                        entry.task_agent_session_id,
-                    )
+            released = self._detach_entry(entry)
+            if released is not None:
+                self._release_lease_quietly(released)
             return
         if receipt.status is not TaskDetachedTurnReceiptStatus.ADMITTED:
             return  # still claimed: the acknowledgement attach owns any staged completion
         try:
-            records = backend.list_runs(entry.external_session_id)
+            status_evidence = self._source.consult_status_evidence(
+                connection_id=entry.connection_id,
+                external_session_id=entry.external_session_id,
+            )
         except Exception as error:  # noqa: BLE001 - the consultation stays best-effort
             logger.warning(
-                "hub-run reconnect run.list consultation failed (%s) for task session %s",
+                "detached-turn reconnect status consultation failed (%s) for task session %s",
                 type(error).__name__,
                 entry.task_agent_session_id,
             )
             return
-        self._classify_reconnected_receipt(entry, receipt.id, _ClineStatusRecordsEvidence(records))
+        self._classify_reconnected_receipt(entry, receipt.id, status_evidence)
 
     def _classify_reconnected_receipt(
         self,
         entry: _SessionObservation,
         receipt_id: UUID,
-        status_evidence: _ClineStatusRecordsEvidence,
+        status_evidence: NativeTurnEvidence,
     ) -> None:
         """Hand one reconnected receipt's status-only evidence to the seam."""
         with application_span(_TRACER_SCOPE, _RECONNECT_SPAN_NAME) as span:
@@ -1045,7 +1005,7 @@ class HubRunObserver:
             try:
                 classification = classify_acknowledged_turn_status(
                     self._pool_provider(),
-                    classifier=self,
+                    classifier=self._source,
                     workspace_id=entry.workspace_id,
                     task_id=entry.task_id,
                     receipt_id=receipt_id,
@@ -1053,63 +1013,24 @@ class HubRunObserver:
                 )
             except Exception as error:  # noqa: BLE001 - the consultation stays best-effort
                 logger.warning(
-                    "hub-run reconnect status classification failed (%s) for task session %s",
+                    "detached-turn reconnect status classification failed (%s) for task session %s",
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )
                 return
         if classification.kind is TurnStatusClassificationKind.CLASSIFIED_FAILURE:
             logger.warning(
-                "hub-run reconnect classified the outstanding run's status-only failed "
-                "record for task session %s",
+                "detached-turn reconnect classified the outstanding turn's status-only "
+                "failed evidence for task session %s",
                 entry.task_agent_session_id,
             )
 
-    # --- the runtime integration's neutral evidence classification -----------
-    # The pinned Hub semantics of which native evidence proves or counters an
-    # admitted turn live here (issue #348): shared application code consumes
-    # only the neutral verdicts these methods produce and never inspects the
-    # opaque carriers or compares native identities itself.
-
-    def classify_turn_start(
-        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
-    ) -> TurnAttribution:
-        """Classify one delivered start envelope's attribution."""
-        if not isinstance(evidence, _ClineHubEventEvidence):
-            raise InvalidCommandError("start evidence must be this integration's carrier")
-        return classify_hub_run_start(
-            evidence.event, outstanding_turn_reference=outstanding_turn_reference
-        )
-
-    def classify_turn_terminal(
-        self,
-        evidence: NativeTurnEvidence,
-        *,
-        consumed_ordering_markers: Sequence[int],
-    ) -> TurnTerminalClassification:
-        """Classify one delivered terminal envelope's freshness and outcome."""
-        if not isinstance(evidence, _ClineHubEventEvidence):
-            raise InvalidCommandError("terminal evidence must be this integration's carrier")
-        return classify_terminal_hub_run(
-            evidence.event, consumed_ordering_markers=consumed_ordering_markers
-        )
-
-    def classify_turn_statuses(
-        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
-    ) -> TurnStatusEvidenceVerdict:
-        """Classify one status-only record consultation for the outstanding ref."""
-        if not isinstance(evidence, _ClineStatusRecordsEvidence):
-            raise InvalidCommandError("status evidence must be this integration's carrier")
-        return classify_hub_run_statuses(
-            evidence.records, outstanding_turn_reference=outstanding_turn_reference
-        )
-
-    def _detach_entry(self, entry: _SessionObservation) -> Subscription | None:
+    def _detach_entry(self, entry: _SessionObservation) -> ObservationLease | None:
         """Detach one entry atomically under the registry lock."""
         with self._lock:
             if self._sessions.get(entry.task_agent_session_id) is not entry:
                 return None
-            subscription = entry.subscription
-            entry.subscription = None
+            lease = entry.observation_lease
+            entry.observation_lease = None
             del self._sessions[entry.task_agent_session_id]
-            return subscription
+            return lease

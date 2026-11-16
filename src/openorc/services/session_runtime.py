@@ -113,18 +113,20 @@ from openorc.persistence.tasks import get_task, lock_workspace_task_arbitration
 from openorc.protocol.initialization_assets import compose_initialization
 from openorc.protocol.models import SESSION_READY_FAMILY
 from openorc.services import task_detached_turn_correlation as turn_correlation
-from openorc.services.cline_hub_observation import HubObservationRefusalReason
 from openorc.services.errors import (
     ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
     ExternalOperationRejectedError,
     ExternalOperationUncertainError,
-    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
+)
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
@@ -722,7 +724,7 @@ def dispatch_task_agent_session_establishment(
     - An early completion that arrived before the acknowledgement is staged
       on the receipt and routed through the ordinary settlement inside the
       acknowledgement attach, so a validated ``session_ready`` observed
-      before the ``runId`` was persisted is never ignored or duplicated.
+      before the acknowledged turn reference was persisted is never ignored or duplicated.
 
     On success the caller owns the post-dispatch sequencing (the bootstrap
     continuation resumes when the observation settles readiness); the
@@ -903,7 +905,7 @@ def _admit_detached_initialization(
             connection_id=binding.connection_id,
             external_session_id=allocation.external_session_id,
         )
-    except HubObservationRegistrationRefusedError:
+    except ObservationRegistrationRefusedError:
         _refuse_dispatched_receipt_quietly(
             pool, receipt, refusal_kind="observation_registration_refused"
         )
@@ -912,10 +914,10 @@ def _admit_detached_initialization(
         _refuse_dispatched_receipt_quietly(
             pool, receipt, refusal_kind="observation_registration_refused"
         )
-        raise HubObservationRegistrationRefusedError(
+        raise ObservationRegistrationRefusedError(
             "the initialization observation registration failed before any "
             "admission; the dispatch is a proven pre-effect failure",
-            reason=HubObservationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+            reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
         ) from error
 
     # --- Phase 3d: admission (external, no transaction held). One

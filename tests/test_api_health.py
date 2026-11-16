@@ -12,7 +12,7 @@ from openorc.api.app import app as module_app
 from openorc.api.app import create_app
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import shutdown_observability
-from openorc.services.cline_hub_observation import HubRunObserver
+from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
 from openorc.workers.invocation import (
     OperationInvocation,
     OperationKind,
@@ -51,7 +51,7 @@ def test_create_app_is_executor_free(settings_factory: Callable[..., Settings]) 
 
     assert not hasattr(app.state, "operation_executor")
     assert not hasattr(app.state, "operation_submitter")
-    assert not hasattr(app.state, "hub_run_observer")
+    assert not hasattr(app.state, "detached_turn_observer")
 
 
 def test_healthz_returns_deterministic_payload(settings_factory: Callable[..., Settings]) -> None:
@@ -79,8 +79,8 @@ def test_lifespan_owns_exactly_one_executor_in_regular_mode(
         assert app.state.operation_submitter is executor
         # The process-owned hub-run observation host (issue #323) is started
         # beside the executor and disposed deterministically at teardown.
-        observer = app.state.hub_run_observer
-        assert isinstance(observer, HubRunObserver)
+        observer = app.state.detached_turn_observer
+        assert isinstance(observer, DetachedTurnObservationHost)
         assert observer.disposed is False
         assert client.get("/healthz").status_code == 200
 
@@ -109,7 +109,7 @@ def test_lifespan_starts_no_executor_in_queue_mode(
         assert app.state.operation_executor is None
         assert isinstance(app.state.operation_submitter, RQQueueOperationSubmission)
         # No long-lived hub-run observer runs in queue mode (issue #323).
-        assert app.state.hub_run_observer is None
+        assert app.state.detached_turn_observer is None
         assert client.get("/healthz").status_code == 200
 
     shutdown_observability()

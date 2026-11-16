@@ -59,8 +59,8 @@ from openorc.workers.bootstrap import create_redis_client
 from openorc.workers.queues import queue_name
 
 if TYPE_CHECKING:
-    from openorc.services.cline_hub_observation import HubRunObserver
     from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
+    from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
     from openorc.services.task_planning_bootstrap import TaskBootstrapRuntimeComposition
     from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 
@@ -1048,10 +1048,10 @@ UserTokenResolverProvider = Callable[[Settings], "ProfileUserAccessTokenResolver
 ReviewerNeutralDirectoryProvider = Callable[[Settings], str]
 ContinuationSubmitterProvider = Callable[[Settings], "OperationSubmitter"]
 TerminalCleanupRuntimeProvider = Callable[[Settings], "TerminalCheckoutCleanupRuntime"]
-HubRunObserverProvider = Callable[[Settings], "HubRunObserver"]
+DetachedTurnObserverProvider = Callable[[Settings], "DetachedTurnObservationHost"]
 
 
-class LateBoundHubRunObserver:
+class LateBoundDetachedTurnObserver:
     """The late-bound regular-mode hub-run-observation provider (issue #323).
 
     The serving lifespan owns exactly one hub-run observation host per
@@ -1064,16 +1064,16 @@ class LateBoundHubRunObserver:
     """
 
     def __init__(self) -> None:
-        self._observer: HubRunObserver | None = None
+        self._observer: DetachedTurnObservationHost | None = None
 
-    def bind(self, observer: HubRunObserver) -> None:
-        """Bind the serving process's own hub-run observation host."""
+    def bind(self, observer: DetachedTurnObservationHost) -> None:
+        """Bind the serving process's own detached-turn observation host."""
         self._observer = observer
 
-    def __call__(self, settings: Settings) -> HubRunObserver:
+    def __call__(self, settings: Settings) -> DetachedTurnObservationHost:
         if self._observer is None:
             raise ExecutionModeDependencyError(
-                "no process-local hub-run observer is bound for detached-run observation"
+                "no process-local detached-turn observer is bound for detached-turn observation"
             )
         return self._observer
 
@@ -1131,7 +1131,7 @@ class OperationDependencies:
     reviewer_neutral_directory_provider: ReviewerNeutralDirectoryProvider | None = None
     continuation_submitter_provider: ContinuationSubmitterProvider | None = None
     terminal_cleanup_runtime_provider: TerminalCleanupRuntimeProvider | None = None
-    hub_run_observer_provider: HubRunObserverProvider | None = None
+    detached_turn_observer_provider: DetachedTurnObserverProvider | None = None
 
     def database_pool(self) -> DatabasePool:
         """Resolve the executing process's database pool."""
@@ -1204,15 +1204,17 @@ class OperationDependencies:
             )
         provider.bind(submitter)
 
-    def hub_run_observer(self) -> HubRunObserver:
+    def detached_turn_observer(self) -> DetachedTurnObservationHost:
         """Resolve the executing process's hub-run observation host."""
-        if self.hub_run_observer_provider is None:
+        if self.detached_turn_observer_provider is None:
             raise ExecutionModeDependencyError(
                 "no hub-run observer provider is configured for operation dependencies"
             )
-        return self.hub_run_observer_provider(self.settings)
+        return self.detached_turn_observer_provider(self.settings)
 
-    def bind_regular_process_hub_run_observer(self, observer: HubRunObserver) -> None:
+    def bind_regular_process_detached_turn_observer(
+        self, observer: DetachedTurnObservationHost
+    ) -> None:
         """Bind the serving process's own hub-run observation host (issue #323).
 
         Regular-mode wiring only: the serving lifespan binds the one
@@ -1220,11 +1222,11 @@ class OperationDependencies:
         the late-bound process seam is a wiring error; queue mode never
         binds an observer.
         """
-        provider = self.hub_run_observer_provider
-        if not isinstance(provider, LateBoundHubRunObserver):
+        provider = self.detached_turn_observer_provider
+        if not isinstance(provider, LateBoundDetachedTurnObserver):
             raise ExecutionModeDependencyError(
                 "operation dependencies are not wired with the late-bound "
-                "regular-mode hub-run observer"
+                "regular-mode detached-turn observer"
             )
         provider.bind(observer)
 
@@ -1262,7 +1264,7 @@ def build_default_operation_dependencies(settings: Settings) -> OperationDepende
         reviewer_neutral_directory_provider=default_reviewer_neutral_directory_provider,
         continuation_submitter_provider=continuation_provider,
         terminal_cleanup_runtime_provider=default_terminal_cleanup_runtime_provider,
-        hub_run_observer_provider=LateBoundHubRunObserver(),
+        detached_turn_observer_provider=LateBoundDetachedTurnObserver(),
     )
 
 

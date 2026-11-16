@@ -22,8 +22,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from openorc.adapters.cline import ClineHubEvent, Subscription
+from openorc.adapters.cline import ClineHubEvent, Subscription, resolve_connection_control_endpoint
+from openorc.adapters.cline import hub_observation as source_module
 from openorc.adapters.cline.errors import ClineBackendUncertainOutcomeError
+from openorc.adapters.cline.hub_observation import ClineHubTurnObservationSource
 from openorc.domain.connections import AdapterType
 from openorc.domain.detached_turns import (
     ObservedTurnEvidence,
@@ -31,17 +33,13 @@ from openorc.domain.detached_turns import (
     TurnEvidenceFamily,
 )
 from openorc.persistence.pool import DatabasePool
-from openorc.services import cline_hub_observation as observation_module
-from openorc.services.cline_hub_observation import (
-    HubObservationRefusalReason,
-    HubRunObserver,
-)
+from openorc.services import task_detached_turn_observation as observation_module
 from openorc.services.connection_credentials import ControlEndpointSecret
 from openorc.services.errors import (
     ConflictError,
-    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
 )
 from openorc.services.task_detached_turn_correlation import (
     TurnSettlementKind,
@@ -49,6 +47,10 @@ from openorc.services.task_detached_turn_correlation import (
     TurnStartCorroboration,
     TurnStatusClassification,
     TurnStatusClassificationKind,
+)
+from openorc.services.task_detached_turn_observation import (
+    DetachedTurnObservationHost,
+    ObservationRegistrationRefusalReason,
 )
 from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
@@ -67,13 +69,13 @@ _RESULT_TEXT = '{"kind": "implementation_result"}'
 
 def _delivered_event(evidence: ObservedTurnEvidence) -> ClineHubEvent:
     """Unwrap this integration's own opaque carrier inside a test."""
-    carrier = cast(observation_module._ClineHubEventEvidence, evidence.native_evidence)
+    carrier = cast(source_module._ClineHubEventEvidence, evidence.native_evidence)
     return carrier.event
 
 
 def _carried_records(status_evidence: Any) -> list[dict[str, Any]]:
     """Unwrap the integration's status-only evidence carrier inside a test."""
-    carrier = cast(observation_module._ClineStatusRecordsEvidence, status_evidence)
+    carrier = cast(source_module._ClineStatusRecordsEvidence, status_evidence)
     return carrier.records
 
 
@@ -344,20 +346,22 @@ def _make_observer(
     conn: ScriptedConnection,
     *,
     backends: list[FakeClineSdkBackend],
-) -> HubRunObserver:
+) -> DetachedTurnObservationHost:
     pool = _pool(conn)
     pending = list(backends)
-    observer = HubRunObserver(
+    source = ClineHubTurnObservationSource(backend_factory=lambda: pending.pop(0))
+    host = DetachedTurnObservationHost(
         lambda: pool,
-        backend_factory=lambda: pending.pop(0),
+        observation_source=source,
         runtime_credential_resolver=_fake_credential_resolver,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
     )
-    observer.start()
-    return observer
+    host.start()
+    return host
 
 
 def _register(
-    observer: HubRunObserver,
+    observer: DetachedTurnObservationHost,
     *,
     task_agent_session_id: UUID = _SESSION_ID,
     external_session_id: str = _EXTERNAL_SESSION,
@@ -413,7 +417,7 @@ def _test_observer(
     *,
     backends: list[FakeClineSdkBackend],
     settle: _SettleRecorder | None = None,
-) -> HubRunObserver:
+) -> DetachedTurnObservationHost:
     """A started observer whose terminal routing is recorded, not settled."""
     observer = _make_observer(conn, backends=backends)
     if settle is not None:
@@ -669,11 +673,13 @@ def test_reconnect_re_establishes_observation_and_consults_the_status_only_read(
         return original_subscribe(session_id, listener)
 
     monkeypatch.setattr(dead_backend, "subscribe_hub", failing_subscribe, raising=True)
-    with pytest.raises(HubObservationRegistrationRefusedError) as refused:
+    with pytest.raises(ObservationRegistrationRefusedError) as refused:
         _register(
             observer, task_agent_session_id=other_session_id, external_session_id=other_external
         )
-    assert refused.value.reason == HubObservationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
+    assert (
+        refused.value.reason == ObservationRegistrationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
+    )
     assert any(call.operation == "dispose" for call in dead_backend.calls())
 
     # The next registration re-attaches through a fresh credential read and
@@ -714,14 +720,15 @@ def test_registration_refusal_blocks_the_enqueue_gate(
     _script_bindings(conn, bindings)
 
     # Not started: the observer refuses before any attachment or dial.
-    unstarted = HubRunObserver(
+    unstarted = DetachedTurnObservationHost(
         lambda: _pool(conn),
-        backend_factory=FakeClineSdkBackend,
+        observation_source=ClineHubTurnObservationSource(backend_factory=FakeClineSdkBackend),
         runtime_credential_resolver=_fake_credential_resolver,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
     )
-    with pytest.raises(HubObservationRegistrationRefusedError) as unavailable:
+    with pytest.raises(ObservationRegistrationRefusedError) as unavailable:
         _register(unstarted)
-    assert unavailable.value.reason == HubObservationRefusalReason.OBSERVER_UNAVAILABLE
+    assert unavailable.value.reason == ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
 
     backend = FakeClineSdkBackend()
     observer = _make_observer(conn, backends=[backend])
@@ -730,19 +737,21 @@ def test_registration_refusal_blocks_the_enqueue_gate(
     # observation, so the dispatch blocks its enqueue.
     monkeypatch.setattr(observation_module, "_MAX_CONCURRENT_SESSION_OBSERVATIONS", 1)
     _register(observer)
-    with pytest.raises(HubObservationRegistrationRefusedError) as at_capacity:
+    with pytest.raises(ObservationRegistrationRefusedError) as at_capacity:
         _register(
             observer,
             task_agent_session_id=other_session_id,
             external_session_id=other_external,
         )
-    assert at_capacity.value.reason == HubObservationRefusalReason.OBSERVER_AT_CAPACITY
+    assert at_capacity.value.reason == ObservationRegistrationRefusalReason.OBSERVER_AT_CAPACITY
     monkeypatch.undo()
 
     # An unresolvable session binding fails closed before any secret access.
-    with pytest.raises(HubObservationRegistrationRefusedError) as unresolved:
+    with pytest.raises(ObservationRegistrationRefusedError) as unresolved:
         _register(observer, external_session_id="ext-session-unknown")
-    assert unresolved.value.reason == HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED
+    assert (
+        unresolved.value.reason == ObservationRegistrationRefusalReason.SESSION_BINDING_UNRESOLVED
+    )
 
     # An attachment failure refuses positively: the enqueue must not proceed.
     failing_backend = FakeClineSdkBackend()
@@ -750,9 +759,12 @@ def test_registration_refusal_blocks_the_enqueue_gate(
         ClineBackendUncertainOutcomeError("the hub attachment outcome is unknown")
     )
     replacing = _make_observer(conn, backends=[failing_backend])
-    with pytest.raises(HubObservationRegistrationRefusedError) as attachment:
+    with pytest.raises(ObservationRegistrationRefusedError) as attachment:
         _register(replacing)
-    assert attachment.value.reason == HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+    assert (
+        attachment.value.reason
+        == ObservationRegistrationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+    )
     assert any(call.operation == "dispose" for call in failing_backend.calls())
 
     # A subscription failure refuses positively and drops the dead attachment.
@@ -765,9 +777,12 @@ def test_registration_refusal_blocks_the_enqueue_gate(
 
     monkeypatch.setattr(subscription_backend, "subscribe_hub", failing_subscribe, raising=True)
     replacing_subscription = _make_observer(conn, backends=[subscription_backend])
-    with pytest.raises(HubObservationRegistrationRefusedError) as subscription:
+    with pytest.raises(ObservationRegistrationRefusedError) as subscription:
         _register(replacing_subscription)
-    assert subscription.value.reason == HubObservationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
+    assert (
+        subscription.value.reason
+        == ObservationRegistrationRefusalReason.OBSERVATION_SUBSCRIPTION_FAILED
+    )
     assert any(call.operation == "dispose" for call in subscription_backend.calls())
 
 
@@ -877,9 +892,9 @@ def test_disposal_stops_observation_idempotently(monkeypatch: pytest.MonkeyPatch
     backend.emit_hub(_terminal_event())
     assert settle.calls == []
     assert any(call.operation == "dispose" for call in backend.calls())
-    with pytest.raises(HubObservationRegistrationRefusedError) as after_disposal:
+    with pytest.raises(ObservationRegistrationRefusedError) as after_disposal:
         _register(observer)
-    assert after_disposal.value.reason == HubObservationRefusalReason.OBSERVER_UNAVAILABLE
+    assert after_disposal.value.reason == ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
     with pytest.raises(ConflictError):
         observer.start()
 
@@ -902,10 +917,12 @@ def test_known_attachment_configuration_failures_are_typed_registration_refusals
         assert isinstance(outcome, Exception)
         raise outcome
 
-    observer = HubRunObserver(
+    source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
+    observer = DetachedTurnObservationHost(
         lambda: pool,
-        backend_factory=lambda: backend,
+        observation_source=source,
         runtime_credential_resolver=refusing_resolver,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
     )
     observer.start()
 
@@ -913,9 +930,12 @@ def test_known_attachment_configuration_failures_are_typed_registration_refusals
     # is the typed registration refusal the dispatch gates the enqueue on —
     # never a workflow conflict escaping the observation host.
     for _ in range(2):
-        with pytest.raises(HubObservationRegistrationRefusedError) as refused:
+        with pytest.raises(ObservationRegistrationRefusedError) as refused:
             _register(observer)
-        assert refused.value.reason == HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+        assert (
+            refused.value.reason
+            == ObservationRegistrationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+        )
 
     # The same contract covers the host's own endpoint validation: a stored
     # but unattachable connection refuses positively before any dial.
@@ -928,9 +948,12 @@ def test_known_attachment_configuration_failures_are_typed_registration_refusals
         )
 
     monkeypatch.setattr(observer, "_credential_resolver", unattachable_resolver, raising=True)
-    with pytest.raises(HubObservationRegistrationRefusedError) as unattachable:
+    with pytest.raises(ObservationRegistrationRefusedError) as unattachable:
         _register(observer)
-    assert unattachable.value.reason == HubObservationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+    assert (
+        unattachable.value.reason
+        == ObservationRegistrationRefusalReason.OBSERVATION_ATTACHMENT_FAILED
+    )
 
     # Every refusal was pre-subscription: no backend was ever constructed or dialed.
     assert backend.calls() == ()
@@ -1001,13 +1024,15 @@ def _make_trigger_observer(
     *,
     backends: list[FakeClineSdkBackend],
     trigger: _RecordingTrigger,
-) -> HubRunObserver:
+) -> DetachedTurnObservationHost:
     pool = _pool(conn)
     pending = list(backends)
-    observer = HubRunObserver(
+    source = ClineHubTurnObservationSource(backend_factory=lambda: pending.pop(0))
+    observer = DetachedTurnObservationHost(
         lambda: pool,
-        backend_factory=lambda: pending.pop(0),
+        observation_source=source,
         runtime_credential_resolver=_fake_credential_resolver,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
         bootstrap_continuation_trigger=trigger,
     )
     observer.start()
@@ -1049,7 +1074,7 @@ def test_establishment_registration_refuses_without_a_matching_receipt() -> None
     )
     observer = _make_observer(conn, backends=[backend])
 
-    with pytest.raises(HubObservationRegistrationRefusedError) as refused:
+    with pytest.raises(ObservationRegistrationRefusedError) as refused:
         observer.register_establishment_session(
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
@@ -1058,7 +1083,7 @@ def test_establishment_registration_refuses_without_a_matching_receipt() -> None
             external_session_id="ext-init-other",
         )
 
-    assert refused.value.reason == HubObservationRefusalReason.SESSION_BINDING_UNRESOLVED
+    assert refused.value.reason == ObservationRegistrationRefusalReason.SESSION_BINDING_UNRESOLVED
     assert _subscribe_calls(backend) == []
 
 

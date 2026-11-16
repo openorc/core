@@ -71,9 +71,9 @@ from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationRejectedError,
     ExternalOperationUncertainError,
-    HubObservationRegistrationRefusedError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
 )
 from openorc.services.session_runtime import (
     ConnectionNotEstablishableError,
@@ -2293,7 +2293,7 @@ def test_registration_refusal_is_a_proven_pre_effect_failure() -> None:
         + [refused_row]
     )
 
-    with pytest.raises(HubObservationRegistrationRefusedError):
+    with pytest.raises(ObservationRegistrationRefusedError):
         adapter = _DetachedAdapterDouble(
             AgentSessionAllocation(external_session_id="ext-9"),
             [],
@@ -2303,7 +2303,7 @@ def test_registration_refusal_is_a_proven_pre_effect_failure() -> None:
             adapter,  # type: ignore[arg-type]
             **_dispatch_kwargs(workspace_id, task_id),
             observation_registrar=_RecordingRegistrar(
-                error=HubObservationRegistrationRefusedError(
+                error=ObservationRegistrationRefusedError(
                     "at capacity", reason="observer_at_capacity"
                 )
             ),  # type: ignore[arg-type]

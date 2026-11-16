@@ -162,7 +162,7 @@ def make_dependencies(
         # The regular-mode hub-run observation host (issue #323): a inert
         # stand-in; the recorded service seams swallow the registrar and the
         # continuation trigger without touching it.
-        "hub_run_observer_provider": lambda _settings: object(),
+        "detached_turn_observer_provider": lambda _settings: object(),
     }
     resolved.update(providers)
     return OperationDependencies(**resolved), submitter

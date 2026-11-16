@@ -55,7 +55,6 @@ from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
-from openorc.services.cline_hub_observation import HubRunObserver
 from openorc.services.cline_planning_bootstrap import ClineBootstrapRuntimeComposition
 from openorc.services.errors import ConflictError, NotFoundError, StaleOperationError
 from openorc.services.github_user_authorization import (
@@ -76,6 +75,7 @@ from openorc.services.task_authorized_merge_retry import (
 from openorc.services.task_authorized_pr_authorization_retry import (
     execute_authorized_pr_authorization_retry,
 )
+from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
@@ -598,12 +598,12 @@ def _compose_task_planning_bootstrap_and_initial_plan(
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
 
-    # The detached establishment needs the executing process's Hub-run
+    # The detached establishment needs the executing process's detached-turn
     # observation host — a regular-mode process dependency (issue #323).
     # Queue mode resolves none and keeps the blocking establishment interim.
-    observation_registrar: HubRunObserver | None = None
+    observation_registrar: DetachedTurnObservationHost | None = None
     if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        observation_registrar = dependencies.hub_run_observer()
+        observation_registrar = dependencies.detached_turn_observer()
 
     preparation = prepare_task_for_planning(
         pool,

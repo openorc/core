@@ -54,6 +54,10 @@ from openorc.adapters.cline.errors import (
     ClineSdkOperationRejectedError,
     ClineSessionNotFoundError,
 )
+from openorc.adapters.cline.hub_observation import (
+    OPENORC_CLIENT_IDENTITY,
+    ClineHubTurnObservationSource,
+)
 from openorc.adapters.cline.hub_projection import (
     HubRunClassificationError,
     classify_hub_run_start,
@@ -98,6 +102,7 @@ __all__ = [
     "ClineDispatchCheckpoint",
     "ClineFinishActivity",
     "ClineHubEvent",
+    "ClineHubTurnObservationSource",
     "ClineIterationActivity",
     "ClineNoticeActivity",
     "ClineNoticeCategory",
@@ -127,6 +132,7 @@ __all__ = [
     "ConnectionControlEndpointError",
     "HubRunClassificationError",
     "JsonObject",
+    "OPENORC_CLIENT_IDENTITY",
     "Subscription",
     "classify_backend_failure",
     "parse_control_endpoint_url",
