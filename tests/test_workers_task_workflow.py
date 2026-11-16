@@ -26,7 +26,11 @@ from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
-from openorc.services.errors import ConflictError, StaleOperationError
+from openorc.services.errors import (
+    ConflictError,
+    ExternalOperationFailedError,
+    StaleOperationError,
+)
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
@@ -1896,6 +1900,70 @@ def test_the_completion_handoff_transitions_and_arranges_the_initial_plan(
     assert payload.task.task_id == str(_TASK_ID)
     assert payload.profile_id == str(_PROFILE_ID)
     assert payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_completion_handoff_reports_a_failing_coordinated_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positively detected reconstruction failure in the coordinated
+
+    transition propagates from the coordinator unchanged after its typed
+    failure handoff: the observation host contains it, and the durable
+    state — the prepared stage with the Level 2/3 blocking consequence —
+    owns recovery. The BLOCKED disposition itself is proven at the service
+    level against the real coordinator and disposition machinery.
+    """
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.PLANNING,
+        current_plan_revision_id=None,
+    )
+    evidence = SimpleNamespace(
+        claim_token=UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000000a"),
+        stage=task_workflow.TaskPlanningBootstrapStage.PREPARED,
+        stage_settled_at=None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task_planning_bootstrap_evidence",
+        lambda _pool, *, task_id: evidence if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "complete_settled_bootstrap_prepare_transition",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ExternalOperationFailedError("the planning-context transition failed")
+        ),
+    )
+
+    def failing_coordinate(pool: Any, **kwargs: Any) -> None:
+        kwargs["invoke_level_one"](InvocationAttemptEvidence())
+
+    monkeypatch.setattr(task_workflow, "coordinate_task_workflow_operation", failing_coordinate)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(ExternalOperationFailedError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+        )
+
+    # A failed transition is never a submission authorization.
+    assert submitter.submissions == []
 
 
 def test_the_completion_handoff_ignores_a_bootstrap_stage_that_is_not_prepared(
