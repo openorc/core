@@ -1,62 +1,81 @@
-"""Hub-run observation projection (detached agent turns, issue #323).
+"""Hub-run evidence interpretation (detached agent turns, issues #323/#348).
 
-The narrow adapter-owned normalization between the pinned SDK's Hub event
-envelopes / status-only ``run.list`` records and the runtime-neutral
-normalized observation values the settlement seam consumes
-(:mod:`openorc.domain.hub_runs`). This module is pure projection: it owns
-the qualified pinned-version payload shapes and nothing else — no transport,
-no workflow meaning, no persistence, no subscription lifecycle.
+The Cline integration's own interpretation of the pinned SDK's Hub event
+envelopes and status-only ``run.list`` records, projected onto the
+runtime-neutral evidence and attribution vocabulary the detached-turn
+settlement seam consumes (:mod:`openorc.domain.detached_turns`). This
+module is pure interpretation: it owns the qualified pinned-version payload
+shapes and the native semantics of which evidence proves or counters an
+admitted turn, and nothing else — no transport, no workflow meaning, no
+persistence, no subscription lifecycle. Shared application code never sees
+a native payload, event name, status token, or identity comparison; it
+consumes only the neutral families and verdicts produced here.
 
 Discipline (mirrors the adapter's established normalization rules):
 
 - Identity is never synthesized. A terminal or start observation carries
   the Hub envelope's own session identity; an envelope without one is
-  unattributable and projects to ``None`` — never guessed from payload
+  unattributable and is never delivered — never guessed from payload
   contents, timestamps, or ``snapshot.prompt``.
 - Terminal events carry neither run nor request identity (issue #320): the
-  projection forwards the envelope's durable-log sequence verbatim and
-  extracts the reply candidate exactly as the blocking send path does —
-  the native ``AgentResult``'s ``text`` — without parsing, repairing, or
-  interpreting it. A terminal observation without a usable candidate text
-  is a legitimate observation (``result_candidate=None``) that the
-  settlement seam routes as it does every unvalidated completion; the
-  projection never invents one and never reads the SDK-native ``error``
-  payload into any message.
+  classification forwards the envelope's durable-log sequence verbatim as
+  the ordering marker and extracts the reply candidate exactly as the
+  blocking send path does — the native ``AgentResult``'s ``text`` — without
+  parsing, repairing, or interpreting it. A completed run without a usable
+  candidate text is a legitimate classification (``result_candidate=None``)
+  that the settlement seam routes as it does every unvalidated completion;
+  the classification never invents one and never reads the SDK-native
+  ``error`` payload into any message.
+- The start attribution applies the pinned Hub's serial-run semantics: a
+  ``run.started`` payload's ``requestId`` is the runtime's own claim of the
+  executing turn, so a claim equal to the outstanding admitted reference
+  attributes it and a concretely different claim contradicts it. A start
+  without a usable claim is honestly unattributable.
+- The stale-replay ordering applies the pinned Hub's durable-log sequence
+  semantics per exact session: a terminal observation whose sequence is
+  not newer than a consumed marker is an already-consumed or replayed
+  notification; an observation without a sequence carries no ordering
+  evidence and is never ordered.
 - Status-only ``run.list`` records carry the Hub's own opaque ``runId`` and
-  ``state`` tokens verbatim. A record that cannot be interpreted fails
-  closed (a typed projection error) instead of being silently dropped:
-  a dropped failed-run record could hide exactly the failure the
-  status-only reconciliation exists to classify.
+  ``state`` tokens. A record that cannot be interpreted fails closed (a
+  typed classification error) instead of being silently dropped: a dropped
+  failed-run record could hide exactly the failure the status-only
+  reconciliation exists to classify. Only the exact outstanding reference
+  reported ``failed`` is failure evidence; ``completed`` alone is never
+  success or result evidence; every other shape stays honestly unresolved.
 - Payload contents never enter representations, errors, or logs.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Final
 
 from openorc.adapters.cline.values import ClineHubEvent, JsonObject
-from openorc.domain.hub_runs import (
-    HubRunObservationKind,
-    ObservedHubRunCompletion,
-    ObservedHubRunStatus,
+from openorc.domain.detached_turns import (
+    DetachedTurnObservationKind,
+    TurnAttribution,
+    TurnEvidenceFamily,
+    TurnFreshness,
+    TurnStatusEvidenceVerdict,
+    TurnTerminalClassification,
+    TurnTerminalOutcome,
 )
 
 __all__ = [
-    "ClineHubRunStartObservation",
-    "HubRunProjectionError",
-    "project_hub_run_start",
-    "project_hub_run_statuses",
-    "project_terminal_hub_run",
+    "HubRunClassificationError",
+    "classify_hub_run_start",
+    "classify_hub_run_statuses",
+    "classify_terminal_hub_run",
+    "hub_evidence_family",
 ]
 
 #: The qualified terminal run event names (issue #320) mapped to the seam's
 #: closed observation vocabulary. Every other event name is not a terminal
-#: run observation and projects to ``None``.
-_TERMINAL_EVENT_KINDS: Final[dict[str, HubRunObservationKind]] = {
-    "run.completed": HubRunObservationKind.RUN_COMPLETED,
-    "run.failed": HubRunObservationKind.RUN_FAILED,
+#: run observation.
+_TERMINAL_EVENT_KINDS: Final[dict[str, DetachedTurnObservationKind]] = {
+    "run.completed": DetachedTurnObservationKind.COMPLETED,
+    "run.failed": DetachedTurnObservationKind.FAILED,
 }
 
 #: The qualified run-start event name whose ``requestId`` payload field is
@@ -67,115 +86,127 @@ _START_EVENT_KIND: Final[str] = "run.started"
 _RUN_LIST_RECORD_ID_KEY: Final[str] = "runId"
 _RUN_LIST_RECORD_STATUS_KEY: Final[str] = "state"
 
+#: The Hub's own status token that positively classifies a failed run.
+_RUN_LIST_FAILED_STATUS: Final[str] = "failed"
 
-class HubRunProjectionError(ValueError):
+#: The Hub's own status token of a completed run: never success or result
+#: evidence by itself.
+_RUN_LIST_COMPLETED_STATUS: Final[str] = "completed"
+
+
+class HubRunClassificationError(ValueError):
     """One observed Hub-run payload cannot be interpreted under the pinned
     contract. The observation is discarded as uninterpretable — never
     guessed around — and the observation's own safe event kind is all any
     caller may log."""
 
 
-@dataclass(frozen=True, slots=True)
-class ClineHubRunStartObservation:
-    """One projected ``run.started`` identity observation.
-
-    ``external_session_id`` is the envelope's own session identity (never
-    synthesized), ``request_id`` the payload's ``requestId`` run handle when
-    it carried one (``None`` is a legitimate start shape the seam
-    classifies as unattributable), and ``sequence`` the envelope's
-    durable-log sequence when present.
-    """
-
-    external_session_id: str
-    request_id: str | None
-    sequence: int | None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.external_session_id, str) or not self.external_session_id.strip():
-            raise ValueError(
-                "ClineHubRunStartObservation.external_session_id must be a non-empty string"
-            )
-        if self.request_id is not None and (
-            not isinstance(self.request_id, str) or not self.request_id.strip()
-        ):
-            raise ValueError(
-                "ClineHubRunStartObservation.request_id must be None or a non-empty string"
-            )
-        if self.sequence is not None and type(self.sequence) is not int:
-            raise ValueError("ClineHubRunStartObservation.sequence must be None or an integer")
-
-
 def _non_blank_str(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def project_terminal_hub_run(event: ClineHubEvent) -> ObservedHubRunCompletion | None:
-    """Project one Hub event envelope into a terminal run observation.
+def hub_evidence_family(event: ClineHubEvent) -> TurnEvidenceFamily | None:
+    """Recognize one Hub event envelope's neutral turn-evidence family.
 
-    Returns ``None`` for every non-terminal event and for a terminal
-    envelope without its own session identity: neither is an attributable
-    terminal run observation, and neither is invented into one. The reply
-    candidate is the native result's ``text`` forwarded verbatim; a
-    completed run without a usable candidate text stays a legitimate
-    observation with ``result_candidate=None``.
+    Returns ``None`` for every event that is not a qualified turn
+    observation and for any envelope without its own session identity:
+    neither is an attributable turn observation, and neither is invented
+    into one.
     """
-    kind = _TERMINAL_EVENT_KINDS.get(event.kind)
-    if kind is None:
+    if _non_blank_str(event.session_id) is None:
         return None
-    external_session_id = _non_blank_str(event.session_id)
-    if external_session_id is None:
-        return None
+    if event.kind in _TERMINAL_EVENT_KINDS:
+        return TurnEvidenceFamily.TURN_TERMINAL
+    if event.kind == _START_EVENT_KIND:
+        return TurnEvidenceFamily.TURN_START
+    return None
+
+
+def classify_terminal_hub_run(
+    event: ClineHubEvent, *, consumed_ordering_markers: Sequence[int]
+) -> TurnTerminalClassification:
+    """Classify one delivered terminal Hub event against the consumed markers.
+
+    The caller delivers only envelopes :func:`hub_evidence_family` already
+    recognized as terminal turn evidence with their own session identity.
+    The reply candidate is the native result's ``text`` forwarded verbatim;
+    a completed run without a usable candidate text stays a legitimate
+    classification with ``result_candidate=None``. The ordering verdict
+    applies the pinned Hub's durable-log sequence semantics: a sequence not
+    newer than any provided consumed marker is a stale replay, and a
+    sequence-less envelope carries no ordering evidence and is never
+    ordered.
+    """
+    kind = _TERMINAL_EVENT_KINDS[event.kind]
     result = event.payload.get("result")
     candidate: str | None = None
     if isinstance(result, dict):
         candidate = _non_blank_str(result.get("text"))
-    return ObservedHubRunCompletion(
-        external_session_id=external_session_id,
-        kind=kind,
-        sequence=event.sequence,
-        result_candidate=candidate,
+    marker = event.sequence
+    if marker is None:
+        freshness = TurnFreshness.UNORDERED
+    elif any(consumed >= marker for consumed in consumed_ordering_markers):
+        freshness = TurnFreshness.STALE
+    else:
+        freshness = TurnFreshness.FRESH
+    return TurnTerminalClassification(
+        freshness=freshness,
+        outcome=TurnTerminalOutcome(kind=kind, result_candidate=candidate),
+        ordering_marker=marker,
     )
 
 
-def project_hub_run_start(event: ClineHubEvent) -> ClineHubRunStartObservation | None:
-    """Project one Hub event envelope into a run-start identity observation.
+def classify_hub_run_start(
+    event: ClineHubEvent, *, outstanding_turn_reference: str
+) -> TurnAttribution:
+    """Classify one delivered ``run.started`` envelope against the outstanding
+    acknowledged turn reference.
 
-    Returns ``None`` for every non-start event and for a start envelope
-    without its own session identity. The ``requestId`` run handle is
-    forwarded verbatim when the payload carried one and is never taken from
-    any other payload field.
+    The pinned Hub's ``requestId`` payload field is the only event-side run
+    handle and is never taken from any other payload field. Under the
+    pinned Hub's serial-run semantics a claim equal to the outstanding
+    reference attributes the start and a concretely different claim
+    contradicts it; a start without a usable claim is honestly
+    unattributable.
     """
-    if event.kind != _START_EVENT_KIND:
-        return None
-    external_session_id = _non_blank_str(event.session_id)
-    if external_session_id is None:
-        return None
-    return ClineHubRunStartObservation(
-        external_session_id=external_session_id,
-        request_id=_non_blank_str(event.payload.get("requestId")),
-        sequence=event.sequence,
-    )
+    claim = _non_blank_str(event.payload.get("requestId"))
+    if claim is None:
+        return TurnAttribution.UNATTRIBUTABLE
+    if claim == outstanding_turn_reference:
+        return TurnAttribution.ATTRIBUTED
+    return TurnAttribution.CONTRADICTED
 
 
-def project_hub_run_statuses(records: Sequence[JsonObject]) -> list[ObservedHubRunStatus]:
-    """Project status-only ``run.list`` records into seam observations.
+def classify_hub_run_statuses(
+    records: Sequence[JsonObject], *, outstanding_turn_reference: str
+) -> TurnStatusEvidenceVerdict:
+    """Classify status-only ``run.list`` records for the outstanding reference.
 
-    The Hub's own ``runId`` and ``state`` tokens are forwarded verbatim. A
-    record without an interpretable identity or status token raises
-    :class:`HubRunProjectionError`: the consultation that produced it is
-    abandoned rather than partially interpreted, because a silently dropped
-    record could hide exactly the failed run the status-only reconciliation
-    exists to classify.
+    Only the exact outstanding reference reported ``failed`` is failure
+    evidence; ``completed`` alone is never success or result evidence; a
+    missing record, an ambiguous duplicate identity, or any other state
+    token stays honestly unresolved. A record without an interpretable
+    identity or status token raises :class:`HubRunClassificationError`: the
+    consultation that produced it is abandoned rather than partially
+    interpreted, because a silently dropped record could hide exactly the
+    failed run the status-only reconciliation exists to classify.
     """
-    projected: list[ObservedHubRunStatus] = []
+    matching_statuses: list[str] = []
     for record in records:
         if not isinstance(record, dict):
-            raise HubRunProjectionError("a run.list record was not a usable record object")
+            raise HubRunClassificationError("a run.list record was not a usable record object")
         run_id = _non_blank_str(record.get(_RUN_LIST_RECORD_ID_KEY))
         status = _non_blank_str(record.get(_RUN_LIST_RECORD_STATUS_KEY))
         if run_id is None or status is None:
-            raise HubRunProjectionError(
+            raise HubRunClassificationError(
                 "a run.list record carried no interpretable run identity or status token"
             )
-        projected.append(ObservedHubRunStatus(run_id=run_id, status=status))
-    return projected
+        if run_id == outstanding_turn_reference:
+            matching_statuses.append(status)
+    if len(matching_statuses) != 1:
+        return TurnStatusEvidenceVerdict.UNRESOLVED_EVIDENCE
+    if matching_statuses[0] == _RUN_LIST_FAILED_STATUS:
+        return TurnStatusEvidenceVerdict.FAILURE_EVIDENCE
+    if matching_statuses[0] == _RUN_LIST_COMPLETED_STATUS:
+        return TurnStatusEvidenceVerdict.COMPLETION_WITHOUT_RESULT_EVIDENCE
+    return TurnStatusEvidenceVerdict.UNRESOLVED_EVIDENCE

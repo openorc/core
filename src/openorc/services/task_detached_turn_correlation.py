@@ -1,47 +1,55 @@
-"""The detached Hub-run correlation/settlement seam (issue #322).
+"""The detached-turn correlation/settlement seam (issues #322/#348).
 
 The runtime-neutral application-service seam between OpenOrc's authorized
-one-shot claims and the native Hub runs that execute them. The Hub ``runId``
-is execution correlation evidence, never OpenOrc workflow authority: the
-receipt adds no second claim identity, decides no workflow meaning, and the
-workflow consequences always route through the existing owning services.
+one-shot claims and the externally admitted runtime turns that execute them.
+The acknowledged opaque turn reference is correlation evidence, never
+OpenOrc workflow authority: the receipt adds no second claim identity,
+decides no workflow meaning, and the workflow consequences always route
+through the existing owning services.
 
 Dispatch side — the owning Level 1 service commits its existing one-shot
 claim and the receipt companion in one short transaction (before any
-enqueue), then acknowledges the admission: a positively identified Hub
-refusal is a proven pre-effect failure (the receipt records ``refused`` so a
-never-dispatched run cannot hold the session's slot), an acknowledged
-admission attaches the exact native ``runId`` (CAS, exactly once), and an
-uncertain admission stays conservatively claimed and is never redispatched.
+admission), then acknowledges the admission: a positively identified
+refusal is a proven pre-effect failure (the receipt records ``refused`` so
+a never-dispatched turn cannot hold the session's slot), an acknowledged
+admission attaches the exact opaque turn reference (CAS, exactly once), and
+an uncertain admission stays conservatively claimed and is never
+redispatched.
 
-Settlement side — an independently observed terminal completion is resolved
+Settlement side — an independently observed terminal observation is resolved
 within its authenticated Connection/Workspace scope against the
 authoritative ``TaskAgentSession`` binding (external identifiers are never a
 cross-Connection match), then attributed by the serial correlation rule: at
-most one unsettled OpenOrc-dispatched Hub run exists per exact binding (the
-durable partial unique index is the backstop), so a fresh terminal event for
-that session attributes to the outstanding acknowledged run. Stale replays
-are rejected at this boundary against the durable consumed-sequence markers
-the session's settled receipts already record — a delayed duplicate of a
-prior run's notification can never be attributed to the next outstanding
-run. An observed ``run.started`` ``requestId`` equal to the acknowledged
-``runId`` corroborates the binding but is never required; an explicitly
-observed contradictory identity is recorded as the receipt's set-once
-contradiction marker (permanently blocking that receipt's settlement), and
-any other concrete attribution conflict leaves the event unresolved rather
-than inventing a match.
+most one unsettled OpenOrc-dispatched turn exists per exact binding (the
+durable partial unique index is the backstop), so a fresh terminal
+observation for that session attributes to the outstanding acknowledged
+turn. The concrete runtime integration owns the native interpretation of
+its own evidence (issue #348): which native observations speak about a
+turn's start or terminal outcome, why a start identity attributes or
+contradicts the outstanding reference, how its ordering evidence proves a
+delivered observation stale, and what its status-only records mean. This
+seam consumes only the integration's neutral
+``TurnAttribution`` / ``TurnFreshness`` / ``TurnStatusEvidenceVerdict``
+classifications and owns every durable consequence: stale replays are
+rejected against the durable consumed ordering markers the session's
+settled receipts already record — a delayed duplicate of a prior turn's
+notification can never be attributed to the next outstanding turn — and an
+explicitly contradictory start classification is recorded as the receipt's
+set-once contradiction marker (permanently blocking that receipt's
+settlement), while any other unresolved classification leaves the evidence
+unresolved rather than inventing a match.
 
-Admission race — a terminal event that resolves to a receipt still
+Admission race — a terminal observation that resolves to a receipt still
 ``claimed`` (acknowledgement not yet persisted) is durably staged on that
-exact receipt and consumed exactly once by the acknowledgement attach, which
-then routes it through the ordinary settlement: the early result is never
-lost and an unidentified run is never prematurely settled. This is the
-smallest safe handoff — no general event ledger, no replay machinery, no
-polling, and no guaranteed crash recovery (a dispatch worker that dies
+exact receipt and consumed exactly once by the acknowledgement attach,
+which then routes it through the ordinary settlement: the early result is
+never lost and an unidentified turn is never prematurely settled. This is
+the smallest safe handoff — no general event ledger, no replay machinery,
+no polling, and no guaranteed crash recovery (a dispatch worker that dies
 before attaching leaves the accepted v1 unresolved state).
 
 Settlement routing — a successfully attributed completion must carry a
-genuine native ``AgentResult``, pass the shared formal contract for the
+genuine validated formal result, pass the shared formal contract for the
 receipt's expected family, and undergo the full current-subject reproof
 (including the family's authorization subject: the E5 approved
 implementation gate over the current plan revision, or the E9 claimed
@@ -49,21 +57,22 @@ iteration still addressing the canonical PR's current reconciled head)
 before the workflow transition. Validated results complete the attempt
 through the shared finalize; genuine observed failures and positively
 established malformed-result protocol failures (an attributed completion
-whose native result is missing or fails the shared contract) finalize the
-still-running attempt truthfully (``failed_final`` with the
+whose result candidate is missing or fails the shared contract) finalize
+the still-running attempt truthfully (``failed_final`` with the
 ``observed_run_failure`` / ``malformed_run_result`` audit kind) and report
 through the existing Level 2 operation-failure path with ``KNOWN_FAILED``
 evidence — never a safe-retry classification. Settlement is atomic (one
 composition) and idempotent (forward-only conditional writes; duplicates,
 stale notifications, and contradicted receipts are rejected no-ops via the
-receipt lifecycle, the consumed sequence marker, and the contradiction
+receipt lifecycle, the consumed ordering marker, and the contradiction
 marker). Only genuinely missing or unattributable terminal evidence stays
 unresolved.
 
 Status-only reconciliation — at existing bounded reconciliation points, the
-exact acknowledged ``runId`` reported ``failed`` by ``run.list`` classifies
-through the same typed operation-failure path; status-only ``completed`` is
-never success/result evidence.
+integration's status-only evidence classification for the exact outstanding
+reference routes a positively classified failure through the same typed
+operation-failure path; a completed status alone is never success or result
+evidence.
 
 v1 scope note: only the execution families (E6 implementation and E9
 PR-remediation) carry settlement routing here; the remaining operation
@@ -77,24 +86,30 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
 
-from openorc.domain.events import WorkflowEventActor
-from openorc.domain.hub_runs import (
+from openorc.domain.detached_turns import (
     SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
     SETTLEMENT_RESULT_NOT_APPLIED,
     SETTLEMENT_VALIDATED_RESULT,
-    HubRunObservationKind,
-    ObservedHubRunCompletion,
-    ObservedHubRunStatus,
-    TaskHubRunReceipt,
-    TaskHubRunReceiptStatus,
+    DetachedTurnObservationKind,
+    NativeTurnEvidence,
+    ObservedTurnEvidence,
+    TaskDetachedTurnReceipt,
+    TaskDetachedTurnReceiptStatus,
+    TurnAttribution,
+    TurnEvidenceFamily,
+    TurnFreshness,
+    TurnStatusEvidenceVerdict,
+    TurnTerminalClassification,
+    TurnTerminalOutcome,
 )
+from openorc.domain.events import WorkflowEventActor
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     OperationalFailureCode,
@@ -106,8 +121,8 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.domain.tasks import TaskStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
-from openorc.persistence import hub_runs as hub_run_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
@@ -143,24 +158,25 @@ from openorc.services.task_operational_failure_triage import (
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
-    "HubRunSettlementKind",
-    "HubRunSettlementOutcome",
-    "HubRunStartCorroboration",
-    "HubRunStatusClassification",
-    "HubRunStatusClassificationKind",
-    "attach_acknowledged_hub_run",
-    "check_hub_run_start_identity",
-    "classify_acknowledged_hub_run_status",
-    "record_task_hub_run_receipt",
-    "settle_observed_hub_run_completion",
+    "TurnEvidenceClassifier",
+    "TurnSettlementKind",
+    "TurnSettlementOutcome",
+    "TurnStartCorroboration",
+    "TurnStatusClassification",
+    "TurnStatusClassificationKind",
+    "attach_acknowledged_turn",
+    "check_turn_start_identity",
+    "classify_acknowledged_turn_status",
+    "record_task_detached_turn_receipt",
+    "settle_observed_turn_completion",
 ]
 
 logger = logging.getLogger(__name__)
 
-_SERVICE_TRACER_SCOPE: Final[str] = "openorc.services.task_hub_run_correlation"
-_ATTACH_SPAN_NAME: Final[str] = "task_hub_run_correlation.attach_acknowledgement"
-_SETTLE_SPAN_NAME: Final[str] = "task_hub_run_correlation.settle_completion"
-_CLASSIFY_SPAN_NAME: Final[str] = "task_hub_run_correlation.classify_status"
+_SERVICE_TRACER_SCOPE: Final[str] = "openorc.services.task_detached_turn_correlation"
+_ATTACH_SPAN_NAME: Final[str] = "task_detached_turn_correlation.attach_acknowledgement"
+_SETTLE_SPAN_NAME: Final[str] = "task_detached_turn_correlation.settle_completion"
+_CLASSIFY_SPAN_NAME: Final[str] = "task_detached_turn_correlation.classify_status"
 
 # The execution families with detached settlement routing in this seam; the
 # remaining operation families gain theirs with their own detached migrations
@@ -195,9 +211,6 @@ _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperati
     PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION: TaskStatus.REVIEWING,
 }
 
-# The Hub's own status token that positively classifies a failed run.
-_RUN_LIST_FAILED_STATUS: Final[str] = "failed"
-
 # The safe failure-classification token the settlement records for a
 # positively established malformed-result protocol failure: an attributed
 # completion whose native result is missing or fails the shared formal
@@ -213,8 +226,46 @@ _OPENORC_ACTOR: Final[event_coordination.WorkflowActorContext] = (
 )
 
 
-class HubRunSettlementKind(StrEnum):
-    """The typed classification of one detached-run seam operation."""
+class TurnEvidenceClassifier(Protocol):
+    """The runtime integration's neutral classification of its own evidence.
+
+    The concrete runtime integration owns the native interpretation of
+    which evidence proves or counters an admitted turn (issue #348): the
+    neutral families it delivers, why a start identity attributes or
+    contradicts the outstanding reference, how its ordering evidence proves
+    a delivered terminal observation stale, and what its status-only
+    records mean. Classifications are pure functions of the opaque native
+    evidence and the safe durable context the seam supplies — the
+    outstanding opaque turn reference and the consumed ordering markers —
+    and perform no I/O, no durable lookup, and no workflow decision. Shared
+    code routes, persists, and acts on the verdicts; it never inspects the
+    native carrier.
+    """
+
+    def classify_turn_start(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnAttribution:
+        """Classify one delivered turn-start observation's attribution."""
+        ...
+
+    def classify_turn_terminal(
+        self,
+        evidence: NativeTurnEvidence,
+        *,
+        consumed_ordering_markers: Sequence[int],
+    ) -> TurnTerminalClassification:
+        """Classify one delivered terminal observation's freshness and outcome."""
+        ...
+
+    def classify_turn_statuses(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnStatusEvidenceVerdict:
+        """Classify one bounded status-only evidence consultation."""
+        ...
+
+
+class TurnSettlementKind(StrEnum):
+    """The typed classification of one detached-turn seam operation."""
 
     ADMITTED = "admitted"
     NO_OUTSTANDING_RUN = "no_outstanding_run"
@@ -228,7 +279,7 @@ class HubRunSettlementKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class HubRunSettlementOutcome:
+class TurnSettlementOutcome:
     """The typed outcome of one acknowledgement attach or completion
     settlement.
 
@@ -237,13 +288,13 @@ class HubRunSettlementOutcome:
     Level 2 disposition exactly when an observed failure was reported.
     """
 
-    kind: HubRunSettlementKind
-    receipt: TaskHubRunReceipt | None
+    kind: TurnSettlementKind
+    receipt: TaskDetachedTurnReceipt | None
     formal_result: FormalResponse | None = None
     disposition: object | None = None
 
 
-class HubRunStatusClassificationKind(StrEnum):
+class TurnStatusClassificationKind(StrEnum):
     """The typed classification of one status-only reconciliation."""
 
     CLASSIFIED_FAILURE = "classified_failure"
@@ -254,24 +305,26 @@ class HubRunStatusClassificationKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class HubRunStatusClassification:
+class TurnStatusClassification:
     """The typed outcome of one status-only reconciliation classification."""
 
-    kind: HubRunStatusClassificationKind
-    receipt: TaskHubRunReceipt | None
+    kind: TurnStatusClassificationKind
+    receipt: TaskDetachedTurnReceipt | None
     disposition: object | None = None
 
 
-class HubRunStartCorroboration(StrEnum):
-    """The read-only corroboration classification of one observed run start.
+class TurnStartCorroboration(StrEnum):
+    """The read-only corroboration classification of one observed turn start.
 
-    ``CORROBORATED``: the observed ``requestId`` equals the outstanding
-    acknowledged run identity. ``CONTRADICTED``: an explicitly observed,
-    concretely different run identity — recorded by selective logging, never
-    mutated against, and never a settlement match. ``UNATTRIBUTABLE``: the
-    receipt is still claimed (no acknowledged identity yet) or the start
-    carried no request identity. ``UNOWNED``: no OpenOrc-dispatched run is
-    outstanding for the resolved binding.
+    ``CORROBORATED``: the integration's classification positively
+    attributes the observed start to the outstanding acknowledged turn
+    reference. ``CONTRADICTED``: the integration's classification
+    positively establishes a concretely different turn identity — recorded
+    by selective logging as the receipt's permanent contradiction marker,
+    never a settlement match. ``UNATTRIBUTABLE``: the receipt is still
+    claimed (no acknowledged reference yet) or the start carried no
+    identity claim to decide with. ``UNOWNED``: no OpenOrc-dispatched turn
+    is outstanding for the resolved binding.
     """
 
     CORROBORATED = "corroborated"
@@ -297,20 +350,20 @@ def _require_nonblank_command(value: object, name: str) -> str:
     return value
 
 
-def _settlement_outcome(label: str, sequence: int | None) -> dict[str, object]:
+def _settlement_outcome(label: str, ordering_marker: int | None) -> dict[str, object]:
     """The canonical settlement outcome payload of one consumed observation."""
     outcome: dict[str, object] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
-    if sequence is not None:
-        # The durable consumed-sequence marker: the settlement evidence later
+    if ordering_marker is not None:
+        # The durable consumed ordering marker: the settlement evidence later
         # reconciliation reads to reject already-consumed notifications.
-        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = sequence
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = ordering_marker
     return outcome
 
 
 # --- the dispatch-side receipt companion ---------------------------------------
 
 
-def record_task_hub_run_receipt(
+def record_task_detached_turn_receipt(
     transaction_pool: DatabasePool,
     *,
     workspace_id: UUID,
@@ -323,19 +376,19 @@ def record_task_hub_run_receipt(
     created_external_session_id: str | None = None,
     effective_config_snapshot: Mapping[str, object] | None = None,
     created_session_provenance: Mapping[str, object] | None = None,
-) -> TaskHubRunReceipt:
-    """Record the claim-to-run receipt companion of one committed one-shot claim.
+) -> TaskDetachedTurnReceipt:
+    """Record the claim-to-turn receipt companion of one committed one-shot claim.
 
     Composed inside the owning Level 1 service's claim transaction (the
     caller's ``expected_state_token`` currentness revalidation owns the
     authorization; this helper adds no second claim identity): the receipt
-    commits before any enqueue, so the admission race and the
-    single-outstanding-run invariant are durable from the first possible
+    commits before any admission, so the admission race and the
+    single-outstanding-turn invariant are durable from the first possible
     effect. The execution families pin their exact expected formal family;
     every other family must name one explicitly until its own detached
-    migration wires its routing. A violated single-outstanding-run invariant
+    migration wires its routing. A violated single-outstanding-turn invariant
     (a concurrent second dispatch for the same session binding) is a typed
-    conflict — fail closed, never a second outstanding run.
+    conflict — fail closed, never a second outstanding turn.
 
     The detached session establishment (issue #324) passes its minimum
     separate provisional establishment evidence (the provisional external
@@ -355,13 +408,13 @@ def record_task_hub_run_receipt(
     if operation in _EXECUTION_SETTLEMENT_FAMILIES:
         if original_attempt_kind is not OriginalAttemptKind.EXECUTION:
             raise InvalidCommandError(
-                "an execution-family hub-run receipt roots at the family's Execution identity"
+                "an execution-family detached-turn receipt roots at the family's Execution identity"
             )
         if expected_formal_family is not None and (
             expected_formal_family != IMPLEMENTATION_RESULT_FAMILY
         ):
             raise InvalidCommandError(
-                "an execution-family hub-run receipt expects the implementation_result family"
+                "an execution-family detached-turn receipt expects the implementation_result family"
             )
         expected_formal_family = IMPLEMENTATION_RESULT_FAMILY
     elif expected_formal_family is None or expected_formal_family not in FORMAL_RESPONSE_FAMILIES:
@@ -375,7 +428,7 @@ def record_task_hub_run_receipt(
             "only a session_initialization receipt carries provisional establishment evidence"
         )
     try:
-        return hub_run_records.create_task_hub_run_receipt(
+        return turn_records.create_task_detached_turn_receipt(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -390,7 +443,7 @@ def record_task_hub_run_receipt(
         )
     except UniqueViolation as error:
         raise ConflictError(
-            "the session binding already carries an outstanding hub-run receipt; "
+            "the session binding already carries an outstanding detached-turn receipt; "
             "the dispatch is refused"
         ) from error
 
@@ -398,17 +451,17 @@ def record_task_hub_run_receipt(
 # --- the acknowledgement attach ------------------------------------------------
 
 
-def attach_acknowledged_hub_run(
+def attach_acknowledged_turn(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
     task_id: UUID,
     receipt_id: UUID,
-    run_id: str,
-) -> HubRunSettlementOutcome:
-    """Attach one acknowledged native runId to its claimed receipt.
+    admitted_turn_reference: str,
+) -> TurnSettlementOutcome:
+    """Attach one acknowledged opaque turn reference to its claimed receipt.
 
-    The post-enqueue acknowledgement of the dispatch invocation: the receipt
+    The post-admission acknowledgement of the dispatch invocation: the receipt
     must still be claimed (a lost/uncertain acknowledgement is a typed
     uncertainty at the adapter boundary and never reaches this attach; a
     positively identified refusal is recorded through the owning pre-effect
@@ -416,13 +469,13 @@ def attach_acknowledged_hub_run(
     completion — a terminal event that arrived during the admission race —
     is consumed exactly once inside the same composition and routed through
     the ordinary settlement, so the early result settles with its now-known
-    run identity instead of being lost. The composition is one short
+    turn reference instead of being lost. The composition is one short
     transaction; a failure rolls the attach and the routing back together.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(receipt_id, "receipt_id")
-    _require_nonblank_command(run_id, "run_id")
+    _require_nonblank_command(admitted_turn_reference, "admitted_turn_reference")
     with application_span(_SERVICE_TRACER_SCOPE, _ATTACH_SPAN_NAME) as span:
         annotate_span(
             span,
@@ -431,7 +484,7 @@ def attach_acknowledged_hub_run(
             task_id=str(task_id),
         )
         with composed_transaction(pool) as transaction_pool:
-            receipt = hub_run_records.get_task_hub_run_receipt_for_update(
+            receipt = turn_records.get_task_detached_turn_receipt_for_update(
                 transaction_pool, receipt_id=receipt_id
             )
             if (
@@ -439,37 +492,40 @@ def attach_acknowledged_hub_run(
                 or receipt.workspace_id != workspace_id
                 or receipt.task_id != task_id
             ):
-                raise NotFoundError("the addressed hub-run receipt is not available in this task")
-            if receipt.status is not TaskHubRunReceiptStatus.CLAIMED:
-                raise StaleOperationError(
-                    "the hub-run receipt is no longer claimed; the acknowledgement is stale"
+                raise NotFoundError(
+                    "the addressed detached-turn receipt is not available in this task"
                 )
-            attached = hub_run_records.attach_task_hub_run_acknowledgement(
+            if receipt.status is not TaskDetachedTurnReceiptStatus.CLAIMED:
+                raise StaleOperationError(
+                    "the detached-turn receipt is no longer claimed; the acknowledgement is stale"
+                )
+            attached = turn_records.attach_task_detached_turn_acknowledgement(
                 transaction_pool,
                 receipt_id=receipt.id,
                 task_id=task_id,
                 workspace_id=workspace_id,
-                run_id=run_id,
+                admitted_turn_reference=admitted_turn_reference,
             )
             if attached is None:  # pragma: no cover - locked claimed receipt must attach
                 raise StaleOperationError(
-                    "the hub-run receipt could not be acknowledged; the attach is stale"
+                    "the detached-turn receipt could not be acknowledged; the attach is stale"
                 )
-            staged = hub_run_records.get_task_hub_run_early_completion_for_update(
+            staged = turn_records.get_task_detached_turn_early_completion_for_update(
                 transaction_pool, receipt_id=receipt.id
             )
             if staged is None:
-                return HubRunSettlementOutcome(kind=HubRunSettlementKind.ADMITTED, receipt=attached)
+                return TurnSettlementOutcome(kind=TurnSettlementKind.ADMITTED, receipt=attached)
             outcome = _route_observed_terminal(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
                 receipt=attached,
-                kind=staged.kind,
-                sequence=staged.sequence,
-                result_candidate=staged.result_candidate,
+                outcome=TurnTerminalOutcome(
+                    kind=staged.kind, result_candidate=staged.result_candidate
+                ),
+                ordering_marker=staged.ordering_marker,
             )
-            hub_run_records.consume_task_hub_run_early_completion(
+            turn_records.consume_task_detached_turn_early_completion(
                 transaction_pool, completion_id=staged.id, receipt_id=receipt.id
             )
             return outcome
@@ -483,11 +539,10 @@ def _route_observed_terminal(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    receipt: TaskHubRunReceipt,
-    kind: HubRunObservationKind,
-    sequence: int | None,
-    result_candidate: str | None,
-) -> HubRunSettlementOutcome:
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
     """Route one attributed terminal observation through its owning services.
 
     Called inside the caller's composition with the receipt row locked. A
@@ -499,19 +554,18 @@ def _route_observed_terminal(
     """
     if receipt.contradicted_at is not None:
         logger.warning(
-            "the outstanding run's correlation was explicitly contradicted by an "
-            "observed run identity; the terminal observation is left unresolved"
+            "the outstanding turn's correlation was explicitly contradicted by an "
+            "observed turn identity; the terminal observation is left unresolved"
         )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
     if receipt.operation in _EXECUTION_SETTLEMENT_FAMILIES:
         return _route_execution_terminal(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            kind=kind,
-            sequence=sequence,
-            result_candidate=result_candidate,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
         )
     if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION:
         return _route_establishment_terminal(
@@ -519,9 +573,8 @@ def _route_observed_terminal(
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            kind=kind,
-            sequence=sequence,
-            result_candidate=result_candidate,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
         )
     raise ConflictError(
         "the receipt's operation family has no detached settlement routing yet; "
@@ -534,11 +587,10 @@ def _route_execution_terminal(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    receipt: TaskHubRunReceipt,
-    kind: HubRunObservationKind,
-    sequence: int | None,
-    result_candidate: str | None,
-) -> HubRunSettlementOutcome:
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
     """Route one attributed terminal observation onto the execution attempt.
 
     The attribution congruence is proved first: the attempt must exist in
@@ -561,31 +613,31 @@ def _route_execution_terminal(
         or execution.producer_session_id != receipt.task_agent_session_id
     ):
         logger.warning(
-            "the observed hub-run completion conflicts with the receipt's attempt "
+            "the observed terminal completion conflicts with the receipt's attempt "
             "binding; the observation is left unresolved"
         )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
-    if kind is HubRunObservationKind.RUN_FAILED:
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
         return _settle_execution_failure(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            sequence=sequence,
+            ordering_marker=ordering_marker,
             error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
             failure_kind=OBSERVED_RUN_FAILURE_KIND,
         )
     # A genuinely attributed completion must carry a usable formal result. A
     # missing candidate, a shared-contract rejection, or an unexpected
-    # family type is a positively established protocol failure of the run —
+    # family type is a positively established protocol failure of the turn —
     # routed through the existing typed operation-failure machinery (never
     # silently unresolved evidence, never a safe retry) — while a validated
     # result completes the still-running attempt through the shared finalize.
     parsed: FormalResponse | None
-    if result_candidate is not None:
+    if outcome.result_candidate is not None:
         try:
             parsed = parse_formal_response(
-                result_candidate, expected_family=receipt.expected_formal_family
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
             )
         except ProtocolError:
             parsed = None
@@ -596,7 +648,7 @@ def _route_execution_terminal(
         # is the same fail-closed protocol classification, never a
         # reinterpretation.
         logger.warning(
-            "the observed hub-run completion carries no usable formal result for its "
+            "the observed terminal completion carries no usable formal result for its "
             "expected family; classifying the positively established protocol failure"
         )
         return _settle_execution_failure(
@@ -604,7 +656,7 @@ def _route_execution_terminal(
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            sequence=sequence,
+            ordering_marker=ordering_marker,
             error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
             failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
         )
@@ -617,25 +669,25 @@ def _route_execution_terminal(
         result=parsed,
     )
     if finalized is None:
-        settled = hub_run_records.settle_task_hub_run_receipt(
+        settled = turn_records.settle_task_detached_turn_receipt(
             transaction_pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, sequence),
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
         )
-        return HubRunSettlementOutcome(
-            kind=HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
         )
-    settled = hub_run_records.settle_task_hub_run_receipt(
+    settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, sequence),
+        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, ordering_marker),
     )
-    return HubRunSettlementOutcome(
-        kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=settled,
         formal_result=parsed,
     )
@@ -646,17 +698,17 @@ def _settle_execution_failure(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    receipt: TaskHubRunReceipt,
-    sequence: int | None,
+    receipt: TaskDetachedTurnReceipt,
+    ordering_marker: int | None,
     error_code: OperationalFailureCode,
     failure_kind: str,
-) -> HubRunSettlementOutcome:
-    """Settle one positively established genuine run failure.
+) -> TurnSettlementOutcome:
+    """Settle one positively established genuine turn failure.
 
     The still-running attempt finalizes ``failed_final`` with the truthful
     failure-classification audit atomically with the receipt's settlement,
     and the failure reports through the existing typed operation-failure
-    path (Level 2) with the caller's stable code — an observed run failure
+    path (Level 2) with the caller's stable code — an observed turn failure
     or a positively established malformed-result protocol failure.
     ``KNOWN_FAILED`` evidence is never a safe-retry classification, so the
     disposition is the policy's own bounded decision (escalation, no
@@ -674,22 +726,22 @@ def _settle_execution_failure(
         failure_kind=failure_kind,
     )
     if finalized is None:
-        settled = hub_run_records.settle_task_hub_run_receipt(
+        settled = turn_records.settle_task_detached_turn_receipt(
             transaction_pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, sequence),
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
         )
-        return HubRunSettlementOutcome(
-            kind=HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
         )
-    settled = hub_run_records.settle_task_hub_run_receipt(
+    settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, sequence),
+        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
     )
     current = task_records.get_task(transaction_pool, task_id=task_id)
     if current is None or current.workspace_id != workspace_id:
@@ -712,7 +764,7 @@ def _settle_execution_failure(
         reporting_attempt_id=receipt.original_attempt_id,
         error_code=error_code,
         effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
-        diagnostic_context={"observation": "hub_run_failure"},
+        diagnostic_context={"observation": "observed_turn_failure"},
     )
     disposition = triage_operational_failure(
         transaction_pool,
@@ -725,8 +777,8 @@ def _settle_execution_failure(
         operation=operation,
         report=report,
     )
-    return HubRunSettlementOutcome(
-        kind=HubRunSettlementKind.SETTLED_OBSERVED_FAILURE,
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
         receipt=settled,
         disposition=disposition,
     )
@@ -740,12 +792,11 @@ def _route_establishment_terminal(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    receipt: TaskHubRunReceipt,
-    kind: HubRunObservationKind,
-    sequence: int | None,
-    result_candidate: str | None,
-) -> HubRunSettlementOutcome:
-    """Route one attributed terminal observation onto the initialization run.
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the initialization turn.
 
     The binding congruence is proved first: the receipt's authoritative
     binding must exist in the addressed scope, belong to the exact Task, and
@@ -777,22 +828,22 @@ def _route_establishment_terminal(
             "the observed initialization completion conflicts with the receipt's "
             "session binding; the observation is left unresolved"
         )
-        return HubRunSettlementOutcome(kind=HubRunSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
-    if kind is HubRunObservationKind.RUN_FAILED:
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
         return _settle_establishment_failure(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            sequence=sequence,
+            ordering_marker=ordering_marker,
             error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
             failure_kind=OBSERVED_RUN_FAILURE_KIND,
         )
     parsed: SessionReady | None
-    if result_candidate is not None:
+    if outcome.result_candidate is not None:
         try:
             candidate = parse_formal_response(
-                result_candidate, expected_family=receipt.expected_formal_family
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
             )
         except ProtocolError:
             candidate = None
@@ -812,7 +863,7 @@ def _route_establishment_terminal(
             workspace_id=workspace_id,
             task_id=task_id,
             receipt=receipt,
-            sequence=sequence,
+            ordering_marker=ordering_marker,
             error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
             failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
         )
@@ -824,15 +875,15 @@ def _route_establishment_terminal(
             "the initialization receipt's binding already moved past CONNECTING; "
             "settling the validated result as not applied"
         )
-        settled = hub_run_records.settle_task_hub_run_receipt(
+        settled = turn_records.settle_task_detached_turn_receipt(
             transaction_pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, sequence),
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
         )
-        return HubRunSettlementOutcome(
-            kind=HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
         )
     provenance = receipt.created_session_provenance or {}
     finalized = finalize_observed_initialization_readiness(
@@ -847,18 +898,18 @@ def _route_establishment_terminal(
         reported_runtime_version=_safe_provenance_str(provenance, "reported_runtime_version"),
     )
     label = SETTLEMENT_VALIDATED_RESULT if finalized.applied else SETTLEMENT_RESULT_NOT_APPLIED
-    settled = hub_run_records.settle_task_hub_run_receipt(
+    settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        outcome=_settlement_outcome(label, sequence),
+        outcome=_settlement_outcome(label, ordering_marker),
     )
-    return HubRunSettlementOutcome(
+    return TurnSettlementOutcome(
         kind=(
-            HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+            TurnSettlementKind.SETTLED_VALIDATED_RESULT
             if finalized.applied
-            else HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+            else TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
         ),
         receipt=settled,
         formal_result=parsed,
@@ -876,28 +927,28 @@ def _settle_establishment_failure(
     *,
     workspace_id: UUID,
     task_id: UUID,
-    receipt: TaskHubRunReceipt,
-    sequence: int | None,
+    receipt: TaskDetachedTurnReceipt,
+    ordering_marker: int | None,
     error_code: OperationalFailureCode,
     failure_kind: str,
-) -> HubRunSettlementOutcome:
+) -> TurnSettlementOutcome:
     """Settle one positively established genuine initialization failure.
 
     The receipt settles truthfully (``observed_failure``) and the failure
     reports through the existing typed operation-failure path (Level 2)
     under the bootstrap claim's established family — the same family the
     blocking establishment's failures have always reported under. The
-    binding stays CONNECTING (never LOST for an observed run failure) and
+    binding stays CONNECTING (never LOST for an observed turn failure) and
     the establishment is never re-dispatched: the initialize-once discipline
     leaves the durable unresolved state to the existing recovery semantics.
     The report is a typed no-op when it no longer addresses current work.
     """
-    settled = hub_run_records.settle_task_hub_run_receipt(
+    settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, sequence),
+        outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
     )
     current = task_records.get_task(transaction_pool, task_id=task_id)
     if current is None or current.workspace_id != workspace_id:
@@ -920,7 +971,7 @@ def _settle_establishment_failure(
         reporting_attempt_id=receipt.original_attempt_id,
         error_code=error_code,
         effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
-        diagnostic_context={"observation": "hub_run_initialization_failure"},
+        diagnostic_context={"observation": "observed_turn_initialization_failure"},
     )
     disposition = triage_operational_failure(
         transaction_pool,
@@ -933,8 +984,8 @@ def _settle_establishment_failure(
         operation=operation,
         report=report,
     )
-    return HubRunSettlementOutcome(
-        kind=HubRunSettlementKind.SETTLED_OBSERVED_FAILURE,
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
         receipt=settled,
         disposition=disposition,
     )
@@ -943,30 +994,37 @@ def _settle_establishment_failure(
 # --- the public settlement and reconciliation entries ---------------------------
 
 
-def settle_observed_hub_run_completion(
+def settle_observed_turn_completion(
     pool: DatabasePool,
     *,
+    classifier: TurnEvidenceClassifier,
     workspace_id: UUID,
     connection_id: UUID,
-    observation: ObservedHubRunCompletion,
-) -> HubRunSettlementOutcome:
-    """Settle one independently observed terminal Hub-run completion.
+    evidence: ObservedTurnEvidence,
+) -> TurnSettlementOutcome:
+    """Settle one independently observed terminal turn observation.
 
     The observation resolves within its authenticated Connection/Workspace
     scope against the authoritative session binding — external identifiers
     are never a cross-Connection match — and then attributes by the serial
     correlation rule: the single outstanding receipt of that exact binding.
-    A claimed receipt (acknowledgement not yet persisted) stages the
-    observation for its acknowledgement attach; an admitted receipt routes
-    the observation through the owning services and settles; no outstanding
-    receipt makes the event unowned, and a second early delivery for the
-    same receipt is a rejected duplicate. Nothing here ever invents a match
-    or treats an unattributable event as a workflow fact.
+    The runtime integration classifies the delivered evidence — its native
+    ordering verdict against the session's durable consumed ordering
+    markers, and the neutral terminal outcome — and this seam owns every
+    durable consequence. A claimed receipt (acknowledgement not yet
+    persisted) stages the observation for its acknowledgement attach; an
+    admitted receipt routes the observation through the owning services and
+    settles; no outstanding receipt makes the observation unowned, and a
+    second early delivery for the same receipt is a rejected duplicate.
+    Nothing here ever invents a match or treats an unattributable
+    observation as a workflow fact.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(connection_id, "connection_id")
-    if not isinstance(observation, ObservedHubRunCompletion):
-        raise InvalidCommandError("observation must be an ObservedHubRunCompletion")
+    if not isinstance(evidence, ObservedTurnEvidence):
+        raise InvalidCommandError("evidence must be an ObservedTurnEvidence")
+    if evidence.family is not TurnEvidenceFamily.TURN_TERMINAL:
+        raise InvalidCommandError("terminal settlement requires TURN_TERMINAL evidence")
     with application_span(_SERVICE_TRACER_SCOPE, _SETTLE_SPAN_NAME) as span:
         annotate_span(
             span,
@@ -977,7 +1035,7 @@ def settle_observed_hub_run_completion(
             pool,
             workspace_id=workspace_id,
             connection_id=connection_id,
-            external_session_id=observation.external_session_id,
+            external_session_id=evidence.external_session_id,
         )
         if binding is None:
             # The bound-identity resolution missed. A CONNECTING binding
@@ -988,24 +1046,22 @@ def settle_observed_hub_run_completion(
             # this authenticated Workspace/Connection scope. An
             # initialization receipt is resolved by its binding's row
             # identity from here on — the same serial-correlation machinery.
-            initialization_receipt = (
-                hub_run_records.find_outstanding_session_initialization_receipt(
-                    pool,
-                    workspace_id=workspace_id,
-                    connection_id=connection_id,
-                    created_external_session_id=observation.external_session_id,
-                )
+            initialization_receipt = turn_records.find_outstanding_session_initialization_receipt(
+                pool,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
+                created_external_session_id=evidence.external_session_id,
             )
             if initialization_receipt is None:
                 logger.info(
-                    "the observed hub-run completion resolves to no session binding in "
+                    "the observed terminal completion resolves to no session binding in "
                     "this connection scope; the observation is unowned"
                 )
-                return HubRunSettlementOutcome(
-                    kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
+                return TurnSettlementOutcome(
+                    kind=TurnSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                 )
             with composed_transaction(pool) as transaction_pool:
-                locked = hub_run_records.get_task_hub_run_receipt_for_update(
+                locked = turn_records.get_task_detached_turn_receipt_for_update(
                     transaction_pool, receipt_id=initialization_receipt.id
                 )
                 if (
@@ -1013,102 +1069,108 @@ def settle_observed_hub_run_completion(
                     or locked.workspace_id != workspace_id
                     or locked.status
                     not in (
-                        TaskHubRunReceiptStatus.CLAIMED,
-                        TaskHubRunReceiptStatus.ADMITTED,
+                        TaskDetachedTurnReceiptStatus.CLAIMED,
+                        TaskDetachedTurnReceiptStatus.ADMITTED,
                     )
                 ):
                     logger.info(
                         "the observed initialization completion has no outstanding "
                         "receipt in this connection scope; the observation is unowned"
                     )
-                    return HubRunSettlementOutcome(
-                        kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
+                    return TurnSettlementOutcome(
+                        kind=TurnSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                     )
                 return _settle_locked_receipt(
                     transaction_pool,
+                    classifier=classifier,
                     workspace_id=workspace_id,
                     task_id=locked.task_id,
                     task_agent_session_id=locked.task_agent_session_id,
                     receipt=locked,
-                    observation=observation,
+                    evidence=evidence,
                 )
         with composed_transaction(pool) as transaction_pool:
-            receipt = hub_run_records.get_outstanding_task_hub_run_receipt_for_update(
+            receipt = turn_records.get_outstanding_task_detached_turn_receipt_for_update(
                 transaction_pool, task_agent_session_id=binding.id
             )
             if receipt is None or receipt.workspace_id != workspace_id:
                 logger.info(
-                    "the observed hub-run completion has no outstanding run for its "
+                    "the observed terminal completion has no outstanding turn for its "
                     "session binding; the observation is unowned"
                 )
-                return HubRunSettlementOutcome(
-                    kind=HubRunSettlementKind.NO_OUTSTANDING_RUN, receipt=None
+                return TurnSettlementOutcome(
+                    kind=TurnSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                 )
             return _settle_locked_receipt(
                 transaction_pool,
+                classifier=classifier,
                 workspace_id=workspace_id,
                 task_id=receipt.task_id,
                 task_agent_session_id=binding.id,
                 receipt=receipt,
-                observation=observation,
+                evidence=evidence,
             )
 
 
 def _settle_locked_receipt(
     transaction_pool: DatabasePool,
     *,
+    classifier: TurnEvidenceClassifier,
     workspace_id: UUID,
     task_id: UUID,
     task_agent_session_id: UUID,
-    receipt: TaskHubRunReceipt,
-    observation: ObservedHubRunCompletion,
-) -> HubRunSettlementOutcome:
+    receipt: TaskDetachedTurnReceipt,
+    evidence: ObservedTurnEvidence,
+) -> TurnSettlementOutcome:
     """Settle one locked outstanding receipt against one terminal observation.
 
     The shared post-lock settlement of both resolutions — the bound-external
     -identity lookup and the initialization receipt's provisional-identity
-    lookup (issue #324). The stale-replay safeguard reads the binding's
-    consumed-sequence markers; a claimed receipt stages the observation for
-    its acknowledgement attach; an admitted receipt routes through the
+    lookup (issue #324). The runtime integration classifies the delivered
+    evidence against the binding's durable consumed ordering markers; the
+    seam applies its own durable consequences: a stale classification is a
+    rejected replay, a claimed receipt stages the observation for its
+    acknowledgement attach, and an admitted receipt routes through the
     owning services and settles.
     """
-    if observation.sequence is not None:
-        # The stale-replay safeguard: a terminal event at or below the
-        # binding's highest consumed sequence marker is an already-consumed
-        # or stale duplicate of a prior run's notification, never a fresh
-        # completion for the outstanding run. A sequence-less observation
-        # carries no ordering evidence and is never rejected by this check.
-        consumed = hub_run_records.get_last_consumed_hub_run_sequence(
-            transaction_pool, task_agent_session_id=task_agent_session_id
+    # The stale-replay safeguard: the integration's ordering verdict against
+    # the binding's consumed ordering markers proves an already-consumed or
+    # replayed notification — never a fresh completion for the outstanding
+    # turn. Evidence without ordering evidence is never rejected by this
+    # check; its settleability is the shared durable rules' decision.
+    consumed = turn_records.get_last_consumed_turn_ordering_marker(
+        transaction_pool, task_agent_session_id=task_agent_session_id
+    )
+    classification = classifier.classify_turn_terminal(
+        evidence.native_evidence,
+        consumed_ordering_markers=() if consumed is None else (consumed,),
+    )
+    if classification.freshness is TurnFreshness.STALE:
+        logger.info(
+            "the observed terminal completion was classified stale against the "
+            "session's consumed ordering marker; the stale duplicate is rejected"
         )
-        if consumed is not None and observation.sequence <= consumed:
-            logger.info(
-                "the observed hub-run completion is at or below the session's "
-                "consumed sequence marker; the stale duplicate is rejected"
-            )
-            return HubRunSettlementOutcome(
-                kind=HubRunSettlementKind.REJECTED_STALE, receipt=receipt
-            )
-    if receipt.status is TaskHubRunReceiptStatus.CLAIMED:
+        return TurnSettlementOutcome(kind=TurnSettlementKind.REJECTED_STALE, receipt=receipt)
+    if receipt.status is TaskDetachedTurnReceiptStatus.CLAIMED:
         try:
-            hub_run_records.stage_task_hub_run_early_completion(
+            turn_records.stage_task_detached_turn_early_completion(
                 transaction_pool,
                 receipt_id=receipt.id,
                 task_id=receipt.task_id,
                 workspace_id=receipt.workspace_id,
-                kind=observation.kind,
-                sequence=observation.sequence,
-                result_candidate=observation.result_candidate,
+                kind=classification.outcome.kind,
+                ordering_marker=classification.ordering_marker,
+                result_candidate=classification.outcome.result_candidate,
             )
         except UniqueViolation:
             logger.info(
                 "a second early completion for the same outstanding receipt is a rejected duplicate"
             )
-            return HubRunSettlementOutcome(
-                kind=HubRunSettlementKind.REJECTED_DUPLICATE, receipt=receipt
+            return TurnSettlementOutcome(
+                kind=TurnSettlementKind.REJECTED_DUPLICATE, receipt=receipt
             )
-        return HubRunSettlementOutcome(
-            kind=HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT,
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT,
             receipt=receipt,
         )
     return _route_observed_terminal(
@@ -1116,36 +1178,37 @@ def _settle_locked_receipt(
         workspace_id=workspace_id,
         task_id=task_id,
         receipt=receipt,
-        kind=observation.kind,
-        sequence=observation.sequence,
-        result_candidate=observation.result_candidate,
+        outcome=classification.outcome,
+        ordering_marker=classification.ordering_marker,
     )
 
 
-def classify_acknowledged_hub_run_status(
+def classify_acknowledged_turn_status(
     pool: DatabasePool,
     *,
+    classifier: TurnEvidenceClassifier,
     workspace_id: UUID,
     task_id: UUID,
     receipt_id: UUID,
-    observed_statuses: Sequence[ObservedHubRunStatus],
-) -> HubRunStatusClassification:
-    """Classify one status-only ``run.list`` reconciliation observation.
+    status_evidence: NativeTurnEvidence,
+) -> TurnStatusClassification:
+    """Classify one bounded status-only reconciliation consultation.
 
-    At existing bounded reconciliation points: the exact acknowledged
-    ``runId`` reported ``failed`` classifies through the existing typed
-    operation-failure path (``KNOWN_FAILED`` — the run executed and failed,
-    never a safe-retry classification); status-only ``completed`` is never
-    success/result evidence and applies nothing; a missing or ambiguous
-    record for the acknowledged identity is the honest unresolved state.
-    Only an admitted receipt carries an identity to classify.
+    At existing bounded reconciliation points the runtime integration
+    classifies its own status-only records for the exact outstanding
+    reference: positively classified failure evidence routes through the
+    existing typed operation-failure path (``KNOWN_FAILED`` — the turn
+    executed and failed, never a safe-retry classification); a completed
+    status alone is never success/result evidence and applies nothing; and
+    every other observed shape — a missing record, an ambiguous duplicate,
+    or an unclassified state — is the honest unresolved state. Only an
+    admitted receipt carries a reference to classify.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(receipt_id, "receipt_id")
-    for observed in observed_statuses:
-        if not isinstance(observed, ObservedHubRunStatus):
-            raise InvalidCommandError("observed_statuses must carry ObservedHubRunStatus values")
+    if not isinstance(status_evidence, NativeTurnEvidence):
+        raise InvalidCommandError("status_evidence must be a NativeTurnEvidence carrier")
     with application_span(_SERVICE_TRACER_SCOPE, _CLASSIFY_SPAN_NAME) as span:
         annotate_span(
             span,
@@ -1153,44 +1216,42 @@ def classify_acknowledged_hub_run_status(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-        receipt = hub_run_records.get_task_hub_run_receipt(pool, receipt_id=receipt_id)
+        receipt = turn_records.get_task_detached_turn_receipt(pool, receipt_id=receipt_id)
         if (
             receipt is None
             or receipt.workspace_id != workspace_id
             or receipt.task_id != task_id
-            or receipt.status is not TaskHubRunReceiptStatus.ADMITTED
+            or receipt.status is not TaskDetachedTurnReceiptStatus.ADMITTED
         ):
-            return HubRunStatusClassification(
-                kind=HubRunStatusClassificationKind.NOT_CLASSIFIABLE, receipt=receipt
+            return TurnStatusClassification(
+                kind=TurnStatusClassificationKind.NOT_CLASSIFIABLE, receipt=receipt
             )
-        assert receipt.run_id is not None  # narrowed by the admitted coherence
-        matches = [observed for observed in observed_statuses if observed.run_id == receipt.run_id]
-        if len(matches) != 1:
-            # Missing record or an ambiguous duplicate identity: honest
-            # unknown, never a classification guess.
-            return HubRunStatusClassification(
-                kind=HubRunStatusClassificationKind.UNRESOLVED, receipt=receipt
-            )
-        if matches[0].status != _RUN_LIST_FAILED_STATUS:
-            if matches[0].status == "completed":
+        assert receipt.admitted_turn_reference is not None  # narrowed by the admitted coherence
+        verdict = classifier.classify_turn_statuses(
+            status_evidence, outstanding_turn_reference=receipt.admitted_turn_reference
+        )
+        if verdict is not TurnStatusEvidenceVerdict.FAILURE_EVIDENCE:
+            if verdict is TurnStatusEvidenceVerdict.COMPLETION_WITHOUT_RESULT_EVIDENCE:
                 logger.info(
-                    "the status-only completed record of the acknowledged run is "
+                    "the status-only completed record of the acknowledged turn is "
                     "never success or result evidence"
                 )
-                return HubRunStatusClassification(
-                    kind=HubRunStatusClassificationKind.NEVER_SUCCESS_EVIDENCE,
+                return TurnStatusClassification(
+                    kind=TurnStatusClassificationKind.NEVER_SUCCESS_EVIDENCE,
                     receipt=receipt,
                 )
-            return HubRunStatusClassification(
-                kind=HubRunStatusClassificationKind.UNRESOLVED, receipt=receipt
+            # Missing record, ambiguous duplicate identity, or an unclassified
+            # state: honest unknown, never a classification guess.
+            return TurnStatusClassification(
+                kind=TurnStatusClassificationKind.UNRESOLVED, receipt=receipt
             )
         with composed_transaction(pool) as transaction_pool:
-            locked = hub_run_records.get_task_hub_run_receipt_for_update(
+            locked = turn_records.get_task_detached_turn_receipt_for_update(
                 transaction_pool, receipt_id=receipt.id
             )
-            if locked is None or locked.status is not TaskHubRunReceiptStatus.ADMITTED:
-                return HubRunStatusClassification(
-                    kind=HubRunStatusClassificationKind.NOT_CLASSIFIABLE, receipt=receipt
+            if locked is None or locked.status is not TaskDetachedTurnReceiptStatus.ADMITTED:
+                return TurnStatusClassification(
+                    kind=TurnStatusClassificationKind.NOT_CLASSIFIABLE, receipt=receipt
                 )
             failure_route = (
                 _settle_establishment_failure
@@ -1202,80 +1263,89 @@ def classify_acknowledged_hub_run_status(
                 workspace_id=workspace_id,
                 task_id=task_id,
                 receipt=locked,
-                sequence=None,
+                ordering_marker=None,
                 error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
                 failure_kind=OBSERVED_RUN_FAILURE_KIND,
             )
-        if outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE:
-            return HubRunStatusClassification(
-                kind=HubRunStatusClassificationKind.CLASSIFIED_FAILURE,
+        if outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE:
+            return TurnStatusClassification(
+                kind=TurnStatusClassificationKind.CLASSIFIED_FAILURE,
                 receipt=outcome.receipt,
                 disposition=outcome.disposition,
             )
-        if outcome.kind is HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED:
-            return HubRunStatusClassification(
-                kind=HubRunStatusClassificationKind.RESULT_NOT_APPLIED,
+        if outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED:
+            return TurnStatusClassification(
+                kind=TurnStatusClassificationKind.RESULT_NOT_APPLIED,
                 receipt=outcome.receipt,
             )
-        return HubRunStatusClassification(
-            kind=HubRunStatusClassificationKind.UNRESOLVED, receipt=outcome.receipt
+        return TurnStatusClassification(
+            kind=TurnStatusClassificationKind.UNRESOLVED, receipt=outcome.receipt
         )
 
 
-def check_hub_run_start_identity(
+def check_turn_start_identity(
     pool: DatabasePool,
     *,
+    classifier: TurnEvidenceClassifier,
     workspace_id: UUID,
     connection_id: UUID,
-    external_session_id: str,
-    request_id: str | None,
-) -> HubRunStartCorroboration:
-    """Classify one observed ``run.started`` identity and record contradictions.
+    evidence: ObservedTurnEvidence,
+) -> TurnStartCorroboration:
+    """Classify one observed turn start and record contradictions.
 
-    The observed ``requestId`` equal to the outstanding acknowledged run
-    identity corroborates the binding. A concretely different identity is an
-    explicitly observed contradiction: it is logged selectively and recorded
-    as the receipt's set-once ``contradicted_at`` marker, permanently
-    blocking that receipt's settlement so the correlation stays honestly
-    unresolved instead of inventing a match — the observation prevents
-    subsequent settlement rather than being discarded. ``UNATTRIBUTABLE``:
-    the receipt is still claimed (no acknowledged identity yet) or the start
-    carried no request identity. ``UNOWNED``: no OpenOrc-dispatched run is
+    The runtime integration owns the native interpretation of its start
+    evidence (issue #348): its classification positively attributes the
+    observed start to the outstanding acknowledged turn reference, or
+    positively establishes a concretely different turn identity. A
+    contradiction is logged selectively and recorded as the receipt's
+    set-once ``contradicted_at`` marker, permanently blocking that receipt's
+    settlement so the correlation stays honestly unresolved instead of
+    inventing a match — the observation prevents subsequent settlement
+    rather than being discarded. ``UNATTRIBUTABLE``: the receipt is still
+    claimed (no acknowledged reference yet) or the start carried no identity
+    claim to decide with. ``UNOWNED``: no OpenOrc-dispatched turn is
     outstanding for the resolved binding.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(connection_id, "connection_id")
-    _require_nonblank_command(external_session_id, "external_session_id")
+    if not isinstance(evidence, ObservedTurnEvidence):
+        raise InvalidCommandError("evidence must be an ObservedTurnEvidence")
+    if evidence.family is not TurnEvidenceFamily.TURN_START:
+        raise InvalidCommandError("start corroboration requires TURN_START evidence")
     binding = session_records.find_task_agent_session_binding(
         pool,
         workspace_id=workspace_id,
         connection_id=connection_id,
-        external_session_id=external_session_id,
+        external_session_id=evidence.external_session_id,
     )
     if binding is None:
-        return HubRunStartCorroboration.UNOWNED
-    receipt = hub_run_records.get_outstanding_task_hub_run_receipt(
+        return TurnStartCorroboration.UNOWNED
+    receipt = turn_records.get_outstanding_task_detached_turn_receipt(
         pool, task_agent_session_id=binding.id
     )
     if receipt is None or receipt.workspace_id != workspace_id:
-        return HubRunStartCorroboration.UNOWNED
+        return TurnStartCorroboration.UNOWNED
     if (
-        receipt.status is not TaskHubRunReceiptStatus.ADMITTED
-        or receipt.run_id is None
-        or request_id is None
+        receipt.status is not TaskDetachedTurnReceiptStatus.ADMITTED
+        or receipt.admitted_turn_reference is None
     ):
-        return HubRunStartCorroboration.UNATTRIBUTABLE
-    if request_id == receipt.run_id:
-        return HubRunStartCorroboration.CORROBORATED
-    logger.warning(
-        "the observed run start carries a concretely different identity than the "
-        "outstanding acknowledged run; recording the contradiction marker and "
-        "leaving the correlation unresolved"
+        return TurnStartCorroboration.UNATTRIBUTABLE
+    verdict = classifier.classify_turn_start(
+        evidence.native_evidence, outstanding_turn_reference=receipt.admitted_turn_reference
     )
-    hub_run_records.mark_task_hub_run_receipt_contradicted(
-        pool,
-        receipt_id=receipt.id,
-        task_id=receipt.task_id,
-        workspace_id=receipt.workspace_id,
-    )
-    return HubRunStartCorroboration.CONTRADICTED
+    if verdict is TurnAttribution.CONTRADICTED:
+        logger.warning(
+            "the observed turn start was classified as a concretely different "
+            "identity than the outstanding acknowledged reference; recording the "
+            "contradiction marker and leaving the correlation unresolved"
+        )
+        turn_records.mark_task_detached_turn_receipt_contradicted(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+        )
+        return TurnStartCorroboration.CONTRADICTED
+    if verdict is TurnAttribution.ATTRIBUTED:
+        return TurnStartCorroboration.CORROBORATED
+    return TurnStartCorroboration.UNATTRIBUTABLE

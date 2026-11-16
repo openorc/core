@@ -4107,9 +4107,9 @@ def test_admit_initialization_run_enqueues_the_initialization_verbatim_without_a
         "cline-session-9", ClineRunAdmission(run_id="run-91", accepted_at=7, queue_position=0)
     )
 
-    admitted = adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+    admitted = adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
-    assert admitted.run_id == "run-91"
+    assert admitted.turn_reference == "run-91"
     enqueue_calls = [call for call in backend.calls() if call.operation == "enqueue"]
     assert len(enqueue_calls) == 1
     assert enqueue_calls[0].session_id == "cline-session-9"
@@ -4123,7 +4123,7 @@ def test_admit_initialization_run_refuses_a_session_this_adapter_did_not_establi
     adapter = ClineAdapter(backend, ScriptedResolver(creation=_context()))
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
-        adapter.admit_initialization_run("cline-session-unknown", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-unknown", _INITIALIZATION)
     assert backend.calls() == ()
 
 
@@ -4139,7 +4139,7 @@ def test_admit_initialization_run_classifies_a_positive_hub_refusal_as_known_fai
     )
 
     with pytest.raises(AgentSessionNotFoundError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
@@ -4151,7 +4151,7 @@ def test_admit_initialization_run_keeps_a_transport_loss_uncertain() -> None:
     backend.queue_enqueue("cline-session-9", ClineBackendUncertainOutcomeError())
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() -> None:
@@ -4170,7 +4170,7 @@ def test_admit_initialization_run_keeps_an_unproven_sdk_rejection_uncertain() ->
     )
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_uncertain() -> None:
@@ -4185,7 +4185,7 @@ def test_admit_initialization_run_keeps_a_connection_close_around_the_enqueue_un
     )
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_as_known() -> None:
@@ -4203,7 +4203,7 @@ def test_admit_initialization_run_still_classifies_a_proven_pre_effect_refusal_a
     )
 
     with pytest.raises(AgentRuntimeUnavailableError):
-        adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+        adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
 
 
 def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
@@ -4221,4 +4221,4 @@ def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
         backend.queue_enqueue("cline-session-9", ClineSdkOperationRejectedError(code))
 
         with pytest.raises(AgentRuntimeUnavailableError):
-            adapter.admit_initialization_run("cline-session-9", _INITIALIZATION)
+            adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)

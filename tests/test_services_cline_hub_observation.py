@@ -25,11 +25,10 @@ import pytest
 from openorc.adapters.cline import ClineHubEvent, Subscription
 from openorc.adapters.cline.errors import ClineBackendUncertainOutcomeError
 from openorc.domain.connections import AdapterType
-from openorc.domain.hub_runs import (
-    HubRunObservationKind,
-    ObservedHubRunCompletion,
-    ObservedHubRunStatus,
-    TaskHubRunReceiptStatus,
+from openorc.domain.detached_turns import (
+    ObservedTurnEvidence,
+    TaskDetachedTurnReceiptStatus,
+    TurnEvidenceFamily,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.services import cline_hub_observation as observation_module
@@ -44,12 +43,12 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
-from openorc.services.task_hub_run_correlation import (
-    HubRunSettlementKind,
-    HubRunSettlementOutcome,
-    HubRunStartCorroboration,
-    HubRunStatusClassification,
-    HubRunStatusClassificationKind,
+from openorc.services.task_detached_turn_correlation import (
+    TurnSettlementKind,
+    TurnSettlementOutcome,
+    TurnStartCorroboration,
+    TurnStatusClassification,
+    TurnStatusClassificationKind,
 )
 from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 
@@ -66,19 +65,16 @@ _ENDPOINT = "ws://hub.example.test:9/hub"
 _RESULT_TEXT = '{"kind": "implementation_result"}'
 
 
-def _completion(
-    *,
-    external_session_id: str = _EXTERNAL_SESSION,
-    kind: HubRunObservationKind = HubRunObservationKind.RUN_COMPLETED,
-    sequence: int | None = 41,
-    result_candidate: str | None = _RESULT_TEXT,
-) -> ObservedHubRunCompletion:
-    return ObservedHubRunCompletion(
-        external_session_id=external_session_id,
-        kind=kind,
-        sequence=sequence,
-        result_candidate=result_candidate,
-    )
+def _delivered_event(evidence: ObservedTurnEvidence) -> ClineHubEvent:
+    """Unwrap this integration's own opaque carrier inside a test."""
+    carrier = cast(observation_module._ClineHubEventEvidence, evidence.native_evidence)
+    return carrier.event
+
+
+def _carried_records(status_evidence: Any) -> list[dict[str, Any]]:
+    """Unwrap the integration's status-only evidence carrier inside a test."""
+    carrier = cast(observation_module._ClineStatusRecordsEvidence, status_evidence)
+    return carrier.records
 
 
 def _terminal_event(
@@ -248,7 +244,7 @@ def _admitted_receipt_row() -> tuple[Any, ...]:
         _EXECUTION_ID,
         "implementation_result",
         _RUN_ID,
-        TaskHubRunReceiptStatus.ADMITTED.value,
+        TaskDetachedTurnReceiptStatus.ADMITTED.value,
         {},
         None,
         _OBSERVED,
@@ -274,56 +270,58 @@ class _FakeConnection:
 class _SettleRecorder:
     """Records the settlement-seam deliveries and answers a fixed outcome."""
 
-    outcome_kind: HubRunSettlementKind
+    outcome_kind: TurnSettlementKind
     receipt: Any = None
-    calls: list[tuple[UUID, UUID, ObservedHubRunCompletion]] = field(default_factory=list)
+    calls: list[tuple[UUID, UUID, ObservedTurnEvidence]] = field(default_factory=list)
 
     def __call__(
         self,
         pool: DatabasePool,
         *,
+        classifier: Any,
         workspace_id: UUID,
         connection_id: UUID,
-        observation: ObservedHubRunCompletion,
-    ) -> HubRunSettlementOutcome:
-        self.calls.append((workspace_id, connection_id, observation))
-        return HubRunSettlementOutcome(kind=self.outcome_kind, receipt=self.receipt)
+        evidence: ObservedTurnEvidence,
+    ) -> TurnSettlementOutcome:
+        self.calls.append((workspace_id, connection_id, evidence))
+        return TurnSettlementOutcome(kind=self.outcome_kind, receipt=self.receipt)
 
 
 @dataclass
 class _ClassifyRecorder:
-    calls: list[tuple[UUID, UUID, UUID, list[ObservedHubRunStatus]]] = field(default_factory=list)
+    calls: list[tuple[UUID, UUID, UUID, Any]] = field(default_factory=list)
 
     def __call__(
         self,
         pool: DatabasePool,
         *,
+        classifier: Any,
         workspace_id: UUID,
         task_id: UUID,
         receipt_id: UUID,
-        observed_statuses: list[ObservedHubRunStatus],
-    ) -> HubRunStatusClassification:
-        self.calls.append((workspace_id, task_id, receipt_id, list(observed_statuses)))
-        return HubRunStatusClassification(
-            kind=HubRunStatusClassificationKind.CLASSIFIED_FAILURE, receipt=None
+        status_evidence: Any,
+    ) -> TurnStatusClassification:
+        self.calls.append((workspace_id, task_id, receipt_id, status_evidence))
+        return TurnStatusClassification(
+            kind=TurnStatusClassificationKind.CLASSIFIED_FAILURE, receipt=None
         )
 
 
 @dataclass
 class _StartRecorder:
-    calls: list[tuple[UUID, UUID, str, str | None]] = field(default_factory=list)
+    calls: list[tuple[UUID, UUID, ObservedTurnEvidence]] = field(default_factory=list)
 
     def __call__(
         self,
         pool: DatabasePool,
         *,
+        classifier: Any,
         workspace_id: UUID,
         connection_id: UUID,
-        external_session_id: str,
-        request_id: str | None,
-    ) -> HubRunStartCorroboration:
-        self.calls.append((workspace_id, connection_id, external_session_id, request_id))
-        return HubRunStartCorroboration.CORROBORATED
+        evidence: ObservedTurnEvidence,
+    ) -> TurnStartCorroboration:
+        self.calls.append((workspace_id, connection_id, evidence))
+        return TurnStartCorroboration.CORROBORATED
 
 
 def _fake_credential_resolver(
@@ -420,7 +418,7 @@ def _test_observer(
     observer = _make_observer(conn, backends=backends)
     if settle is not None:
         monkeypatch.setattr(
-            observation_module, "settle_observed_hub_run_completion", settle, raising=True
+            observation_module, "settle_observed_turn_completion", settle, raising=True
         )
     return observer
 
@@ -432,7 +430,7 @@ def test_registration_subscribes_the_exact_session_through_the_current_trusted_a
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
 
     _register(observer)
@@ -449,17 +447,18 @@ def test_a_verified_completion_settles_through_the_seam_and_releases_the_subscri
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
 
     backend.emit_hub(_terminal_event())
 
     assert len(settle.calls) == 1
-    workspace_id, connection_id, observation = settle.calls[0]
+    workspace_id, connection_id, evidence = settle.calls[0]
     assert workspace_id == _WORKSPACE_ID
     assert connection_id == _CONNECTION_ID
-    assert observation == _completion()
+    assert evidence.family is TurnEvidenceFamily.TURN_TERMINAL
+    assert _delivered_event(evidence) == _terminal_event()
     # The terminal classification releases the session's observation: a
     # further delivery reaches no listener and no re-subscription happened.
     backend.emit_hub(_terminal_event(sequence=42))
@@ -474,7 +473,7 @@ def test_an_observed_completion_after_the_dispatch_job_has_exited_still_settles(
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     # The dispatch job's registration returned long before the completion:
     # the observation is independent of that job's lifetime.
@@ -483,7 +482,7 @@ def test_an_observed_completion_after_the_dispatch_job_has_exited_still_settles(
     backend.emit_hub(_terminal_event(sequence=7))
 
     assert len(settle.calls) == 1
-    assert settle.calls[0][2] == _completion(sequence=7)
+    assert _delivered_event(settle.calls[0][2]) == _terminal_event(sequence=7)
 
 
 def test_a_duplicate_delivery_is_rejected_and_the_observation_is_kept(
@@ -493,7 +492,7 @@ def test_a_duplicate_delivery_is_rejected_and_the_observation_is_kept(
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.REJECTED_STALE)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.REJECTED_STALE)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
 
@@ -521,7 +520,7 @@ def test_a_terminal_event_before_the_acknowledgement_is_staged_and_observation_i
         _EXECUTION_ID,
         "implementation_result",
         None,
-        TaskHubRunReceiptStatus.CLAIMED.value,
+        TaskDetachedTurnReceiptStatus.CLAIMED.value,
         {},
         None,
         _OBSERVED,
@@ -545,7 +544,7 @@ def test_a_terminal_event_before_the_acknowledgement_is_staged_and_observation_i
             _WORKSPACE_ID,
             _TASK_ID,
             _RECEIPT_ID,
-            HubRunObservationKind.RUN_COMPLETED.value,
+            "run.completed",
             41,
             _RESULT_TEXT,
             _OBSERVED,
@@ -577,11 +576,11 @@ def test_a_run_started_identity_is_corroborated_through_the_seam(
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
     start = _StartRecorder()
-    monkeypatch.setattr(observation_module, "check_hub_run_start_identity", start, raising=True)
+    monkeypatch.setattr(observation_module, "check_turn_start_identity", start, raising=True)
 
     backend.emit_hub(
         ClineHubEvent(
@@ -592,7 +591,11 @@ def test_a_run_started_identity_is_corroborated_through_the_seam(
         )
     )
 
-    assert start.calls == [(_WORKSPACE_ID, _CONNECTION_ID, _EXTERNAL_SESSION, _RUN_ID)]
+    assert len(start.calls) == 1
+    start_workspace, start_connection, start_evidence = start.calls[0]
+    assert (start_workspace, start_connection) == (_WORKSPACE_ID, _CONNECTION_ID)
+    assert start_evidence.family is TurnEvidenceFamily.TURN_START
+    assert _delivered_event(start_evidence).payload == {"requestId": _RUN_ID}
     assert settle.calls == []  # a start identity is never a terminal observation
 
 
@@ -610,7 +613,7 @@ def test_scoped_session_isolation_routes_each_session_within_its_own_scope(
     )
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
     _register(observer, task_agent_session_id=other_session_id, external_session_id=other_external)
@@ -618,8 +621,8 @@ def test_scoped_session_isolation_routes_each_session_within_its_own_scope(
     backend.emit_hub(_terminal_event(session_id=other_external, sequence=5))
 
     assert len(settle.calls) == 1
-    _workspace_id, _connection_id, observation = settle.calls[0]
-    assert observation.external_session_id == other_external
+    _workspace_id, _connection_id, evidence = settle.calls[0]
+    assert evidence.external_session_id == other_external
     assert settle.calls[0][:2] == (_WORKSPACE_ID, _CONNECTION_ID)
     # The foreign session's event never reached the other session's scope.
     backend.emit_hub(_terminal_event(sequence=6))
@@ -647,7 +650,7 @@ def test_reconnect_re_establishes_observation_and_consults_the_status_only_read(
     fresh_backend.queue_list_runs(
         _EXTERNAL_SESSION, [{"runId": _RUN_ID, "state": "failed", "error": "session not found"}]
     )
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(
         monkeypatch, conn, backends=[dead_backend, fresh_backend], settle=settle
     )
@@ -678,14 +681,16 @@ def test_reconnect_re_establishes_observation_and_consults_the_status_only_read(
     # session and consults its status-only run.list read.
     classify = _ClassifyRecorder()
     monkeypatch.setattr(
-        observation_module, "classify_acknowledged_hub_run_status", classify, raising=True
+        observation_module, "classify_acknowledged_turn_status", classify, raising=True
     )
     _register(observer, task_agent_session_id=other_session_id, external_session_id=other_external)
 
     assert len(classify.calls) == 1
-    workspace_id, task_id, receipt_id, statuses = classify.calls[0]
+    workspace_id, task_id, receipt_id, status_evidence = classify.calls[0]
     assert (workspace_id, task_id, receipt_id) == (_WORKSPACE_ID, _TASK_ID, _RECEIPT_ID)
-    assert statuses == [ObservedHubRunStatus(run_id=_RUN_ID, status="failed")]
+    assert _carried_records(status_evidence) == [
+        {"runId": _RUN_ID, "state": "failed", "error": "session not found"}
+    ]
     fresh_subscribes = _subscribe_calls(fresh_backend)
     assert [call.session_id for call in fresh_subscribes] == [
         _EXTERNAL_SESSION,
@@ -773,7 +778,7 @@ def test_malformed_registration_commands_fail_closed(monkeypatch: pytest.MonkeyP
         monkeypatch,
         conn,
         backends=[backend],
-        settle=_SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT),
+        settle=_SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT),
     )
 
     with pytest.raises(InvalidCommandError):
@@ -798,16 +803,17 @@ def test_a_successor_registration_between_settlement_and_cleanup_keeps_the_obser
     observer = _make_observer(conn, backends=[backend])
     _register(observer)
 
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     registered_successor = False
 
     def interleaving_settle(
         pool: DatabasePool,
         *,
+        classifier: Any,
         workspace_id: UUID,
         connection_id: UUID,
-        observation: ObservedHubRunCompletion,
-    ) -> HubRunSettlementOutcome:
+        evidence: ObservedTurnEvidence,
+    ) -> TurnSettlementOutcome:
         # Run A's atomic settlement released the outstanding-run constraint;
         # Run B legitimately registers during the settlement, before Run A's
         # subscription cleanup has executed.
@@ -815,14 +821,10 @@ def test_a_successor_registration_between_settlement_and_cleanup_keeps_the_obser
         if not registered_successor:
             registered_successor = True
             _register(observer)
-        settle.calls.append((workspace_id, connection_id, observation))
-        return HubRunSettlementOutcome(
-            kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT, receipt=None
-        )
+        settle.calls.append((workspace_id, connection_id, evidence))
+        return TurnSettlementOutcome(kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT, receipt=None)
 
-    monkeypatch.setattr(
-        observation_module, "settle_observed_hub_run_completion", interleaving_settle
-    )
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", interleaving_settle)
 
     backend.emit_hub(_terminal_event())
 
@@ -843,7 +845,7 @@ def test_an_unknown_result_after_an_observer_restart_is_never_invented(
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
     observer.dispose()
@@ -865,7 +867,7 @@ def test_disposal_stops_observation_idempotently(monkeypatch: pytest.MonkeyPatch
     bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
     _script_bindings(conn, bindings)
     backend = FakeClineSdkBackend()
-    settle = _SettleRecorder(outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
     observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
     _register(observer)
 
@@ -962,7 +964,7 @@ def _establishment_receipt_row(
         uuid4(),
         "session_ready",
         None,
-        TaskHubRunReceiptStatus.CLAIMED.value,
+        TaskDetachedTurnReceiptStatus.CLAIMED.value,
         {},
         None,
         _OBSERVED,
@@ -1069,7 +1071,7 @@ def test_validated_establishment_settlement_fires_the_continuation_trigger(
     _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
     _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
     settle = _SettleRecorder(
-        outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
+        outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=cast(
             Any,
             SimpleNamespace(operation=SimpleNamespace(value="session_initialization")),
@@ -1077,9 +1079,7 @@ def test_validated_establishment_settlement_fires_the_continuation_trigger(
     )
     observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
     _register(observer)
-    monkeypatch.setattr(
-        observation_module, "settle_observed_hub_run_completion", settle, raising=True
-    )
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
 
     backend.emit_hub(_terminal_event())
 
@@ -1096,14 +1096,12 @@ def test_execution_settlement_never_fires_the_continuation_trigger(
     _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
     _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
     settle = _SettleRecorder(
-        outcome_kind=HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
+        outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=cast(Any, _admitted_receipt_row()),
     )
     observer = _make_trigger_observer(conn, backends=[backend], trigger=trigger)
     _register(observer)
-    monkeypatch.setattr(
-        observation_module, "settle_observed_hub_run_completion", settle, raising=True
-    )
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
 
     backend.emit_hub(_terminal_event())
 

@@ -1,4 +1,4 @@
-"""Deterministic service tests for the detached Hub-run correlation/settlement
+"""Deterministic service tests for the detached-turn correlation/settlement
 seam (issue #322).
 
 The seam's own behavior and its critical cross-boundary seams: the
@@ -15,7 +15,7 @@ triage-disposition, and protocol-validation matrices are not re-proven here.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -26,19 +26,25 @@ import pytest
 from psycopg.errors import UniqueViolation
 
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.events import WorkflowEventActor, WorkflowEventType
-from openorc.domain.gates import OwnerGateStatus, OwnerGateType
-from openorc.domain.hub_runs import (
+from openorc.domain.detached_turns import (
     SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
     SETTLEMENT_RESULT_NOT_APPLIED,
     SETTLEMENT_VALIDATED_RESULT,
-    HubRunObservationKind,
-    ObservedHubRunCompletion,
-    ObservedHubRunStatus,
-    TaskHubRunReceiptStatus,
+    DetachedTurnObservationKind,
+    NativeTurnEvidence,
+    ObservedTurnEvidence,
+    TaskDetachedTurnReceiptStatus,
+    TurnAttribution,
+    TurnEvidenceFamily,
+    TurnFreshness,
+    TurnStatusEvidenceVerdict,
+    TurnTerminalClassification,
+    TurnTerminalOutcome,
 )
+from openorc.domain.events import WorkflowEventActor, WorkflowEventType
+from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     OperationalFailureCode,
@@ -50,17 +56,17 @@ from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.models import ImplementationResult
-from openorc.services import task_hub_run_correlation as correlation_module
+from openorc.services import task_detached_turn_correlation as correlation_module
 from openorc.services.errors import ConflictError, InvalidCommandError, StaleOperationError
-from openorc.services.task_hub_run_correlation import (
-    HubRunSettlementKind,
-    HubRunStartCorroboration,
-    HubRunStatusClassificationKind,
-    attach_acknowledged_hub_run,
-    check_hub_run_start_identity,
-    classify_acknowledged_hub_run_status,
-    record_task_hub_run_receipt,
-    settle_observed_hub_run_completion,
+from openorc.services.task_detached_turn_correlation import (
+    TurnSettlementKind,
+    TurnStartCorroboration,
+    TurnStatusClassificationKind,
+    attach_acknowledged_turn,
+    check_turn_start_identity,
+    classify_acknowledged_turn_status,
+    record_task_detached_turn_receipt,
+    settle_observed_turn_completion,
 )
 from tests.fakes.agent_runtime import implementation_result_candidate
 from tests.fakes.task_rows import task_row
@@ -79,7 +85,7 @@ _ITERATION_ID = uuid4()
 _LOOP_ID = uuid4()
 _PR_ID = uuid4()
 _HEAD_SHA = "b" * 40
-_RUN_ID = "hub-run-1"
+_TURN_REFERENCE = "turn-1"
 _STAGED_ID = uuid4()
 _RESULT_CANDIDATE = json.dumps(
     implementation_result_candidate(
@@ -214,7 +220,7 @@ def _session_row() -> tuple[Any, ...]:
 def _receipt_row(
     *,
     status: str = "claimed",
-    run_id: str | None = None,
+    admitted_turn_reference: str | None = None,
     outcome: dict[str, Any] | None = None,
     operation: str = "implementation_execution",
     contradicted: bool = False,
@@ -235,7 +241,7 @@ def _receipt_row(
         "execution",
         _EXECUTION_ID,
         "implementation_result",
-        run_id,
+        admitted_turn_reference,
         status,
         outcome if outcome is not None else {},
         _OBSERVED if contradicted else None,
@@ -307,18 +313,22 @@ def _event_row(
 
 
 def _admitted_row() -> tuple[Any, ...]:
-    return _receipt_row(status="admitted", run_id=_RUN_ID)
+    return _receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE)
 
 
 def _remediation_admitted_row() -> tuple[Any, ...]:
-    return _receipt_row(status="admitted", run_id=_RUN_ID, operation="pr_remediation_execution")
+    return _receipt_row(
+        status="admitted",
+        admitted_turn_reference=_TURN_REFERENCE,
+        operation="pr_remediation_execution",
+    )
 
 
-def _settled_row(label: str, *, sequence: int | None = 41) -> tuple[Any, ...]:
+def _settled_row(label: str, *, marker: int | None = 41) -> tuple[Any, ...]:
     outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
-    if sequence is not None:
-        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = sequence
-    return _receipt_row(status="settled", run_id=_RUN_ID, outcome=outcome)
+    if marker is not None:
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
+    return _receipt_row(status="settled", admitted_turn_reference=_TURN_REFERENCE, outcome=outcome)
 
 
 # --- scripted-flow helpers ---------------------------------------------------------
@@ -596,7 +606,7 @@ def triage(monkeypatch: pytest.MonkeyPatch) -> _RecordingTriage:
 def test_record_receipt_commits_the_claim_companion_with_pinned_family() -> None:
     conn = ScriptedConnection()
     conn.on(_sql_has("insert into openorc.task_hub_run_receipts"), _receipt_row())
-    receipt = record_task_hub_run_receipt(
+    receipt = record_task_detached_turn_receipt(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
@@ -606,18 +616,18 @@ def test_record_receipt_commits_the_claim_companion_with_pinned_family() -> None
         original_attempt_id=_EXECUTION_ID,
     )
     assert receipt.id == _RECEIPT_ID
-    assert receipt.status is TaskHubRunReceiptStatus.CLAIMED
+    assert receipt.status is TaskDetachedTurnReceiptStatus.CLAIMED
     assert receipt.expected_formal_family == "implementation_result"
     insert_sql, insert_params = conn.executed[0]
     assert "insert into openorc.task_hub_run_receipts" in " ".join(insert_sql.split())
     assert insert_params is not None and insert_params[6] == "implementation_result"
 
 
-def test_record_receipt_refuses_a_second_outstanding_run_for_the_session() -> None:
+def test_record_receipt_refuses_a_second_outstanding_turn_for_the_session() -> None:
     conn = ScriptedConnection()
     conn.on(_sql_has("insert into openorc.task_hub_run_receipts"), UniqueViolation())
-    with pytest.raises(ConflictError, match="outstanding hub-run receipt"):
-        record_task_hub_run_receipt(
+    with pytest.raises(ConflictError, match="outstanding detached-turn receipt"):
+        record_task_detached_turn_receipt(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
@@ -631,7 +641,7 @@ def test_record_receipt_refuses_a_second_outstanding_run_for_the_session() -> No
 def test_record_receipt_validates_the_family_pairing() -> None:
     conn = ScriptedConnection()
     with pytest.raises(InvalidCommandError, match="implementation_result family"):
-        record_task_hub_run_receipt(
+        record_task_detached_turn_receipt(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
@@ -642,7 +652,7 @@ def test_record_receipt_validates_the_family_pairing() -> None:
             expected_formal_family="pr_result",
         )
     with pytest.raises(InvalidCommandError, match="expected formal family"):
-        record_task_hub_run_receipt(
+        record_task_detached_turn_receipt(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
@@ -653,14 +663,108 @@ def test_record_receipt_validates_the_family_pairing() -> None:
         )
 
 
-# --- the acknowledgement attach -----------------------------------------------------
+# --- the runtime-neutral boundary fake ----------------------------------------------
 
-_COMPLETION_OBSERVATION = ObservedHubRunCompletion(
-    external_session_id=_EXTERNAL_SESSION,
-    kind=HubRunObservationKind.RUN_COMPLETED,
-    sequence=41,
-    result_candidate=_RESULT_CANDIDATE,
-)
+
+class _ScriptedTurnEvidence(NativeTurnEvidence):
+    """Opaque test carrier holding the facts the scripted classifier classifies.
+
+    The boundary fake classifies its own invented evidence shape under its
+    own neutral ordering rule; the shared settlement path consumes only the
+    neutral verdicts, proving it depends on the runtime-neutral contract and
+    never on Cline's evidence semantics.
+    """
+
+    __slots__ = ("attribution", "outcome", "marker", "statuses")
+
+    def __init__(
+        self,
+        *,
+        attribution: TurnAttribution = TurnAttribution.UNATTRIBUTABLE,
+        outcome: TurnTerminalOutcome | None = None,
+        marker: int | None = None,
+        statuses: TurnStatusEvidenceVerdict = TurnStatusEvidenceVerdict.UNRESOLVED_EVIDENCE,
+    ) -> None:
+        self.attribution = attribution
+        self.outcome = outcome
+        self.marker = marker
+        self.statuses = statuses
+
+    def __repr__(self) -> str:
+        return "_ScriptedTurnEvidence(<withheld>)"
+
+
+class _ScriptedClassifier:
+    """The scripted runtime-neutral classifier of the boundary fake."""
+
+    def classify_turn_start(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnAttribution:
+        assert isinstance(evidence, _ScriptedTurnEvidence)
+        return evidence.attribution
+
+    def classify_turn_terminal(
+        self,
+        evidence: NativeTurnEvidence,
+        *,
+        consumed_ordering_markers: Sequence[int],
+    ) -> TurnTerminalClassification:
+        assert isinstance(evidence, _ScriptedTurnEvidence)
+        assert evidence.outcome is not None
+        # The fake's own ordering rule: a marker not newer than a consumed
+        # marker is a stale replay; a marker-less observation is unordered.
+        if evidence.marker is None:
+            freshness = TurnFreshness.UNORDERED
+        elif any(consumed >= evidence.marker for consumed in consumed_ordering_markers):
+            freshness = TurnFreshness.STALE
+        else:
+            freshness = TurnFreshness.FRESH
+        return TurnTerminalClassification(
+            freshness=freshness,
+            outcome=evidence.outcome,
+            ordering_marker=evidence.marker,
+        )
+
+    def classify_turn_statuses(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnStatusEvidenceVerdict:
+        assert isinstance(evidence, _ScriptedTurnEvidence)
+        return evidence.statuses
+
+
+_CLASSIFIER = _ScriptedClassifier()
+
+
+def _terminal_evidence(
+    *,
+    kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
+    marker: int | None = 41,
+    candidate: str | None = _RESULT_CANDIDATE,
+) -> ObservedTurnEvidence:
+    """One terminal evidence item of the fake's own invented evidence shape."""
+    return ObservedTurnEvidence(
+        external_session_id=_EXTERNAL_SESSION,
+        family=TurnEvidenceFamily.TURN_TERMINAL,
+        native_evidence=_ScriptedTurnEvidence(
+            outcome=TurnTerminalOutcome(kind=kind, result_candidate=candidate),
+            marker=marker,
+        ),
+    )
+
+
+def _start_evidence(attribution: TurnAttribution) -> ObservedTurnEvidence:
+    return ObservedTurnEvidence(
+        external_session_id=_EXTERNAL_SESSION,
+        family=TurnEvidenceFamily.TURN_START,
+        native_evidence=_ScriptedTurnEvidence(attribution=attribution),
+    )
+
+
+def _status_evidence(verdict: TurnStatusEvidenceVerdict) -> NativeTurnEvidence:
+    return _ScriptedTurnEvidence(statuses=verdict)
+
+
+_COMPLETION_EVIDENCE = _terminal_evidence()
 
 
 def test_attach_acknowledges_the_claimed_receipt_exactly_once() -> None:
@@ -668,20 +772,20 @@ def test_attach_acknowledges_the_claimed_receipt_exactly_once() -> None:
     _script_receipt_for_update(conn, _receipt_row())
     _script_attach(conn, _admitted_row())
     _script_staged(conn, None)
-    outcome = attach_acknowledged_hub_run(
+    outcome = attach_acknowledged_turn(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        run_id=_RUN_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.ADMITTED
+    assert outcome.kind is TurnSettlementKind.ADMITTED
     attach_params = next(
         params
         for sql, params in conn.executed
         if "set status = 'admitted'" in " ".join(sql.split())
     )
-    assert attach_params is not None and attach_params[0] == _RUN_ID
+    assert attach_params is not None and attach_params[0] == _TURN_REFERENCE
     assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
 
 
@@ -689,12 +793,12 @@ def test_attach_refuses_a_receipt_that_is_no_longer_claimed() -> None:
     conn = ScriptedConnection()
     _script_receipt_for_update(conn, _admitted_row())
     with pytest.raises(StaleOperationError, match="no longer claimed"):
-        attach_acknowledged_hub_run(
+        attach_acknowledged_turn(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
             receipt_id=_RECEIPT_ID,
-            run_id=_RUN_ID,
+            admitted_turn_reference=_TURN_REFERENCE,
         )
 
 
@@ -713,16 +817,16 @@ def test_attach_consumes_the_staged_completion_and_settles_the_validated_result(
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
     _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT))
     _script_consume(conn)
-    outcome = attach_acknowledged_hub_run(
+    outcome = attach_acknowledged_turn(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        run_id=_RUN_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.SETTLED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
     assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
     assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] == 41
     assert isinstance(outcome.formal_result, ImplementationResult)
@@ -756,14 +860,14 @@ def test_attach_consumes_the_staged_failure_and_reports_level_2(
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
     _script_consume(conn)
-    outcome = attach_acknowledged_hub_run(
+    outcome = attach_acknowledged_turn(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        run_id=_RUN_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert outcome.receipt is not None
     assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == "observed_failure"
     assert len(triage.calls) == 1
@@ -805,16 +909,16 @@ def test_attach_routes_a_malformed_staged_result_through_the_failure_path(
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
     _script_consume(conn)
-    outcome = attach_acknowledged_hub_run(
+    outcome = attach_acknowledged_turn(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        run_id=_RUN_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.SETTLED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
     assert len(triage.calls) == 1
     assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
     assert triage.calls[0]["report"].effect_evidence is FailureEffectEvidence.KNOWN_FAILED
@@ -840,20 +944,16 @@ def test_settlement_routes_a_resultless_completion_through_the_failure_path(
     _script_event_insert(
         conn, event_type=WorkflowEventType.EXECUTION_FAILED, failure_kind="malformed_run_result"
     )
-    _script_settle(conn, _settled_row("observed_failure", sequence=None))
+    _script_settle(conn, _settled_row("observed_failure", marker=None))
     _script_current_task(conn)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=ObservedHubRunCompletion(
-            external_session_id=_EXTERNAL_SESSION,
-            kind=HubRunObservationKind.RUN_COMPLETED,
-            sequence=None,
-            result_candidate=None,
-        ),
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(marker=None, candidate=None),
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
 
@@ -868,13 +968,14 @@ def test_settlement_resolves_within_the_authenticated_connection_scope() -> None
     # is equally Connection-scoped: no outstanding initialization receipt
     # resolves a cross-Connection identifier either.
     _script_initialization_receipt_lookup(conn, None)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.NO_OUTSTANDING_RUN
+    assert outcome.kind is TurnSettlementKind.NO_OUTSTANDING_RUN
     (sql, _params) = conn.executed[0]
     normalized = " ".join(sql.split())
     # The external identifier never matches across Connections: the lookup is
@@ -890,13 +991,14 @@ def test_settlement_is_unowned_without_an_outstanding_receipt() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, None)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.NO_OUTSTANDING_RUN
+    assert outcome.kind is TurnSettlementKind.NO_OUTSTANDING_RUN
     assert outcome.receipt is None
 
 
@@ -906,15 +1008,16 @@ def test_settlement_stages_an_early_completion_for_a_claimed_receipt() -> None:
     _script_outstanding_receipt(conn, _receipt_row())
     _script_last_consumed_sequence(conn, None)
     _script_stage_insert(conn, _staged_row(candidate=_RESULT_CANDIDATE))
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT
+    assert outcome.kind is TurnSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.CLAIMED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.CLAIMED
     insert_sql, insert_params = next(
         (sql, params)
         for sql, params in conn.executed
@@ -932,16 +1035,17 @@ def test_settlement_rejects_a_duplicate_early_completion() -> None:
     _script_outstanding_receipt(conn, _receipt_row())
     _script_last_consumed_sequence(conn, None)
     _script_stage_insert(conn, UniqueViolation())
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.REJECTED_DUPLICATE
+    assert outcome.kind is TurnSettlementKind.REJECTED_DUPLICATE
 
 
-def test_settlement_settles_the_single_outstanding_run_without_run_started(
+def test_settlement_settles_the_single_outstanding_turn_without_a_start_observation(
     triage: _RecordingTriage,
 ) -> None:
     conn = ScriptedConnection()
@@ -955,13 +1059,14 @@ def test_settlement_settles_the_single_outstanding_run_without_run_started(
     _script_complete_execution(conn)
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
     _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT))
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     assert isinstance(outcome.formal_result, ImplementationResult)
     assert outcome.formal_result.status == "COMPLETED"
     assert triage.calls == []
@@ -984,18 +1089,16 @@ def test_settlement_classifies_an_observed_failure_through_the_typed_path(
     )
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=ObservedHubRunCompletion(
-            external_session_id=_EXTERNAL_SESSION,
-            kind=HubRunObservationKind.RUN_FAILED,
-            sequence=None,
-            result_candidate=None,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            kind=DetachedTurnObservationKind.FAILED, marker=None, candidate=None
         ),
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["report"].effect_evidence is FailureEffectEvidence.KNOWN_FAILED
 
@@ -1008,13 +1111,14 @@ def test_settlement_leaves_a_concrete_attribution_conflict_unresolved(
     _script_outstanding_receipt(conn, _admitted_row())
     _script_last_consumed_sequence(conn, None)
     _script_execution_read(conn, _execution_row(producer_session_id=uuid4()))
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.LEFT_UNRESOLVED
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
     assert triage.calls == []
     assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
     assert not any("update openorc.executions" in sql for sql, _ in conn.executed)
@@ -1023,7 +1127,7 @@ def test_settlement_leaves_a_concrete_attribution_conflict_unresolved(
 # --- status-only reconciliation ------------------------------------------------------
 
 
-def test_status_classification_routes_the_exact_failed_run(
+def test_status_classification_routes_the_exact_failed_reference(
     triage: _RecordingTriage,
 ) -> None:
     conn = ScriptedConnection()
@@ -1039,21 +1143,19 @@ def test_status_classification_routes_the_exact_failed_run(
     _script_event_insert(
         conn, event_type=WorkflowEventType.EXECUTION_FAILED, failure_kind="observed_run_failure"
     )
-    _script_settle(conn, _settled_row("observed_failure", sequence=None))
+    _script_settle(conn, _settled_row("observed_failure", marker=None))
     _script_current_task(conn)
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[
-            ObservedHubRunStatus(run_id="other-run", status="completed"),
-            ObservedHubRunStatus(run_id=_RUN_ID, status="failed"),
-        ],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(TurnStatusEvidenceVerdict.FAILURE_EVIDENCE),
     )
-    assert classification.kind is HubRunStatusClassificationKind.CLASSIFIED_FAILURE
+    assert classification.kind is TurnStatusClassificationKind.CLASSIFIED_FAILURE
     assert classification.receipt is not None
-    assert classification.receipt.status is TaskHubRunReceiptStatus.SETTLED
+    assert classification.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
     assert len(triage.calls) == 1
 
 
@@ -1065,14 +1167,17 @@ def test_status_classification_never_treats_completed_as_success_evidence(
         _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
         _admitted_row(),
     )
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="completed")],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(
+            TurnStatusEvidenceVerdict.COMPLETION_WITHOUT_RESULT_EVIDENCE
+        ),
     )
-    assert classification.kind is HubRunStatusClassificationKind.NEVER_SUCCESS_EVIDENCE
+    assert classification.kind is TurnStatusClassificationKind.NEVER_SUCCESS_EVIDENCE
     assert triage.calls == []
     assert not any("update openorc" in sql for sql, _ in conn.executed)
 
@@ -1083,14 +1188,15 @@ def test_status_classification_is_not_classifiable_unless_admitted() -> None:
         _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
         _receipt_row(),
     )
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="failed")],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(TurnStatusEvidenceVerdict.FAILURE_EVIDENCE),
     )
-    assert classification.kind is HubRunStatusClassificationKind.NOT_CLASSIFIABLE
+    assert classification.kind is TurnStatusClassificationKind.NOT_CLASSIFIABLE
 
 
 def test_status_classification_leaves_a_missing_record_unresolved() -> None:
@@ -1099,14 +1205,15 @@ def test_status_classification_leaves_a_missing_record_unresolved() -> None:
         _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
         _admitted_row(),
     )
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[ObservedHubRunStatus(run_id="other-run", status="completed")],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(TurnStatusEvidenceVerdict.UNRESOLVED_EVIDENCE),
     )
-    assert classification.kind is HubRunStatusClassificationKind.UNRESOLVED
+    assert classification.kind is TurnStatusClassificationKind.UNRESOLVED
 
 
 # --- the read-only run-start corroboration -------------------------------------------
@@ -1117,14 +1224,14 @@ def test_start_identity_corroboration_is_read_only_and_never_required() -> None:
     _script_binding_lookup(conn, repeat=True)
     _script_outstanding_receipt(conn, _admitted_row(), repeat=True)
     assert (
-        check_hub_run_start_identity(
+        check_turn_start_identity(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             connection_id=_CONNECTION_ID,
-            external_session_id=_EXTERNAL_SESSION,
-            request_id=_RUN_ID,
+            classifier=_CLASSIFIER,
+            evidence=_start_evidence(TurnAttribution.ATTRIBUTED),
         )
-        is HubRunStartCorroboration.CORROBORATED
+        is TurnStartCorroboration.CORROBORATED
     )
     assert not any(
         " ".join(sql.split()).startswith(("update ", "insert ", "delete "))
@@ -1132,31 +1239,31 @@ def test_start_identity_corroboration_is_read_only_and_never_required() -> None:
     )
 
 
-def test_start_identity_is_unattributable_before_admission_and_unowned_without_a_run() -> None:
+def test_start_identity_is_unattributable_before_admission_and_unowned_without_a_turn() -> None:
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _receipt_row())
     assert (
-        check_hub_run_start_identity(
+        check_turn_start_identity(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             connection_id=_CONNECTION_ID,
-            external_session_id=_EXTERNAL_SESSION,
-            request_id=_RUN_ID,
+            classifier=_CLASSIFIER,
+            evidence=_start_evidence(TurnAttribution.ATTRIBUTED),
         )
-        is HubRunStartCorroboration.UNATTRIBUTABLE
+        is TurnStartCorroboration.UNATTRIBUTABLE
     )
     conn = ScriptedConnection()
     _script_binding_lookup(conn, found=False)
     assert (
-        check_hub_run_start_identity(
+        check_turn_start_identity(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             connection_id=_CONNECTION_ID,
-            external_session_id=_EXTERNAL_SESSION,
-            request_id=_RUN_ID,
+            classifier=_CLASSIFIER,
+            evidence=_start_evidence(TurnAttribution.ATTRIBUTED),
         )
-        is HubRunStartCorroboration.UNOWNED
+        is TurnStartCorroboration.UNOWNED
     )
 
 
@@ -1170,15 +1277,16 @@ def test_settlement_rejects_a_stale_replay_after_a_consumed_settlement(
     _script_binding_lookup(conn)
     _script_outstanding_receipt(conn, _admitted_row())
     _script_last_consumed_sequence(conn, 41)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.REJECTED_STALE
+    assert outcome.kind is TurnSettlementKind.REJECTED_STALE
     assert outcome.receipt is not None
-    assert outcome.receipt.status is TaskHubRunReceiptStatus.ADMITTED
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.ADMITTED
     assert triage.calls == []
     # The stale duplicate never reaches the attempt: no execution reads, no
     # settlement, no staging.
@@ -1202,20 +1310,16 @@ def test_settlement_accepts_a_fresher_completion_after_a_consumed_settlement(
     _script_execution_lock(conn, _execution_row())
     _script_complete_execution(conn)
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
-    _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT, sequence=43))
-    fresher = ObservedHubRunCompletion(
-        external_session_id=_EXTERNAL_SESSION,
-        kind=HubRunObservationKind.RUN_COMPLETED,
-        sequence=43,
-        result_candidate=_RESULT_CANDIDATE,
-    )
-    outcome = settle_observed_hub_run_completion(
+    _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT, marker=43))
+    fresher = _terminal_evidence(marker=43)
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=fresher,
+        classifier=_CLASSIFIER,
+        evidence=fresher,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     assert outcome.receipt is not None
     assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] == 43
 
@@ -1229,16 +1333,18 @@ def test_settlement_leaves_a_contradicted_receipt_unresolved(
     conn = ScriptedConnection()
     _script_binding_lookup(conn)
     _script_outstanding_receipt(
-        conn, _receipt_row(contradicted=True, run_id=_RUN_ID, status="admitted")
+        conn,
+        _receipt_row(contradicted=True, admitted_turn_reference=_TURN_REFERENCE, status="admitted"),
     )
     _script_last_consumed_sequence(conn, None)
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.LEFT_UNRESOLVED
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
     assert outcome.receipt is not None
     assert outcome.receipt.contradicted_at is not None
     assert triage.calls == []
@@ -1252,17 +1358,17 @@ def test_start_identity_records_the_contradiction_marker() -> None:
     _script_outstanding_receipt(conn, _admitted_row())
     conn.on(
         _sql_has("set contradicted_at = now()"),
-        _receipt_row(status="admitted", run_id=_RUN_ID, contradicted=True),
+        _receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE, contradicted=True),
     )
     assert (
-        check_hub_run_start_identity(
+        check_turn_start_identity(
             _pool(conn),
             workspace_id=_WORKSPACE_ID,
             connection_id=_CONNECTION_ID,
-            external_session_id=_EXTERNAL_SESSION,
-            request_id="hub-run-other",
+            classifier=_CLASSIFIER,
+            evidence=_start_evidence(TurnAttribution.CONTRADICTED),
         )
-        is HubRunStartCorroboration.CONTRADICTED
+        is TurnStartCorroboration.CONTRADICTED
     )
     marker_sql, marker_params = next(
         (sql, params)
@@ -1287,13 +1393,14 @@ def test_settlement_leaves_a_moved_remediation_head_a_truthful_no_op(
     _script_execution_lock(conn, _execution_row(review_iteration_id=_ITERATION_ID))
     _script_remediation_subject(conn, head_sha="c" * 40)
     _script_settle(conn, _settled_row("result_not_applied"))
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
     assert outcome.receipt is not None
     assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == "result_not_applied"
     assert triage.calls == []
@@ -1314,13 +1421,14 @@ def test_settlement_settles_a_current_remediation_result(
     _script_complete_execution(conn)
     _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
     _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT))
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_COMPLETION_OBSERVATION,
+        classifier=_CLASSIFIER,
+        evidence=_COMPLETION_EVIDENCE,
     )
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     assert triage.calls == []
 
 
@@ -1342,7 +1450,7 @@ def _initialization_receipt_row(
 ) -> tuple[Any, ...]:
     admitted_at = _OBSERVED if status in ("admitted", "settled") else None
     settled_at = _OBSERVED if status in ("settled", "refused") else None
-    run_id = _RUN_ID if status in ("admitted", "settled") else None
+    run_id = _TURN_REFERENCE if status in ("admitted", "settled") else None
     return (
         _RECEIPT_ID,
         _WORKSPACE_ID,
@@ -1366,10 +1474,10 @@ def _initialization_receipt_row(
     )
 
 
-def _settled_initialization_row(label: str, *, sequence: int | None = 7) -> tuple[Any, ...]:
+def _settled_initialization_row(label: str, *, marker: int | None = 7) -> tuple[Any, ...]:
     outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
-    if sequence is not None:
-        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = sequence
+    if marker is not None:
+        outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
     return _initialization_receipt_row(status="settled", outcome=outcome)
 
 
@@ -1414,17 +1522,12 @@ def _script_initialize(conn: ScriptedConnection, ready_row: Any) -> None:
     )
 
 
-def _establishment_observation(
+def _establishment_evidence(
     *,
-    kind: HubRunObservationKind = HubRunObservationKind.RUN_COMPLETED,
+    kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
     result_candidate: str | None = _READY_PAYLOAD_CANDIDATE,
-) -> ObservedHubRunCompletion:
-    return ObservedHubRunCompletion(
-        external_session_id="ext-init-1",
-        kind=kind,
-        sequence=7,
-        result_candidate=result_candidate,
-    )
+) -> ObservedTurnEvidence:
+    return _terminal_evidence(kind=kind, marker=7, candidate=result_candidate)
 
 
 def test_initialization_settlement_finalizes_ready_atomically_with_the_receipt(
@@ -1444,14 +1547,15 @@ def test_initialization_settlement_finalizes_ready_atomically_with_the_receipt(
     )
     _script_settle(conn, _settled_initialization_row(SETTLEMENT_VALIDATED_RESULT))
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(),
     )
 
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     assert outcome.receipt is not None
     assert outcome.receipt.operation.value == "session_initialization"
     # The one atomic READY write carries the provisional external identity,
@@ -1481,17 +1585,18 @@ def test_initialization_failure_settles_truthfully_and_reports_level_2(
     _script_receipt_for_update(conn, _initialization_receipt_row())
     _script_last_consumed_sequence(conn, None)
     _script_binding_by_id(conn, _connecting_binding_row())
-    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, marker=None))
     _script_current_task(conn, status="planning")
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(kind=HubRunObservationKind.RUN_FAILED),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(kind=DetachedTurnObservationKind.FAILED),
     )
 
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     # The binding is never rewritten: an observed initialization failure
     # leaves the binding CONNECTING, never LOST.
     assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
@@ -1512,17 +1617,18 @@ def test_invalid_initialization_response_is_a_positively_established_protocol_fa
     _script_receipt_for_update(conn, _initialization_receipt_row())
     _script_last_consumed_sequence(conn, None)
     _script_binding_by_id(conn, _connecting_binding_row())
-    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, marker=None))
     _script_current_task(conn, status="planning")
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(result_candidate=_GARBAGE_CANDIDATE),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(result_candidate=_GARBAGE_CANDIDATE),
     )
 
-    assert outcome.kind is HubRunSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["report"].error_code.value == "runtime_protocol"
     assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
@@ -1544,23 +1650,24 @@ def test_initialization_completion_before_the_acknowledgement_is_staged(
             _WORKSPACE_ID,
             _TASK_ID,
             _RECEIPT_ID,
-            HubRunObservationKind.RUN_COMPLETED.value,
+            "run.completed",
             7,
             _READY_PAYLOAD_CANDIDATE,
             _OBSERVED,
         ),
     )
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(),
     )
 
     # The early result is staged on the claimed receipt and consumed exactly
     # once by the acknowledgement attach: never ignored, never duplicated.
-    assert outcome.kind is HubRunSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT
+    assert outcome.kind is TurnSettlementKind.STAGED_PENDING_ACKNOWLEDGEMENT
     inserts = [
         sql
         for sql, _ in conn.executed
@@ -1580,14 +1687,15 @@ def test_moved_on_binding_settles_the_validated_result_as_not_applied(
     _script_binding_by_id(conn, _ready_binding_row("ext-init-1"))
     _script_settle(conn, _settled_initialization_row(SETTLEMENT_RESULT_NOT_APPLIED))
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(),
     )
 
-    assert outcome.kind is HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
     assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
 
 
@@ -1609,14 +1717,15 @@ def test_exact_role_isolation_the_reviewer_settlement_never_touches_the_producer
     _script_initialize(conn, tuple(ready_row))
     _script_settle(conn, _settled_initialization_row(SETTLEMENT_VALIDATED_RESULT))
 
-    outcome = settle_observed_hub_run_completion(
+    outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         connection_id=_CONNECTION_ID,
-        observation=_establishment_observation(),
+        classifier=_CLASSIFIER,
+        evidence=_establishment_evidence(),
     )
 
-    assert outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
     initialize_writes = [
         (sql, params)
         for sql, params in conn.executed
@@ -1635,21 +1744,24 @@ def test_establishment_status_only_completed_is_never_success_evidence(
 ) -> None:
     """Issue #324: a no-prompt ``interactive`` session may carry a Cline
     ``completed``/``endedAt`` record before readiness; the status-only
-    ``run.list`` consultation never treats it as ``session_ready`` or as a
+    status-only consultation never treats it as ``session_ready`` or as a
     settled initialization."""
     conn = ScriptedConnection()
     conn.on(
         _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
         _initialization_receipt_row(),
     )
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="completed")],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(
+            TurnStatusEvidenceVerdict.COMPLETION_WITHOUT_RESULT_EVIDENCE
+        ),
     )
-    assert classification.kind is HubRunStatusClassificationKind.NEVER_SUCCESS_EVIDENCE
+    assert classification.kind is TurnStatusClassificationKind.NEVER_SUCCESS_EVIDENCE
     assert triage.calls == []
     assert not any("update openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
 
@@ -1662,15 +1774,16 @@ def test_establishment_status_only_failed_record_routes_the_establishment_failur
         _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
         _initialization_receipt_row(),
     )
-    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, sequence=None))
+    _script_settle(conn, _settled_initialization_row(SETTLEMENT_OBSERVED_FAILURE, marker=None))
     _script_current_task(conn, status="planning")
-    classification = classify_acknowledged_hub_run_status(
+    classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         receipt_id=_RECEIPT_ID,
-        observed_statuses=[ObservedHubRunStatus(run_id=_RUN_ID, status="failed")],
+        classifier=_CLASSIFIER,
+        status_evidence=_status_evidence(TurnStatusEvidenceVerdict.FAILURE_EVIDENCE),
     )
-    assert classification.kind is HubRunStatusClassificationKind.CLASSIFIED_FAILURE
+    assert classification.kind is TurnStatusClassificationKind.CLASSIFIED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["operation"].family.value == "planning_bootstrap_prepare"

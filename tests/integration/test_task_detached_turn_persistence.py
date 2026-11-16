@@ -1,5 +1,5 @@
-"""Integration-marked persistence tests for the Hub-run correlation/settlement
-seam (issue #322).
+"""Integration-marked persistence tests for the detached-turn
+correlation/settlement seam (issues #322/#348).
 
 These tests apply the committed Supabase migrations within the explicitly
 supplied non-production Supabase branch database and prove the durable
@@ -8,7 +8,7 @@ invariants directly against real Postgres:
 - the partial unique index enforces the single-outstanding-run invariant per
   authoritative session binding (one unsettled ``claimed``/``admitted``
   receipt), while a settled prior receipt frees the slot for the next run;
-- the acknowledged ``runId`` binds at most once per session binding;
+- the acknowledged opaque turn reference binds at most once per session binding;
 - the per-status coherence and outcome-label CHECK constraints reject
   incoherent rows;
 - the acknowledgement attach, settlement, and refusal are one-shot
@@ -25,7 +25,7 @@ pytest configuration. Run explicitly when a target has been made available
 
     OPENORC_TEST_DATABASE_URL=<supplied non-production branch database URL> \\
       .venv/bin/python -m pytest -m integration \\
-      tests/integration/test_task_hub_run_persistence.py
+      tests/integration/test_task_detached_turn_persistence.py
 
 The suite consumes the database it is given and never provisions one.
 """
@@ -41,19 +41,19 @@ from psycopg import Connection
 from psycopg.errors import CheckViolation, ForeignKeyViolation, UniqueViolation
 from psycopg.types.json import Jsonb
 
-from openorc.domain.hub_runs import HubRunObservationKind
+from openorc.domain.detached_turns import DetachedTurnObservationKind
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
-from openorc.persistence.hub_runs import (
-    attach_task_hub_run_acknowledgement,
-    consume_task_hub_run_early_completion,
-    create_task_hub_run_receipt,
-    get_outstanding_task_hub_run_receipt,
-    get_task_hub_run_early_completion_for_update,
-    mark_task_hub_run_receipt_contradicted,
-    refuse_task_hub_run_receipt,
-    settle_task_hub_run_receipt,
-    stage_task_hub_run_early_completion,
+from openorc.persistence.detached_turns import (
+    attach_task_detached_turn_acknowledgement,
+    consume_task_detached_turn_early_completion,
+    create_task_detached_turn_receipt,
+    get_outstanding_task_detached_turn_receipt,
+    get_task_detached_turn_early_completion_for_update,
+    mark_task_detached_turn_receipt_contradicted,
+    refuse_task_detached_turn_receipt,
+    settle_task_detached_turn_receipt,
+    stage_task_detached_turn_early_completion,
 )
 
 pytestmark = pytest.mark.integration
@@ -149,7 +149,7 @@ def _insert_producer_session(conn: Connection[Any], workspace_id: Any, task_id: 
 
 
 def _create_receipt(pool: Any, workspace_id: Any, task_id: Any, session_id: Any) -> Any:
-    return create_task_hub_run_receipt(
+    return create_task_detached_turn_receipt(
         pool,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -170,7 +170,10 @@ def test_the_single_outstanding_run_invariant_is_durable_per_session(
 
     first = _create_receipt(pool, workspace_id, task_id, session_id)
     assert first.status.value == "claimed"
-    assert get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=session_id) is not None
+    assert (
+        get_outstanding_task_detached_turn_receipt(pool, task_agent_session_id=session_id)
+        is not None
+    )
 
     # A concurrent second dispatch for the same session binding is rejected
     # by the partial unique index while the first run is outstanding.
@@ -178,18 +181,18 @@ def test_the_single_outstanding_run_invariant_is_durable_per_session(
         _create_receipt(pool, workspace_id, task_id, session_id)
 
     # Admitting does not free the slot; settling does.
-    attached = attach_task_hub_run_acknowledgement(
+    attached = attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=first.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-1",
+        admitted_turn_reference="run-1",
     )
     assert attached is not None and attached.status.value == "admitted"
     with pytest.raises(UniqueViolation):
         _create_receipt(pool, workspace_id, task_id, session_id)
 
-    settled = settle_task_hub_run_receipt(
+    settled = settle_task_detached_turn_receipt(
         pool,
         receipt_id=first.id,
         task_id=task_id,
@@ -197,7 +200,9 @@ def test_the_single_outstanding_run_invariant_is_durable_per_session(
         outcome={"settlement": "validated_result", "consumed_sequence": 7},
     )
     assert settled is not None and settled.status.value == "settled"
-    assert get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=session_id) is None
+    assert (
+        get_outstanding_task_detached_turn_receipt(pool, task_agent_session_id=session_id) is None
+    )
     second = _create_receipt(pool, workspace_id, task_id, session_id)
     assert second.id != first.id
 
@@ -208,15 +213,15 @@ def test_the_acknowledged_runid_binds_once_per_session(conn: Connection[Any]) ->
     pool = _SingleConnectionPool(conn)
 
     first = _create_receipt(pool, workspace_id, task_id, session_id)
-    attached = attach_task_hub_run_acknowledgement(
+    attached = attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=first.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-1",
+        admitted_turn_reference="run-1",
     )
     assert attached is not None
-    settle_task_hub_run_receipt(
+    settle_task_detached_turn_receipt(
         pool,
         receipt_id=first.id,
         task_id=task_id,
@@ -226,19 +231,19 @@ def test_the_acknowledged_runid_binds_once_per_session(conn: Connection[Any]) ->
     second = _create_receipt(pool, workspace_id, task_id, session_id)
     # The same native run identity can never bind twice within one session.
     with pytest.raises(UniqueViolation):
-        attach_task_hub_run_acknowledgement(
+        attach_task_detached_turn_acknowledgement(
             pool,
             receipt_id=second.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            run_id="run-1",
+            admitted_turn_reference="run-1",
         )
-    rebound = attach_task_hub_run_acknowledgement(
+    rebound = attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=second.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-2",
+        admitted_turn_reference="run-2",
     )
     assert rebound is not None and rebound.run_id == "run-2"
 
@@ -252,28 +257,28 @@ def test_the_forward_only_transitions_are_one_shot_no_ops_when_raced(
 
     receipt = _create_receipt(pool, workspace_id, task_id, session_id)
     assert (
-        attach_task_hub_run_acknowledgement(
+        attach_task_detached_turn_acknowledgement(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            run_id="run-1",
+            admitted_turn_reference="run-1",
         )
         is not None
     )
     # A replayed attach is a rejected no-op that rewrites nothing.
     assert (
-        attach_task_hub_run_acknowledgement(
+        attach_task_detached_turn_acknowledgement(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            run_id="run-2",
+            admitted_turn_reference="run-2",
         )
         is None
     )
     assert (
-        settle_task_hub_run_receipt(
+        settle_task_detached_turn_receipt(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
@@ -283,7 +288,7 @@ def test_the_forward_only_transitions_are_one_shot_no_ops_when_raced(
         is not None
     )
     assert (
-        settle_task_hub_run_receipt(
+        settle_task_detached_turn_receipt(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
@@ -294,17 +299,17 @@ def test_the_forward_only_transitions_are_one_shot_no_ops_when_raced(
     )
 
     refused = _create_receipt(pool, workspace_id, task_id, session_id)
-    settled_slot = attach_task_hub_run_acknowledgement(
+    settled_slot = attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=refused.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-3",
+        admitted_turn_reference="run-3",
     )
     assert settled_slot is not None
     # A refusal applies only to a claimed receipt.
     assert (
-        refuse_task_hub_run_receipt(
+        refuse_task_detached_turn_receipt(
             pool,
             receipt_id=refused.id,
             task_id=task_id,
@@ -323,38 +328,38 @@ def test_the_staged_completion_is_unique_per_receipt_and_consumed_once(
     pool = _SingleConnectionPool(conn)
     receipt = _create_receipt(pool, workspace_id, task_id, session_id)
 
-    staged = stage_task_hub_run_early_completion(
+    staged = stage_task_detached_turn_early_completion(
         pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        kind=HubRunObservationKind.RUN_COMPLETED,
-        sequence=41,
+        kind=DetachedTurnObservationKind.COMPLETED,
+        ordering_marker=41,
         result_candidate='{"type": "implementation_result"}',
     )
-    assert staged.sequence == 41
+    assert staged.ordering_marker == 41
     # A second terminal delivery for the same single outstanding run is a
     # duplicate, never a second staged row.
     with pytest.raises(UniqueViolation):
-        stage_task_hub_run_early_completion(
+        stage_task_detached_turn_early_completion(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
             workspace_id=workspace_id,
-            kind=HubRunObservationKind.RUN_FAILED,
-            sequence=42,
+            kind=DetachedTurnObservationKind.FAILED,
+            ordering_marker=42,
             result_candidate=None,
         )
-    locked = get_task_hub_run_early_completion_for_update(pool, receipt_id=receipt.id)
+    locked = get_task_detached_turn_early_completion_for_update(pool, receipt_id=receipt.id)
     assert locked is not None and locked.id == staged.id
-    assert consume_task_hub_run_early_completion(
+    assert consume_task_detached_turn_early_completion(
         pool, completion_id=staged.id, receipt_id=receipt.id
     )
     # The exactly-once consumption: a second delete is a rejected no-op.
-    assert not consume_task_hub_run_early_completion(
+    assert not consume_task_detached_turn_early_completion(
         pool, completion_id=staged.id, receipt_id=receipt.id
     )
-    assert get_task_hub_run_early_completion_for_update(pool, receipt_id=receipt.id) is None
+    assert get_task_detached_turn_early_completion_for_update(pool, receipt_id=receipt.id) is None
 
 
 def test_the_subject_foreign_keys_reject_cross_task_subjects(conn: Connection[Any]) -> None:
@@ -364,7 +369,7 @@ def test_the_subject_foreign_keys_reject_cross_task_subjects(conn: Connection[An
     pool = _SingleConnectionPool(conn)
     # A receipt referencing another Task's session identity is impossible.
     with pytest.raises(ForeignKeyViolation):
-        create_task_hub_run_receipt(
+        create_task_detached_turn_receipt(
             pool,
             workspace_id=first_workspace,
             task_id=first_task,
@@ -381,14 +386,14 @@ def test_the_contradiction_marker_blocks_settlement(conn: Connection[Any]) -> No
     session_id = _insert_producer_session(conn, workspace_id, task_id)
     pool = _SingleConnectionPool(conn)
     receipt = _create_receipt(pool, workspace_id, task_id, session_id)
-    attach_task_hub_run_acknowledgement(
+    attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-1",
+        admitted_turn_reference="run-1",
     )
-    marked = mark_task_hub_run_receipt_contradicted(
+    marked = mark_task_detached_turn_receipt_contradicted(
         pool,
         receipt_id=receipt.id,
         task_id=task_id,
@@ -397,7 +402,7 @@ def test_the_contradiction_marker_blocks_settlement(conn: Connection[Any]) -> No
     assert marked is not None and marked.contradicted_at is not None
     # A repeated contradiction is a rejected no-op; the marker is set once.
     assert (
-        mark_task_hub_run_receipt_contradicted(
+        mark_task_detached_turn_receipt_contradicted(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
@@ -408,7 +413,7 @@ def test_the_contradiction_marker_blocks_settlement(conn: Connection[Any]) -> No
     # A contradicted correlation can never settle: the settlement CAS refuses
     # it, so the outstanding run stays honestly unresolved.
     assert (
-        settle_task_hub_run_receipt(
+        settle_task_detached_turn_receipt(
             pool,
             receipt_id=receipt.id,
             task_id=task_id,
@@ -433,12 +438,12 @@ def test_the_coherence_and_outcome_label_checks_reject_incoherent_rows(
             "update openorc.task_hub_run_receipts set status = 'admitted' where id = %s",
             (receipt.id,),
         )
-    attach_task_hub_run_acknowledgement(
+    attach_task_detached_turn_acknowledgement(
         pool,
         receipt_id=receipt.id,
         task_id=task_id,
         workspace_id=workspace_id,
-        run_id="run-1",
+        admitted_turn_reference="run-1",
     )
     # A settled receipt must carry its settlement label.
     with pytest.raises(CheckViolation), conn.transaction():
@@ -447,7 +452,7 @@ def test_the_coherence_and_outcome_label_checks_reject_incoherent_rows(
             "settled_at = now() where id = %s",
             (receipt.id,),
         )
-    settled = settle_task_hub_run_receipt(
+    settled = settle_task_detached_turn_receipt(
         pool,
         receipt_id=receipt.id,
         task_id=task_id,

@@ -58,9 +58,9 @@ from typing import Any
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import AgentRuntimeError, AgentSessionNotFoundError
 from openorc.adapters.agent_runtime.results import (
-    AgentRunAdmission,
     AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
@@ -400,23 +400,23 @@ class FakeAgentRuntimeAdapter(AgentRuntimeAdapter):
             reported_runtime_version=self._reported_runtime_version,
         )
 
-    def admit_initialization_run(self, session_id: str, initialization: str) -> AgentRunAdmission:
+    def admit_detached_turn(self, session_id: str, content: str) -> AgentTurnAdmission:
         """Admit the composed initialization verbatim as one detached run."""
         session = self._sessions.get(session_id)
         if session is None or session.lost:
             raise AgentSessionNotFoundError(
                 "the exact addressed external session is not live on this runtime"
             )
-        self._detached_admissions.append((session_id, initialization))
+        self._detached_admissions.append((session_id, content))
         if self._lifecycle is not None:
-            self._lifecycle.append("admit_initialization_run")
-        session.initialization = initialization
+            self._lifecycle.append("admit_detached_turn")
+        session.initialization = content
         if self._admission_outcomes:
             outcome = self._admission_outcomes.pop(0)
             if isinstance(outcome, AgentRuntimeError):
                 raise outcome
         self._admission_number += 1
-        return AgentRunAdmission(run_id=f"fake-run-{self._admission_number}")
+        return AgentTurnAdmission(turn_reference=f"fake-run-{self._admission_number}")
 
     def detached_allocation_requests(self) -> tuple[AgentSessionCreationRequest, ...]:
         """Every detached allocation attempt in order, exactly as received."""

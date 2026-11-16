@@ -106,9 +106,9 @@ from openorc.domain.tasks import (
 )
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
-from openorc.persistence.hub_runs import (
+from openorc.persistence.detached_turns import (
     get_latest_session_initialization_receipt,
-    get_outstanding_task_hub_run_receipt,
+    get_outstanding_task_detached_turn_receipt,
 )
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -392,10 +392,10 @@ def _classify_claimed_bootstrap(
     """
     if stage is not None:
         return _ClaimedBootstrapDisposition.UNRESOLVED_PAST_ESTABLISHMENT
-    producer_receipt = get_outstanding_task_hub_run_receipt(
+    producer_receipt = get_outstanding_task_detached_turn_receipt(
         transaction_pool, task_agent_session_id=producer.id
     )
-    reviewer_receipt = get_outstanding_task_hub_run_receipt(
+    reviewer_receipt = get_outstanding_task_detached_turn_receipt(
         transaction_pool, task_agent_session_id=reviewer.id
     )
     producer_dispatched = producer_receipt is not None or (
@@ -479,11 +479,11 @@ def find_resumable_bootstrap_continuation(
         ):
             return None
         if (
-            get_outstanding_task_hub_run_receipt(
+            get_outstanding_task_detached_turn_receipt(
                 transaction_pool, task_agent_session_id=producer.id
             )
             is not None
-            or get_outstanding_task_hub_run_receipt(
+            or get_outstanding_task_detached_turn_receipt(
                 transaction_pool, task_agent_session_id=reviewer.id
             )
             is not None

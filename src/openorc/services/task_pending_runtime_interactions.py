@@ -50,8 +50,8 @@ from openorc.domain.tasks import Task, TaskPlanningBootstrapStage, TaskStatus
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import list_outstanding_session_initialization_receipts
 from openorc.persistence.executions import list_task_executions
-from openorc.persistence.hub_runs import list_outstanding_session_initialization_receipts
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import get_task_pull_request_for_task
 from openorc.persistence.sessions import get_task_agent_session

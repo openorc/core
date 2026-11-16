@@ -70,19 +70,21 @@ from typing import Final, Protocol, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import (
+    DetachedTurnRuntime,
+)
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeUncertainOutcomeError,
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
-    AgentRunAdmission,
     AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
 )
 from openorc.domain.connections import AdapterType, WorkflowRole
-from openorc.domain.hub_runs import TaskHubRunReceipt
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Workspace
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -95,9 +97,9 @@ from openorc.domain.sessions import (
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
-from openorc.persistence.hub_runs import (
-    get_outstanding_task_hub_run_receipt,
-    refuse_task_hub_run_receipt,
+from openorc.persistence.detached_turns import (
+    get_outstanding_task_detached_turn_receipt,
+    refuse_task_detached_turn_receipt,
 )
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -110,7 +112,7 @@ from openorc.persistence.sessions import (
 from openorc.persistence.tasks import get_task, lock_workspace_task_arbitration
 from openorc.protocol.initialization_assets import compose_initialization
 from openorc.protocol.models import SESSION_READY_FAMILY
-from openorc.services import task_hub_run_correlation as hub_run_correlation
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.cline_hub_observation import HubObservationRefusalReason
 from openorc.services.errors import (
     ApplicationError,
@@ -604,34 +606,13 @@ def establish_task_agent_session(
             ) from error
 
 
-class DetachedInitializationRuntime(Protocol):
-    """The structural detached-initialization capability of one runtime.
-
-    Runtime-neutral typing for the detached session establishment dispatch
-    (issue #324): concrete adapters implement the two capability methods
-    structurally (the universal ``AgentRuntimeAdapter`` surface is never
-    expanded), and application services duck-type the capability before
-    dispatching. A runtime without the capability is never dispatched
-    detached — it keeps the existing blocking readiness handshake.
-    """
-
-    def allocate_detached_session(
-        self, request: AgentSessionCreationRequest
-    ) -> AgentSessionAllocation:
-        """Allocate the fresh external session; no model turn, no readiness."""
-        ...
-
-    def admit_initialization_run(self, session_id: str, initialization: str) -> AgentRunAdmission:
-        """Admit the composed canonical initialization as one detached run."""
-        ...
-
-
 class EstablishmentObservationRegistrar(Protocol):
     """The structural registration seam of the process's Hub-run observer.
 
-    The positively-required pre-enqueue gate (issue #323): the establishment
-    dispatch registers the exact created external session before any
-    enqueue, so the pinned SDK's unreplayable terminal result can never be
+    The positively-required pre-admission gate (issue #323): the
+    establishment dispatch registers the exact created external session
+    before any admission, so the pinned SDK's unreplayable terminal result
+    can never be
     dispatched without active observation. Failures are the observer's typed
     refusals, routed through the pre-effect failure machinery.
     """
@@ -663,22 +644,22 @@ class DispatchedSessionEstablishment:
     """
 
     task_agent_session: TaskAgentSession
-    receipt: TaskHubRunReceipt | None
+    receipt: TaskDetachedTurnReceipt | None
 
 
 _DISPATCH_SPAN_NAME: Final = "session_runtime.dispatch_task_agent_session_establishment"
 _READINESS_FINALIZE_SPAN_NAME: Final = "session_runtime.finalize_observed_initialization_readiness"
 
 
-def _require_detached_capability(adapter: AgentRuntimeAdapter) -> DetachedInitializationRuntime:
+def _require_detached_capability(adapter: AgentRuntimeAdapter) -> DetachedTurnRuntime:
     """Fail closed unless the adapter implements the detached capability."""
     allocate = getattr(adapter, "allocate_detached_session", None)
-    admit = getattr(adapter, "admit_initialization_run", None)
+    admit = getattr(adapter, "admit_detached_turn", None)
     if not callable(allocate) or not callable(admit):
         raise InvalidCommandError(
-            "the runtime adapter does not implement the detached initialization capability"
+            "the runtime adapter does not implement the detached turn capability"
         )
-    return cast(DetachedInitializationRuntime, adapter)
+    return cast(DetachedTurnRuntime, adapter)
 
 
 def _require_observation_registrar(
@@ -710,10 +691,10 @@ def dispatch_task_agent_session_establishment(
 
     The detached counterpart of the #130 readiness establishment (issue
     #324): the same phase 1 binding validation and phase 2 composition, then
-    the initialization becomes one enqueued, independently completed agent
+    the initialization becomes one admitted, independently completed agent
     turn — one promptless ``start`` of the v1 ``interactive`` construction
     bundle, one positively-required observation registration, and one
-    ``run.enqueue`` admission of the composed canonical initialization
+    detached-turn admission of the composed canonical initialization
     verbatim. No ``send`` and no prompt-inside-``start`` shortcut exists in
     this path, and no database transaction is ever held across a runtime
     call.
@@ -723,12 +704,12 @@ def dispatch_task_agent_session_establishment(
     - The receipt is the minimum separate provisional establishment
       evidence, committed with the provisional external identity and the
       dispatch-composed non-secret configuration snapshot strictly before
-      any enqueue. The authoritative binding stays CONNECTING with a NULL
+      any admission. The authoritative binding stays CONNECTING with a NULL
       external identity: Hub admission is never readiness, never a bound
       identity, and never a durable final binding.
     - An outstanding initialization receipt makes this dispatch an
       idempotent no-op (the same receipt returned): a repeated bootstrap can
-      never create or enqueue twice. A refused/failed receipt while
+      never create or admit twice. A refused/failed receipt while
       CONNECTING is the caller's unresolved-establishment classification,
       not a re-dispatch authorization.
     - A positively identified refusal (unavailable before effect, Hub
@@ -790,7 +771,7 @@ def dispatch_task_agent_session_establishment(
             # facts.
             return DispatchedSessionEstablishment(
                 binding,
-                get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=binding.id),
+                get_outstanding_task_detached_turn_receipt(pool, task_agent_session_id=binding.id),
             )
         if binding.lifecycle_status in (
             TaskSessionLifecycleStatus.LOST,
@@ -808,8 +789,10 @@ def dispatch_task_agent_session_establishment(
             )
 
         # --- Replay guard: a durably dispatched establishment is never
-        # re-created or re-enqueued; the outstanding receipt is the proof. ---
-        outstanding = get_outstanding_task_hub_run_receipt(pool, task_agent_session_id=binding.id)
+        # re-created or re-admitted; the outstanding receipt is the proof. ---
+        outstanding = get_outstanding_task_detached_turn_receipt(
+            pool, task_agent_session_id=binding.id
+        )
         if outstanding is not None:
             return DispatchedSessionEstablishment(binding, outstanding)
 
@@ -867,7 +850,7 @@ def _admit_detached_initialization(
     pool: DatabasePool,
     *,
     registrar: EstablishmentObservationRegistrar,
-    runtime: DetachedInitializationRuntime,
+    runtime: DetachedTurnRuntime,
     workspace_id: UUID,
     task_id: UUID,
     role: WorkflowRole,
@@ -880,11 +863,11 @@ def _admit_detached_initialization(
 ) -> DispatchedSessionEstablishment:
     """Record the provisional receipt, register observation, admit, attach."""
     # --- Phase 3b: the provisional establishment receipt (one short
-    # transaction, strictly before any enqueue). The admission race and the
+    # transaction, strictly before any admission). The admission race and the
     # single-outstanding-run invariant are durable from the first possible
     # effect. ---
     try:
-        receipt = hub_run_correlation.record_task_hub_run_receipt(
+        receipt = turn_correlation.record_task_detached_turn_receipt(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -907,8 +890,8 @@ def _admit_detached_initialization(
         ) from error
 
     # --- Phase 3c: observation registration — the positively-required
-    # pre-enqueue gate. A refusal is a proven pre-effect failure: the
-    # just-recorded receipt is marked refused so a never-dispatched run
+    # pre-admission gate. A refusal is a proven pre-effect failure: the
+    # just-recorded receipt is marked refused so a never-dispatched turn
     # cannot hold the session's single-outstanding slot. A typed observer
     # refusal propagates unchanged with its own safe reason; any other
     # failure is typed into the same refusal with the safe generic token. ---
@@ -931,14 +914,15 @@ def _admit_detached_initialization(
         )
         raise HubObservationRegistrationRefusedError(
             "the initialization observation registration failed before any "
-            "enqueue; the dispatch is a proven pre-effect failure",
+            "admission; the dispatch is a proven pre-effect failure",
             reason=HubObservationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
         ) from error
 
     # --- Phase 3d: admission (external, no transaction held). One
-    # ``run.enqueue`` of the composed canonical initialization verbatim. ---
+    # detached-turn admission of the composed canonical initialization
+    # verbatim. ---
     try:
-        admission = runtime.admit_initialization_run(allocation.external_session_id, initialization)
+        admission = runtime.admit_detached_turn(allocation.external_session_id, initialization)
     except AgentRuntimeUncertainOutcomeError as error:
         logger.warning(
             "the detached initialization admission ended with an uncertain "
@@ -951,7 +935,7 @@ def _admit_detached_initialization(
             "never re-dispatched"
         ) from error
     except AgentRuntimeError as error:
-        # A positively identified refusal (unreachable before effect, Hub
+        # A positively identified refusal (unreachable before effect, runtime
         # rejection, exact-session absence): proven pre-effect, so the
         # receipt is marked refused and the dispatch fails known.
         _refuse_dispatched_receipt_quietly(pool, receipt, refusal_kind="admission_refused")
@@ -966,12 +950,12 @@ def _admit_detached_initialization(
     # finished before the acknowledgement was persisted is correlated, never
     # ignored or duplicated. ---
     try:
-        outcome = hub_run_correlation.attach_acknowledged_hub_run(
+        outcome = turn_correlation.attach_acknowledged_turn(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
             receipt_id=receipt.id,
-            run_id=admission.run_id,
+            admitted_turn_reference=admission.turn_reference,
         )
     except ApplicationError:
         raise
@@ -998,7 +982,7 @@ def _reported_provenance(allocation: AgentSessionAllocation) -> dict[str, object
 
 
 def _refuse_dispatched_receipt_quietly(
-    pool: DatabasePool, receipt: TaskHubRunReceipt, *, refusal_kind: str
+    pool: DatabasePool, receipt: TaskDetachedTurnReceipt, *, refusal_kind: str
 ) -> None:
     """Mark a claimed receipt refused after a proven pre-effect failure.
 
@@ -1008,7 +992,7 @@ def _refuse_dispatched_receipt_quietly(
     the failure is logged selectively.
     """
     try:
-        refused = refuse_task_hub_run_receipt(
+        refused = refuse_task_detached_turn_receipt(
             pool,
             receipt_id=receipt.id,
             task_id=receipt.task_id,

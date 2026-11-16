@@ -4,7 +4,7 @@ The regular-mode application-lifecycle component that receives Hub run
 completions without keeping any OpenOrc local worker slot or bridge RPC
 blocked for the turn's lifetime. The observer is a process/application
 -lifecycle concern owned by the serving lifespan; the shared settlement seam
-(:mod:`openorc.services.task_hub_run_correlation`) remains the sole workflow
+(:mod:`openorc.services.task_detached_turn_correlation`) remains the sole workflow
 authority, and the owning Level 1 dispatch services (migrated in issue #325)
 remain the only intended callers of the registration seam.
 
@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import StrEnum
 from typing import Final
 from uuid import UUID
@@ -60,28 +60,33 @@ from uuid import UUID
 from openorc.adapters.cline import (
     ClineBridgeProcessBackend,
     ClineHubEvent,
-    ClineHubRunStartObservation,
     ClineRemoteConfig,
     ClineSdkBackend,
     ClineSdkBackendError,
+    JsonObject,
     Subscription,
     classify_backend_failure,
-    project_hub_run_start,
-    project_hub_run_statuses,
-    project_terminal_hub_run,
+    classify_hub_run_start,
+    classify_hub_run_statuses,
+    classify_terminal_hub_run,
+    hub_evidence_family,
     resolve_connection_control_endpoint,
 )
 from openorc.adapters.cline.connection_endpoint import ConnectionControlEndpointError
 from openorc.domain.connections import AdapterType, Connection
-from openorc.domain.hub_runs import (
-    ObservedHubRunCompletion,
-    ObservedHubRunStatus,
-    TaskHubRunReceiptStatus,
+from openorc.domain.detached_turns import (
+    NativeTurnEvidence,
+    ObservedTurnEvidence,
+    TaskDetachedTurnReceiptStatus,
+    TurnAttribution,
+    TurnEvidenceFamily,
+    TurnStatusEvidenceVerdict,
+    TurnTerminalClassification,
 )
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.hub_runs import (
+from openorc.persistence.detached_turns import (
     find_outstanding_session_initialization_receipt,
-    get_outstanding_task_hub_run_receipt,
+    get_outstanding_task_detached_turn_receipt,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import find_task_agent_session_binding
@@ -96,12 +101,12 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
-from openorc.services.task_hub_run_correlation import (
-    HubRunSettlementKind,
-    HubRunStatusClassificationKind,
-    check_hub_run_start_identity,
-    classify_acknowledged_hub_run_status,
-    settle_observed_hub_run_completion,
+from openorc.services.task_detached_turn_correlation import (
+    TurnSettlementKind,
+    TurnStatusClassificationKind,
+    check_turn_start_identity,
+    classify_acknowledged_turn_status,
+    settle_observed_turn_completion,
 )
 
 # The post-commit bootstrap continuation trigger of the process wiring
@@ -143,12 +148,12 @@ _MAX_CONCURRENT_SESSION_OBSERVATIONS: Final[int] = 128
 # a staged early completion still awaits its acknowledgement, a rejected
 # stale duplicate may precede the fresh completion, and an unresolved
 # observation is retained rather than abandoned.
-_CLEANUP_SETTLEMENT_KINDS: Final[frozenset[HubRunSettlementKind]] = frozenset(
+_CLEANUP_SETTLEMENT_KINDS: Final[frozenset[TurnSettlementKind]] = frozenset(
     {
-        HubRunSettlementKind.SETTLED_VALIDATED_RESULT,
-        HubRunSettlementKind.SETTLED_OBSERVED_FAILURE,
-        HubRunSettlementKind.SETTLED_RESULT_NOT_APPLIED,
-        HubRunSettlementKind.NO_OUTSTANDING_RUN,
+        TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+        TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED,
+        TurnSettlementKind.NO_OUTSTANDING_RUN,
     }
 )
 
@@ -207,6 +212,40 @@ class _SessionObservation:
         self.external_session_id = external_session_id
         self.subscription = subscription
         self.lifecycle_token = 0
+
+
+class _ClineHubEventEvidence(NativeTurnEvidence):
+    """Opaque carrier of one delivered Hub event envelope.
+
+    The envelope stays inside the Cline integration: shared application code
+    routes the neutral evidence envelope and hands this carrier back to this
+    integration's classifier, never inspecting or persisting its contents.
+    """
+
+    __slots__ = ("event",)
+
+    def __init__(self, event: ClineHubEvent) -> None:
+        self.event = event
+
+    def __repr__(self) -> str:
+        return "_ClineHubEventEvidence(<withheld>)"
+
+
+class _ClineStatusRecordsEvidence(NativeTurnEvidence):
+    """Opaque carrier of one status-only ``run.list`` record consultation.
+
+    The records stay inside the Cline integration and are interpreted only
+    by this integration's classifier; payload contents never enter
+    representations, errors, or logs.
+    """
+
+    __slots__ = ("records",)
+
+    def __init__(self, records: list[JsonObject]) -> None:
+        self.records = records
+
+    def __repr__(self) -> str:
+        return f"_ClineStatusRecordsEvidence({len(self.records)} records)"
 
 
 class _ConnectionAttachment:
@@ -761,21 +800,26 @@ class HubRunObserver:
                 "subscribed task session; it is not routed"
             )
             return
-        completion = project_terminal_hub_run(event)
-        if completion is not None:
-            self._route_terminal_observation(entry, lease, completion)
+        family = hub_evidence_family(event)
+        if family is None or event.session_id is None:
+            return  # not a qualified, attributable turn observation; nothing is invented
+        evidence = ObservedTurnEvidence(
+            external_session_id=event.session_id,
+            family=family,
+            native_evidence=_ClineHubEventEvidence(event),
+        )
+        if family is TurnEvidenceFamily.TURN_TERMINAL:
+            self._route_terminal_observation(entry, lease, evidence)
             return
-        start = project_hub_run_start(event)
-        if start is not None:
-            self._route_start_observation(entry, start)
+        self._route_start_observation(entry, evidence)
 
     def _route_terminal_observation(
         self,
         entry: _SessionObservation,
         lease: int,
-        completion: ObservedHubRunCompletion,
+        evidence: ObservedTurnEvidence,
     ) -> None:
-        """Settle one verified terminal observation through the shared seam.
+        """Settle one delivered terminal observation through the shared seam.
 
         The seam owns attribution, duplicate/stale rejection, staging for
         the admission race, formal validation, and every workflow
@@ -794,11 +838,12 @@ class HubRunObserver:
                 connection_id=str(entry.connection_id),
             )
             try:
-                outcome = settle_observed_hub_run_completion(
+                outcome = settle_observed_turn_completion(
                     self._pool_provider(),
+                    classifier=self,
                     workspace_id=entry.workspace_id,
                     connection_id=entry.connection_id,
-                    observation=completion,
+                    evidence=evidence,
                 )
             except Exception as error:  # noqa: BLE001 - best-effort ingestion
                 logger.warning(
@@ -810,7 +855,7 @@ class HubRunObserver:
         if outcome.kind in _CLEANUP_SETTLEMENT_KINDS:
             self._cleanup_after_settlement(entry, lease)
         if (
-            outcome.kind is HubRunSettlementKind.SETTLED_VALIDATED_RESULT
+            outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
             and outcome.receipt is not None
             and outcome.receipt.operation.value == "session_initialization"
             and self._bootstrap_continuation_trigger is not None
@@ -834,22 +879,22 @@ class HubRunObserver:
                 )
 
     def _route_start_observation(
-        self, entry: _SessionObservation, start: ClineHubRunStartObservation
+        self, entry: _SessionObservation, evidence: ObservedTurnEvidence
     ) -> None:
-        """Corroborate one observed run-start identity through the seam.
+        """Corroborate one delivered turn-start observation through the seam.
 
-        Read-only: the seam classifies corroboration, contradiction, and
-        unattributable starts and records contradictions itself; this
-        boundary delivers the identity exactly as observed and contains
-        every failure.
+        Read-only: the seam resolves the durable correlation and records
+        contradictions itself, on this integration's neutral attribution
+        classification; this boundary delivers the evidence exactly as
+        observed and contains every failure.
         """
         try:
-            check_hub_run_start_identity(
+            check_turn_start_identity(
                 self._pool_provider(),
+                classifier=self,
                 workspace_id=entry.workspace_id,
                 connection_id=entry.connection_id,
-                external_session_id=start.external_session_id,
-                request_id=start.request_id,
+                evidence=evidence,
             )
         except Exception as error:  # noqa: BLE001 - best-effort ingestion
             logger.warning(
@@ -945,7 +990,7 @@ class HubRunObserver:
     ) -> None:
         """Recheck one entry's outstanding receipt and consult status-only reads."""
         try:
-            receipt = get_outstanding_task_hub_run_receipt(
+            receipt = get_outstanding_task_detached_turn_receipt(
                 self._pool_provider(), task_agent_session_id=entry.task_agent_session_id
             )
         except Exception as error:  # noqa: BLE001 - best-effort reconciliation
@@ -969,11 +1014,10 @@ class HubRunObserver:
                         entry.task_agent_session_id,
                     )
             return
-        if receipt.status is not TaskHubRunReceiptStatus.ADMITTED:
+        if receipt.status is not TaskDetachedTurnReceiptStatus.ADMITTED:
             return  # still claimed: the acknowledgement attach owns any staged completion
         try:
             records = backend.list_runs(entry.external_session_id)
-            statuses = project_hub_run_statuses(records)
         except Exception as error:  # noqa: BLE001 - the consultation stays best-effort
             logger.warning(
                 "hub-run reconnect run.list consultation failed (%s) for task session %s",
@@ -981,15 +1025,15 @@ class HubRunObserver:
                 entry.task_agent_session_id,
             )
             return
-        self._classify_reconnected_receipt(entry, receipt.id, statuses)
+        self._classify_reconnected_receipt(entry, receipt.id, _ClineStatusRecordsEvidence(records))
 
     def _classify_reconnected_receipt(
         self,
         entry: _SessionObservation,
         receipt_id: UUID,
-        statuses: list[ObservedHubRunStatus],
+        status_evidence: _ClineStatusRecordsEvidence,
     ) -> None:
-        """Hand one reconnected receipt's status-only observation to the seam."""
+        """Hand one reconnected receipt's status-only evidence to the seam."""
         with application_span(_TRACER_SCOPE, _RECONNECT_SPAN_NAME) as span:
             annotate_span(
                 span,
@@ -999,12 +1043,13 @@ class HubRunObserver:
                 connection_id=str(entry.connection_id),
             )
             try:
-                classification = classify_acknowledged_hub_run_status(
+                classification = classify_acknowledged_turn_status(
                     self._pool_provider(),
+                    classifier=self,
                     workspace_id=entry.workspace_id,
                     task_id=entry.task_id,
                     receipt_id=receipt_id,
-                    observed_statuses=statuses,
+                    status_evidence=status_evidence,
                 )
             except Exception as error:  # noqa: BLE001 - the consultation stays best-effort
                 logger.warning(
@@ -1013,12 +1058,51 @@ class HubRunObserver:
                     entry.task_agent_session_id,
                 )
                 return
-        if classification.kind is HubRunStatusClassificationKind.CLASSIFIED_FAILURE:
+        if classification.kind is TurnStatusClassificationKind.CLASSIFIED_FAILURE:
             logger.warning(
                 "hub-run reconnect classified the outstanding run's status-only failed "
                 "record for task session %s",
                 entry.task_agent_session_id,
             )
+
+    # --- the runtime integration's neutral evidence classification -----------
+    # The pinned Hub semantics of which native evidence proves or counters an
+    # admitted turn live here (issue #348): shared application code consumes
+    # only the neutral verdicts these methods produce and never inspects the
+    # opaque carriers or compares native identities itself.
+
+    def classify_turn_start(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnAttribution:
+        """Classify one delivered start envelope's attribution."""
+        if not isinstance(evidence, _ClineHubEventEvidence):
+            raise InvalidCommandError("start evidence must be this integration's carrier")
+        return classify_hub_run_start(
+            evidence.event, outstanding_turn_reference=outstanding_turn_reference
+        )
+
+    def classify_turn_terminal(
+        self,
+        evidence: NativeTurnEvidence,
+        *,
+        consumed_ordering_markers: Sequence[int],
+    ) -> TurnTerminalClassification:
+        """Classify one delivered terminal envelope's freshness and outcome."""
+        if not isinstance(evidence, _ClineHubEventEvidence):
+            raise InvalidCommandError("terminal evidence must be this integration's carrier")
+        return classify_terminal_hub_run(
+            evidence.event, consumed_ordering_markers=consumed_ordering_markers
+        )
+
+    def classify_turn_statuses(
+        self, evidence: NativeTurnEvidence, *, outstanding_turn_reference: str
+    ) -> TurnStatusEvidenceVerdict:
+        """Classify one status-only record consultation for the outstanding ref."""
+        if not isinstance(evidence, _ClineStatusRecordsEvidence):
+            raise InvalidCommandError("status evidence must be this integration's carrier")
+        return classify_hub_run_statuses(
+            evidence.records, outstanding_turn_reference=outstanding_turn_reference
+        )
 
     def _detach_entry(self, entry: _SessionObservation) -> Subscription | None:
         """Detach one entry atomically under the registry lock."""

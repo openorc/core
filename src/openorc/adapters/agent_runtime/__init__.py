@@ -7,6 +7,10 @@ local adapter boundaries and never expand the universal contract.
 """
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import (
+    AgentTurnAdmission,
+    DetachedTurnRuntime,
+)
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeDeliveryUncertainError,
@@ -20,7 +24,6 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
-    AgentRunAdmission,
     AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
@@ -38,10 +41,11 @@ __all__ = [
     "AgentRuntimeTransportError",
     "AgentRuntimeUnavailableError",
     "AgentRuntimeUncertainOutcomeError",
-    "AgentRunAdmission",
     "AgentSessionAllocation",
     "AgentSessionCreated",
     "AgentSessionCreationRequest",
     "AgentSessionNotFoundError",
     "AgentTextResponse",
+    "AgentTurnAdmission",
+    "DetachedTurnRuntime",
 ]
