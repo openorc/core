@@ -660,7 +660,7 @@ _RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id =
 _RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
 _RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
 _EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
-_FAILED_TRANSIENT_UPDATE = _sql_has("update openorc.executions set status = %s")
+_EXECUTION_STATUS_UPDATE = _sql_has("update openorc.executions set status = %s")
 
 
 def _remediation_receipt_row(
@@ -900,7 +900,7 @@ def test_a_refused_remediation_registration_refuses_the_receipt_and_finalizes_th
     conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
     conn.on(_RECEIPT_REFUSE, _remediation_receipt_row(status="refused"))
     conn.on(
-        _FAILED_TRANSIENT_UPDATE,
+        _EXECUTION_STATUS_UPDATE,
         _claimed_execution_row(status="failed_transient"),
     )
     conn.on(_EVENT_INSERT, _event_returned_row("execution_failed"))
@@ -920,7 +920,7 @@ def test_a_refused_remediation_registration_refuses_the_receipt_and_finalizes_th
         )
 
     assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
-    assert _count(conn, _FAILED_TRANSIENT_UPDATE) == 1
+    assert _count(conn, _EXECUTION_STATUS_UPDATE) == 1
     assert adapter.detached_admissions() == ()
 
 
@@ -948,8 +948,130 @@ def test_an_uncertain_remediation_admission_leaves_the_receipt_claimed(
 
     assert not any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
     assert _count(conn, _COMPLETE_UPDATE) == 0
-    assert _count(conn, _FAILED_TRANSIENT_UPDATE) == 0
+    assert _count(conn, _EXECUTION_STATUS_UPDATE) == 0
     assert len(adapter.detached_admissions()) == 1
+
+
+# The Level 3 block installation's SQL predicates and canned rows (the shared
+# F3 exceptional-blocking foundation, mirroring the E8 block shape).
+_BLOCK_INSERT = _sql_has("insert into openorc.task_blocks")
+_GATES_INSERT = _sql_has("insert into openorc.owner_gates")
+_TASK_GATE_WRITE = _sql_has("update openorc.tasks set current_owner_gate_id")
+
+
+def _remediation_block_row() -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "stale_operation",
+        {},
+        None,
+        _OBSERVED,
+    )
+
+
+def _remediation_block_gate_row() -> tuple[Any, ...]:
+    """The pending Type B ``BLOCK_RESOLUTION`` gate an unverifiable round
+    installs, bound to its fresh TaskBlock subject."""
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "block_resolution",
+        "pending",
+        None,
+        None,
+        None,
+        uuid.uuid4(),
+        None,
+        _OBSERVED,
+    )
+
+
+def _event_types(conn: ScriptedConnection) -> list[str]:
+    types: list[str] = []
+    for sql, params in conn.executed:
+        if _EVENT_INSERT(sql, None) and params is not None:
+            types.append(str(params[2]))
+    return types
+
+
+def test_a_failed_receipt_recording_aborts_the_dispatch_before_any_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-shot E9 claim and its detached-turn receipt companion commit in
+    ONE short transaction (issue #338): a receipt failure — a concurrent
+    outstanding receipt for the session binding — fails the whole composition
+    as the typed conflict, so a claimed Execution can never exist without its
+    correlation receipt and nothing is ever registered or admitted."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_claim(conn)
+    conn.on(
+        _RECEIPT_INSERT,
+        UniqueViolation("receipt", "unique", "one unsettled receipt per session"),
+    )
+    adapter = _prepared_producer_adapter(fake_pool)
+
+    with pytest.raises(ConflictError, match="outstanding detached-turn receipt"):
+        _detached_remediation_call(
+            pool,
+            adapter,
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    # The receipt insert and the claim's own statements ran inside the same
+    # attempted composition; the typed conflict surfaced before any
+    # registration or admission, and durable atomicity (the whole claim
+    # rolling back with the receipt) is proven by the integration-marked
+    # suite against a real database.
+    assert _count(conn, _RECEIPT_INSERT) == 1
+    assert _count(conn, _EXECUTION_INSERT) == 1
+    assert adapter.detached_admissions() == ()
+
+
+def test_an_r1_authority_movement_after_the_claim_refuses_the_receipt_and_finalizes_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authority moving on after the claim-and-receipt commit, before any
+    runtime effect, finalizes the never-dispatched attempt truthfully as
+    ``failed_final`` and refuses the just-recorded receipt — a never-dispatched
+    turn never holds the session's single-outstanding slot."""
+    conn = ScriptedConnection()
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    _script_claim(conn)
+    conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
+    # R1: the post-attachment currentness proof fails on a rotated token.
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, StaleOperationError("the task state has moved on"))
+    conn.on(_RECEIPT_REFUSE, _remediation_receipt_row(status="refused"))
+    conn.on(
+        _EXECUTION_STATUS_UPDATE,
+        _claimed_execution_row(status="failed_final"),
+    )
+    conn.on(_EVENT_INSERT, _event_returned_row("execution_failed"))
+    adapter = _prepared_producer_adapter(fake_pool)
+
+    with pytest.raises(StaleOperationError):
+        _detached_remediation_call(
+            pool,
+            adapter,
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
+    final_params = [
+        params
+        for sql, params in conn.executed
+        if _EXECUTION_STATUS_UPDATE(sql, None) and params is not None
+    ]
+    assert any(str(params[0]) == "failed_final" for params in final_params)
+    assert adapter.detached_admissions() == ()
 
 
 def _verification_pool_setup(
@@ -957,26 +1079,60 @@ def _verification_pool_setup(
     *,
     execution_row: Any,
     iteration_rows: list[Any],
-    observed_head: str,
+    observed_head: str | None,
 ) -> FakePool:
-    """Phase 1 subject set + B7 reconciliation + the post-reconciliation reads."""
+    """Phase 1 subject set + (optionally) B7 reconciliation + post reads."""
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
     conn.on(_LOOPS_LIST, [_loop_row()])
     conn.on_repeat(_ITERATIONS_LIST, iteration_rows)
     conn.on(_EXECUTIONS_LIST, [execution_row])
-    # B7's phase-1 reads, the phase-3 locked write phase, and the post reads.
-    conn.on(_TASK_READ, _task_row())
-    conn.on(_PR_READ, _pr_row())
-    conn.on(_REPOSITORY_ROW_READ, _repository_row())
-    conn.on(_INSTALLATION_READ, _installation_row())
-    conn.on(_WORKSPACE_READ, _ws_row())
-    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
-    conn.on(_REPOSITORY_ROW_LOCKED, _repository_row())
-    conn.on(_PR_READ_LOCKED, _pr_row())
-    conn.on(_PR_UPDATE, _pr_row(head_sha=observed_head))
-    conn.on(_TASK_READ, _task_row())
+    if observed_head is not None:
+        # B7's phase-1 reads, the phase-3 locked write phase, and the post
+        # reads.
+        conn.on(_TASK_READ, _task_row())
+        conn.on(_PR_READ, _pr_row())
+        conn.on(_REPOSITORY_ROW_READ, _repository_row())
+        conn.on(_INSTALLATION_READ, _installation_row())
+        conn.on(_WORKSPACE_READ, _ws_row())
+        conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+        conn.on(_REPOSITORY_ROW_LOCKED, _repository_row())
+        conn.on(_PR_READ_LOCKED, _pr_row())
+        conn.on(_PR_UPDATE, _pr_row(head_sha=observed_head))
+        conn.on(_TASK_READ, _task_row())
     return FakePool(conn)
+
+
+def _script_verification_block(conn: ScriptedConnection) -> None:
+    """The atomic Level 3 block installation for an unverifiable round: the
+    account barrier, the locked currentness re-proof, and the F3 foundation's
+    block/gate/transition/audit composition."""
+    conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    # The F3 foundation's own guarded currentness re-proof.
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_BLOCK_INSERT, _remediation_block_row())
+    conn.on(_GATES_INSERT, _remediation_block_gate_row())
+    conn.on(_TASK_GATE_WRITE, _task_row())
+    conn.on(_EVENT_INSERT, _event_returned_row("task_blocked"))
+    conn.on(_EVENT_INSERT, _event_returned_row("owner_gate_created"))
+
+
+def _verification_call(
+    pool: DatabasePool,
+    github: Any,
+    fake_pool: FakePool,
+) -> Any:
+    return verify_settled_pr_remediation_push(
+        pool,
+        github,
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
 
 
 def test_the_settled_remediation_verification_confirms_the_new_head(
@@ -999,40 +1155,27 @@ def test_the_settled_remediation_verification_confirms_the_new_head(
         observed_head=_NEW_HEAD_SHA,
     )
     pool = _pool(conn)
-    evidence_calls: list[Any] = []
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
 
-    class _Evidence:
-        def record_attempt(self, **kwargs: Any) -> None:
-            evidence_calls.append(kwargs)
-
-        def record_task_token(self, token: Any) -> None:  # pragma: no cover
-            return None
-
-    continuation = verify_settled_pr_remediation_push(
-        pool,
-        _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA).as_client(),
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=_STATE_TOKEN,
-        attempt_evidence=cast(Any, _Evidence()),
-    )
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
 
     assert isinstance(continuation, SettledPrRemediationVerification)
     assert continuation.new_head_sha == _NEW_HEAD_SHA
     assert continuation.addressed_iteration.id == _REVIEW_ITERATION_ID
     assert continuation.finalized_execution.status.value == "succeeded"
     assert continuation.task.state_token == _STATE_TOKEN
-    assert len(evidence_calls) == 1
-    assert evidence_calls[0]["family"].value == "pr_remediation_execution"
-    assert evidence_calls[0]["original_attempt_id"] == execution_row[0]
+    assert _count(conn, _BLOCK_INSERT) == 0
 
 
-def test_a_wrong_branch_recorded_completion_never_verifies_a_push(
+def test_a_wrong_branch_recorded_completion_installs_the_level_3_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Finding-2 semantics for the detached continuation: a recorded completion
-    claiming a branch other than the Task's canonical branch never verifies a
-    push and never launches a new review — before any GitHub call."""
+    claiming a branch other than the Task's canonical branch is a positively
+    unverifiable round — the atomic Level 3 BLOCK_RESOLUTION block installs
+    through the shared exceptional-blocking foundation (before any GitHub
+    call), the recorded completion is never rewritten, and no review
+    dispatches."""
     conn = ScriptedConnection()
     execution_row = _execution_row(
         execution_number=2,
@@ -1044,30 +1187,44 @@ def test_a_wrong_branch_recorded_completion_never_verifies_a_push(
         conn,
         execution_row=execution_row,
         iteration_rows=[_addressed_iteration_row()],
-        observed_head=_NEW_HEAD_SHA,
+        observed_head=None,
     )
+    _script_verification_block(conn)
     pool = _pool(conn)
     github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
 
-    with pytest.raises(ConflictError, match="canonical feature branch"):
-        verify_settled_pr_remediation_push(
-            pool,
-            github.as_client(),
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_STATE_TOKEN,
-        )
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
 
+    assert continuation is None
     assert github.repository_calls == []
     assert github.pull_request_calls == []
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    # The unverifiable-round fact is deliberately not a supported Type A
+    # condition: the Level 3 catalog selects the Type B BLOCK_RESOLUTION
+    # diagnostic gate, and the block preserves the exact proven detection
+    # facts for later guarded recovery (issue #280).
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None and gate_params[2] == "block_resolution"
+    block_params_list = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    (block_params,) = block_params_list
+    assert block_params is not None
+    assert block_params[2] == "stale_operation"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["detection"] == "wrong_branch_claim"
+    assert block_context["claimed_branch"] == "other/branch"
+    assert block_context["review_iteration_id"] == str(_REVIEW_ITERATION_ID)
 
 
-def test_an_unconfirmed_push_fails_closed_after_the_reconciliation(
+def test_an_unconfirmed_push_installs_the_level_3_block_after_the_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A recorded completion whose canonical pull request head is unchanged
-    after the authoritative reconciliation fails closed — the recorded result
-    is never rewritten into invented success."""
+    after the authoritative reconciliation is a positively unverifiable round:
+    the atomic Level 3 block installs instead of stranding the reviewing Task,
+    and the recorded result is never rewritten into invented success."""
     conn = ScriptedConnection()
     execution_row = _execution_row(
         execution_number=2,
@@ -1081,19 +1238,23 @@ def test_an_unconfirmed_push_fails_closed_after_the_reconciliation(
         iteration_rows=[_addressed_iteration_row()],
         observed_head=_HEAD_SHA,
     )
+    _script_verification_block(conn)
     pool = _pool(conn)
     github = _GitHubClient(fake_pool, observed_head=_HEAD_SHA)
 
-    with pytest.raises(ExternalOperationFailedError, match="head is unchanged"):
-        verify_settled_pr_remediation_push(
-            pool,
-            github.as_client(),
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            expected_state_token=_STATE_TOKEN,
-        )
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
 
+    assert continuation is None
     assert len(github.pull_request_calls) == 1
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    block_params_list = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    (block_params,) = block_params_list
+    assert block_params is not None
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["detection"] == "no_confirmed_push"
+    assert block_context["addressed_head_sha"] == _HEAD_SHA
 
 
 def test_an_already_continued_head_applies_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1123,15 +1284,66 @@ def test_an_already_continued_head_applies_nothing(monkeypatch: pytest.MonkeyPat
     pool = _pool(conn)
     github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
 
-    continuation = verify_settled_pr_remediation_push(
-        pool,
-        github.as_client(),
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=_STATE_TOKEN,
-    )
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
 
     assert continuation is None
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_a_superseded_continuation_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later routed iteration means the addressed remediation already
+    resolved (the E2 supersession rule): the continuation is a no-op — no
+    verification I/O, no block, no dispatch."""
+    conn = ScriptedConnection()
+    execution_row = _execution_row(
+        execution_number=2,
+        status="succeeded",
+        result_payload=dict(_IMPLEMENTATION_PAYLOAD),
+        claimed_iteration_id=_REVIEW_ITERATION_ID,
+    )
+    fake_pool = _verification_pool_setup(
+        conn,
+        execution_row=execution_row,
+        iteration_rows=[
+            _addressed_iteration_row(),
+            _iteration_row(
+                iteration_id=uuid.uuid4(),
+                number=2,
+                pr_id=_PR_ID,
+                head_sha=_HEAD_SHA,
+                outcome="accepted",
+                summary="Resolved.",
+                findings=[],
+                decided_at=_OBSERVED,
+            ),
+        ],
+        observed_head=None,
+    )
+    pool = _pool(conn)
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
+
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
+
+    assert continuation is None
+    assert github.repository_calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_a_moved_on_subject_mid_verification_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A subject that moved on between the handoff's pre-check and the
+    verification's own transaction is a no-op — never an error, never a block
+    against another seam's subject."""
+    conn = ScriptedConnection()
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, StaleOperationError("the task state has moved on"))
+    fake_pool = FakePool(conn)
+    pool = _pool(conn)
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
+
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
+
+    assert continuation is None
+    assert github.repository_calls == []
 
 
 def test_an_unsettled_remediation_owns_no_continuation(
@@ -1144,18 +1356,12 @@ def test_an_unsettled_remediation_owns_no_continuation(
         conn,
         execution_row=_claimed_execution_row(status="running"),
         iteration_rows=[_addressed_iteration_row()],
-        observed_head=_NEW_HEAD_SHA,
+        observed_head=None,
     )
     pool = _pool(conn)
     github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
 
-    continuation = verify_settled_pr_remediation_push(
-        pool,
-        github.as_client(),
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=_STATE_TOKEN,
-    )
+    continuation = _verification_call(pool, github.as_client(), fake_pool)
 
     assert continuation is None
     assert github.repository_calls == []

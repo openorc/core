@@ -80,8 +80,10 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
+from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import TaskDetachedTurnReceipt
+from openorc.domain.events import WorkflowEventActor
 from openorc.domain.executions import Execution
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -132,6 +134,8 @@ from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
+from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
+from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pr_review_dispatch import (
     TaskPrReviewDispatchOutcome,
@@ -295,6 +299,140 @@ def _require_ready_producer(
 # --- the durable one-shot claim transaction ------------------------------------------
 
 
+def _claim_remediation_in_transaction(
+    transaction_pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    addressed_iteration: ReviewIteration,
+) -> tuple[Task, TaskPullRequest, ReviewLoop, TaskAgentSession, Execution]:
+    """Claim the one-shot remediation attempt durably inside the caller's
+    transaction.
+
+    The claim composition under the caller's already-taken Task row lock: the
+    exact subjects are proved and the next numbered attempt is inserted with
+    the ``review_iteration_id`` claim association and claimed ``running`` in
+    the same transaction. The claim is never rolled back on any send outcome;
+    the detached dispatch composes it with its detached-turn receipt companion
+    in ONE short transaction (issue #338), so a receipt failure claims nothing
+    at all.
+    """
+    require_account_operational(transaction_pool, profile_id=profile_id)
+    require_workspace_task(
+        transaction_pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    task = require_current_task(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+    )
+    if task.status is not TaskStatus.REVIEWING:
+        raise ConflictError(
+            "the addressed task is not reviewing; producer remediation is not available"
+        )
+    producer = _require_ready_producer(transaction_pool, workspace_id=workspace_id, task_id=task_id)
+    # The canonical PR at the addressed iteration's exact head: the
+    # addressed result was produced against that head, and remediation
+    # continues it. A moved head is a stale operation that claims nothing.
+    head_sha = addressed_iteration.reviewed_head_sha
+    if head_sha is None:
+        raise ConflictError("the addressed review iteration does not carry a PR/head subject")
+    pull_request = require_task_pull_request_head(
+        transaction_pool, task=task, expected_head_sha=head_sha
+    )
+    if pull_request.id != addressed_iteration.task_pull_request_id:
+        raise StaleOperationError(
+            "the addressed review iteration does not belong to the task's canonical "
+            "pull request; the operation is stale"
+        )
+    # The OPEN PR_REVIEW loop owning the addressed iteration; planning
+    # loops are never selected or consulted.
+    loops = [
+        loop
+        for loop in review_records.list_task_review_loops(transaction_pool, task_id=task_id)
+        if loop.purpose is ReviewLoopPurpose.PR_REVIEW
+        and loop.id == addressed_iteration.review_loop_id
+    ]
+    if len(loops) != 1:
+        raise NotFoundError("the requested review loop is not available for this task")
+    loop = review_records.get_review_loop(
+        transaction_pool, review_loop_id=loops[0].id, for_update=True
+    )
+    if loop is None or loop.status is not ReviewLoopStatus.OPEN:
+        raise ConflictError("the addressed review loop is not open; remediation applies nothing")
+    iterations = review_records.list_review_loop_iterations(
+        transaction_pool, review_loop_id=loop.id
+    )
+    stored = next(
+        (iteration for iteration in iterations if iteration.id == addressed_iteration.id),
+        None,
+    )
+    if stored is None:
+        raise NotFoundError("the addressed review iteration is not available in this loop")
+    if stored.outcome is None:
+        raise ConflictError("the addressed review iteration is not finalized; nothing is routable")
+    if stored.outcome is not ReviewOutcome.CHANGES_REQUESTED:
+        raise ConflictError(
+            "only a finalized CHANGES_REQUESTED review iteration routes to producer remediation"
+        )
+    finalized_on_head = [
+        iteration
+        for iteration in iterations
+        if iteration.outcome is not None
+        and iteration.task_pull_request_id == pull_request.id
+        and iteration.reviewed_head_sha == head_sha
+    ]
+    if not finalized_on_head or stored.id != finalized_on_head[-1].id:
+        # E2's supersession pattern: a superseded iteration is never
+        # remediable; its result has been superseded on its own head.
+        raise StaleOperationError(
+            "the addressed review iteration is superseded by a newer finalized "
+            "result on the same head; the operation is stale"
+        )
+    history = execution_records.list_task_executions(transaction_pool, task_id=task_id)
+    next_number = max((execution.execution_number for execution in history), default=0) + 1
+    try:
+        execution = execution_records.create_execution(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            producer_session_id=producer.id,
+            execution_number=next_number,
+            review_iteration_id=addressed_iteration.id,
+        )
+    except UniqueViolation as exc:
+        # The partial unique index refused a second claim for the same
+        # iteration: a prior attempt exists — completed, known-failed, or
+        # uncertain alike. The one-shot invariant is durable and token-
+        # independent; the replayed claim applies nothing.
+        raise StaleOperationError(
+            "this finalized review iteration was already claimed for remediation; "
+            "the one-shot claim is durable and a second attempt is never allocated"
+        ) from exc
+    claimed = execution_records.claim_execution_running(transaction_pool, execution_id=execution.id)
+    if claimed is None:
+        raise StaleOperationError(
+            "the reserved remediation attempt could not be claimed; the dispatch claim is stale"
+        )
+    event_coordination.record_execution_started_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        execution_id=claimed.id,
+        actor=event_coordination.producer_actor(producer.id),
+    )
+    return task, pull_request, loop, producer, claimed
+
+
 def _claim_remediation_transaction(
     pool: DatabasePool,
     *,
@@ -312,126 +450,14 @@ def _claim_remediation_transaction(
     same transaction. The claim is never rolled back on any send outcome.
     """
     with composed_transaction(pool) as transaction_pool:
-        require_account_operational(transaction_pool, profile_id=profile_id)
-        require_workspace_task(
+        return _claim_remediation_in_transaction(
             transaction_pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
-        )
-        locked = task_records.get_task_for_update(transaction_pool, task_id)
-        if locked is None or locked.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
             expected_state_token=expected_state_token,
+            addressed_iteration=addressed_iteration,
         )
-        if task.status is not TaskStatus.REVIEWING:
-            raise ConflictError(
-                "the addressed task is not reviewing; producer remediation is not available"
-            )
-        producer = _require_ready_producer(
-            transaction_pool, workspace_id=workspace_id, task_id=task_id
-        )
-        # The canonical PR at the addressed iteration's exact head: the
-        # addressed result was produced against that head, and remediation
-        # continues it. A moved head is a stale operation that claims nothing.
-        head_sha = addressed_iteration.reviewed_head_sha
-        if head_sha is None:
-            raise ConflictError("the addressed review iteration does not carry a PR/head subject")
-        pull_request = require_task_pull_request_head(
-            transaction_pool, task=task, expected_head_sha=head_sha
-        )
-        if pull_request.id != addressed_iteration.task_pull_request_id:
-            raise StaleOperationError(
-                "the addressed review iteration does not belong to the task's canonical "
-                "pull request; the operation is stale"
-            )
-        # The OPEN PR_REVIEW loop owning the addressed iteration; planning
-        # loops are never selected or consulted.
-        loops = [
-            loop
-            for loop in review_records.list_task_review_loops(transaction_pool, task_id=task_id)
-            if loop.purpose is ReviewLoopPurpose.PR_REVIEW
-            and loop.id == addressed_iteration.review_loop_id
-        ]
-        if len(loops) != 1:
-            raise NotFoundError("the requested review loop is not available for this task")
-        loop = review_records.get_review_loop(
-            transaction_pool, review_loop_id=loops[0].id, for_update=True
-        )
-        if loop is None or loop.status is not ReviewLoopStatus.OPEN:
-            raise ConflictError(
-                "the addressed review loop is not open; remediation applies nothing"
-            )
-        iterations = review_records.list_review_loop_iterations(
-            transaction_pool, review_loop_id=loop.id
-        )
-        stored = next(
-            (iteration for iteration in iterations if iteration.id == addressed_iteration.id),
-            None,
-        )
-        if stored is None:
-            raise NotFoundError("the addressed review iteration is not available in this loop")
-        if stored.outcome is None:
-            raise ConflictError(
-                "the addressed review iteration is not finalized; nothing is routable"
-            )
-        if stored.outcome is not ReviewOutcome.CHANGES_REQUESTED:
-            raise ConflictError(
-                "only a finalized CHANGES_REQUESTED review iteration routes to producer remediation"
-            )
-        finalized_on_head = [
-            iteration
-            for iteration in iterations
-            if iteration.outcome is not None
-            and iteration.task_pull_request_id == pull_request.id
-            and iteration.reviewed_head_sha == head_sha
-        ]
-        if not finalized_on_head or stored.id != finalized_on_head[-1].id:
-            # E2's supersession pattern: a superseded iteration is never
-            # remediable; its result has been superseded on its own head.
-            raise StaleOperationError(
-                "the addressed review iteration is superseded by a newer finalized "
-                "result on the same head; the operation is stale"
-            )
-        history = execution_records.list_task_executions(transaction_pool, task_id=task_id)
-        next_number = max((execution.execution_number for execution in history), default=0) + 1
-        try:
-            execution = execution_records.create_execution(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                producer_session_id=producer.id,
-                execution_number=next_number,
-                review_iteration_id=addressed_iteration.id,
-            )
-        except UniqueViolation as exc:
-            # The partial unique index refused a second claim for the same
-            # iteration: a prior attempt exists — completed, known-failed, or
-            # uncertain alike. The one-shot invariant is durable and token-
-            # independent; the replayed claim applies nothing.
-            raise StaleOperationError(
-                "this finalized review iteration was already claimed for remediation; "
-                "the one-shot claim is durable and a second attempt is never allocated"
-            ) from exc
-        claimed = execution_records.claim_execution_running(
-            transaction_pool, execution_id=execution.id
-        )
-        if claimed is None:
-            raise StaleOperationError(
-                "the reserved remediation attempt could not be claimed; the dispatch claim is stale"
-            )
-        event_coordination.record_execution_started_event(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            execution_id=claimed.id,
-            actor=event_coordination.producer_actor(producer.id),
-        )
-        return task, pull_request, loop, producer, claimed
 
 
 # --- the send and the conditional one-shot result recording ---------------------------
@@ -1302,44 +1328,43 @@ def _dispatch_pr_remediation_turn(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
-    execution: Execution,
-    producer_session: TaskAgentSession,
     addressed_iteration: ReviewIteration,
     message: str,
+    compose_claim_and_receipt: Callable[
+        [DatabasePool], tuple[Task, TaskAgentSession, Execution, TaskDetachedTurnReceipt]
+    ],
     producer_runtime_factory: ProducerRuntimeAttachmentFactory,
     observation_registrar: PrRemediationObservationRegistrar,
     completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None,
 ) -> DispatchedPrRemediation:
     """Admit the canonical REVISE instruction as one detached agent turn.
 
     The detached dispatch mechanics of the E9 remediation family (issue
-    #338), mirroring the established execution-family dispatch shape: the
-    runtime lease and the detached capability are acquired and duck-typed
-    fail-closed BEFORE any durable dispatch effect, the post-attachment
-    authority revalidation re-proves the exact claimed subjects under the
-    Task row lock and closes before the receipt, the claimed Execution's
+    #338), mirroring the established plan-family dispatch shape: the runtime
+    lease and the detached capability are acquired and duck-typed fail-closed
+    BEFORE any durable dispatch effect, the exact one-shot E9 claim and its
     detached-turn receipt companion (expecting the canonical
-    ``implementation_result`` family) commits strictly before any runtime
-    effect, one positively-required observation registration gates the
-    admission, one detached-turn admission carries the composed canonical
-    REVISE message verbatim on the exact Task checkout, and the
-    acknowledgement attach consumes any staged early completion exactly
-    once. No ``send`` and no blocking wait exists in this path, and no
-    database transaction is ever held across a runtime call.
+    ``implementation_result`` family) commit in ONE short transaction
+    strictly before any runtime effect — so a receipt failure claims nothing
+    at all and the admission race and the single-outstanding-turn invariant
+    are durable from the first possible effect — one positively-required
+    observation registration gates the admission, one detached-turn admission
+    carries the composed canonical REVISE message verbatim on the exact Task
+    checkout, and the acknowledgement attach consumes any staged early
+    completion exactly once. No ``send`` and no blocking wait exists in this
+    path, and no database transaction is ever held across a runtime call.
 
-    The R1/R2 authority guards and the proven/uncertain failure
-    classification are exactly the ordinary remediation dispatch's: authority
-    moving on before any effect finalizes the never-dispatched attempt
-    truthfully; only positively proven pre-effect failures refuse the receipt
-    and finalize ``failed_transient``; an uncertain admission leaves the
-    attempt conservatively running and the receipt conservatively claimed and
-    is never re-dispatched. The dispatching worker returns after the
+    The proven/uncertain failure classification is exactly the ordinary
+    remediation dispatch's: only positively proven pre-effect failures refuse
+    the receipt and finalize the claimed ``running`` attempt truthfully
+    (``failed_transient``; an authority movement after the claim finalizes
+    ``failed_final``); an uncertain admission leaves the attempt
+    conservatively running and the receipt conservatively claimed and is
+    never re-dispatched. The dispatching worker returns after the
     acknowledgement attach; the observed completion settles the attempt
     through the existing #322 E9 execution-settlement route.
     """
-    producer_external_session_id = producer_session.external_session_id
-    if producer_external_session_id is None or not producer_external_session_id.strip():
-        raise ConflictError("the producer session binding carries no external session identity")
     register = getattr(observation_registrar, "register_session", None)
     if not callable(register):
         raise InvalidCommandError(
@@ -1347,42 +1372,55 @@ def _dispatch_pr_remediation_turn(
             "established-session registration seam"
         )
     with ExitStack() as attachment_stack:
-        try:
-            runtime = attachment_stack.enter_context(producer_runtime_factory())
-        except ExternalOperationUncertainError:
-            # Uncertain attachment: the claimed attempt stays conservatively
-            # running (the potentially-dispatched record) and nothing resends.
-            raise
-        except ExternalOperationFailedError:
-            # A known attachment failure provably occurred before any effect.
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=execution.id,
-                producer_session_id=producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise
+        runtime = attachment_stack.enter_context(producer_runtime_factory())
+        # The detached capability is duck-typed fail-closed BEFORE any durable
+        # dispatch effect: a runtime without it cannot serve the detached
+        # dispatch, and no claim or receipt was ever recorded.
         admit = getattr(runtime, "admit_detached_turn", None)
         if not callable(admit):
-            # The attached runtime cannot admit detached turns: a proven
-            # pre-effect condition of this never-dispatched attempt.
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=execution.id,
-                producer_session_id=producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
             raise ExternalOperationFailedError(
                 "the producer runtime does not implement the detached turn "
                 "capability; the remediation dispatch failed before any effect"
             )
         admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # --- The one short dispatch transaction: the exact one-shot E9 claim
+        # and its detached-turn receipt companion, committed atomically
+        # strictly before any runtime effect. A replayed or raced continuation
+        # never claims or dispatches again: the claim's one-shot subject guard
+        # and the single-outstanding-receipt invariant are durable from here,
+        # and a receipt failure rolls the whole claim back. ---
+        task, producer_session, execution, receipt = compose_claim_and_receipt(pool)
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # remediation Execution identity (#262). Recorded immediately
+            # after the claim-and-receipt commit, before anything below — the
+            # R1 revalidation included — can fail (issue #268).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=execution.id,
+                phase="pr_remediation_execution",
+            )
+        producer_external_session_id = producer_session.external_session_id
+        if producer_external_session_id is None or not producer_external_session_id.strip():
+            # Unreachable for the claim's own READY-Producer guard; kept
+            # explicit with the claim-coupled cleanup for fail-closed safety.
+            _refuse_pr_remediation_dispatch_quietly(
+                pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ConflictError(
+                "the claimed producer session binding carries no external session identity"
+            )
         # --- R1: authority revalidation after acquisition, before any
         # runtime interaction. ---
         try:
@@ -1396,8 +1434,13 @@ def _dispatch_pr_remediation_turn(
                     head_sha=addressed_iteration.reviewed_head_sha or "",
                 )
         except (NotFoundError, ConflictError, StaleOperationError):
-            # Authority moved on during attachment, before any runtime effect:
-            # the never-dispatched attempt finalizes truthfully.
+            # Authority moved on after the claim, before any runtime effect:
+            # the never-dispatched attempt finalizes truthfully and the
+            # just-recorded receipt is refused, so a never-dispatched turn
+            # cannot hold the session's single-outstanding slot.
+            _refuse_pr_remediation_dispatch_quietly(
+                pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND
+            )
             _finalize_pre_effect_failure(
                 pool,
                 workspace_id=workspace_id,
@@ -1408,50 +1451,10 @@ def _dispatch_pr_remediation_turn(
                 failure_kind=_AUTHORITY_STALE_FAILURE_KIND,
             )
             raise
-        # --- the receipt: the claim's detached-turn companion, committed
-        # strictly before the first runtime interaction, so the admission
-        # race and the single-outstanding-turn invariant are durable from
-        # the first possible effect. ---
-        try:
-            receipt = turn_correlation.record_task_detached_turn_receipt(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                task_agent_session_id=producer_session.id,
-                operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
-                original_attempt_kind=OriginalAttemptKind.EXECUTION,
-                original_attempt_id=execution.id,
-            )
-        except ExternalOperationUncertainError:
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=execution.id,
-                producer_session_id=producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise
-        except Exception as error:
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=execution.id,
-                producer_session_id=producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise ExternalOperationFailedError(
-                "the detached remediation receipt could not be durably recorded "
-                "before any dispatch; the attempt failed before any effect"
-            ) from error
         # --- the positive pre-admission observation registration: the
         # positively-required gate. A refusal is a proven pre-effect failure:
         # the just-recorded receipt is marked refused and the never-dispatched
-        # attempt finalizes truthfully, so a never-dispatched turn cannot hold
-        # the session's single-outstanding slot. ---
+        # attempt finalizes truthfully. ---
         try:
             register(
                 workspace_id=workspace_id,
@@ -1604,25 +1607,21 @@ def dispatch_pr_remediation_detached(
     """Dispatch one routed Producer remediation as one detached agent turn.
 
     The detached counterpart of the ordinary remediation route (issues
-    #325/#338): the same durable one-shot E9 claim — the exact current
-    ``REVIEWING`` Task, the canonical PR at the addressed iteration's exact
-    head, the READY Producer binding, the OPEN PR loop, the finalized latest
-    ``CHANGES_REQUESTED`` iteration, and the next-numbered Execution claimed
-    ``running`` with the ``review_iteration_id`` association, all in one
-    short transaction that is never rolled back on any dispatch outcome —
-    followed by the canonical ``review_result`` JSON of the **persisted**
-    finalized iteration (rebuilt verbatim, never from transient state)
-    admitted as one independently completed agent turn on the original
-    Producer session at the exact Task checkout, with the claimed Execution's
-    detached-turn receipt companion committed strictly before the positive
-    observation registration and the admission. No ``send`` and no blocking
-    wait exists in this path, and the dispatching worker exits after the
-    acknowledgement attach. The independently observed completion settles
-    the attempt through the existing #322 E9 execution-settlement route, and
-    the ONE post-commit completion handoff owns the continuation from
-    committed state. A replayed claim for an already-claimed iteration —
-    whatever the prior outcome, and whatever token a retry presents —
-    applies nothing.
+    #325/#338): the exact one-shot E9 claim — bound to the finalized
+    ``CHANGES_REQUESTED`` iteration and the original Producer session — and
+    its detached-turn receipt companion commit in ONE short transaction that
+    is never rolled back on any dispatch outcome and never leaves a claimed
+    attempt without its correlation receipt, followed by the canonical
+    ``review_result`` JSON of the **persisted** finalized iteration (rebuilt
+    verbatim, never from transient state) admitted as one independently
+    completed agent turn on the original Producer session at the exact Task
+    checkout. No ``send`` and no blocking wait exists in this path, and the
+    dispatching worker exits after the acknowledgement attach. The
+    independently observed completion settles the attempt through the
+    existing #322 E9 execution-settlement route, and the ONE post-commit
+    completion handoff owns the continuation from committed state. A replayed
+    claim for an already-claimed iteration — whatever the prior outcome, and
+    whatever token a retry presents — applies nothing.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_DETACHED_SPAN_NAME) as span:
         # --- Phase 0: command shape (no I/O). ---
@@ -1631,7 +1630,6 @@ def dispatch_pr_remediation_detached(
         _require_uuid_command(task_id, "task_id")
         _require_uuid_command(expected_state_token, "expected_state_token")
         addressed = _require_addressed_iteration(addressed_iteration)
-        producer_factory = producer_runtime_factory
         annotate_span(
             span,
             operation=_DISPATCH_DETACHED_SPAN_NAME,
@@ -1639,52 +1637,57 @@ def dispatch_pr_remediation_detached(
             task_id=str(task_id),
         )
 
-        # --- Phase 1: the durable one-shot claim (database only). ---
-        (
-            task,
-            _pull_request,
-            _review_loop,
-            producer_session,
-            claimed,
-        ) = _claim_remediation_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            addressed_iteration=addressed,
-        )
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's reserved
-            # remediation Execution identity (#262). Recorded immediately
-            # after the claim commit, before anything below — the attachment
-            # acquisition included — can fail (issue #268).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+        def compose_claim_and_receipt(
+            transaction_pool: DatabasePool,
+        ) -> tuple[Task, TaskAgentSession, Execution, TaskDetachedTurnReceipt]:
+            _task, _pull_request, _review_loop, producer_session, claimed = (
+                _claim_remediation_in_transaction(
+                    transaction_pool,
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    addressed_iteration=addressed,
+                )
+            )
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer_session.id,
+                operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
                 original_attempt_kind=OriginalAttemptKind.EXECUTION,
                 original_attempt_id=claimed.id,
-                phase="pr_remediation_execution",
             )
+            return _task, producer_session, claimed, receipt
 
-        # --- Phase 2: the composed canonical REVISE message from the
-        # persisted finalized iteration, then the detached admission. ---
+        # --- the composed canonical REVISE message from the persisted
+        # finalized iteration, then the detached admission. ---
         message = serialize_review_result(_review_result_from_iteration(addressed))
         return _dispatch_pr_remediation_turn(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
-            execution=claimed,
-            producer_session=producer_session,
             addressed_iteration=addressed,
             message=message,
-            producer_runtime_factory=producer_factory,
+            compose_claim_and_receipt=compose_claim_and_receipt,
+            producer_runtime_factory=producer_runtime_factory,
             observation_registrar=observation_registrar,
             completion_handoff=completion_handoff,
+            attempt_evidence=attempt_evidence,
         )
 
 
 # --- the settled-remediation continuation verification (issue #338) -------------------
+
+
+# The OPENORC logical actor of the verification's Level 3 block installation:
+# the classification is OpenOrc's own typed observation, never a runtime- or
+# Owner-attributed decision.
+_OPENORC_ACTOR: Final[event_coordination.WorkflowActorContext] = (
+    event_coordination.WorkflowActorContext(WorkflowEventActor.OPENORC, None)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1698,8 +1701,9 @@ class SettledPrRemediationVerification:
     GitHub-confirmed NEW head with no review iteration yet reserved for that
     head — the exact facts the ONE completion handoff needs to submit the
     next typed ``TASK_PR_REVIEW`` for the confirmed head. ``None`` means no
-    continuation is owed from committed state; a positively detected
-    verification failure raises a typed error instead.
+    continuation is owed from committed state — nothing settled to continue,
+    a moved-on or superseded subject, a continuation already owned by another
+    path, or a round whose verification installed its atomic Level 3 block.
     """
 
     task: Task
@@ -1709,23 +1713,122 @@ class SettledPrRemediationVerification:
     new_head_sha: str
 
 
+def _block_unverifiable_remediation_round(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    context: dict[str, str],
+) -> Task | None:
+    """Atomically block the Task on an unverifiable settled remediation round.
+
+    The established E8 stale-publication block shape (issue #338): one short
+    composed transaction — the approving Profile's account-operational
+    barrier re-proved first, the locked Task's exact currentness re-proven,
+    and the F3 exceptional blocking foundation (#258) installing — atomically
+    — the ``stale_operation`` TaskBlock, its pending Level 3-selected OwnerGate
+    bound to it as the only subject (F8b, issue #287), the ``reviewing →
+    blocked`` transition with one rotated token, and the ``task_blocked`` /
+    ``owner_gate_created`` audits under the truthful OPENORC actor.
+
+    The unverifiable-round fact is deliberately presented to the Level 3
+    blocking-case catalog (F8a, issue #286) as no supported condition — it is
+    not one of the settled Type A cases — so the policy selects the Type B
+    ``BLOCK_RESOLUTION`` diagnostic gate; this caller never chooses a gate
+    type. The caller's ``context`` carries only the exact proven machine
+    facts of the detection site (issue #280) for later guarded recovery.
+
+    A subject that moved on between the detection and the installation
+    applies nothing and returns ``None`` — the continuation is that subject's
+    own seam's, never this guard's. A succeeded remediation Execution is
+    never rewritten, never labelled failed, and never re-dispatched: the
+    recorded round and its one-shot semantics stand unchanged.
+    """
+    try:
+        with composed_transaction(pool) as transaction_pool:
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            locked = task_records.get_task_for_update(transaction_pool, task_id)
+            if locked is None or locked.workspace_id != workspace_id:
+                return None
+            task = require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+            )
+            if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
+                return None
+            gate_type = classify_blocking_case(None, context, TaskBlockReason.STALE_OPERATION)
+            installation = install_exceptional_block_gate(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                expected_status=task.status,
+                expected_current_owner_gate_id=task.current_owner_gate_id,
+                gate_type=gate_type,
+                block_reason=TaskBlockReason.STALE_OPERATION,
+                block_context=context,
+                actor=_OPENORC_ACTOR,
+            )
+            return installation.task
+    except (NotFoundError, StaleOperationError):
+        # The subject moved on between the detection and the installation:
+        # the durable state is another seam's, and no block applies.
+        return None
+
+
 def verify_settled_pr_remediation_push(
     pool: DatabasePool,
     github: GitHubAppClient,
     *,
+    profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> SettledPrRemediationVerification | None:
     """Re-prove a settled remediation round and verify its confirmed new head.
 
-    The detached remediation completion's owning-service continuation (issue
+    The detached remediation completion's owning continuation guard (issue
     #338), reusing the ordinary chain's verification policy with every
     subject re-derived from committed state — never from a transient
-    settlement object. ``None`` means no continuation is owed: nothing is
-    fabricated, nothing is retried, and no other path's subject is touched.
+    settlement object. This is a direct control guard, not a Level 1
+    operation: a succeeded remediation Execution is never a Level 2 failure
+    identity (the execution-family contracts deliberately reject succeeded
+    attempts), so its positively detected verification mismatches reach
+    Level 3 directly through the shared exceptional-blocking foundation and
+    its uncertain or known-failed GitHub reads stay typed errors whose
+    durable state the existing Owner Resume recovery owns.
+
+    **Phase 1 — the continuation subject set (database only):** the exact
+    current non-archived ``REVIEWING`` Task at the caller's token with no
+    current OwnerGate, the single OPEN ``PR_REVIEW`` loop, its
+    latest-numbered finalized ``CHANGES_REQUESTED`` PR iteration still the
+    loop's latest iteration (a later routed iteration means the remediation
+    already resolved), and the one durably SUCCEEDED remediation Execution
+    claimed for exactly that iteration with a recorded canonical
+    ``implementation_result`` — the one-shot claim association guarantees at
+    most one. Any missing, moved-on, or superseded subject means no
+    continuation is owed and ``None`` is returned.
+
+    **Phase 2 — the recorded branch claim:** the recorded canonical envelope
+    must be the completed ``implementation_result`` family whose ``branch``
+    claim names exactly the Task's bound canonical feature branch. The claim
+    is routing evidence, never head/PR authority; a mismatching recorded
+    completion installs the atomic Level 3 block and is never rewritten into
+    invented success.
+
+    **Phase 3 — the authoritative head verification (no transaction open
+    across GitHub I/O):** the SAME canonical pull request is reconciled
+    through B7, must still be exactly the addressed iteration's record and
+    OPEN, and must report a GitHub-confirmed NEW head — a missing push
+    (unchanged head) installs the atomic Level 3 block. A review iteration
+    already reserved for the confirmed head (a concurrently continued
+    subject) is a no-op instead of dispatching twice.
     """
+    _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
     _require_uuid_command(expected_state_token, "expected_state_token")
@@ -1736,12 +1839,17 @@ def verify_settled_pr_remediation_push(
         locked = task_records.get_task_for_update(transaction_pool, task_id)
         if locked is None or locked.workspace_id != workspace_id:
             return None
-        task = require_current_task(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-        )
+        try:
+            task = require_current_task(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+            )
+        except (NotFoundError, StaleOperationError):
+            # The subject moved on between the handoff's pre-check and this
+            # transaction: the continuation is moot, never an error.
+            return None
         if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
             # A gate or a moved-on status owns the workflow: the continuation
             # is that seam's, never this verification's.
@@ -1766,6 +1874,11 @@ def verify_settled_pr_remediation_push(
         if not change_requests:
             return None
         addressed = change_requests[-1]
+        if iterations[-1].id != addressed.id:
+            # A later routed iteration means this remediation already resolved
+            # (the E2 supersession rule the Level 2 remediation subject
+            # contract proves): the continuation is superseded.
+            return None
         claimed = [
             execution
             for execution in execution_records.list_task_executions(
@@ -1788,77 +1901,53 @@ def verify_settled_pr_remediation_push(
             # Nothing durably settled to continue (still running, known
             # failed, or uncertain): the settlement routes own those states.
             return None
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this continuation's
-            # verified settled Execution identity (#262), recorded before
-            # any external verification can fail.
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
-                original_attempt_kind=OriginalAttemptKind.EXECUTION,
-                original_attempt_id=execution.id,
-                phase="pr_remediation_verification",
-            )
-    return _verify_settled_remediation_push_external(
-        pool,
-        github_client,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        task=task,
-        loop=loop,
-        addressed=addressed,
-        execution=execution,
-    )
 
-
-def _verify_settled_remediation_push_external(
-    pool: DatabasePool,
-    github_client: GitHubAppClient,
-    *,
-    workspace_id: UUID,
-    task_id: UUID,
-    task: Task,
-    loop: ReviewLoop,
-    addressed: ReviewIteration,
-    execution: Execution,
-) -> SettledPrRemediationVerification | None:
-    """The recorded-branch-claim check and the authoritative head verification.
-
-    **Phase 2 — the recorded branch claim:** the recorded canonical envelope
-    must be the completed ``implementation_result`` family whose ``branch``
-    claim names exactly the Task's bound canonical feature branch. The claim
-    is routing evidence, never head/PR authority; a wrong-branch recorded
-    completion fails closed and is never rewritten into invented success.
-
-    **Phase 3 — the authoritative head verification (no transaction open
-    across GitHub I/O):** the SAME canonical pull request is reconciled
-    through B7, must still be exactly the addressed iteration's record and
-    OPEN, and must report a GitHub-confirmed NEW head — a missing push
-    (unchanged head) fails closed. A review iteration already reserved for
-    the confirmed head (a concurrently continued subject) returns ``None``
-    instead of dispatching twice.
-    """
+    # --- Phase 2: the recorded branch claim (the routing evidence). ---
     payload = execution.implementation_result
     if (
         not isinstance(payload, dict)
         or payload.get("type") != IMPLEMENTATION_RESULT_FAMILY
         or payload.get("status") != _IMPLEMENTATION_COMPLETED_STATUS
     ):
-        raise ConflictError(
-            "the settled remediation completion is not the canonical completed "
-            "implementation_result envelope; no push is verifiable and no new "
-            "review is launched"
+        _block_unverifiable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            context={
+                "detection": "noncanonical_recorded_result",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+            },
         )
+        return None
     branch_claim = payload.get("branch")
     if (
         not isinstance(branch_claim, str)
         or task.canonical_feature_branch is None
         or branch_claim != task.canonical_feature_branch
     ):
-        raise ConflictError(
-            "the producer completion claims a branch other than the task's bound "
-            "canonical feature branch; no push is verifiable and no new review is "
-            "launched"
+        _block_unverifiable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            context={
+                "detection": "wrong_branch_claim",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "claimed_branch": branch_claim if isinstance(branch_claim, str) else "",
+                "canonical_feature_branch": task.canonical_feature_branch or "",
+            },
         )
+        return None
+
+    # --- Phase 3: the authoritative head verification (GitHub I/O, no
+    # transaction held across it). An uncertain or known-failed read stays a
+    # typed error — never a block, never a proven workflow mismatch — and
+    # the durable state owns recovery. ---
     reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
         pool,
         github_client,
@@ -1867,21 +1956,53 @@ def _verify_settled_remediation_push_external(
     )
     reconciled = reconciliation.pull_request
     if reconciled.id != addressed.task_pull_request_id:
-        raise ConflictError(
-            "the reconciled pull request is not the addressed canonical record; "
-            "another pull request is never adopted"
+        _block_unverifiable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            context={
+                "detection": "canonical_pull_request_mismatch",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "addressed_pull_request_id": str(addressed.task_pull_request_id),
+                "reconciled_pull_request_id": str(reconciled.id),
+            },
         )
+        return None
     if reconciled.state is not TaskPullRequestState.OPEN:
-        raise ConflictError(
-            "the canonical pull request is no longer open; closed-PR and merge "
-            "recovery belong to the later recovery layer"
+        _block_unverifiable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            context={
+                "detection": "pull_request_not_open",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "pull_request_state": reconciled.state.value,
+            },
         )
+        return None
     new_head = reconciled.head_sha
     if new_head == addressed.reviewed_head_sha:
-        raise ExternalOperationFailedError(
-            "the producer completion is recorded but the canonical pull request "
-            "head is unchanged; no push is confirmed and no new review is launched"
+        _block_unverifiable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            context={
+                "detection": "no_confirmed_push",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "addressed_head_sha": addressed.reviewed_head_sha or "",
+                "reconciled_head_sha": new_head,
+            },
         )
+        return None
     # A concurrently continued subject — the review for the confirmed head is
     # already reserved — owns its own state; this continuation applies nothing.
     current_iterations = review_records.list_review_loop_iterations(pool, review_loop_id=loop.id)

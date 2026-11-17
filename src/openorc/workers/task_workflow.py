@@ -1185,17 +1185,22 @@ def _handoff_pr_remediation_completion(
     Re-derives the continuation's authority from committed state — the
     settled SUCCEEDED remediation Execution bound to the latest finalized
     CHANGES_REQUESTED iteration, its recorded branch claim, and the canonical
-    PR — and invokes the existing owning verification under the F5b
-    coordinator's typed failure handoff, so a verification failure (a
-    wrong-branch recorded completion, a closed PR, or a missing push) triages
-    exactly like the ordinary authorized continuation under the settled
-    Execution's own identity. Only the GitHub-confirmed NEW head submits the
-    existing typed ``TASK_PR_REVIEW`` through the executing process's
-    continuation seam with the reloaded post-reconciliation token; a ``None``
-    verification owns no continuation. Every input is re-derived from
-    committed durable state; a failed or uncertain submission is transport
-    information only, never Task truth, and never permits a blind re-enqueue
-    — the durable state owns recovery.
+    PR — and invokes the existing owning verification directly. The
+    verification is a direct control guard, not a Level 1 operation: a
+    succeeded Execution is never a Level 2 failure identity (the
+    execution-family contracts deliberately reject succeeded attempts), so a
+    positively unverifiable round installs the exact atomic Level 3
+    BLOCK_RESOLUTION block through the shared exceptional-blocking foundation
+    instead of stranding the reviewing Task, and an uncertain or known-failed
+    GitHub read stays a typed error whose durable state the existing Owner
+    Resume recovery owns — never a block, never a proven workflow mismatch.
+    Only the GitHub-confirmed NEW head submits the existing typed
+    ``TASK_PR_REVIEW`` through the executing process's continuation seam with
+    the reloaded post-reconciliation token; a ``None`` verification owns no
+    continuation. Every input is re-derived from committed durable state; a
+    failed or uncertain submission is transport information only, never Task
+    truth, and never permits a blind re-enqueue — the durable state owns
+    recovery.
     """
     pool = dependencies.database_pool()
     task = task_records.get_task(pool, task_id=task_id)
@@ -1210,45 +1215,31 @@ def _handoff_pr_remediation_completion(
     if workspace is None:  # pragma: no cover - the Task's scope proved it
         return
     owner_profile_id = workspace.owner_profile_id
-    expected_state_token = task.state_token
-    github = dependencies.github_client()
-
-    def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
-        continuation = verify_settled_pr_remediation_push(
-            pool,
-            github,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            attempt_evidence=evidence,
-        )
-        if continuation is None:
-            return
-        _submit_continuation(
-            dependencies,
-            OperationInvocation(
-                kind=OperationKind.TASK_PR_REVIEW,
-                payload=TaskPrReviewPayload(
-                    task=TaskScope(
-                        workspace_id=str(continuation.task.workspace_id),
-                        task_id=str(continuation.task.id),
-                        role=WorkflowRoleRef.REVIEWER,
-                    ),
-                    profile_id=str(owner_profile_id),
-                    task_pull_request_id=str(continuation.pull_request.id),
-                    expected_state_token=str(continuation.task.state_token),
-                ),
-            ),
-        )
-
-    coordinate_task_workflow_operation(
+    continuation = verify_settled_pr_remediation_push(
         pool,
-        expected_status=TaskStatus.REVIEWING,
+        dependencies.github_client(),
+        profile_id=owner_profile_id,
         workspace_id=workspace_id,
         task_id=task_id,
-        profile_id=owner_profile_id,
-        expected_state_token=expected_state_token,
-        invoke_level_one=invoke_level_one,
+        expected_state_token=task.state_token,
+    )
+    if continuation is None:
+        return
+    _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PR_REVIEW,
+            payload=TaskPrReviewPayload(
+                task=TaskScope(
+                    workspace_id=str(continuation.task.workspace_id),
+                    task_id=str(continuation.task.id),
+                    role=WorkflowRoleRef.REVIEWER,
+                ),
+                profile_id=str(owner_profile_id),
+                task_pull_request_id=str(continuation.pull_request.id),
+                expected_state_token=str(continuation.task.state_token),
+            ),
+        ),
     )
 
 
