@@ -1660,6 +1660,13 @@ def _compose_task_authorized_implementation_retry(
 ) -> None:
     """Execute the one F4-authorized implementation retry and present the PR gate.
 
+    The F5c retry composition is the one deliberate blocking-model-turn
+    exception to the detached ordinary-turn migration (issues #325/#340): it
+    keeps the shared E6 external mechanics blocking in both execution modes
+    until its own detached migration, and nothing submits this operation kind
+    until F11 (issue #257) delivers the due-time wakeup — so no ordinary
+    regular-mode model turn can reach it today.
+
     The F5c retry service atomically consumes the exact durably authorized
     F4 attempt for one new Execution (reserved, claimed, audited, and bound
     set-once before any external effect), then reuses the shared E6 external
