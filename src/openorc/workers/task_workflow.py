@@ -99,6 +99,9 @@ from openorc.services.task_owner_resume import (
     SessionResumeFollowUp,
     dispatch_authorized_task_resume,
 )
+from openorc.services.task_owner_reviewer_discussion import (
+    admit_owner_reviewer_discussion_turn,
+)
 from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
     dispatch_initial_plan_detached,
@@ -162,6 +165,7 @@ from openorc.workers.invocation import (
     TaskAuthorizedImplementationPayload,
     TaskAuthorizedImplementationRetryPayload,
     TaskAuthorizedMergeRetryPayload,
+    TaskOwnerReviewerDiscussionPayload,
     TaskPlanningBootstrapAndInitialPlanPayload,
     TaskPlanningReviewPayload,
     TaskPrAuthorizationRetryPayload,
@@ -641,6 +645,11 @@ class _DetachedCompletionHandoff:
                 validated_result=validated_result,
             )
             return
+        if operation is PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION:
+            _handoff_discussion_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
         raise ConflictError(
             "the settled operation family has no detached completion handoff "
             "route yet; its own detached migration wires it"
@@ -989,6 +998,26 @@ def _handoff_review_result_completion(
         expected_state_token=expected_state_token,
         invoke_level_one=invoke_level_one,
     )
+
+
+def _handoff_discussion_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The discussion route: the settled exchange's workflow continuations.
+
+    The discussion settlement's formal continuations commit the durable
+    decision (the new finalized iteration, the retired or settled gate) and
+    no Producer work; the ONE post-commit handoff re-derives every next-step
+    authority from committed state (issue #339) through the same committed
+    state derivations the ordinary review decisions use: a Task whose
+    workflow resumed to ``planning`` presents the exact-plan
+    IMPLEMENTATION_AUTHORIZATION on an accepted review or dispatches the new
+    authorized Producer REVISE as one detached turn; a Task back in
+    ``reviewing`` dispatches the in-budget PR remediation. A Task still
+    carrying a current OwnerGate is owned by that gate's own seam and sends
+    no Producer prompt.
+    """
+    _handoff_review_result_completion(dependencies, workspace_id=workspace_id, task_id=task_id)
 
 
 def _handoff_pr_compose_completion(
@@ -2133,14 +2162,53 @@ def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
     return handler
 
 
+def _handle_task_owner_reviewer_discussion(
+    payload: Any, *, dependencies: OperationDependencies
+) -> None:
+    """Admit one prepared Owner ↔ Reviewer discussion turn (issue #339).
+
+    The discussion admission is deliberately NOT enrolled in the F5b
+    coordinator's Level 2 handoff: the discussion family carries no
+    operational retry/block semantics (an Owner-initiated advisory
+    conversation never reports operational failures or blocks the Task), so
+    the handler invokes the admission service directly. The receipt
+    lifecycle, the one-shot admission stamp, and the typed transport errors
+    own every failure; the Owner-visible receipt-status projection reports
+    them.
+    """
+    discussion_payload = cast(TaskOwnerReviewerDiscussionPayload, payload)
+    workspace_id = UUID(discussion_payload.task.workspace_id)
+    task_id = UUID(discussion_payload.task.task_id)
+    admit_owner_reviewer_discussion_turn(
+        dependencies.database_pool(),
+        profile_id=UUID(discussion_payload.profile_id),
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=UUID(discussion_payload.owner_gate_id),
+        receipt_id=UUID(discussion_payload.receipt_id),
+        message=discussion_payload.message,
+        reviewer_runtime_factory=_reviewer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
+    )
+
+
 def build_task_workflow_handlers() -> Mapping[OperationKind, OperationHandler]:
     """The explicit F5a Task-workflow kind-to-handler table.
 
     The Task-less GitHub delivery/reconciliation kinds are not Task-workflow
     operations: F9 (issue #255) registers them separately in
-    ``openorc.workers.github_operations``.
+    ``openorc.workers.github_operations``. The detached Owner ↔ Reviewer
+    discussion admission (issue #339) is registered beside them with its own
+    non-coordinator handler.
     """
-    return {kind: _task_workflow_handler(kind) for kind in _TASK_WORKFLOW_COMPOSITIONS}
+    handlers: dict[OperationKind, OperationHandler] = {
+        kind: _task_workflow_handler(kind) for kind in _TASK_WORKFLOW_COMPOSITIONS
+    }
+    handlers[OperationKind.TASK_OWNER_REVIEWER_DISCUSSION] = _handle_task_owner_reviewer_discussion
+    return handlers
 
 
 # --- production dependency providers -----------------------------------------

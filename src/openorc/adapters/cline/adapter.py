@@ -119,6 +119,7 @@ from dataclasses import dataclass, replace
 from typing import Final, TypeVar
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.conversation import ConversationMessage
 from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
@@ -689,6 +690,50 @@ class ClineAdapter(AgentRuntimeAdapter):
                 session_id=session_id,
             )
             return AgentTurnAdmission(turn_reference=admission.run_id)
+
+    def read_conversation(self, session_id: str) -> list[ConversationMessage]:
+        """Project the session's runtime conversation records (issue #339).
+
+        The optional conversation-read capability: one pure observational
+        ``read_messages`` read of the exact addressed external session — no
+        effect, no durable record, never a send. The runtime's own message
+        records are projected into the neutral shape: the zero-based
+        conversation index, the message's own category token when its native
+        ``type`` field carries a string, and its textual content when its
+        native ``text`` field carries a string. A message shaped beyond the
+        projection projects with ``None`` kind/text rather than failing the
+        whole read: the runtime owns its conversation, and an unknown shape
+        is honestly projected as unknown, never guessed.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.read_conversation") as span:
+            annotate_span(span, operation="cline_adapter.read_conversation")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if session_id not in self._known_identity:
+                # The durable bound-session resolver is the sole authority
+                # for a session this instance did not allocate in-process;
+                # the same exact-session discipline as the admission.
+                self._resolve_bound_context(session_id)
+            messages = self._backend_operation(
+                "read_messages",
+                lambda: self._backend.read_messages(session_id),
+                session_id=session_id,
+            )
+            projected: list[ConversationMessage] = []
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    projected.append(ConversationMessage(index=index, kind=None, text=None))
+                    continue
+                kind = message.get("type")
+                text = message.get("text")
+                projected.append(
+                    ConversationMessage(
+                        index=index,
+                        kind=kind if isinstance(kind, str) else None,
+                        text=text if isinstance(text, str) else None,
+                    )
+                )
+            return projected
 
     def send(
         self,

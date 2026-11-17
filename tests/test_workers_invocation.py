@@ -29,6 +29,7 @@ from openorc.workers.invocation import (
     SubmissionOutcome,
     SubmissionRefusalReason,
     SubmissionResult,
+    TaskOwnerReviewerDiscussionPayload,
     TaskScope,
     WebhookDeliveryDispatchPayload,
     WorkflowRoleRef,
@@ -309,6 +310,9 @@ def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
         invocation.OperationKind.TASK_PR_REVIEW,
         invocation.OperationKind.TASK_SESSION_RESUME,
         invocation.OperationKind.TASK_TERMINAL_FINALIZATION,
+        # The detached discussion admission (issue #339): registered beside
+        # the F5a table with its own non-coordinator handler.
+        invocation.OperationKind.TASK_OWNER_REVIEWER_DISCUSSION,
     }
 
 
@@ -648,3 +652,70 @@ def test_entrypoint_fails_closed_for_an_unregistered_kind(
         traceback.format_exception(type(raised.value), raised.value, raised.value.__traceback__)
     )
     assert "no handler is registered" not in formatted
+
+
+def test_task_owner_reviewer_discussion_payload_round_trips_exactly() -> None:
+    original = OperationInvocation(
+        kind=OperationKind.TASK_OWNER_REVIEWER_DISCUSSION,
+        payload=TaskOwnerReviewerDiscussionPayload(
+            task=TaskScope(workspace_id=UUID_A, task_id=UUID_B, role=WorkflowRoleRef.REVIEWER),
+            profile_id=UUID_A,
+            owner_gate_id=UUID_B,
+            receipt_id=UUID_A,
+            message="Owner question: is the retry backoff sufficient?",
+        ),
+    )
+
+    decoded = decode_operation_invocation(original.encode())
+
+    assert decoded == original
+    assert isinstance(decoded.payload, TaskOwnerReviewerDiscussionPayload)
+    assert decoded.payload.message == "Owner question: is the retry backoff sufficient?"
+
+
+def test_task_owner_reviewer_discussion_payload_rejects_a_role_mismatch() -> None:
+    # The construction-time correspondence check rejects a payload whose
+    # consuming role does not match the kind (issue #253).
+    with pytest.raises(InvalidInvocationError, match="does not match the operation kind"):
+        OperationInvocation(
+            kind=OperationKind.TASK_OWNER_REVIEWER_DISCUSSION,
+            payload=TaskOwnerReviewerDiscussionPayload(
+                task=TaskScope(workspace_id=UUID_A, task_id=UUID_B, role=WorkflowRoleRef.PRODUCER),
+                profile_id=UUID_A,
+                owner_gate_id=UUID_B,
+                receipt_id=UUID_A,
+                message="Owner question.",
+            ),
+        )
+
+
+def test_task_owner_reviewer_discussion_payload_rejects_unexpected_fields() -> None:
+    import json
+
+    encoded = json.loads(
+        OperationInvocation(
+            kind=OperationKind.TASK_OWNER_REVIEWER_DISCUSSION,
+            payload=TaskOwnerReviewerDiscussionPayload(
+                task=TaskScope(workspace_id=UUID_A, task_id=UUID_B, role=WorkflowRoleRef.REVIEWER),
+                profile_id=UUID_A,
+                owner_gate_id=UUID_B,
+                receipt_id=UUID_A,
+                message="Owner question.",
+            ),
+        ).encode()
+    )
+    encoded["expected_state_token"] = UUID_A
+
+    with pytest.raises(InvalidInvocationError):
+        decode_operation_invocation(json.dumps(encoded))
+
+
+def test_task_owner_reviewer_discussion_payload_rejects_a_blank_message() -> None:
+    with pytest.raises(InvalidInvocationError):
+        TaskOwnerReviewerDiscussionPayload(
+            task=TaskScope(workspace_id=UUID_A, task_id=UUID_B, role=WorkflowRoleRef.REVIEWER),
+            profile_id=UUID_A,
+            owner_gate_id=UUID_B,
+            receipt_id=UUID_A,
+            message="   ",
+        )

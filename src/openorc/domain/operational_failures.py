@@ -176,6 +176,14 @@ class OriginalAttemptKind(StrEnum):
     # one merge episode roots at. The gate is resolved history at merge time;
     # the episode never re-approves, mutates, or replaces it.
     MERGE_DECISION_GATE = "merge_decision_gate"
+    # Detached Owner ↔ Reviewer discussion (issue #339): the gate-bound
+    # discussion identity. The receipt's ``original_attempt_id`` is the exact
+    # pending current OwnerGate UUID the conversation is admitted at — the
+    # gate is the durable discussion subject, never an approved decision and
+    # never a claim the discussion invents. The gate-bound kind deliberately
+    # roots at no Execution, no interrupt intent, and no one-shot automated
+    # attempt.
+    OWNER_GATE_DISCUSSION = "owner_gate_discussion"
 
 
 class GitHubMergeOperation(StrEnum):

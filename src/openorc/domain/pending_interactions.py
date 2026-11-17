@@ -75,6 +75,14 @@ class PendingTaskRuntimeInteractionOperation(StrEnum):
     # one interrupted workflow interaction; the durable one-shot
     # session-resume record is its original attempt identity.
     SESSION_RESUME = "session_resume"
+    # Detached Owner ↔ Reviewer discussion (issue #339): the single enqueued
+    # conversational turn on the exact existing Reviewer session at one
+    # pending current OwnerGate. It is a receipt-operation vocabulary member
+    # (its detached-turn receipt is the outstanding run) and it is
+    # deliberately NOT a Level 2 operational-failure family — Owner-initiated
+    # advisory conversation carries no operational retry/block semantics;
+    # observed failures settle the receipt truthfully and stop.
+    OWNER_REVIEWER_DISCUSSION = "owner_reviewer_discussion"
 
 
 @dataclass(frozen=True, slots=True)

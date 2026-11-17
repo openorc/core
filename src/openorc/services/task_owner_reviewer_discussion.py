@@ -1,83 +1,79 @@
-"""E4: Owner ↔ Reviewer discussion across Reviewer-related gates (issue #79).
+"""E4: detached Owner ↔ Reviewer discussion without transcript persistence.
 
-One focused Owner-authenticated service routes free-form Owner ↔ Reviewer
-discussion at every pending current OwnerGate of a non-archived
-``waiting_for_owner`` Task through the Task's existing admitted READY
-Reviewer session. At ordinary gates the exchange is strictly advisory. At
-a pending current REVIEW_RESOLUTION gate, an explicitly recognizable
-standalone, schema-valid Reviewer ``review_result`` reply is a formal
-continuation of the same OPEN ReviewLoop and is dispatched — never applied
-here — to the authoritative exact-subject settlement seam (E3c planning
-today; E9 PR/head when that leaf lands). At a still-current plan-subject
-IMPLEMENTATION_AUTHORIZATION gate, issue #219 makes exactly one reply
-formal: a standalone schema-valid ``review_result`` with
-``CHANGES_REQUESTED`` dispatches E3's implementation-gate change-request
-handoff (a new iteration for the unchanged accepted revision, the gate
-superseded, planning resumed); any ACCEPTED reply there — like ordinary
-prose — stays advisory and the Owner may still approve the gate. E4 owns
-message routing and recognition; it never mutates gates, loops, or
-iterations directly. The runtime owns conversation context; OpenOrc
-records no transcript.
+One focused Owner-authenticated capability routes free-form Owner ↔ Reviewer
+discussion at a pending current REVIEW_RESOLUTION, IMPLEMENTATION_AUTHORIZATION,
+or MERGE_DECISION OwnerGate of a non-archived ``waiting_for_owner`` Task
+through the Task's existing admitted READY Reviewer session as ONE detached
+agent turn (issue #339). Discussion is never admitted at a PR_AUTHORIZATION
+or exceptional gate. At ordinary gates the exchange is strictly advisory. On
+the independently attributed completion text, an explicitly recognizable
+standalone, schema-valid Reviewer ``review_result`` is routed by the
+gate-specific decision rules to the existing owning settlements: any formal
+result at a REVIEW_RESOLUTION gate (plan or PR/head subject) settles that
+gate through the owning E3c/E9 resolution settlement; at a plan-subject
+IMPLEMENTATION_AUTHORIZATION gate issue #219 makes exactly one reply formal
+(a standalone ``CHANGES_REQUESTED`` supersedes the gate through the owning
+E3 change-request handoff); at a pending PR/head MERGE_DECISION gate only a
+standalone ``CHANGES_REQUESTED`` retires the gate through the owning E9
+supersession (a formal ACCEPTED there — like ordinary prose — stays advisory
+while the head is unchanged). Every formal continuation commits atomically
+with the receipt's settlement inside the correlation seam's transaction; the
+exact new ReviewIteration is created there, only the current gate is retired
+or settled, and the Producer work is submitted strictly after commit by the
+ONE post-commit completion handoff re-deriving from committed state. E4 owns
+admission routing, recognition, and gate-specific decision rules; it never
+mutates gates, loops, or iterations directly, and no automated formal REVIEW
+claim is ever invented. The runtime owns conversation context; OpenOrc
+records no transcript and no conversation text in any durable row.
 
-Composition order (authorization precedes every adapter acquisition):
+The discussion is the one detached dispatch whose claim and admission live in
+different invocations (the Owner-facing asynchronous seam), so the shared
+receipt machinery carries two discussion-specific duties:
 
-1. command-shape validation (no I/O);
-2. one short transaction proving the account-operational barrier, exact
-   Workspace/Task Owner authorization, the exact current Task under the
-   caller's expected token, ``WAITING_FOR_OWNER``, the exact pending
-   current gate addressed by ``owner_gate_id``, the gate's real subject
-   form (exact current PlanRevision for plan-subject gates; the recorded
-   pre-PR committed head for ``PR_AUTHORIZATION`` with no PR invented; the
-   canonical TaskPullRequest plus its exact reconciled head for PR/head
-   subjects), and the exact admitted READY Reviewer binding;
-3. deferred acquisition of the exact Reviewer runtime attachment through
-   the caller-supplied factory — production composition binds the #190
-   ``attach_cline_runtime`` BOUND attachment to the Phase-1 external
-   session identity, so no adapter is ever acquired before authorization;
-4. one short revalidation of the same currentness facts (attachment takes
-   wall-clock time; the send is refused when the state moved on);
-5. the verbatim Owner message as ONE ordinary exact-session send
-   (``expected_family=None``) with NO database transaction open;
-6. post-send recheck and one short recheck transaction that FIRST takes the
-   existing Task row ``FOR UPDATE`` — serializing the still-current decision
-   and its effects against concurrent Task mutations (an Owner gate
-   resolution stamps the gate and rotates the token under the same row
-   lock), so an ordinary exchange can never audit itself against a gate
-   that is no longer current: a still-current
-   ordinary exchange records exactly two direction-only
-   ``OWNER_REVIEWER_DISCUSSION_MESSAGE`` events (Owner message, Reviewer
-   reply) bound to the addressed gate — direction-only context, never any
-   text; a still-current formal result at a plan-subject REVIEW_RESOLUTION
-   dispatches the E3c settlement, and a still-current formal
-   CHANGES_REQUESTED at a plan-subject IMPLEMENTATION_AUTHORIZATION
-   dispatches issue #219's E3 change-request handoff, each with
-   ``record_discussion_message_events`` so the discussion facts commit
-   atomically with the authoritative continuation and no partial success
-   is representable; a recognized ACCEPTED at the implementation gate is
-   advisory and records the ordinary exchange; a recognized result at a
-   PR/head-subject REVIEW_RESOLUTION gate fails closed until E9 (#84)
-   adds its settlement seam.
+- **prepare** (:func:`prepare_owner_reviewer_discussion`) — the synchronous
+  authorization + receipt commit: one short transaction (Task row lock
+  first) proving the account-operational barrier, the exact authenticated
+  Owner Workspace/Task authorization for the claimed ``profile_id`` (never
+  the Workspace's recorded owner as proof of an unproven caller), the exact
+  current ``WAITING_FOR_OWNER`` Task, the exact pending current permitted
+  gate, its exact real subject form (current PlanRevision for plan gates;
+  the canonical TaskPullRequest plus its exact reconciled head for PR/head
+  gates), and the exact admitted READY Reviewer binding — then the
+  gate-bound receipt companion commits atomically (operation
+  ``owner_reviewer_discussion``, attempt kind ``owner_gate_discussion``,
+  identity the exact OwnerGate UUID, expected family the dedicated
+  non-formal discussion token). The single-outstanding-receipt invariant is
+  the writer-exclusion backstop.
+- **admit** (:func:`admit_owner_reviewer_discussion_turn`) — the
+  asynchronous admission operation: one short reproof transaction (the same
+  subjects, the claimed ``profile_id`` re-proven, the receipt still claimed
+  and unstamped) that also takes the receipt's set-once one-shot admission
+  stamp — a duplicate or re-delivered admission execution can never reach a
+  second enqueue of the same prepared message; then the exact Reviewer
+  attachment, the positive observation registration, the verbatim message
+  enqueue, and the acknowledgement attach, each outside any transaction. A
+  positively proven refusal — the attachment, the observation registration,
+  or the runtime admission — marks the receipt ``refused`` (the slot is
+  freed); an uncertain admission stays conservatively claimed (stamped,
+  never re-dispatched); the attach consumes any staged early completion.
 
-Recognition rule (deliberately stricter than the shared #65 parser's
-one-object-amid-prose tolerance): the whole normalized reply text must be
-exactly one standalone JSON object (unfenced) or exactly one fenced JSON
-object with nothing outside the fence. Prose-wrapped, buried, quoted, or
-example JSON, multiple objects, malformed JSON, and other-family or
-unknown-version objects all stay ordinary displayed conversation. Only an
-isolated candidate is validated through the existing #65
-``parse_formal_response``; the family must classify as ``review_result``
-and schema-validate, yielding the typed ``ReviewResult``. The parser matrix
-is reused, never duplicated or extended. At the implementation gate
-(issue #219) the recognized outcome additionally decides formality: only
-``CHANGES_REQUESTED`` is a workflow trigger, and a schema-valid
-``ACCEPTED`` stays ordinary displayed conversation.
+**settlement** (:func:`settle_observed_discussion_result`) — the attributed
+completion routes here from the correlation seam's discussion branch, atomic
+with the receipt settlement: the Task row lock, the full currentness reproof,
+the existing strict standalone ``review_result`` recognition, the
+gate-specific decisions through the owning E3c/E9 transaction phases, or the
+two direction-only ``OWNER_REVIEWER_DISCUSSION_MESSAGE`` audit events for an
+ordinary or advisory exchange. A discussion whose gate has moved on settles
+``result_not_applied``; an observed turn failure settles the receipt
+truthfully and stops (a discussion is deliberately not a Level 2
+operational-failure family).
 
-Failure discipline: known/uncertain adapter failures, unavailable exact
-sessions, stale/foreign subjects, and raced resolutions return typed safe
-errors, record nothing, and grant no workflow authority. An uncertain send
-may already have been delivered; it is never resent and never presented as
-a successful exchange. No database transaction spans the runtime send or
-any attachment acquisition.
+The Owner-facing contract is asynchronous by construction: the request
+acknowledges authorization and queueing, the receipt-status projection
+reports actual admission and refusal, and the reply is read through the
+runtime-native conversation surface. Transport acceptance is never presented
+as successful message delivery, and no conversation text ever enters a
+workflow event, a receipt outcome, or any OpenOrc transcript table.
 """
 
 from __future__ import annotations
@@ -86,27 +82,40 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, Final, Protocol, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
-    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
-from openorc.adapters.agent_runtime.results import AgentTextResponse
-from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import (
+    OWNER_REVIEWER_DISCUSSION_FAMILY,
+    REFUSAL_OUTCOME_KIND_KEY,
+    SETTLEMENT_DISCUSSION_EXCHANGE,
+    SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION,
+    SETTLEMENT_OUTCOME_LABEL_KEY,
+    TaskDetachedTurnReceipt,
+    TaskDetachedTurnReceiptStatus,
+)
 from openorc.domain.events import WorkflowEventActor
-from openorc.domain.gates import OwnerGate, OwnerGateType
+from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import detached_turns as turn_records
+from openorc.persistence import gates as gate_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.errors import ProtocolError
@@ -114,57 +123,106 @@ from openorc.protocol.models import REVIEW_OUTCOME_CHANGES_REQUESTED, ReviewResu
 from openorc.protocol.parsing import parse_formal_response
 from openorc.services import event_coordination
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
     StaleOperationError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_detached_turn_correlation import (
+    TurnSettlementKind,
+    TurnSettlementOutcome,
+    attach_acknowledged_turn,
+    record_task_detached_turn_receipt,
+)
+from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
 from openorc.services.task_planning_review_resolution import (
-    TaskPlanningGateChangeRequestOutcome,
-    TaskPlanningReviewResolutionOutcome,
-    settle_planning_review_resolution,
-    supersede_implementation_authorization_with_changes,
+    settle_observed_planning_review_resolution,
+    supersede_observed_implementation_authorization_with_changes,
 )
 from openorc.services.task_pr_review_decision import (
-    TaskPrMergeGateChangeRequestOutcome,
-    TaskPrReviewGateResolutionOutcome,
-    retire_pr_merge_decision_with_changes,
-    settle_pr_review_resolution,
+    retire_observed_pr_merge_decision_with_changes,
+    settle_observed_pr_review_resolution,
 )
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
-    require_current_task,
     require_task_pull_request_head,
 )
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
-    "OwnerReviewerDiscussionExchange",
-    "ProducerRuntimeAttachmentFactory",
+    "AdmittedOwnerReviewerDiscussion",
+    "DiscussionObservationRegistrar",
+    "ObservedDiscussionSettlement",
+    "ObservedDiscussionSettlementKind",
+    "OwnerGateDiscussionStatus",
+    "PreparedOwnerReviewerDiscussion",
     "ReviewerRuntimeAttachmentFactory",
-    "TaskOwnerReviewerDiscussionOutcome",
-    "send_owner_reviewer_discussion_message",
+    "admit_owner_reviewer_discussion_turn",
+    "get_owner_gate_discussion_status",
+    "prepare_owner_reviewer_discussion",
+    "release_prepared_discussion_receipt",
+    "settle_observed_discussion_result",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_owner_reviewer_discussion"
-_DISCUSSION_SPAN_NAME = "task_owner_reviewer_discussion.send_owner_reviewer_discussion_message"
+_PREPARE_SPAN_NAME = "task_owner_reviewer_discussion.prepare_owner_reviewer_discussion"
+_ADMIT_SPAN_NAME = "task_owner_reviewer_discussion.admit_owner_reviewer_discussion_turn"
+_SETTLEMENT_SPAN_NAME = "task_owner_reviewer_discussion.settle_observed_discussion_result"
+_STATUS_SPAN_NAME = "task_owner_reviewer_discussion.get_owner_gate_discussion_status"
+
+# The bounded wire/queue shape of one verbatim Owner message: far above any
+# ordinary conversational message, far below unbounded bodies. The text is
+# sent verbatim and never durably stored by OpenOrc.
+_MAX_DISCUSSION_MESSAGE_LENGTH: Final[int] = 20_000
+
+# The positively proven pre-effect refusal kinds of the discussion admission.
+_ATTACHMENT_REFUSAL_KIND: Final[str] = "admission_attachment_refused"
+_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+# The positively proven refusal of the operation submission itself (issue
+# #339): no worker will run, so the prepared receipt is released truthfully.
+_SUBMISSION_REFUSAL_KIND: Final[str] = "admission_submission_refused"
 
 logger = logging.getLogger(__name__)
 
-# The deferred attachment seams: the service decides WHEN each adapter is
+# The deferred attachment seam: the service decides WHEN the adapter is
 # acquired; the caller owns HOW the production attachment is composed (the
 # #190 BOUND ``attach_cline_runtime`` composition). No adapter is ever
-# acquired before the Phase-1 authorization transaction has committed.
+# acquired before the authorization transaction has committed.
 ReviewerRuntimeAttachmentFactory = Callable[
     [TaskAgentSession], AbstractContextManager[AgentRuntimeAdapter]
 ]
-ProducerRuntimeAttachmentFactory = Callable[[], AbstractContextManager[AgentRuntimeAdapter]]
+
+
+class DiscussionObservationRegistrar(Protocol):
+    """The positive pre-admission observation registration seam.
+
+    The serving process's detached-turn observation host implements it: the
+    admission must not proceed without the exact session being actively
+    observed, because the runtime integration cannot replay an arbitrary
+    missed terminal result.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Establish the positive detached-turn observation of one session."""
+        ...
+
 
 # Standalone fenced-object recognition: the whole normalized text must be
 # exactly one fence whose inner content is one JSON object, with nothing
@@ -175,51 +233,83 @@ _FENCED_OBJECT = re.compile(
 )
 
 
-class OwnerReviewerDiscussionExchange(StrEnum):
-    """The classified exchange outcome of one discussion service invocation."""
+class ObservedDiscussionSettlementKind(StrEnum):
+    """The classified durable outcome of one observed discussion completion."""
 
-    ORDINARY_REPLY = "ordinary_reply"
-    FORMAL_RESOLUTION_SETTLED = "formal_resolution_settled"
-    FORMAL_PLANNING_CHANGE_REQUESTED = "formal_planning_change_requested"
-    # Issue #84: the PR/head-subject formal continuations dispatch E9's
-    # dedicated seams instead of the planning settlement.
-    FORMAL_PR_RESOLUTION_SETTLED = "formal_pr_resolution_settled"
-    FORMAL_PR_MERGE_GATE_CHANGE_REQUESTED = "formal_pr_merge_gate_change_requested"
+    ORDINARY_EXCHANGE = "ordinary_exchange"
+    FORMAL_CONTINUATION = "formal_continuation"
 
 
 @dataclass(frozen=True, slots=True)
-class TaskOwnerReviewerDiscussionOutcome:
-    """The safe durable result of one Owner ↔ Reviewer discussion exchange.
+class PreparedOwnerReviewerDiscussion:
+    """The safe durable result of one prepared Owner ↔ Reviewer discussion.
 
-    ``exchange`` classifies the outcome. On ``ORDINARY_REPLY`` the reply
-    text is returned unmodified for the Owner-facing caller; the exchange
-    is audited as two direction-only events bound to the addressed gate.
-    On ``FORMAL_RESOLUTION_SETTLED`` the recognized formal result was
-    dispatched to the authoritative exact-subject settlement seam and
-    ``resolution`` carries its outcome. On
-    ``FORMAL_PLANNING_CHANGE_REQUESTED`` (issue #219) the recognized
-    CHANGES_REQUESTED result at the implementation gate was dispatched to
-    E3's change-request handoff and ``change_request`` carries its
-    outcome. The reply text is not re-exposed for any formal exchange
-    (the dispatched events and the runtime's own conversation context own
-    the facts). ``task`` is the still-current Task observed by the
-    post-send recheck. A failed exchange returns a typed error instead of
-    an outcome, never a falsely successful one.
+    The gate-bound receipt companion is committed and the message is
+    authorized for its single asynchronous admission. The message text is
+    carried by the operation invocation only — never by this result, never
+    by any durable row.
     """
 
-    exchange: OwnerReviewerDiscussionExchange
+    receipt: TaskDetachedTurnReceipt
     owner_gate: OwnerGate
     reviewer_session: TaskAgentSession
     task: Task
-    reply_text: str | None
-    resolution: TaskPlanningReviewResolutionOutcome | None
-    change_request: TaskPlanningGateChangeRequestOutcome | None
-    # Issue #84: the PR/head-subject formal continuations carry their E9
-    # seam outcomes (the settled PR/head resolution — with its installed
-    # merge decision gate or routed remediation round — or the retired
-    # merge-gate change request).
-    pr_resolution: TaskPrReviewGateResolutionOutcome | None = None
-    pr_merge_gate_change_request: TaskPrMergeGateChangeRequestOutcome | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedOwnerReviewerDiscussion:
+    """The safe durable result of one discussion admission invocation.
+
+    ``receipt`` is the receipt after the acknowledgement attach;
+    ``settlement_outcome`` carries the attach's classification — a staged
+    early completion may have settled the exchange within this very
+    invocation, and its post-commit handoff has already run. No message or
+    reply text is carried. A failed admission returns a typed error instead
+    of an outcome, never a falsely successful one.
+    """
+
+    receipt: TaskDetachedTurnReceipt
+    owner_gate: OwnerGate
+    reviewer_session: TaskAgentSession
+    task: Task
+    settlement_outcome: TurnSettlementOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedDiscussionSettlement:
+    """The durable outcome of one settled discussion completion.
+
+    ``kind`` classifies the exchange; ``settlement_label`` is the safe
+    machine label the receipt outcome records. No conversation text is
+    carried; the formal continuations' durable facts live in the owning
+    settlements' commits, and their Producer work belongs to the post-commit
+    completion handoff.
+    """
+
+    kind: ObservedDiscussionSettlementKind
+    settlement_label: str
+    owner_gate: OwnerGate
+    task: Task
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerGateDiscussionStatus:
+    """The Owner-visible lifecycle of one gate-bound discussion exchange.
+
+    The receipt is the single durable fact; ``outcome_label`` is the safe
+    settlement or refusal label exactly as recorded (``None`` while the
+    receipt is still claimed or admitted). ``admission_attempted_at`` lets a
+    ``claimed`` status distinguish an authorized message whose admission has
+    not yet been attempted from one whose attempt is unresolved.
+    """
+
+    receipt_id: UUID
+    status: TaskDetachedTurnReceiptStatus
+    claimed_at: datetime
+    admission_attempted_at: datetime | None
+    admitted_at: datetime | None
+    settled_at: datetime | None
+    outcome_label: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,9 +332,11 @@ def _require_uuid_command(value: object, name: str) -> UUID:
 
 
 def _require_message(value: object) -> str:
-    """Require one nonblank Owner message; the text is sent verbatim."""
+    """Require one bounded nonblank Owner message; the text is sent verbatim."""
     if not isinstance(value, str) or not value.strip():
         raise InvalidCommandError("message must be a non-empty string")
+    if len(value) > _MAX_DISCUSSION_MESSAGE_LENGTH:
+        raise InvalidCommandError("message exceeds the bounded discussion message length")
     return value
 
 
@@ -258,14 +350,24 @@ def _require_reviewer_factory(value: object) -> ReviewerRuntimeAttachmentFactory
     return cast(ReviewerRuntimeAttachmentFactory, value)
 
 
-def _require_producer_factory(value: object) -> ProducerRuntimeAttachmentFactory:
-    """Require the deferred Producer attachment factory for a formal continuation."""
-    if not callable(value):
+def _require_observation_registrar(value: object) -> DiscussionObservationRegistrar:
+    """Require the positive pre-admission observation registration seam."""
+    register = getattr(value, "register_session", None)
+    if not callable(register):
         raise InvalidCommandError(
-            "producer_runtime_factory must be a callable returning one adapter "
-            "attachment context manager for the formal E2 continuation"
+            "observation_registrar does not implement the established-session registration seam"
         )
-    return cast(ProducerRuntimeAttachmentFactory, value)
+    return cast(DiscussionObservationRegistrar, value)
+
+
+def _require_completion_handoff(value: object) -> DetachedTurnCompletionHandoff:
+    """Require the post-commit completion handoff dependency."""
+    handoff = getattr(value, "handoff_settled_completion", None)
+    if not callable(handoff):
+        raise InvalidCommandError(
+            "completion_handoff does not implement the detached-completion handoff seam"
+        )
+    return cast(DetachedTurnCompletionHandoff, value)
 
 
 # --- subject-form validation ------------------------------------------------------
@@ -367,95 +469,133 @@ def _require_ready_reviewer(
     return binding
 
 
-def _revalidate_currentness(
+def _require_discussion_gate(gate: OwnerGate) -> None:
+    """Refuse discussion at any gate type outside the permitted three.
+
+    Discussion is limited to the currently pending REVIEW_RESOLUTION,
+    IMPLEMENTATION_AUTHORIZATION, and MERGE_DECISION gates — never a
+    PR_AUTHORIZATION gate, never an exceptional blocked-Task gate, never
+    BLOCKED state. A non-permitted current gate is a typed conflict.
+    """
+    if gate.gate_type not in (
+        OwnerGateType.REVIEW_RESOLUTION,
+        OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+        OwnerGateType.MERGE_DECISION,
+    ):
+        raise ConflictError("discussion is not admitted at this owner gate type")
+
+
+def _load_discussion_subjects(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
     task_id: UUID,
     owner_gate_id: UUID,
-    expected_state_token: UUID,
-    expected_reviewer_session_id: UUID | None,
 ) -> _DiscussionSubjects:
-    """Reload and re-prove the exact current discussion subjects.
+    """Load and prove the exact current discussion subjects under the Task lock.
 
-    The one shared currentness reloader: the exact current non-archived
-    Task under the expected token, ``WAITING_FOR_OWNER``, the exact
-    pending current gate, its real subject form, and the exact admitted
-    READY Reviewer binding. Every phase proves the identical facts; when
-    ``expected_reviewer_session_id`` is supplied (the pre-send revalidation
-    and the post-send recheck), the durable binding must still be exactly
-    the Phase-1 session — never a replacement.
+    The one shared currentness loader of the discussion's authorization
+    transactions (prepare and admission): the Task row locked ``FOR UPDATE``
+    first — serializing the gate-bound receipt facts and the admission stamp
+    against every concurrent Task mutation (an Owner gate resolution stamps
+    the gate and rotates the token under the same row lock) — then the exact
+    current non-archived ``WAITING_FOR_OWNER`` Task, the exact pending
+    current permitted gate addressed by ``owner_gate_id``, the gate's real
+    subject form, and the exact admitted READY Reviewer binding. The Task's
+    own current ``state_token`` is the only currentness anchor these
+    Owner-facing invocations have: the caller supplies no token.
     """
-    task = require_current_task(
-        pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=expected_state_token,
-    )
+    task = task_records.get_task_for_update(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if task.archived_at is not None:
+        raise StaleOperationError("the task has already been archived; the operation is stale")
+    if task.terminalization_outcome is not None:
+        raise StaleOperationError(
+            "the task's terminalization is committed and its archival is pending; "
+            "the operation is stale"
+        )
     if task.status is not TaskStatus.WAITING_FOR_OWNER:
         raise ConflictError("the addressed task is not waiting on its owner gate")
     gate = require_current_owner_gate(pool, task=task, owner_gate_id=owner_gate_id)
+    _require_discussion_gate(gate)
     _validate_gate_subject(pool, task=task, gate=gate)
     reviewer = _require_ready_reviewer(pool, workspace_id=workspace_id, task_id=task_id)
-    if expected_reviewer_session_id is not None and reviewer.id != expected_reviewer_session_id:
-        raise StaleOperationError(
-            "the reviewer session binding has moved on since this exchange was "
-            "prepared; the operation is stale"
-        )
     return _DiscussionSubjects(task=task, gate=gate, reviewer=reviewer)
 
 
-# --- the exact-session send ---------------------------------------------------------
+def _refuse_discussion_receipt_quietly(
+    pool: DatabasePool, receipt: TaskDetachedTurnReceipt, refusal_kind: str
+) -> None:
+    """Mark a proven never-dispatched discussion receipt refused, best-effort.
 
-
-def _send_discussion_message(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
-    task_id: UUID,
-    external_session_id: str,
-    message: str,
-) -> AgentTextResponse:
-    """Send the Owner message verbatim to the exact Reviewer session.
-
-    ONE ordinary exact-session interaction (``expected_family=None``): the
-    adapter performs no protocol parsing, so formal-looking JSON in the
-    reply stays ordinary text at the adapter boundary. Known failure and
-    uncertain outcome stay distinct; an uncertain send may already have
-    been delivered and is never resent or presented as success. No
-    database transaction is open across this call.
+    The positively proven pre-effect refusal of the admission (a refused
+    observation registration or a positively refused runtime admission):
+    the receipt records ``refused`` so a never-dispatched message cannot
+    hold the Reviewer session's single-outstanding slot. A failed refusal
+    write is contained and logged — the durable state owns recovery — and
+    never turns into reported success.
     """
     try:
-        response = runtime.send(external_session_id, message, expected_family=None)
-    except AgentRuntimeInterruptedTurnError as error:
-        settle_observed_task_interrupt(
-            pool, runtime, task_id=task_id, external_session_id=external_session_id
+        refused = turn_records.refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
         )
-        raise ExternalOperationFailedError(
-            "the agent runtime discussion send was interrupted by the runtime; the "
-            "exchange was not recorded and nothing was applied"
-        ) from error
-    except AgentRuntimeUncertainOutcomeError as error:
+    except Exception as error:  # noqa: BLE001 - contained refusal write
         logger.warning(
-            "owner-reviewer discussion send ended with an uncertain runtime outcome; "
-            "the exchange was not recorded and nothing was applied"
+            "the discussion receipt could not be marked refused (%s); "
+            "authoritative recovery is required",
+            type(error).__name__,
         )
-        raise ExternalOperationUncertainError(
-            "the outcome of the agent runtime discussion send is unknown; the exchange "
-            "was not recorded and nothing was applied"
-        ) from error
-    except AgentRuntimeError as error:
-        raise ExternalOperationFailedError(
-            "the agent runtime discussion send failed; the exchange was not recorded "
-            "and nothing was applied"
-        ) from error
-    if not isinstance(response, AgentTextResponse):
-        # An ordinary send returns the typed ordinary reply; anything else
-        # is a known non-answer and is never interpreted as one.
-        raise ExternalOperationFailedError(
-            "the agent runtime did not return an ordinary discussion reply; the "
-            "exchange was not recorded and nothing was applied"
+        return
+    if refused is None:
+        logger.warning(
+            "the discussion receipt could not be marked refused; it is no longer claimed"
         )
-    return response
+
+
+def release_prepared_discussion_receipt(
+    pool: DatabasePool,
+    *,
+    receipt_id: UUID,
+    task_id: UUID,
+    workspace_id: UUID,
+) -> None:
+    """Release a prepared discussion receipt after a proven submission refusal.
+
+    The Owner-facing POST's known-refusal path (issue #339): the receipt was
+    committed and the admission operation submission was positively refused,
+    so no worker will ever run and the claimed receipt would otherwise hold
+    the Reviewer session's single-outstanding slot forever. The receipt is
+    settled ``refused`` with the submission-refusal kind through the
+    existing one-shot refusal transition — a raced concurrent admission (an
+    uncertainty that turns out to have been delivered) is a rejected no-op,
+    never a false release. The caller maps the refusal to its honest HTTP
+    failure afterwards; nothing here reports success.
+    """
+    try:
+        refused = turn_records.refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt_id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            refusal_kind=_SUBMISSION_REFUSAL_KIND,
+        )
+    except Exception as error:  # noqa: BLE001 - contained refusal write
+        logger.warning(
+            "the prepared discussion receipt could not be released after its "
+            "submission refusal (%s); authoritative recovery is required",
+            type(error).__name__,
+        )
+        return
+    if refused is None:
+        logger.warning(
+            "the prepared discussion receipt could not be released after its "
+            "submission refusal; it is no longer claimed"
+        )
 
 
 # --- formal-result recognition -------------------------------------------------------
@@ -554,238 +694,47 @@ def _record_ordinary_exchange_events(
     )
 
 
-# --- the formal dispatch ----------------------------------------------------------------
+# --- the detached dispatch: prepare (synchronous) and admit (asynchronous) ---
 
 
-def _dispatch_formal_resolution(
-    pool: DatabasePool,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    subjects: _DiscussionSubjects,
-    formal_result: ReviewResult,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    producer_runtime_factory: ProducerRuntimeAttachmentFactory | None,
-    github: GitHubAppClient | None,
-) -> TaskOwnerReviewerDiscussionOutcome:
-    """Hand one recognized formal result to the authoritative continuation seam.
-
-    E4 never mutates gates, loops, or iterations: a plan-subject
-    REVIEW_RESOLUTION dispatches the merged E3c settlement with the
-    discussion-audit coordination flag, and a still-current plan-subject
-    IMPLEMENTATION_AUTHORIZATION dispatches issue #219's E3 change-request
-    handoff the same way — only a CHANGES_REQUESTED result ever reaches
-    this dispatcher from that gate. A formal CHANGES_REQUESTED routes new
-    findings to E2, so the Producer-side attachment is acquired lazily —
-    only now, only for this path — around the seam call; a formal
-    ACCEPTED at REVIEW_RESOLUTION needs no Producer attachment and no
-    GitHub client. A PR/head-subject REVIEW_RESOLUTION belongs to E9
-    (#84): until that seam lands, a recognized result there fails closed
-    with no effect rather than being invented here. The dispatch target
-    re-proves every exact subject in its own transaction, so a raced
-    stale result applies nothing.
-    """
-    gate = subjects.gate
-    if gate.plan_revision_id is None:
-        # PR/head-subject form: E9's exact-subject PR-review seams (issue
-        # #84). At a pending PR/head MERGE_DECISION gate only a standalone
-        # valid CHANGES_REQUESTED is actionable — a formal ACCEPTED stays
-        # advisory exactly like ordinary prose, and the Owner may still
-        # approve the unchanged-head gate. At a PR/head REVIEW_RESOLUTION
-        # gate any schema-valid formal result settles it through E9's
-        # dedicated settlement. The dispatch target re-proves every exact
-        # subject in its own transaction, so a raced stale result applies
-        # nothing.
-        if gate.gate_type is OwnerGateType.MERGE_DECISION:
-            # Only a standalone valid CHANGES_REQUESTED reaches this branch:
-            # E4's recognition keeps a formal ACCEPTED advisory, and the
-            # retirement seam re-validates the outcome as its backstop.
-            if producer_runtime_factory is None or github is None:
-                raise InvalidCommandError(
-                    "the actionable merge-gate continuation requires the deferred "
-                    "producer runtime attachment factory and the GitHub client"
-                )
-            with producer_runtime_factory() as producer_runtime:
-                pr_change_request = retire_pr_merge_decision_with_changes(
-                    pool,
-                    producer_runtime,
-                    github,
-                    reviewer_runtime_factory,
-                    profile_id=profile_id,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    expected_state_token=expected_state_token,
-                    review_result=formal_result,
-                    record_discussion_message_events=True,
-                )
-            return TaskOwnerReviewerDiscussionOutcome(
-                exchange=OwnerReviewerDiscussionExchange.FORMAL_PR_MERGE_GATE_CHANGE_REQUESTED,
-                owner_gate=subjects.gate,
-                reviewer_session=subjects.reviewer,
-                task=pr_change_request.task,
-                reply_text=None,
-                resolution=None,
-                change_request=None,
-                pr_resolution=None,
-                pr_merge_gate_change_request=pr_change_request,
-            )
-        if formal_result.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
-            if producer_runtime_factory is None or github is None:
-                raise InvalidCommandError(
-                    "the formal continuation requires the deferred producer runtime "
-                    "attachment factory and the GitHub client"
-                )
-            with producer_runtime_factory() as producer_runtime:
-                pr_resolution = settle_pr_review_resolution(
-                    pool,
-                    producer_runtime,
-                    github,
-                    reviewer_runtime_factory,
-                    profile_id=profile_id,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    expected_state_token=expected_state_token,
-                    review_result=formal_result,
-                    record_discussion_message_events=True,
-                )
-        else:
-            pr_resolution = settle_pr_review_resolution(
-                pool,
-                None,
-                github,
-                reviewer_runtime_factory,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                review_result=formal_result,
-                record_discussion_message_events=True,
-            )
-        return TaskOwnerReviewerDiscussionOutcome(
-            exchange=OwnerReviewerDiscussionExchange.FORMAL_PR_RESOLUTION_SETTLED,
-            owner_gate=subjects.gate,
-            reviewer_session=subjects.reviewer,
-            task=pr_resolution.task,
-            reply_text=None,
-            resolution=None,
-            change_request=None,
-            pr_resolution=pr_resolution,
-            pr_merge_gate_change_request=None,
-        )
-    if gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
-        # Issue #219: the Reviewer change request at the accepted-plan gate
-        # hands planning back to the Producer through E3's exact-plan G1
-        # handoff; only the CHANGES_REQUESTED outcome reaches this branch.
-        if producer_runtime_factory is None:
-            raise InvalidCommandError(
-                "the formal continuation requires the deferred producer runtime attachment factory"
-            )
-        with producer_runtime_factory() as producer_runtime:
-            change_request = supersede_implementation_authorization_with_changes(
-                pool,
-                producer_runtime,
-                github,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                review_result=formal_result,
-                record_discussion_message_events=True,
-            )
-        return TaskOwnerReviewerDiscussionOutcome(
-            exchange=OwnerReviewerDiscussionExchange.FORMAL_PLANNING_CHANGE_REQUESTED,
-            owner_gate=subjects.gate,
-            reviewer_session=subjects.reviewer,
-            task=change_request.task,
-            reply_text=None,
-            resolution=None,
-            change_request=change_request,
-        )
-    if formal_result.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
-        if producer_runtime_factory is None:
-            raise InvalidCommandError(
-                "the formal continuation requires the deferred producer runtime attachment factory"
-            )
-        with producer_runtime_factory() as producer_runtime:
-            resolution = settle_planning_review_resolution(
-                pool,
-                producer_runtime,
-                github,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                review_result=formal_result,
-                record_discussion_message_events=True,
-            )
-    else:
-        resolution = settle_planning_review_resolution(
-            pool,
-            None,
-            github,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            review_result=formal_result,
-            record_discussion_message_events=True,
-        )
-    return TaskOwnerReviewerDiscussionOutcome(
-        exchange=OwnerReviewerDiscussionExchange.FORMAL_RESOLUTION_SETTLED,
-        owner_gate=subjects.gate,
-        reviewer_session=subjects.reviewer,
-        task=resolution.task,
-        reply_text=None,
-        resolution=resolution,
-        change_request=None,
-    )
-
-
-def send_owner_reviewer_discussion_message(
+def prepare_owner_reviewer_discussion(
     pool: DatabasePool,
     *,
     profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
     owner_gate_id: UUID,
-    expected_state_token: UUID,
     message: str,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    producer_runtime_factory: ProducerRuntimeAttachmentFactory | None = None,
-    github: GitHubAppClient | None = None,
-) -> TaskOwnerReviewerDiscussionOutcome:
-    """Route one Owner message to the exact admitted Reviewer session at one gate.
+) -> PreparedOwnerReviewerDiscussion:
+    """Authorize one Owner message and commit its gate-bound discussion receipt.
 
-    The single E4 discussion operation. Every authorization and currentness
-    check commits BEFORE any adapter acquisition; the exact Reviewer
-    attachment is acquired through the deferred factory bound to the
-    Phase-1 external session identity; the relevant currentness facts are
-    revalidated after acquisition and again after the send; and the
-    reply's classification decides only between ordinary audit and formal
-    continuation dispatch (the E3c settlement, or issue #219's E3
-    implementation-gate change-request handoff). No database transaction
-    spans the attachment or the send, and no failure path ever applies
-    workflow authority.
+    The synchronous prepare of the split Owner-facing seam (issue #339):
+    every immediately detectable failure is a typed error before any
+    submission. One short transaction (the Task row ``FOR UPDATE`` taken
+    first) proves the account-operational barrier, the exact authenticated
+    Owner Workspace/Task authorization for the claimed ``profile_id`` — never
+    the Workspace's recorded owner as proof of an unproven caller — and the
+    exact current discussion subjects, then commits the gate-bound receipt
+    companion atomically. The single-outstanding-receipt invariant is the
+    writer-exclusion backstop: a concurrent outstanding run on the exact
+    Reviewer session binding is a typed conflict. The message is validated
+    and bounded here and travels with the operation invocation only.
     """
-    with application_span(_SERVICE_TRACER_SCOPE, _DISCUSSION_SPAN_NAME) as span:
+    with application_span(_SERVICE_TRACER_SCOPE, _PREPARE_SPAN_NAME) as span:
         # --- Phase 0: command shape (no I/O). ---
         _require_uuid_command(profile_id, "profile_id")
         _require_uuid_command(workspace_id, "workspace_id")
         _require_uuid_command(task_id, "task_id")
         _require_uuid_command(owner_gate_id, "owner_gate_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
         _require_message(message)
-        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
         annotate_span(
             span,
-            operation=_DISCUSSION_SPAN_NAME,
+            operation=_PREPARE_SPAN_NAME,
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
 
-        # --- Phase 1: authorization + currentness, BEFORE any acquisition. ---
+        # --- Phase 1: authorization + currentness + the receipt companion. ---
         with composed_transaction(pool) as transaction_pool:
             require_account_operational(transaction_pool, profile_id=profile_id)
             require_workspace_task(
@@ -794,114 +743,564 @@ def send_owner_reviewer_discussion_message(
                 workspace_id=workspace_id,
                 task_id=task_id,
             )
-            subjects = _revalidate_currentness(
+            subjects = _load_discussion_subjects(
                 transaction_pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
                 owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-                expected_reviewer_session_id=None,
             )
-        prepared_reviewer_id = subjects.reviewer.id
-
-        # --- Phase 2a: acquire the exact Reviewer attachment (no tx open). ---
-        with reviewer_factory(subjects.reviewer) as reviewer_runtime:
-            # --- Phase 2b: revalidate currentness after acquisition. ---
-            with composed_transaction(pool) as transaction_pool:
-                _revalidate_currentness(
-                    transaction_pool,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    owner_gate_id=owner_gate_id,
-                    expected_state_token=expected_state_token,
-                    expected_reviewer_session_id=prepared_reviewer_id,
-                )
-            # --- Phase 2c: the ONE verbatim send, no transaction open. ---
-            reply = _send_discussion_message(
-                pool,
-                reviewer_runtime,
-                task_id,
-                subjects.reviewer.external_session_id or "",
-                message,
+            receipt = record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=subjects.reviewer.id,
+                operation=PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION,
+                original_attempt_kind=OriginalAttemptKind.OWNER_GATE_DISCUSSION,
+                original_attempt_id=owner_gate_id,
+                expected_formal_family=OWNER_REVIEWER_DISCUSSION_FAMILY,
             )
+        return PreparedOwnerReviewerDiscussion(
+            receipt=receipt,
+            owner_gate=subjects.gate,
+            reviewer_session=subjects.reviewer,
+            task=subjects.task,
+        )
 
-        # Recognition is pure text work on the already-received reply; it
-        # runs at REVIEW_RESOLUTION gates, at plan-subject
-        # IMPLEMENTATION_AUTHORIZATION gates, and at PR/head MERGE_DECISION
-        # gates, and decides which effects (if any) the still-current reply
-        # may have.
-        formal_result: ReviewResult | None = None
-        if subjects.gate.gate_type is OwnerGateType.REVIEW_RESOLUTION:
-            formal_result = _recognize_formal_review_result(reply.text)
-        elif subjects.gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
-            recognized = _recognize_formal_review_result(reply.text)
-            if recognized is not None and recognized.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
-                # Issue #219: at the implementation gate only a valid
-                # CHANGES_REQUESTED reply is an actionable formal trigger;
-                # a standalone ACCEPTED — like ordinary prose — stays
-                # advisory and the Owner may still approve the gate.
-                formal_result = recognized
-        elif subjects.gate.gate_type is OwnerGateType.MERGE_DECISION:
-            # Issue #84: at the pending PR/head merge gate only a standalone
-            # valid CHANGES_REQUESTED reply is an actionable formal trigger;
-            # ordinary discussion, malformed or embedded JSON, and a
-            # standalone ACCEPTED all stay advisory while the head is
-            # unchanged.
-            recognized = _recognize_formal_review_result(reply.text)
-            if recognized is not None and recognized.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED:
-                formal_result = recognized
 
-        # --- Phase 3: post-send recheck + effects (one short transaction). ---
+def admit_owner_reviewer_discussion_turn(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    receipt_id: UUID,
+    message: str,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    observation_registrar: DiscussionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> AdmittedOwnerReviewerDiscussion:
+    """Admit the prepared Owner message as ONE detached turn, exactly once.
+
+    The asynchronous admission of the split Owner-facing seam (issue #339).
+    One short reproof transaction (the Task row lock first, then the receipt
+    row) re-proves the claimed ``profile_id``'s authority and every exact
+    current subject, requires the receipt still claimed and unstamped, and
+    takes the receipt's set-once one-shot admission stamp — a duplicate or
+    re-delivered execution of the same prepared message can never reach a
+    second enqueue. Then, with no transaction open: the exact Reviewer
+    attachment (a positively proven attachment failure refuses the receipt
+    and frees the session's slot — the message was never enqueued; the
+    detached capability is duck-typed fail-closed), the positive
+    observation registration, the verbatim message enqueue, and the
+    acknowledgement attach. A positively proven refusal — attachment,
+    registration, or runtime — marks the receipt ``refused`` so the
+    never-dispatched message cannot hold the Reviewer session's slot; an
+    uncertain admission stays conservatively claimed and is never
+    re-dispatched. The attach consumes any staged early completion, and its
+    post-commit handoff runs when a staged completion settled the exchange
+    within this invocation.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _ADMIT_SPAN_NAME) as span:
+        # --- Phase 0: command shape (no I/O). ---
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
+        _require_uuid_command(receipt_id, "receipt_id")
+        _require_message(message)
+        registrar = _require_observation_registrar(observation_registrar)
+        handoff = _require_completion_handoff(completion_handoff)
+        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
+        annotate_span(
+            span,
+            operation=_ADMIT_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: the reproof + the one-shot admission stamp. ---
         with composed_transaction(pool) as transaction_pool:
-            # Serialize against concurrent Task mutations FIRST (the same
-            # Task-row lock every authoritative Task mutation takes, E3c's
-            # established pattern): an Owner gate resolution stamps the gate
-            # and rotates the token under this lock, so the still-current
-            # decision below and the audit/dispatch it authorizes can never
-            # interleave with a concurrent resolution. The lock lives only
-            # inside this short transaction — never across the attachment
-            # or the send, which happened before it.
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            current = _revalidate_currentness(
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            require_workspace_task(
                 transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-                expected_reviewer_session_id=prepared_reviewer_id,
-            )
-            if formal_result is None:
-                _record_ordinary_exchange_events(
-                    transaction_pool,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    gate=current.gate,
-                    reviewer=current.reviewer,
-                    profile_id=profile_id,
-                )
-
-        if formal_result is not None:
-            return _dispatch_formal_resolution(
-                pool,
                 profile_id=profile_id,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                expected_state_token=expected_state_token,
-                subjects=current,
-                formal_result=formal_result,
-                reviewer_runtime_factory=reviewer_runtime_factory,
-                producer_runtime_factory=producer_runtime_factory,
-                github=github,
             )
+            subjects = _load_discussion_subjects(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+            )
+            receipt = turn_records.get_task_detached_turn_receipt_for_update(
+                transaction_pool, receipt_id=receipt_id
+            )
+            if (
+                receipt is None
+                or receipt.workspace_id != workspace_id
+                or receipt.task_id != task_id
+                or receipt.operation
+                is not PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION
+                or receipt.original_attempt_id != owner_gate_id
+                or receipt.task_agent_session_id != subjects.reviewer.id
+            ):
+                raise NotFoundError(
+                    "the addressed discussion receipt is not available for this task"
+                )
+            if receipt.status is not TaskDetachedTurnReceiptStatus.CLAIMED:
+                raise StaleOperationError(
+                    "the discussion receipt is no longer claimed; the admission is stale"
+                )
+            if receipt.admission_attempted_at is not None:
+                raise StaleOperationError(
+                    "the discussion receipt's single admission attempt was already "
+                    "taken; the prepared message is never re-enqueued"
+                )
+            stamped = turn_records.mark_task_detached_turn_admission_attempted(
+                transaction_pool,
+                receipt_id=receipt.id,
+                task_id=task_id,
+                workspace_id=workspace_id,
+            )
+            if not stamped:  # pragma: no cover - locked claimed receipt must stamp
+                raise StaleOperationError(
+                    "the discussion receipt's one-shot admission stamp could not be "
+                    "taken; the message is never re-enqueued"
+                )
 
-        return TaskOwnerReviewerDiscussionOutcome(
-            exchange=OwnerReviewerDiscussionExchange.ORDINARY_REPLY,
-            owner_gate=current.gate,
-            reviewer_session=current.reviewer,
-            task=current.task,
-            reply_text=reply.text,
-            resolution=None,
-            change_request=None,
+        # --- Phases 2–5: attachment, registration, enqueue, attach — no
+        # database transaction spans any of them. ---
+        reviewer_external_session_id = subjects.reviewer.external_session_id
+        if reviewer_external_session_id is None or not reviewer_external_session_id.strip():
+            raise ConflictError("the reviewer session binding carries no external session identity")
+        with ExitStack() as attachment_stack:
+            # The exact Reviewer attachment. A positively proven attachment
+            # failure — a disabled connection, an unusable credential, an
+            # invalid configuration, a failed SDK attachment — is strictly
+            # pre-admission evidence: the message cannot have been enqueued
+            # yet, so the receipt is refused through the existing one-shot
+            # refusal path and the Reviewer session's single-outstanding slot
+            # is freed. Typed application errors keep their identity.
+            try:
+                runtime = attachment_stack.enter_context(reviewer_factory(subjects.reviewer))
+            except ApplicationError as error:
+                logger.warning(
+                    "the discussion attachment was refused before any admission (%s); "
+                    "the receipt is refused and the message never dispatched",
+                    type(error).__name__,
+                )
+                _refuse_discussion_receipt_quietly(pool, receipt, _ATTACHMENT_REFUSAL_KIND)
+                raise
+            except Exception as error:
+                logger.warning(
+                    "the discussion attachment failed before any admission (%s); "
+                    "the receipt is refused and the message never dispatched",
+                    type(error).__name__,
+                )
+                _refuse_discussion_receipt_quietly(pool, receipt, _ATTACHMENT_REFUSAL_KIND)
+                raise ExternalOperationFailedError(
+                    "the reviewer runtime attachment failed before any admission; "
+                    "the receipt is refused and the message never dispatched"
+                ) from error
+            # The detached capability is duck-typed fail-closed BEFORE any
+            # admission effect: a runtime without it cannot serve the
+            # detached discussion, and the just-stamped receipt is refused.
+            admit = getattr(runtime, "admit_detached_turn", None)
+            if not callable(admit):
+                _refuse_discussion_receipt_quietly(pool, receipt, _ADMISSION_REFUSAL_KIND)
+                raise ExternalOperationFailedError(
+                    "the reviewer runtime does not implement the detached turn "
+                    "capability; the discussion admission failed before any effect"
+                )
+            admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+            # The positive pre-admission observation registration: the
+            # positively-required gate. A refusal is a proven pre-effect
+            # failure: the receipt is marked refused, so a never-dispatched
+            # message cannot hold the session's single-outstanding slot.
+            try:
+                registrar.register_session(
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    task_agent_session_id=subjects.reviewer.id,
+                    connection_id=subjects.reviewer.connection_id,
+                    external_session_id=reviewer_external_session_id,
+                )
+            except ObservationRegistrationRefusedError as error:
+                _refuse_discussion_receipt_quietly(pool, receipt, _REGISTRATION_REFUSAL_KIND)
+                raise ExternalOperationFailedError(
+                    "the discussion observation registration was refused before "
+                    "any admission; the message never dispatched"
+                ) from error
+            except Exception as error:
+                logger.warning(
+                    "the discussion observation registration failed (%s) before any "
+                    "admission; the receipt is refused and the message never dispatched",
+                    type(error).__name__,
+                )
+                _refuse_discussion_receipt_quietly(pool, receipt, _REGISTRATION_REFUSAL_KIND)
+                raise ExternalOperationFailedError(
+                    "the discussion observation registration failed before any "
+                    "admission; the message never dispatched"
+                ) from error
+
+            # The ONE verbatim enqueue. Uncertainty keeps the receipt
+            # conservatively claimed (stamped) and never re-dispatches; a
+            # positively identified refusal is proven pre-effect, so the
+            # receipt is marked refused and the admission fails known.
+            try:
+                admission = admit_detached_turn(reviewer_external_session_id, message)
+            except AgentRuntimeUncertainOutcomeError as error:
+                logger.warning(
+                    "the detached discussion admission ended with an uncertain outcome; "
+                    "the receipt stays conservatively claimed and is never re-dispatched"
+                )
+                raise ExternalOperationUncertainError(
+                    "the outcome of the discussion admission is unknown; the receipt "
+                    "stays conservatively claimed and the message is never re-dispatched"
+                ) from error
+            except AgentRuntimeError as error:
+                _refuse_discussion_receipt_quietly(pool, receipt, _ADMISSION_REFUSAL_KIND)
+                raise ExternalOperationRejectedError(
+                    "the discussion admission was refused before any effect; "
+                    "the receipt is refused and the message never dispatched"
+                ) from error
+
+            # The acknowledgement attach (one short transaction). A staged
+            # early completion is consumed exactly once here and routed
+            # through the ordinary settlement, so a discussion exchange that
+            # finished before the acknowledgement was persisted is
+            # correlated, never ignored or duplicated.
+            try:
+                outcome: TurnSettlementOutcome = attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            except ApplicationError:
+                raise
+            except Exception as error:
+                raise ExternalOperationFailedError(
+                    "the discussion acknowledgement could not be durably attached "
+                    "after its known admission; authoritative recovery is required "
+                    "and the message is never re-dispatched"
+                ) from error
+
+        # The attachment is released; the handoff is strictly post-dispatch
+        # and never holds the runtime lease.
+        if outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+            try:
+                handoff.handoff_settled_completion(
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    operation=PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION,
+                )
+            except Exception as error:  # noqa: BLE001 - contained handoff
+                logger.warning(
+                    "the post-admission discussion completion handoff failed (%s); "
+                    "the durable state owns recovery",
+                    type(error).__name__,
+                )
+        reloaded_task = task_records.get_task(pool, task_id=task_id)
+        if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        return AdmittedOwnerReviewerDiscussion(
+            receipt=outcome.receipt if outcome.receipt is not None else receipt,
+            owner_gate=subjects.gate,
+            reviewer_session=subjects.reviewer,
+            task=reloaded_task,
+            settlement_outcome=outcome,
+        )
+
+
+# --- the observed completion settlement ----------------------------------------
+
+
+def _settle_observed_formal_continuation(
+    transaction_pool: DatabasePool,
+    *,
+    owner_profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    gate: OwnerGate,
+    formal_result: ReviewResult,
+) -> None:
+    """Dispatch one actionable formal continuation to its owning settlement phase.
+
+    The gate-specific decision rules on the recognized standalone
+    ``review_result``: any formal result at a REVIEW_RESOLUTION gate settles
+    that gate through the owning E3c (plan-subject) or E9 (PR/head-subject)
+    resolution settlement; at a plan-subject IMPLEMENTATION_AUTHORIZATION
+    gate only a CHANGES_REQUESTED reaches the owning E3 supersession; at a
+    pending PR/head MERGE_DECISION gate only a CHANGES_REQUESTED reaches the
+    owning E9 retirement. Each phase runs inside the caller's transaction —
+    the exact new ReviewIteration, the gate retirement/settlement, the audit
+    events, and the direction-only discussion audit commit atomically with
+    the receipt's settlement — and no runtime or GitHub dependency is
+    involved: the Producer work belongs to the post-commit completion
+    handoff.
+    """
+    if gate.gate_type is OwnerGateType.REVIEW_RESOLUTION:
+        if gate.plan_revision_id is not None:
+            settle_observed_planning_review_resolution(
+                transaction_pool,
+                profile_id=owner_profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                result=formal_result,
+                record_discussion_message_events=True,
+            )
+            return
+        settle_observed_pr_review_resolution(
+            transaction_pool,
+            profile_id=owner_profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            result=formal_result,
+            record_discussion_message_events=True,
+        )
+        return
+    if gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
+        # Issue #219: at the implementation gate only a valid CHANGES_REQUESTED
+        # reply is an actionable formal trigger; a standalone ACCEPTED — like
+        # ordinary prose — stays advisory and the Owner may still approve.
+        supersede_observed_implementation_authorization_with_changes(
+            transaction_pool,
+            profile_id=owner_profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            result=formal_result,
+            record_discussion_message_events=True,
+        )
+        return
+    # Issue #84: at the pending PR/head merge gate only a standalone valid
+    # CHANGES_REQUESTED is actionable; the retirement seam re-validates the
+    # outcome as its backstop.
+    retire_observed_pr_merge_decision_with_changes(
+        transaction_pool,
+        profile_id=owner_profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        result=formal_result,
+        record_discussion_message_events=True,
+    )
+
+
+def settle_observed_discussion_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    result_text: str | None,
+) -> ObservedDiscussionSettlement | None:
+    """Settle one attributed discussion completion, atomic with the receipt.
+
+    Called inside the correlation seam's settlement transaction (issue
+    #339): the Task row ``FOR UPDATE`` taken FIRST — serializing the
+    still-current decision against concurrent Task mutations — then the full
+    currentness reproof (the exact gate-bound discussion subject still the
+    Task's current pending permitted gate with its intact subject form, and
+    the exact READY Reviewer binding). The raw attributed text — never
+    funneled through the shared formal contract, because the discussion's
+    permitted result is a non-formal attributed text — goes through the
+    existing strict standalone ``review_result`` recognizer and the
+    gate-specific decision rules: an actionable formal continuation commits
+    through the owning E3c/E9 settlement phase; an ordinary or advisory
+    exchange records exactly the two direction-only
+    ``OWNER_REVIEWER_DISCUSSION_MESSAGE`` events. The Workspace's single
+    Owner identity is the durable OWNER actor of the exchange audit and the
+    owning settlements' authorization input — the v1 identity every
+    discussion caller must re-prove as. ``None`` means the discussion moved
+    on (a raced resolution, a superseded gate, a moved binding): the receipt
+    settles ``result_not_applied`` and nothing is applied.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _SETTLEMENT_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_SETTLEMENT_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        # --- The Task row lock FIRST. ---
+        locked = task_records.get_task_for_update(transaction_pool, task_id=task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        # --- The currentness reproof under the lock. ---
+        gate = gate_records.get_owner_gate(
+            transaction_pool, owner_gate_id=receipt.original_attempt_id
+        )
+        if (
+            gate is None
+            or gate.workspace_id != workspace_id
+            or gate.task_id != task_id
+            or locked.current_owner_gate_id != gate.id
+            or gate.status is not OwnerGateStatus.PENDING
+        ):
+            return None
+        try:
+            _require_discussion_gate(gate)
+            _validate_gate_subject(transaction_pool, task=locked, gate=gate)
+        except (ConflictError, NotFoundError, StaleOperationError):
+            return None
+        binding = get_task_agent_session(
+            transaction_pool, task_id=task_id, role=WorkflowRole.REVIEWER
+        )
+        if (
+            binding is None
+            or binding.id != receipt.task_agent_session_id
+            or binding.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        ):
+            return None
+        workspace = get_workspace(transaction_pool, workspace_id)
+        if workspace is None:  # pragma: no cover - the Task's scope proved it
+            raise NotFoundError("the requested workspace is not available")
+        owner_profile_id = workspace.owner_profile_id
+        expected_state_token = locked.state_token
+
+        # --- Recognition and the gate-specific decision rules. ---
+        recognized = (
+            _recognize_formal_review_result(result_text) if result_text is not None else None
+        )
+        formal_result: ReviewResult | None = None
+        if recognized is not None:
+            if gate.gate_type is OwnerGateType.REVIEW_RESOLUTION:
+                # Any standalone schema-valid formal result settles the
+                # resolution gate through its owning E3c/E9 settlement.
+                formal_result = recognized
+            elif recognized.outcome == REVIEW_OUTCOME_CHANGES_REQUESTED and gate.gate_type in (
+                OwnerGateType.IMPLEMENTATION_AUTHORIZATION,
+                OwnerGateType.MERGE_DECISION,
+            ):
+                # Only a CHANGES_REQUESTED is actionable at the approval
+                # gates; a standalone ACCEPTED — like ordinary prose — stays
+                # advisory while the Owner authority is intact.
+                formal_result = recognized
+        if formal_result is not None:
+            _settle_observed_formal_continuation(
+                transaction_pool,
+                owner_profile_id=owner_profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                gate=gate,
+                formal_result=formal_result,
+            )
+            return ObservedDiscussionSettlement(
+                kind=ObservedDiscussionSettlementKind.FORMAL_CONTINUATION,
+                settlement_label=SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION,
+                owner_gate=gate,
+                task=locked,
+            )
+        # Ordinary text, unrecognized JSON, or a nonactionable formal ACCEPTED
+        # at an approval gate: Owner authority intact, only the existing
+        # direction-only audit.
+        _record_ordinary_exchange_events(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            gate=gate,
+            reviewer=binding,
+            profile_id=owner_profile_id,
+        )
+        return ObservedDiscussionSettlement(
+            kind=ObservedDiscussionSettlementKind.ORDINARY_EXCHANGE,
+            settlement_label=SETTLEMENT_DISCUSSION_EXCHANGE,
+            owner_gate=gate,
+            task=locked,
+        )
+
+
+# --- the Owner-visible receipt-status projection -------------------------------
+
+
+def get_owner_gate_discussion_status(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+) -> OwnerGateDiscussionStatus | None:
+    """Project one gate-bound discussion's durable lifecycle for its Owner.
+
+    The correlated asynchronous status projection of the split Owner-facing
+    seam (issue #339): a read-only service over the receipts bound to the
+    addressed durable identity — the exact OwnerGate UUID — scoped to the
+    authenticated Owner's Task. The outstanding receipt (claimed or
+    admitted) is reported while it exists, so the Owner can distinguish an
+    authorized-and-queued message (claimed, not yet attempted), an
+    unresolved admission attempt (claimed, stamped), and a runtime-acknowledged
+    turn (admitted); otherwise the newest terminal record reports the
+    recorded exchange, the dispatched formal continuation, a proven refusal,
+    or an unresolved failure. ``None`` is the honest no-discussion fact: a
+    foreign identity is indistinguishable from addressing something absent.
+    Transport acceptance is never reported here as delivery — the receipt's
+    own lifecycle is.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _STATUS_SPAN_NAME) as span:
+        # --- Phase 0: command shape (no I/O). ---
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(owner_gate_id, "owner_gate_id")
+        annotate_span(
+            span,
+            operation=_STATUS_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        # --- Phase 1: the read-only authorization. ---
+        with composed_transaction(pool) as transaction_pool:
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            require_workspace_task(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
+        # --- The scoped read. ---
+        receipts = turn_records.list_task_detached_turn_receipts_for_original_attempt(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            original_attempt_kind=OriginalAttemptKind.OWNER_GATE_DISCUSSION,
+            original_attempt_id=owner_gate_id,
+        )
+        if not receipts:
+            return None
+        outstanding = next(
+            (
+                receipt
+                for receipt in receipts
+                if receipt.status
+                in (TaskDetachedTurnReceiptStatus.CLAIMED, TaskDetachedTurnReceiptStatus.ADMITTED)
+            ),
+            None,
+        )
+        chosen = outstanding if outstanding is not None else receipts[0]
+        outcome_label: str | None = None
+        if chosen.status is TaskDetachedTurnReceiptStatus.SETTLED:
+            label = chosen.outcome.get(SETTLEMENT_OUTCOME_LABEL_KEY)
+            outcome_label = label if isinstance(label, str) else None
+        elif chosen.status is TaskDetachedTurnReceiptStatus.REFUSED:
+            label = chosen.outcome.get(REFUSAL_OUTCOME_KIND_KEY)
+            outcome_label = label if isinstance(label, str) else None
+        return OwnerGateDiscussionStatus(
+            receipt_id=chosen.id,
+            status=chosen.status,
+            claimed_at=chosen.claimed_at,
+            admission_attempted_at=chosen.admission_attempted_at,
+            admitted_at=chosen.admitted_at,
+            settled_at=chosen.settled_at,
+            outcome_label=outcome_label,
         )

@@ -707,6 +707,7 @@ def _remediation_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 

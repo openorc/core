@@ -1327,6 +1327,7 @@ def _detached_initialization_receipt_row(
         "ext-init-9",
         {"adapter": "cline", "configuration": {}},
         None,
+        None,
     )
 
 
@@ -1353,6 +1354,7 @@ def _settled_initialization_receipt_row(
         external_session_id,
         {"adapter": "cline", "configuration": {}},
         None,
+        None,
     )
 
 
@@ -1376,6 +1378,7 @@ def _detached_prepare_receipt_row(
         None,
         None,
         _OBSERVED,
+        None,
         None,
         None,
         None,
@@ -1856,6 +1859,7 @@ def _refused_receipt_row(receipt_row: tuple[Any, ...], refusal_kind: str) -> tup
         None,
         _OBSERVED,  # the refusal instant
         _OBSERVED,
+        None,
         None,
         None,
         None,

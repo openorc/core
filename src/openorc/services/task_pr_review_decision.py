@@ -156,8 +156,10 @@ __all__ = [
     "TaskPrReviewDecisionOutcome",
     "TaskPrReviewGateResolutionOutcome",
     "finalize_pr_review_decision",
+    "retire_observed_pr_merge_decision_with_changes",
     "retire_pr_merge_decision_with_changes",
     "settle_observed_pr_review",
+    "settle_observed_pr_review_resolution",
     "settle_pr_review_resolution",
 ]
 
@@ -1095,6 +1097,78 @@ def _settle_pr_resolution_transaction(
             None,
             reviewer,
         )
+
+
+def settle_observed_pr_review_resolution(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: ReviewResult,
+    record_discussion_message_events: bool = True,
+) -> tuple:
+    """Settle the exact PR/head REVIEW_RESOLUTION gate inside the caller's transaction.
+
+    The detached discussion settlement's entry point (issue #339): the exact
+    durable settlement transaction of :func:`settle_pr_review_resolution`,
+    composed inside the caller's already-open transaction (the nested
+    composition becomes a SAVEPOINT), so the gate's ``SETTLED`` stamp, the
+    NEW finalized same-head iteration, the audit events, and the
+    direction-only discussion audit commit atomically with the caller's
+    receipt settlement. A formal ACCEPTED installs a NEW exact-head
+    MERGE_DECISION inside the same transaction; a formal CHANGES_REQUESTED
+    returns the Task to ``REVIEWING`` with no Producer routing here. The
+    blocking wrapper's external consequences belong to this seam's own
+    post-commit continuation — the detached completion handoff re-derives the
+    Producer remediation dispatch from committed state — so no runtime or
+    GitHub dependency is proven here and nothing external is invoked.
+    """
+    return _settle_pr_resolution_transaction(
+        pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        result=result,
+        record_discussion_message_events=record_discussion_message_events,
+    )
+
+
+def retire_observed_pr_merge_decision_with_changes(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: ReviewResult,
+    record_discussion_message_events: bool = True,
+) -> tuple:
+    """Retire the pending PR/head MERGE_DECISION gate inside the caller's transaction.
+
+    The detached discussion settlement's entry point (issue #339): the exact
+    durable retirement transaction of
+    :func:`retire_pr_merge_decision_with_changes`, composed inside the
+    caller's already-open transaction (the nested composition becomes a
+    SAVEPOINT), so the NEW finalized same-head iteration, the audit events,
+    the guarded gate supersession, the pointer clear, and the token rotation
+    commit atomically with the caller's receipt settlement. The blocking
+    wrapper's external consequences belong to this seam's own post-commit
+    continuation — the detached completion handoff re-derives the Producer
+    remediation dispatch from committed state — so no runtime or GitHub
+    dependency is proven here and nothing external is invoked.
+    """
+    return _retire_pr_merge_decision_transaction(
+        pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        result=result,
+        record_discussion_message_events=record_discussion_message_events,
+    )
 
 
 def settle_pr_review_resolution(

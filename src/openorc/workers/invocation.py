@@ -137,6 +137,13 @@ class OperationKind(StrEnum):
     # any runtime effect, and a late or duplicate invocation is the
     # idempotent no-op. Not enrolled in the F5b Level 2/3 triage.
     TASK_TERMINAL_FINALIZATION = "task_terminal_finalization"
+    # Detached Owner ↔ Reviewer discussion admission (issue #339): the
+    # asynchronous admission of one prepared, already-authorized discussion
+    # message as one detached turn on the exact Reviewer session at its
+    # gate-bound receipt. Not enrolled in the F5b Level 2 triage — an
+    # Owner-initiated advisory conversation carries no operational
+    # retry/block semantics; the receipt lifecycle owns every failure.
+    TASK_OWNER_REVIEWER_DISCUSSION = "task_owner_reviewer_discussion"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -260,6 +267,9 @@ _TASK_KIND_ROLES: Mapping[OperationKind, WorkflowRoleRef] = {
     OperationKind.TASK_PR_AUTHORIZATION_RETRY: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_COMPOSITION: WorkflowRoleRef.PRODUCER,
     OperationKind.TASK_PR_REVIEW: WorkflowRoleRef.REVIEWER,
+    # Issue #339: the discussion admission executes on the exact Reviewer
+    # session; the scope carries the consuming (REVIEWER) role.
+    OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: WorkflowRoleRef.REVIEWER,
 }
 
 
@@ -526,6 +536,43 @@ class TaskPrReviewPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskOwnerReviewerDiscussionPayload:
+    """The detached Owner ↔ Reviewer discussion admission payload (issue #339).
+
+    The exact durable Workspace/Task units with the consuming Reviewer role
+    (the session the turn is admitted on), the accountable authenticated
+    Owner Profile identity whose authority the executing service re-proves,
+    the addressed OwnerGate and its already-prepared gate-bound receipt, and
+    the verbatim Owner message. The message is the operation's own command
+    input — Owner-authored conversational content, transient on the wire,
+    never durably stored by OpenOrc: no receipt, event, or projection row
+    ever carries it. The gate's currency and the receipt's one-shot
+    admission are re-proven from durable state by the executing service.
+    """
+
+    task: TaskScope
+    profile_id: str
+    owner_gate_id: str
+    receipt_id: str
+    message: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "profile_id", _require_canonical_uuid(self.profile_id, "profile_id")
+        )
+        object.__setattr__(
+            self, "owner_gate_id", _require_canonical_uuid(self.owner_gate_id, "owner_gate_id")
+        )
+        object.__setattr__(
+            self, "receipt_id", _require_canonical_uuid(self.receipt_id, "receipt_id")
+        )
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise InvalidInvocationError(
+                "the invocation field 'message' must be a non-empty string"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class WebhookDeliveryDispatchPayload:
     """The GitHub webhook delivery-dispatch operation payload (Task-less).
 
@@ -634,6 +681,7 @@ OperationPayload = (
     | TaskPrReviewPayload
     | TaskSessionResumePayload
     | TerminalFinalizationPayload
+    | TaskOwnerReviewerDiscussionPayload
 )
 
 
@@ -666,6 +714,9 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
         {"task", "profile_id", "task_resume_intent_id", "restored_status", "expected_state_token"}
     ),
     OperationKind.TASK_TERMINAL_FINALIZATION: frozenset({"workspace_id", "task_id"}),
+    OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: frozenset(
+        {"task", "profile_id", "owner_gate_id", "receipt_id", "message"}
+    ),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -686,6 +737,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_PR_REVIEW: TaskPrReviewPayload,
     OperationKind.TASK_SESSION_RESUME: TaskSessionResumePayload,
     OperationKind.TASK_TERMINAL_FINALIZATION: TerminalFinalizationPayload,
+    OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: TaskOwnerReviewerDiscussionPayload,
 }
 
 
@@ -852,6 +904,21 @@ def _decode_terminal_finalization_payload(
     )
 
 
+def _decode_task_owner_reviewer_discussion_payload(
+    raw: object,
+) -> TaskOwnerReviewerDiscussionPayload:
+    kind = OperationKind.TASK_OWNER_REVIEWER_DISCUSSION
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    message = _require_non_empty_string(fields["message"], "message")
+    return TaskOwnerReviewerDiscussionPayload(
+        task=_decode_task_scope_for_kind(fields["task"], kind),
+        profile_id=_require_canonical_uuid(fields["profile_id"], "profile_id"),
+        owner_gate_id=_require_canonical_uuid(fields["owner_gate_id"], "owner_gate_id"),
+        receipt_id=_require_canonical_uuid(fields["receipt_id"], "receipt_id"),
+        message=message,
+    )
+
+
 _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: _decode_webhook_delivery_dispatch_payload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: _decode_reconciliation_sweep_payload,
@@ -867,6 +934,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_PR_REVIEW: _decode_task_pr_review_payload,
     OperationKind.TASK_SESSION_RESUME: _decode_task_session_resume_payload,
     OperationKind.TASK_TERMINAL_FINALIZATION: _decode_terminal_finalization_payload,
+    OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: (_decode_task_owner_reviewer_discussion_payload),
 }
 
 
@@ -884,6 +952,16 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         kind is OperationKind.TASK_TERMINAL_FINALIZATION
     ):
         return {"workspace_id": payload.workspace_id, "task_id": payload.task_id}
+    if isinstance(payload, TaskOwnerReviewerDiscussionPayload) and (
+        kind is OperationKind.TASK_OWNER_REVIEWER_DISCUSSION
+    ):
+        return {
+            "task": payload.task.encode(),
+            "profile_id": payload.profile_id,
+            "owner_gate_id": payload.owner_gate_id,
+            "receipt_id": payload.receipt_id,
+            "message": payload.message,
+        }
     if isinstance(payload, TaskPlanningBootstrapAndInitialPlanPayload) and (
         kind is OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
     ):

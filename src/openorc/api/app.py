@@ -21,6 +21,7 @@ from openorc.api.request_correlation import (
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
 from openorc.api.routers.role_bindings import router as role_bindings_router
+from openorc.api.routers.tasks import router as tasks_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
@@ -142,6 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(github_webhooks_router)
     app.include_router(role_bindings_router)
+    app.include_router(tasks_router)
     app.state.settings = resolved
     return app
 

@@ -116,6 +116,7 @@ def test_claimed_receipt_is_the_valid_default() -> None:
             "created_external_session_id",
             "effective_config_snapshot",
             "created_session_provenance",
+            "admission_attempted_at",
         }
     )
 

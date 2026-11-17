@@ -576,6 +576,7 @@ def _initialization_receipt_row(task_agent_session_id: Any) -> tuple[Any, ...]:
         "ext-session-7",
         {"adapter": "clin", "configuration": {}},
         None,
+        None,
     )
 
 

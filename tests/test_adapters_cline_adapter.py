@@ -33,6 +33,7 @@ from uuid import UUID
 import pytest
 
 import openorc.protocol
+from openorc.adapters.agent_runtime.conversation import ConversationMessage
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeDeliveryUncertainError,
@@ -4253,3 +4254,39 @@ def test_recognized_hub_admission_refusals_classify_as_known_refusals() -> None:
 
         with pytest.raises(AgentRuntimeUnavailableError):
             adapter.admit_detached_turn("cline-session-9", _INITIALIZATION)
+
+
+# --- the conversation-read capability (issue #339) ------------------------------
+
+
+def test_read_conversation_projects_the_runtime_messages_defensively() -> None:
+    from typing import cast
+
+    from openorc.adapters.cline.values import JsonObject
+
+    adapter, backend, _resolver, session_id = _ready_adapter()
+    backend.queue_read_messages(
+        session_id,
+        cast(
+            list[JsonObject],
+            [
+                {"type": "say", "text": "Reviewer message one."},
+                {"type": "ask", "unrelated": 1},
+                "not-a-dict",
+            ],
+        ),
+    )
+
+    projected = adapter.read_conversation(session_id)
+
+    assert projected == [
+        ConversationMessage(index=0, kind="say", text="Reviewer message one."),
+        ConversationMessage(index=1, kind="ask", text=None),
+        ConversationMessage(index=2, kind=None, text=None),
+    ]
+    # A pure observational read: the read itself sends nothing beyond the
+    # construction-time readiness handshake.
+    sends_before = sum(1 for call in backend.calls() if call.operation == "send")
+    adapter.read_conversation(session_id)
+    sends_after = sum(1 for call in backend.calls() if call.operation == "send")
+    assert sends_after == sends_before
