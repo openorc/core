@@ -42,6 +42,7 @@ integration-marked suite against a real Postgres.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -63,17 +64,26 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.send_claims import (
+    TaskRuntimeSendClaim,
+    TaskRuntimeSendClaimKind,
+    TaskRuntimeSendClaimStatus,
+)
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.models import PR_RESULT_FAMILY
+from openorc.protocol.models import PR_RESULT_FAMILY, PrResult
+from openorc.protocol.parsing import parse_formal_response
 from openorc.services import pull_request_publication
 from openorc.services.errors import (
     AuthorizationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.pull_request_publication import (
@@ -83,9 +93,16 @@ from openorc.services.pull_request_publication import (
     TaskPullRequestPublication,
     TaskPullRequestPublicationOutcome,
 )
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
+)
 from openorc.services.task_pr_composition import (
     ProducerRuntimeAttachmentFactory,
+    SettledTaskPrPublication,
     compose_and_publish_task_pr,
+    dispatch_pr_compose_detached,
+    publish_settled_task_pr_composition,
+    settle_observed_pr_compose_result,
 )
 from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
 from tests.fakes.agent_runtime import (
@@ -1881,3 +1898,702 @@ def test_continuation_reconciliation_observing_a_changed_head_blocks_recoverably
     assert block_context["owner_gate_id"] == str(_PR_GATE_ID)
     assert block_context["observed_head_sha"] == _RACED_SHA
     uuid.UUID(str(block_context["pull_request_id"]))
+
+
+# --- the detached PR_COMPOSE dispatch, settlement, and continuation (#337) -------------
+
+_RECEIPT_INSERT = _sql_has("insert into openorc.task_hub_run_receipts")
+_RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id = %s for update")
+_RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
+_RECEIPT_SETTLE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'settled'")
+_RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
+_EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
+_EARLY_COMPLETION_CONSUME = _sql_has("delete from openorc.task_hub_run_early_completions")
+_CLAIM_READ = _sql_has("from openorc.task_runtime_send_claims where id = %s")
+
+
+def _claim_write(status: str) -> Callable[[str, tuple[Any, ...] | None], bool]:
+    """One claim terminal write with its target status as the first param."""
+
+    def predicate(sql: str, params: tuple[Any, ...] | None) -> bool:
+        return (
+            "update openorc.task_runtime_send_claims" in sql
+            and params is not None
+            and params[0] == status
+        )
+
+    return predicate
+
+
+_CLAIM_SETTLE_WRITE = _claim_write("settled")
+_CLAIM_NON_DELIVERY = _claim_write("known_nondelivery")
+_RECEIPT_ID = uuid.uuid4()
+_TURN_REFERENCE = "fake-run-1"
+_RECEIPT_CLAIMED_AT = datetime(2026, 10, 26, 9, 30, 5, tzinfo=UTC)
+
+
+def _detached_pr_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+) -> tuple[Any, ...]:
+    """The 19-column detached-turn receipt row for the PR_COMPOSE family."""
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    if status == "settled":
+        outcome: dict[str, Any] = {"settlement": "validated_result"}
+    elif status == "refused":
+        outcome = {"refusal_kind": "admission_refused"}
+    else:
+        outcome = {}
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "pr_compose_dispatch",
+        "runtime_send_claim",
+        _CLAIM_ID,
+        "pr_result",
+        admitted_turn_reference,
+        status,
+        outcome,
+        None,
+        _RECEIPT_CLAIMED_AT,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def _staged_pr_completion_row(*, kind: str = "run.completed") -> tuple[Any, ...]:
+    """One staged early completion carrying the validated pr_result candidate."""
+    return (
+        uuid.uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _RECEIPT_ID,
+        kind,
+        7,
+        json.dumps(pr_result_candidate(title=_TITLE, body=_BODY)),
+        _OBSERVED,
+    )
+
+
+class _RecordingRegistrar:
+    """Records the pre-admission observation registrations (issue #323 seam)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.registrations: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        connection_id: Any,
+        external_session_id: Any,
+    ) -> None:
+        self.registrations.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _RecordingHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #337)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+        validated_result: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "operation": operation,
+                "validated_result": validated_result,
+            }
+        )
+
+
+def _dispatch_call(
+    pool: DatabasePool,
+    github: Any,
+    resolver: Any,
+    runtime_factory: ProducerRuntimeAttachmentFactory,
+    *,
+    registrar: Any,
+    handoff: Any,
+    attempt_evidence: Any = None,
+    profile_id: Any = _OWNER_PROFILE_ID,
+    expected_state_token: Any = _STATE_TOKEN,
+    owner_gate_id: Any = _PR_GATE_ID,
+) -> Any:
+    return dispatch_pr_compose_detached(
+        pool,
+        github,
+        resolver,
+        runtime_factory,
+        profile_id=profile_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=expected_state_token,
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+        attempt_evidence=attempt_evidence,
+    )
+
+
+def _validated_pr_result() -> Any:
+    return parse_formal_response(
+        pr_result_candidate(title=_TITLE, body=_BODY), expected_family=PR_RESULT_FAMILY
+    )
+
+
+def _settlement_claim() -> TaskRuntimeSendClaim:
+    return TaskRuntimeSendClaim(
+        id=_CLAIM_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        kind=TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH,
+        task_agent_session_id=_SESSION_ID,
+        review_iteration_id=None,
+        owner_gate_id=_PR_GATE_ID,
+        subject_head_sha=_HEAD_SHA,
+        dispatch_repository_base_sha=None,
+        status=TaskRuntimeSendClaimStatus.CLAIMED,
+        outcome={},
+        claimed_at=_CLAIM_AT,
+        settled_at=None,
+        updated_at=_CLAIM_AT,
+    )
+
+
+def _dispatch_claim_evidence() -> Any:
+    class _Evidence:
+        def __init__(self) -> None:
+            self.attempts: list[dict[str, Any]] = []
+
+        def record_attempt(self, **kwargs: Any) -> None:
+            self.attempts.append(kwargs)
+
+    return _Evidence()
+
+
+def _script_detached_fresh_dispatch(conn: ScriptedConnection) -> None:
+    """The detached fresh-path SQL: one admission pass, the claim+receipt
+    dispatch transaction, the plain attach, and the post-dispatch reload."""
+    _script_repeating_reads(conn)
+    _script_admission_pass(conn, task_row=_task_row(), pr_read=None)
+    _script_pr_compose_claim(conn)
+    conn.on(_RECEIPT_INSERT, _detached_pr_receipt_row())
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_pr_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_pr_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, None)
+    conn.on(_TASK_READ, _task_row())
+
+
+def test_the_detached_dispatch_commits_the_claim_and_receipt_and_admits_the_composition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_detached_fresh_dispatch(conn)
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    adapter = _prepared_adapter()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+    evidence = _dispatch_claim_evidence()
+
+    dispatched = _dispatch_call(
+        pool,
+        github,
+        _FakeResolver(),
+        _runtime_factory(adapter),
+        registrar=registrar,
+        handoff=handoff,
+        attempt_evidence=evidence,
+    )
+
+    # The receipt companion: the PR_COMPOSE family rooted at the one-shot
+    # send claim, expecting the canonical pr_result family.
+    (receipt_params,) = [
+        params for sql, params in conn.executed if _RECEIPT_INSERT(sql, None) and params
+    ]
+    assert receipt_params[3] == "pr_compose_dispatch"
+    assert receipt_params[4] == "runtime_send_claim"
+    assert receipt_params[6] == "pr_result"
+    # The F5b coordinator's handoff fact carries the committed claim identity.
+    assert evidence.attempts == [
+        {
+            "family": PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+            "original_attempt_kind": "runtime_send_claim",
+            "original_attempt_id": _CLAIM_ID,
+            "phase": "pr_compose_dispatch",
+        }
+    ]
+    # One positive observation registration on the exact bound Producer
+    # session.
+    assert registrar.registrations == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _SESSION_ID,
+            "connection_id": dispatched.producer_session.connection_id,
+            "external_session_id": _EXTERNAL_SESSION_ID,
+        }
+    ]
+    # The canonical PR_COMPOSE instruction was admitted verbatim on the exact
+    # session; no blocking realization ran, nothing settled, and no GitHub
+    # call happened in the dispatching worker.
+    assert len(adapter.detached_admissions()) == 1
+    admitted_session, admitted_message = adapter.detached_admissions()[0]
+    assert admitted_session == _EXTERNAL_SESSION_ID
+    assert "octocat/hello-world" in admitted_message
+    assert str(_ISSUE_NUMBER) in admitted_message
+    assert len(adapter.realized_controls(_EXTERNAL_SESSION_ID)) == 0
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
+    assert github.repository_calls == []
+    assert handoff.calls == []
+    assert dispatched.published is None
+    assert dispatched.send_claim is not None
+    assert dispatched.receipt is not None
+    assert cast(FakePool, pool).active_connections == 0
+
+
+def test_a_refused_pr_compose_registration_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    _script_admission_pass(conn, task_row=_task_row(), pr_read=None)
+    _script_pr_compose_claim(conn)
+    conn.on(_RECEIPT_INSERT, _detached_pr_receipt_row())
+    conn.on(_RECEIPT_REFUSE, _detached_pr_receipt_row(status="refused"))
+    conn.on(_CLAIM_NON_DELIVERY, _claim_row(status="known_nondelivery"))
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    adapter = _prepared_adapter()
+
+    with pytest.raises(ExternalOperationFailedError, match="registration was refused"):
+        _dispatch_call(
+            pool,
+            github,
+            _FakeResolver(),
+            _runtime_factory(adapter),
+            registrar=_RecordingRegistrar(
+                error=ObservationRegistrationRefusedError(
+                    "refused",
+                    reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED,
+                )
+            ),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
+    assert any(_CLAIM_NON_DELIVERY(sql, params) for sql, params in conn.executed)
+    assert adapter.detached_admissions() == ()
+
+
+def test_a_refused_pr_compose_admission_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    _script_admission_pass(conn, task_row=_task_row(), pr_read=None)
+    _script_pr_compose_claim(conn)
+    conn.on(_RECEIPT_INSERT, _detached_pr_receipt_row())
+    conn.on(_RECEIPT_REFUSE, _detached_pr_receipt_row(status="refused"))
+    conn.on(_CLAIM_NON_DELIVERY, _claim_row(status="known_nondelivery"))
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    adapter = _prepared_adapter()
+    adapter.queue_detached_admission(AgentRuntimeProtocolFailureError("refused"))
+
+    with pytest.raises(ExternalOperationRejectedError):
+        _dispatch_call(
+            pool,
+            github,
+            _FakeResolver(),
+            _runtime_factory(adapter),
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
+    assert any(_CLAIM_NON_DELIVERY(sql, params) for sql, params in conn.executed)
+    # The refusal is proven pre-effect: nothing settled and nothing published.
+    assert not any(_CLAIM_SETTLE_WRITE(sql, params) for sql, params in conn.executed)
+
+
+def test_an_uncertain_pr_compose_admission_stays_claimed_and_is_never_re_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    _script_admission_pass(conn, task_row=_task_row(), pr_read=None)
+    _script_pr_compose_claim(conn)
+    conn.on(_RECEIPT_INSERT, _detached_pr_receipt_row())
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    adapter = _prepared_adapter()
+    adapter.queue_detached_admission(AgentRuntimeUncertainOutcomeError("timeout"))
+
+    with pytest.raises(ExternalOperationUncertainError):
+        _dispatch_call(
+            pool,
+            github,
+            _FakeResolver(),
+            _runtime_factory(adapter),
+            registrar=_RecordingRegistrar(),
+            handoff=_RecordingHandoff(),
+        )
+
+    # The conservatively claimed residue: no refusal, no non-delivery record,
+    # and no publication of any kind.
+    assert not any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
+    assert not any(_CLAIM_NON_DELIVERY(sql, params) for sql, params in conn.executed)
+    assert not any(_CLAIM_SETTLE(sql, None) for sql, _ in conn.executed)
+    assert github.repository_calls == []
+
+
+def test_the_narrow_continuation_finalizes_inline_without_any_detached_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed composition over this module's own interrupted publication
+    reconciles and finalizes inline — no composition turn, no claim, no
+    receipt, no second create."""
+    conn = ScriptedConnection()
+    _script_continuation(conn, observed_pr_row=_pr_row())
+    pool = _pool(conn)
+    github = _FakeGitHub(
+        pool=cast(FakePool, pool),
+        repository_observation=GitHubRepositoryObservation(
+            github_repository_id=_GITHUB_REPOSITORY_ID,
+            owner_login="octocat",
+            name="hello-world",
+            html_url="https://github.com/octocat/hello-world",
+            is_private=False,
+            default_branch="main",
+        ),
+        pull_request_observation=_reconciliation_observation(),
+    )
+    adapter = _prepared_adapter()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    dispatched = _dispatch_call(
+        pool,
+        github,
+        _FakeResolver(),
+        _runtime_factory(adapter),
+        registrar=registrar,
+        handoff=handoff,
+    )
+
+    assert dispatched.published is not None
+    assert dispatched.published.task.state_token == _ROTATED_TOKEN
+    assert dispatched.send_claim is None
+    assert dispatched.receipt is None
+    assert dispatched.producer_session is None
+    assert registrar.registrations == []
+    assert len(adapter.detached_admissions()) == 0
+    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
+    assert not any(_CLAIM_INSERT(sql, None) for sql, _ in conn.executed)
+    assert handoff.calls == []
+
+
+def _script_pr_settlement(conn: ScriptedConnection, *, task_row: tuple[Any, ...]) -> None:
+    """The settlement transaction's reads: the Task read under the exclusive
+    Task row lock (the settlement's currentness serialization, issue #337),
+    the canonical record read (absent on the applicable subject), the
+    Workspace-scope task read under the route-subject resolution, and the
+    repeating gate/audit/session/route reads — then the claim's one-shot
+    settlement."""
+    _script_repeating_reads(conn)
+    conn.on(_TASK_READ_LOCKED, task_row)
+    conn.on(_PR_READ, None)
+    conn.on(_TASK_READ, task_row)
+    conn.on(_CLAIM_SETTLE_WRITE, _claim_row(status="settled"))
+
+
+def test_the_observed_pr_result_settles_the_claim_with_only_the_head_identity() -> None:
+    conn = ScriptedConnection()
+    _script_pr_settlement(conn, task_row=_task_row())
+    pool = _pool(conn)
+
+    subjects = settle_observed_pr_compose_result(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        send_claim=_settlement_claim(),
+        result=_validated_pr_result(),
+    )
+
+    assert subjects is not None
+    assert subjects.approving_profile_id == _OWNER_PROFILE_ID
+    assert subjects.gate.subject_head_sha == _HEAD_SHA
+    (settle_params,) = [params for sql, params in conn.executed if _CLAIM_SETTLE_WRITE(sql, params)]
+    assert settle_params is not None
+    # The claim settles truthfully with only the safe approved head identity
+    # — without pretending GitHub publication has completed.
+    outcome = getattr(settle_params[1], "obj", settle_params[1])
+    assert outcome == {"subject_head_sha": _HEAD_SHA}
+    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
+    # The settlement's currentness observation is serialized on the Task row
+    # lock: a concurrent Owner Abort/blocking/cancellation either won the
+    # lock before the settlement (observed here) or serializes behind it.
+    assert any(_TASK_READ_LOCKED(sql, None) for sql, _ in conn.executed)
+
+
+def test_a_concurrent_task_transition_before_the_settlement_settles_result_not_applied() -> None:
+    """The settlement-currentness race regression (issue #337 review): the
+    settlement writes no Task row of its own, so its currentness observation
+    is serialized on the Task row lock — a concurrent Owner Abort (or any
+    other composed transition) that won the lock first is observed as the
+    moved-on subject, and the validated result can never settle a stale
+    claim+receipt as ``validated_result``."""
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    # The concurrent transition won the lock first: the locked observation
+    # sees the aborted Task under its rotated token.
+    conn.on(
+        _TASK_READ_LOCKED,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
+    pool = _pool(conn)
+
+    subjects = settle_observed_pr_compose_result(
+        pool,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        send_claim=_settlement_claim(),
+        result=_validated_pr_result(),
+    )
+
+    assert subjects is None
+    # Nothing settled: the claim stays conservatively claimed and the receipt
+    # settles result-not-applied at the routing layer — never a
+    # validated_result for a no-longer-current subject.
+    assert any(_TASK_READ_LOCKED(sql, None) for sql, _ in conn.executed)
+    assert not any(_CLAIM_SETTLE_WRITE(sql, params) for sql, params in conn.executed)
+    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
+
+
+def _script_settled_publication(
+    conn: ScriptedConnection,
+    *,
+    publication: TaskPullRequestPublicationOutcome,
+    observed_pr_row: tuple[Any, ...] | None = None,
+) -> None:
+    """The publication continuation's SQL: the one short revalidation
+    transaction (audit/lock/current/record/gate/route reads), then the
+    publication and the guarded finalization."""
+    _script_repeating_reads(conn)
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, None)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_PR_READ, _pr_row())
+    conn.on(
+        _STATUS_UPDATE,
+        _task_row(status="reviewing", state_token=_ROTATED_TOKEN),
+    )
+    conn.on_repeat(_EVENT_INSERT, _event_row())
+
+
+def test_the_settled_publication_continuation_publishes_once_and_finalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_settled_publication(conn, publication=TaskPullRequestPublicationOutcome.PUBLISHED)
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    publication = _publication_fake(
+        monkeypatch,
+        result=_publication_result(
+            TaskPullRequestPublicationOutcome.PUBLISHED, pull_request=_pr_row()
+        ),
+    )
+
+    published = publish_settled_task_pr_composition(
+        pool,
+        github,
+        _FakeResolver(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        owner_gate_id=_PR_GATE_ID,
+        expected_state_token=_STATE_TOKEN,
+        pr_result=_validated_pr_result(),
+        terminal_finalization_submission=_AcceptedFinalization(),
+    )
+
+    # Exactly one B8 invocation with the exact approved head under the
+    # re-derived approving Profile.
+    assert len(publication.commands) == 1
+    command = publication.commands[0]
+    assert command.authorized_head_sha == _HEAD_SHA
+    assert command.profile_id == _OWNER_PROFILE_ID
+    assert command.canonical_branch == _BRANCH
+    assert command.title == _TITLE
+    assert isinstance(published, SettledTaskPrPublication)
+    assert published.approving_profile_id == _OWNER_PROFILE_ID
+    assert published.task.state_token == _ROTATED_TOKEN
+    assert _event_types(conn) == ["pr_created"]
+    assert cast(FakePool, pool).active_connections == 0
+
+
+def test_the_settled_publication_continuation_blocks_on_head_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_settled_publication(conn, publication=TaskPullRequestPublicationOutcome.PREFLIGHT_STALE)
+    # The recoverable block composition after the primitive's classification.
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_BLOCK_INSERT, _block_row())
+    conn.on(_GATES_INSERT, _stale_publication_gate_row())
+    conn.on(
+        _TASK_GATE_WRITE,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    publication = _publication_fake(
+        monkeypatch,
+        result=_publication_result(
+            TaskPullRequestPublicationOutcome.PREFLIGHT_STALE, pull_request=None
+        ),
+    )
+
+    with pytest.raises(StaleOperationError):
+        publish_settled_task_pr_composition(
+            pool,
+            github,
+            _FakeResolver(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_PR_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            pr_result=_validated_pr_result(),
+        )
+
+    assert len(publication.commands) == 1
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _TASK_GATE_WRITE) == 1
+    assert not any(_STATUS_UPDATE(sql, None) for sql, _ in conn.executed)
+
+
+def test_the_settled_publication_continuation_propagates_publication_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_settled_publication(conn, publication=TaskPullRequestPublicationOutcome.PUBLISHED)
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    _publication_fake(
+        monkeypatch,
+        error=ExternalOperationUncertainError("the create outcome is unknown"),
+    )
+
+    with pytest.raises(ExternalOperationUncertainError):
+        publish_settled_task_pr_composition(
+            pool,
+            github,
+            _FakeResolver(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_PR_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            pr_result=_validated_pr_result(),
+        )
+
+    # The uncertain effect is never a finalize: no reviewing transition and
+    # no pr_created event exist.
+    assert not any(_STATUS_UPDATE(sql, None) for sql, _ in conn.executed)
+    assert _event_types(conn) == []
+
+
+def test_an_early_pr_result_settles_through_the_attach_and_reaches_the_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal completion staged during the admission race is consumed
+    exactly once by the acknowledgement attach; its validated ``pr_result``
+    settles the claim and the receipt and reaches the ONE post-commit
+    completion handoff in memory for the publication continuation."""
+    conn = ScriptedConnection()
+    _script_repeating_reads(conn)
+    _script_admission_pass(conn, task_row=_task_row(), pr_read=None)
+    _script_pr_compose_claim(conn)
+    conn.on(_RECEIPT_INSERT, _detached_pr_receipt_row())
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_pr_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_pr_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, _staged_pr_completion_row())
+    conn.on(_CLAIM_READ, _claim_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
+    conn.on(_PR_READ, None)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_CLAIM_SETTLE_WRITE, _claim_row(status="settled"))
+    conn.on(
+        _RECEIPT_SETTLE,
+        _detached_pr_receipt_row(status="settled", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_CONSUME, (uuid.uuid4(),))
+    conn.on(_TASK_READ, _task_row())
+    pool = _pool(conn)
+    github = _FakeGitHub(pool=cast(FakePool, pool))
+    adapter = _prepared_adapter()
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    _dispatch_call(
+        pool,
+        github,
+        _FakeResolver(),
+        _runtime_factory(adapter),
+        registrar=registrar,
+        handoff=handoff,
+    )
+
+    # The early-validated result settled the claim and the receipt and was
+    # carried in memory to the handoff — never discarded, never durable.
+    assert len(handoff.calls) == 1
+    call = handoff.calls[0]
+    assert call["operation"] is PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH
+    assert isinstance(call["validated_result"], PrResult)
+    assert call["validated_result"].title == _TITLE
+    assert any(_EARLY_COMPLETION_CONSUME(sql, None) for sql, _ in conn.executed)
+    assert any(_CLAIM_SETTLE_WRITE(sql, params) for sql, params in conn.executed)
+    assert any(_RECEIPT_SETTLE(sql, None) for sql, _ in conn.executed)

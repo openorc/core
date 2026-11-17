@@ -80,6 +80,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -91,6 +92,7 @@ from openorc.adapters.github import GitHubAppClient
 from openorc.domain.blocking_cases import Level3BlockingCondition
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.events import WorkflowEvent, WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import OriginalAttemptKind
@@ -106,6 +108,7 @@ from openorc.persistence import ownership as ownership_records
 from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import PrComposeInteraction
 from openorc.protocol.models import PR_RESULT_FAMILY, PrResult
@@ -115,10 +118,15 @@ from openorc.services import (
     task_cancellation,
     task_pull_request_reconciliation,
 )
+from openorc.services import (
+    task_detached_turn_correlation as turn_correlation,
+)
 from openorc.services.errors import (
+    ApplicationError,
     AuthorizationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
@@ -132,8 +140,13 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusedError,
+)
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_level3_blocking_catalog import classify_blocking_case
+from openorc.services.task_plan_production import PlanProductionObservationRegistrar
 from openorc.services.task_runtime_send_claims import (
     RUNTIME_PRE_EFFECT_FAILURE_KIND,
     claim_pr_compose_send,
@@ -148,13 +161,20 @@ if TYPE_CHECKING:
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "DispatchedPrComposition",
     "ProducerRuntimeAttachmentFactory",
+    "SettledTaskPrPublication",
     "TaskPrPublished",
     "compose_and_publish_task_pr",
+    "dispatch_pr_compose_detached",
+    "publish_settled_task_pr_composition",
+    "settle_observed_pr_compose_result",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_composition"
 _COMPOSE_SPAN_NAME = "task_pr_composition.compose_and_publish_task_pr"
+_DISPATCH_COMPOSE_SPAN_NAME = "task_pr_composition.dispatch_pr_compose_detached"
+_PUBLISH_SETTLED_SPAN_NAME = "task_pr_composition.publish_settled_task_pr_composition"
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +403,53 @@ def _admit_publication_subjects(
     require_workspace_task(
         transaction_pool, profile_id=profile_id, workspace_id=workspace_id, task_id=task_id
     )
+    task, gate, existing_pr = _revalidate_publication_subjects(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=expected_state_token,
+    )
+    approving_profile_id = _resolve_approved_resolution_audit(
+        transaction_pool, workspace_id=workspace_id, owner_gate_id=owner_gate_id
+    )
+    if approving_profile_id != profile_id:
+        raise AuthorizationError(
+            "the pr authorization was approved by a different profile; "
+            "publication is not available to this caller"
+        )
+    return _resolve_publication_route_subjects(
+        transaction_pool,
+        approving_profile_id=approving_profile_id,
+        workspace_id=workspace_id,
+        task=task,
+        gate=gate,
+        existing_pr=existing_pr,
+    )
+
+
+def _revalidate_publication_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+) -> tuple[Task, OwnerGate, TaskPullRequest | None]:
+    """The shared locked publication-subject reproof (#337).
+
+    Under the Task row lock the Task must be current, non-archived,
+    ``waiting_for_owner``, at the expected token, with no current OwnerGate
+    (E7 intentionally cleared the pointer on approval) and a bound canonical
+    feature branch. The addressed historical gate must belong to this
+    Task/Workspace, be the durably ``APPROVED`` ``PR_AUTHORIZATION`` gate
+    carrying exactly its head-SHA subject. A canonical ``TaskPullRequest``
+    carrying the exact approved head routes the invocation to the narrow
+    continuation path; a record carrying any other head is a conflict
+    (unrelated external PRs are never adopted). The caller-checked admission
+    (issue #83) and the settled-composition continuation (issue #337) share
+    this reproof.
+    """
     locked = task_records.get_task_for_update(transaction_pool, task_id)
     if locked is None or locked.workspace_id != workspace_id:
         raise NotFoundError("the requested task is not available in this workspace")
@@ -426,21 +493,36 @@ def _admit_publication_subjects(
         or gate.task_pull_request_id is not None
     ):
         raise ConflictError("the pr authorization gate does not carry the exact head-sha subject")
-    approving_profile_id = _resolve_approved_resolution_audit(
-        transaction_pool, workspace_id=workspace_id, owner_gate_id=owner_gate_id
-    )
-    if approving_profile_id != profile_id:
-        raise AuthorizationError(
-            "the pr authorization was approved by a different profile; "
-            "publication is not available to this caller"
-        )
+    return task, gate, existing_pr
 
+
+def _resolve_publication_route_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    approving_profile_id: UUID,
+    workspace_id: UUID,
+    task: Task,
+    gate: OwnerGate,
+    existing_pr: TaskPullRequest | None,
+) -> _PublicationSubjects:
+    """The shared post-admission route/Producer/guidance resolution.
+
+    The account-operational barrier is re-proved under the resolved
+    approving Profile — publication's only identity — then the routed
+    Repository presentation context is resolved (the workflow base comes
+    from the routed Repository record, never from the Producer). The
+    canonical record of this module's own interrupted publication routes the
+    invocation to the narrow continuation path; the fresh path additionally
+    resolves the original READY Producer binding and the current Workspace
+    guidance. The caller-checked admission (issue #83) and the detached
+    settlement's subject re-derivation (issue #337) share this resolution.
+    """
     require_account_operational(transaction_pool, profile_id=approving_profile_id)
     require_workspace_task(
         transaction_pool,
         profile_id=approving_profile_id,
         workspace_id=workspace_id,
-        task_id=task_id,
+        task_id=task.id,
     )
     route = resolve_system_repository_installation_route(
         transaction_pool,
@@ -456,6 +538,14 @@ def _admit_publication_subjects(
             "the routed repository carries no usable workflow base branch; "
             "publication is not available"
         )
+    canonical_branch = task.canonical_feature_branch
+    if canonical_branch is None:
+        # Narrowed by every subject revalidation; kept explicit for
+        # fail-closed safety.
+        raise ConflictError(
+            "the task carries no bound canonical feature branch; the publication "
+            "subject is incomplete"
+        )
     if existing_pr is not None:
         # The continuation path: only the canonical record of this module's
         # own interrupted publication may complete — never an unrelated
@@ -469,7 +559,7 @@ def _admit_publication_subjects(
             approving_profile_id=approving_profile_id,
             task=task,
             gate=gate,
-            canonical_branch=task.canonical_feature_branch,
+            canonical_branch=canonical_branch,
             base_ref=base_ref,
             repository_full_name=repository_full_name,
             continuation_pull_request=existing_pr,
@@ -495,7 +585,7 @@ def _admit_publication_subjects(
         approving_profile_id=approving_profile_id,
         task=task,
         gate=gate,
-        canonical_branch=task.canonical_feature_branch,
+        canonical_branch=canonical_branch,
         base_ref=base_ref,
         repository_full_name=repository_full_name,
         continuation_pull_request=None,
@@ -1177,83 +1267,87 @@ def compose_and_publish_task_pr(
                 task_id=task_id,
                 subject_head_sha=approved_head_sha,
             )
-        # --- deterministic closing reference + the one B8 invocation ---
-        command = pull_request_publication.PublicationCommand(
+        # --- deterministic closing reference + the one B8 invocation + the
+        # outcome handling: finalize clean, block recoverably, or fail closed
+        # truthfully (shared with the detached continuation, issue #337). ---
+        return _publish_and_finalize(
+            pool,
+            github,
+            user_token_resolver,
+            subjects=subjects,
+            pr_result=pr_result,
             workspace_id=workspace_id,
             task_id=task_id,
-            profile_id=subjects.approving_profile_id,
-            authorized_head_sha=approved_head_sha,
-            canonical_branch=subjects.canonical_branch,
-            base_ref=subjects.base_ref,
-            state_token=expected_state_token,
-            title=pr_result.title,
-            body=_normalized_pr_body(
-                pr_result,
-                repository_full_name=subjects.repository_full_name,
-                issue_number=subjects.task.github_issue_number,
-            ),
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
-        publication = pull_request_publication.publish_task_pull_request(
-            pool, github, user_token_resolver, command
+
+
+def _publish_and_finalize(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    user_token_resolver: ProfileUserAccessTokenResolver,
+    *,
+    subjects: _PublicationSubjects,
+    pr_result: PrResult,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None,
+) -> TaskPrPublished:
+    """The bounded publication consequence both compositions share (#337).
+
+    The deterministic closing reference normalizes the validated
+    presentation, the one B8 invocation publishes through the existing
+    race-safe primitive exactly once under the approving Profile's GitHub
+    user-to-server authorization, and the outcome handling finalizes clean,
+    blocks recoverably, or fails closed truthfully. The primitive's typed
+    failures and uncertain outcomes propagate unchanged and are never
+    replayed. No database transaction is ever held across the GitHub call.
+    """
+    approved_head_sha = subjects.gate.subject_head_sha
+    if approved_head_sha is None:
+        # Narrowed by every subject admission; kept explicit for fail-closed
+        # safety.
+        raise ConflictError("the pr authorization gate does not carry the exact head-sha subject")
+    command = pull_request_publication.PublicationCommand(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=subjects.approving_profile_id,
+        authorized_head_sha=approved_head_sha,
+        canonical_branch=subjects.canonical_branch,
+        base_ref=subjects.base_ref,
+        state_token=expected_state_token,
+        title=pr_result.title,
+        body=_normalized_pr_body(
+            pr_result,
+            repository_full_name=subjects.repository_full_name,
+            issue_number=subjects.task.github_issue_number,
+        ),
+    )
+    publication = pull_request_publication.publish_task_pull_request(
+        pool, github, user_token_resolver, command
+    )
+    if publication.outcome is TaskPullRequestPublicationOutcome.PUBLISHED:
+        published_pr = publication.pull_request
+        return _finalize_or_block(
+            pool,
+            subjects=subjects,
+            expected_github_pr_id=(published_pr.github_pr_id if published_pr is not None else None),
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            terminal_finalization_submission=terminal_finalization_submission,
         )
-        # --- outcome handling: finalize clean, block recoverably, or fail
-        # closed truthfully. The primitive's typed failures and uncertain
-        # outcomes propagate unchanged and are never replayed. ---
-        if publication.outcome is TaskPullRequestPublicationOutcome.PUBLISHED:
-            published_pr = publication.pull_request
-            return _finalize_or_block(
-                pool,
-                subjects=subjects,
-                expected_github_pr_id=(
-                    published_pr.github_pr_id if published_pr is not None else None
-                ),
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-                terminal_finalization_submission=terminal_finalization_submission,
-            )
-        if publication.outcome is TaskPullRequestPublicationOutcome.PREFLIGHT_STALE:
-            # No PR was created by this invocation; the approved head can no
-            # longer be published. No SHA is silently reauthorized, and no
-            # canonical PR record exists to cite — the block preserves the
-            # exact authorized head and the originating gate identity
-            # (issue #280) without manufacturing a PR identity.
-            _block_stale_publication(
-                pool,
-                profile_id=subjects.approving_profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                condition=Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
-                reason=TaskBlockReason.STALE_OPERATION,
-                context={
-                    "authorized_head_sha": approved_head_sha,
-                    "owner_gate_id": str(owner_gate_id),
-                },
-            )
-            raise StaleOperationError(
-                "the published head no longer matches the approved authorization; "
-                "the task is blocked pending owner recovery"
-            )
-        created = publication.pull_request
-        if created is None:
-            # The post-create classifications always carry the persisted
-            # record; narrowed explicitly for fail-closed safety.
-            raise StaleOperationError(
-                "the publication outcome is stale and carries no canonical record"
-            )
-        observed_head_context = (
-            {"observed_head_sha": created.head_sha}
-            if publication.outcome is TaskPullRequestPublicationOutcome.POST_CREATE_HEAD_MISMATCH
-            else {"github_pull_request_id": str(created.github_pr_id)}
-        )
-        # The created PR is an external fact that is never erased: where the
-        # Task is still current the recoverable block records it, and where
-        # it already moved on the block composition applies nothing. The
-        # context preserves the exact authorized head, the originating gate
-        # identity, and the persisted canonical PR identity alongside the
-        # outcome-specific observed evidence (issue #280).
+    if publication.outcome is TaskPullRequestPublicationOutcome.PREFLIGHT_STALE:
+        # No PR was created by this invocation; the approved head can no
+        # longer be published. No SHA is silently reauthorized, and no
+        # canonical PR record exists to cite — the block preserves the
+        # exact authorized head and the originating gate identity
+        # (issue #280) without manufacturing a PR identity.
         _block_stale_publication(
             pool,
             profile_id=subjects.approving_profile_id,
@@ -1265,12 +1359,720 @@ def compose_and_publish_task_pr(
             context={
                 "authorized_head_sha": approved_head_sha,
                 "owner_gate_id": str(owner_gate_id),
-                "pull_request_id": str(created.id),
-                "github_pr_number": str(created.github_pr_number),
-                **observed_head_context,
             },
         )
         raise StaleOperationError(
-            "the publication's durable authority moved on after creation; the "
-            "task is blocked pending owner recovery"
+            "the published head no longer matches the approved authorization; "
+            "the task is blocked pending owner recovery"
+        )
+    created = publication.pull_request
+    if created is None:
+        # The post-create classifications always carry the persisted
+        # record; narrowed explicitly for fail-closed safety.
+        raise StaleOperationError(
+            "the publication outcome is stale and carries no canonical record"
+        )
+    observed_head_context = (
+        {"observed_head_sha": created.head_sha}
+        if publication.outcome is TaskPullRequestPublicationOutcome.POST_CREATE_HEAD_MISMATCH
+        else {"github_pull_request_id": str(created.github_pr_id)}
+    )
+    # The created PR is an external fact that is never erased: where the
+    # Task is still current the recoverable block records it, and where
+    # it already moved on the block composition applies nothing. The
+    # context preserves the exact authorized head, the originating gate
+    # identity, and the persisted canonical PR identity alongside the
+    # outcome-specific observed evidence (issue #280).
+    _block_stale_publication(
+        pool,
+        profile_id=subjects.approving_profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        condition=Level3BlockingCondition.PR_PUBLICATION_AUTHORITY_MISMATCH,
+        reason=TaskBlockReason.STALE_OPERATION,
+        context={
+            "authorized_head_sha": approved_head_sha,
+            "owner_gate_id": str(owner_gate_id),
+            "pull_request_id": str(created.id),
+            "github_pr_number": str(created.github_pr_number),
+            **observed_head_context,
+        },
+    )
+    raise StaleOperationError(
+        "the publication's durable authority moved on after creation; the "
+        "task is blocked pending owner recovery"
+    )
+
+
+# --- the detached PR_COMPOSE dispatch and settlement (issue #337) --------------
+
+# Safe refusal-kind tokens for a receipt's durable refusal outcome after a
+# proven pre-effect detached-dispatch failure (no exception text or error
+# content ever enters durable state).
+_REGISTRATION_REFUSAL_KIND = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND = "admission_refused"
+
+
+@dataclass(frozen=True, slots=True)
+class SettledTaskPrPublication:
+    """The durable publication facts of the settled-composition continuation.
+
+    ``task`` is the post-write Task (``reviewing`` under its rotated
+    ``state_token``), ``pull_request`` the one canonical TaskPullRequest,
+    and ``approving_profile_id`` the re-derived approving Profile the F1
+    PR-review dispatch addresses.
+    """
+
+    task: Task
+    pull_request: TaskPullRequest
+    approving_profile_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedPrComposition:
+    """The typed detached PR_COMPOSE dispatch outcome (issue #337).
+
+    The fresh path's authoritative facts exactly as the durable state reads
+    after the dispatch: the post-claim Task (its token unrotated by the
+    claim), the committed one-shot send claim, the claimed detached-turn
+    receipt companion, and the exact Producer binding the canonical
+    PR_COMPOSE instruction was admitted on. No runtime result and no
+    validated ``pr_result`` exists yet: the independently observed completion
+    owns the settlement, and the ONE post-commit completion handoff owns the
+    bounded publication and the F1 PR-review submission.
+
+    The narrow continuation path (this module's own interrupted publication)
+    dispatches no turn at all: it reconciles and finalizes inline — the F1
+    invocation's own bounded post-claim consequence, never a second
+    composition — and carries exactly the finalized ``published`` result
+    with ``None`` claim, receipt, and Producer session.
+    """
+
+    task: Task
+    send_claim: TaskRuntimeSendClaim | None
+    receipt: TaskDetachedTurnReceipt | None
+    producer_session: TaskAgentSession | None
+    published: TaskPrPublished | None
+
+
+def _refuse_pr_compose_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    send_claim: TaskRuntimeSendClaim,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed PR_COMPOSE receipt refused and its claim non-delivered.
+
+    Best-effort containment after a positively proven pre-effect failure: a
+    persistence failure here must never mask the typed refusal the caller
+    raises. The claimed receipt stays the honest unresolved state under the
+    accepted v1 recovery bounds and the failure is logged selectively.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused pr-composition receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the pr-composition receipt was no longer claimed when its pre-effect "
+            "refusal was recorded"
+        )
+    try:
+        record_send_claim_known_non_delivery(
+            pool,
+            claim=send_claim,
+            workspace_id=send_claim.workspace_id,
+            task_id=send_claim.task_id,
+            failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused pr-composition claim could not be durably marked (%s); "
+            "the claimed claim stays the honest unresolved state",
+            type(error).__name__,
+        )
+
+
+def dispatch_pr_compose_detached(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    user_token_resolver: ProfileUserAccessTokenResolver,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    profile_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+    observation_registrar: PlanProductionObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPrComposition:
+    """Dispatch the exact approved-head PR_COMPOSE as one detached agent turn.
+
+    The detached counterpart of the ordinary PR composition (issues
+    #325/#337): the same E8 admission of the persisted approved
+    ``PR_AUTHORIZATION`` gate, its exact head-SHA subject, and the
+    OWNER-attributed approving Profile — the same one-shot PR_COMPOSE
+    dispatch claim — now committed together with its detached-turn receipt
+    companion, followed by the canonical ``PrComposeInteraction`` admitted
+    verbatim as one independently completed agent turn on the exact READY
+    Producer session. The claim transaction re-proves the full publication
+    subject under the Task row lock strictly after the attachment is
+    acquired and strictly before the admission (the fresh path's R1
+    reproof). No ``realize_control`` and no blocking wait exists in this
+    path, and the dispatching worker returns after the acknowledgement
+    attach. The independently observed completion settles the validated
+    ``pr_result`` through :func:`settle_observed_pr_compose_result`; the ONE
+    post-commit completion handoff owns the bounded publication and the
+    typed PR-review submission from committed state.
+
+    The narrow continuation path (the Task already carries this module's own
+    interrupted publication record) performs no detached turn at all: it
+    runs the existing authoritative reconciliation and atomic finalization
+    inline and returns the finalized publication for the F1 invocation's
+    PR-review submission — the composition and the create are never
+    repeated.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(owner_gate_id, "owner_gate_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_COMPOSE_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_DISPATCH_COMPOSE_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: the one short admission transaction (database only). ---
+        with composed_transaction(pool) as transaction_pool:
+            subjects = _admit_publication_subjects(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+                expected_state_token=expected_state_token,
+            )
+        if subjects.continuation_pull_request is not None:
+            # The narrow continuation (issue #83): the authoritative
+            # reconciliation with no transaction open, then the same atomic
+            # finalization-or-block. No model turn exists to detach and no
+            # claim is created.
+            task_pull_request_reconciliation.reconcile_task_pull_request(
+                pool, github, workspace_id=workspace_id, task_id=task_id
+            )
+            published = _finalize_or_block(
+                pool,
+                subjects=subjects,
+                expected_github_pr_id=None,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+                expected_state_token=expected_state_token,
+                terminal_finalization_submission=terminal_finalization_submission,
+            )
+            return DispatchedPrComposition(
+                task=published.task,
+                send_claim=None,
+                receipt=None,
+                producer_session=None,
+                published=published,
+            )
+        producer_session = subjects.producer_session
+        if producer_session is None or producer_session.external_session_id is None:
+            # Narrowed by the fresh-path admission; kept explicit for
+            # fail-closed safety.
+            raise ConflictError(
+                "the fresh pr composition carries no ready producer session binding"
+            )
+        register = getattr(observation_registrar, "register_session", None)
+        if not callable(register):
+            raise InvalidCommandError(
+                "the pr-composition observation registrar does not implement the "
+                "established-session registration seam"
+            )
+        message = PrComposeInteraction(
+            repository_full_name=subjects.repository_full_name,
+            issue_number=subjects.task.github_issue_number,
+            guidance=subjects.guidance,
+        ).render()
+        return _dispatch_pr_compose_turn(
+            pool,
+            producer_runtime_factory,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            subjects=subjects,
+            producer_session=producer_session,
+            message=message,
+            register_session=register,
+            completion_handoff=completion_handoff,
+            attempt_evidence=attempt_evidence,
+        )
+
+
+def _dispatch_pr_compose_turn(
+    pool: DatabasePool,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    subjects: _PublicationSubjects,
+    producer_session: TaskAgentSession,
+    message: str,
+    register_session: Callable[..., object],
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None,
+) -> DispatchedPrComposition:
+    """Admit the canonical PR_COMPOSE instruction as one detached agent turn.
+
+    The shared detached-dispatch mechanics of the fresh composition path
+    (issue #337), mirroring the established detached-dispatch shape: the
+    runtime lease and the detached capability are acquired and duck-typed
+    fail-closed BEFORE any durable dispatch effect, the exact one-shot claim
+    and the detached-turn receipt companion commit in ONE short transaction
+    strictly before any runtime effect (the claim's own subject reproof
+    under the Task row lock is the fresh path's post-attachment R1
+    revalidation), one positively-required observation registration gates
+    the admission, one detached-turn admission carries the composed
+    canonical instruction verbatim, and the acknowledgement attach consumes
+    any staged early completion exactly once. No ``realize_control`` and no
+    blocking wait exists in this path, and no database transaction is ever
+    held across a runtime call.
+
+    Proven pre-effect failures refuse the receipt and record the claim's
+    known non-delivery, then raise the typed operational-failure classes the
+    F5b coordinator triages under the claim's own family. An uncertain
+    admission leaves the claim and receipt conservatively claimed and is
+    never re-dispatched. The dispatching worker returns after the
+    acknowledgement attach; the observed completion owns the settlement.
+    """
+    producer_external_session_id = producer_session.external_session_id
+    if producer_external_session_id is None or not producer_external_session_id.strip():
+        raise ConflictError("the producer session binding carries no external session identity")
+    runtime_factory = _require_producer_factory(producer_runtime_factory)
+    with ExitStack() as attachment_stack:
+        runtime = attachment_stack.enter_context(runtime_factory())
+        # The detached capability is duck-typed fail-closed BEFORE any durable
+        # dispatch effect: a runtime without it cannot serve the detached
+        # dispatch, and no claim or receipt was ever recorded.
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            raise ExternalOperationFailedError(
+                "the producer runtime does not implement the detached turn "
+                "capability; the pr composition dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # --- The one short dispatch transaction: the exact pre-send claim and
+        # the detached-turn receipt companion, committed atomically strictly
+        # before any runtime effect. The claim's own subject reproof under the
+        # Task row lock is the fresh path's post-attachment R1 revalidation.
+        # A replayed or raced continuation never claims or dispatches again.
+        # ---
+        with composed_transaction(pool) as transaction_pool:
+            send_claim = claim_pr_compose_send(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=subjects.task.state_token,
+                owner_gate=subjects.gate,
+                producer=producer_session,
+            )
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer_session.id,
+                operation=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                expected_formal_family=PR_RESULT_FAMILY,
+            )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # dispatch claim identity (issue #262).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+                original_attempt_id=send_claim.id,
+                phase=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH.value,
+            )
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the just-recorded receipt is marked refused and the claim records
+        # its known non-delivery, so a never-dispatched turn cannot hold the
+        # session's single-outstanding slot. ---
+        try:
+            register_session(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer_session.id,
+                connection_id=producer_session.connection_id,
+                external_session_id=producer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_pr_compose_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the pr-composition observation registration was refused before "
+                "any admission; the composition never dispatched"
+            ) from error
+        except Exception as error:
+            from openorc.services.task_detached_turn_observation import (  # noqa: PLC0415
+                ObservationRegistrationRefusalReason,
+            )
+
+            _refuse_pr_compose_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the pr-composition observation registration failed "
+                f"({ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value}) "
+                "before any admission; the composition never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One detached-turn
+        # admission of the composed canonical PR_COMPOSE instruction
+        # verbatim. ---
+        try:
+            admission = admit_detached_turn(producer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached pr-composition admission ended with an uncertain "
+                "outcome; the claim and receipt stay conservatively claimed "
+                "and are never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the pr-composition admission is unknown; the "
+                "claim and receipt stay conservatively claimed and the "
+                "composition is never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_pr_compose_dispatch_quietly(
+                pool, receipt, send_claim, refusal_kind=_ADMISSION_REFUSAL_KIND
+            )
+            raise ExternalOperationRejectedError(
+                "the pr-composition admission was refused before any effect; "
+                "the receipt is refused and the composition never dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated pr_result that finished
+        # before the acknowledgement was persisted is correlated, never
+        # ignored or duplicated. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the pr-composition acknowledgement could not be durably "
+                "attached after its known admission; authoritative recovery "
+                "is required and the composition is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease. A staged early completion settled the
+    # claim and the receipt within the attach: its validated ``pr_result`` is
+    # not durable anywhere (the v1 persistence decision, issue #337), so the
+    # ONE post-commit completion handoff receives it in memory for the same
+    # invocation's bounded publication continuation. Strictly post-commit,
+    # contained, never a workflow authority.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        validated_result = outcome.formal_result
+        if not isinstance(validated_result, PrResult):
+            raise ConflictError(
+                "the early-completed pr composition settled without a validated "
+                "pr_result; the publication continuation is not available"
+            )
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+                validated_result=validated_result,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch pr-completion handoff failed (%s); "
+                "the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return DispatchedPrComposition(
+        task=reloaded_task,
+        send_claim=send_claim,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+        producer_session=producer_session,
+        published=None,
+    )
+
+
+def _revalidate_settlement_subjects(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    send_claim: TaskRuntimeSendClaim,
+) -> _PublicationSubjects:
+    """The detached settlement's database-only subject re-derivation (#337).
+
+    The exact durable facts the committed PR_COMPOSE claim addressed must
+    still be the publication's subject set at observation time: the exact
+    current ``waiting_for_owner`` Task — read under the exclusive Task row
+    lock, because this settlement performs no conditional Task write of its
+    own (the publication is the post-settlement consequence) and the lock is
+    what serializes its currentness with every composed Task transition (an
+    Owner Abort, blocking, or cancellation that wins the lock first is
+    observed here; one that comes later serializes behind the settlement) —
+    no current OwnerGate, a bound canonical feature branch, no canonical
+    record, the claim's approved ``PR_AUTHORIZATION`` gate still carrying the
+    claim's exact head SHA, and the claim's exact READY Producer binding. An
+    existing canonical record means the composition already resolved — the
+    existing recovery semantics own the residue, never a second create. The
+    full authorization re-proof (the account barrier, the Workspace Owner
+    scope) happens again in the bounded publication continuation, before any
+    GitHub call.
+    """
+    task = task_records.get_task_for_update(transaction_pool, task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if task.status is not TaskStatus.WAITING_FOR_OWNER:
+        raise StaleOperationError(
+            "the task is no longer waiting on its owner gate; the observed "
+            "pr result can no longer apply"
+        )
+    if task.current_owner_gate_id is not None:
+        raise StaleOperationError(
+            "the task carries a current owner gate; the observed pr result can no longer apply"
+        )
+    if task.canonical_feature_branch is None:
+        raise ConflictError(
+            "the task carries no bound canonical feature branch; the observed "
+            "pr result can no longer apply"
+        )
+    existing_pr = pull_request_records.get_task_pull_request_for_task(
+        transaction_pool, task_id=task.id
+    )
+    if existing_pr is not None:
+        raise StaleOperationError(
+            "the task already carries a canonical pull request; the observed "
+            "pr result can no longer apply"
+        )
+    owner_gate_id = send_claim.owner_gate_id
+    if owner_gate_id is None:
+        # Narrowed by the kind's subject form; explicit for fail-closed safety.
+        raise ConflictError("the pr compose dispatch claim carries no owner-gate subject")
+    gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=owner_gate_id)
+    if gate is None or gate.task_id != task.id or gate.workspace_id != workspace_id:
+        raise NotFoundError("the requested owner gate is not available for this task")
+    if (
+        gate.gate_type is not OwnerGateType.PR_AUTHORIZATION
+        or gate.status is not OwnerGateStatus.APPROVED
+        or gate.subject_head_sha is None
+        or gate.subject_head_sha != send_claim.subject_head_sha
+    ):
+        raise StaleOperationError(
+            "the approved pr authorization gate moved on; the observed pr result "
+            "can no longer apply"
+        )
+    approving_profile_id = _resolve_approved_resolution_audit(
+        transaction_pool, workspace_id=workspace_id, owner_gate_id=owner_gate_id
+    )
+    session = session_records.get_task_agent_session(
+        transaction_pool, task_id=task.id, role=WorkflowRole.PRODUCER
+    )
+    if session is None or session.task_id != task.id or session.workspace_id != workspace_id:
+        raise NotFoundError("the requested producer session is not available for this task")
+    if (
+        session.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        or session.id != send_claim.task_agent_session_id
+        or session.external_session_id is None
+        or not session.external_session_id.strip()
+    ):
+        raise StaleOperationError(
+            "the claimed producer session binding moved on; the observed pr result "
+            "can no longer apply"
+        )
+    return _resolve_publication_route_subjects(
+        transaction_pool,
+        approving_profile_id=approving_profile_id,
+        workspace_id=workspace_id,
+        task=task,
+        gate=gate,
+        existing_pr=None,
+    )
+
+
+def settle_observed_pr_compose_result(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    send_claim: TaskRuntimeSendClaim,
+    result: PrResult,
+) -> _PublicationSubjects | None:
+    """Finalize one observed PR_COMPOSE result through the owning service.
+
+    The detached composition settlement's owning-service composition (issue
+    #337): the correlation seam funnels the attributed terminal observation
+    through the shared formal contract and hands the validated ``PrResult``
+    here inside its own settlement transaction. The settlement re-derives
+    every subject from durable state and settles the send claim exactly once
+    with only the safe approved head identity as its outcome — atomically
+    with the receipt settlement the route performs next, and without
+    pretending GitHub publication has completed. ``None`` means the subject
+    set has moved on: the observation can no longer apply, nothing is
+    rewritten, and the existing recovery semantics own the conservative
+    residue.
+    """
+    if not isinstance(result, PrResult):
+        raise InvalidCommandError("settle_observed_pr_compose_result requires a PrResult")
+    if not isinstance(send_claim, TaskRuntimeSendClaim):
+        raise InvalidCommandError("settle_observed_pr_compose_result requires a send claim")
+    try:
+        subjects = _revalidate_settlement_subjects(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id, send_claim=send_claim
+        )
+    except (NotFoundError, ConflictError, StaleOperationError):
+        # The subject set moved on between the dispatch and the observed
+        # completion (a rotated token, a lost session, a competing canonical
+        # record, a moved-on gate): the validated result can no longer apply,
+        # so nothing is rewritten and the receipt settles as
+        # result-not-applied. Never a fabricated publication.
+        return None
+    approved_head_sha = subjects.gate.subject_head_sha
+    if approved_head_sha is None:  # pragma: no cover - narrowed by revalidation
+        raise ConflictError("the pr authorization gate does not carry the exact head-sha subject")
+    settle_pr_compose_send_claim(
+        transaction_pool,
+        claim=send_claim,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        subject_head_sha=approved_head_sha,
+    )
+    return subjects
+
+
+def publish_settled_task_pr_composition(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    user_token_resolver: ProfileUserAccessTokenResolver,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    expected_state_token: UUID,
+    pr_result: PrResult,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+) -> SettledTaskPrPublication:
+    """Publish one settled composition's validated presentation (issue #337).
+
+    The ONE post-commit completion handoff's bounded post-settlement
+    consequence: the validated ``pr_result`` is presentation material only —
+    the authoritative repository, branch, base, head SHA, and approving
+    identity are re-derived from durable state in one short transaction at
+    the Task's current token (a moved-on subject fails closed truthfully) —
+    and then the existing bounded publication
+    preflight/create/reconcile/finalize runs in this same
+    completion-processing invocation, with no database transaction across
+    the GitHub I/O. This is deliberately not a new model turn, not a second
+    observer implementation, and not an independent F1 publication job; a
+    process death after the settlement but before any GitHub create is the
+    explicitly accepted narrow v1 liveness/stranding limitation (issue
+    #337) — the claimed model turn is never repeated and no title/body is
+    ever invented.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(owner_gate_id, "owner_gate_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    if not isinstance(pr_result, PrResult):
+        raise InvalidCommandError(
+            "publish_settled_task_pr_composition requires a validated PrResult"
+        )
+    with application_span(_SERVICE_TRACER_SCOPE, _PUBLISH_SETTLED_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_PUBLISH_SETTLED_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        # --- One short transaction: the approving Profile is re-derived from
+        # the gate's OWNER-attributed approved audit and the full publication
+        # subject set is revalidated at the Task's current token. The
+        # account-operational barrier and the Workspace Owner scope are
+        # re-proved under the resolved approving Profile — publication's only
+        # identity — before any GitHub call. ---
+        with composed_transaction(pool) as transaction_pool:
+            approving_profile_id = _resolve_approved_resolution_audit(
+                transaction_pool, workspace_id=workspace_id, owner_gate_id=owner_gate_id
+            )
+            task, gate, existing_pr = _revalidate_publication_subjects(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                owner_gate_id=owner_gate_id,
+                expected_state_token=expected_state_token,
+            )
+            subjects = _resolve_publication_route_subjects(
+                transaction_pool,
+                approving_profile_id=approving_profile_id,
+                workspace_id=workspace_id,
+                task=task,
+                gate=gate,
+                existing_pr=existing_pr,
+            )
+        # --- The bounded publication consequence in the same invocation,
+        # with no transaction open across the GitHub I/O. ---
+        published = _publish_and_finalize(
+            pool,
+            github,
+            user_token_resolver,
+            subjects=subjects,
+            pr_result=pr_result,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            terminal_finalization_submission=terminal_finalization_submission,
+        )
+        return SettledTaskPrPublication(
+            task=published.task,
+            pull_request=published.pull_request,
+            approving_profile_id=subjects.approving_profile_id,
         )

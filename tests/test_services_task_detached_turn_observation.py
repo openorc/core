@@ -1022,9 +1022,15 @@ class _RecordingHandoff:
         workspace_id: UUID,
         task_id: UUID,
         operation: PendingTaskRuntimeInteractionOperation,
+        validated_result: Any = None,
     ) -> None:
         self.calls.append(
-            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "operation": operation,
+                "validated_result": validated_result,
+            }
         )
 
 
@@ -1125,6 +1131,7 @@ def test_validated_establishment_settlement_fires_the_completion_handoff(
             "workspace_id": _WORKSPACE_ID,
             "task_id": _TASK_ID,
             "operation": PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION,
+            "validated_result": None,
         }
     ]
 
@@ -1158,5 +1165,6 @@ def test_validated_execution_settlement_fires_the_completion_handoff_with_its_fa
             "workspace_id": _WORKSPACE_ID,
             "task_id": _TASK_ID,
             "operation": PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            "validated_result": None,
         }
     ]

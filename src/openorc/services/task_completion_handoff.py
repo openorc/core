@@ -29,6 +29,7 @@ from typing import Protocol
 from uuid import UUID
 
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.protocol.models import FormalResponse
 
 __all__ = ["DetachedTurnCompletionHandoff"]
 
@@ -42,6 +43,7 @@ class DetachedTurnCompletionHandoff(Protocol):
         workspace_id: UUID,
         task_id: UUID,
         operation: PendingTaskRuntimeInteractionOperation,
+        validated_result: FormalResponse | None = None,
     ) -> None:
         """Route one settled validated completion by its explicit family.
 
@@ -50,5 +52,13 @@ class DetachedTurnCompletionHandoff(Protocol):
         durable state and routes only a family with a wired continuation
         route; every failure is contained by the caller and leaves the
         durable state to the existing recovery semantics.
+
+        ``validated_result`` is the deliberately narrow #337 exception: the
+        PR_COMPOSE family's validated ``pr_result`` is presentation material
+        that the v1 persistence decision deliberately does not store, so it
+        is carried in memory to the same invocation's bounded publication
+        continuation. Every other family re-derives its continuation from
+        committed durable state and receives ``None``; the PR route fails
+        closed without a genuine ``PrResult``.
         """
         ...

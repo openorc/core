@@ -79,6 +79,7 @@ from openorc.domain.detached_turns import (
     TaskDetachedTurnReceiptStatus,
     TurnEvidenceFamily,
 )
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.detached_turns import (
     find_outstanding_session_initialization_receipt,
@@ -838,11 +839,22 @@ class DetachedTurnObservationHost:
             # family routing and the resumption. Strictly post-commit,
             # contained, never a workflow authority; a failed routing
             # leaves the durable state to the existing recovery semantics.
+            # The in-memory validated result is forwarded only for the
+            # PR_COMPOSE family (issue #337): its presentation material is
+            # deliberately not durable, so the same invocation's bounded
+            # publication continuation receives it here; every other family
+            # re-derives its continuation from committed durable state.
             try:
                 self._completion_handoff.handoff_settled_completion(
                     workspace_id=entry.workspace_id,
                     task_id=entry.task_id,
                     operation=outcome.receipt.operation,
+                    validated_result=(
+                        outcome.formal_result
+                        if outcome.receipt.operation
+                        is PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH
+                        else None
+                    ),
                 )
             except Exception as error:  # noqa: BLE001 - best-effort handoff
                 logger.warning(
