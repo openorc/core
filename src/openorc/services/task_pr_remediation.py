@@ -63,14 +63,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
-from typing import Final, cast
+from typing import Final, Protocol, cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -80,6 +81,7 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.executions import Execution
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -98,6 +100,7 @@ from openorc.persistence import executions as execution_records
 from openorc.persistence import pull_requests as pull_request_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.executions import ExecutionStatus
 from openorc.persistence.ownership import get_repository
 from openorc.persistence.pool import DatabasePool
@@ -108,12 +111,16 @@ from openorc.protocol.models import (
     REVIEW_OUTCOME_CHANGES_REQUESTED,
     SCHEMA_VERSION,
     ImplementationResult,
+    ReviewFinding,
     ReviewResult,
 )
 from openorc.services import event_coordination
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
@@ -123,6 +130,8 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pr_review_dispatch import (
     TaskPrReviewDispatchOutcome,
@@ -141,15 +150,28 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "DispatchedPrRemediation",
+    "PrRemediationObservationRegistrar",
+    "ProducerRuntimeAttachmentFactory",
     "ReviewerRuntimeAttachmentFactory",
+    "SettledPrRemediationVerification",
     "TaskPrRemediationOutcome",
     "complete_resumed_pr_remediation_result",
     "continue_resumed_pr_remediation_chain",
+    "dispatch_pr_remediation_detached",
     "route_pr_remediation",
+    "verify_settled_pr_remediation_push",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_remediation"
 _REMEDIATION_SPAN_NAME = "task_pr_remediation.route_pr_remediation"
+_DISPATCH_DETACHED_SPAN_NAME = "task_pr_remediation.dispatch_pr_remediation_detached"
+
+# The positively established pre-effect refusal kinds the detached dispatch's
+# receipt containment records: the observation registration's typed refusal
+# and the admission's proven pre-effect runtime rejection.
+_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
 
 logger = logging.getLogger(__name__)
 
@@ -1144,4 +1166,737 @@ def continue_resumed_pr_remediation_chain(
         finalized_execution=finalized_execution,
         result=result,
         repository_full_name=_repository_full_name(repository),
+    )
+
+
+# --- the detached Producer remediation dispatch (issues #325/#338) --------------------
+
+
+# The deferred Producer attachment seam for the detached remediation enqueue:
+# the service decides WHEN the adapter is acquired; the caller owns HOW the
+# production attachment is composed (the #190 BOUND composition on the exact
+# Task checkout).
+ProducerRuntimeAttachmentFactory = Callable[[], AbstractContextManager[AgentRuntimeAdapter]]
+
+
+class PrRemediationObservationRegistrar(Protocol):
+    """The structural registration seam of the process's detached-turn observer.
+
+    The same positively-required pre-admission gate the detached
+    establishment, implementation, plan, review, and composition dispatches
+    consume (issues #323/#333/#334/#335/#336/#337): the remediation enqueue
+    registers the exact bound external Producer session before any admission,
+    so an unreplayable terminal ``implementation_result`` can never be
+    produced without active observation. Failures are the observer's typed
+    refusals, routed through the pre-effect failure machinery.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Register one exact bound session for detached-turn observation."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedPrRemediation:
+    """The typed detached E9 remediation dispatch outcome (issue #338).
+
+    The authoritative facts exactly as the durable state reads after the
+    dispatch: the post-dispatch Task, the claimed ``running`` remediation
+    Execution whose receipt companion was committed, the claimed
+    detached-turn receipt, the exact Producer binding the canonical REVISE
+    instruction was admitted on, and the addressed finalized
+    ``CHANGES_REQUESTED`` iteration. No runtime result and no validated
+    ``implementation_result`` exists yet: the independently observed
+    completion settles the attempt through the existing #322 E9
+    execution-settlement route, and the ONE post-commit completion handoff
+    owns the workflow continuation.
+    """
+
+    task: Task
+    execution: Execution
+    receipt: TaskDetachedTurnReceipt
+    producer_session: TaskAgentSession
+    addressed_iteration: ReviewIteration
+
+
+def _review_result_from_iteration(iteration: ReviewIteration) -> ReviewResult:
+    """Rebuild the persisted protocol-validated review result verbatim.
+
+    The finalized CHANGES_REQUESTED iteration's summary and findings are the
+    remediation input (issue #338): values and ordering are preserved
+    exactly, with no interpretation, rewriting, or free-text mutation. A
+    persisted findings document that is no longer in the canonical
+    ``review_result`` finding shape fails closed instead of being repaired
+    or inferred.
+    """
+    findings: list[ReviewFinding] = []
+    for item in iteration.findings or ():
+        if (
+            not isinstance(item, dict)
+            or set(item.keys()) != {"summary", "details"}
+            or not isinstance(item.get("summary"), str)
+            or not str(item.get("summary", "")).strip()
+            or not isinstance(item.get("details"), str)
+            or not str(item.get("details", "")).strip()
+        ):
+            raise ConflictError(
+                "the persisted review findings are not in the canonical review_result "
+                "finding shape; no remediation turn is dispatched"
+            )
+        findings.append(ReviewFinding(summary=item["summary"], details=item["details"]))
+    return ReviewResult(
+        outcome=REVIEW_OUTCOME_CHANGES_REQUESTED,
+        summary=iteration.summary or "",
+        findings=tuple(findings),
+    )
+
+
+def _refuse_pr_remediation_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed remediation receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises. The claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively. The claimed Execution keeps its own durable
+    attempt identity and is finalized by the caller's pre-effect failure
+    path, never by this containment.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused remediation-dispatch receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the remediation-dispatch receipt was no longer claimed when its "
+            "pre-effect refusal was recorded"
+        )
+
+
+def _dispatch_pr_remediation_turn(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    execution: Execution,
+    producer_session: TaskAgentSession,
+    addressed_iteration: ReviewIteration,
+    message: str,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: PrRemediationObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> DispatchedPrRemediation:
+    """Admit the canonical REVISE instruction as one detached agent turn.
+
+    The detached dispatch mechanics of the E9 remediation family (issue
+    #338), mirroring the established execution-family dispatch shape: the
+    runtime lease and the detached capability are acquired and duck-typed
+    fail-closed BEFORE any durable dispatch effect, the post-attachment
+    authority revalidation re-proves the exact claimed subjects under the
+    Task row lock and closes before the receipt, the claimed Execution's
+    detached-turn receipt companion (expecting the canonical
+    ``implementation_result`` family) commits strictly before any runtime
+    effect, one positively-required observation registration gates the
+    admission, one detached-turn admission carries the composed canonical
+    REVISE message verbatim on the exact Task checkout, and the
+    acknowledgement attach consumes any staged early completion exactly
+    once. No ``send`` and no blocking wait exists in this path, and no
+    database transaction is ever held across a runtime call.
+
+    The R1/R2 authority guards and the proven/uncertain failure
+    classification are exactly the ordinary remediation dispatch's: authority
+    moving on before any effect finalizes the never-dispatched attempt
+    truthfully; only positively proven pre-effect failures refuse the receipt
+    and finalize ``failed_transient``; an uncertain admission leaves the
+    attempt conservatively running and the receipt conservatively claimed and
+    is never re-dispatched. The dispatching worker returns after the
+    acknowledgement attach; the observed completion settles the attempt
+    through the existing #322 E9 execution-settlement route.
+    """
+    producer_external_session_id = producer_session.external_session_id
+    if producer_external_session_id is None or not producer_external_session_id.strip():
+        raise ConflictError("the producer session binding carries no external session identity")
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the remediation observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    with ExitStack() as attachment_stack:
+        try:
+            runtime = attachment_stack.enter_context(producer_runtime_factory())
+        except ExternalOperationUncertainError:
+            # Uncertain attachment: the claimed attempt stays conservatively
+            # running (the potentially-dispatched record) and nothing resends.
+            raise
+        except ExternalOperationFailedError:
+            # A known attachment failure provably occurred before any effect.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            # The attached runtime cannot admit detached turns: a proven
+            # pre-effect condition of this never-dispatched attempt.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationFailedError(
+                "the producer runtime does not implement the detached turn "
+                "capability; the remediation dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+        # --- R1: authority revalidation after acquisition, before any
+        # runtime interaction. ---
+        try:
+            with composed_transaction(pool) as transaction_pool:
+                _revalidate_remediation_subjects_for_send(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    expected_state_token=expected_state_token,
+                    producer_session=producer_session,
+                    head_sha=addressed_iteration.reviewed_head_sha or "",
+                )
+        except (NotFoundError, ConflictError, StaleOperationError):
+            # Authority moved on during attachment, before any runtime effect:
+            # the never-dispatched attempt finalizes truthfully.
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_FINAL,
+                failure_kind=_AUTHORITY_STALE_FAILURE_KIND,
+            )
+            raise
+        # --- the receipt: the claim's detached-turn companion, committed
+        # strictly before the first runtime interaction, so the admission
+        # race and the single-outstanding-turn invariant are durable from
+        # the first possible effect. ---
+        try:
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer_session.id,
+                operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=execution.id,
+            )
+        except ExternalOperationUncertainError:
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        except Exception as error:
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationFailedError(
+                "the detached remediation receipt could not be durably recorded "
+                "before any dispatch; the attempt failed before any effect"
+            ) from error
+        # --- the positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the just-recorded receipt is marked refused and the never-dispatched
+        # attempt finalizes truthfully, so a never-dispatched turn cannot hold
+        # the session's single-outstanding slot. ---
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=producer_session.id,
+                connection_id=producer_session.connection_id,
+                external_session_id=producer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError:
+            _refuse_pr_remediation_dispatch_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise
+        except Exception as error:
+            from openorc.services.task_detached_turn_observation import (  # noqa: PLC0415
+                ObservationRegistrationRefusalReason,
+            )
+
+            _refuse_pr_remediation_dispatch_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ObservationRegistrationRefusedError(
+                "the remediation observation registration failed before any "
+                "admission; the dispatch is a proven pre-effect failure",
+                reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+            ) from error
+        # --- the admission (external, no transaction held). One detached-turn
+        # admission of the composed canonical REVISE message verbatim on the
+        # exact Task checkout. ---
+        try:
+            admission = admit_detached_turn(producer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached remediation admission ended with an uncertain "
+                "outcome; the receipt stays conservatively claimed and the "
+                "attempt is never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the remediation admission is unknown; the "
+                "receipt stays conservatively claimed and the attempt is "
+                "never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the attempt fails known.
+            _refuse_pr_remediation_dispatch_quietly(
+                pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND
+            )
+            _finalize_pre_effect_failure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                execution_id=execution.id,
+                producer_session_id=producer_session.id,
+                next_status=ExecutionStatus.FAILED_TRANSIENT,
+                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            )
+            raise ExternalOperationRejectedError(
+                "the remediation admission was refused before any effect; "
+                "the receipt is refused and the attempt never dispatched"
+            ) from error
+        # --- the acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated result that finished before
+        # the acknowledgement was persisted is correlated, never ignored or
+        # duplicated. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the remediation acknowledgement could not be durably attached "
+                "after its known admission; authoritative recovery is required "
+                "and the attempt is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the attempt and the receipt
+        # within this dispatch: the ONE post-commit completion handoff owns
+        # the family routing. Strictly post-commit, contained, never a
+        # workflow authority; a failed routing leaves the durable state to
+        # the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch remediation completion handoff failed (%s); "
+                "the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return DispatchedPrRemediation(
+        task=reloaded_task,
+        execution=execution,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+        producer_session=producer_session,
+        addressed_iteration=addressed_iteration,
+    )
+
+
+def dispatch_pr_remediation_detached(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    addressed_iteration: ReviewIteration,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: PrRemediationObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPrRemediation:
+    """Dispatch one routed Producer remediation as one detached agent turn.
+
+    The detached counterpart of the ordinary remediation route (issues
+    #325/#338): the same durable one-shot E9 claim — the exact current
+    ``REVIEWING`` Task, the canonical PR at the addressed iteration's exact
+    head, the READY Producer binding, the OPEN PR loop, the finalized latest
+    ``CHANGES_REQUESTED`` iteration, and the next-numbered Execution claimed
+    ``running`` with the ``review_iteration_id`` association, all in one
+    short transaction that is never rolled back on any dispatch outcome —
+    followed by the canonical ``review_result`` JSON of the **persisted**
+    finalized iteration (rebuilt verbatim, never from transient state)
+    admitted as one independently completed agent turn on the original
+    Producer session at the exact Task checkout, with the claimed Execution's
+    detached-turn receipt companion committed strictly before the positive
+    observation registration and the admission. No ``send`` and no blocking
+    wait exists in this path, and the dispatching worker exits after the
+    acknowledgement attach. The independently observed completion settles
+    the attempt through the existing #322 E9 execution-settlement route, and
+    the ONE post-commit completion handoff owns the continuation from
+    committed state. A replayed claim for an already-claimed iteration —
+    whatever the prior outcome, and whatever token a retry presents —
+    applies nothing.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_DETACHED_SPAN_NAME) as span:
+        # --- Phase 0: command shape (no I/O). ---
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        addressed = _require_addressed_iteration(addressed_iteration)
+        producer_factory = producer_runtime_factory
+        annotate_span(
+            span,
+            operation=_DISPATCH_DETACHED_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: the durable one-shot claim (database only). ---
+        (
+            task,
+            _pull_request,
+            _review_loop,
+            producer_session,
+            claimed,
+        ) = _claim_remediation_transaction(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            addressed_iteration=addressed,
+        )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's reserved
+            # remediation Execution identity (#262). Recorded immediately
+            # after the claim commit, before anything below — the attachment
+            # acquisition included — can fail (issue #268).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=claimed.id,
+                phase="pr_remediation_execution",
+            )
+
+        # --- Phase 2: the composed canonical REVISE message from the
+        # persisted finalized iteration, then the detached admission. ---
+        message = serialize_review_result(_review_result_from_iteration(addressed))
+        return _dispatch_pr_remediation_turn(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            execution=claimed,
+            producer_session=producer_session,
+            addressed_iteration=addressed,
+            message=message,
+            producer_runtime_factory=producer_factory,
+            observation_registrar=observation_registrar,
+            completion_handoff=completion_handoff,
+        )
+
+
+# --- the settled-remediation continuation verification (issue #338) -------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SettledPrRemediationVerification:
+    """The GitHub-verified continuation facts of one settled remediation round.
+
+    Returned only when a durably SUCCEEDED remediation Execution is recorded
+    for the latest finalized ``CHANGES_REQUESTED`` PR iteration, the recorded
+    completion's branch claim corresponds to the Task's bound canonical
+    branch, and B7 reconciles the SAME canonical pull request to a
+    GitHub-confirmed NEW head with no review iteration yet reserved for that
+    head — the exact facts the ONE completion handoff needs to submit the
+    next typed ``TASK_PR_REVIEW`` for the confirmed head. ``None`` means no
+    continuation is owed from committed state; a positively detected
+    verification failure raises a typed error instead.
+    """
+
+    task: Task
+    pull_request: TaskPullRequest
+    addressed_iteration: ReviewIteration
+    finalized_execution: Execution
+    new_head_sha: str
+
+
+def verify_settled_pr_remediation_push(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> SettledPrRemediationVerification | None:
+    """Re-prove a settled remediation round and verify its confirmed new head.
+
+    The detached remediation completion's owning-service continuation (issue
+    #338), reusing the ordinary chain's verification policy with every
+    subject re-derived from committed state — never from a transient
+    settlement object. ``None`` means no continuation is owed: nothing is
+    fabricated, nothing is retried, and no other path's subject is touched.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    github_client = _require_github(github)
+
+    # --- Phase 1: the continuation subject set (database only). ---
+    with composed_transaction(pool) as transaction_pool:
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            return None
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
+            # A gate or a moved-on status owns the workflow: the continuation
+            # is that seam's, never this verification's.
+            return None
+        loops = [
+            loop
+            for loop in review_records.list_task_review_loops(transaction_pool, task_id=task_id)
+            if loop.workspace_id == workspace_id and loop.purpose is ReviewLoopPurpose.PR_REVIEW
+        ]
+        if len(loops) != 1 or loops[0].status is not ReviewLoopStatus.OPEN:
+            return None
+        loop = loops[0]
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        change_requests = [
+            iteration
+            for iteration in iterations
+            if iteration.outcome is ReviewOutcome.CHANGES_REQUESTED
+            and iteration.task_pull_request_id is not None
+        ]
+        if not change_requests:
+            return None
+        addressed = change_requests[-1]
+        claimed = [
+            execution
+            for execution in execution_records.list_task_executions(
+                transaction_pool, task_id=task_id
+            )
+            if execution.review_iteration_id == addressed.id
+        ]
+        if len(claimed) != 1:
+            # The one-shot claim association admits at most one execution per
+            # iteration; anything else is a durable invariant violation.
+            raise ConflictError(
+                "the addressed review iteration does not carry exactly one claimed "
+                "remediation execution; the continuation cannot choose a subject"
+            )
+        execution = claimed[0]
+        if (
+            execution.status is not ExecutionStatus.SUCCEEDED
+            or execution.implementation_result is None
+        ):
+            # Nothing durably settled to continue (still running, known
+            # failed, or uncertain): the settlement routes own those states.
+            return None
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this continuation's
+            # verified settled Execution identity (#262), recorded before
+            # any external verification can fail.
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=execution.id,
+                phase="pr_remediation_verification",
+            )
+    return _verify_settled_remediation_push_external(
+        pool,
+        github_client,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        task=task,
+        loop=loop,
+        addressed=addressed,
+        execution=execution,
+    )
+
+
+def _verify_settled_remediation_push_external(
+    pool: DatabasePool,
+    github_client: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task: Task,
+    loop: ReviewLoop,
+    addressed: ReviewIteration,
+    execution: Execution,
+) -> SettledPrRemediationVerification | None:
+    """The recorded-branch-claim check and the authoritative head verification.
+
+    **Phase 2 — the recorded branch claim:** the recorded canonical envelope
+    must be the completed ``implementation_result`` family whose ``branch``
+    claim names exactly the Task's bound canonical feature branch. The claim
+    is routing evidence, never head/PR authority; a wrong-branch recorded
+    completion fails closed and is never rewritten into invented success.
+
+    **Phase 3 — the authoritative head verification (no transaction open
+    across GitHub I/O):** the SAME canonical pull request is reconciled
+    through B7, must still be exactly the addressed iteration's record and
+    OPEN, and must report a GitHub-confirmed NEW head — a missing push
+    (unchanged head) fails closed. A review iteration already reserved for
+    the confirmed head (a concurrently continued subject) returns ``None``
+    instead of dispatching twice.
+    """
+    payload = execution.implementation_result
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != IMPLEMENTATION_RESULT_FAMILY
+        or payload.get("status") != _IMPLEMENTATION_COMPLETED_STATUS
+    ):
+        raise ConflictError(
+            "the settled remediation completion is not the canonical completed "
+            "implementation_result envelope; no push is verifiable and no new "
+            "review is launched"
+        )
+    branch_claim = payload.get("branch")
+    if (
+        not isinstance(branch_claim, str)
+        or task.canonical_feature_branch is None
+        or branch_claim != task.canonical_feature_branch
+    ):
+        raise ConflictError(
+            "the producer completion claims a branch other than the task's bound "
+            "canonical feature branch; no push is verifiable and no new review is "
+            "launched"
+        )
+    reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
+        pool,
+        github_client,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    reconciled = reconciliation.pull_request
+    if reconciled.id != addressed.task_pull_request_id:
+        raise ConflictError(
+            "the reconciled pull request is not the addressed canonical record; "
+            "another pull request is never adopted"
+        )
+    if reconciled.state is not TaskPullRequestState.OPEN:
+        raise ConflictError(
+            "the canonical pull request is no longer open; closed-PR and merge "
+            "recovery belong to the later recovery layer"
+        )
+    new_head = reconciled.head_sha
+    if new_head == addressed.reviewed_head_sha:
+        raise ExternalOperationFailedError(
+            "the producer completion is recorded but the canonical pull request "
+            "head is unchanged; no push is confirmed and no new review is launched"
+        )
+    # A concurrently continued subject — the review for the confirmed head is
+    # already reserved — owns its own state; this continuation applies nothing.
+    current_iterations = review_records.list_review_loop_iterations(pool, review_loop_id=loop.id)
+    if any(
+        iteration.task_pull_request_id == reconciled.id and iteration.reviewed_head_sha == new_head
+        for iteration in current_iterations
+    ):
+        return None
+    reloaded_task = task_records.get_task(pool, task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return SettledPrRemediationVerification(
+        task=reloaded_task,
+        pull_request=reconciled,
+        addressed_iteration=addressed,
+        finalized_execution=execution,
+        new_head_sha=new_head,
     )

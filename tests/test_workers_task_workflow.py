@@ -946,7 +946,14 @@ def test_pr_composition_composition_submits_the_pr_review(
 def test_pr_review_composition_loops_finalize_over_remediation_in_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    """The queue-mode interim (until #328): the blocking in-process loop.
+
+    Regular mode dispatches the PR review as one detached turn and never
+    re-enters this loop (issue #338); the queue-mode composition keeps the
+    blocking dispatch/decision/remediation interim, so this proof is pinned
+    to the queue execution mode.
+    """
+    dependencies, submitter = make_queue_dependencies()
     published = fake_published(_STATE_TOKEN)
     first_dispatch = fake_dispatch_outcome(_NEXT_TOKEN)
     remediated_dispatch = fake_dispatch_outcome(_THIRD_TOKEN)
@@ -1733,7 +1740,7 @@ def test_the_completion_handoff_refuses_a_family_without_a_wired_route() -> None
         handoff.handoff_settled_completion(
             workspace_id=_WORKSPACE_ID,
             task_id=_TASK_ID,
-            operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+            operation=PendingTaskRuntimeInteractionOperation.SESSION_RESUME,
         )
     assert submitter.submissions == []
 
@@ -2857,4 +2864,377 @@ def test_the_completion_handoff_pr_route_is_a_noop_without_a_settled_claim(
         validated_result=validated,
     )
 
+    assert submitter.submissions == []
+
+
+# --- the detached PR-review cycle (issue #338) -----------------------------------------
+
+
+def test_pr_review_composition_dispatches_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode PR-review composition (issue #338): the REVIEW
+    dispatch is itself one detached agent turn — the reserved PR/head
+    iteration, its detached-turn receipt companion, and the verbatim admission
+    commit in the dispatch service, and the composition returns after the
+    durable admission without any blocking send, in-process decision, or
+    inline submission."""
+    dependencies, submitter = make_dependencies()
+    review_dispatch = RecordingService(
+        result=SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
+    )
+    monkeypatch.setattr(task_workflow, "dispatch_pr_review_detached", review_dispatch, raising=True)
+
+    def refusing_blocking_dispatch(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the blocking PR-review dispatch must not run in regular mode")
+
+    monkeypatch.setattr(task_workflow, "dispatch_pr_review", refusing_blocking_dispatch)
+    finalize = RecordingService(result=None)
+    monkeypatch.setattr(task_workflow, "finalize_pr_review_decision", finalize, raising=True)
+    published = fake_published(_STATE_TOKEN)
+    with patched_workflow_environment(monkeypatch, reloaded_published=published):
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_PR_REVIEW,
+                payload=TaskPrReviewPayload(
+                    task=_TASK_SCOPE_REVIEWER,
+                    profile_id=str(_PROFILE_ID),
+                    task_pull_request_id=str(_PR_RECORD_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+    # The E9 detached dispatch ran against the reloaded published subject with
+    # the composed deferred Reviewer attachment factory, the process's
+    # observation registrar, and the ONE completion handoff.
+    assert review_dispatch.call_count == 1
+    assert review_dispatch.calls[0]["kwargs"]["profile_id"] == _PROFILE_ID
+    assert review_dispatch.calls[0]["kwargs"]["expected_state_token"] == (
+        published.task.state_token
+    )
+    assert len(review_dispatch.calls[0]["args"]) == 3
+    assert review_dispatch.calls[0]["kwargs"]["observation_registrar"] is not None
+    assert callable(
+        review_dispatch.calls[0]["kwargs"]["completion_handoff"].handoff_settled_completion
+    )
+    # No blocking decision runs in the composition and nothing is submitted
+    # inline: the observed completion's settlement and the ONE handoff own the
+    # continuation from committed state.
+    assert finalize.call_count == 0
+    assert submitter.submissions == []
+
+
+def _pr_review_handoff_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    task: Any,
+    loops: list[Any],
+    iterations: list[Any],
+    executions: list[Any] | None = None,
+) -> Any:
+
+    dependencies, submitter = make_dependencies()
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_task_review_loops",
+        lambda _pool, *, task_id: loops if task_id == _TASK_ID else [],
+    )
+    monkeypatch.setattr(
+        task_workflow.review_records,
+        "list_review_loop_iterations",
+        lambda _pool, *, review_loop_id: iterations if loops else [],
+    )
+    monkeypatch.setattr(
+        task_workflow.execution_records,
+        "list_task_executions",
+        lambda _pool, *, task_id: executions or [],
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+    return dependencies, submitter
+
+
+def test_the_pr_review_handoff_dispatches_the_pr_change_request_remediation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PR-review handoff route (issue #338): an in-budget CHANGES_REQUESTED
+    PR/head decision's committed state — the REVIEWING Task with no current
+    gate, the OPEN PR loop, its latest finalized PR/head iteration, and no
+    claimed remediation Execution — is the only remediation authority; the
+    detached E9 enqueue runs on the exact Task checkout under the F5b
+    coordinator and nothing is submitted inline."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=None,
+        canonical_feature_branch="feat/branch",
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        status=ReviewLoopStatus.OPEN,
+    )
+    changes_requested = SimpleNamespace(
+        id=_PR_RECORD_ID,
+        outcome=ReviewOutcome.CHANGES_REQUESTED,
+        task_pull_request_id=_PR_RECORD_ID,
+        reviewed_head_sha="a" * 40,
+    )
+    dependencies, submitter = _pr_review_handoff_environment(
+        monkeypatch,
+        task=task,
+        loops=[loop],
+        iterations=[changes_requested],
+        executions=[],
+    )
+    dispatch = RecordingService(result=SimpleNamespace(task=task))
+    monkeypatch.setattr(task_workflow, "dispatch_pr_remediation_detached", dispatch, raising=True)
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    assert dispatch.call_count == 1
+    dispatch_kwargs = dispatch.calls[0]["kwargs"]
+    assert dispatch_kwargs["profile_id"] == _PROFILE_ID
+    assert dispatch_kwargs["workspace_id"] == _WORKSPACE_ID
+    assert dispatch_kwargs["task_id"] == _TASK_ID
+    assert dispatch_kwargs["expected_state_token"] == _NEXT_TOKEN
+    assert dispatch_kwargs["addressed_iteration"] is changes_requested
+    assert callable(dispatch_kwargs["producer_runtime_factory"])
+    assert dispatch_kwargs["observation_registrar"] is not None
+    assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
+    assert submitter.submissions == []
+
+
+def test_the_pr_review_handoff_is_a_noop_for_an_already_claimed_remediation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-shot E9 claim association: an iteration whose remediation
+    Execution is already claimed is owned by its own durable attempt — the
+    handoff dispatches nothing and permits no blind re-enqueue."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=None,
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        status=ReviewLoopStatus.OPEN,
+    )
+    changes_requested = SimpleNamespace(
+        id=_PR_RECORD_ID,
+        outcome=ReviewOutcome.CHANGES_REQUESTED,
+        task_pull_request_id=_PR_RECORD_ID,
+        reviewed_head_sha="a" * 40,
+    )
+    claimed = SimpleNamespace(review_iteration_id=_PR_RECORD_ID)
+    dependencies, submitter = _pr_review_handoff_environment(
+        monkeypatch,
+        task=task,
+        loops=[loop],
+        iterations=[changes_requested],
+        executions=[claimed],
+    )
+    dispatch = RecordingService(result=None)
+    monkeypatch.setattr(task_workflow, "dispatch_pr_remediation_detached", dispatch, raising=True)
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    assert dispatch.call_count == 0
+    assert submitter.submissions == []
+
+
+def test_the_pr_review_handoff_is_a_noop_for_gate_owned_review_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ACCEPTED MERGE_DECISION and the exhausted/sticky REVIEW_RESOLUTION
+    gates own their Owner seams: a Task carrying a current owner gate receives
+    no Producer prompt and no remediation dispatch."""
+    from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=uuid4(),
+    )
+    loop = SimpleNamespace(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        status=ReviewLoopStatus.OPEN,
+    )
+    changes_requested = SimpleNamespace(
+        id=_PR_RECORD_ID,
+        outcome=ReviewOutcome.CHANGES_REQUESTED,
+        task_pull_request_id=_PR_RECORD_ID,
+        reviewed_head_sha="a" * 40,
+    )
+    dependencies, submitter = _pr_review_handoff_environment(
+        monkeypatch,
+        task=task,
+        loops=[loop],
+        iterations=[changes_requested],
+    )
+    dispatch = RecordingService(result=None)
+    monkeypatch.setattr(task_workflow, "dispatch_pr_remediation_detached", dispatch, raising=True)
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+    )
+
+    assert dispatch.call_count == 0
+    assert submitter.submissions == []
+
+
+def test_the_pr_remediation_handoff_submits_the_pr_review_for_the_confirmed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The E9-remediation handoff route (issue #338): the settled round's
+    owning verification under the F5b coordinator proves the recorded branch
+    claim and the GitHub-confirmed new head, and only that confirmed head
+    submits the existing typed TASK_PR_REVIEW through F1 with the re-derived
+    canonical PR identity and post-reconciliation token."""
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=None,
+    )
+    continuation = SimpleNamespace(
+        task=task,
+        pull_request=SimpleNamespace(id=_PR_RECORD_ID),
+        addressed_iteration=SimpleNamespace(id=uuid4()),
+        finalized_execution=SimpleNamespace(id=uuid4()),
+        new_head_sha="d" * 40,
+    )
+    verify = RecordingService(result=continuation)
+    monkeypatch.setattr(task_workflow, "verify_settled_pr_remediation_push", verify, raising=True)
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+    )
+
+    assert verify.call_count == 1
+    assert verify.calls[0]["kwargs"]["expected_state_token"] == _NEXT_TOKEN
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_PR_REVIEW
+    assert isinstance(submitted.payload, TaskPrReviewPayload)
+    assert submitted.payload.profile_id == str(_PROFILE_ID)
+    assert submitted.payload.task_pull_request_id == str(_PR_RECORD_ID)
+    assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_pr_remediation_handoff_submits_nothing_without_a_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verification that owns no continuation (nothing settled, a moved-on
+    subject, or an already-continued head) submits nothing and never permits a
+    blind re-enqueue — the durable state owns recovery."""
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=None,
+    )
+    verify = RecordingService(result=None)
+    monkeypatch.setattr(task_workflow, "verify_settled_pr_remediation_push", verify, raising=True)
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+    )
+
+    assert verify.call_count == 1
+    assert submitter.submissions == []
+
+
+def test_the_pr_remediation_handoff_is_a_noop_for_moved_on_subjects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settled remediation's durable continuations are the only authority:
+    a moved-on Task (a gate, a decision, or the Owner Resume routing) receives
+    no verification call and no submission."""
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.WAITING_FOR_OWNER,
+        current_owner_gate_id=uuid4(),
+    )
+    verify = RecordingService(result=None)
+    monkeypatch.setattr(task_workflow, "verify_settled_pr_remediation_push", verify, raising=True)
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+    )
+
+    assert verify.call_count == 0
     assert submitter.submissions == []

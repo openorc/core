@@ -65,6 +65,24 @@ E8):
 Review-subject settlement, Owner discussion, remediation routing, and the
 merge decision belong to the sibling E9 modules and later layers (E10,
 issue #85).
+
+Detached regular-mode dispatch (issue #338): the same authenticated
+admission, authoritative reconciliation, and atomic reservation
+(:func:`_reserve_pr_review_attempt`, shared with the blocking entry) commit
+the reserved attempt together with the resolved durable evidence payload,
+and the ONE detached-turn receipt companion of that exact iteration —
+operation ``reviewer_review``, attempt kind ``review_iteration``, expecting
+the canonical ``review_result`` family — commits in one short transaction
+strictly before the positive observation registration and the verbatim
+admission of the composed canonical REVIEW message on the exact READY
+Reviewer session. No ``send`` and no blocking wait exists in this path, and
+the dispatching worker exits after the acknowledgement attach. The
+independently observed completion routes through the correlation seam to
+the owning PR-review decision settlement (issue #338); proven pre-effect
+failures refuse the receipt and report through the existing Level 1/2
+machinery attributable to the reserved iteration, and an uncertain
+admission leaves the receipt conservatively claimed and is never
+re-dispatched.
 """
 
 from __future__ import annotations
@@ -72,14 +90,15 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
-from typing import cast
+from typing import Protocol, cast
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
@@ -87,6 +106,7 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.ownership import Repository
@@ -106,6 +126,7 @@ from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.executions import ExecutionStatus
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
@@ -117,9 +138,12 @@ from openorc.protocol.models import (
     SCHEMA_VERSION,
     ReviewResult,
 )
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
@@ -128,6 +152,8 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
+from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
 from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pull_request_reconciliation import (
     TaskPullRequestReconciliation,
@@ -141,14 +167,24 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "DispatchedPrReview",
+    "PrReviewObservationRegistrar",
     "ReviewerRuntimeAttachmentFactory",
     "TaskPrReviewDispatchOutcome",
     "dispatch_pr_review",
+    "dispatch_pr_review_detached",
     "serialize_implementation_result_message",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_review_dispatch"
 _DISPATCH_SPAN_NAME = "task_pr_review_dispatch.dispatch_pr_review"
+_DISPATCH_DETACHED_SPAN_NAME = "task_pr_review_dispatch.dispatch_pr_review_detached"
+
+# The positively established pre-effect refusal kinds the detached dispatch's
+# receipt containment records: the observation registration's typed refusal
+# and the admission's proven pre-effect runtime rejection.
+_REGISTRATION_REFUSAL_KIND = "observation_registration_refused"
+_ADMISSION_REFUSAL_KIND = "admission_refused"
 
 logger = logging.getLogger(__name__)
 
@@ -769,6 +805,188 @@ def _revalidate_reserved_subjects(
 # --- the dispatch operation ---------------------------------------------------------
 
 
+# --- the shared authenticated admission, reconciliation, and reservation -------
+
+
+@dataclass(frozen=True, slots=True)
+class _ReservedPrReviewAttempt:
+    """The committed Phase A0/A/B reservation facts both dispatch entries consume."""
+
+    task: Task
+    pull_request: TaskPullRequest
+    reviewer: TaskAgentSession
+    repository_full_name: str
+    loop: ReviewLoop
+    iteration: ReviewIteration
+    head_sha: str
+    message_payload: dict[str, object]
+
+
+def _reserve_pr_review_attempt(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    expected_pull_request_id: UUID | None,
+) -> _ReservedPrReviewAttempt:
+    """Reserve exactly one next-numbered unfinalized PR/head ReviewIteration.
+
+    The shared authenticated admission, authoritative reconciliation, and
+    atomic reservation of both dispatch entries (issues #84/#338):
+
+    **Phase A0 — authenticated admission (database only, closed before any
+    external call):** the account-operational barrier and the exact
+    authenticated Owner Workspace/Task scope.
+
+    **Phase A — authoritative reconciliation (no transaction open):** B7
+    reconciles the canonical PR against GitHub; the reconciled record must be
+    open/unmerged, on the canonical head branch, on the workflow base routing,
+    with the fresh reconciled head SHA. When the caller carries triggering
+    publication facts, they must name exactly the reconciled canonical record.
+
+    **Phase B — reservation transaction (database only):** the account
+    barrier and Owner scope are re-proved under the Task row ``FOR UPDATE``;
+    the Task must be non-archived ``REVIEWING`` at the expected token with no
+    current OwnerGate and a bound canonical feature branch; the canonical PR
+    must still carry exactly the reconciled head; the exact admitted READY
+    Reviewer session is resolved; the single OPEN ``PR_REVIEW`` loop is
+    established once if absent (snapshotting the Workspace limit); and, under
+    the loop row lock, the latest appropriate successful
+    ``implementation_result`` evidence is resolved and one next-numbered
+    unfinalized PR/head iteration is reserved — after refusing unresolved
+    earlier attempts and duplicate dispatch for an already-reviewed head.
+    """
+    github_client = _require_github(github)
+
+    # --- Phase A0: authenticated admission (database only, closed first). ---
+    with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        require_workspace_task(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+
+    # --- Phase A: authoritative reconciliation (no transaction open). ---
+    reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
+        pool,
+        github_client,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    reconciled = reconciliation.pull_request
+    task = task_records.get_task(pool, task_id)
+    if task is None or task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    if reconciled.task_id != task.id or reconciled.workspace_id != workspace_id:
+        raise NotFoundError("the requested pull request record is not available for this task")
+    if expected_pull_request_id is not None and expected_pull_request_id != reconciled.id:
+        raise NotFoundError(
+            "the addressed publication facts do not name the task's canonical pull request record"
+        )
+    repository = get_repository(pool, task.repository_id)
+    if repository is None or repository.workspace_id != workspace_id:
+        raise NotFoundError("the requested repository is not available in this workspace")
+    _require_review_eligible_pull_request(pull_request=reconciled, task=task, repository=repository)
+    head_sha = reconciled.head_sha
+
+    # --- Phase B: reservation transaction (database only). ---
+    with composed_transaction(pool) as transaction_pool:
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        require_workspace_task(
+            transaction_pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        locked = task_records.get_task_for_update(transaction_pool, task_id)
+        if locked is None or locked.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        task = require_current_task(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+        )
+        if task.status is not TaskStatus.REVIEWING:
+            raise ConflictError(
+                "the addressed task is not reviewing; the ordinary PR review "
+                "dispatch is not available"
+            )
+        if task.current_owner_gate_id is not None:
+            raise ConflictError(
+                "the task carries a current owner gate; the ordinary PR review "
+                "dispatch is not available"
+            )
+        # The persisted reconciled head is revalidated under the Task lock:
+        # a concurrent durable change rolls the reservation back — no
+        # reservation commits against a moved subject.
+        pull_request = require_task_pull_request_head(
+            transaction_pool, task=task, expected_head_sha=head_sha
+        )
+        if pull_request.id != reconciled.id or pull_request.github_pr_id != reconciled.github_pr_id:
+            raise StaleOperationError(
+                "the canonical pull request identity changed during dispatch; "
+                "the operation is stale"
+            )
+        reviewer = _require_ready_reviewer(
+            transaction_pool, workspace_id=workspace_id, task_id=task_id
+        )
+        workspace = get_workspace(transaction_pool, workspace_id)
+        if workspace is None:
+            raise NotFoundError("the requested workspace is not available")
+        loop = _require_or_establish_pr_loop(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            iteration_limit=workspace.review_iteration_limit,
+        )
+        locked_loop = review_records.get_review_loop(
+            transaction_pool, review_loop_id=loop.id, for_update=True
+        )
+        if locked_loop is None or locked_loop.id != loop.id:
+            raise StaleOperationError("the pr_review loop has moved on; the dispatch is stale")
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=locked_loop.id
+        )
+        _require_no_unresolved_attempt(iterations)
+        _require_no_iteration_for_current_head(iterations, pull_request, head_sha)
+        payload = _resolve_dispatch_evidence(
+            transaction_pool,
+            task_id=task_id,
+            canonical_feature_branch=task.canonical_feature_branch or "",
+            reconciled_head_sha=head_sha,
+            initial_authorized_head_sha=_resolve_initial_authorized_head(
+                transaction_pool, task_id=task_id
+            ),
+            loop=locked_loop,
+        )
+        reserved = _reserve_iteration(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            loop=locked_loop,
+            iterations=iterations,
+            task_pull_request_id=pull_request.id,
+            reviewed_head_sha=head_sha,
+        )
+
+    return _ReservedPrReviewAttempt(
+        task=task,
+        pull_request=pull_request,
+        reviewer=reviewer,
+        repository_full_name=f"{repository.metadata.owner_login}/{repository.metadata.name}",
+        loop=locked_loop,
+        iteration=reserved,
+        head_sha=head_sha,
+        message_payload=payload,
+    )
+
+
 def dispatch_pr_review(
     pool: DatabasePool,
     reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
@@ -838,125 +1056,19 @@ def dispatch_pr_review(
             task_id=str(task_id),
         )
 
-        # --- Phase A0: authenticated admission (database only, closed first). ---
-        with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-
-        # --- Phase A: authoritative reconciliation (no transaction open). ---
-        reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
+        # --- Phases A0/A/B: the shared authenticated admission, the
+        # authoritative reconciliation, and the atomic reservation. The
+        # triggering publication facts must name exactly the reconciled
+        # canonical record. ---
+        reserved = _reserve_pr_review_attempt(
             pool,
             github_client,
+            profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
+            expected_state_token=expected_state_token,
+            expected_pull_request_id=published_facts.pull_request.id,
         )
-        reconciled = reconciliation.pull_request
-        task = task_records.get_task(pool, task_id)
-        if task is None or task.workspace_id != workspace_id:
-            raise NotFoundError("the requested task is not available in this workspace")
-        if reconciled.task_id != task.id or reconciled.workspace_id != workspace_id:
-            raise NotFoundError("the requested pull request record is not available for this task")
-        if published_facts.pull_request.id != reconciled.id:
-            raise NotFoundError(
-                "the addressed publication facts do not name the task's canonical "
-                "pull request record"
-            )
-        repository = get_repository(pool, task.repository_id)
-        if repository is None or repository.workspace_id != workspace_id:
-            raise NotFoundError("the requested repository is not available in this workspace")
-        _require_review_eligible_pull_request(
-            pull_request=reconciled, task=task, repository=repository
-        )
-        head_sha = reconciled.head_sha
-
-        # --- Phase B: reservation transaction (database only). ---
-        with composed_transaction(pool) as transaction_pool:
-            require_account_operational(transaction_pool, profile_id=profile_id)
-            require_workspace_task(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-            )
-            locked = task_records.get_task_for_update(transaction_pool, task_id)
-            if locked is None or locked.workspace_id != workspace_id:
-                raise NotFoundError("the requested task is not available in this workspace")
-            task = require_current_task(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-            )
-            if task.status is not TaskStatus.REVIEWING:
-                raise ConflictError(
-                    "the addressed task is not reviewing; the ordinary PR review "
-                    "dispatch is not available"
-                )
-            if task.current_owner_gate_id is not None:
-                raise ConflictError(
-                    "the task carries a current owner gate; the ordinary PR review "
-                    "dispatch is not available"
-                )
-            # The persisted reconciled head is revalidated under the Task lock:
-            # a concurrent durable change rolls the reservation back — no
-            # reservation commits against a moved subject.
-            pull_request = require_task_pull_request_head(
-                transaction_pool, task=task, expected_head_sha=head_sha
-            )
-            if (
-                pull_request.id != reconciled.id
-                or pull_request.github_pr_id != reconciled.github_pr_id
-            ):
-                raise StaleOperationError(
-                    "the canonical pull request identity changed during dispatch; "
-                    "the operation is stale"
-                )
-            reviewer = _require_ready_reviewer(
-                transaction_pool, workspace_id=workspace_id, task_id=task_id
-            )
-            workspace = get_workspace(transaction_pool, workspace_id)
-            if workspace is None:
-                raise NotFoundError("the requested workspace is not available")
-            loop = _require_or_establish_pr_loop(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                iteration_limit=workspace.review_iteration_limit,
-            )
-            locked_loop = review_records.get_review_loop(
-                transaction_pool, review_loop_id=loop.id, for_update=True
-            )
-            if locked_loop is None or locked_loop.id != loop.id:
-                raise StaleOperationError("the pr_review loop has moved on; the dispatch is stale")
-            iterations = review_records.list_review_loop_iterations(
-                transaction_pool, review_loop_id=locked_loop.id
-            )
-            _require_no_unresolved_attempt(iterations)
-            _require_no_iteration_for_current_head(iterations, pull_request, head_sha)
-            payload = _resolve_dispatch_evidence(
-                transaction_pool,
-                task_id=task_id,
-                canonical_feature_branch=task.canonical_feature_branch or "",
-                reconciled_head_sha=head_sha,
-                initial_authorized_head_sha=_resolve_initial_authorized_head(
-                    transaction_pool, task_id=task_id
-                ),
-                loop=locked_loop,
-            )
-            reserved = _reserve_iteration(
-                transaction_pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                loop=locked_loop,
-                iterations=iterations,
-                task_pull_request_id=pull_request.id,
-                reviewed_head_sha=head_sha,
-            )
 
         if attempt_evidence is not None:
             # The F5b coordinator's handoff fact: this invocation's committed
@@ -964,21 +1076,20 @@ def dispatch_pr_review(
             attempt_evidence.record_attempt(
                 family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
                 original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
-                original_attempt_id=reserved.id,
+                original_attempt_id=reserved.iteration.id,
                 phase="pr_review_dispatch",
             )
 
         # --- Phases C and D: the ONE send, with NO database transaction open. ---
-        repository_full_name = f"{repository.metadata.owner_login}/{repository.metadata.name}"
         subject = PrReviewSubject(
-            repository_full_name=repository_full_name,
-            pull_request_number=reconciled.github_pr_number,
-            head_sha=head_sha,
-            issue_number=task.github_issue_number,
+            repository_full_name=reserved.repository_full_name,
+            pull_request_number=reserved.pull_request.github_pr_number,
+            head_sha=reserved.head_sha,
+            issue_number=reserved.task.github_issue_number,
         )
         interaction = ReviewInteraction(subject=subject)
-        message = serialize_implementation_result_message(payload)
-        with reviewer_factory(reviewer) as runtime:
+        message = serialize_implementation_result_message(reserved.message_payload)
+        with reviewer_factory(reserved.reviewer) as runtime:
             # Phase C: the post-attachment currentness proof — one short
             # database-only transaction re-proving the exact reserved
             # Task/token/status, PR identity/head, and Reviewer binding after
@@ -988,15 +1099,15 @@ def dispatch_pr_review(
                 pool,
                 workspace_id=workspace_id,
                 task_id=task_id,
-                expected_state_token=expected_state_token,
-                expected_pull_request_id=pull_request.id,
-                reserved_head_sha=head_sha,
-                reviewer_session=reviewer,
+                expected_state_token=reserved.task.state_token,
+                expected_pull_request_id=reserved.pull_request.id,
+                reserved_head_sha=reserved.head_sha,
+                reviewer_session=reserved.reviewer,
             )
             review_result = _realize_pr_review_control(
                 pool,
                 runtime,
-                reviewer.external_session_id or "",
+                reserved.reviewer.external_session_id or "",
                 task_id=task_id,
                 interaction=interaction,
                 message=message,
@@ -1008,11 +1119,381 @@ def dispatch_pr_review(
         # in one transaction, rechecking the exact Task/token/PR/head/session
         # subjects this dispatch proved.
         return TaskPrReviewDispatchOutcome(
-            review_loop=locked_loop,
-            review_iteration=reserved,
+            review_loop=reserved.loop,
+            review_iteration=reserved.iteration,
             review_result=review_result,
+            reviewer_session=reserved.reviewer,
+            task=reserved.task,
+            pull_request=reserved.pull_request,
+            reconciled_head_sha=reserved.head_sha,
+        )
+
+
+# --- the detached regular-mode dispatch (issue #338) ---------------------------------
+
+
+class PrReviewObservationRegistrar(Protocol):
+    """The structural registration seam of the process's detached-turn observer.
+
+    The same positively-required pre-admission gate the detached
+    establishment, implementation, plan, and planning-review dispatches
+    consume (issues #323/#333/#334/#335/#336): the PR-review dispatch
+    registers the exact bound external Reviewer session before any admission,
+    so an unreplayable terminal ``review_result`` can never be produced
+    without active observation. Failures are the observer's typed refusals,
+    routed through the pre-effect failure machinery.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Register one exact bound session for detached-turn observation."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchedPrReview:
+    """The typed detached PR-review dispatch outcome (issue #338).
+
+    The authoritative facts exactly as the durable state reads after the
+    dispatch: the post-dispatch Task (its token unrotated by the receipt),
+    the reserved unfinalized PR/head ReviewIteration whose receipt companion
+    was committed, the claimed detached-turn receipt, and the exact Reviewer
+    binding the canonical REVIEW instruction was admitted on. No runtime
+    result and no validated ``review_result`` exists yet: the independently
+    observed completion owns the decision settlement, and the ONE post-commit
+    completion handoff owns the workflow continuation.
+    """
+
+    task: Task
+    review_iteration: ReviewIteration
+    receipt: TaskDetachedTurnReceipt
+    reviewer_session: TaskAgentSession
+
+
+def _refuse_pr_review_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed PR-review receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises. The claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively. There is no send claim to mark — the reserved
+    ReviewIteration is the durable attempt identity.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused pr-review-dispatch receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the pr-review-dispatch receipt was no longer claimed when its pre-effect "
+            "refusal was recorded"
+        )
+
+
+def _dispatch_pr_review_turn(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    reserved: _ReservedPrReviewAttempt,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    observation_registrar: PrReviewObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> DispatchedPrReview:
+    """Admit the canonical REVIEW instruction as one detached agent turn.
+
+    The shared detached-dispatch mechanics of the PR-review family (issue
+    #338), mirroring the established detached-dispatch shape: the runtime
+    lease and the detached capability are acquired and duck-typed fail-closed
+    BEFORE any durable dispatch effect, the post-attachment currentness proof
+    re-proves the exact reserved subjects under the Task row lock and closes
+    before the receipt, the detached-turn receipt companion of the exact
+    reserved PR/head ReviewIteration commits in ONE short transaction
+    strictly before any runtime effect, one positively-required observation
+    registration gates the admission, one detached-turn admission carries the
+    composed canonical instruction verbatim, and the acknowledgement attach
+    consumes any staged early completion exactly once. No ``send`` and no
+    blocking wait exists in this path, and no database transaction is ever
+    held across a runtime call.
+
+    Proven pre-effect failures refuse the receipt and raise the typed
+    operational-failure classes the F5b coordinator triages under the
+    reserved iteration's own family. An uncertain admission leaves the
+    receipt conservatively claimed and is never re-dispatched. The
+    dispatching worker returns after the acknowledgement attach; the observed
+    completion owns the decision settlement.
+    """
+    reviewer = reserved.reviewer
+    reviewer_external_session_id = reviewer.external_session_id
+    if reviewer_external_session_id is None or not reviewer_external_session_id.strip():
+        raise ConflictError("the reviewer session binding carries no external session identity")
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the pr-review observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    with ExitStack() as attachment_stack:
+        runtime = attachment_stack.enter_context(reviewer_runtime_factory(reviewer))
+        # The detached capability is duck-typed fail-closed BEFORE any durable
+        # dispatch effect: a runtime without it cannot serve the detached
+        # dispatch, and no receipt was ever recorded.
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            raise ExternalOperationFailedError(
+                "the reviewer runtime does not implement the detached turn "
+                "capability; the pr review dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # The post-attachment currentness proof re-proves the reserved
+        # subjects under the Task row lock and closes before the receipt —
+        # the same proof the blocking send performs immediately before its
+        # one interaction send.
+        _revalidate_reserved_subjects(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=reserved.task.state_token,
+            expected_pull_request_id=reserved.pull_request.id,
+            reserved_head_sha=reserved.head_sha,
             reviewer_session=reviewer,
-            task=task,
-            pull_request=pull_request,
-            reconciled_head_sha=head_sha,
+        )
+
+        # --- The one short dispatch transaction: the detached-turn receipt
+        # companion of the exact reserved ReviewIteration, committed
+        # strictly before any runtime effect. The single-outstanding-receipt
+        # invariant and the receipt lifecycle are durable from here. ---
+        with composed_transaction(pool) as transaction_pool:
+            receipt = turn_correlation.record_task_detached_turn_receipt(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reviewer.id,
+                operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.iteration.id,
+                expected_formal_family=REVIEW_RESULT_FAMILY,
+            )
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the just-recorded receipt is marked refused, so a never-dispatched
+        # turn cannot hold the session's single-outstanding slot. ---
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=reviewer.id,
+                connection_id=reviewer.connection_id,
+                external_session_id=reviewer_external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_pr_review_dispatch_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the pr-review observation registration was refused before "
+                "any admission; the instruction never dispatched"
+            ) from error
+        except Exception as error:
+            logger.warning(
+                "the pr-review observation registration failed (%s) before any "
+                "admission; the receipt is refused and the instruction never "
+                "dispatched",
+                type(error).__name__,
+            )
+            _refuse_pr_review_dispatch_quietly(
+                pool, receipt, refusal_kind=_REGISTRATION_REFUSAL_KIND
+            )
+            raise ExternalOperationFailedError(
+                "the pr-review observation registration failed before any "
+                "admission; the instruction never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One
+        # detached-turn admission of the composed canonical instruction
+        # verbatim — the exact REVIEW interaction message the blocking send
+        # realizes, whose serialized ``implementation_result`` evidence and
+        # exact PR/head subject facts are already proven by the reservation. ---
+        message = serialize_implementation_result_message(reserved.message_payload)
+        try:
+            admission = admit_detached_turn(reviewer_external_session_id, message)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached pr-review admission ended with an uncertain outcome; "
+                "the receipt stays conservatively claimed and is never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the pr-review admission is unknown; the receipt "
+                "stays conservatively claimed and the instruction is never "
+                "re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect,
+            # so the receipt is marked refused and the dispatch fails known.
+            _refuse_pr_review_dispatch_quietly(pool, receipt, refusal_kind=_ADMISSION_REFUSAL_KIND)
+            raise ExternalOperationRejectedError(
+                "the pr-review admission was refused before any effect; "
+                "the receipt is refused and the instruction never dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a validated review result that finished
+        # before the acknowledgement was persisted is correlated, never
+        # ignored or duplicated. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the pr-review acknowledgement could not be durably attached "
+                "after its known admission; authoritative recovery is required "
+                "and the instruction is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoff is strictly post-dispatch and
+    # never holds the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the iteration and the receipt
+        # within this dispatch: the ONE post-commit completion handoff owns
+        # the family routing. Strictly post-commit, contained, never a
+        # workflow authority; a failed routing leaves the durable state to
+        # the existing recovery semantics.
+        try:
+            completion_handoff.handoff_settled_completion(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+            )
+        except Exception as error:  # noqa: BLE001 - contained handoff
+            logger.warning(
+                "the post-dispatch pr-review completion handoff failed (%s); "
+                "the durable state owns recovery",
+                type(error).__name__,
+            )
+    reloaded_task = task_records.get_task(pool, task_id=task_id)
+    if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
+        raise NotFoundError("the requested task is not available in this workspace")
+    return DispatchedPrReview(
+        task=reloaded_task,
+        review_iteration=reserved.iteration,
+        receipt=outcome.receipt if outcome.receipt is not None else receipt,
+        reviewer_session=reviewer,
+    )
+
+
+def dispatch_pr_review_detached(
+    pool: DatabasePool,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
+    github: GitHubAppClient,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    observation_registrar: PrReviewObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+) -> DispatchedPrReview:
+    """Dispatch the canonical PR's ordinary review as one detached agent turn.
+
+    The detached counterpart of the ordinary PR-review dispatch (issues
+    #325/#338): the same shared authenticated admission, authoritative
+    reconciliation, and Phase-1 reservation — the exact current ``REVIEWING``
+    Task, the canonical PR at the freshly reconciled head, the exact admitted
+    READY Reviewer session, the OPEN PR loop established on first review with
+    the Workspace's snapshotted budget, the resolved durable evidence
+    payload, and the next-numbered unfinalized PR/head ReviewIteration
+    committed atomically — followed by the composed canonical REVIEW message
+    admitted verbatim as one independently completed agent turn on the exact
+    Reviewer session, with the iteration's detached-turn receipt companion
+    (expecting the canonical ``review_result`` family) committed strictly
+    before the positive observation registration and the admission. No
+    ``send`` and no blocking wait exists in this path, and the dispatching
+    worker returns after the acknowledgement attach. The independently
+    observed completion settles the validated ``review_result`` through the
+    owning PR-review decision settlement, and the ONE post-commit completion
+    handoff owns the workflow continuation from committed state. A stale,
+    duplicate, or late REVIEW observation can never decide twice.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_DETACHED_SPAN_NAME) as span:
+        _require_uuid_command(profile_id, "profile_id")
+        _require_uuid_command(workspace_id, "workspace_id")
+        _require_uuid_command(task_id, "task_id")
+        _require_uuid_command(expected_state_token, "expected_state_token")
+        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
+        github_client = _require_github(github)
+        annotate_span(
+            span,
+            operation=_DISPATCH_DETACHED_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+
+        # --- Phase 1: the shared entry validation + atomic reservation. ---
+        reserved = _reserve_pr_review_attempt(
+            pool,
+            github_client,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            expected_pull_request_id=None,
+        )
+
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's committed
+            # reserved review iteration identity (#262). Recorded immediately
+            # after the reservation commit, before anything below — the
+            # attachment acquisition included — can fail (issue #268).
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+                original_attempt_id=reserved.iteration.id,
+                phase="pr_review_dispatch",
+            )
+
+        return _dispatch_pr_review_turn(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            reserved=reserved,
+            reviewer_runtime_factory=reviewer_factory,
+            observation_registrar=observation_registrar,
+            completion_handoff=completion_handoff,
         )
