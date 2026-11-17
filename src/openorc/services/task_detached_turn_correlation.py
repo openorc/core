@@ -96,6 +96,7 @@ from psycopg.errors import UniqueViolation
 
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import (
+    OWNER_REVIEWER_DISCUSSION_FAMILY,
     SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
@@ -128,6 +129,7 @@ from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
+from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_iteration_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
@@ -258,6 +260,15 @@ _REVIEW_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperat
 # same invocation, never a durable effect of this seam.
 _PR_COMPOSE_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
     frozenset({PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH})
+)
+
+# The discussion family with detached settlement routing in this seam (issue
+# #339): the Owner ↔ Reviewer discussion turn whose attributed completion is
+# routed through the owning discussion service's settlement — the standalone
+# formal-result recognition, the gate-specific decisions, and the
+# direction-only audit, all atomic with the receipt's settlement.
+_DISCUSSION_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
+    frozenset({PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION})
 )
 
 # The safe failure-classification token the settlement records for a
@@ -466,6 +477,25 @@ def record_task_detached_turn_receipt(
                 "an execution-family detached-turn receipt expects the implementation_result family"
             )
         expected_formal_family = IMPLEMENTATION_RESULT_FAMILY
+    elif operation is PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION:
+        # The gate-bound discussion receipt (issue #339): its identity is the
+        # exact pending current OwnerGate and its permitted result is a
+        # permitted NON-formal attributed text, so the dedicated non-formal
+        # discussion family token is pinned — never a canonical v1 response
+        # family, never an invented formal REVIEW claim.
+        if original_attempt_kind is not OriginalAttemptKind.OWNER_GATE_DISCUSSION:
+            raise InvalidCommandError(
+                "a discussion detached-turn receipt roots at its exact gate-bound "
+                "owner_gate_discussion identity"
+            )
+        if expected_formal_family is not None and (
+            expected_formal_family != OWNER_REVIEWER_DISCUSSION_FAMILY
+        ):
+            raise InvalidCommandError(
+                "a discussion detached-turn receipt expects the dedicated "
+                "non-formal discussion family"
+            )
+        expected_formal_family = OWNER_REVIEWER_DISCUSSION_FAMILY
     elif expected_formal_family is None or expected_formal_family not in FORMAL_RESPONSE_FAMILIES:
         raise InvalidCommandError(
             "the receipt requires its expected formal family to name a canonical v1 response family"
@@ -654,6 +684,15 @@ def _route_observed_terminal(
         )
     if receipt.operation in _PR_COMPOSE_SETTLEMENT_FAMILIES:
         return _route_pr_compose_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
+        )
+    if receipt.operation in _DISCUSSION_SETTLEMENT_FAMILIES:
+        return _route_discussion_terminal(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -1058,6 +1097,110 @@ def _route_pr_compose_terminal(
         kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=settled,
         formal_result=parsed,
+    )
+
+
+def _route_discussion_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the gate-bound exchange.
+
+    The attribution congruence is proved first (issue #339): the receipt's
+    gate-bound discussion subject must exist in the addressed scope (the
+    exact OwnerGate UUID) and anchor to exactly the receipt's Reviewer
+    session binding, still READY. A concrete attribution conflict leaves the
+    observation unresolved — never a fabricated match.
+
+    A terminal failure settles the receipt truthfully and stops: an
+    Owner-initiated advisory conversation is deliberately NOT a Level 2
+    operational-failure family, so no triage report is made, no disposition
+    is derived, and nothing is blocked — the Owner simply sends the next
+    message. A completion routes the raw attributed text — never funneled
+    through the shared formal contract, because the discussion's permitted
+    result is a non-formal attributed text — to the owning discussion
+    settlement: the standalone strict ``review_result`` recognition, the
+    gate-specific decisions, and the direction-only audit, all atomic with
+    the receipt's settlement. A settlement that proves the discussion stale
+    (the gate moved on) settles the receipt ``result_not_applied``.
+    """
+    # Deferred import: the owning service imports this module's dispatch
+    # mechanics at module level.
+    from openorc.services.task_owner_reviewer_discussion import (  # noqa: PLC0415
+        settle_observed_discussion_result,
+    )
+
+    gate = gate_records.get_owner_gate(transaction_pool, owner_gate_id=receipt.original_attempt_id)
+    if (
+        gate is None
+        or gate.workspace_id != workspace_id
+        or gate.task_id != task_id
+        or gate.id != receipt.original_attempt_id
+    ):
+        logger.warning(
+            "the observed terminal completion conflicts with the receipt's gate-bound "
+            "discussion subject; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    binding = get_task_agent_session(transaction_pool, task_id=task_id, role=WorkflowRole.REVIEWER)
+    if (
+        binding is None
+        or binding.id != receipt.task_agent_session_id
+        or binding.lifecycle_status is not TaskSessionLifecycleStatus.READY
+    ):
+        logger.warning(
+            "the observed terminal completion conflicts with the receipt's reviewer "
+            "session binding; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
+        # The advisory conversation's observed failure: the receipt settles
+        # truthfully and nothing else happens. No Level 2 report, no
+        # disposition, no block — a discussion turn is not consequential
+        # automated workflow work, and its failure never holds authority.
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE, receipt=settled
+        )
+    settlement = settle_observed_discussion_result(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        receipt=receipt,
+        result_text=outcome.result_candidate,
+    )
+    if settlement is None:
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(settlement.settlement_label, ordering_marker),
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=settled,
     )
 
 

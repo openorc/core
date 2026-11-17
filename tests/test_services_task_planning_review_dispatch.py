@@ -1592,6 +1592,7 @@ def _detached_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 

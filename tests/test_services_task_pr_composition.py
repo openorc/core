@@ -1966,6 +1966,7 @@ def _detached_pr_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 

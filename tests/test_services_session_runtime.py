@@ -2042,6 +2042,7 @@ def _initialization_receipt_row(
         external_session_id,
         {"adapter": "cline", "configuration": {}},
         None,
+        None,
     )
 
 

@@ -127,7 +127,9 @@ __all__ = [
     "PlanningReviewResolutionDecision",
     "TaskPlanningGateChangeRequestOutcome",
     "TaskPlanningReviewResolutionOutcome",
+    "settle_observed_planning_review_resolution",
     "settle_planning_review_resolution",
+    "supersede_observed_implementation_authorization_with_changes",
     "supersede_implementation_authorization_with_changes",
 ]
 
@@ -719,6 +721,76 @@ def _settle_resolution_transaction(
 
 
 # --- the settlement operation -----------------------------------------------------
+
+
+def settle_observed_planning_review_resolution(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: ReviewResult,
+    record_discussion_message_events: bool = True,
+) -> _Settlement:
+    """Settle the exact plan-subject REVIEW_RESOLUTION gate inside the caller's transaction.
+
+    The detached discussion settlement's entry point (issue #339): the exact
+    durable Phase-1 settlement transaction of
+    :func:`settle_planning_review_resolution`, composed inside the caller's
+    already-open transaction (the nested composition becomes a SAVEPOINT), so
+    the gate's ``SETTLED`` stamp, the NEW finalized settlement iteration, the
+    audit events, and the direction-only discussion audit commit atomically
+    with the caller's receipt settlement. The blocking wrapper's external
+    consequences belong to this seam's own post-commit continuation — the
+    detached completion handoff re-derives the Producer continuations from
+    committed state — so no runtime or GitHub dependency is proven here and
+    nothing external is invoked.
+    """
+    return _settle_resolution_transaction(
+        pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        result=result,
+        record_discussion_message_events=record_discussion_message_events,
+    )
+
+
+def supersede_observed_implementation_authorization_with_changes(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    result: ReviewResult,
+    record_discussion_message_events: bool = True,
+) -> _GateChangeRequest:
+    """Supersede the plan-subject IMPLEMENTATION_AUTHORIZATION gate inside the caller's transaction.
+
+    The detached discussion settlement's entry point (issue #339): the exact
+    durable Phase-1 supersession transaction of
+    :func:`supersede_implementation_authorization_with_changes`, composed
+    inside the caller's already-open transaction (the nested composition
+    becomes a SAVEPOINT), so the gate's supersession, the NEW finalized
+    change-request iteration, the audit events, and the direction-only
+    discussion audit commit atomically with the caller's receipt settlement.
+    The blocking wrapper's external consequences belong to this seam's own
+    post-commit continuation — the detached completion handoff re-derives the
+    Producer REVISE dispatch from committed state — so no runtime or GitHub
+    dependency is proven here and nothing external is invoked.
+    """
+    return _supersede_implementation_gate_transaction(
+        pool,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=expected_state_token,
+        result=result,
+        record_discussion_message_events=record_discussion_message_events,
+    )
 
 
 def settle_planning_review_resolution(

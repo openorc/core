@@ -68,7 +68,10 @@ __all__ = [
     "NativeTurnEvidence",
     "ObservationLease",
     "ObservedTurnEvidence",
+    "OWNER_REVIEWER_DISCUSSION_FAMILY",
     "REFUSAL_OUTCOME_KIND_KEY",
+    "SETTLEMENT_DISCUSSION_EXCHANGE",
+    "SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION",
     "SETTLEMENT_OBSERVED_FAILURE",
     "SETTLEMENT_OUTCOME_LABEL_KEY",
     "SETTLEMENT_OUTCOME_SEQUENCE_KEY",
@@ -113,7 +116,20 @@ SETTLEMENT_OUTCOME_SEQUENCE_KEY: Final[str] = "consumed_sequence"
 SETTLEMENT_VALIDATED_RESULT: Final[str] = "validated_result"
 SETTLEMENT_OBSERVED_FAILURE: Final[str] = "observed_failure"
 SETTLEMENT_RESULT_NOT_APPLIED: Final[str] = "result_not_applied"
+# The discussion family's own settlement labels (issue #339): the ordinary
+# recorded exchange and the formal continuation dispatched through an owning
+# E3c/E9 settlement. No conversation text ever enters the outcome payload.
+SETTLEMENT_DISCUSSION_EXCHANGE: Final[str] = "discussion_exchange"
+SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION: Final[str] = "discussion_formal_continuation"
 REFUSAL_OUTCOME_KIND_KEY: Final[str] = "refusal_kind"
+
+# The dedicated NON-formal expected-family token of a detached Owner ↔
+# Reviewer discussion receipt (issue #339). The discussion turn's completion
+# is ordinary attributed text — never a formal response — so its receipt
+# deliberately carries no canonical v1 response family. The token is pinned
+# to exactly the ``owner_reviewer_discussion`` receipt operation and is not a
+# member of the formal-response family vocabulary.
+OWNER_REVIEWER_DISCUSSION_FAMILY: Final[str] = "owner_reviewer_discussion"
 
 
 class DetachedTurnObservationKind(StrEnum):
@@ -384,6 +400,17 @@ class TaskDetachedTurnReceipt:
     created_external_session_id: str | None = None
     effective_config_snapshot: Mapping[str, object] | None = None
     created_session_provenance: Mapping[str, object] | None = None
+    # The set-once one-shot admission-attempt stamp (issue #339). A dispatch
+    # whose claim and admission live in different invocations (the split
+    # Owner-facing discussion prepare/admit seam) stamps the receipt exactly
+    # once, strictly before its enqueue, so a duplicate or re-delivered
+    # admission execution can never reach a second enqueue of the same
+    # prepared message. The monolithic dispatches gate on their own claim
+    # transactions and never stamp; a positively refused submission settles
+    # the receipt ``refused`` without a stamp, while an attempted admission —
+    # acknowledged, refused at the runtime, or uncertain — carries the stamp
+    # truthfully.
+    admission_attempted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "workspace_id", "task_id", "task_agent_session_id"):
@@ -444,6 +471,7 @@ class TaskDetachedTurnReceipt:
         _require_instant(self.admitted_at, "admitted_at", nullable=True)
         _require_instant(self.settled_at, "settled_at", nullable=True)
         _require_instant(self.updated_at, "updated_at")
+        _require_instant(self.admission_attempted_at, "admission_attempted_at", nullable=True)
         self._require_status_coherence()
 
     def _require_status_coherence(self) -> None:

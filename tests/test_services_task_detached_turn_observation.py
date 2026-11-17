@@ -257,6 +257,7 @@ def _admitted_receipt_row() -> tuple[Any, ...]:
         None,
         None,
         None,
+        None,
     )
 
 
@@ -532,6 +533,7 @@ def test_a_terminal_event_before_the_acknowledgement_is_staged_and_observation_i
         None,
         None,
         _OBSERVED,
+        None,
         None,
         None,
         None,
@@ -997,6 +999,7 @@ def _establishment_receipt_row(
         _OBSERVED,
         external_session_id,
         {"adapter": "cline", "configuration": {}},
+        None,
         None,
     )
 

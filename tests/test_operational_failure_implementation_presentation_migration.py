@@ -104,10 +104,11 @@ def test_the_domain_vocabulary_stays_aligned_with_the_migration() -> None:
     for value in (member.value for member in ImplementationAuthorizationPresentationOperation):
         assert f"'{value}'" in _collapsed(_migration_text_raw())
     for value in (member.value for member in OriginalAttemptKind):
-        # Every identity kind is admitted by the (unchanged) episode CHECK —
-        # the F5d migration last re-created it with the full vocabulary.
+        # Every identity kind is admitted by the episode CHECK — the
+        # discussion migration (issue #339) last re-created it with the
+        # full vocabulary.
         assert f"'{value}'" in _collapsed(
             (
-                MIGRATIONS_DIR / "20261103000000_extend_operational_failures_for_merge_retries.sql"
+                MIGRATIONS_DIR / "20261117000000_add_owner_reviewer_discussion_receipts.sql"
             ).read_text(encoding="utf-8")
         )

@@ -81,6 +81,8 @@ __all__ = [
     "get_task_detached_turn_receipt",
     "get_task_detached_turn_receipt_for_update",
     "list_outstanding_session_initialization_receipts",
+    "list_task_detached_turn_receipts_for_original_attempt",
+    "mark_task_detached_turn_admission_attempted",
     "mark_task_detached_turn_receipt_contradicted",
     "refuse_task_detached_turn_receipt",
     "settle_task_detached_turn_receipt",
@@ -92,7 +94,8 @@ _RECEIPT_COLUMNS = (
     "original_attempt_kind, original_attempt_id, expected_formal_family, "
     "run_id, status, outcome, contradicted_at, claimed_at, admitted_at, "
     "settled_at, updated_at, created_external_session_id, "
-    "effective_config_snapshot, created_session_provenance"
+    "effective_config_snapshot, created_session_provenance, "
+    "admission_attempted_at"
 )
 
 # The same receipt projection aliased for the establishment settlement's
@@ -103,7 +106,8 @@ _RECEIPT_COLUMNS_ALIASED = (
     "r.original_attempt_kind, r.original_attempt_id, r.expected_formal_family, "
     "r.run_id, r.status, r.outcome, r.contradicted_at, r.claimed_at, "
     "r.admitted_at, r.settled_at, r.updated_at, r.created_external_session_id, "
-    "r.effective_config_snapshot, r.created_session_provenance"
+    "r.effective_config_snapshot, r.created_session_provenance, "
+    "r.admission_attempted_at"
 )
 
 _EARLY_COMPLETION_COLUMNS = (
@@ -146,6 +150,7 @@ def _receipt_from_row(row: Sequence[Any]) -> TaskDetachedTurnReceipt:
         created_external_session_id=row[16],
         effective_config_snapshot=row[17],
         created_session_provenance=row[18],
+        admission_attempted_at=None if row[19] is None else normalize_utc(row[19]),
     )
 
 
@@ -595,6 +600,75 @@ def refuse_task_detached_turn_receipt(
             (Jsonb(canonical_outcome), receipt_id, task_id, workspace_id),
         ).fetchone()
     return None if row is None else _receipt_from_row(row)
+
+
+def mark_task_detached_turn_admission_attempted(
+    pool: DatabasePool,
+    *,
+    receipt_id: UUID,
+    task_id: UUID,
+    workspace_id: UUID,
+) -> bool:
+    """Set the one-shot admission-attempt stamp on a claimed receipt, once.
+
+    The exactly-once admission gate of a dispatch whose claim and admission
+    live in different invocations (the split Owner-facing discussion
+    prepare/admit seam, issue #339): the admission execution stamps the
+    claimed receipt strictly before its enqueue, and any later execution of
+    the same prepared message — a duplicate or re-delivered worker run —
+    finds the stamp already set and must never enqueue again. ``False``
+    means the receipt is missing, out of scope, no longer claimed, or
+    already stamped — a rejected no-op that is never retried blindly.
+    """
+    _require_uuid(receipt_id, "receipt_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(workspace_id, "workspace_id")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.task_hub_run_receipts "
+            "set admission_attempted_at = now(), updated_at = now() "
+            "where id = %s and task_id = %s and workspace_id = %s "
+            "and status = 'claimed' and admission_attempted_at is null "
+            "returning id",
+            (receipt_id, task_id, workspace_id),
+        ).fetchone()
+    return row is not None
+
+
+def list_task_detached_turn_receipts_for_original_attempt(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    original_attempt_kind: OriginalAttemptKind,
+    original_attempt_id: UUID,
+) -> list[TaskDetachedTurnReceipt]:
+    """List a Task's receipts rooted at one exact original attempt identity.
+
+    The Owner-facing discussion status projection's read (issue #339): the
+    receipts bound to one addressed durable identity (for a discussion, the
+    exact OwnerGate UUID), deterministically ordered newest-claimed first.
+    The caller picks the outstanding receipt or the latest terminal record;
+    an empty list is the honest no-discussion fact. The Task/Workspace scope
+    is enforced by the query, so a foreign identity is indistinguishable
+    from addressing something absent.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(task_id, "task_id")
+    _require_uuid(original_attempt_id, "original_attempt_id")
+    if not isinstance(original_attempt_kind, OriginalAttemptKind):
+        raise ValueError(
+            "list_task_detached_turn_receipts_for_original_attempt requires an OriginalAttemptKind"
+        )
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_RECEIPT_COLUMNS} from openorc.task_hub_run_receipts "
+            "where workspace_id = %s and task_id = %s "
+            "and original_attempt_kind = %s and original_attempt_id = %s "
+            "order by claimed_at desc, id desc",
+            (workspace_id, task_id, original_attempt_kind.value, original_attempt_id),
+        ).fetchall()
+    return [_receipt_from_row(row) for row in rows]
 
 
 def stage_task_detached_turn_early_completion(

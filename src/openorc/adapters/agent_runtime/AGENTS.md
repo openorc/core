@@ -31,6 +31,15 @@ domain vocabulary.
   universal surface stays untouched. Application services duck-type the
   capability fail-closed; a runtime without it keeps the blocking
   readiness handshake.
+- The session-conversation read (issue #339) is likewise an optional
+  runtime capability, never a universal operation: the
+  `SessionConversationReader` protocol beside `AgentRuntimeAdapter`
+  carries one pure observational `read_conversation` (`ConversationMessage`
+  records — the runtime's own projected message shape, never a formal
+  response), serving the authorized Owner-facing Reviewer-conversation read
+  projection. The read takes no effect, records nothing durable, and a
+  runtime without the capability keeps its conversation runtime-owned and
+  unread by OpenOrc.
 - No provider/model selection, no Cline modes or any runtime's native action
   vocabulary, no telemetry streams, no approvals, no filesystem/Git
   operations, and no capability marketplace on the universal interface.

@@ -253,6 +253,7 @@ def _receipt_row(
         created_external_session_id if initialization else None,
         snapshot,
         None,
+        None,
     )
 
 
@@ -1472,6 +1473,7 @@ def _initialization_receipt_row(
         external_session_id,
         {"adapter": "cline", "configuration": {}},
         {"reported_provider": "fake-provider"},
+        None,
     )
 
 
@@ -1823,6 +1825,7 @@ def _prepare_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 
@@ -2170,6 +2173,7 @@ def _plan_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 
@@ -2332,6 +2336,7 @@ def _review_receipt_row(
         admitted_at,
         settled_at,
         _OBSERVED,
+        None,
         None,
         None,
         None,
@@ -2671,6 +2676,7 @@ def _review_pr_receipt_row(
         None,
         None,
         None,
+        None,
     )
 
 
@@ -2857,6 +2863,7 @@ def _pr_compose_receipt_row(
         admitted_at,
         settled_at,
         _OBSERVED,
+        None,
         None,
         None,
         None,

@@ -50,6 +50,8 @@ from openorc.persistence.detached_turns import (
     create_task_detached_turn_receipt,
     get_outstanding_task_detached_turn_receipt,
     get_task_detached_turn_early_completion_for_update,
+    list_task_detached_turn_receipts_for_original_attempt,
+    mark_task_detached_turn_admission_attempted,
     mark_task_detached_turn_receipt_contradicted,
     refuse_task_detached_turn_receipt,
     settle_task_detached_turn_receipt,
@@ -158,6 +160,30 @@ def _create_receipt(pool: Any, workspace_id: Any, task_id: Any, session_id: Any)
         original_attempt_kind=OriginalAttemptKind.EXECUTION,
         original_attempt_id=uuid.uuid4(),
         expected_formal_family="implementation_result",
+    )
+
+
+def _create_discussion_receipt(
+    pool: Any,
+    workspace_id: Any,
+    task_id: Any,
+    session_id: Any,
+    *,
+    gate_id: Any | None = None,
+    family: str | None = None,
+    kind: OriginalAttemptKind | None = None,
+) -> Any:
+    return create_task_detached_turn_receipt(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        task_agent_session_id=session_id,
+        operation=PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION,
+        original_attempt_kind=(
+            kind if kind is not None else OriginalAttemptKind.OWNER_GATE_DISCUSSION
+        ),
+        original_attempt_id=gate_id if gate_id is not None else uuid.uuid4(),
+        expected_formal_family=(family if family is not None else "owner_reviewer_discussion"),
     )
 
 
@@ -460,3 +486,109 @@ def test_the_coherence_and_outcome_label_checks_reject_incoherent_rows(
         outcome={"settlement": "validated_result"},
     )
     assert settled is not None and settled.outcome["settlement"] == "validated_result"
+
+
+def test_the_discussion_receipt_identity_coherence_check_rejects_wrong_identities(
+    conn: Connection[Any],
+) -> None:
+    task_id, workspace_id = _insert_task_chain(conn)
+    session_id = _insert_producer_session(conn, workspace_id, task_id)
+    pool = _SingleConnectionPool(conn)
+    gate_id = uuid.uuid4()
+
+    receipt = _create_discussion_receipt(pool, workspace_id, task_id, session_id, gate_id=gate_id)
+    assert receipt.expected_formal_family == "owner_reviewer_discussion"
+    assert receipt.original_attempt_kind.value == "owner_gate_discussion"
+    assert str(receipt.original_attempt_id) == str(gate_id)
+
+    # A discussion receipt must carry the gate-bound attempt kind and the
+    # dedicated non-formal family; any other pairing is a CHECK violation.
+    with pytest.raises(CheckViolation), conn.transaction():
+        _create_discussion_receipt(
+            pool,
+            workspace_id,
+            task_id,
+            session_id,
+            gate_id=uuid.uuid4(),
+            kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
+        )
+    with pytest.raises(CheckViolation), conn.transaction():
+        _create_discussion_receipt(
+            pool,
+            workspace_id,
+            task_id,
+            session_id,
+            gate_id=uuid.uuid4(),
+            family="review_result",
+        )
+    # A non-discussion receipt can never carry the discussion family.
+    with pytest.raises(CheckViolation), conn.transaction():
+        create_task_detached_turn_receipt(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            task_agent_session_id=session_id,
+            operation=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+            original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
+            original_attempt_id=uuid.uuid4(),
+            expected_formal_family="owner_reviewer_discussion",
+        )
+    # The gate-bound receipts are queryable by their exact original attempt.
+    listed = list_task_detached_turn_receipts_for_original_attempt(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        original_attempt_kind=OriginalAttemptKind.OWNER_GATE_DISCUSSION,
+        original_attempt_id=gate_id,
+    )
+    assert [row.id for row in listed] == [receipt.id]
+
+
+def test_the_admission_attempt_stamp_is_set_once_and_the_refusal_releases_the_slot(
+    conn: Connection[Any],
+) -> None:
+    task_id, workspace_id = _insert_task_chain(conn)
+    session_id = _insert_producer_session(conn, workspace_id, task_id)
+    pool = _SingleConnectionPool(conn)
+    receipt = _create_discussion_receipt(
+        pool, workspace_id, task_id, session_id, gate_id=uuid.uuid4()
+    )
+
+    # The one-shot admission stamp: set exactly once on the claimed receipt.
+    assert (
+        mark_task_detached_turn_admission_attempted(
+            pool, receipt_id=receipt.id, task_id=task_id, workspace_id=workspace_id
+        )
+        is True
+    )
+    stamped = get_outstanding_task_detached_turn_receipt(pool, task_agent_session_id=session_id)
+    assert stamped is not None and stamped.admission_attempted_at is not None
+    # A duplicate or re-delivered admission execution is a rejected no-op.
+    assert (
+        mark_task_detached_turn_admission_attempted(
+            pool, receipt_id=receipt.id, task_id=task_id, workspace_id=workspace_id
+        )
+        is False
+    )
+
+    # The positively proven submission refusal releases the Reviewer
+    # session's slot: the refused receipt is terminal, and the stamp stays.
+    refused = refuse_task_detached_turn_receipt(
+        pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        refusal_kind="admission_submission_refused",
+    )
+    assert refused is not None and refused.status.value == "refused"
+    assert refused.admission_attempted_at is not None
+    assert (
+        get_outstanding_task_detached_turn_receipt(pool, task_agent_session_id=session_id) is None
+    )
+    # A stamped-and-terminal receipt can never be stamped again.
+    assert (
+        mark_task_detached_turn_admission_attempted(
+            pool, receipt_id=receipt.id, task_id=task_id, workspace_id=workspace_id
+        )
+        is False
+    )
