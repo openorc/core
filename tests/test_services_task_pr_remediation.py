@@ -251,9 +251,20 @@ def _noop_attachment(adapter: FakeAgentRuntimeAdapter) -> Any:
 
 
 class _GitHubClient:
-    def __init__(self, pool: FakePool, *, observed_head: str = _NEW_HEAD_SHA) -> None:
+    def __init__(
+        self,
+        pool: FakePool,
+        *,
+        observed_head: str = _NEW_HEAD_SHA,
+        observed_state: str = "open",
+        observed_merged: bool = False,
+        observed_merged_at: Any = None,
+    ) -> None:
         self._pool = pool
         self._observed_head = observed_head
+        self._observed_state = observed_state
+        self._observed_merged = observed_merged
+        self._observed_merged_at = observed_merged_at
         self.repository_calls: list[tuple[int, int]] = []
         self.pull_request_calls: list[int] = []
 
@@ -285,9 +296,9 @@ class _GitHubClient:
             head_ref=_BRANCH,
             head_sha=self._observed_head,
             base_ref="main",
-            state="open",
-            merged=False,
-            merged_at=None,
+            state=self._observed_state,
+            merged=self._observed_merged,
+            merged_at=self._observed_merged_at,
         )
 
 
@@ -1080,6 +1091,7 @@ def _verification_pool_setup(
     execution_row: Any,
     iteration_rows: list[Any],
     observed_head: str | None,
+    update_row: Any = None,
 ) -> FakePool:
     """Phase 1 subject set + (optionally) B7 reconciliation + post reads."""
     conn.on(_TASK_READ_LOCKED, _task_row())
@@ -1098,7 +1110,7 @@ def _verification_pool_setup(
         conn.on(_ACCOUNT_BARRIER, _ACCOUNT_OPERATIONAL_ROW)
         conn.on(_REPOSITORY_ROW_LOCKED, _repository_row())
         conn.on(_PR_READ_LOCKED, _pr_row())
-        conn.on(_PR_UPDATE, _pr_row(head_sha=observed_head))
+        conn.on(_PR_UPDATE, update_row or _pr_row(head_sha=observed_head))
         conn.on(_TASK_READ, _task_row())
     return FakePool(conn)
 
@@ -1365,3 +1377,218 @@ def test_an_unsettled_remediation_owns_no_continuation(
 
     assert continuation is None
     assert github.repository_calls == []
+
+
+def _closed_pr_row(*, merged: bool) -> tuple[Any, ...]:
+    """The reconciled canonical record in its GitHub-confirmed terminal state."""
+    row = list(_pr_row(head_sha=_HEAD_SHA))
+    row[9] = "closed"
+    row[10] = _OBSERVED if merged else None
+    return tuple(row)
+
+
+def test_a_confirmed_closed_unmerged_record_routes_through_the_trusted_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub-confirmed closed-unmerged canonical record is the externally
+    established terminal condition (issue #229): the ONE trusted
+    GitHub-observation cancellation entrypoint applies the terminal
+    consequence with the forwarded finalization submission — never a
+    competing recoverable block, never a dispatch, never a rewrite of the
+    recorded round."""
+    conn = ScriptedConnection()
+    execution_row = _execution_row(
+        execution_number=2,
+        status="succeeded",
+        result_payload=dict(_IMPLEMENTATION_PAYLOAD),
+        claimed_iteration_id=_REVIEW_ITERATION_ID,
+    )
+    fake_pool = _verification_pool_setup(
+        conn,
+        execution_row=execution_row,
+        iteration_rows=[_addressed_iteration_row()],
+        observed_head=_HEAD_SHA,
+        update_row=_closed_pr_row(merged=False),
+    )
+    pool = _pool(conn)
+    github = _GitHubClient(fake_pool, observed_head=_HEAD_SHA, observed_state="closed")
+    cancellation_calls: list[dict[str, Any]] = []
+    submission = object()
+
+    def _stub_cancellation(*args: Any, **kwargs: Any) -> Any:
+        cancellation_calls.append(kwargs)
+        return types.SimpleNamespace(task=None)
+
+    monkeypatch.setattr(
+        task_pr_remediation, "cancel_task_for_confirmed_pr_closure", _stub_cancellation
+    )
+
+    continuation = verify_settled_pr_remediation_push(
+        pool,
+        github.as_client(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        terminal_finalization_submission=cast(Any, submission),
+    )
+
+    assert continuation is None
+    assert len(cancellation_calls) == 1
+    assert cancellation_calls[0]["workspace_id"] == _WORKSPACE_ID
+    assert cancellation_calls[0]["task_id"] == _TASK_ID
+    assert cancellation_calls[0]["terminal_finalization_submission"] is submission
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _GATES_INSERT) == 0
+
+
+def test_a_confirmed_merge_applies_zero_durable_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub-confirmed merged canonical record is the externally
+    established terminal fact whose completion belongs to the later recovery
+    layer: zero durable mutation here — never a competing recoverable block,
+    never a cancellation, never a dispatch."""
+    conn = ScriptedConnection()
+    execution_row = _execution_row(
+        execution_number=2,
+        status="succeeded",
+        result_payload=dict(_IMPLEMENTATION_PAYLOAD),
+        claimed_iteration_id=_REVIEW_ITERATION_ID,
+    )
+    fake_pool = _verification_pool_setup(
+        conn,
+        execution_row=execution_row,
+        iteration_rows=[_addressed_iteration_row()],
+        observed_head=_HEAD_SHA,
+        update_row=_closed_pr_row(merged=True),
+    )
+    pool = _pool(conn)
+    github = _GitHubClient(
+        fake_pool,
+        observed_head=_HEAD_SHA,
+        observed_state="closed",
+        observed_merged=True,
+        observed_merged_at=_OBSERVED,
+    )
+
+    def _refusing_cancellation(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a confirmed merge never routes to the cancellation entrypoint")
+
+    monkeypatch.setattr(
+        task_pr_remediation, "cancel_task_for_confirmed_pr_closure", _refusing_cancellation
+    )
+
+    continuation = verify_settled_pr_remediation_push(
+        pool,
+        github.as_client(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert continuation is None
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _GATES_INSERT) == 0
+    assert _count(conn, _TASK_GATE_WRITE) == 0
+
+
+def test_an_uncertain_reconciliation_read_installs_the_level_3_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed verification observation is a guarded direct Level 3
+    disposition: the atomic BLOCK_RESOLUTION block installs under the
+    escalation reason vocabulary, so the settled round can never silently
+    strand the reviewing Task without an actionable Owner gate."""
+    conn = ScriptedConnection()
+    execution_row = _execution_row(
+        execution_number=2,
+        status="succeeded",
+        result_payload=dict(_IMPLEMENTATION_PAYLOAD),
+        claimed_iteration_id=_REVIEW_ITERATION_ID,
+    )
+    fake_pool = _verification_pool_setup(
+        conn,
+        execution_row=execution_row,
+        iteration_rows=[_addressed_iteration_row()],
+        observed_head=None,
+    )
+    _script_verification_block(conn)
+    pool = _pool(conn)
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
+
+    def _uncertain_reconcile(*args: Any, **kwargs: Any) -> Any:
+        raise ExternalOperationUncertainError("the authoritative read is unknown")
+
+    monkeypatch.setattr(task_pr_remediation, "reconcile_task_pull_request", _uncertain_reconcile)
+
+    continuation = verify_settled_pr_remediation_push(
+        pool,
+        github.as_client(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert continuation is None
+    assert _count(conn, _BLOCK_INSERT) == 1
+    assert _count(conn, _GATES_INSERT) == 1
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+    (gate_params,) = [params for sql, params in conn.executed if _GATES_INSERT(sql, None)]
+    assert gate_params is not None and gate_params[2] == "block_resolution"
+    block_params_list = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    (block_params,) = block_params_list
+    assert block_params is not None
+    assert block_params[2] == "external_operation_uncertain"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["detection"] == "github_reconciliation_uncertain"
+    assert block_context["review_iteration_id"] == str(_REVIEW_ITERATION_ID)
+
+
+def test_a_known_failed_reconciliation_read_installs_the_level_3_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A known-failed verification observation receives the same guarded
+    direct Level 3 disposition under the escalation vocabulary's coarse
+    ``unknown`` reason — never a silent stranding of the reviewing Task."""
+    conn = ScriptedConnection()
+    execution_row = _execution_row(
+        execution_number=2,
+        status="succeeded",
+        result_payload=dict(_IMPLEMENTATION_PAYLOAD),
+        claimed_iteration_id=_REVIEW_ITERATION_ID,
+    )
+    fake_pool = _verification_pool_setup(
+        conn,
+        execution_row=execution_row,
+        iteration_rows=[_addressed_iteration_row()],
+        observed_head=None,
+    )
+    _script_verification_block(conn)
+    pool = _pool(conn)
+    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
+
+    def _failed_reconcile(*args: Any, **kwargs: Any) -> Any:
+        raise ExternalOperationFailedError("the authoritative read failed")
+
+    monkeypatch.setattr(task_pr_remediation, "reconcile_task_pull_request", _failed_reconcile)
+
+    continuation = verify_settled_pr_remediation_push(
+        pool,
+        github.as_client(),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+    )
+
+    assert continuation is None
+    assert _count(conn, _BLOCK_INSERT) == 1
+    block_params_list = [params for sql, params in conn.executed if _BLOCK_INSERT(sql, None)]
+    (block_params,) = block_params_list
+    assert block_params is not None
+    assert block_params[2] == "unknown"
+    block_context = getattr(block_params[3], "obj", block_params[3])
+    assert block_context["detection"] == "github_reconciliation_read_failed"

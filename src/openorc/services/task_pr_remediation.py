@@ -80,7 +80,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
-from openorc.domain.blocks import TaskBlockReason
+from openorc.domain.blocks import TaskBlockReason, canonical_task_block_context
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.events import WorkflowEventActor
@@ -132,6 +132,7 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.review_result_envelope import serialize_review_result
 from openorc.services.task_abort import settle_observed_task_interrupt
+from openorc.services.task_cancellation import cancel_task_for_confirmed_pr_closure
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
@@ -150,6 +151,7 @@ from openorc.services.task_subject_guards import (
     require_current_task,
     require_task_pull_request_head,
 )
+from openorc.services.task_terminal_finalization import TerminalFinalizationSubmission
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
@@ -1713,32 +1715,36 @@ class SettledPrRemediationVerification:
     new_head_sha: str
 
 
-def _block_unverifiable_remediation_round(
+def _block_uncontinuable_remediation_round(
     pool: DatabasePool,
     *,
     profile_id: UUID,
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    reason: TaskBlockReason,
     context: dict[str, str],
 ) -> Task | None:
-    """Atomically block the Task on an unverifiable settled remediation round.
+    """Atomically block the Task on an uncontinuable settled remediation round.
 
     The established E8 stale-publication block shape (issue #338): one short
     composed transaction — the approving Profile's account-operational
     barrier re-proved first, the locked Task's exact currentness re-proven,
     and the F3 exceptional blocking foundation (#258) installing — atomically
-    — the ``stale_operation`` TaskBlock, its pending Level 3-selected OwnerGate
-    bound to it as the only subject (F8b, issue #287), the ``reviewing →
-    blocked`` transition with one rotated token, and the ``task_blocked`` /
-    ``owner_gate_created`` audits under the truthful OPENORC actor.
+    — the caller's typed ``reason`` TaskBlock, its pending Level 3-selected
+    OwnerGate bound to it as the only subject (F8b, issue #287), the
+    ``reviewing → blocked`` transition with one rotated token, and the
+    ``task_blocked`` / ``owner_gate_created`` audits under the truthful
+    OPENORC actor.
 
-    The unverifiable-round fact is deliberately presented to the Level 3
-    blocking-case catalog (F8a, issue #286) as no supported condition — it is
-    not one of the settled Type A cases — so the policy selects the Type B
-    ``BLOCK_RESOLUTION`` diagnostic gate; this caller never chooses a gate
-    type. The caller's ``context`` carries only the exact proven machine
-    facts of the detection site (issue #280) for later guarded recovery.
+    Both guarded facts this verification detects are deliberately presented
+    to the Level 3 blocking-case catalog (F8a, issue #286) as no supported
+    condition — a proven-but-unverifiable round is not one of the settled
+    Type A cases, and neither is a failed or uncertain verification
+    observation — so the policy selects the Type B ``BLOCK_RESOLUTION``
+    diagnostic gate; this caller never chooses a gate type. The caller's
+    ``context`` carries only the exact proven machine facts of the detection
+    site (issue #280), canonically normalized, for later guarded recovery.
 
     A subject that moved on between the detection and the installation
     applies nothing and returns ``None`` — the continuation is that subject's
@@ -1760,7 +1766,8 @@ def _block_unverifiable_remediation_round(
             )
             if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
                 return None
-            gate_type = classify_blocking_case(None, context, TaskBlockReason.STALE_OPERATION)
+            block_context = canonical_task_block_context(context)
+            gate_type = classify_blocking_case(None, block_context, reason)
             installation = install_exceptional_block_gate(
                 transaction_pool,
                 workspace_id=workspace_id,
@@ -1769,8 +1776,8 @@ def _block_unverifiable_remediation_round(
                 expected_status=task.status,
                 expected_current_owner_gate_id=task.current_owner_gate_id,
                 gate_type=gate_type,
-                block_reason=TaskBlockReason.STALE_OPERATION,
-                block_context=context,
+                block_reason=reason,
+                block_context=block_context,
                 actor=_OPENORC_ACTOR,
             )
             return installation.task
@@ -1788,6 +1795,7 @@ def verify_settled_pr_remediation_push(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> SettledPrRemediationVerification | None:
     """Re-prove a settled remediation round and verify its confirmed new head.
 
@@ -1822,11 +1830,21 @@ def verify_settled_pr_remediation_push(
 
     **Phase 3 — the authoritative head verification (no transaction open
     across GitHub I/O):** the SAME canonical pull request is reconciled
-    through B7, must still be exactly the addressed iteration's record and
-    OPEN, and must report a GitHub-confirmed NEW head — a missing push
-    (unchanged head) installs the atomic Level 3 block. A review iteration
-    already reserved for the confirmed head (a concurrently continued
-    subject) is a no-op instead of dispatching twice.
+    through B7. A failed or uncertain reconciliation read installs the
+    atomic Level 3 block under the escalation reason vocabulary — the
+    verification observation failed, so the round cannot continue and the
+    Task must never be stranded without an actionable Owner gate. A
+    GitHub-confirmed terminal pull-request state is the externally
+    established fact the existing terminal-reconciliation ownership owns: a
+    confirmed closed-unmerged record routes through the ONE trusted
+    GitHub-observation cancellation entrypoint (issue #229) and a confirmed
+    merge applies zero durable mutation (its completion belongs to the later
+    recovery layer) — neither ever installs a competing recoverable block. A
+    still-OPEN record must be exactly the addressed iteration's record and
+    must report a GitHub-confirmed NEW head — a missing push (unchanged
+    head) installs the atomic Level 3 block. A review iteration already
+    reserved for the confirmed head (a concurrently continued subject) is a
+    no-op instead of dispatching twice.
     """
     _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
@@ -1909,12 +1927,13 @@ def verify_settled_pr_remediation_push(
         or payload.get("type") != IMPLEMENTATION_RESULT_FAMILY
         or payload.get("status") != _IMPLEMENTATION_COMPLETED_STATUS
     ):
-        _block_unverifiable_remediation_round(
+        _block_uncontinuable_remediation_round(
             pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            reason=TaskBlockReason.STALE_OPERATION,
             context={
                 "detection": "noncanonical_recorded_result",
                 "execution_id": str(execution.id),
@@ -1928,12 +1947,13 @@ def verify_settled_pr_remediation_push(
         or task.canonical_feature_branch is None
         or branch_claim != task.canonical_feature_branch
     ):
-        _block_unverifiable_remediation_round(
+        _block_uncontinuable_remediation_round(
             pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            reason=TaskBlockReason.STALE_OPERATION,
             context={
                 "detection": "wrong_branch_claim",
                 "execution_id": str(execution.id),
@@ -1945,23 +1965,64 @@ def verify_settled_pr_remediation_push(
         return None
 
     # --- Phase 3: the authoritative head verification (GitHub I/O, no
-    # transaction held across it). An uncertain or known-failed read stays a
-    # typed error — never a block, never a proven workflow mismatch — and
-    # the durable state owns recovery. ---
-    reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
-        pool,
-        github_client,
-        workspace_id=workspace_id,
-        task_id=task_id,
-    )
-    reconciled = reconciliation.pull_request
-    if reconciled.id != addressed.task_pull_request_id:
-        _block_unverifiable_remediation_round(
+    # transaction held across it). A failed or uncertain reconciliation read
+    # is a guarded direct Level 3 disposition — the verification observation
+    # failed, so the round cannot continue and the Task is never stranded
+    # without an actionable Owner gate; the succeeded Execution is never the
+    # failure's subject and is never rewritten. A durable subject that moved
+    # on between the subject set and the read is a no-op. ---
+    try:
+        reconciliation: TaskPullRequestReconciliation = reconcile_task_pull_request(
+            pool,
+            github_client,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+    except ExternalOperationUncertainError:
+        _block_uncontinuable_remediation_round(
             pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            reason=TaskBlockReason.EXTERNAL_OPERATION_UNCERTAIN,
+            context={
+                "detection": "github_reconciliation_uncertain",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "addressed_head_sha": addressed.reviewed_head_sha or "",
+            },
+        )
+        return None
+    except ExternalOperationFailedError:
+        _block_uncontinuable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            reason=TaskBlockReason.UNKNOWN,
+            context={
+                "detection": "github_reconciliation_read_failed",
+                "execution_id": str(execution.id),
+                "review_iteration_id": str(addressed.id),
+                "addressed_head_sha": addressed.reviewed_head_sha or "",
+            },
+        )
+        return None
+    except (NotFoundError, StaleOperationError):
+        # The durable subject moved on between the subject set and the
+        # authoritative read: the continuation is moot, never a block.
+        return None
+    reconciled = reconciliation.pull_request
+    if reconciled.id != addressed.task_pull_request_id:
+        _block_uncontinuable_remediation_round(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            reason=TaskBlockReason.STALE_OPERATION,
             context={
                 "detection": "canonical_pull_request_mismatch",
                 "execution_id": str(execution.id),
@@ -1972,28 +2033,37 @@ def verify_settled_pr_remediation_push(
         )
         return None
     if reconciled.state is not TaskPullRequestState.OPEN:
-        _block_unverifiable_remediation_round(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            context={
-                "detection": "pull_request_not_open",
-                "execution_id": str(execution.id),
-                "review_iteration_id": str(addressed.id),
-                "pull_request_state": reconciled.state.value,
-            },
-        )
+        # A GitHub-confirmed terminal pull-request state is the externally
+        # established fact the existing terminal-reconciliation ownership
+        # owns — never a recoverable TaskBlock (issue #338 review).
+        if reconciled.merged_at is None:
+            # The confirmed closed-unmerged canonical PR is the externally
+            # established terminal condition (issue #229): the ONE trusted
+            # GitHub-observation cancellation entrypoint applies the terminal
+            # consequence, re-proving the durable evidence under its own
+            # locks and failing closed on any conflict. The successful
+            # Execution is never rewritten and this guard never competes
+            # with the terminal machinery with a recoverable block.
+            cancel_task_for_confirmed_pr_closure(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                terminal_finalization_submission=terminal_finalization_submission,
+            )
+            return None
+        # A confirmed merge's completion belongs to the later recovery layer:
+        # zero durable mutation here — never a competing block, never a
+        # dispatch, never a rewrite of the recorded round.
         return None
     new_head = reconciled.head_sha
     if new_head == addressed.reviewed_head_sha:
-        _block_unverifiable_remediation_round(
+        _block_uncontinuable_remediation_round(
             pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+            reason=TaskBlockReason.STALE_OPERATION,
             context={
                 "detection": "no_confirmed_push",
                 "execution_id": str(execution.id),
