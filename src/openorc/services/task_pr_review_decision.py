@@ -157,6 +157,7 @@ __all__ = [
     "TaskPrReviewGateResolutionOutcome",
     "finalize_pr_review_decision",
     "retire_pr_merge_decision_with_changes",
+    "settle_observed_pr_review",
     "settle_pr_review_resolution",
 ]
 
@@ -443,31 +444,38 @@ def _reserve_and_finalize_decision_iteration(
 def _finalize_pr_decision_transaction(
     pool: DatabasePool,
     *,
-    profile_id: UUID,
+    profile_id: UUID | None,
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
-    dispatch: TaskPrReviewDispatchOutcome,
+    review_result: ReviewResult,
+    review_iteration_id: UUID,
+    expected_reviewer_session_id: UUID,
     task_resume_intent_id: UUID | None = None,
 ) -> tuple:
     """Finalize the reserved PR attempt and commit the next decision atomically.
 
-    Composition (database only): the account barrier, the exact Owner scope,
-    the Task row locked ``FOR UPDATE``, the exact current ``REVIEWING`` Task
-    at the caller's token with no current OwnerGate, the canonical PR at
-    exactly the dispatch's reconciled head, the OPEN PR loop with the reserved
-    unfinalized attempt, the exact READY Reviewer binding, the one-shot
-    finalization, the safe REVIEWER ``PR_REVIEWED`` event, and the budget/
-    stickiness-derived durable next decision — all in one transaction.
+    Composition (database only): the accountable-Profile barriers exactly when
+    the caller carries one (the blocking entries; the detached settlement's
+    scope is the receipt's authenticated Workspace resolution instead, issue
+    #338), the Task row locked ``FOR UPDATE``, the exact current ``REVIEWING``
+    Task at the caller's token with no current OwnerGate, the exact reserved
+    attempt re-derived from durable state — never from a process-local
+    continuation object — the canonical PR at exactly the reserved attempt's
+    reviewed head, the re-locked OPEN PR loop, the exact READY Reviewer
+    binding, the one-shot finalization, the safe REVIEWER ``PR_REVIEWED``
+    event, and the budget/stickiness-derived durable next decision — all in
+    one transaction.
     """
     with composed_transaction(pool) as transaction_pool:
-        require_account_operational(transaction_pool, profile_id=profile_id)
-        require_workspace_task(
-            transaction_pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-        )
+        if profile_id is not None:
+            require_account_operational(transaction_pool, profile_id=profile_id)
+            require_workspace_task(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+            )
         locked = task_records.get_task_for_update(transaction_pool, task_id)
         if locked is None or locked.workspace_id != workspace_id:
             raise NotFoundError("the requested task is not available in this workspace")
@@ -486,54 +494,73 @@ def _finalize_pr_decision_transaction(
                 "the task carries a current owner gate; the ordinary pr review "
                 "decision is not available"
             )
-        head_sha = dispatch.reconciled_head_sha
-        pull_request = require_task_pull_request_head(
-            transaction_pool, task=task, expected_head_sha=head_sha
+        # The exact reserved attempt is re-derived from durable state — never
+        # from a process-local continuation object (issue #338): it must exist
+        # in this scope, still be unfinalized, and be exactly one PR/head
+        # iteration whose reviewed head and canonical PR subject this
+        # composition proves under the lock.
+        reserved = review_records.get_review_iteration(
+            transaction_pool, review_iteration_id=review_iteration_id
         )
-        if pull_request.id != dispatch.pull_request.id:
+        if reserved is None or reserved.workspace_id != workspace_id or reserved.task_id != task_id:
             raise StaleOperationError(
-                "the canonical pull request identity changed since the dispatch; "
-                "the decision is stale"
-            )
-        loop = review_records.get_review_loop(
-            transaction_pool,
-            review_loop_id=dispatch.review_loop.id,
-            for_update=True,
-        )
-        if loop is None or loop.id != dispatch.review_loop.id:
-            raise StaleOperationError("the pr_review loop has moved on; the decision is stale")
-        if loop.status is not ReviewLoopStatus.OPEN:
-            raise ConflictError("the pr_review loop is not open; the decision applies nothing")
-        iterations = review_records.list_review_loop_iterations(
-            transaction_pool, review_loop_id=loop.id
-        )
-        reserved = next(
-            (iteration for iteration in iterations if iteration.id == dispatch.review_iteration.id),
-            None,
-        )
-        if reserved is None:
-            raise StaleOperationError(
-                "the reserved review attempt is not available in this loop; the decision is stale"
+                "the reserved review attempt is not available in this task; the decision is stale"
             )
         if reserved.outcome is not None:
             raise ConflictError(
                 "the reserved review attempt is already finalized; a second verdict, "
                 "gate, or event is never created"
             )
+        if (
+            reserved.plan_revision_id is not None
+            or reserved.task_pull_request_id is None
+            or reserved.reviewed_head_sha is None
+        ):
+            raise ConflictError(
+                "the reserved review attempt is not a pr/head iteration; the decision is stale"
+            )
+        head_sha = reserved.reviewed_head_sha
+        pull_request = require_task_pull_request_head(
+            transaction_pool, task=task, expected_head_sha=head_sha
+        )
+        if pull_request.id != reserved.task_pull_request_id:
+            raise StaleOperationError(
+                "the canonical pull request identity changed since the dispatch; "
+                "the decision is stale"
+            )
+        loop = review_records.get_review_loop(
+            transaction_pool,
+            review_loop_id=reserved.review_loop_id,
+            for_update=True,
+        )
+        if loop is None or loop.id != reserved.review_loop_id:
+            raise StaleOperationError("the pr_review loop has moved on; the decision is stale")
+        if loop.status is not ReviewLoopStatus.OPEN:
+            raise ConflictError("the pr_review loop is not open; the decision applies nothing")
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if (
+            next((iteration for iteration in iterations if iteration.id == reserved.id), None)
+            is None
+        ):
+            raise StaleOperationError(
+                "the reserved review attempt is not available in this loop; the decision is stale"
+            )
         reviewer = _require_ready_reviewer(
             transaction_pool, workspace_id=workspace_id, task_id=task_id
         )
-        if reviewer.id != dispatch.reviewer_session.id:
+        if reviewer.id != expected_reviewer_session_id:
             raise StaleOperationError(
                 "the reviewer session binding has moved on; the decision is stale"
             )
-        outcome = _resolution_outcome(dispatch.review_result)
+        outcome = _resolution_outcome(review_result)
         finalized = review_records.record_review_iteration_result(
             transaction_pool,
             review_iteration_id=reserved.id,
             outcome=outcome,
-            summary=dispatch.review_result.summary,
-            findings=_finding_documents(dispatch.review_result),
+            summary=review_result.summary,
+            findings=_finding_documents(review_result),
         )
         if task_resume_intent_id is not None:
             # The F8g atomic settlement seam (issue #292): the resumed turn's
@@ -754,7 +781,9 @@ def finalize_pr_review_decision(
             task_id=task_id,
             task_resume_intent_id=task_resume_intent_id,
             expected_state_token=expected_state_token,
-            dispatch=dispatch,
+            review_result=dispatch.review_result,
+            review_iteration_id=dispatch.review_iteration.id,
+            expected_reviewer_session_id=dispatch.reviewer_session.id,
         )
 
         # --- Phase 2: the external consequence, with NO transaction open. ---
@@ -783,6 +812,82 @@ def finalize_pr_review_decision(
             gate=gate,
             remediation=remediation,
         )
+
+
+def settle_observed_pr_review(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    review_iteration_id: UUID,
+    expected_reviewer_session_id: UUID,
+    result: ReviewResult,
+) -> TaskPrReviewDecisionOutcome | None:
+    """Finalize one observed PR/head review through the owning service.
+
+    The detached-run settlement's owning-service composition (issue #338):
+    the correlation seam funnels the attributed terminal observation through
+    the shared formal contract and hands the validated ``ReviewResult`` here
+    inside its own settlement transaction. The settlement re-derives every
+    subject from durable state — the exact current ``REVIEWING`` Task, the
+    exact reserved unfinalized PR/head iteration still addressing the
+    canonical pull request at its reviewed head in the still-OPEN PR loop,
+    and the exact READY Reviewer binding the receipt anchored — and runs the
+    one shared decision composition atomically: the one-shot conditional
+    result recording, the persisted-state budget and sticky Owner-mediation
+    derivation, the safe audit events, and the committed durable next
+    decision (the exact-head ``MERGE_DECISION`` on acceptance — never a
+    merge; the exact PR/head ``REVIEW_RESOLUTION`` on exhaustion or
+    stickiness). No Producer turn is started here: the in-budget
+    ``CHANGES_REQUESTED`` continuation is the ONE completion handoff's from
+    committed state, never this seam's. A moved-on subject settles
+    result-not-applied; a duplicate, late, or stale REVIEW can never decide
+    twice.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(review_iteration_id, "review_iteration_id")
+    _require_uuid_command(expected_reviewer_session_id, "expected_reviewer_session_id")
+    validated = _require_formal_result(result)
+    _resolution_outcome(validated)
+    try:
+        task = task_records.get_task(transaction_pool, task_id=task_id)
+        if task is None or task.workspace_id != workspace_id:
+            raise NotFoundError("the requested task is not available in this workspace")
+        (
+            decision,
+            finalized,
+            loop,
+            settled_task,
+            pull_request,
+            gate,
+            _reviewer,
+        ) = _finalize_pr_decision_transaction(
+            transaction_pool,
+            profile_id=None,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=task.state_token,
+            review_result=validated,
+            review_iteration_id=review_iteration_id,
+            expected_reviewer_session_id=expected_reviewer_session_id,
+        )
+    except (NotFoundError, ConflictError, StaleOperationError):
+        # The subject set moved on between the dispatch and the observed
+        # completion (a rotated token, a lost session, a superseded attempt,
+        # a moved-on loop): the validated result can no longer apply, so
+        # nothing is rewritten and the receipt settles as result-not-applied.
+        # Never a fabricated decision, never a rewrite of moved-on history.
+        return None
+    return TaskPrReviewDecisionOutcome(
+        decision=decision,
+        review_iteration=finalized,
+        review_loop=loop,
+        task=settled_task,
+        pull_request=pull_request,
+        gate=gate,
+        remediation=None,
+    )
 
 
 # --- the PR/head resolution settlement (E4 formal continuation) -----------------------

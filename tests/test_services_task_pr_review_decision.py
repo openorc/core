@@ -49,6 +49,7 @@ from tests.test_services_task_pr_review_dispatch import (
     _EXECUTIONS_LIST,
     _HEAD_SHA,
     _ITERATION_INSERT,
+    _ITERATION_READ,
     _ITERATIONS_LIST,
     _LOOP_GUARD_LOCKED,
     _LOOP_ID,
@@ -203,6 +204,7 @@ def _script_finalization(
     conn.on(_TASK_READ, _task_row())
     conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_TASK_READ, _task_row())
+    conn.on(_ITERATION_READ, next(row for row in iterations if row[0] == reserved_id))
     conn.on(_PR_READ, _pr_row())
     conn.on(_LOOP_READ_LOCKED, _loop_row())
     conn.on(_ITERATIONS_LIST, iterations)

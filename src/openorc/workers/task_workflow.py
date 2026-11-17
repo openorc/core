@@ -58,6 +58,7 @@ from openorc.domain.send_claims import (
 )
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
+from openorc.persistence import executions as execution_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
@@ -129,11 +130,16 @@ from openorc.services.task_pr_composition import (
     dispatch_pr_compose_detached,
     publish_settled_task_pr_composition,
 )
-from openorc.services.task_pr_remediation import TaskPrRemediationOutcome
+from openorc.services.task_pr_remediation import (
+    TaskPrRemediationOutcome,
+    dispatch_pr_remediation_detached,
+    verify_settled_pr_remediation_push,
+)
 from openorc.services.task_pr_review_decision import finalize_pr_review_decision
 from openorc.services.task_pr_review_dispatch import (
     ReviewerRuntimeAttachmentFactory,
     dispatch_pr_review,
+    dispatch_pr_review_detached,
 )
 from openorc.services.task_start import TaskStartOutcome, TaskStartStatus
 from openorc.services.task_subject_guards import (
@@ -561,7 +567,14 @@ class _DetachedCompletionHandoff:
     through the existing owning service — the one place the settlement's
     in-memory validated ``pr_result`` is consumed, since the v1 persistence
     decision deliberately stores no title/body — and then submits the
-    existing typed TASK_PR_REVIEW from committed state. A settled family
+    existing typed TASK_PR_REVIEW from committed state; the review-result
+    route (issue #338) resolves the settled review decision's continuation
+    by the reserved attempt's durable subject flavor — the planning
+    continuation for a plan-subject iteration and the detached E9 remediation
+    enqueue on the exact Task checkout for an in-budget PR/head change
+    request — and the PR-remediation route re-proves the settled round,
+    verifies the GitHub-confirmed new head, and submits the next typed
+    TASK_PR_REVIEW through F1 from committed state. A settled family
     without a wired route is a fail-closed conflict that its own detached
     migration wires; no gate or workflow policy lives here beyond the
     routing and the committed-state re-derivation itself.
@@ -612,6 +625,11 @@ class _DetachedCompletionHandoff:
             return
         if operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
             _handoff_review_result_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        if operation is PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION:
+            _handoff_pr_remediation_completion(
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
             )
             return
@@ -871,6 +889,14 @@ def _handoff_review_result_completion(
         # any other owner gate) owns the workflow: no Producer prompt is
         # sent and the Owner-mediated resolution is not a workflow operation.
         return
+    if task.status is TaskStatus.REVIEWING:
+        # The PR-review flavor (issue #338): the settled PR/head review
+        # decision's in-budget change-request continuation from committed
+        # state.
+        _handoff_pr_change_request_remediation(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        )
+        return
     if task.status is not TaskStatus.PLANNING or task.current_plan_revision_id is None:
         # The settled decision's own durable continuations are the only
         # authority; anything else is already resolved or owned by another
@@ -1064,6 +1090,162 @@ def _handoff_pr_compose_completion(
                 profile_id=str(published.approving_profile_id),
                 task_pull_request_id=str(published.pull_request.id),
                 expected_state_token=str(published.task.state_token),
+            ),
+        ),
+    )
+
+
+def _handoff_pr_change_request_remediation(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The PR-review route's in-budget change-request continuation (issue #338).
+
+    Re-derives the durable remediation authority from committed state — the
+    REVIEWING Task with no current OwnerGate, the single OPEN PR loop whose
+    latest finalized PR/head iteration is exactly one in-budget
+    ``CHANGES_REQUESTED`` result with no claimed remediation Execution yet —
+    and, only when the durable state proves it, dispatches the new
+    authorized E9 remediation as one detached agent turn on the exact Task
+    checkout through the existing E9 service under the F5b coordinator's
+    typed failure handoff. The ACCEPTED MERGE_DECISION and the exhausted or
+    sticky REVIEW_RESOLUTION gates own their Owner seams with no Producer
+    prompt; a failed or uncertain dispatch is transport information only,
+    never Task truth, and never permits a blind re-enqueue — the durable
+    state owns recovery.
+    """
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
+        return
+    loops = [
+        loop
+        for loop in review_records.list_task_review_loops(pool, task_id=task.id)
+        if loop.workspace_id == workspace_id and loop.purpose is ReviewLoopPurpose.PR_REVIEW
+    ]
+    if len(loops) != 1 or loops[0].status is not ReviewLoopStatus.OPEN:
+        return
+    iterations = review_records.list_review_loop_iterations(pool, review_loop_id=loops[0].id)
+    if not iterations:
+        return
+    latest = iterations[-1]
+    if latest.outcome is not ReviewOutcome.CHANGES_REQUESTED or latest.task_pull_request_id is None:
+        # The accepted merge decision and the exhausted/sticky resolution
+        # gates own their Owner seams; a plan-subject attempt is never a PR
+        # continuation.
+        return
+    claimed = [
+        execution
+        for execution in execution_records.list_task_executions(pool, task_id=task.id)
+        if execution.review_iteration_id == latest.id
+    ]
+    if claimed:
+        # The one-shot E9 claim association: a claimed iteration's
+        # remediation is already owned by its own durable attempt.
+        return
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:  # pragma: no cover - the Task's scope proved it
+        return
+    owner_profile_id = workspace.owner_profile_id
+    expected_state_token = task.state_token
+
+    def invoke_level_one(evidence: InvocationAttemptEvidence) -> None:
+        dispatch_pr_remediation_detached(
+            pool,
+            profile_id=owner_profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            addressed_iteration=latest,
+            producer_runtime_factory=_producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=evidence,
+        )
+
+    coordinate_task_workflow_operation(
+        pool,
+        expected_status=TaskStatus.REVIEWING,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        profile_id=owner_profile_id,
+        expected_state_token=expected_state_token,
+        invoke_level_one=invoke_level_one,
+    )
+
+
+def _handoff_pr_remediation_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The E9-remediation route: the settled round's verified continuation.
+
+    Re-derives the continuation's authority from committed state — the
+    settled SUCCEEDED remediation Execution bound to the latest finalized
+    CHANGES_REQUESTED iteration, its recorded branch claim, and the canonical
+    PR — and invokes the existing owning verification directly. The
+    verification is a direct control guard, not a Level 1 operation: a
+    succeeded Execution is never a Level 2 failure identity (the
+    execution-family contracts deliberately reject succeeded attempts), so a
+    positively unverifiable round or a failed/uncertain reconciliation read
+    installs the exact atomic Level 3 BLOCK_RESOLUTION block through the
+    shared exceptional-blocking foundation under the escalation reason
+    vocabulary instead of stranding the reviewing Task, and a GitHub-confirmed
+    terminal pull-request state routes through the existing authoritative
+    terminal-reconciliation ownership — the trusted #229 cancellation
+    entrypoint for a confirmed closed-unmerged record, with this handoff's
+    F1-backed terminal-finalization submission forwarded so the normal bounded
+    checkout-cleanup arrangement survives, and zero durable mutation for a
+    confirmed merge — instead of a competing recoverable block.
+    Only the GitHub-confirmed NEW head submits the existing typed
+    ``TASK_PR_REVIEW`` through the executing process's continuation seam with
+    the reloaded post-reconciliation token; a ``None`` verification owns no
+    continuation. Every input is re-derived from committed durable state; a
+    failed or uncertain submission is transport information only, never Task
+    truth, and never permits a blind re-enqueue — the durable state owns
+    recovery.
+    """
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    if task.status is not TaskStatus.REVIEWING or task.current_owner_gate_id is not None:
+        # The settled remediation's own durable continuations are the only
+        # authority; anything else is already resolved or owned by another
+        # path (a gate, a decision, or the Owner Resume routing).
+        return
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:  # pragma: no cover - the Task's scope proved it
+        return
+    owner_profile_id = workspace.owner_profile_id
+    continuation = verify_settled_pr_remediation_push(
+        pool,
+        dependencies.github_client(),
+        profile_id=owner_profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=task.state_token,
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
+            dependencies.continuation_submitter()
+        ),
+    )
+    if continuation is None:
+        return
+    _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PR_REVIEW,
+            payload=TaskPrReviewPayload(
+                task=TaskScope(
+                    workspace_id=str(continuation.task.workspace_id),
+                    task_id=str(continuation.task.id),
+                    role=WorkflowRoleRef.REVIEWER,
+                ),
+                profile_id=str(owner_profile_id),
+                task_pull_request_id=str(continuation.pull_request.id),
+                expected_state_token=str(continuation.task.state_token),
             ),
         ),
     )
@@ -1668,18 +1850,34 @@ def _compose_task_pr_review(
     dependencies: OperationDependencies,
     attempt_evidence: InvocationAttemptEvidence | None = None,
 ) -> None:
-    """Run the PR review: E9 dispatch → decision, with remediation in-process.
+    """Run one PR review round.
 
-    The dispatch and its decision finalization are one logical invocation —
-    the reserved PR/head iteration's unfinalized ``ReviewResult`` is never
-    durable and never serialized. The published subjects are re-derived from
-    committed state under the payload's exact token and canonical PR
-    identity. When the decision routes an in-budget change request, the
-    remediation chain the decision already executed internally re-enters the
-    ordinary dispatch and returns its outcome; the chain must continue in
-    this same process (the re-entered outcome embeds an unfinalized result
-    that can never cross a job boundary) until a decision ends the loop with
-    the MERGE_DECISION or REVIEW_RESOLUTION gate — both Owner seams.
+    Regular mode (issue #338): the REVIEW dispatch is itself one detached
+    agent turn — the composition re-derives the round's exact published
+    subjects from committed state under the payload's exact token and
+    canonical PR identity, and the owning service reserves exactly one
+    next-numbered unfinalized PR/head ReviewIteration for the freshly
+    reconciled head (the OPEN PR loop established on first review with the
+    Workspace's snapshotted budget), commits the iteration's detached-turn
+    receipt companion, and admits the composed canonical REVIEW message
+    verbatim on the exact READY Reviewer session before returning. No
+    ``send`` and no blocking wait exists here, and the worker's ``while
+    True`` dependency on a nonserialized dispatch outcome is gone: the
+    independently observed completion settles the validated ``review_result``
+    through the owning PR-review decision settlement, and the ONE post-commit
+    completion handoff owns the workflow continuation from committed state —
+    the detached E9 remediation enqueue on an in-budget change request
+    (whose own observed completion re-proves the subjects, verifies the
+    GitHub-confirmed new head, and submits the next typed ``TASK_PR_REVIEW``
+    through F1), with the MERGE_DECISION and REVIEW_RESOLUTION gates owning
+    their Owner seams. A stale, duplicate, or late REVIEW observation can
+    never decide twice, and duplicate/stale/ambiguous output never advances
+    a newer head.
+
+    Queue mode keeps the blocking E9 dispatch/decision/remediation interim
+    until #328: the in-process loop re-enters the ordinary dispatch after
+    each routed remediation round until a decision ends the loop with the
+    MERGE_DECISION or REVIEW_RESOLUTION gate — both Owner seams.
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -1697,6 +1895,28 @@ def _compose_task_pr_review(
         expected_state_token=UUID(payload.expected_state_token),
         task_pull_request_id=UUID(payload.task_pull_request_id),
     )
+    # The regular-mode REVIEW dispatch is itself one detached agent turn
+    # (issue #338): no Reviewer attachment is acquired in this composition,
+    # no decision runs in-process, and the remediation chain never re-enters
+    # this worker — the reserved PR/head iteration, its detached-turn receipt
+    # companion, and the verbatim admission commit in the owning dispatch
+    # service, and the independently observed completion owns the decision
+    # settlement with the ONE post-commit completion handoff owning the
+    # remediation enqueue and every later continuation from committed state.
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        dispatch_pr_review_detached(
+            pool,
+            reviewer_runtime_factory,
+            github,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=published.task.state_token,
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=attempt_evidence,
+        )
+        return
     dispatch_outcome = dispatch_pr_review(
         pool,
         reviewer_runtime_factory,

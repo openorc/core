@@ -2584,6 +2584,246 @@ def test_a_moved_on_review_settles_the_validated_result_as_not_applied(
     assert not any("insert into openorc.workflow_events" in sql for sql in executed)
 
 
+# --- the PR-review settlement routing (issue #338) -------------------------------------
+
+_PR_ITERATION_ID = uuid4()
+_PR_RECORD_ID = uuid4()
+_PR_HEAD = "c" * 40
+
+
+def _review_pr_row() -> tuple[Any, ...]:
+    """The canonical TaskPullRequest row at the reviewed head."""
+    return (
+        _PR_RECORD_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        uuid4(),
+        9001,
+        42,
+        "feat/branch",
+        "main",
+        _PR_HEAD,
+        "open",
+        None,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _review_pr_loop_row(*, status: str = "open") -> tuple[Any, ...]:
+    return (
+        _REVIEW_LOOP_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "pr_review",
+        5,
+        status,
+        None,
+        _OBSERVED,
+    )
+
+
+def _review_pr_iteration_row(*, outcome: str | None = None) -> tuple[Any, ...]:
+    """A PR/head review iteration: canonical pull request subject, no plan."""
+    return (
+        _PR_ITERATION_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _REVIEW_LOOP_ID,
+        1,
+        None,
+        _PR_RECORD_ID,
+        _PR_HEAD,
+        outcome,
+        "Needs work" if outcome is not None else None,
+        [{"summary": "Clarify scope", "details": "Say which module."}]
+        if outcome is not None
+        else None,
+        _OBSERVED if outcome is not None else None,
+        _OBSERVED,
+    )
+
+
+def _review_pr_receipt_row(
+    *,
+    status: str = "admitted",
+    outcome: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "reviewer_review",
+        "review_iteration",
+        _PR_ITERATION_ID,
+        "review_result",
+        _TURN_REFERENCE if status in ("admitted", "settled") else None,
+        status,
+        outcome if outcome is not None else {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def _review_pr_settled_row(label: str, *, marker: int | None = 41) -> tuple[Any, ...]:
+    settled_outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
+    if marker is not None:
+        settled_outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
+    return _review_pr_receipt_row(status="settled", outcome=settled_outcome)
+
+
+def _script_review_reviewing_task(conn: ScriptedConnection) -> None:
+    """Script the current coarse-reviewing Task read (repeatable)."""
+    conn.on_repeat(
+        _sql_has_not("from openorc.tasks where id = %s", absent="planning_bootstrap"),
+        task_row(
+            id=_TASK_ID,
+            workspace_id=_WORKSPACE_ID,
+            status="reviewing",
+            state_token=_STATE_TOKEN,
+            canonical_feature_branch="feat/branch",
+            current_plan_revision_id=None,
+            source_requirements_fingerprint="a" * 64,
+        ),
+    )
+
+
+def _pr_review_settlement_flow(
+    triage: _RecordingTriage,
+    *,
+    candidate: str | None,
+    kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
+    settle_label: str = SETTLEMENT_VALIDATED_RESULT,
+    iteration_reads: list[tuple[Any, ...]] | None = None,
+    binding_reads: int = 2,
+    with_decision_composition: bool = True,
+) -> tuple[ScriptedConnection, TurnSettlementOutcome]:
+    conn = ScriptedConnection()
+    _script_review_reviewing_task(conn)
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _review_pr_receipt_row())
+    _script_receipt_for_update(conn, _review_pr_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    for row in (
+        iteration_reads
+        if iteration_reads is not None
+        else [
+            _review_pr_iteration_row(),
+            _review_pr_iteration_row(),
+        ]
+    ):
+        _script_review_iteration_read(conn, row)
+    _script_reviewer_binding_read(conn, times=binding_reads)
+    if with_decision_composition:
+        conn.on(_sql_has("from openorc.task_pull_requests"), _review_pr_row())
+        conn.on(
+            _sql_has("from openorc.review_loops where id", "for update"),
+            _review_pr_loop_row(),
+        )
+        conn.on(
+            _sql_has("update openorc.review_iterations"),
+            _review_pr_iteration_row(outcome="changes_requested"),
+        )
+        conn.on_repeat(
+            _sql_has("review_iterations where review_loop_id"),
+            [_review_pr_iteration_row(outcome="changes_requested")],
+        )
+        conn.on(_sql_has("from openorc.owner_gates where task_id"), [])
+        _script_event_insert(conn, event_type=WorkflowEventType.PR_REVIEWED)
+    _script_settle(conn, _review_pr_settled_row(settle_label))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(kind=kind, marker=41, candidate=candidate),
+    )
+    return conn, outcome
+
+
+def test_a_validated_pr_review_result_settles_through_the_pr_decision(
+    triage: _RecordingTriage,
+) -> None:
+    """A REVIEWER_REVIEW terminal on a PR/head iteration routes to the owning
+    PR-review decision settlement (issue #338): the one-shot result recording,
+    the REVIEWER ``PR_REVIEWED`` audit, and the receipt settle atomically —
+    never through the planning decision composition."""
+    conn, outcome = _pr_review_settlement_flow(triage, candidate=_REVIEW_CANDIDATE)
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.operation.value == "reviewer_review"
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
+    assert outcome.formal_result is not None
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert any("update openorc.review_iterations" in sql for sql in executed)
+    assert any("insert into openorc.workflow_events" in sql for sql in executed)
+    # The PR/head flavor resolved durably: the canonical pull request subject
+    # was re-proven and the planning composition's revision read never ran.
+    assert any("from openorc.task_pull_requests" in sql for sql in executed)
+    assert not any("from openorc.plan_revisions" in sql for sql in executed)
+
+
+def test_a_failed_pr_review_terminal_reports_with_the_reviewing_expected_status(
+    triage: _RecordingTriage,
+) -> None:
+    """A PR/head review attempt's observed failure reports through the review
+    family with the attempt flavor's durable ``reviewing`` expected status —
+    never the flat family map's planning expectation (issue #338)."""
+    conn, outcome = _pr_review_settlement_flow(
+        triage,
+        candidate=None,
+        kind=DetachedTurnObservationKind.FAILED,
+        settle_label=SETTLEMENT_OBSERVED_FAILURE,
+        with_decision_composition=False,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    operation = triage.calls[0]["operation"]
+    assert operation.family.value == "reviewer_review"
+    assert operation.original_attempt_kind.value == "review_iteration"
+    assert operation.original_attempt_id == _PR_ITERATION_ID
+    assert triage.calls[0]["expected_status"].value == "reviewing"
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("update openorc.review_iterations" in sql for sql in executed)
+
+
+def test_a_moved_on_pr_review_settles_the_validated_result_as_not_applied(
+    triage: _RecordingTriage,
+) -> None:
+    """A validated PR/head result whose reserved attempt was finalized
+    concurrently applies nothing: the receipt settles result-not-applied and
+    no second verdict, gate, or event is fabricated."""
+    conn, outcome = _pr_review_settlement_flow(
+        triage,
+        candidate=_REVIEW_CANDIDATE,
+        iteration_reads=[
+            _review_pr_iteration_row(),
+            _review_pr_iteration_row(outcome="changes_requested"),
+        ],
+        settle_label=SETTLEMENT_RESULT_NOT_APPLIED,
+        with_decision_composition=False,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("insert into openorc.workflow_events" in sql for sql in executed)
+
+
 # --- the PR_COMPOSE settlement routing (issue #337) -----------------------------------
 
 _PR_CLAIM_ID = uuid4()

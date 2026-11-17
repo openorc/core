@@ -218,7 +218,10 @@ _EXECUTION_FAMILY_SUBJECTS: Final[
 }
 
 # The Level 2 report's expected Task status per settled family, mirroring
-# the owning dispatch services' subject contracts.
+# the owning dispatch services' subject contracts. The REVIEWER_REVIEW
+# entry is the planning flavor's flat expectation; the PR/head review
+# flavor (issue #338) resolves its ``reviewing`` expectation from the
+# reserved attempt's durable subject (_expected_failure_status).
 _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperation, TaskStatus]] = {
     PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: TaskStatus.IMPLEMENTING,
     PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION: TaskStatus.REVIEWING,
@@ -238,9 +241,11 @@ _PLAN_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperatio
     }
 )
 
-# The planning-review family with detached settlement routing in this seam
-# (issue #336): the Reviewer REVIEW dispatch whose validated ``review_result``
-# finalizes through the owning planning-review decision service's settlement.
+# The review family with detached settlement routing in this seam: the
+# Reviewer REVIEW dispatch whose validated ``review_result`` finalizes
+# through the owning decision service's settlement for the reserved
+# attempt's durable subject flavor — the planning-review settlement (issue
+# #336) or the PR/head review settlement (issue #338).
 _REVIEW_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = frozenset(
     {PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW}
 )
@@ -792,25 +797,32 @@ def _route_review_terminal(
 ) -> TurnSettlementOutcome:
     """Route one attributed terminal observation onto the reserved iteration.
 
-    The attribution congruence is proved first (issue #336): the reserved
-    ReviewIteration must exist in the addressed scope, still be unfinalized,
-    and anchor to exactly the receipt's Reviewer session binding — the
-    task's current durable ``(Task, REVIEWER)`` binding. A concrete
-    attribution conflict leaves the observation unresolved — never a
-    fabricated match, and a finalized iteration is never decided twice. A
+    The attribution congruence is proved first (issues #336/#338): the
+    reserved ReviewIteration must exist in the addressed scope, still be
+    unfinalized, and anchor to exactly the receipt's Reviewer session
+    binding — the task's current durable ``(Task, REVIEWER)`` binding. A
+    concrete attribution conflict leaves the observation unresolved — never
+    a fabricated match, and a finalized iteration is never decided twice. A
     terminal failure settles the receipt truthfully and reports through the
     existing typed operation-failure path (Level 2) under the review
-    family's own identity. A completion funnels the candidate through the
-    shared formal contract; a validated ``review_result`` finalizes through
-    the owning decision service's settlement (the one-shot result recording,
-    the persisted-state decision, the audit events, and the receipt's
-    settlement, all atomic), while a missing or contract-failing candidate
-    is a positively established protocol failure of the turn.
+    family's own identity with the attempt flavor's expected Task status.
+    A completion funnels the candidate through the shared formal contract; a
+    validated ``review_result`` finalizes through the owning decision
+    service's settlement for the reserved attempt's durable subject flavor
+    — the planning settlement (issue #336) for a plan-subject iteration, the
+    PR/head settlement (issue #338) for a canonical-pull-request/head
+    iteration — with the one-shot result recording, the persisted-state
+    decision, the audit events, and the receipt's settlement all atomic;
+    a missing or contract-failing candidate is a positively established
+    protocol failure of the turn.
     """
-    # Deferred import: the owning service imports this module's dispatch
+    # Deferred imports: the owning services import this module's dispatch
     # mechanics at module level.
     from openorc.services.task_planning_review_decision import (  # noqa: PLC0415
         settle_observed_planning_review,
+    )
+    from openorc.services.task_pr_review_decision import (  # noqa: PLC0415
+        settle_observed_pr_review,
     )
 
     iteration = review_iteration_records.get_review_iteration(
@@ -878,14 +890,31 @@ def _route_review_terminal(
             error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
             failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
         )
-    finalized = settle_observed_planning_review(
-        transaction_pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        review_iteration_id=receipt.original_attempt_id,
-        expected_reviewer_session_id=receipt.task_agent_session_id,
-        result=parsed,
-    )
+    if iteration.plan_revision_id is not None:
+        # The planning flavor (issue #336): the owning planning-review
+        # decision settlement over the exact current PlanRevision.
+        finalized = settle_observed_planning_review(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            review_iteration_id=receipt.original_attempt_id,
+            expected_reviewer_session_id=receipt.task_agent_session_id,
+            result=parsed,
+        )
+    else:
+        # The PR/head flavor (issue #338): the owning PR-review decision
+        # settlement over the exact canonical pull request/head. Its own
+        # subject guards re-prove the PR-iteration flavor fail-closed, so a
+        # malformed subject shape settles result-not-applied instead of
+        # being silently reinterpreted.
+        finalized = settle_observed_pr_review(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            review_iteration_id=receipt.original_attempt_id,
+            expected_reviewer_session_id=receipt.task_agent_session_id,
+            result=parsed,
+        )
     if finalized is None:
         settled = turn_records.settle_task_detached_turn_receipt(
             transaction_pool,
@@ -1032,6 +1061,31 @@ def _route_pr_compose_terminal(
     )
 
 
+def _expected_failure_status(
+    transaction_pool: DatabasePool, receipt: TaskDetachedTurnReceipt
+) -> TaskStatus:
+    """The Level 2 report's expected Task status for one observed failure.
+
+    The flat family map serves every family whose subject form is fixed. The
+    ``REVIEWER_REVIEW`` family covers both review attempt flavors (issue
+    #338), so its expected status resolves from the reserved iteration's
+    durable subject: a plan-subject iteration runs on a ``planning`` Task
+    and a canonical-pull-request/head iteration on a ``reviewing`` Task. An
+    unavailable attempt falls back to the family's flat expectation — the
+    triage re-proves every subject itself and the report is a typed no-op
+    when it no longer addresses current work.
+    """
+    family_status = _FAMILY_EXPECTED_TASK_STATUS[receipt.operation]
+    if receipt.operation is not PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
+        return family_status
+    iteration = review_iteration_records.get_review_iteration(
+        transaction_pool, review_iteration_id=receipt.original_attempt_id
+    )
+    if iteration is None or iteration.task_pull_request_id is None:
+        return family_status
+    return TaskStatus.REVIEWING
+
+
 def _settle_observed_turn_failure(
     transaction_pool: DatabasePool,
     *,
@@ -1089,7 +1143,7 @@ def _settle_observed_turn_failure(
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=current.state_token,
-        expected_status=_FAMILY_EXPECTED_TASK_STATUS[receipt.operation],
+        expected_status=_expected_failure_status(transaction_pool, receipt),
         expected_current_owner_gate_id=None,
         actor=_OPENORC_ACTOR,
         operation=operation,
@@ -1291,7 +1345,7 @@ def _settle_execution_failure(
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=current.state_token,
-        expected_status=_FAMILY_EXPECTED_TASK_STATUS[receipt.operation],
+        expected_status=_expected_failure_status(transaction_pool, receipt),
         expected_current_owner_gate_id=None,
         actor=_OPENORC_ACTOR,
         operation=operation,
