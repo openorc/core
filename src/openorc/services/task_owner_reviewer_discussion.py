@@ -52,7 +52,8 @@ receipt machinery carries two discussion-specific duties:
   second enqueue of the same prepared message; then the exact Reviewer
   attachment, the positive observation registration, the verbatim message
   enqueue, and the acknowledgement attach, each outside any transaction. A
-  positively proven refusal marks the receipt ``refused`` (the slot is
+  positively proven refusal — the attachment, the observation registration,
+  or the runtime admission — marks the receipt ``refused`` (the slot is
   freed); an uncertain admission stays conservatively claimed (stamped,
   never re-dispatched); the attach consumes any staged early completion.
 
@@ -183,6 +184,7 @@ _STATUS_SPAN_NAME = "task_owner_reviewer_discussion.get_owner_gate_discussion_st
 _MAX_DISCUSSION_MESSAGE_LENGTH: Final[int] = 20_000
 
 # The positively proven pre-effect refusal kinds of the discussion admission.
+_ATTACHMENT_REFUSAL_KIND: Final[str] = "admission_attachment_refused"
 _REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
 _ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
 # The positively proven refusal of the operation submission itself (issue
@@ -787,14 +789,17 @@ def admit_owner_reviewer_discussion_turn(
     takes the receipt's set-once one-shot admission stamp — a duplicate or
     re-delivered execution of the same prepared message can never reach a
     second enqueue. Then, with no transaction open: the exact Reviewer
-    attachment (the detached capability duck-typed fail-closed), the positive
+    attachment (a positively proven attachment failure refuses the receipt
+    and frees the session's slot — the message was never enqueued; the
+    detached capability is duck-typed fail-closed), the positive
     observation registration, the verbatim message enqueue, and the
-    acknowledgement attach. A positively proven refusal (registration or
-    runtime) marks the receipt ``refused`` so the never-dispatched message
-    cannot hold the Reviewer session's slot; an uncertain admission stays
-    conservatively claimed and is never re-dispatched. The attach consumes
-    any staged early completion, and its post-commit handoff runs when a
-    staged completion settled the exchange within this invocation.
+    acknowledgement attach. A positively proven refusal — attachment,
+    registration, or runtime — marks the receipt ``refused`` so the
+    never-dispatched message cannot hold the Reviewer session's slot; an
+    uncertain admission stays conservatively claimed and is never
+    re-dispatched. The attach consumes any staged early completion, and its
+    post-commit handoff runs when a staged completion settled the exchange
+    within this invocation.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _ADMIT_SPAN_NAME) as span:
         # --- Phase 0: command shape (no I/O). ---
@@ -871,7 +876,34 @@ def admit_owner_reviewer_discussion_turn(
         if reviewer_external_session_id is None or not reviewer_external_session_id.strip():
             raise ConflictError("the reviewer session binding carries no external session identity")
         with ExitStack() as attachment_stack:
-            runtime = attachment_stack.enter_context(reviewer_factory(subjects.reviewer))
+            # The exact Reviewer attachment. A positively proven attachment
+            # failure — a disabled connection, an unusable credential, an
+            # invalid configuration, a failed SDK attachment — is strictly
+            # pre-admission evidence: the message cannot have been enqueued
+            # yet, so the receipt is refused through the existing one-shot
+            # refusal path and the Reviewer session's single-outstanding slot
+            # is freed. Typed application errors keep their identity.
+            try:
+                runtime = attachment_stack.enter_context(reviewer_factory(subjects.reviewer))
+            except ApplicationError as error:
+                logger.warning(
+                    "the discussion attachment was refused before any admission (%s); "
+                    "the receipt is refused and the message never dispatched",
+                    type(error).__name__,
+                )
+                _refuse_discussion_receipt_quietly(pool, receipt, _ATTACHMENT_REFUSAL_KIND)
+                raise
+            except Exception as error:
+                logger.warning(
+                    "the discussion attachment failed before any admission (%s); "
+                    "the receipt is refused and the message never dispatched",
+                    type(error).__name__,
+                )
+                _refuse_discussion_receipt_quietly(pool, receipt, _ATTACHMENT_REFUSAL_KIND)
+                raise ExternalOperationFailedError(
+                    "the reviewer runtime attachment failed before any admission; "
+                    "the receipt is refused and the message never dispatched"
+                ) from error
             # The detached capability is duck-typed fail-closed BEFORE any
             # admission effect: a runtime without it cannot serve the
             # detached discussion, and the just-stamped receipt is refused.

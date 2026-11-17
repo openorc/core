@@ -783,6 +783,72 @@ def test_a_settled_receipt_refuses_admission_as_stale() -> None:
         _admit(conn, runtime)
 
 
+class _FailingAttachment:
+    """Deferred Reviewer attachment probe whose acquisition always fails."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.acquisitions = 0
+
+    def __call__(self, binding: Any) -> AbstractContextManager[FakeAgentRuntimeAdapter]:
+        self.acquisitions += 1
+        raise self._error
+
+    def __enter__(self) -> FakeAgentRuntimeAdapter:  # pragma: no cover - never entered
+        raise AssertionError("a failing attachment is never entered")
+
+    def __exit__(self, *_exc: object) -> bool:  # pragma: no cover - never entered
+        return False
+
+
+def test_a_failed_attachment_marks_the_receipt_refused_and_frees_the_slot() -> None:
+    conn = ScriptedConnection()
+    runtime = FakeAgentRuntimeAdapter()
+    # A positively proven pre-admission attachment failure (a disabled
+    # connection, an unusable credential, an invalid configuration, a failed
+    # SDK attachment): the message was never enqueued.
+    attachment = _FailingAttachment(
+        ExternalOperationFailedError("the attachment refused: connection disabled")
+    )
+    _script_authorization(conn)
+    _script_load_subjects(
+        conn,
+        task_row=_task_row(),
+        gate_row=_gate_row(),
+        revision_row=_revision_row(),
+        session_row=_reviewer_ready_row(),
+    )
+    # The stamp commits before the attachment (the one-shot gate), and the
+    # refusal write follows the proven attachment failure.
+    conn.on(_RECEIPT_FOR_UPDATE, _discussion_receipt_row())
+    conn.on(_RECEIPT_STAMP, (_RECEIPT_ID,))
+    conn.on(
+        _RECEIPT_REFUSE,
+        _discussion_receipt_row(status="refused", outcome={"refusal_kind": "x"}),
+    )
+
+    # A typed attachment failure keeps its identity (re-raised after the
+    # refusal write); an untyped one is classified safely.
+    with pytest.raises(ExternalOperationFailedError, match="attachment refused"):
+        admit_owner_reviewer_discussion_turn(
+            _pool(conn),
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            owner_gate_id=_GATE_1_ID,
+            receipt_id=_RECEIPT_ID,
+            message=_OWNER_MESSAGE,
+            reviewer_runtime_factory=attachment,
+            observation_registrar=_Registrar(),
+            completion_handoff=_Handoff(),
+        )
+
+    # The slot is freed: the refusal write ran, and nothing was enqueued.
+    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
+    assert runtime.detached_admissions() == ()
+    assert attachment.acquisitions == 1
+
+
 def test_a_refused_registration_marks_the_receipt_refused_without_enqueueing() -> None:
     from openorc.adapters.agent_runtime.errors import AgentSessionNotFoundError
 
