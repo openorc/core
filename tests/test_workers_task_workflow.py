@@ -3171,6 +3171,61 @@ def test_the_pr_remediation_handoff_submits_the_pr_review_for_the_confirmed_head
     assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
 
 
+def test_the_pr_remediation_handoff_supplies_the_terminal_finalization_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The E9-remediation handoff route forwards the executing process's
+    F1-backed terminal-finalization submission into the owning verification,
+    so a confirmed closed-unmerged cancellation detected there arranges the
+    normal bounded checkout cleanup instead of the archive-only fallback
+    (issue #338 review)."""
+    dependencies, submitter = make_dependencies()
+    task = SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_NEXT_TOKEN,
+        status=TaskStatus.REVIEWING,
+        current_owner_gate_id=None,
+    )
+    verify_calls: list[dict[str, Any]] = []
+
+    def _verify_stub(*args: Any, **kwargs: Any) -> Any:
+        # A dedicated recorder: the shared RecordingService deliberately
+        # excludes the optional process-local submission plumbing from its
+        # recorded comparisons, and this test's subject is exactly that
+        # threading.
+        verify_calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        task_workflow, "verify_settled_pr_remediation_push", _verify_stub, raising=True
+    )
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow,
+        "get_workspace",
+        lambda _pool, workspace_id: SimpleNamespace(owner_profile_id=_PROFILE_ID),
+    )
+
+    task_workflow.build_detached_completion_handoff(dependencies).handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+    )
+
+    assert len(verify_calls) == 1
+    forwarded = verify_calls[0]["terminal_finalization_submission"]
+    assert isinstance(forwarded, task_workflow.F1TerminalFinalizationSubmission)
+    # The forwarded seam is live: it submits the bounded terminal-finalization
+    # operation through the executing process's continuation submitter.
+    forwarded.submit(workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+    assert submitter.submissions[-1].kind is OperationKind.TASK_TERMINAL_FINALIZATION
+
+
 def test_the_pr_remediation_handoff_submits_nothing_without_a_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

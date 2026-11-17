@@ -1189,11 +1189,16 @@ def _handoff_pr_remediation_completion(
     verification is a direct control guard, not a Level 1 operation: a
     succeeded Execution is never a Level 2 failure identity (the
     execution-family contracts deliberately reject succeeded attempts), so a
-    positively unverifiable round installs the exact atomic Level 3
-    BLOCK_RESOLUTION block through the shared exceptional-blocking foundation
-    instead of stranding the reviewing Task, and an uncertain or known-failed
-    GitHub read stays a typed error whose durable state the existing Owner
-    Resume recovery owns — never a block, never a proven workflow mismatch.
+    positively unverifiable round or a failed/uncertain reconciliation read
+    installs the exact atomic Level 3 BLOCK_RESOLUTION block through the
+    shared exceptional-blocking foundation under the escalation reason
+    vocabulary instead of stranding the reviewing Task, and a GitHub-confirmed
+    terminal pull-request state routes through the existing authoritative
+    terminal-reconciliation ownership — the trusted #229 cancellation
+    entrypoint for a confirmed closed-unmerged record, with this handoff's
+    F1-backed terminal-finalization submission forwarded so the normal bounded
+    checkout-cleanup arrangement survives, and zero durable mutation for a
+    confirmed merge — instead of a competing recoverable block.
     Only the GitHub-confirmed NEW head submits the existing typed
     ``TASK_PR_REVIEW`` through the executing process's continuation seam with
     the reloaded post-reconciliation token; a ``None`` verification owns no
@@ -1222,6 +1227,9 @@ def _handoff_pr_remediation_completion(
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=task.state_token,
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
+            dependencies.continuation_submitter()
+        ),
     )
     if continuation is None:
         return
