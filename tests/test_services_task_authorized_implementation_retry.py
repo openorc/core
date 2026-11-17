@@ -48,6 +48,7 @@ from openorc.adapters.agent_runtime.errors import (
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import OriginalAttemptKind
@@ -66,7 +67,12 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_authorized_implementation_retry import (
+    dispatch_authorized_implementation_retry_detached,
     execute_authorized_implementation_retry,
+)
+from openorc.services.task_detached_turn_observation import (
+    ObservationRegistrationRefusalReason,
+    ObservationRegistrationRefusedError,
 )
 from tests.fakes.agent_runtime import (
     ControlRealization,
@@ -75,6 +81,17 @@ from tests.fakes.agent_runtime import (
     session_ready_candidate,
 )
 from tests.fakes.task_rows import task_row
+from tests.test_services_task_authorized_implementation_execution import (  # noqa: I001
+    _EARLY_COMPLETION_READ,
+    _EXECUTION_READ,
+    _RECEIPT_ATTACH,
+    _RECEIPT_FOR_UPDATE,
+    _RECEIPT_ID,
+    _RECEIPT_INSERT,
+    _RECEIPT_REFUSE,
+    _RecordingHandoff,
+    _RecordingRegistrar,
+)
 
 _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 _DUE = _OBSERVED - timedelta(seconds=1)
@@ -1133,3 +1150,201 @@ def test_replayed_consumption_after_binding_never_reaches_the_adapter() -> None:
     conn = ScriptedConnection()
     _script_admission(conn, attempt=_attempt_row(resulting_execution_id=_RETRY_EXECUTION_ID))
     _refused_before_effects(conn, StaleOperationError, clock=lambda: _OBSERVED)
+
+
+# --- the detached retry dispatch (issues #325/#340) ---------------------------------
+
+
+def _retry_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+) -> tuple[Any, ...]:
+    """The detached-turn receipt row for the NEW retry Execution identity."""
+    admitted_at = _OBSERVED if status == "admitted" else None
+    settled_at = _OBSERVED if status == "refused" else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "implementation_execution",
+        "execution",
+        _RETRY_EXECUTION_ID,
+        "implementation_result",
+        admitted_turn_reference,
+        status,
+        {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def _arrange_retry_detached(
+    conn: ScriptedConnection,
+) -> tuple[FakePool, FakeAgentRuntimeAdapter, _ProducerAttachment]:
+    """One scripted case with an admission-ready detached runtime."""
+    pool = FakePool(conn)
+    runtime = _ScriptedRealizeRuntime(pool)
+    runtime.queue_creation(session_ready_candidate())
+    created = runtime.create_session(
+        AgentSessionCreationRequest(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            role=WorkflowRole.PRODUCER,
+            initialization="prepared",
+        )
+    )
+    assert created.external_session_id == _EXTERNAL_SESSION_ID
+    runtime.script_realization(_EXTERNAL_SESSION_ID, ControlRealization.NATIVE_ONLY)
+    attachment = _ProducerAttachment(runtime)
+    return pool, runtime, attachment
+
+
+def _dispatch_retry_detached_call(
+    pool: DatabasePool,
+    *,
+    producer_runtime_factory: Any,  # noqa: ANN401 - typed at the service boundary
+    observation_registrar: Any,  # noqa: ANN401
+    completion_handoff: Any,  # noqa: ANN401
+    clock: Callable[[], datetime] | None = None,
+) -> Any:  # noqa: ANN401 - the typed outcome
+    return dispatch_authorized_implementation_retry_detached(
+        pool,
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=_STATE_TOKEN,
+        retry_attempt_id=_ATTEMPT_ID,
+        producer_runtime_factory=producer_runtime_factory,
+        observation_registrar=observation_registrar,
+        completion_handoff=completion_handoff,
+        clock=clock,
+    )
+
+
+def test_the_detached_retry_dispatch_records_registers_admits_and_attaches_exactly_once() -> None:
+    """The authorized retry dispatches as one detached turn (#340): the F4
+    authorization is consumed for the NEW retry Execution, the receipt commits
+    strictly before the first runtime interaction, the serialized ACT mode is
+    reconstructed on the exact original Producer session, the observation is
+    registered, the persisted accepted Reviewer envelope is admitted verbatim,
+    and the acknowledgement attaches — with no send and no blocking wait."""
+    conn = ScriptedConnection()
+    _script_admission(conn)
+    _script_subject_reads(conn)  # R1
+    conn.on(_RECEIPT_INSERT, _retry_receipt_row())
+    _script_subject_reads(conn)  # R2
+    conn.on(_RECEIPT_FOR_UPDATE, _retry_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _retry_receipt_row(status="admitted", admitted_turn_reference="retry-turn-1"),
+    )
+    conn.on(_EARLY_COMPLETION_READ, None)
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_EXECUTION_READ, _execution_row(status="running", last_activity=_OBSERVED))
+    pool, runtime, attachment = _arrange_retry_detached(conn)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_retry_detached_call(
+        cast(DatabasePool, pool),
+        producer_runtime_factory=attachment,
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+        clock=lambda: _OBSERVED,
+    )
+
+    # The attempt stayed conservatively running; the receipt is admitted with
+    # its acknowledged turn reference and the NEW retry Execution identity.
+    assert outcome.execution.status is ExecutionStatus.RUNNING
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.ADMITTED
+    assert outcome.receipt.admitted_turn_reference == "retry-turn-1"
+    assert (
+        outcome.receipt.operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    )
+    assert outcome.receipt.original_attempt_id == _RETRY_EXECUTION_ID
+
+    # The serialized ACT mode was reconstructed once on the exact original
+    # Producer session, and the observation registration preceded the
+    # admission on that exact session.
+    (control,) = runtime.realized_controls()
+    assert control.external_session_id == _EXTERNAL_SESSION_ID
+    assert control.interaction.kind is InteractionKind.IMPLEMENT
+    assert control.message is None and control.native_action is True
+    assert len(registrar.registrations) == 1
+    assert registrar.registrations[0]["task_agent_session_id"] == _SESSION_ID
+    assert registrar.registrations[0]["external_session_id"] == _EXTERNAL_SESSION_ID
+
+    # The persisted accepted Reviewer envelope was admitted verbatim — the
+    # same canonical message the blocking send carries — and no blocking
+    # send ever ran. No staged early completion settled inside the dispatch,
+    # so the handoff is not invoked here.
+    ((admitted_session, admitted_message),) = runtime.detached_admissions()
+    assert admitted_session == _EXTERNAL_SESSION_ID
+    assert json.loads(admitted_message) == {
+        "type": "review_result",
+        "schema_version": 1,
+        "outcome": "accepted",
+        "summary": _SUMMARY,
+        "findings": [],
+    }
+    assert runtime.submitted_sends() == ()
+    assert handoff.calls == []
+    assert attachment.acquisitions == 1 and attachment.disposals == 1
+    # The one-shot F4 consumption: exactly one Execution insert (number 2),
+    # one claim, and one set-once authorization binding.
+    assert _count(conn, _EXECUTION_INSERT) == 1
+    assert _count(conn, _EXECUTION_CLAIM) == 1
+    assert _count(conn, _BIND_UPDATE) == 1
+
+
+def test_detached_retry_registration_refusal_refuses_the_receipt_and_finalizes() -> None:
+    """A positively-required observation registration refusal is a proven
+    pre-effect failure of the never-dispatched retry: the receipt is refused
+    (freeing the session's single-outstanding slot), the NEW retry Execution
+    finalizes ``failed_transient``, and nothing is admitted or sent."""
+    conn = ScriptedConnection()
+    _script_admission(conn)
+    _script_subject_reads(conn)  # R1
+    conn.on(_RECEIPT_INSERT, _retry_receipt_row())
+    conn.on(_RECEIPT_REFUSE, _retry_receipt_row(status="refused"))
+    conn.on(
+        _EXECUTION_GUARDED_UPDATE,
+        _execution_row(execution_id=_RETRY_EXECUTION_ID, number=2, status="failed_transient"),
+    )
+    pool, runtime, attachment = _arrange_retry_detached(conn)
+    registrar = _RecordingRegistrar(
+        error=ObservationRegistrationRefusedError(
+            "the observer refused the registration",
+            reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED.value,
+        )
+    )
+    handoff = _RecordingHandoff()
+
+    with pytest.raises(ObservationRegistrationRefusedError):
+        _dispatch_retry_detached_call(
+            cast(DatabasePool, pool),
+            producer_runtime_factory=attachment,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+            clock=lambda: _OBSERVED,
+        )
+
+    assert len(registrar.registrations) == 1
+    assert _count(conn, _RECEIPT_REFUSE) == 1
+    (update_params,) = [
+        params for sql, params in conn.executed if _EXECUTION_GUARDED_UPDATE(sql, None)
+    ]
+    assert update_params == ("failed_transient", _RETRY_EXECUTION_ID, "running")
+    assert _event_types(conn) == ["execution_started", "execution_failed"]
+    assert runtime.detached_admissions() == ()
+    assert runtime.submitted_sends() == ()
+    assert handoff.calls == []

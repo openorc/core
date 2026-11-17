@@ -114,12 +114,12 @@ class OperationKind(StrEnum):
     TASK_AUTHORIZED_IMPLEMENTATION_RETRY = "task_authorized_implementation_retry"
     # F5d (issue #267): the F4-authorized exact-head merge retry. The handler
     # invokes the shared merge-retry execution service; the due-time wakeup
-    # scheduling belongs to F11 (#257), not to this catalog.
+    # scheduling belongs to F12 (#316), not to this catalog.
     TASK_AUTHORIZED_MERGE_RETRY = "task_authorized_merge_retry"
     # F5f (issue #269): the F4-authorized exact-head PR-authorization
     # presentation retry. The handler invokes the shared presentation-retry
     # execution seam, which re-enters ONLY the guarded E7 presentation; the
-    # due-time wakeup scheduling belongs to F11 (#257), not to this catalog.
+    # due-time wakeup scheduling belongs to F12 (#316), not to this catalog.
     TASK_PR_AUTHORIZATION_RETRY = "task_pr_authorization_retry"
     TASK_PR_COMPOSITION = "task_pr_composition"
     TASK_PR_REVIEW = "task_pr_review"

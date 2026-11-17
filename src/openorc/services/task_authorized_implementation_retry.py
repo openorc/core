@@ -48,19 +48,27 @@ transaction spans an attachment or any runtime call):
    lookup then resolves the episode's original identity and automatically
    constructs F4's ``PRIOR_AUTHORIZED`` report with the exact bound effect
    row on failure; this service duplicates none of that reporting logic.
-3. **The shared E6 external mechanics** (no transaction open): process-local
-   attachment to the same admitted Producer session, R1 revalidation, the
-   native PLAN→ACT control on the same external session ID, the optional
-   qualifying-activity subscription, R2 revalidation immediately before the
-   one send carrying the canonical accepted Reviewer envelope, and the
-   guarded one-shot finalize reusing E6's exact failure discipline. An
-   uncertain ACT/send/finalize leaves the new Execution conservatively
-   ``running``; only a positively proven pre-effect failure finalizes it
-   truthfully. No automatic retries live in this service, and no F11
-   wakeup, scheduler, polling loop, or additional recovery policy is built
-   here: this seam is explicitly invocable for an already-due authorization
-   in both execution modes, and the persisted due instant is re-proven at
-   actual admission.
+3. **The external phase by execution mode (no transaction open):** in regular
+   mode the detached dispatch (issues #325/#340) commits the implementation
+   receipt strictly before the first runtime interaction, reconstructs the
+   serialized PLAN→ACT mode on the same external session ID, registers the
+   positively-required pre-admission observation, admits the persisted
+   accepted Reviewer envelope verbatim, and attaches the acknowledgement — no
+   send and no blocking wait; the independently observed completion settles
+   the new retry Execution through the shared settlement. The queue-mode
+   interim keeps the blocking external mechanics: process-local attachment to
+   the same admitted Producer session, R1 revalidation, the native PLAN→ACT
+   control on the same external session ID, the optional qualifying-activity
+   subscription, R2 revalidation immediately before the one send carrying the
+   canonical accepted Reviewer envelope, and the guarded one-shot finalize
+   reusing E6's exact failure discipline. An uncertain ACT/send/finalize (or
+   the detached path's uncertain admission) leaves the new Execution
+   conservatively ``running``; only a positively proven pre-effect failure
+   finalizes it truthfully. No automatic retries live in this service, and no
+   due-time wakeup, scheduler, polling loop, or additional recovery policy is
+   built here (F12, issue #316, owns waking due authorizations): this seam is
+   explicitly invocable for an already-due authorization in both execution
+   modes, and the persisted due instant is re-proven at actual admission.
 
 The E6 initial-implementation reservation stays strictly initial-only: this
 module never calls it, and the two seams share one execution workflow rather
@@ -107,11 +115,17 @@ from openorc.services.review_result_envelope import (
 from openorc.services.task_authorized_implementation_execution import (
     ActivitySubscriptionFactory,
     AuthorizedImplementationExecution,
+    DetachedTurnCompletionHandoff,
+    DispatchedImplementationExecution,
+    ImplementationObservationRegistrar,
     ProducerRuntimeAttachmentFactory,
+    _dispatch_detached_external_phase,
     _execute_external_phase,
     _load_authorized_subjects,
     _require_activity_factory,
+    _require_completion_handoff,
     _require_implementing_task,
+    _require_observation_registrar,
     _require_producer_factory,
     _require_uuid_command,
     _ReservedAttempt,
@@ -127,6 +141,7 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
+    "dispatch_authorized_implementation_retry_detached",
     "execute_authorized_implementation_retry",
 ]
 
@@ -134,6 +149,7 @@ logger = logging.getLogger(__name__)
 
 _SERVICE_TRACER_SCOPE: Final[str] = "openorc.services.task_authorized_implementation_retry"
 _EXECUTE_SPAN_NAME: Final[str] = "task_authorized_implementation_retry.execute"
+_DISPATCH_SPAN_NAME: Final[str] = "task_authorized_implementation_retry.dispatch_detached"
 
 
 def _consume_authorized_retry(
@@ -391,4 +407,105 @@ def execute_authorized_implementation_retry(
             message=message,
             producer_factory=producer_factory,
             activity_factory=activity_factory,
+        )
+
+
+def dispatch_authorized_implementation_retry_detached(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+    retry_attempt_id: UUID,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
+    observation_registrar: ImplementationObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+    attempt_evidence: InvocationAttemptEvidence | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> DispatchedImplementationExecution:
+    """Dispatch the one F4-authorized retry as one detached agent turn.
+
+    The detached counterpart of the ordinary F5c dispatch (issues
+    #325/#340): the same atomic admission, one-shot F4 authorization
+    consumption, set-once F4 binding, and the NEW retry Execution
+    reservation — then the shared detached external phase commits the
+    implementation receipt strictly before the first runtime interaction,
+    reconstructs the serialized PLAN→ACT mode on the same original Producer
+    session, registers the positively-required pre-admission observation,
+    admits the persisted accepted Reviewer envelope verbatim, and attaches
+    the acknowledgement. No ``send`` and no blocking wait exists in this
+    path, and no database transaction is ever held across a runtime call.
+
+    The R1/R2 authority guards and the proven/uncertain failure
+    classification are exactly the ordinary retry dispatch's: authority
+    moving on before realization finalizes the never-dispatched attempt
+    truthfully; authority moving on after realization is an uncertainty
+    that leaves the attempt conservatively running and the receipt
+    conservatively claimed, never a re-dispatch. Only positively proven
+    pre-effect failures refuse the receipt and finalize ``failed_transient``.
+
+    The dispatching worker returns after the acknowledgement attach. The
+    independently observed completion settles the NEW retry Execution
+    through the shared settlement (the receipt's ``IMPLEMENTATION_EXECUTION``
+    family and the retry Execution identity), and the ONE post-commit
+    completion handoff routes the exact-head PR_AUTHORIZATION presentation
+    from committed state. When a staged early completion already settled the
+    attempt within this dispatch, the handoff is invoked here strictly
+    post-commit — exactly one of the dispatching path and the observation
+    path settles a given receipt, so the continuation fires exactly once
+    either way.
+    """
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    _require_uuid_command(retry_attempt_id, "retry_attempt_id")
+    producer_factory = _require_producer_factory(producer_runtime_factory)
+    registrar = _require_observation_registrar(observation_registrar)
+    handoff = _require_completion_handoff(completion_handoff)
+    now = clock if clock is not None else (lambda: datetime.now(UTC))
+    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_DISPATCH_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        # --- Phase 1: the identical atomic admission, one-shot consumption,
+        # F4 set-once binding, and the new retry Execution reservation. ---
+        with composed_transaction(pool) as transaction_pool:
+            reserved = _consume_authorized_retry(
+                transaction_pool,
+                profile_id=profile_id,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                expected_state_token=expected_state_token,
+                retry_attempt_id=retry_attempt_id,
+                now=now,
+            )
+        if attempt_evidence is not None:
+            # The F5b coordinator's handoff fact: this invocation's newly
+            # produced retry Execution identity (#263) — never the original
+            # episode Execution. F5b's durable binding lookup turns a later
+            # failure into F4's PRIOR_AUTHORIZED report.
+            attempt_evidence.record_attempt(
+                family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+                original_attempt_kind=OriginalAttemptKind.EXECUTION,
+                original_attempt_id=reserved.execution.id,
+                phase="authorized_implementation_retry",
+            )
+        message = serialize_review_result(reserved.accepted_review)
+        # --- the detached dispatch phase: the shared authority-gated
+        # admission effects and the receipt bookkeeping. ---
+        return _dispatch_detached_external_phase(
+            pool,
+            reserved=reserved,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            message=message,
+            producer_factory=producer_factory,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
         )

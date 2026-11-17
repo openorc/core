@@ -81,7 +81,7 @@ transaction ever spans a GitHub call):
    escalates — the code can never be retry-eligible) instead of orphaning
    the consumed authorization.
 
-This seam never schedules wakeups (F11 #257 owns due-time submission), never
+This seam never schedules wakeups (F12 #316 owns due-time submission), never
 re-approves or mutates the gate, and never applies a second merge mutation
 within one invocation.
 """
