@@ -2483,7 +2483,12 @@ class _RecordingCompletionHandoff:
         self.calls: list[tuple[Any, Any, Any]] = []
 
     def handoff_settled_completion(
-        self, *, workspace_id: Any, task_id: Any, operation: Any
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+        validated_result: Any = None,
     ) -> None:
         self.calls.append((workspace_id, task_id, operation))
 

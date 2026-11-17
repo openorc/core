@@ -55,7 +55,7 @@ from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOpe
 from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.models import ImplementationResult, WorkspaceResult
+from openorc.protocol.models import ImplementationResult, PrResult, WorkspaceResult
 from openorc.services import task_detached_turn_correlation as correlation_module
 from openorc.services.errors import ConflictError, InvalidCommandError, StaleOperationError
 from openorc.services.task_detached_turn_correlation import (
@@ -69,7 +69,7 @@ from openorc.services.task_detached_turn_correlation import (
     record_task_detached_turn_receipt,
     settle_observed_turn_completion,
 )
-from tests.fakes.agent_runtime import implementation_result_candidate
+from tests.fakes.agent_runtime import implementation_result_candidate, pr_result_candidate
 from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 11, 15, 9, 0, 0, tzinfo=UTC)
@@ -2582,3 +2582,246 @@ def test_a_moved_on_review_settles_the_validated_result_as_not_applied(
     assert triage.calls == []
     executed = [" ".join(sql.split()) for sql, _ in conn.executed]
     assert not any("insert into openorc.workflow_events" in sql for sql in executed)
+
+
+# --- the PR_COMPOSE settlement routing (issue #337) -----------------------------------
+
+_PR_CLAIM_ID = uuid4()
+_PR_GATE_ROW_ID = uuid4()
+_PR_APPROVER_ID = uuid4()
+_PR_RESULT_CANDIDATE = json.dumps(pr_result_candidate(title="feat: ship it", body="Done."))
+
+
+def _pr_compose_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+) -> tuple[Any, ...]:
+    """The PR_COMPOSE family's receipt row: rooted at the send claim."""
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        "pr_compose_dispatch",
+        "runtime_send_claim",
+        _PR_CLAIM_ID,
+        "pr_result",
+        admitted_turn_reference,
+        status,
+        {},
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+    )
+
+
+def _pr_compose_claim_row(*, status: str = "claimed") -> tuple[Any, ...]:
+    """The 14-column PR_COMPOSE send-claim row the route reads."""
+    settled_at = _OBSERVED if status != "claimed" else None
+    return (
+        _PR_CLAIM_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "pr_compose_dispatch",
+        _SESSION_ID,
+        None,
+        _PR_GATE_ROW_ID,
+        "d" * 40,
+        None,
+        status,
+        {},
+        _OBSERVED,
+        settled_at,
+        _OBSERVED,
+    )
+
+
+def _script_pr_compose_settlement_subjects(conn: ScriptedConnection) -> None:
+    """The owning settlement's subject re-derivation reads: the plain Task
+    read, the absent canonical record, and the repeating
+    gate/audit/session/barrier/Workspace/route reads."""
+    _waiting_row = task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        status="waiting_for_owner",
+        state_token=_STATE_TOKEN,
+        source_requirements_fingerprint="a" * 64,
+        canonical_feature_branch="openorc/task-42-implementation",
+    )
+    conn.on(_sql_has_not("from openorc.tasks where id = %s", absent="for update"), _waiting_row)
+    conn.on(_sql_has("from openorc.task_pull_requests"), None)
+    conn.on(_sql_has_not("from openorc.tasks where id = %s", absent="for update"), _waiting_row)
+    conn.on_repeat(
+        _sql_has("from openorc.owner_gates"),
+        (
+            uuid4(),
+            _WORKSPACE_ID,
+            _TASK_ID,
+            OwnerGateType.PR_AUTHORIZATION.value,
+            OwnerGateStatus.APPROVED.value,
+            None,
+            "d" * 40,
+            None,
+            None,
+            _OBSERVED,
+            _OBSERVED,
+        ),
+    )
+    conn.on_repeat(
+        _sql_has("from openorc.workflow_events"),
+        [
+            (
+                uuid4(),
+                _WORKSPACE_ID,
+                _TASK_ID,
+                "owner_gate_resolved",
+                "owner",
+                str(_PR_APPROVER_ID),
+                "owner_gate",
+                _PR_GATE_ROW_ID,
+                {"outcome": "approved"},
+                _OBSERVED,
+            )
+        ],
+    )
+    conn.on_repeat(_sql_has("from openorc.task_agent_sessions"), _session_row())
+    conn.on_repeat(
+        _sql_has("from openorc.profiles"),
+        (None, None, None),
+    )
+    conn.on_repeat(
+        _sql_has("from openorc.workspaces"),
+        (
+            _WORKSPACE_ID,
+            _PR_APPROVER_ID,
+            "platform",
+            _OBSERVED,
+            _OBSERVED,
+            2,
+            "",
+            None,
+        ),
+    )
+    conn.on_repeat(
+        _sql_has("from openorc.repositories"),
+        (
+            uuid4(),
+            uuid4(),
+            _WORKSPACE_ID,
+            987654321,
+            "octocat",
+            "hello-world",
+            "https://github.com/octocat/hello-world",
+            False,
+            "main",
+            _OBSERVED,
+            _OBSERVED,
+            uuid4(),
+        ),
+    )
+    conn.on_repeat(
+        _sql_has("from openorc.github_installations"),
+        (
+            uuid4(),
+            _WORKSPACE_ID,
+            12345678,
+            501,
+            "octocat",
+            "Organization",
+            None,
+            _OBSERVED,
+            _OBSERVED,
+        ),
+    )
+
+
+def test_a_validated_pr_result_settles_the_pr_compose_claim_and_receipt(
+    triage: _RecordingTriage,
+) -> None:
+    """The PR_COMPOSE family's attributed completion funnels the validated
+    ``pr_result`` through the owning settlement: the send claim and the
+    receipt settle atomically and no Level 2 report runs (issue #337)."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _pr_compose_receipt_row())
+    _script_attach(
+        conn,
+        _pr_compose_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    _script_staged(conn, _staged_row(candidate=_PR_RESULT_CANDIDATE))
+    conn.on(
+        _sql_has("from openorc.task_runtime_send_claims where id = %s"),
+        _pr_compose_claim_row(),
+    )
+    _script_pr_compose_settlement_subjects(conn)
+    conn.on(
+        _sql_has("update openorc.task_runtime_send_claims"),
+        _pr_compose_claim_row(status="settled"),
+    )
+    _script_settle(conn, _settled_row(SETTLEMENT_VALIDATED_RESULT))
+    _script_consume(conn)
+
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert isinstance(outcome.formal_result, PrResult)
+    assert outcome.formal_result.title == "feat: ship it"
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    settle_at = next(index for index, sql in enumerate(executed) if "set status = 'settled'" in sql)
+    delete_at = next(
+        index for index, sql in enumerate(executed) if sql.startswith("delete from openorc")
+    )
+    assert settle_at < delete_at
+
+
+def test_a_failed_pr_compose_terminal_reports_level_2_under_the_claim_family(
+    triage: _RecordingTriage,
+) -> None:
+    """An observed PR_COMPOSE run failure settles the receipt truthfully and
+    reports through the existing Level 2 machinery under the claim's own
+    family at the composition's expected Task status — never a re-dispatch
+    of the one-shot claim (issue #337)."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _pr_compose_receipt_row())
+    _script_attach(
+        conn, _pr_compose_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE)
+    )
+    _script_staged(conn, _staged_row(kind="run.failed"))
+    conn.on(
+        _sql_has("from openorc.task_runtime_send_claims where id = %s"),
+        _pr_compose_claim_row(),
+    )
+    _script_settle(conn, _settled_row("observed_failure"))
+    _script_current_task(conn, status="waiting_for_owner")
+    _script_consume(conn)
+
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    call = triage.calls[0]
+    assert call["expected_status"].value == "waiting_for_owner"
+    assert call["operation"].family.value == "pr_compose_dispatch"
+    assert call["operation"].original_attempt_kind.value == "runtime_send_claim"
+    assert call["operation"].original_attempt_id == _PR_CLAIM_ID
+    assert call["report"].error_code is OperationalFailureCode.EXTERNAL_OPERATION_FAILED

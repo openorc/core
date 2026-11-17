@@ -24,8 +24,14 @@ import pytest
 from openorc.config import ConfigurationError, ExecutionMode, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
+from openorc.domain.send_claims import (
+    TaskRuntimeSendClaimKind,
+    TaskRuntimeSendClaimStatus,
+)
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
+from openorc.protocol.models import PR_RESULT_FAMILY
+from openorc.protocol.parsing import parse_formal_response
 from openorc.services.errors import (
     ConflictError,
     ExternalOperationFailedError,
@@ -35,7 +41,7 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_planning_review_decision import PlanningReviewDecision
-from openorc.services.task_pr_composition import TaskPrPublished
+from openorc.services.task_pr_composition import SettledTaskPrPublication, TaskPrPublished
 from openorc.services.task_pr_review_decision import PrReviewDecision
 from openorc.services.task_start import TaskStartStatus
 from openorc.workers import task_workflow
@@ -65,6 +71,7 @@ from openorc.workers.invocation import (
     decode_operation_invocation,
     execute_operation_job,
 )
+from tests.fakes.agent_runtime import pr_result_candidate
 from tests.fakes.task_rows import task_row
 
 _WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000001")
@@ -896,7 +903,10 @@ def test_authorized_implementation_retry_composition_consumes_and_presents_the_p
 def test_pr_composition_composition_submits_the_pr_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    # The blocking compose-publish-review interim is the queue-mode behavior
+    # (until #328); the regular-mode composition dispatches the composition
+    # turn detached (issue #337).
+    dependencies, submitter = make_queue_dependencies()
     published = fake_published()
     compose = RecordingService(result=published)
     with patched_workflow_environment(monkeypatch, compose_pr=compose):
@@ -2617,4 +2627,234 @@ def test_the_completion_handoff_review_route_ends_at_the_resolution_gate(
 
     assert presentations == []
     assert dispatches == []
+    assert submitter.submissions == []
+
+
+# --- the detached PR_COMPOSE dispatch and the settlement handoff route (#337) ---------
+
+
+def test_pr_composition_composition_dispatches_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode composition admits the PR_COMPOSE turn detached and
+    returns: no blocking composition, no publication, and no inline PR-review
+    submission happen in the dispatching worker (issue #337)."""
+    dependencies, submitter = make_dependencies()
+    dispatched = SimpleNamespace(published=None)
+    dispatch = RecordingService(result=dispatched)
+    monkeypatch.setattr(task_workflow, "dispatch_pr_compose_detached", dispatch, raising=True)
+
+    payload = TaskPrCompositionPayload(
+        task=_TASK_SCOPE_PRODUCER,
+        profile_id=str(_PROFILE_ID),
+        owner_gate_id=str(_OWNER_GATE_ID),
+        expected_state_token=str(_STATE_TOKEN),
+    )
+    task_workflow.execute_task_workflow_operation(
+        OperationInvocation(kind=OperationKind.TASK_PR_COMPOSITION, payload=payload),
+        dependencies=dependencies,
+    )
+
+    assert dispatch.call_count == 1
+    recorded = dispatch.calls[0]["kwargs"]
+    assert recorded["profile_id"] == _PROFILE_ID
+    assert recorded["workspace_id"] == _WORKSPACE_ID
+    assert recorded["task_id"] == _TASK_ID
+    assert recorded["owner_gate_id"] == _OWNER_GATE_ID
+    assert recorded["expected_state_token"] == _STATE_TOKEN
+    assert recorded["observation_registrar"] is not None
+    assert callable(recorded["completion_handoff"].handoff_settled_completion)
+    assert submitter.submissions == []
+
+
+def test_pr_composition_composition_submits_the_pr_review_on_the_continuation_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The narrow interrupted-publication continuation owns no detached turn:
+    the dispatch finalizes it inline and the composition submits the exact
+    typed PR review for the finalized publication (issue #337)."""
+    dependencies, submitter = make_dependencies()
+    published_token = _NEXT_TOKEN
+    pull_request_id = uuid4()
+    dispatched = SimpleNamespace(
+        published=SimpleNamespace(
+            task=SimpleNamespace(state_token=published_token),
+            pull_request=SimpleNamespace(id=pull_request_id),
+        )
+    )
+    dispatch = RecordingService(result=dispatched)
+    monkeypatch.setattr(task_workflow, "dispatch_pr_compose_detached", dispatch, raising=True)
+
+    payload = TaskPrCompositionPayload(
+        task=_TASK_SCOPE_PRODUCER,
+        profile_id=str(_PROFILE_ID),
+        owner_gate_id=str(_OWNER_GATE_ID),
+        expected_state_token=str(_STATE_TOKEN),
+    )
+    task_workflow.execute_task_workflow_operation(
+        OperationInvocation(kind=OperationKind.TASK_PR_COMPOSITION, payload=payload),
+        dependencies=dependencies,
+    )
+
+    assert dispatch.call_count == 1
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_PR_REVIEW
+    assert isinstance(submitted.payload, TaskPrReviewPayload)
+    assert submitted.payload.profile_id == str(_PROFILE_ID)
+    assert submitted.payload.task_pull_request_id == str(pull_request_id)
+    assert submitted.payload.expected_state_token == str(published_token)
+
+
+def _settled_pr_claim() -> Any:
+    return SimpleNamespace(
+        kind=TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH,
+        status=TaskRuntimeSendClaimStatus.SETTLED,
+        owner_gate_id=_OWNER_GATE_ID,
+    )
+
+
+def _waiting_task(*, status: TaskStatus = TaskStatus.WAITING_FOR_OWNER) -> Any:
+    return SimpleNamespace(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        state_token=_STATE_TOKEN,
+        status=status,
+        current_owner_gate_id=None,
+        canonical_feature_branch="openorc/task-42-implementation",
+    )
+
+
+def test_the_completion_handoff_publishes_the_pr_compose_family_and_submits_the_pr_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settled PR_COMPOSE completion publishes through the owning service
+    with the in-memory validated result and submits exactly one typed
+    TASK_PR_REVIEW from committed state (issue #337)."""
+    dependencies, submitter = make_queue_dependencies()
+    task = _waiting_task()
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.send_claim_records,
+        "list_task_runtime_send_claims",
+        lambda _pool, *, task_id: [_settled_pr_claim()] if task_id == _TASK_ID else [],
+    )
+    pull_request_id = uuid4()
+    published = SettledTaskPrPublication(
+        task=cast(Any, SimpleNamespace(state_token=_NEXT_TOKEN)),
+        pull_request=cast(Any, SimpleNamespace(id=pull_request_id)),
+        approving_profile_id=_PROFILE_ID,
+    )
+    publication = RecordingService(result=published)
+    monkeypatch.setattr(
+        task_workflow, "publish_settled_task_pr_composition", publication, raising=True
+    )
+    validated = parse_formal_response(
+        pr_result_candidate(title="t", body="b"), expected_family=PR_RESULT_FAMILY
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+        validated_result=validated,
+    )
+
+    assert publication.call_count == 1
+    assert publication.calls[0]["kwargs"] == {
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "owner_gate_id": _OWNER_GATE_ID,
+        "expected_state_token": _STATE_TOKEN,
+        "pr_result": validated,
+    }
+    assert len(submitter.submissions) == 1
+    submitted = submitter.submissions[0]
+    assert submitted.kind is OperationKind.TASK_PR_REVIEW
+    assert isinstance(submitted.payload, TaskPrReviewPayload)
+    assert submitted.payload.profile_id == str(_PROFILE_ID)
+    assert submitted.payload.task_pull_request_id == str(pull_request_id)
+    assert submitted.payload.expected_state_token == str(_NEXT_TOKEN)
+
+
+def test_the_completion_handoff_pr_route_requires_the_validated_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The publication cannot re-derive the v1-unstored title/body: a missing
+    in-memory validated result fails closed before any read (issue #337)."""
+    dependencies, submitter = make_queue_dependencies()
+
+    def _fail_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("no durable read may run without the validated result")
+
+    monkeypatch.setattr(task_workflow.task_records, "get_task", _fail_read)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(ConflictError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+        )
+
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_rejects_a_result_on_other_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the PR_COMPOSE family consumes an in-memory validated result;
+    every other family's durable-state continuation rejects one fail-closed
+    (issue #337)."""
+    dependencies, submitter = make_queue_dependencies()
+    validated = parse_formal_response(
+        pr_result_candidate(title="t", body="b"), expected_family=PR_RESULT_FAMILY
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(ConflictError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+            validated_result=validated,
+        )
+
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_pr_route_is_a_noop_without_a_settled_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A moved-on Task or a missing settled claim submits nothing: the durable
+    state owns every other outcome (issue #337)."""
+    dependencies, submitter = make_queue_dependencies()
+    task = _waiting_task(status=TaskStatus.REVIEWING)
+    monkeypatch.setattr(
+        task_workflow.task_records,
+        "get_task",
+        lambda _pool, *, task_id: task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        task_workflow.send_claim_records,
+        "list_task_runtime_send_claims",
+        lambda _pool, *, task_id: [],
+    )
+    validated = parse_formal_response(
+        pr_result_candidate(title="t", body="b"), expected_family=PR_RESULT_FAMILY
+    )
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
+        validated_result=validated,
+    )
+
     assert submitter.submissions == []

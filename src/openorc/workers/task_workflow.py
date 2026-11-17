@@ -52,13 +52,19 @@ from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
+from openorc.domain.send_claims import (
+    TaskRuntimeSendClaimKind,
+    TaskRuntimeSendClaimStatus,
+)
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.persistence import reviews as review_records
+from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
+from openorc.protocol.models import FormalResponse, PrResult
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
 from openorc.services.cline_planning_bootstrap import ClineBootstrapRuntimeComposition
 from openorc.services.errors import ConflictError, NotFoundError, StaleOperationError
@@ -117,7 +123,12 @@ from openorc.services.task_planning_review_dispatch import (
     dispatch_planning_review_detached,
 )
 from openorc.services.task_pr_authorization import ApprovedPrAuthorization, open_pr_authorization
-from openorc.services.task_pr_composition import TaskPrPublished, compose_and_publish_task_pr
+from openorc.services.task_pr_composition import (
+    TaskPrPublished,
+    compose_and_publish_task_pr,
+    dispatch_pr_compose_detached,
+    publish_settled_task_pr_composition,
+)
 from openorc.services.task_pr_remediation import TaskPrRemediationOutcome
 from openorc.services.task_pr_review_decision import finalize_pr_review_decision
 from openorc.services.task_pr_review_dispatch import (
@@ -540,15 +551,20 @@ class _DetachedCompletionHandoff:
     same-session planning-context transition and arranges the next typed
     initial-plan invocation; the plan-result routes (issue #335) submit
     the existing typed planning REVIEW round from committed state after a
-    settled initial-PLAN or REVISE result; and the planning-REVIEW route
+    settled initial-PLAN or REVISE result; the planning-REVIEW route
     (issue #336) owns the settled review decision's workflow continuation
     from committed state — the exact-plan IMPLEMENTATION_AUTHORIZATION
     presentation on acceptance and the detached Producer REVISE dispatch on
     an in-budget change request, with the exhausted REVIEW_RESOLUTION gate
-    owning its own Owner-mediated pause. A settled family without a wired
-    route is a fail-closed conflict that its own detached migration wires; no
-    gate or workflow policy lives here beyond the routing and the
-    committed-state re-derivation itself.
+    owning its own Owner-mediated pause; and the PR_COMPOSE route
+    (issue #337) performs the settled composition's bounded publication
+    through the existing owning service — the one place the settlement's
+    in-memory validated ``pr_result`` is consumed, since the v1 persistence
+    decision deliberately stores no title/body — and then submits the
+    existing typed TASK_PR_REVIEW from committed state. A settled family
+    without a wired route is a fail-closed conflict that its own detached
+    migration wires; no gate or workflow policy lives here beyond the
+    routing and the committed-state re-derivation itself.
     """
 
     def __init__(self, dependencies: OperationDependencies) -> None:
@@ -560,7 +576,17 @@ class _DetachedCompletionHandoff:
         workspace_id: UUID,
         task_id: UUID,
         operation: PendingTaskRuntimeInteractionOperation,
+        validated_result: FormalResponse | None = None,
     ) -> None:
+        if validated_result is not None and (
+            operation is not PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH
+        ):
+            # Fail-closed: only the PR_COMPOSE family consumes an in-memory
+            # validated result (issue #337) — every other family re-derives
+            # its continuation from committed durable state.
+            raise ConflictError(
+                "the settled operation family cannot carry an in-memory validated result"
+            )
         if operation is PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION:
             _handoff_initialization_completion(
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
@@ -587,6 +613,14 @@ class _DetachedCompletionHandoff:
         if operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
             _handoff_review_result_completion(
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
+        if operation is PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH:
+            _handoff_pr_compose_completion(
+                self._dependencies,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                validated_result=validated_result,
             )
             return
         raise ConflictError(
@@ -928,6 +962,110 @@ def _handoff_review_result_completion(
         profile_id=owner_profile_id,
         expected_state_token=expected_state_token,
         invoke_level_one=invoke_level_one,
+    )
+
+
+def _handoff_pr_compose_completion(
+    dependencies: OperationDependencies,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    validated_result: FormalResponse | None,
+) -> None:
+    """The PR_COMPOSE route: the settled composition's bounded publication.
+
+    The settled PR_COMPOSE claim (exactly one ``settled`` claim — its
+    validated ``pr_result`` was the only settlement authority, issue #337)
+    is the durable proof that the attributable composition turn completed;
+    the validated ``PrResult`` arrives in memory from the same settlement
+    invocation (the v1 persistence decision deliberately stores no
+    title/body, so the publication cannot be re-derived). The route
+    re-derives every authority from committed state — the exact current
+    ``waiting_for_owner`` Task (the claim and receipt settlements never
+    rotated its token), no current OwnerGate, a bound canonical branch, no
+    canonical record — and invokes the existing owning service's bounded
+    publication continuation in this same completion-processing invocation,
+    with no database transaction across the GitHub I/O. On the finalized
+    publication it submits the existing typed ``TASK_PR_REVIEW`` invocation
+    through the executing process's continuation seam with the published
+    token, the canonical PR identity, and the re-derived approving Profile —
+    exactly the submission the blocking compositions perform after a
+    published PR. Every input is re-derived from committed durable state
+    except the in-memory presentation; a failed or uncertain continuation
+    is transport information only, never Task truth, and never permits a
+    blind re-enqueue — the durable state owns recovery.
+    """
+    if not isinstance(validated_result, PrResult):
+        # Fail-closed: the PR route's publication cannot run without the
+        # settlement's validated presentation, and no title/body is ever
+        # invented or re-derived.
+        raise ConflictError(
+            "the settled pr composition carries no in-memory validated "
+            "pr_result; the publication continuation is not available"
+        )
+    pool = dependencies.database_pool()
+    task = task_records.get_task(pool, task_id=task_id)
+    if task is None or task.workspace_id != workspace_id:
+        return
+    if (
+        task.status is not TaskStatus.WAITING_FOR_OWNER
+        or task.current_owner_gate_id is not None
+        or task.canonical_feature_branch is None
+    ):
+        # The settled composition's own durable continuations are the only
+        # authority; anything else is already resolved or owned by another
+        # path.
+        return
+    settled_claims = [
+        claim
+        for claim in send_claim_records.list_task_runtime_send_claims(pool, task_id=task_id)
+        if claim.kind is TaskRuntimeSendClaimKind.PR_COMPOSE_DISPATCH
+        and claim.status is TaskRuntimeSendClaimStatus.SETTLED
+    ]
+    if not settled_claims:
+        return
+    if len(settled_claims) > 1:
+        # More than one settled PR_COMPOSE claim for one Task is a durable
+        # invariant violation (the one-shot claim's exactly-once backstop):
+        # fail closed, never guess.
+        raise ConflictError(
+            "the task carries multiple settled pr compose claims; the publication "
+            "continuation cannot choose a subject"
+        )
+    settled_claim = settled_claims[0]
+    owner_gate_id = settled_claim.owner_gate_id
+    if owner_gate_id is None:  # pragma: no cover - the kind's subject form
+        raise ConflictError("the settled pr compose claim carries no owner-gate subject")
+    github = dependencies.github_client()
+    user_token_resolver = dependencies.user_token_resolver()
+    published = publish_settled_task_pr_composition(
+        pool,
+        github,
+        user_token_resolver,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=task.state_token,
+        pr_result=validated_result,
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
+            dependencies.continuation_submitter()
+        ),
+    )
+    _submit_continuation(
+        dependencies,
+        OperationInvocation(
+            kind=OperationKind.TASK_PR_REVIEW,
+            payload=TaskPrReviewPayload(
+                task=TaskScope(
+                    workspace_id=str(task.workspace_id),
+                    task_id=str(task.id),
+                    role=WorkflowRoleRef.REVIEWER,
+                ),
+                profile_id=str(published.approving_profile_id),
+                task_pull_request_id=str(published.pull_request.id),
+                expected_state_token=str(published.task.state_token),
+            ),
+        ),
     )
 
 
@@ -1423,7 +1561,20 @@ def _compose_task_pr_composition(
 ) -> None:
     """Compose and publish the canonical PR under the approving Profile.
 
-    The E8 service re-derives the persisted approved PR_AUTHORIZATION gate,
+    Regular mode (issue #337): the composition turn is itself one detached
+    agent turn — the E8 admission, the one-shot PR_COMPOSE send claim with
+    its detached-turn receipt companion, and the verbatim admission on the
+    exact Producer session commit here, and the worker returns after the
+    acknowledgement attach without waiting for any model turn. The
+    independently observed completion settles the validated ``pr_result``
+    through the owning settlement, and the ONE post-commit completion
+    handoff owns the bounded publication and the PR-review submission from
+    committed state. The narrow interrupted-publication continuation owns
+    no detached turn: the dispatch reconciles and finalizes it inline, and
+    this composition submits the PR review for the finalized publication.
+
+    Queue mode keeps the blocking compose-publish-review interim until #328:
+    the E8 service re-derives the persisted approved PR_AUTHORIZATION gate,
     its exact head-SHA subject, and the OWNER-attributed approving Profile
     from durable state, and publishes through the approving Profile's own
     user-to-server authorization — the payload's accountable Profile is
@@ -1441,23 +1592,58 @@ def _compose_task_pr_composition(
     owner_gate_id = UUID(payload.owner_gate_id)
     expected_state_token = UUID(payload.expected_state_token)
 
-    published = compose_and_publish_task_pr(
-        pool,
-        github,
-        user_token_resolver,
-        _producer_runtime_attachment_factory(
-            dependencies, workspace_id=workspace_id, task_id=task_id
-        ),
-        profile_id=profile_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        owner_gate_id=owner_gate_id,
-        expected_state_token=expected_state_token,
-        attempt_evidence=attempt_evidence,
-        terminal_finalization_submission=F1TerminalFinalizationSubmission(
-            dependencies.continuation_submitter()
-        ),
-    )
+    # The detached PR-composition dispatch needs the executing process's
+    # detached-turn observation host and the ONE post-commit completion
+    # handoff — regular-mode process dependencies (issues #323/#333). Queue
+    # mode resolves neither and keeps the blocking composition interim.
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        dispatched = dispatch_pr_compose_detached(
+            pool,
+            github,
+            user_token_resolver,
+            _producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            terminal_finalization_submission=F1TerminalFinalizationSubmission(
+                dependencies.continuation_submitter()
+            ),
+            attempt_evidence=attempt_evidence,
+        )
+        if dispatched.published is None:
+            # The fresh composition is durably admitted: the worker returns
+            # without waiting for the pr_result. The observed completion owns
+            # the settlement; submission outcomes are transport information
+            # only and the durable state owns recovery.
+            return
+        # The narrow continuation finalized this invocation's own
+        # interrupted publication (no composition ran): the same authorized
+        # PR-review submission the clean published result always performs.
+        published = dispatched.published
+    else:
+        published = compose_and_publish_task_pr(
+            pool,
+            github,
+            user_token_resolver,
+            _producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            owner_gate_id=owner_gate_id,
+            expected_state_token=expected_state_token,
+            attempt_evidence=attempt_evidence,
+            terminal_finalization_submission=F1TerminalFinalizationSubmission(
+                dependencies.continuation_submitter()
+            ),
+        )
     _submit_continuation(
         dependencies,
         OperationInvocation(
