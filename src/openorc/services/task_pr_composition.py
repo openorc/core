@@ -1853,18 +1853,22 @@ def _revalidate_settlement_subjects(
 
     The exact durable facts the committed PR_COMPOSE claim addressed must
     still be the publication's subject set at observation time: the exact
-    current ``waiting_for_owner`` Task (the claim and receipt settlements
-    never rotate the token, so the Task's current token is the subject's
-    own), no current OwnerGate, a bound canonical feature branch, no
-    canonical record, the claim's approved ``PR_AUTHORIZATION`` gate still
-    carrying the claim's exact head SHA, and the claim's exact READY
-    Producer binding. An existing canonical record means the composition
-    already resolved — the existing recovery semantics own the residue,
-    never a second create. The full authorization re-proof (the account
-    barrier, the Workspace Owner scope) happens again in the bounded
-    publication continuation, before any GitHub call.
+    current ``waiting_for_owner`` Task — read under the exclusive Task row
+    lock, because this settlement performs no conditional Task write of its
+    own (the publication is the post-settlement consequence) and the lock is
+    what serializes its currentness with every composed Task transition (an
+    Owner Abort, blocking, or cancellation that wins the lock first is
+    observed here; one that comes later serializes behind the settlement) —
+    no current OwnerGate, a bound canonical feature branch, no canonical
+    record, the claim's approved ``PR_AUTHORIZATION`` gate still carrying the
+    claim's exact head SHA, and the claim's exact READY Producer binding. An
+    existing canonical record means the composition already resolved — the
+    existing recovery semantics own the residue, never a second create. The
+    full authorization re-proof (the account barrier, the Workspace Owner
+    scope) happens again in the bounded publication continuation, before any
+    GitHub call.
     """
-    task = task_records.get_task(transaction_pool, task_id=task_id)
+    task = task_records.get_task_for_update(transaction_pool, task_id)
     if task is None or task.workspace_id != workspace_id:
         raise NotFoundError("the requested task is not available in this workspace")
     if task.status is not TaskStatus.WAITING_FOR_OWNER:

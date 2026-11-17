@@ -2328,12 +2328,14 @@ def test_the_narrow_continuation_finalizes_inline_without_any_detached_turn(
 
 
 def _script_pr_settlement(conn: ScriptedConnection, *, task_row: tuple[Any, ...]) -> None:
-    """The settlement transaction's reads: the plain Task read, the canonical
-    record read (absent on the applicable subject), the Workspace-scope task
-    read under the route-subject resolution, and the repeating
-    gate/audit/session/route reads — then the claim's one-shot settlement."""
+    """The settlement transaction's reads: the Task read under the exclusive
+    Task row lock (the settlement's currentness serialization, issue #337),
+    the canonical record read (absent on the applicable subject), the
+    Workspace-scope task read under the route-subject resolution, and the
+    repeating gate/audit/session/route reads — then the claim's one-shot
+    settlement."""
     _script_repeating_reads(conn)
-    conn.on(_TASK_READ, task_row)
+    conn.on(_TASK_READ_LOCKED, task_row)
     conn.on(_PR_READ, None)
     conn.on(_TASK_READ, task_row)
     conn.on(_CLAIM_SETTLE_WRITE, _claim_row(status="settled"))
@@ -2362,12 +2364,27 @@ def test_the_observed_pr_result_settles_the_claim_with_only_the_head_identity() 
     outcome = getattr(settle_params[1], "obj", settle_params[1])
     assert outcome == {"subject_head_sha": _HEAD_SHA}
     assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
+    # The settlement's currentness observation is serialized on the Task row
+    # lock: a concurrent Owner Abort/blocking/cancellation either won the
+    # lock before the settlement (observed here) or serializes behind it.
+    assert any(_TASK_READ_LOCKED(sql, None) for sql, _ in conn.executed)
 
 
-def test_a_moved_on_subject_settles_the_observed_pr_result_not_applied() -> None:
+def test_a_concurrent_task_transition_before_the_settlement_settles_result_not_applied() -> None:
+    """The settlement-currentness race regression (issue #337 review): the
+    settlement writes no Task row of its own, so its currentness observation
+    is serialized on the Task row lock — a concurrent Owner Abort (or any
+    other composed transition) that won the lock first is observed as the
+    moved-on subject, and the validated result can never settle a stale
+    claim+receipt as ``validated_result``."""
     conn = ScriptedConnection()
     _script_repeating_reads(conn)
-    conn.on(_TASK_READ, _task_row(status="implementing", state_token=_ROTATED_TOKEN))
+    # The concurrent transition won the lock first: the locked observation
+    # sees the aborted Task under its rotated token.
+    conn.on(
+        _TASK_READ_LOCKED,
+        _task_row(status="blocked", state_token=_ROTATED_TOKEN, gate_id=_STALE_GATE_ID),
+    )
     pool = _pool(conn)
 
     subjects = settle_observed_pr_compose_result(
@@ -2379,7 +2396,12 @@ def test_a_moved_on_subject_settles_the_observed_pr_result_not_applied() -> None
     )
 
     assert subjects is None
+    # Nothing settled: the claim stays conservatively claimed and the receipt
+    # settles result-not-applied at the routing layer — never a
+    # validated_result for a no-longer-current subject.
+    assert any(_TASK_READ_LOCKED(sql, None) for sql, _ in conn.executed)
     assert not any(_CLAIM_SETTLE_WRITE(sql, params) for sql, params in conn.executed)
+    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
 
 
 def _script_settled_publication(
@@ -2540,7 +2562,7 @@ def test_an_early_pr_result_settles_through_the_attach_and_reaches_the_handoff(
     )
     conn.on(_EARLY_COMPLETION_READ, _staged_pr_completion_row())
     conn.on(_CLAIM_READ, _claim_row())
-    conn.on(_TASK_READ, _task_row())
+    conn.on(_TASK_READ_LOCKED, _task_row())
     conn.on(_PR_READ, None)
     conn.on(_TASK_READ, _task_row())
     conn.on(_CLAIM_SETTLE_WRITE, _claim_row(status="settled"))

@@ -2645,9 +2645,11 @@ def _pr_compose_claim_row(*, status: str = "claimed") -> tuple[Any, ...]:
 
 
 def _script_pr_compose_settlement_subjects(conn: ScriptedConnection) -> None:
-    """The owning settlement's subject re-derivation reads: the plain Task
-    read, the absent canonical record, and the repeating
-    gate/audit/session/barrier/Workspace/route reads."""
+    """The owning settlement's subject re-derivation reads: the Task read
+    under the exclusive Task row lock (the settlement's currentness
+    serialization, issue #337 review), the absent canonical record, the
+    Workspace-scope task read under the route-subject resolution, and the
+    repeating gate/audit/session/barrier/Workspace/route reads."""
     _waiting_row = task_row(
         id=_TASK_ID,
         workspace_id=_WORKSPACE_ID,
@@ -2656,7 +2658,7 @@ def _script_pr_compose_settlement_subjects(conn: ScriptedConnection) -> None:
         source_requirements_fingerprint="a" * 64,
         canonical_feature_branch="openorc/task-42-implementation",
     )
-    conn.on(_sql_has_not("from openorc.tasks where id = %s", absent="for update"), _waiting_row)
+    conn.on(_sql_has("from openorc.tasks where id = %s for update"), _waiting_row)
     conn.on(_sql_has("from openorc.task_pull_requests"), None)
     conn.on(_sql_has_not("from openorc.tasks where id = %s", absent="for update"), _waiting_row)
     conn.on_repeat(
@@ -2781,7 +2783,16 @@ def test_a_validated_pr_result_settles_the_pr_compose_claim_and_receipt(
     assert outcome.formal_result.title == "feat: ship it"
     assert triage.calls == []
     executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    # The settlement's currentness observation is serialized on the Task row
+    # lock (issue #337 review): the settlement writes no Task row of its own,
+    # so the locked read is what excludes a concurrent transition.
+    task_read_at = next(
+        index
+        for index, sql in enumerate(executed)
+        if "from openorc.tasks where id" in sql and "for update" in sql
+    )
     settle_at = next(index for index, sql in enumerate(executed) if "set status = 'settled'" in sql)
+    assert task_read_at < settle_at
     delete_at = next(
         index for index, sql in enumerate(executed) if sql.startswith("delete from openorc")
     )
