@@ -184,8 +184,8 @@ class TaskMergeOutcomeKind(StrEnum):
     # transport failure received ONE durably authorized bounded Level 2 retry
     # (the persisted OperationalFailureAttempt with its ordinal and due
     # instant). No block applies; the Task stays ``waiting_for_owner`` with
-    # no current gate, and the due-time wakeup scheduling belongs to F11 —
-    # not to this seam.
+    # no current gate, and the due-time wakeup scheduling belongs to F12
+    # (#316) — not to this seam.
     RETRY_AUTHORIZED = "retry_authorized"
 
 
@@ -1102,7 +1102,7 @@ def _classify_after_uncertain_merge_send(
     type-only (no provider prose, HTTP-status guessing, or caller flag).
     This seam never applies another merge mutation itself and never invents a
     disposition: F4's decision is authoritative, and the due-time wakeup
-    scheduling belongs to F11, not here.
+    scheduling belongs to F12 (#316), not here.
     """
     # One authoritative reconciliation read (external, no transaction open)
     # grounds EVERY subsequent decision: it is the fresh post-send

@@ -48,7 +48,7 @@ a GitHub call):
    authorization remains forward-only consumed history, the workflow stays
    at its committed durable state, and nothing is replayed or re-consumed.
 
-This seam never schedules wakeups (F11 #257 owns due-time submission), never
+This seam never schedules wakeups (F12 #316 owns due-time submission), never
 reruns the implementation, never mutates the successful E6 Execution, and
 never applies a second presentation within one invocation.
 """

@@ -80,6 +80,7 @@ from openorc.services.task_authorized_implementation_execution import (
     execute_authorized_implementation,
 )
 from openorc.services.task_authorized_implementation_retry import (
+    dispatch_authorized_implementation_retry_detached,
     execute_authorized_implementation_retry,
 )
 from openorc.services.task_authorized_merge_retry import (
@@ -1660,12 +1661,14 @@ def _compose_task_authorized_implementation_retry(
 ) -> None:
     """Execute the one F4-authorized implementation retry and present the PR gate.
 
-    The F5c retry composition is the one deliberate blocking-model-turn
-    exception to the detached ordinary-turn migration (issues #325/#340): it
-    keeps the shared E6 external mechanics blocking in both execution modes
-    until its own detached migration, and nothing submits this operation kind
-    until F11 (issue #257) delivers the due-time wakeup — so no ordinary
-    regular-mode model turn can reach it today.
+    The regular-mode composition dispatches the authorized retry as one
+    detached agent turn (issues #325/#340) through the shared F5c/E6 detached
+    external phase and returns after the durable admission; the independently
+    observed completion settles the NEW retry Execution and the completion
+    handoff owns the exact-head PR_AUTHORIZATION presentation. The queue-mode
+    interim keeps the blocking composition (execute then present) until #328,
+    and F12 (issue #316) owns submitting due authorized retries through this
+    registered operation in either mode.
 
     The F5c retry service atomically consumes the exact durably authorized
     F4 attempt for one new Execution (reserved, claimed, audited, and bound
@@ -1684,6 +1687,30 @@ def _compose_task_authorized_implementation_retry(
     task_id = UUID(payload.task.task_id)
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
+    # The detached retry dispatch needs the executing process's detached-turn
+    # observation host and the ONE post-commit completion handoff —
+    # regular-mode process dependencies (issues #323/#333/#340). Queue mode
+    # resolves neither and keeps the blocking composition interim.
+    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
+        dispatch_authorized_implementation_retry_detached(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            retry_attempt_id=UUID(payload.retry_attempt_id),
+            producer_runtime_factory=_producer_runtime_attachment_factory(
+                dependencies, workspace_id=workspace_id, task_id=task_id
+            ),
+            observation_registrar=dependencies.detached_turn_observer(),
+            completion_handoff=build_detached_completion_handoff(dependencies),
+            attempt_evidence=attempt_evidence,
+        )
+        # The detached dispatch is durably admitted: the worker returns
+        # without waiting for the implementation result. The observed
+        # completion owns the settlement; submission outcomes are transport
+        # information only and the durable state owns recovery.
+        return
 
     execution = execute_authorized_implementation_retry(
         pool,
@@ -1723,8 +1750,8 @@ def _compose_task_authorized_merge_retry(
     guarded F3/F4 escalation, and lets the merge send's own unknown outcome
     propagate for the F5b coordinator's typed Level 2 handoff. A successful
     merge completes the Task through the shared completion seam; no Owner
-    approval, gate presentation, or wakeup scheduling exists here (F11 owns
-    the due-time wakeups).
+    approval, gate presentation, or wakeup scheduling exists here (F12 #316
+    owns the due-time wakeups).
     """
     execute_authorized_merge_retry(
         dependencies.database_pool(),
@@ -1757,7 +1784,7 @@ def _compose_task_pr_authorization_retry(
     re-presentation's operational error propagates for the F5b coordinator's
     typed Level 2 handoff with the consumed attempt as the PRIOR_AUTHORIZED
     reporting source; its workflow-semantic refusals are Level 1 outcomes.
-    No wakeup scheduling exists here (F11 owns the due-time wakeups).
+    No wakeup scheduling exists here (F12 #316 owns the due-time wakeups).
     """
     execute_authorized_pr_authorization_retry(
         dependencies.database_pool(),

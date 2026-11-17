@@ -855,7 +855,8 @@ def test_authorized_implementation_composition_presents_the_pr_gate(
 def test_authorized_implementation_retry_composition_consumes_and_presents_the_pr_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dependencies, submitter = make_dependencies()
+    """The queue-mode interim (until #328) keeps the blocking composition."""
+    dependencies, submitter = make_queue_dependencies()
     execution = fake_execution()
     execute_retry = RecordingService(result=execution)
     open_pr = RecordingService(
@@ -2122,6 +2123,71 @@ def test_authorized_implementation_composition_dispatches_detached_in_regular_mo
     assert dispatch_kwargs["observation_registrar"] is not None
     assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
     # The blocking E6 service and the inline presentation never ran.
+    assert presentations == []
+    assert submitter.submissions == []
+
+
+def test_authorized_implementation_retry_composition_dispatches_detached_in_regular_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode F5c composition admits the detached retry and returns.
+
+    The registered F1 retry operation is directly invocable for an
+    already-due F4 authorization (issues #263/#340), so the ordinary
+    model-backed retry turn must not hold a regular-mode worker: no blocking
+    E6 execution and no inline PR-gate presentation happen in the dispatching
+    worker — the observed completion settles the NEW retry Execution and the
+    ONE post-commit completion handoff owns the presentation. F12 (#316)
+    owns submitting due authorized retries in either mode.
+    """
+    dependencies, submitter = make_dependencies()
+    dispatched = SimpleNamespace(task=None, execution=None, producer_session=None, receipt=None)
+    dispatch = RecordingService(result=dispatched)
+    monkeypatch.setattr(
+        task_workflow,
+        "dispatch_authorized_implementation_retry_detached",
+        dispatch,
+        raising=True,
+    )
+
+    def refusing_blocking_retry(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the blocking F5c composition must not run in regular mode")
+
+    presentations: list[dict[str, Any]] = []
+
+    def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
+        presentations.append(dict(kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        task_workflow, "execute_authorized_implementation_retry", refusing_blocking_retry
+    )
+    monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr, raising=True)
+
+    task_workflow.execute_task_workflow_operation(
+        OperationInvocation(
+            kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
+            payload=TaskAuthorizedImplementationRetryPayload(
+                task=_TASK_SCOPE_PRODUCER,
+                profile_id=str(_PROFILE_ID),
+                retry_attempt_id=str(_OWNER_GATE_ID),
+                expected_state_token=str(_STATE_TOKEN),
+            ),
+        ),
+        dependencies=dependencies,
+    )
+
+    assert dispatch.call_count == 1
+    dispatch_kwargs = dispatch.calls[0]["kwargs"]
+    assert dispatch_kwargs["profile_id"] == _PROFILE_ID
+    assert dispatch_kwargs["workspace_id"] == _WORKSPACE_ID
+    assert dispatch_kwargs["task_id"] == _TASK_ID
+    assert dispatch_kwargs["expected_state_token"] == _STATE_TOKEN
+    assert dispatch_kwargs["retry_attempt_id"] == _OWNER_GATE_ID
+    assert callable(dispatch_kwargs["producer_runtime_factory"])
+    assert dispatch_kwargs["observation_registrar"] is not None
+    assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
+    # The blocking F5c service and the inline presentation never ran.
     assert presentations == []
     assert submitter.submissions == []
 

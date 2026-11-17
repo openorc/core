@@ -12,10 +12,11 @@ submission or detached dispatch, re-derived from committed state, with no
 recursive in-process chain and no blocking model call.
 
 The documented blocking exceptions the survey names are the queue-mode
-interim entry points (until #328), the F10 terminal cleanup (#327), the
-bounded native ACT mode controls, and the currently-unsubmitted F5c
-authorized-implementation-retry composition (nothing submits its operation
-kind until F11 #257 owns the due-time wakeup).
+interim entry points (until #328), the F10 terminal cleanup (#327), and the
+bounded native ACT mode controls. Every ordinary model turn — including the
+F5c authorized-implementation retry, whose registered F1 operation is
+directly invocable for an already-due F4 authorization — routes detached in
+regular mode; F12 (#316) owns submitting due authorized retries.
 """
 
 from __future__ import annotations
@@ -727,6 +728,11 @@ def test_every_regular_mode_composition_splits_to_its_detached_dispatch() -> Non
             ("execute_authorized_implementation",),
         ),
         (
+            "_compose_task_authorized_implementation_retry",
+            "dispatch_authorized_implementation_retry_detached",
+            ("execute_authorized_implementation_retry",),
+        ),
+        (
             "_compose_task_pr_composition",
             "dispatch_pr_compose_detached",
             ("compose_and_publish_task_pr",),
@@ -740,11 +746,30 @@ def test_every_regular_mode_composition_splits_to_its_detached_dispatch() -> Non
             assert entry in calls[composition], (composition, entry)
 
 
-def test_the_f5c_retry_composition_is_the_documented_blocking_exception() -> None:
-    """The F5c authorized-implementation retry keeps the blocking E6 external
-    mechanics until its own detached migration: nothing submits its operation
-    kind until F11 (#257) owns the due-time wakeup, so no regular-mode worker
-    waits on it today — and the composition documents that boundary in place."""
+def test_the_shared_blocking_external_phase_serves_only_the_blocking_entries() -> None:
+    """The shared blocking E6 external phase is consumed only by the two
+    blocking execution entries — the initial E6 execute and the F5c retry
+    execute, both queue-mode interims (#340). No other module path reaches a
+    blocking model-turn send through it."""
+    execution_calls = _function_calls(
+        "src/openorc/services/task_authorized_implementation_execution.py"
+    )
+    retry_calls = _function_calls("src/openorc/services/task_authorized_implementation_retry.py")
+    callers: set[str] = set()
+    for calls in (execution_calls, retry_calls):
+        for name, called in calls.items():
+            if "_execute_external_phase" in called:
+                callers.add(name)
+    assert callers == {
+        "execute_authorized_implementation",
+        "execute_authorized_implementation_retry",
+    }
+
+
+def test_the_f5c_retry_boundary_is_documented_in_place() -> None:
+    """The F5c retry composition documents its detached regular-mode routing
+    and the F12 (#316) wakeup ownership where the blocking queue-mode interim
+    is defined, so the boundary is not implicit (#340 review)."""
     tree = ast.parse((_REPO_ROOT / "src/openorc/workers/task_workflow.py").read_text())
     retry = next(
         node
@@ -753,13 +778,8 @@ def test_the_f5c_retry_composition_is_the_documented_blocking_exception() -> Non
         and node.name == "_compose_task_authorized_implementation_retry"
     )
     docstring = ast.get_docstring(retry) or ""
-    assert "F11" in docstring and "#257" in docstring
+    assert "F12" in docstring and "#316" in docstring
     calls = _function_calls("src/openorc/workers/task_workflow.py")
-    assert (
-        "execute_authorized_implementation_retry"
-        in calls["_compose_task_authorized_implementation_retry"]
-    )
-    assert not any(
-        name.endswith("_detached")
-        for name in calls["_compose_task_authorized_implementation_retry"]
-    )
+    retry_calls = calls["_compose_task_authorized_implementation_retry"]
+    assert "dispatch_authorized_implementation_retry_detached" in retry_calls
+    assert "execute_authorized_implementation_retry" in retry_calls

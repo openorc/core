@@ -8,7 +8,7 @@ operational failure supplies F4's disposition service
 triage_operational_failure`) with stable typed classification and independently
 verified durable attempt/effect evidence. It implements no recovery policy of
 its own: F4's dispositions are authoritative, the durably authorized retry is
-never consumed here (F5c owns that consumption, F11 the wakeups), and the
+never consumed here (F5c owns that consumption, F12 #316 the wakeups), and the
 original exception always propagates unchanged so the F1 sanitized unchained
 worker-error report is preserved.
 
@@ -1137,8 +1137,8 @@ def coordinate_task_workflow_operation(
             if disposition is not None:
                 # Every disposition is authoritative and final here. The
                 # authorized retry is recorded but never consumed, replayed,
-                # or scheduled: F5c owns the execution attempt and F11 the
-                # due wakeups. BLOCKED and every no-op already applied their
+                # or scheduled: F5c owns the execution attempt and F12 #316
+                # the due wakeups. BLOCKED and every no-op already applied their
                 # (or no) durable effect inside F4's own composition.
                 logger.debug(
                     "operational-failure disposition applied (kind=%s)",
