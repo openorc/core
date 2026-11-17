@@ -80,6 +80,12 @@ _SESSION_ID = uuid4()
 _EXTERNAL_SESSION = "ext-session-1"
 _RECEIPT_ID = uuid4()
 _EXECUTION_ID = uuid4()
+# The detached F5c retry's NEW resulting Execution and its F4 episode facts
+# (issue #340 review): the receipt names the retry Execution while the
+# authorized report must address the EXISTING episode's original identity.
+_RETRY_EXECUTION_ID = uuid4()
+_F4_ATTEMPT_ID = uuid4()
+_EPISODE_ID = uuid4()
 _STATE_TOKEN = uuid4()
 _REVISION_ID = uuid4()
 _ITERATION_ID = uuid4()
@@ -226,6 +232,7 @@ def _receipt_row(
     operation: str = "implementation_execution",
     contradicted: bool = False,
     created_external_session_id: str | None = None,
+    original_attempt_id: UUID = _EXECUTION_ID,
 ) -> tuple[Any, ...]:
     admitted_at = _OBSERVED if status in ("admitted", "settled") else None
     settled_at = _OBSERVED if status in ("settled", "refused") else None
@@ -240,7 +247,7 @@ def _receipt_row(
         _SESSION_ID,
         operation,
         "execution",
-        _EXECUTION_ID,
+        original_attempt_id,
         "implementation_result",
         admitted_turn_reference,
         status,
@@ -280,9 +287,10 @@ def _execution_row(
     implementation_result: Any = None,
     producer_session_id: UUID | None = None,
     review_iteration_id: UUID | None = None,
+    execution_id: UUID = _EXECUTION_ID,
 ) -> tuple[Any, ...]:
     return (
-        _EXECUTION_ID,
+        execution_id,
         _WORKSPACE_ID,
         _TASK_ID,
         producer_session_id if producer_session_id is not None else _SESSION_ID,
@@ -297,7 +305,10 @@ def _execution_row(
 
 
 def _event_row(
-    *, event_type: WorkflowEventType, failure_kind: str | None = None
+    *,
+    event_type: WorkflowEventType,
+    failure_kind: str | None = None,
+    execution_id: UUID = _EXECUTION_ID,
 ) -> tuple[Any, ...]:
     context: dict[str, Any] = {} if failure_kind is None else {"failure_kind": failure_kind}
     return (
@@ -308,7 +319,7 @@ def _event_row(
         WorkflowEventActor.PRODUCER.value,
         str(_SESSION_ID),
         "execution",
-        _EXECUTION_ID,
+        execution_id,
         context,
         _OBSERVED,
     )
@@ -326,11 +337,51 @@ def _remediation_admitted_row() -> tuple[Any, ...]:
     )
 
 
-def _settled_row(label: str, *, marker: int | None = 41) -> tuple[Any, ...]:
+def _settled_row(
+    label: str, *, marker: int | None = 41, original_attempt_id: UUID = _EXECUTION_ID
+) -> tuple[Any, ...]:
     outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
     if marker is not None:
         outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] = marker
-    return _receipt_row(status="settled", admitted_turn_reference=_TURN_REFERENCE, outcome=outcome)
+    return _receipt_row(
+        status="settled",
+        admitted_turn_reference=_TURN_REFERENCE,
+        outcome=outcome,
+        original_attempt_id=original_attempt_id,
+    )
+
+
+def _retry_bound_attempt_row() -> tuple[Any, ...]:
+    """The F4 authorized attempt bound set-once to the retry's Execution."""
+    return (
+        _F4_ATTEMPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _EPISODE_ID,
+        1,
+        "original",
+        _EXECUTION_ID,
+        "runtime_unavailable",
+        _OBSERVED,
+        _RETRY_EXECUTION_ID,
+        None,
+        _OBSERVED,
+    )
+
+
+def _retry_episode_row() -> tuple[Any, ...]:
+    """The existing F4 failure episode rooted at the INITIAL Execution."""
+    return (
+        _EPISODE_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        "implementation_execution",
+        "execution",
+        _EXECUTION_ID,
+        {"execution_id": str(_EXECUTION_ID), "task_agent_session_id": str(_SESSION_ID)},
+        None,
+        _OBSERVED,
+    )
 
 
 # --- scripted-flow helpers ---------------------------------------------------------
@@ -552,10 +603,10 @@ def _script_complete_execution(conn: ScriptedConnection) -> None:
     )
 
 
-def _script_fail_execution(conn: ScriptedConnection) -> None:
+def _script_fail_execution(conn: ScriptedConnection, *, execution_id: UUID = _EXECUTION_ID) -> None:
     conn.on(
         _sql_has("update openorc.executions", "set status = %s"),
-        _execution_row(status="failed_final"),
+        _execution_row(status="failed_final", execution_id=execution_id),
     )
 
 
@@ -564,10 +615,11 @@ def _script_event_insert(
     *,
     event_type: WorkflowEventType,
     failure_kind: str | None = None,
+    execution_id: UUID = _EXECUTION_ID,
 ) -> None:
     conn.on(
         _sql_has("insert into openorc.workflow_events"),
-        _event_row(event_type=event_type, failure_kind=failure_kind),
+        _event_row(event_type=event_type, failure_kind=failure_kind, execution_id=execution_id),
     )
 
 
@@ -582,6 +634,19 @@ def _script_current_task(conn: ScriptedConnection, *, status: str = "implementin
             source_requirements_fingerprint="a" * 64,
             current_plan_revision_id=uuid4(),
         ),
+    )
+
+
+def _script_failure_binding_lookup(conn: ScriptedConnection, row: Any) -> None:
+    """The F4 authorized-retry binding lookup in the failure-report resolution.
+
+    ``None`` proves the failing Execution is not a durably authorized retry's
+    effect row (the ORIGINAL report path); a bound-attempt row resolves the
+    PRIOR_AUTHORIZED episode report (issue #340 review).
+    """
+    conn.on(
+        _sql_has("from openorc.operational_failure_attempts", "where resulting_execution_id = %s"),
+        row,
     )
 
 
@@ -861,6 +926,7 @@ def test_attach_consumes_the_staged_failure_and_reports_level_2(
     )
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
+    _script_failure_binding_lookup(conn, None)
     _script_consume(conn)
     outcome = attach_acknowledged_turn(
         _pool(conn),
@@ -910,6 +976,7 @@ def test_attach_routes_a_malformed_staged_result_through_the_failure_path(
     )
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
+    _script_failure_binding_lookup(conn, None)
     _script_consume(conn)
     outcome = attach_acknowledged_turn(
         _pool(conn),
@@ -948,6 +1015,7 @@ def test_settlement_routes_a_resultless_completion_through_the_failure_path(
     )
     _script_settle(conn, _settled_row("observed_failure", marker=None))
     _script_current_task(conn)
+    _script_failure_binding_lookup(conn, None)
     outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
@@ -958,6 +1026,72 @@ def test_settlement_routes_a_resultless_completion_through_the_failure_path(
     assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
     assert len(triage.calls) == 1
     assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
+
+
+def test_the_observed_failure_of_a_detached_authorized_retry_reports_prior_authorized(
+    triage: _RecordingTriage,
+) -> None:
+    """One focused F5c-retry proof (issue #340 review): the newly detached
+    authorized-implementation retry shares the ``IMPLEMENTATION_EXECUTION``
+    receipt family and its receipt names the NEW resulting Execution — so the
+    observed failure resolves the F4 attempt's set-once
+    ``resulting_execution_id`` binding and reports ``PRIOR_AUTHORIZED``
+    against the EXISTING episode's original identity with the bound attempt
+    and the exact resulting Execution, instead of establishing a competing
+    original episode for the retry Execution."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(
+        conn,
+        _receipt_row(
+            status="admitted",
+            admitted_turn_reference=_TURN_REFERENCE,
+            original_attempt_id=_RETRY_EXECUTION_ID,
+        ),
+    )
+    _script_last_consumed_sequence(conn, None)
+    _script_execution_read(conn, _execution_row(execution_id=_RETRY_EXECUTION_ID))
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row(execution_id=_RETRY_EXECUTION_ID))
+    _script_fail_execution(conn, execution_id=_RETRY_EXECUTION_ID)
+    _script_event_insert(
+        conn,
+        event_type=WorkflowEventType.EXECUTION_FAILED,
+        failure_kind="observed_run_failure",
+        execution_id=_RETRY_EXECUTION_ID,
+    )
+    _script_settle(
+        conn, _settled_row("observed_failure", marker=None, original_attempt_id=_RETRY_EXECUTION_ID)
+    )
+    _script_current_task(conn)
+    _script_failure_binding_lookup(conn, _retry_bound_attempt_row())
+    conn.on(
+        _sql_has("from openorc.operational_failure_episodes", "where id = %s"),
+        _retry_episode_row(),
+    )
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(marker=None, candidate=None),
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    operation = triage.calls[0]["operation"]
+    report = triage.calls[0]["report"]
+    # The Level 2 report addresses the EXISTING F4 episode's original
+    # identity — the initial Execution — never the retry Execution itself.
+    assert operation.original_attempt_id == _EXECUTION_ID
+    assert operation.original_attempt_kind is OriginalAttemptKind.EXECUTION
+    assert operation.family is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    # The authorized attempt is the reporting source with its exact bound
+    # effect row, disposing the retry within its original episode.
+    assert report.reporting_attempt_kind is OperationalFailureSourceKind.PRIOR_AUTHORIZED
+    assert report.reporting_attempt_id == _F4_ATTEMPT_ID
+    assert report.effect_attempt_id == _RETRY_EXECUTION_ID
+    assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
 
 
 # --- the settlement entry ------------------------------------------------------------
@@ -1091,6 +1225,7 @@ def test_settlement_classifies_an_observed_failure_through_the_typed_path(
     )
     _script_settle(conn, _settled_row("observed_failure"))
     _script_current_task(conn)
+    _script_failure_binding_lookup(conn, None)
     outcome = settle_observed_turn_completion(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,
@@ -1147,6 +1282,7 @@ def test_status_classification_routes_the_exact_failed_reference(
     )
     _script_settle(conn, _settled_row("observed_failure", marker=None))
     _script_current_task(conn)
+    _script_failure_binding_lookup(conn, None)
     classification = classify_acknowledged_turn_status(
         _pool(conn),
         workspace_id=_WORKSPACE_ID,

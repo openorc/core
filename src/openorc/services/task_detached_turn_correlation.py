@@ -130,6 +130,7 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
+from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import reviews as review_iteration_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
@@ -1410,6 +1411,74 @@ def _route_execution_terminal(
     )
 
 
+def _resolve_authorized_retry_failure_report(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    error_code: OperationalFailureCode,
+) -> tuple[OperationalFailureOperation, OperationalFailureReport] | None:
+    """Resolve one durably authorized retry's observed failure report.
+
+    The F5c authorized-implementation retry shares the
+    ``IMPLEMENTATION_EXECUTION`` receipt family with the initial dispatch,
+    and its receipt's original-attempt identity is the NEW resulting
+    Execution — so a plain original-attempt report would establish a
+    competing failure episode instead of disposing the authorized retry
+    inside its existing F4 episode (issue #340 review). The F4 attempt's
+    set-once ``resulting_execution_id`` binding is the durable proof that
+    this Execution is an authorized retry's effect row: when the binding
+    resolves within the addressed scope and its episode matches the
+    receipt's family and attempt kind exactly, the report retains the
+    episode's original identity and reports ``PRIOR_AUTHORIZED`` with the
+    bound attempt and the exact resulting Execution — the same enrichment
+    the F5b coordinator applies to a blocking retry's failure report. An
+    incongruent binding is a durable invariant violation and fails closed.
+    Every other Execution (initial IMPLEMENT, PR remediation) reports the
+    original attempt identity exactly as before.
+    """
+    bound_attempt = failure_records.find_operational_failure_attempt_by_resulting_execution(
+        transaction_pool, resulting_execution_id=receipt.original_attempt_id
+    )
+    if bound_attempt is None:
+        return None
+    if bound_attempt.workspace_id != workspace_id or bound_attempt.task_id != task_id:
+        raise ConflictError(
+            "the authorized retry's failure binding addresses a different "
+            "scope; the observed failure cannot be reported"
+        )
+    episode = failure_records.get_operational_failure_episode(
+        transaction_pool, episode_id=bound_attempt.episode_id
+    )
+    if (
+        episode is None
+        or episode.workspace_id != workspace_id
+        or episode.task_id != task_id
+        or episode.operation_family is not receipt.operation
+        or episode.original_attempt_kind is not receipt.original_attempt_kind
+    ):
+        raise ConflictError(
+            "the authorized retry's failure episode does not match the "
+            "observed receipt; the observed failure cannot be reported"
+        )
+    operation = OperationalFailureOperation(
+        family=episode.operation_family,
+        original_attempt_kind=episode.original_attempt_kind,
+        original_attempt_id=episode.original_attempt_id,
+        subject=dict(episode.subject),
+    )
+    report = OperationalFailureReport(
+        reporting_attempt_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+        reporting_attempt_id=bound_attempt.id,
+        error_code=error_code,
+        effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
+        effect_attempt_id=receipt.original_attempt_id,
+        diagnostic_context={"observation": "observed_turn_failure"},
+    )
+    return operation, report
+
+
 def _settle_execution_failure(
     transaction_pool: DatabasePool,
     *,
@@ -1465,24 +1534,36 @@ def _settle_execution_failure(
         # Unreachable after the finalize's own locked reproof; kept explicit
         # for fail-closed safety.
         raise NotFoundError("the requested task is not available in this workspace")
-    operation = OperationalFailureOperation(
-        family=receipt.operation,
-        original_attempt_kind=receipt.original_attempt_kind,
-        original_attempt_id=receipt.original_attempt_id,
-        subject=canonical_failure_subject(
-            {
-                "execution_id": str(receipt.original_attempt_id),
-                "task_agent_session_id": str(receipt.task_agent_session_id),
-            }
-        ),
-    )
-    report = OperationalFailureReport(
-        reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
-        reporting_attempt_id=receipt.original_attempt_id,
+    resolved = _resolve_authorized_retry_failure_report(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        receipt=receipt,
         error_code=error_code,
-        effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
-        diagnostic_context={"observation": "observed_turn_failure"},
     )
+    if resolved is not None:
+        # The failing Execution is a durably authorized retry's effect row:
+        # the report disposes within its existing F4 episode.
+        operation, report = resolved
+    else:
+        operation = OperationalFailureOperation(
+            family=receipt.operation,
+            original_attempt_kind=receipt.original_attempt_kind,
+            original_attempt_id=receipt.original_attempt_id,
+            subject=canonical_failure_subject(
+                {
+                    "execution_id": str(receipt.original_attempt_id),
+                    "task_agent_session_id": str(receipt.task_agent_session_id),
+                }
+            ),
+        )
+        report = OperationalFailureReport(
+            reporting_attempt_kind=OperationalFailureSourceKind.ORIGINAL,
+            reporting_attempt_id=receipt.original_attempt_id,
+            error_code=error_code,
+            effect_evidence=FailureEffectEvidence.KNOWN_FAILED,
+            diagnostic_context={"observation": "observed_turn_failure"},
+        )
     disposition = triage_operational_failure(
         transaction_pool,
         workspace_id=workspace_id,
