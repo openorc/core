@@ -1899,6 +1899,24 @@ def _dispatch_plan_turn(
                 "(%s); the durable state owns recovery",
                 type(error).__name__,
             )
+    if (
+        outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+        and outcome.receipt is not None
+    ):
+        # A staged interrupted completion settled the receipt within this
+        # dispatch (issue #342): the ONE post-commit completion handoff owns
+        # the Interrupt settlement — the attached adapter's D6b guard
+        # release and the annotated intent's outcome recording — exactly as
+        # it owns the validated families' continuations. Strictly
+        # post-attach, contained best-effort inside the handoff, never a
+        # workflow authority; a failed settlement leaves the durable
+        # annotated intent exactly as committed.
+        completion_handoff.handoff_settled_interrupt(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            task_agent_session_id=outcome.receipt.task_agent_session_id,
+            external_session_id=producer_external_session_id,
+        )
     reloaded_task = task_records.get_task(pool, task_id=task_id)
     if reloaded_task is None or reloaded_task.workspace_id != workspace_id:
         raise NotFoundError("the requested task is not available in this workspace")

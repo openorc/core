@@ -2485,6 +2485,7 @@ class _RecordingCompletionHandoff:
 
     def __init__(self) -> None:
         self.calls: list[tuple[Any, Any, Any]] = []
+        self.interrupt_calls: list[dict[str, Any]] = []
 
     def handoff_settled_completion(
         self,
@@ -2495,6 +2496,23 @@ class _RecordingCompletionHandoff:
         validated_result: Any = None,
     ) -> None:
         self.calls.append((workspace_id, task_id, operation))
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        external_session_id: str,
+    ) -> None:
+        self.interrupt_calls.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "external_session_id": external_session_id,
+            }
+        )
 
 
 class _RecordingRegistrar:

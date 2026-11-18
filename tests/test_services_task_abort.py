@@ -807,6 +807,49 @@ def test_the_detached_annotated_settlement_requires_the_d6b_discipline() -> None
         )
 
 
+def test_the_detached_annotated_settlement_records_the_durable_settled_outcome() -> None:
+    """The positive staged-path settlement (issue #342): after the attach's
+    observation annotation committed, the post-commit seam's one-shot
+    conditional recording advances the intent to ``settled`` — the intent is
+    durably settled, not merely annotated."""
+    conn = ScriptedConnection()
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="settled", outcome={"settlement": "confirmed"}),
+    )
+    adapter = _FakeClineAdapter()
+    intent = cast(
+        Any,
+        TaskInterruptIntent(
+            id=_INTENT_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id=None,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id=_EXTERNAL_SESSION_ID,
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            outcome={"observed_resolution": "interrupted_turn"},
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
+
+    outcome = settle_annotated_task_interrupt(
+        _pool(conn),
+        cast(Any, adapter),
+        task_id=_TASK_ID,
+        intent=intent,
+        external_session_id=_EXTERNAL_SESSION_ID,
+    )
+
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.SETTLED
+    assert outcome.detail == "settled"
+    assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
+
+
 def test_the_detached_annotated_settlement_raced_outcome_leaves_the_durable_record() -> None:
     """A replayed post-commit settlement whose conditional outcome recording
     races a concurrent settlement is a rejected no-op: the adapter hygiene
@@ -815,6 +858,23 @@ def test_the_detached_annotated_settlement_raced_outcome_leaves_the_durable_reco
     conn = ScriptedConnection()
     conn.on(_INTENT_UPDATE, None)  # the one-shot recording raced: rejected no-op
     adapter = _FakeClineAdapter()
+    intent = cast(
+        Any,
+        TaskInterruptIntent(
+            id=_INTENT_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id=None,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id=_EXTERNAL_SESSION_ID,
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            outcome={"observed_resolution": "interrupted_turn"},
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
     intent = cast(
         Any,
         TaskInterruptIntent(

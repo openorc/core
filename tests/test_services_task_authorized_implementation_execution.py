@@ -1316,6 +1316,7 @@ class _RecordingHandoff:
     def __init__(self, error: Exception | None = None) -> None:
         self._error = error
         self.calls: list[dict[str, Any]] = []
+        self.interrupt_calls: list[dict[str, Any]] = []
 
     def handoff_settled_completion(
         self,
@@ -1326,6 +1327,25 @@ class _RecordingHandoff:
     ) -> None:
         self.calls.append(
             {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+        if self._error is not None:
+            raise self._error
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        external_session_id: str,
+    ) -> None:
+        self.interrupt_calls.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "external_session_id": external_session_id,
+            }
         )
         if self._error is not None:
             raise self._error
@@ -1761,6 +1781,110 @@ def test_a_detached_staged_early_completion_settles_in_dispatch_and_fires_the_ha
             "operation": PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
         }
     ]
+
+
+def test_a_staged_interrupted_completion_settles_and_hands_off_the_interrupt_settlement() -> None:
+    """The complete staged sequence (issue #342): an Owner-aborted turn's
+    positively interrupted terminal arrives before the acknowledgement is
+    persisted; the attach consumes it exactly once — settling the receipt
+    ``interrupted_turn`` and recording the observation on the exact session's
+    single unsettled intent — and the ONE post-commit completion handoff then
+    owns the Interrupt settlement. No result is applied to the attempt, no
+    failure is reported, and the handoff receives the exact session's
+    settlement facts for the adapter's D6b guard release and the intent's
+    one-shot recording to ``settled``."""
+    _INTERRUPT_INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
+    _INTERRUPT_INTENT_UPDATE = _sql_has("update openorc.task_interrupt_intents")
+    intent_id = uuid.uuid4()
+    intent_row = (
+        intent_id,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        None,
+        "producer",
+        _EXTERNAL_SESSION_ID,
+        _OWNER_PROFILE_ID,
+        "unsettled",
+        {"dispatch": "acknowledged"},
+        _OBSERVED,
+        _OBSERVED,
+    )
+    annotated_row = (*intent_row[:9], {"observed_resolution": "interrupted_turn"}, *intent_row[10:])
+
+    conn = ScriptedConnection()
+    _script_detached_admission(conn)
+    _script_subject_reads(conn)  # R2 passes
+    _script_detached_attach(
+        conn,
+        staged=(
+            _STAGED_ID,
+            _WORKSPACE_ID,
+            _TASK_ID,
+            _RECEIPT_ID,
+            "run.failed",
+            41,
+            None,
+            True,
+            _OBSERVED,
+        ),
+    )
+    # The interrupted routing inside the attach: the single unsettled intent
+    # gains the observation, then the receipt settles truthfully.
+    conn.on(_INTERRUPT_INTENTS_LIST, [intent_row])
+    conn.on(_INTERRUPT_INTENT_UPDATE, annotated_row)
+    conn.on(
+        _RECEIPT_SETTLE,
+        _detached_receipt_row(
+            status="settled",
+            admitted_turn_reference=_TURN_REFERENCE,
+            outcome={"settlement": "interrupted_turn", "consumed_sequence": 41},
+        ),
+    )
+    conn.on(_EARLY_COMPLETION_DELETE, None)
+    # The post-dispatch reload reflects the untouched running attempt.
+    conn.on(_TASK_READ, _task_row())
+    conn.on(_EXECUTION_READ, _execution_row(status="running", last_activity=_OBSERVED))
+    pool, runtime, attachment = _arrange_detached(conn)
+    registrar = _RecordingRegistrar()
+    handoff = _RecordingHandoff()
+
+    outcome = _dispatch_detached_call(
+        cast(DatabasePool, pool),
+        producer_runtime_factory=attachment,
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+    )
+
+    # The receipt settled exactly once with the interrupted label and the
+    # staged observation was consumed; the attempt itself is untouched.
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
+    assert outcome.execution.status is ExecutionStatus.RUNNING
+    assert runtime.submitted_sends() == ()
+    assert _count(conn, _RECEIPT_SETTLE) == 1
+    assert _count(conn, _EARLY_COMPLETION_DELETE) == 1
+    assert _count(conn, _EXECUTION_COMPLETE) == 0
+    assert _event_types(conn) == ["execution_started"]
+    # The validated-result continuation never fired; the ONE post-commit
+    # handoff routed the Interrupt settlement with the exact session facts.
+    assert handoff.calls == []
+    assert handoff.interrupt_calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _SESSION_ID,
+            "external_session_id": _EXTERNAL_SESSION_ID,
+        }
+    ]
+    # The observation annotation applied only while the intent was unsettled.
+    annotate_sql, annotate_params = next(
+        (sql, params)
+        for sql, params in conn.executed
+        if "update openorc.task_interrupt_intents" in " ".join(sql.split())
+    )
+    assert annotate_params is not None
+    assert annotate_params[0].obj == {"observed_resolution": "interrupted_turn"}
+    assert annotate_params[1] == intent_id
 
 
 def test_the_detached_dispatch_seams_fail_closed() -> None:

@@ -482,9 +482,13 @@ class _Handoff:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.interrupt_calls: list[dict[str, Any]] = []
 
     def handoff_settled_completion(self, **kwargs: Any) -> None:
         self.calls.append(dict(kwargs))
+
+    def handoff_settled_interrupt(self, **kwargs: Any) -> None:
+        self.interrupt_calls.append(dict(kwargs))
 
 
 def _script_authorization(conn: ScriptedConnection) -> None:

@@ -20,7 +20,12 @@ dispatching service's in-dispatch settlement, and the post-dispatch
 bootstrap tail all invoke the same ONE handoff, so a settled completion
 triggers its continuation exactly once regardless of which path settled
 it, and a family without a wired route fails closed until its own
-detached migration wires it.
+detached migration wires it. The settled-interrupted-turn route
+(``handoff_settled_interrupt``, issue #342) is the same ONE handoff's
+second method: both settlement-observing paths — the observation host's
+terminal routing and the dispatching service's acknowledgement attach
+that consumed a staged early completion — route the post-commit
+Interrupt settlement through it identically.
 """
 
 from __future__ import annotations
@@ -60,5 +65,33 @@ class DetachedTurnCompletionHandoff(Protocol):
         continuation. Every other family re-derives its continuation from
         committed durable state and receives ``None``; the PR route fails
         closed without a genuine ``PrResult``.
+        """
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Route one settled interrupted turn to its Interrupt settlement
+        (issue #342).
+
+        Invoked strictly after the settlement composition that committed the
+        receipt's ``interrupted_turn`` settlement and the exact session's
+        intent observation — by the process that observed the settlement:
+        the observation host's terminal routing, or the dispatching
+        service's acknowledgement-attach path that consumed a staged early
+        completion. The implementation re-derives the annotated unsettled
+        intent from committed durable state, releases the attached adapter's
+        D6b guard discipline with no database transaction across it, and
+        records the intent's outcome through the same one-shot conditional
+        write the Owner settlement branch uses.
+
+        Contained best-effort by contract: the implementation never raises;
+        a failed settlement leaves the durable annotated intent exactly as
+        committed and the Owner-facing settlement branch remains the
+        authority.
         """
         ...
