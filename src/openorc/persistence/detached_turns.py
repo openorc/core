@@ -112,7 +112,7 @@ _RECEIPT_COLUMNS_ALIASED = (
 
 _EARLY_COMPLETION_COLUMNS = (
     "id, workspace_id, task_id, task_hub_run_receipt_id, kind, sequence, "
-    "result_candidate, staged_at"
+    "result_candidate, interrupted, staged_at"
 )
 
 
@@ -163,7 +163,8 @@ def _early_completion_from_row(row: Sequence[Any]) -> TaskDetachedTurnEarlyCompl
         kind=_require_stored_observation_kind(row[4]),
         ordering_marker=row[5],
         result_candidate=row[6],
-        staged_at=normalize_utc(row[7]),
+        interrupted=row[7],
+        staged_at=normalize_utc(row[8]),
     )
 
 
@@ -680,14 +681,18 @@ def stage_task_detached_turn_early_completion(
     kind: DetachedTurnObservationKind,
     ordering_marker: int | None,
     result_candidate: str | None,
+    interrupted: bool,
 ) -> TaskDetachedTurnEarlyCompletion:
     """Stage one early terminal observation on its claimed receipt.
 
     The admission-race handoff: the observation arrived while the receipt
-    was still claimed (acknowledgement not yet persisted). The insert is
-    unique per receipt — a second terminal delivery for the same single
-    outstanding turn raises ``UniqueViolation`` and is classified by the
-    service layer as a duplicate, never consumed twice.
+    was still claimed (acknowledgement not yet persisted). The staged row
+    carries the observation's neutral interrupted verdict (issue #342) so
+    the positive interrupted-turn evidence survives the race exactly as
+    classified. The insert is unique per receipt — a second terminal
+    delivery for the same single outstanding turn raises ``UniqueViolation``
+    and is classified by the service layer as a duplicate, never consumed
+    twice.
     """
     _require_uuid(receipt_id, "receipt_id")
     _require_uuid(task_id, "task_id")
@@ -704,11 +709,13 @@ def stage_task_detached_turn_early_completion(
         raise ValueError(
             "stage_task_detached_turn_early_completion requires a non-empty result candidate"
         )
+    if not isinstance(interrupted, bool):
+        raise ValueError("stage_task_detached_turn_early_completion requires a boolean verdict")
     with transaction(pool) as conn:
         row = conn.execute(
             "insert into openorc.task_hub_run_early_completions "
             "(workspace_id, task_id, task_hub_run_receipt_id, kind, sequence, "
-            "result_candidate) values (%s, %s, %s, %s, %s, %s) "
+            "result_candidate, interrupted) values (%s, %s, %s, %s, %s, %s, %s) "
             f"returning {_EARLY_COMPLETION_COLUMNS}",
             (
                 workspace_id,
@@ -717,6 +724,7 @@ def stage_task_detached_turn_early_completion(
                 _OBSERVATION_KIND_TOKENS[kind],
                 ordering_marker,
                 result_candidate,
+                interrupted,
             ),
         ).fetchone()
     assert row is not None

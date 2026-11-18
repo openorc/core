@@ -97,6 +97,7 @@ from psycopg.errors import UniqueViolation
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import (
     OWNER_REVIEWER_DISCUSSION_FAMILY,
+    SETTLEMENT_INTERRUPTED_TURN,
     SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
@@ -130,6 +131,7 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as turn_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import gates as gate_records
+from openorc.persistence import intents as intent_records
 from openorc.persistence import operational_failures as failure_records
 from openorc.persistence import reviews as review_iteration_records
 from openorc.persistence import send_claims as send_claim_records
@@ -334,6 +336,7 @@ class TurnSettlementKind(StrEnum):
     SETTLED_VALIDATED_RESULT = "settled_validated_result"
     SETTLED_OBSERVED_FAILURE = "settled_observed_failure"
     SETTLED_RESULT_NOT_APPLIED = "settled_result_not_applied"
+    SETTLED_INTERRUPTED_TURN = "settled_interrupted_turn"
     LEFT_UNRESOLVED = "left_unresolved"
     REJECTED_DUPLICATE = "rejected_duplicate"
     REJECTED_STALE = "rejected_stale"
@@ -601,7 +604,9 @@ def attach_acknowledged_turn(
                 task_id=task_id,
                 receipt=attached,
                 outcome=TurnTerminalOutcome(
-                    kind=staged.kind, result_candidate=staged.result_candidate
+                    kind=staged.kind,
+                    result_candidate=staged.result_candidate,
+                    interrupted=staged.interrupted,
                 ),
                 ordering_marker=staged.ordering_marker,
             )
@@ -638,6 +643,19 @@ def _route_observed_terminal(
             "observed turn identity; the terminal observation is left unresolved"
         )
         return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.interrupted:
+        # The positive interrupted-turn routing (issue #342), checked before
+        # every family routing: an interrupted turn's terminal evidence
+        # settles the receipt and the session's registered Interrupt intent
+        # — never a result application, never a Level 2 failure report,
+        # never a synthetic block.
+        return _route_interrupted_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+        )
     if receipt.operation in _EXECUTION_SETTLEMENT_FAMILIES:
         return _route_execution_terminal(
             transaction_pool,
@@ -705,6 +723,76 @@ def _route_observed_terminal(
         "the receipt's operation family has no detached settlement routing yet; "
         "the observation is left unresolved"
     )
+
+
+def _route_interrupted_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation that positively ended by
+    interruption (issue #342).
+
+    Called inside the caller's composition with the receipt row locked,
+    before any family routing. The turn's own native evidence positively
+    identified it as ended by interruption — the same normalized signal the
+    blocking-send path classifies as ``AgentRuntimeInterruptedTurnError`` —
+    so this routing records exactly two durable facts in one short
+    transaction and defers everything else:
+
+    - The receipt settles truthfully with the ``interrupted_turn`` label,
+      consuming the observation's ordering marker: the turn's terminal
+      resolution is the receipt's own evidence, independent of any intent
+      bookkeeping. Nothing is applied to any subject — no result, no
+      failure finalization, no Level 2 report, no block — and the original
+      Execution/ReviewIteration/claim identity and its historic audit stay
+      exactly as they are, available for later Owner Resume or Cancel.
+    - The exact session's unsettled Interrupt intent — the one outstanding
+      interruption a registered Abort (Owner or cost composition) recorded
+      for this binding — gains the same durable ``observed_resolution``
+      observation the executing-service correlation records, when exactly
+      one such intent exists. Zero matches (the intent already settled
+      through its own branch, was durably recorded failed/unknown, or is
+      the victim of a concurrent settlement) leave the intent untouched;
+      an unexpected multiple is an unexpected durable shape that fails the
+      whole observation closed instead of guessing which intent matched.
+
+    The adapter's D6b guard settlement is deliberately NOT part of this
+    composition: it is process-local best-effort hygiene, it runs strictly
+    after this composition commits through the composition-rooted
+    settlement seam (``settle_annotated_task_interrupt``), and the durable
+    intent remains the authority either way.
+    """
+    intents = [
+        intent
+        for intent in intent_records.list_unsettled_task_interrupt_intents(
+            transaction_pool, task_id=task_id
+        )
+        if intent.task_agent_session_id == receipt.task_agent_session_id
+    ]
+    if len(intents) > 1:
+        logger.warning(
+            "the interrupted turn's session carries more than one unsettled "
+            "Interrupt intent; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if len(intents) == 1:
+        intent_records.annotate_unsettled_task_interrupt_intent(
+            transaction_pool,
+            task_interrupt_intent_id=intents[0].id,
+            outcome={"observed_resolution": "interrupted_turn"},
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_INTERRUPTED_TURN, ordering_marker),
+    )
+    return TurnSettlementOutcome(kind=TurnSettlementKind.SETTLED_INTERRUPTED_TURN, receipt=settled)
 
 
 def _route_plan_terminal(
@@ -2176,6 +2264,7 @@ def _settle_locked_receipt(
                 kind=classification.outcome.kind,
                 ordering_marker=classification.ordering_marker,
                 result_candidate=classification.outcome.result_candidate,
+                interrupted=classification.outcome.interrupted,
             )
         except UniqueViolation:
             logger.info(

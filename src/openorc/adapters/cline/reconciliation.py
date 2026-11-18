@@ -49,6 +49,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from openorc.adapters.agent_runtime.results import (
+    AgentRuntimeSettlementOutcome,
+    AgentRuntimeSettlementRefusal,
+)
 from openorc.adapters.cline.values import JsonObject
 
 __all__ = [
@@ -174,35 +178,13 @@ class ClineReconciliationResult:
                 raise ValueError(f"ClineReconciliationResult.{name} must be None or a boolean")
 
 
-class ClineSettlementRefusal(StrEnum):
-    """Safe machine reasons a settlement attempt refused to clear a guard."""
-
-    OUTSTANDING_ABORT = "outstanding_abort"
-    UNRESOLVED_ABORT = "unresolved_abort"
-    RECONSTRUCTION_ACTIVE = "reconstruction_active"
-    NOTHING_TO_SETTLE = "nothing_to_settle"
-
-
-@dataclass(frozen=True)
-class ClineSettlementOutcome:
-    """The outcome of one explicit guard-settlement attempt.
-
-    ``settled`` is True only when the requested kind's local protection was
-    cleared atomically after the final concurrency recheck. A refusal keeps
-    every guard latched and names the safe machine reason; an unresolved
-    concurrent abort or an active reconstruction is always a veto.
-    """
-
-    settled: bool
-    refusal: ClineSettlementRefusal | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.settled, bool):
-            raise ValueError("ClineSettlementOutcome.settled must be a boolean")
-        if self.settled and self.refusal is not None:
-            raise ValueError("a settled outcome carries no refusal reason")
-        if not self.settled and self.refusal is None:
-            raise ValueError("a refused outcome carries its safe refusal reason")
+# The D6b settlement vocabulary is the shared runtime-neutral contract
+# (issue #342): the concrete integration's names are deliberate aliases of
+# the normalized types, so the adapter's guard discipline keeps its local
+# vocabulary while shared application policy consumes only the neutral
+# boundary and never imports this concrete module.
+ClineSettlementRefusal = AgentRuntimeSettlementRefusal
+ClineSettlementOutcome = AgentRuntimeSettlementOutcome
 
 
 def classify_session_evidence(

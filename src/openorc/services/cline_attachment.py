@@ -93,6 +93,7 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
+from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
     "OPENORC_CLIENT_IDENTITY",
@@ -100,6 +101,7 @@ __all__ = [
     "ClineAttachmentPhase",
     "attach_cline_runtime",
     "dispatch_cost_limit_interrupt",
+    "settle_observed_detached_interrupt",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.cline_attachment"
@@ -519,6 +521,65 @@ def dispatch_cost_limit_interrupt(
             task_abort.dispatch_registered_task_interrupt(
                 pool,
                 attached.adapter,
+                intent=intent,
+                external_session_id=external_session_id,
+            )
+
+
+def settle_observed_detached_interrupt(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    task_agent_session_id: UUID,
+    external_session_id: str,
+) -> task_abort.TaskInterruptOutcome | None:
+    """Settle one observed detached interruption through a fresh BOUND lease.
+
+    The composition-rooted post-commit Interrupt-settlement seam the
+    detached-turn observation host (issue #342) binds as its
+    ``interrupt_settlement`` member: strictly after the correlation seam's
+    settlement composition committed the durable interrupted-turn
+    observation, with no database transaction open across the adapter call.
+    One short composed transaction re-derives the annotated unsettled intent
+    from durable state — its identity supplies the exact admitted Task/role
+    attachment — then the shared E10b settlement machinery releases the
+    adapter's D6b guard discipline and records the outcome on the durable
+    intent, exactly like the interactive Owner settlement branch. An intent
+    that no longer correlates settles nothing and performs no attachment.
+    """
+    with application_span(
+        _SERVICE_TRACER_SCOPE, "cline_attachment.settle_observed_detached_interrupt"
+    ) as span:
+        annotate_span(
+            span,
+            operation="cline_attachment.settle_observed_detached_interrupt",
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        with composed_transaction(pool) as transaction_pool:
+            intent = task_abort.find_annotated_task_interrupt_observation(
+                transaction_pool,
+                task_id=task_id,
+                task_agent_session_id=task_agent_session_id,
+            )
+        if intent is None:
+            # Nothing durably outstanding for this session: the settlement
+            # raced a concurrent completion or no interruption is
+            # outstanding — no attachment, no adapter I/O, nothing to settle.
+            return None
+        with attach_cline_runtime(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=intent.workflow_role,
+            phase=ClineAttachmentPhase.BOUND,
+            external_session_id=external_session_id,
+        ) as attached:
+            return task_abort.settle_annotated_task_interrupt(
+                pool,
+                attached.adapter,
+                task_id=task_id,
                 intent=intent,
                 external_session_id=external_session_id,
             )

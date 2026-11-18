@@ -408,9 +408,11 @@ def test_the_staged_early_completion_validates_its_shape() -> None:
         kind=DetachedTurnObservationKind.FAILED,
         ordering_marker=None,
         result_candidate=None,
+        interrupted=False,
         staged_at=_OBSERVED,
     )
     assert completion.result_candidate is None
+    assert completion.interrupted is False
     assert task_detached_turn_early_completion_field_names() == frozenset(
         {
             "id",
@@ -420,6 +422,7 @@ def test_the_staged_early_completion_validates_its_shape() -> None:
             "kind",
             "ordering_marker",
             "result_candidate",
+            "interrupted",
             "staged_at",
         }
     )
@@ -432,6 +435,7 @@ def test_the_staged_early_completion_validates_its_shape() -> None:
             kind="run.completed",  # type: ignore[arg-type]
             ordering_marker=None,
             result_candidate=None,
+            interrupted=False,
             staged_at=_OBSERVED,
         )
     with pytest.raises(ValueError, match="staged_at"):
@@ -443,5 +447,18 @@ def test_the_staged_early_completion_validates_its_shape() -> None:
             kind=DetachedTurnObservationKind.COMPLETED,
             ordering_marker=None,
             result_candidate=None,
+            interrupted=False,
             staged_at=datetime(2026, 11, 15, 9, 0, 0),
+        )
+    with pytest.raises(ValueError, match="interrupted"):
+        TaskDetachedTurnEarlyCompletion(
+            id=uuid4(),
+            workspace_id=uuid4(),
+            task_id=uuid4(),
+            task_detached_turn_receipt_id=uuid4(),
+            kind=DetachedTurnObservationKind.FAILED,
+            ordering_marker=None,
+            result_candidate=None,
+            interrupted="yes",  # type: ignore[arg-type]
+            staged_at=_OBSERVED,
         )

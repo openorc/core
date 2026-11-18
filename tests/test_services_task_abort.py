@@ -45,7 +45,7 @@ from openorc.adapters.agent_runtime import (
 from openorc.adapters.cline import ClineSettlementOutcome, ClineSettlementRefusal
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.executions import ExecutionStatus
-from openorc.domain.intents import TaskInterruptIntentStatus
+from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
@@ -60,6 +60,7 @@ from openorc.services.task_abort import (
     TaskAbortOutcomeKind,
     TaskInterruptSettlement,
     abort_task_activity,
+    settle_annotated_task_interrupt,
     settle_observed_task_interrupt,
 )
 from tests.test_services_task_pr_review_decision import (
@@ -753,6 +754,157 @@ def test_an_adapter_veto_keeps_the_observed_interruption_unresolved() -> None:
     annotate_sql = [sql for sql, _ in conn.executed if "set outcome = %s" in sql]
     assert len(annotate_sql) == 2  # the observation, then the refusal annotation
     assert all("set status = %s" not in sql for sql in annotate_sql)
+
+
+def test_the_detached_annotated_settlement_rejects_a_foreign_task_intent() -> None:
+    """The post-commit seam validates the intent's task identity before any
+    adapter effect: an intent from another task is a caller defect."""
+    conn = ScriptedConnection()
+    adapter = _FakeClineAdapter()
+
+    with pytest.raises(InvalidCommandError, match="another task"):
+        settle_annotated_task_interrupt(
+            _pool(conn),
+            cast(Any, adapter),
+            task_id=uuid4(),
+            intent=cast(
+                Any,
+                TaskInterruptIntent(
+                    id=_INTENT_ID,
+                    workspace_id=_WORKSPACE_ID,
+                    task_id=_TASK_ID,
+                    task_agent_session_id=_SESSION_ID,
+                    task_block_id=None,
+                    workflow_role=WorkflowRole.PRODUCER,
+                    external_session_id=_EXTERNAL_SESSION_ID,
+                    requested_by_profile_id=_OWNER_PROFILE_ID,
+                    status=TaskInterruptIntentStatus.UNSETTLED,
+                    outcome={"observed_resolution": "interrupted_turn"},
+                    created_at=_OBSERVED,
+                    updated_at=_OBSERVED,
+                ),
+            ),
+            external_session_id=_EXTERNAL_SESSION_ID,
+        )
+
+    assert adapter.settle_calls == []
+    assert adapter.abort_calls == []
+
+
+def test_the_detached_annotated_settlement_requires_the_d6b_discipline() -> None:
+    """An adapter without the D6b settlement discipline is a caller defect
+    raised before any effect — never contained as unavailability."""
+    conn = ScriptedConnection()
+    intent_row = _intent_row(outcome={"observed_resolution": "interrupted_turn"})
+
+    with pytest.raises(InvalidCommandError, match="D6b settlement discipline"):
+        settle_annotated_task_interrupt(
+            _pool(conn),
+            cast(Any, object()),
+            task_id=_TASK_ID,
+            intent=cast(Any, SimpleNamespace(id=intent_row[0], task_id=_TASK_ID)),
+            external_session_id=_EXTERNAL_SESSION_ID,
+        )
+
+
+def test_the_detached_annotated_settlement_records_the_durable_settled_outcome() -> None:
+    """The positive staged-path settlement (issue #342): after the attach's
+    observation annotation committed, the post-commit seam's one-shot
+    conditional recording advances the intent to ``settled`` — the intent is
+    durably settled, not merely annotated."""
+    conn = ScriptedConnection()
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="settled", outcome={"settlement": "confirmed"}),
+    )
+    adapter = _FakeClineAdapter()
+    intent = cast(
+        Any,
+        TaskInterruptIntent(
+            id=_INTENT_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id=None,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id=_EXTERNAL_SESSION_ID,
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            outcome={"observed_resolution": "interrupted_turn"},
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
+
+    outcome = settle_annotated_task_interrupt(
+        _pool(conn),
+        cast(Any, adapter),
+        task_id=_TASK_ID,
+        intent=intent,
+        external_session_id=_EXTERNAL_SESSION_ID,
+    )
+
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.SETTLED
+    assert outcome.detail == "settled"
+    assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
+
+
+def test_the_detached_annotated_settlement_raced_outcome_leaves_the_durable_record() -> None:
+    """A replayed post-commit settlement whose conditional outcome recording
+    races a concurrent settlement is a rejected no-op: the adapter hygiene
+    may run, but the returned outcome carries the intent's own durable
+    status and the durable record the flow already holds is the truth."""
+    conn = ScriptedConnection()
+    conn.on(_INTENT_UPDATE, None)  # the one-shot recording raced: rejected no-op
+    adapter = _FakeClineAdapter()
+    intent = cast(
+        Any,
+        TaskInterruptIntent(
+            id=_INTENT_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id=None,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id=_EXTERNAL_SESSION_ID,
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            outcome={"observed_resolution": "interrupted_turn"},
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
+    intent = cast(
+        Any,
+        TaskInterruptIntent(
+            id=_INTENT_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            task_block_id=None,
+            workflow_role=WorkflowRole.PRODUCER,
+            external_session_id=_EXTERNAL_SESSION_ID,
+            requested_by_profile_id=_OWNER_PROFILE_ID,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            outcome={"observed_resolution": "interrupted_turn"},
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
+
+    outcome = settle_annotated_task_interrupt(
+        _pool(conn),
+        cast(Any, adapter),
+        task_id=_TASK_ID,
+        intent=intent,
+        external_session_id=_EXTERNAL_SESSION_ID,
+    )
+
+    assert outcome is not None
+    assert outcome.status is TaskInterruptIntentStatus.UNSETTLED
+    assert outcome.detail == "settled"
+    assert adapter.settle_calls == [(_EXTERNAL_SESSION_ID, True, True)]
 
 
 def test_an_abort_without_evidence_refuses_and_surfaces_the_unresolved_interruption() -> None:

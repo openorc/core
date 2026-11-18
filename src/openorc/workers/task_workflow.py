@@ -66,7 +66,11 @@ from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.models import FormalResponse, PrResult
-from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
+from openorc.services.cline_attachment import (
+    ClineAttachmentPhase,
+    attach_cline_runtime,
+    settle_observed_detached_interrupt,
+)
 from openorc.services.cline_planning_bootstrap import ClineBootstrapRuntimeComposition
 from openorc.services.errors import ConflictError, NotFoundError, StaleOperationError
 from openorc.services.github_user_authorization import (
@@ -655,6 +659,41 @@ class _DetachedCompletionHandoff:
             "the settled operation family has no detached completion handoff "
             "route yet; its own detached migration wires it"
         )
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """The #342 Interrupt-settlement route: contained best-effort.
+
+        Re-derives the annotated unsettled Interrupt intent from committed
+        durable state and, only when one correlates, releases the attached
+        adapter's D6b guard discipline and records the intent's outcome
+        through the shared E10b settlement machinery — strictly post-commit,
+        with no database transaction across the adapter call. Never raises:
+        a failed settlement leaves the durable annotated intent exactly as
+        committed and the Owner-facing settlement branch remains the
+        authority.
+        """
+        try:
+            settle_observed_detached_interrupt(
+                self._dependencies.database_pool(),
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=task_agent_session_id,
+                external_session_id=external_session_id,
+            )
+        except Exception as error:  # noqa: BLE001 - contained settlement
+            logger.warning(
+                "the post-commit Interrupt settlement failed (%s) for task "
+                "session %s; the durable annotated intent owns recovery",
+                type(error).__name__,
+                task_agent_session_id,
+            )
 
 
 def build_detached_completion_handoff(

@@ -166,6 +166,7 @@ _CLEANUP_SETTLEMENT_KINDS: Final[frozenset[TurnSettlementKind]] = frozenset(
         TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
         TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED,
+        TurnSettlementKind.SETTLED_INTERRUPTED_TURN,
         TurnSettlementKind.NO_OUTSTANDING_RUN,
     }
 )
@@ -1190,6 +1191,28 @@ class DetachedTurnObservationHost:
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )
+        if (
+            outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+            and outcome.receipt is not None
+            and self._completion_handoff is not None
+        ):
+            # A settled interrupted-turn observation committed (issue #342):
+            # the ONE post-commit completion handoff owns the Interrupt
+            # settlement — the attached adapter's D6b guard release and the
+            # annotated intent's outcome recording — exactly as it owns the
+            # validated families' continuations, strictly after the
+            # settlement composition committed and with no database
+            # transaction across the adapter call. Contained best-effort
+            # inside the handoff, never a workflow authority: a failed
+            # settlement leaves the durable annotated intent exactly as
+            # committed — the Owner-facing settlement branch remains the
+            # authority.
+            self._completion_handoff.handoff_settled_interrupt(
+                workspace_id=entry.workspace_id,
+                task_id=entry.task_id,
+                task_agent_session_id=entry.task_agent_session_id,
+                external_session_id=entry.external_session_id,
+            )
 
     def _route_start_observation(
         self,

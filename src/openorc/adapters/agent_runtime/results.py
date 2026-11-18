@@ -19,11 +19,14 @@ by the adapter, and never echoed back in results or diagnostics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from uuid import UUID
 
 from openorc.domain.connections import WorkflowRole
 
 __all__ = [
+    "AgentRuntimeSettlementOutcome",
+    "AgentRuntimeSettlementRefusal",
     "AgentSessionAllocation",
     "AgentSessionCreated",
     "AgentSessionCreationRequest",
@@ -139,3 +142,47 @@ class AgentTextResponse:
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
             raise ValueError("AgentTextResponse.text must be a string")
+
+
+class AgentRuntimeSettlementRefusal(StrEnum):
+    """The neutral refusal vocabulary of one adapter guard-settlement attempt
+    (issue #342).
+
+    A refusal keeps every guard latched and names the safe machine reason;
+    only ``NOTHING_TO_SETTLE`` is classified by shared settlement policy as
+    a successful no-op — a fresh per-attachment-lease adapter instance
+    legitimately holds no local guard to release, and the durable Interrupt
+    intent is the authority. The concrete integration maps its own
+    guard states onto this closed vocabulary; no native reason crosses the
+    boundary.
+    """
+
+    OUTSTANDING_ABORT = "outstanding_abort"
+    UNRESOLVED_ABORT = "unresolved_abort"
+    RECONSTRUCTION_ACTIVE = "reconstruction_active"
+    NOTHING_TO_SETTLE = "nothing_to_settle"
+
+
+@dataclass(frozen=True)
+class AgentRuntimeSettlementOutcome:
+    """The neutral outcome of one explicit adapter guard-settlement attempt
+    (issue #342).
+
+    ``settled`` is ``True`` only when the requested kind's local protection
+    was cleared atomically after the final concurrency recheck. A refusal
+    carries its safe machine reason; an outstanding concurrent abort or an
+    active reconstruction is always a veto. The outcome classifies the
+    adapter's process-local guard discipline only — the durable workflow
+    authority stays with the caller's intent/Task records.
+    """
+
+    settled: bool
+    refusal: AgentRuntimeSettlementRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.settled, bool):
+            raise ValueError("AgentRuntimeSettlementOutcome.settled must be a boolean")
+        if self.settled and self.refusal is not None:
+            raise ValueError("a settled outcome carries no refusal reason")
+        if not self.settled and self.refusal is None:
+            raise ValueError("a refused outcome carries its safe refusal reason")

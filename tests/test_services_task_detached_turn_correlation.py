@@ -27,6 +27,7 @@ from psycopg.errors import UniqueViolation
 
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import (
+    SETTLEMENT_INTERRUPTED_TURN,
     SETTLEMENT_OBSERVED_FAILURE,
     SETTLEMENT_OUTCOME_LABEL_KEY,
     SETTLEMENT_OUTCOME_SEQUENCE_KEY,
@@ -268,6 +269,7 @@ def _staged_row(
     *,
     kind: str = "run.completed",
     candidate: str | None = None,
+    interrupted: bool = False,
 ) -> tuple[Any, ...]:
     return (
         _STAGED_ID,
@@ -277,6 +279,7 @@ def _staged_row(
         kind,
         41,
         candidate,
+        interrupted,
         _OBSERVED,
     )
 
@@ -807,13 +810,16 @@ def _terminal_evidence(
     kind: DetachedTurnObservationKind = DetachedTurnObservationKind.COMPLETED,
     marker: int | None = 41,
     candidate: str | None = _RESULT_CANDIDATE,
+    interrupted: bool = False,
 ) -> ObservedTurnEvidence:
     """One terminal evidence item of the fake's own invented evidence shape."""
     return ObservedTurnEvidence(
         external_session_id=_EXTERNAL_SESSION,
         family=TurnEvidenceFamily.TURN_TERMINAL,
         native_evidence=_ScriptedTurnEvidence(
-            outcome=TurnTerminalOutcome(kind=kind, result_candidate=candidate),
+            outcome=TurnTerminalOutcome(
+                kind=kind, result_candidate=candidate, interrupted=interrupted
+            ),
             marker=marker,
         ),
     )
@@ -1179,6 +1185,196 @@ def test_settlement_rejects_a_duplicate_early_completion() -> None:
         evidence=_COMPLETION_EVIDENCE,
     )
     assert outcome.kind is TurnSettlementKind.REJECTED_DUPLICATE
+
+
+# --- the interrupted-turn settlement routing (issue #342) --------------------------
+
+
+_INTENTS_LIST = _sql_has("from openorc.task_interrupt_intents")
+_INTENT_ANNOTATE = _sql_has("update openorc.task_interrupt_intents")
+
+
+def _interrupt_intent_row(
+    *,
+    status: str = "unsettled",
+    outcome: dict[str, Any] | None = None,
+    task_agent_session_id: UUID = _SESSION_ID,
+) -> tuple[Any, ...]:
+    """The 12-column ``task_interrupt_intents`` projection row."""
+    return (
+        uuid4(),
+        _WORKSPACE_ID,
+        _TASK_ID,
+        task_agent_session_id,
+        None,
+        WorkflowRole.PRODUCER.value,
+        _EXTERNAL_SESSION,
+        uuid4(),
+        status,
+        outcome if outcome is not None else {"dispatch": "acknowledged"},
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _script_interrupt_intents(conn: ScriptedConnection, intents: list[tuple[Any, ...]]) -> None:
+    conn.on(_INTENTS_LIST, intents)
+
+
+def test_an_interrupted_terminal_settles_the_receipt_and_annotates_the_single_intent(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    intent = _interrupt_intent_row()
+    annotated = _interrupt_intent_row(outcome={"observed_resolution": "interrupted_turn"})
+    _script_interrupt_intents(conn, [intent])
+    conn.on(_INTENT_ANNOTATE, annotated)
+    _script_settle(conn, _settled_row(SETTLEMENT_INTERRUPTED_TURN))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(interrupted=True),
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+    assert outcome.receipt is not None
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_INTERRUPTED_TURN
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_SEQUENCE_KEY] == 41
+    _annotate_sql, annotate_params = next(
+        (sql, params)
+        for sql, params in conn.executed
+        if "update openorc.task_interrupt_intents" in " ".join(sql.split())
+    )
+    assert annotate_params is not None
+    assert annotate_params[0].obj == {"observed_resolution": "interrupted_turn"}
+    assert annotate_params[1] == intent[0]
+    # The interrupted routing runs before every family routing: no Execution
+    # subject read, no failure finalization, no Level 2 report, no block.
+    assert not any("from openorc.executions" in sql for sql, _ in conn.executed)
+    assert triage.calls == []
+
+
+def test_a_failed_interrupted_terminal_never_reports_level_2(
+    triage: _RecordingTriage,
+) -> None:
+    """A ``run.failed``-shaped terminal whose native evidence positively
+    identifies an interrupted turn routes to the Interrupt settlement — never
+    a synthetic failure disposition under the attempt family."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_interrupt_intents(conn, [_interrupt_intent_row()])
+    conn.on(
+        _INTENT_ANNOTATE,
+        _interrupt_intent_row(outcome={"observed_resolution": "interrupted_turn"}),
+    )
+    _script_settle(conn, _settled_row(SETTLEMENT_INTERRUPTED_TURN))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            kind=DetachedTurnObservationKind.FAILED, candidate=None, interrupted=True
+        ),
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_INTERRUPTED_TURN
+    assert triage.calls == []
+
+
+def test_an_interrupted_terminal_without_a_matching_intent_settles_the_receipt_only(
+    triage: _RecordingTriage,
+) -> None:
+    """No unsettled intent for the exact binding — the interruption already
+    settled through its own branch, was durably recorded failed/unknown, or
+    raced away — leaves the intent untouched while the turn's own terminal
+    evidence still settles the receipt truthfully."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_interrupt_intents(conn, [])
+    _script_settle(conn, _settled_row(SETTLEMENT_INTERRUPTED_TURN))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(interrupted=True),
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+    assert not any(
+        "update openorc.task_interrupt_intents" in " ".join(sql.split()) for sql, _ in conn.executed
+    )
+    assert triage.calls == []
+
+
+def test_an_interrupted_terminal_with_an_ambiguous_intent_shape_fails_closed(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _admitted_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_interrupt_intents(conn, [_interrupt_intent_row(), _interrupt_intent_row()])
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(interrupted=True),
+    )
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
+    assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
+    assert not any(
+        "update openorc.task_interrupt_intents" in " ".join(sql.split()) for sql, _ in conn.executed
+    )
+    assert triage.calls == []
+
+
+def test_a_staged_interrupted_completion_routes_through_the_attach(
+    triage: _RecordingTriage,
+) -> None:
+    """The staged early completion preserves its interrupted verdict through
+    the admission race: the acknowledgement attach routes the positive
+    interrupted-turn evidence exactly as a direct delivery."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _receipt_row())
+    _script_attach(conn, _admitted_row())
+    _script_staged(conn, _staged_row(interrupted=True))
+    _script_last_consumed_sequence(conn, None)
+    _script_interrupt_intents(conn, [_interrupt_intent_row()])
+    conn.on(
+        _INTENT_ANNOTATE,
+        _interrupt_intent_row(outcome={"observed_resolution": "interrupted_turn"}),
+    )
+    _script_settle(conn, _settled_row(SETTLEMENT_INTERRUPTED_TURN))
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_INTERRUPTED_TURN
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    delete_at = next(
+        index for index, sql in enumerate(executed) if sql.startswith("delete from openorc")
+    )
+    settle_at = next(index for index, sql in enumerate(executed) if "set status = 'settled'" in sql)
+    assert settle_at < delete_at
 
 
 def test_settlement_settles_the_single_outstanding_turn_without_a_start_observation(
@@ -1792,6 +1988,7 @@ def test_initialization_completion_before_the_acknowledgement_is_staged(
             "run.completed",
             7,
             _READY_PAYLOAD_CANDIDATE,
+            False,
             _OBSERVED,
         ),
     )
