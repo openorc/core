@@ -833,12 +833,20 @@ class DetachedTurnObservationHost:
 
         The next registration for this connection re-attaches through a
         fresh credential read and the bounded reconnect reconciliation
-        re-establishes the still-outstanding sessions.
+        re-establishes the still-outstanding sessions. Each dropped
+        observation's attestation evidence is invalidated (issue #341): an
+        explicitly lost observation attests nothing, and a live turn is
+        re-corroborated only by fresh qualifying activity on the
+        re-established, actively observed session.
         """
         with self._lock:
             for entry in self._sessions.values():
                 if entry.connection_id == connection_id:
                     entry.observed = False
+                    epoch = entry.attestation_epoch
+                    if epoch is not None:
+                        epoch.start_claimed = False
+                        epoch.activity_observed = False
         self._source.drop_connection(connection_id)
 
     def _install_observation(
@@ -991,29 +999,41 @@ class DetachedTurnObservationHost:
             entry = self._sessions.get(task_agent_session_id)
             if entry is None:
                 return  # disposed, superseded, or already cleaned up
-            lease = entry.lifecycle_token
-            epoch = entry.attestation_epoch
-            if evidence.family in (
-                TurnEvidenceFamily.TURN_ACTIVITY,
-                TurnEvidenceFamily.TURN_USAGE,
-            ):
-                # The qualified activity/usage pulse (issue #341): the bare
-                # fact lands on the exact epoch captured here — a successor
-                # registration that replaced the epoch between the delivery
-                # and this ingest cannot inherit predecessor evidence.
-                if epoch is not None:
-                    epoch.activity_observed = True
-                driver = entry.cost_evaluation
-            elif evidence.family is TurnEvidenceFamily.TURN_TERMINAL and epoch is not None:
-                # The observed run ended: its epoch's in-progress evidence
-                # is cleared immediately, so even a settlement still in
-                # flight can never leave a finished turn attested.
-                epoch.start_claimed = False
-                epoch.activity_observed = False
+            if evidence.external_session_id != entry.external_session_id:
+                # The exact-session isolation guard (issue #341): a foreign
+                # identity envelope is never routed and never mutates this
+                # session's attestation epoch — this check precedes every
+                # epoch mutation and evaluation trigger below, so foreign
+                # activity can never attest and a foreign terminal can never
+                # erase valid attestation.
+                foreign = True
+                epoch = None
                 driver = None
             else:
-                driver = None
-        if evidence.external_session_id != entry.external_session_id:
+                foreign = False
+                lease = entry.lifecycle_token
+                epoch = entry.attestation_epoch
+                if evidence.family in (
+                    TurnEvidenceFamily.TURN_ACTIVITY,
+                    TurnEvidenceFamily.TURN_USAGE,
+                ):
+                    # The qualified activity/usage pulse (issue #341): the bare
+                    # fact lands on the exact epoch captured here — a successor
+                    # registration that replaced the epoch between the delivery
+                    # and this ingest cannot inherit predecessor evidence.
+                    if epoch is not None:
+                        epoch.activity_observed = True
+                    driver = entry.cost_evaluation
+                elif evidence.family is TurnEvidenceFamily.TURN_TERMINAL and epoch is not None:
+                    # The observed run ended: its epoch's in-progress evidence
+                    # is cleared immediately, so even a settlement still in
+                    # flight can never leave a finished turn attested.
+                    epoch.start_claimed = False
+                    epoch.activity_observed = False
+                    driver = None
+                else:
+                    driver = None
+        if foreign:
             logger.warning(
                 "a delivered evidence envelope carried a foreign session identity "
                 "for a registered task session; it is not routed"
@@ -1074,11 +1094,16 @@ class DetachedTurnObservationHost:
             entry = self._sessions.get(task_agent_session_id)
             if (
                 entry is None
+                or not entry.observed
                 or entry.workspace_id != workspace_id
                 or entry.task_id != task_id
                 or entry.connection_id != connection_id
                 or entry.external_session_id != external_session_id
             ):
+                # A lost observation (a dropped attachment, a disposed host,
+                # an unregistered or foreign session) attests nothing
+                # (issue #341): unavailable evidence is ``UNATTESTED``, and
+                # reconnection must re-corroborate with fresh evidence.
                 return TurnActivityAttestation.UNATTESTED
             epoch = entry.attestation_epoch
             if (
@@ -1364,6 +1389,19 @@ class DetachedTurnObservationHost:
                 "failed evidence for task session %s",
                 entry.task_agent_session_id,
             )
+            # The status-only reconciliation positively settled THIS
+            # receipt's turn (issue #341): the matching epoch's stale
+            # attestation evidence is invalidated — only the epoch bound to
+            # the settled receipt id, never a successor's epoch.
+            with self._lock:
+                epoch = entry.attestation_epoch
+                if (
+                    self._sessions.get(entry.task_agent_session_id) is entry
+                    and epoch is not None
+                    and epoch.receipt_id == receipt_id
+                ):
+                    epoch.start_claimed = False
+                    epoch.activity_observed = False
 
     def _detach_entry(self, entry: _SessionObservation) -> ObservationLease | None:
         """Detach one entry atomically under the registry lock."""
