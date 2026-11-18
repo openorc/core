@@ -12,6 +12,7 @@ and reconnection policy by the observation-host tests.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, cast
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ import pytest
 
 from openorc.adapters.cline import (
     ClineHubEvent,
+    ClineSessionEvent,
     Subscription,
     hub_evidence_family,
 )
@@ -285,3 +287,106 @@ def test_disposal_releases_every_observation_and_attachment() -> None:
 
 def test_the_family_recognition_is_exported_for_the_delivery_wrap() -> None:
     assert hub_evidence_family(_terminal_event()) is TurnEvidenceFamily.TURN_TERMINAL
+
+
+# --- the exact-session activity/usage pulses (issue #341) -------------------------
+
+
+def _activity_event() -> ClineSessionEvent:
+    """One qualifying model-backed activity event (thinking began)."""
+    return ClineSessionEvent(
+        session_id=_EXTERNAL_SESSION,
+        kind="agent_event",
+        payload={"event": {"type": "content_start", "contentType": "reasoning"}},
+    )
+
+
+def _usage_signal_event() -> ClineSessionEvent:
+    """One live usage signal event."""
+    return ClineSessionEvent(
+        session_id=_EXTERNAL_SESSION,
+        kind="agent_event",
+        payload={"event": {"type": "usage", "totalCost": 1.5}},
+    )
+
+
+def _observe_session(
+    delivered: list[Any],
+) -> tuple[FakeClineSdkBackend, ClineHubTurnObservationSource, ObservationLease]:
+    backend = FakeClineSdkBackend()
+    source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
+    _attach(source, backend)
+    lease = source.observe_session(
+        connection_id=_CONNECTION_ID,
+        external_session_id=_EXTERNAL_SESSION,
+        deliver=delivered.append,
+    )
+    return backend, source, lease
+
+
+def test_the_observation_delivers_content_free_activity_and_usage_pulses() -> None:
+    delivered: list[Any] = []
+    backend, _source, _lease = _observe_session(delivered)
+
+    backend.emit(_activity_event())
+    backend.emit(_usage_signal_event())
+    backend.emit(
+        ClineSessionEvent(session_id=_EXTERNAL_SESSION, kind="status", payload={"status": "idle"})
+    )
+    backend.emit(
+        ClineSessionEvent(session_id=_EXTERNAL_SESSION, kind="ended", payload={"reason": "done"})
+    )
+
+    assert [evidence.family for evidence in delivered] == [
+        TurnEvidenceFamily.TURN_ACTIVITY,
+        TurnEvidenceFamily.TURN_USAGE,
+    ]
+    for evidence in delivered:
+        assert evidence.external_session_id == _EXTERNAL_SESSION
+        # The pulse carrier is content-free: no kind, detail, or event
+        # material crosses the boundary.
+        assert repr(evidence.native_evidence) == "_ClineActivityPulseEvidence(<content-free>)"
+    # The Hub stream events of the same session still route as before.
+    backend.emit_hub(_terminal_event())
+    assert delivered[-1].family is TurnEvidenceFamily.TURN_TERMINAL
+
+
+def test_the_usage_consultation_returns_the_neutral_aggregate_reading() -> None:
+    backend = FakeClineSdkBackend()
+    source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
+    _attach(source, backend)
+    backend.queue_get_accumulated_usage(
+        _EXTERNAL_SESSION, {"usage": {"totalCost": 99.0}, "aggregateUsage": {"totalCost": 26.5}}
+    )
+
+    reading = source.consult_session_usage(
+        connection_id=_CONNECTION_ID, external_session_id=_EXTERNAL_SESSION
+    )
+
+    assert reading.aggregate_total_usd == Decimal("26.5")  # only the aggregate scope
+
+
+def test_the_usage_consultation_without_a_usable_aggregate_is_unknown() -> None:
+    backend = FakeClineSdkBackend()
+    source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
+    _attach(source, backend)
+    backend.queue_get_accumulated_usage(_EXTERNAL_SESSION, {"usage": {"totalCost": 99.0}})
+
+    reading = source.consult_session_usage(
+        connection_id=_CONNECTION_ID, external_session_id=_EXTERNAL_SESSION
+    )
+
+    assert reading.aggregate_total_usd is None
+
+
+def test_the_observation_lease_releases_both_stream_subscriptions() -> None:
+    delivered: list[Any] = []
+    backend, source, lease = _observe_session(delivered)
+
+    source.release_observation(lease)
+
+    # Neither stream delivers after the release: both subscriptions were
+    # released together with the lease.
+    backend.emit(_activity_event())
+    backend.emit_hub(_terminal_event())
+    assert delivered == []

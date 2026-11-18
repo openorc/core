@@ -26,6 +26,7 @@ from openorc.adapters.cline.activity import (
     ClineToolCategory,
     ClineTurnFinishReason,
     ClineUsageActivity,
+    aggregate_usage_cost_usd,
     project_qualifying_pulse,
     project_session_event,
     project_usage_summary,
@@ -86,6 +87,7 @@ from openorc.adapters.cline.values import (
 
 __all__ = [
     "CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY",
+    "aggregate_usage_cost_usd",
     "ClineAccumulatedUsage",
     "ClineAdapter",
     "ClineActivityDetail",

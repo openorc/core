@@ -29,6 +29,7 @@ from openorc.domain.detached_turns import (
     TaskDetachedTurnEarlyCompletion,
     TaskDetachedTurnReceipt,
     TaskDetachedTurnReceiptStatus,
+    TurnActivityAttestation,
     TurnAttribution,
     TurnEvidenceFamily,
     TurnFreshness,
@@ -385,6 +386,12 @@ def test_the_neutral_verdict_vocabularies_are_closed() -> None:
     assert {member.value for member in TurnEvidenceFamily} == {
         "turn_start",
         "turn_terminal",
+        "turn_activity",
+        "turn_usage",
+    }
+    assert {member.value for member in TurnActivityAttestation} == {
+        "active",
+        "unattested",
     }
     assert {member.value for member in DetachedTurnObservationKind} == {
         "completed",

@@ -53,6 +53,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Final
 from uuid import UUID
@@ -70,6 +71,7 @@ __all__ = [
     "ObservedTurnEvidence",
     "OWNER_REVIEWER_DISCUSSION_FAMILY",
     "REFUSAL_OUTCOME_KIND_KEY",
+    "SessionUsageReading",
     "SETTLEMENT_DISCUSSION_EXCHANGE",
     "SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION",
     "SETTLEMENT_OBSERVED_FAILURE",
@@ -80,6 +82,7 @@ __all__ = [
     "TaskDetachedTurnEarlyCompletion",
     "TaskDetachedTurnReceipt",
     "TaskDetachedTurnReceiptStatus",
+    "TurnActivityAttestation",
     "TurnAttribution",
     "TurnEvidenceFamily",
     "TurnFreshness",
@@ -172,13 +175,19 @@ class TurnEvidenceFamily(StrEnum):
     """The neutral family of one delivered turn observation.
 
     The concrete integration recognizes which of its native observations
-    speak about a turn's start or terminal outcome and delivers only those,
-    each with its own opaque native evidence. Every other native event is
-    not a turn observation and is never delivered.
+    speak about a turn's start, terminal outcome, or (issue #341) the
+    actual model-backed activity of the observed session, and delivers
+    only those, each with its own opaque native evidence. Every other
+    native event is not a turn observation and is never delivered. The
+    activity families carry the bare fact that qualified model-backed
+    activity (or a usage signal) was observed for the exact session —
+    never any kind, content, or payload material.
     """
 
     TURN_START = "turn_start"
     TURN_TERMINAL = "turn_terminal"
+    TURN_ACTIVITY = "turn_activity"
+    TURN_USAGE = "turn_usage"
 
 
 class TurnAttribution(StrEnum):
@@ -233,6 +242,53 @@ class TurnStatusEvidenceVerdict(StrEnum):
     FAILURE_EVIDENCE = "failure_evidence"
     COMPLETION_WITHOUT_RESULT_EVIDENCE = "completion_without_result_evidence"
     UNRESOLVED_EVIDENCE = "unresolved_evidence"
+
+
+class TurnActivityAttestation(StrEnum):
+    """The neutral activity attestation of one observed exact session (issue #341).
+
+    ``ACTIVE``: positively corroborated evidence — an outstanding
+    autonomous (formal-family) admitted turn whose start was attributed and
+    whose qualified model-backed activity/usage was observed since that
+    start — attests the session's currently interruptible autonomous turn.
+    ``UNATTESTED``: absent, insufficient, or non-autonomous evidence. An
+    unattested session is never attested by admission alone, by a start
+    claim without activity, by a session record, or by silence; the value
+    is advisory attestation evidence for the application cost/interrupt
+    policy and is never a workflow decision.
+    """
+
+    ACTIVE = "active"
+    UNATTESTED = "unattested"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionUsageReading:
+    """One sanitized cumulative session usage reading (issue #341).
+
+    ``aggregate_total_usd`` is the runtime's session-wide aggregate total
+    exactly as the integration extracted it — an exact ``Decimal`` when a
+    usable reading exists, ``None`` when the reading is absent, malformed,
+    or unusable (unknown truth, never a substituted or invented value).
+    This is the only field the consultation exposes: no scope breakdown,
+    no raw runtime payload material.
+    """
+
+    aggregate_total_usd: Decimal | None
+
+    def __post_init__(self) -> None:
+        total = self.aggregate_total_usd
+        if total is None:
+            return
+        if not isinstance(total, Decimal):
+            raise ValueError("SessionUsageReading.aggregate_total_usd must be a Decimal or None")
+        if not total.is_finite() or total < 0:
+            raise ValueError(
+                "SessionUsageReading.aggregate_total_usd must be finite and non-negative"
+            )
+
+    def __repr__(self) -> str:
+        return f"SessionUsageReading(aggregate_total_usd={self.aggregate_total_usd!r})"
 
 
 class ObservationLease:

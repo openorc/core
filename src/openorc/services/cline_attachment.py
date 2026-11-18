@@ -76,11 +76,13 @@ from openorc.adapters.cline.errors import ClineSdkBackendError
 from openorc.adapters.cline.hub_observation import OPENORC_CLIENT_IDENTITY
 from openorc.adapters.cline.values import ClineRemoteConfig
 from openorc.domain.connections import AdapterType, Connection, WorkflowRole
+from openorc.domain.intents import TaskInterruptIntent
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.connections import get_connection
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
+from openorc.services import task_abort
 from openorc.services.cline_construction import DurableClineConstructionContextResolver
 from openorc.services.cline_usage_observation import SessionUsageCostObserver
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
@@ -97,6 +99,7 @@ __all__ = [
     "AttachedClineRuntime",
     "ClineAttachmentPhase",
     "attach_cline_runtime",
+    "dispatch_cost_limit_interrupt",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.cline_attachment"
@@ -476,3 +479,46 @@ def attach_cline_runtime(
                     usage_observer.dispose()
         finally:
             backend.dispose()
+
+
+def dispatch_cost_limit_interrupt(
+    pool: DatabasePool,
+    *,
+    intent: TaskInterruptIntent,
+    external_session_id: str,
+) -> None:
+    """Dispatch one registered cost-limit Interrupt through a fresh BOUND lease.
+
+    The composition-rooted post-commit Interrupt dispatcher the detached-turn
+    observation host (issue #341) binds as its ``cost_limit_interrupt_dispatch``
+    seam: strictly after the blocking composition committed, with no database
+    transaction open, one short trusted attachment lease for the intent's
+    exact admitted Task/role/Connection session acquires the adapter and the
+    shared E10b dispatch machinery records the safe outcome on the durable
+    intent — exactly like the interactive Owner Abort's post-commit dispatch.
+    The adapter's classified outcomes are never interpreted here: a dispatch
+    failure is recorded on the durable intent by that machinery.
+    """
+    with application_span(
+        _SERVICE_TRACER_SCOPE, "cline_attachment.dispatch_cost_limit_interrupt"
+    ) as span:
+        annotate_span(
+            span,
+            operation="cline_attachment.dispatch_cost_limit_interrupt",
+            workspace_id=str(intent.workspace_id),
+            task_id=str(intent.task_id),
+        )
+        with attach_cline_runtime(
+            pool,
+            workspace_id=intent.workspace_id,
+            task_id=intent.task_id,
+            role=intent.workflow_role,
+            phase=ClineAttachmentPhase.BOUND,
+            external_session_id=external_session_id,
+        ) as attached:
+            task_abort.dispatch_registered_task_interrupt(
+                pool,
+                attached.adapter,
+                intent=intent,
+                external_session_id=external_session_id,
+            )

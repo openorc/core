@@ -58,6 +58,22 @@ interprets native evidence.
   that died loses its in-memory registry by design, and previously
   outstanding receipts stay unresolved under the accepted v1 fail-closed
   recovery bounds.
+- Each observation carries the receipt-epoch attestation of its exact
+  outstanding turn (issue #341): the epoch binds to the outstanding
+  receipt's identity and advances — resetting its evidence — whenever a
+  registration resolves a different outstanding receipt, including on the
+  successor-guard path that reuses a live subscription. The epoch attests
+  ``ACTIVE`` only when its receipt is autonomous (a formal family, never
+  the discussion family), its start was positively attributed, and
+  qualified model-backed activity or a usage signal was observed since
+  that start; every other state is honestly ``UNATTESTED``. A usage
+  signal additionally drives the shared best-effort cost-evaluation engine
+  (:class:`openorc.services.cline_usage_observation.SessionCostEvaluationDriver`)
+  over the neutral usage consultation and this attestation, so the
+  existing cost policy enforces while the dispatch worker is gone — the
+  composition-rooted post-commit Interrupt dispatcher is injected
+  alongside the source consultation capability, and without either the
+  usage signals attest but never trigger evaluations.
 """
 
 from __future__ import annotations
@@ -72,11 +88,14 @@ from uuid import UUID
 
 from openorc.domain.connections import AdapterType, Connection
 from openorc.domain.detached_turns import (
+    OWNER_REVIEWER_DISCUSSION_FAMILY,
     DetachedTurnObservationSourceError,
     NativeTurnEvidence,
     ObservationLease,
     ObservedTurnEvidence,
+    SessionUsageReading,
     TaskDetachedTurnReceiptStatus,
+    TurnActivityAttestation,
     TurnEvidenceFamily,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
@@ -87,6 +106,10 @@ from openorc.persistence.detached_turns import (
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import find_task_agent_session_binding
+from openorc.services.cline_usage_observation import (
+    InterruptDispatch,
+    SessionCostEvaluationDriver,
+)
 from openorc.services.connection_credentials import (
     ControlEndpointSecret,
     resolve_connection_runtime_credential,
@@ -101,6 +124,7 @@ from openorc.services.task_completion_handoff import DetachedTurnCompletionHando
 from openorc.services.task_detached_turn_correlation import (
     TurnEvidenceClassifier,
     TurnSettlementKind,
+    TurnStartCorroboration,
     TurnStatusClassificationKind,
     check_turn_start_identity,
     classify_acknowledged_turn_status,
@@ -113,6 +137,7 @@ __all__ = [
     "DetachedTurnObservationSource",
     "ObservationAttachmentInputs",
     "ObservationRegistrationRefusalReason",
+    "SessionUsageConsultationSource",
 ]
 
 logger = logging.getLogger(__name__)
@@ -252,16 +277,74 @@ class DetachedTurnObservationSource(TurnEvidenceClassifier, Protocol):
         ...
 
 
+class SessionUsageConsultationSource(Protocol):
+    """The optional neutral usage-consultation capability (issue #341).
+
+    A structural capability beside :class:`DetachedTurnObservationSource`:
+    a concrete integration MAY expose ``consult_session_usage`` to serve
+    the observation host's detached-turn cost evaluations, exactly like
+    the optional runtime capabilities beside ``AgentRuntimeAdapter``. The
+    host duck-types the capability fail-closed: a source without it keeps
+    every detached-turn observation behavior and simply never triggers a
+    cost evaluation from its usage pulses. The returned reading is the
+    neutral sanitized cumulative value — ``None`` is unknown truth.
+    """
+
+    def consult_session_usage(
+        self, *, connection_id: UUID, external_session_id: str
+    ) -> SessionUsageReading:
+        """Read one bounded cumulative usage consultation."""
+        ...
+
+
+class _TurnAttestationEpoch:
+    """The receipt-bound attestation epoch of one exact outstanding turn (issue #341).
+
+    The epoch binds to the exact outstanding receipt's identity and carries
+    only that turn's own evidence: whether the receipt is autonomous (a
+    formal family — never the discussion family), whether its admitted
+    turn's start was positively attributed, and whether qualified
+    model-backed activity or a usage signal was observed for the exact
+    session since that start. The flags live on the epoch, so a successor
+    registration's epoch replacement — atomically swapping the whole object
+    under the registry lock — can never inherit, erase, or mix predecessor
+    evidence: turn A's activity can never attest turn B, and predecessor
+    cleanup acts only on the epoch it captured. The epoch holds no content
+    and is never persisted: absent evidence stays honestly unattested.
+    """
+
+    __slots__ = ("activity_observed", "autonomous_turn", "receipt_id", "start_claimed")
+
+    def __init__(self, *, receipt_id: UUID | None, autonomous_turn: bool) -> None:
+        self.receipt_id = receipt_id
+        self.autonomous_turn = autonomous_turn
+        self.start_claimed = False
+        self.activity_observed = False
+
+    def __repr__(self) -> str:
+        return (
+            f"_TurnAttestationEpoch(receipt_id={self.receipt_id!r}, "
+            f"autonomous_turn={self.autonomous_turn!r}, "
+            f"start_claimed={self.start_claimed!r}, "
+            f"activity_observed={self.activity_observed!r})"
+        )
+
+
 class _SessionObservation:
     """One registered exact-session observation and its lifecycle lease.
 
     ``lifecycle_token`` is the small successor guard: every registration
     that reuses the session's live observation renews it, and a cleanup
     whose lease has since been renewed leaves the observation in place.
+    ``attestation_epoch`` is the exact outstanding turn's receipt-bound
+    evidence epoch (issue #341), replaced whenever a registration advances
+    to a different outstanding receipt.
     """
 
     __slots__ = (
+        "attestation_epoch",
         "connection_id",
+        "cost_evaluation",
         "external_session_id",
         "lifecycle_token",
         "observation_lease",
@@ -288,6 +371,8 @@ class _SessionObservation:
         self.observed = False
         self.observation_lease: ObservationLease | None = None
         self.lifecycle_token = 0
+        self.attestation_epoch: _TurnAttestationEpoch | None = None
+        self.cost_evaluation: SessionCostEvaluationDriver | None = None
 
 
 class DetachedTurnObservationHost:
@@ -310,12 +395,26 @@ class DetachedTurnObservationHost:
         ),
         control_endpoint_resolver: EndpointResolver,
         completion_handoff: DetachedTurnCompletionHandoff | None = None,
+        cost_limit_interrupt_dispatch: InterruptDispatch | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
         self._source = observation_source
         self._credential_resolver = runtime_credential_resolver
         self._endpoint_resolver = control_endpoint_resolver
         self._completion_handoff = completion_handoff
+        # The composition-rooted post-commit Interrupt dispatcher (issue
+        # #341): the host drives the shared cost-evaluation engine with it
+        # only when BOTH trusted seams exist — the source's neutral usage
+        # consultation capability and this dispatcher. A source without the
+        # consultation capability, or a composition without the dispatcher,
+        # keeps every usage signal as attestation evidence but never
+        # triggers a cost evaluation: a cost-limit block is never composed
+        # without a dispatch path for its registered Interrupts.
+        self._cost_limit_interrupt_dispatch = cost_limit_interrupt_dispatch
+        self._usage_consultation = getattr(observation_source, "consult_session_usage", None)
+        self._cost_evaluation_supported = (
+            callable(self._usage_consultation) and cost_limit_interrupt_dispatch is not None
+        )
         self._lock = threading.Lock()
         self._started = False
         self._disposed = False
@@ -357,6 +456,10 @@ class DetachedTurnObservationHost:
         for entry in sessions:
             lease = entry.observation_lease
             entry.observation_lease = None
+            driver = entry.cost_evaluation
+            entry.cost_evaluation = None
+            if driver is not None:
+                driver.dispose()
             if lease is not None:
                 self._release_lease_quietly(lease)
         self._source.dispose()
@@ -422,12 +525,36 @@ class DetachedTurnObservationHost:
                     "binding in its connection scope"
                 )
                 raise self._refusal(ObservationRegistrationRefusalReason.SESSION_BINDING_UNRESOLVED)
+            # The registration's receipt-epoch resolution (issue #341): the
+            # exact outstanding receipt this observation belongs to. The
+            # dispatch flow commits the receipt companion strictly before
+            # the registration gate, so the outstanding receipt exists here
+            # under the single-outstanding invariant; a transiently missing
+            # one binds a non-attesting epoch instead of guessing.
+            try:
+                receipt = get_outstanding_task_detached_turn_receipt(
+                    self._pool_provider(), task_agent_session_id=task_agent_session_id
+                )
+            except Exception as error:  # noqa: BLE001 - the read stays best-effort
+                logger.warning(
+                    "detached-turn observation registration receipt read failed (%s) "
+                    "for task session %s",
+                    type(error).__name__,
+                    task_agent_session_id,
+                )
+                receipt = None
             self._register_proven_session(
                 workspace_id=workspace_id,
                 task_id=task_id,
                 task_agent_session_id=task_agent_session_id,
                 connection_id=connection_id,
                 external_session_id=external_session_id,
+                receipt_id=None if receipt is None else receipt.id,
+                autonomous_turn=(
+                    False
+                    if receipt is None
+                    else receipt.expected_formal_family != OWNER_REVIEWER_DISCUSSION_FAMILY
+                ),
             )
 
     def register_establishment_session(
@@ -496,6 +623,10 @@ class DetachedTurnObservationHost:
                 task_agent_session_id=task_agent_session_id,
                 connection_id=connection_id,
                 external_session_id=external_session_id,
+                receipt_id=receipt.id,
+                autonomous_turn=(
+                    receipt.expected_formal_family != OWNER_REVIEWER_DISCUSSION_FAMILY
+                ),
             )
 
     def _register_proven_session(
@@ -506,6 +637,8 @@ class DetachedTurnObservationHost:
         task_agent_session_id: UUID,
         connection_id: UUID,
         external_session_id: str,
+        receipt_id: UUID | None,
+        autonomous_turn: bool,
     ) -> None:
         """Attach and observe a registration whose binding is proven."""
         with self._lock:
@@ -517,6 +650,9 @@ class DetachedTurnObservationHost:
                 # observation; a settlement cleanup whose lease this renewal
                 # supersedes leaves the observation in place.
                 existing.lifecycle_token += 1
+                self._advance_attestation_epoch_locked(
+                    existing, receipt_id=receipt_id, autonomous_turn=autonomous_turn
+                )
                 return
             if existing is None and len(self._sessions) >= _MAX_CONCURRENT_SESSION_OBSERVATIONS:
                 logger.warning(
@@ -530,7 +666,13 @@ class DetachedTurnObservationHost:
                     raise self._refusal(ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE)
                 winner = self._sessions.get(task_agent_session_id)
                 if winner is not None and winner.observed:
-                    return  # a concurrent registration established the observation
+                    # A concurrent registration established the observation:
+                    # renew and advance this registration's own receipt epoch.
+                    winner.lifecycle_token += 1
+                    self._advance_attestation_epoch_locked(
+                        winner, receipt_id=receipt_id, autonomous_turn=autonomous_turn
+                    )
+                    return
             self._ensure_attachment(workspace_id=workspace_id, connection_id=connection_id)
             try:
                 lease = self._source.observe_session(
@@ -559,7 +701,27 @@ class DetachedTurnObservationHost:
                 task_id=task_id,
                 connection_id=connection_id,
                 external_session_id=external_session_id,
+                receipt_id=receipt_id,
+                autonomous_turn=autonomous_turn,
             )
+
+    def _advance_attestation_epoch_locked(
+        self, entry: _SessionObservation, *, receipt_id: UUID | None, autonomous_turn: bool
+    ) -> None:
+        """Advance the entry's receipt-epoch when registration resolves another receipt.
+
+        Called under the registry lock. The same outstanding receipt keeps
+        its in-progress evidence (a renewal of the same turn); a different
+        receipt — including a first registration over reused evidence and a
+        successor turn — replaces the whole epoch object, so predecessor
+        evidence can never attest the successor's turn.
+        """
+        current = entry.attestation_epoch
+        if current is not None and current.receipt_id == receipt_id:
+            return
+        entry.attestation_epoch = _TurnAttestationEpoch(
+            receipt_id=receipt_id, autonomous_turn=autonomous_turn
+        )
 
     def _require_running(self) -> None:
         """Fail the registration closed when the host is not running."""
@@ -689,6 +851,8 @@ class DetachedTurnObservationHost:
         task_id: UUID,
         connection_id: UUID,
         external_session_id: str,
+        receipt_id: UUID | None,
+        autonomous_turn: bool,
     ) -> None:
         """Install a freshly established observation, or discard a losing race.
 
@@ -726,6 +890,16 @@ class DetachedTurnObservationHost:
                     current.observed = True
                     current.observation_lease = lease
                     current.lifecycle_token += 1
+                    # The registration's own receipt-epoch (issue #341): the
+                    # fresh observation binds the exact outstanding receipt
+                    # this registration resolved, and — when the trusted
+                    # composition provided both cost seams — the per-session
+                    # evaluation driver the usage pulses request.
+                    current.attestation_epoch = _TurnAttestationEpoch(
+                        receipt_id=receipt_id, autonomous_turn=autonomous_turn
+                    )
+                    if self._cost_evaluation_supported:
+                        current.cost_evaluation = self._make_cost_evaluation_driver(current)
         if not doomed:
             return
         self._release_lease_quietly(lease)
@@ -737,6 +911,46 @@ class DetachedTurnObservationHost:
                 "concurrent session bound"
             )
         raise self._refusal(doomed_reason)
+
+    def _make_cost_evaluation_driver(
+        self, entry: _SessionObservation
+    ) -> SessionCostEvaluationDriver:
+        """Compose the session's best-effort cost-evaluation driver (issue #341).
+
+        The shared engine behind the lease-attached observer, parameterized
+        by this process's trusted seams: the source's neutral cumulative
+        usage consultation for the exact session, this host's receipt-epoch
+        attestation sampled per evaluation, and the composition-rooted
+        post-commit Interrupt dispatcher. Called only when both seams exist.
+        """
+        assert self._usage_consultation is not None  # guarded by _cost_evaluation_supported
+        assert self._cost_limit_interrupt_dispatch is not None  # guarded likewise
+        consultation = self._usage_consultation
+        dispatch = self._cost_limit_interrupt_dispatch
+        return SessionCostEvaluationDriver(
+            self._pool_provider(),
+            workspace_id=entry.workspace_id,
+            task_id=entry.task_id,
+            task_agent_session_id=entry.task_agent_session_id,
+            connection_id=entry.connection_id,
+            read_cumulative_usage=lambda: (
+                consultation(
+                    connection_id=entry.connection_id,
+                    external_session_id=entry.external_session_id,
+                ).aggregate_total_usd
+            ),
+            attest_autonomous_turn=lambda: (
+                self.attest_session_activity(
+                    workspace_id=entry.workspace_id,
+                    task_id=entry.task_id,
+                    task_agent_session_id=entry.task_agent_session_id,
+                    connection_id=entry.connection_id,
+                    external_session_id=entry.external_session_id,
+                )
+                is TurnActivityAttestation.ACTIVE
+            ),
+            dispatch_interrupt=dispatch,
+        )
 
     def _release_lease_quietly(self, lease: ObservationLease) -> None:
         """Release one observation lease; failures never mask the caller."""
@@ -769,24 +983,112 @@ class DetachedTurnObservationHost:
         The envelope's own session identity is authoritative: a session-
         scoped observation must only deliver the exact session's evidence,
         and a mismatched identity is never routed or attributed. The
-        delivery-time lifecycle lease is captured under the registry lock so
-        the post-settlement cleanup can detect a successor registration.
+        delivery-time lifecycle lease and attestation epoch are captured
+        under the registry lock so the post-settlement cleanup and a
+        successor registration can detect what this delivery belongs to.
         """
         with self._lock:
             entry = self._sessions.get(task_agent_session_id)
             if entry is None:
                 return  # disposed, superseded, or already cleaned up
             lease = entry.lifecycle_token
+            epoch = entry.attestation_epoch
+            if evidence.family in (
+                TurnEvidenceFamily.TURN_ACTIVITY,
+                TurnEvidenceFamily.TURN_USAGE,
+            ):
+                # The qualified activity/usage pulse (issue #341): the bare
+                # fact lands on the exact epoch captured here — a successor
+                # registration that replaced the epoch between the delivery
+                # and this ingest cannot inherit predecessor evidence.
+                if epoch is not None:
+                    epoch.activity_observed = True
+                driver = entry.cost_evaluation
+            elif evidence.family is TurnEvidenceFamily.TURN_TERMINAL and epoch is not None:
+                # The observed run ended: its epoch's in-progress evidence
+                # is cleared immediately, so even a settlement still in
+                # flight can never leave a finished turn attested.
+                epoch.start_claimed = False
+                epoch.activity_observed = False
+                driver = None
+            else:
+                driver = None
         if evidence.external_session_id != entry.external_session_id:
             logger.warning(
                 "a delivered evidence envelope carried a foreign session identity "
                 "for a registered task session; it is not routed"
             )
             return
+        if driver is not None and evidence.family is TurnEvidenceFamily.TURN_USAGE:
+            # One coalesced cumulative cost evaluation per usage signal
+            # (issue #341), driven from the process-resident observation
+            # lifetime while the dispatch worker is gone. Best-effort and
+            # contained by the shared engine.
+            driver.request_evaluation()
+            return
         if evidence.family is TurnEvidenceFamily.TURN_TERMINAL:
             self._route_terminal_observation(entry, lease, evidence)
             return
-        self._route_start_observation(entry, evidence)
+        if evidence.family in (
+            TurnEvidenceFamily.TURN_ACTIVITY,
+            TurnEvidenceFamily.TURN_USAGE,
+        ):
+            return  # the pulse is recorded; nothing else routes
+        self._route_start_observation(entry, epoch, evidence)
+
+    def attest_session_activity(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> TurnActivityAttestation:
+        """Return the exact session's autonomous-turn activity attestation (issue #341).
+
+        The trusted read-only query behind the detached-turn cost path: the
+        attestation is ``ACTIVE`` only when this host actively observes the
+        exact identity tuple, the observation's receipt-bound epoch belongs
+        to an outstanding AUTONOMOUS (formal-family) admitted turn, that
+        turn's start was positively attributed to it, and qualified
+        model-backed activity or a usage signal was observed for the exact
+        session since that start. Every other state — an unobserved
+        session, a discussion receipt, a start without activity, a turn
+        whose terminal was delivered, a foreign identity tuple — is
+        honestly ``UNATTESTED``, never ``ACTIVE``. The value is advisory
+        attestation evidence for the application cost policy and is never a
+        workflow decision.
+        """
+        for name, value in (
+            ("workspace_id", workspace_id),
+            ("task_id", task_id),
+            ("task_agent_session_id", task_agent_session_id),
+            ("connection_id", connection_id),
+        ):
+            if not isinstance(value, UUID):
+                raise InvalidCommandError(f"{name} must be a UUID")
+        if not isinstance(external_session_id, str) or not external_session_id.strip():
+            raise InvalidCommandError("external_session_id must be a non-empty string")
+        with self._lock:
+            entry = self._sessions.get(task_agent_session_id)
+            if (
+                entry is None
+                or entry.workspace_id != workspace_id
+                or entry.task_id != task_id
+                or entry.connection_id != connection_id
+                or entry.external_session_id != external_session_id
+            ):
+                return TurnActivityAttestation.UNATTESTED
+            epoch = entry.attestation_epoch
+            if (
+                epoch is None
+                or not epoch.autonomous_turn
+                or not epoch.start_claimed
+                or not epoch.activity_observed
+            ):
+                return TurnActivityAttestation.UNATTESTED
+            return TurnActivityAttestation.ACTIVE
 
     def _route_terminal_observation(
         self,
@@ -865,17 +1167,24 @@ class DetachedTurnObservationHost:
                 )
 
     def _route_start_observation(
-        self, entry: _SessionObservation, evidence: ObservedTurnEvidence
+        self,
+        entry: _SessionObservation,
+        epoch: _TurnAttestationEpoch | None,
+        evidence: ObservedTurnEvidence,
     ) -> None:
         """Corroborate one delivered turn-start observation through the seam.
 
         Read-only: the seam resolves the durable correlation and records
         contradictions itself, on this integration's neutral attribution
         classification; this boundary delivers the evidence exactly as
-        observed and contains every failure.
+        observed and contains every failure. A positively corroborated
+        start claims the captured receipt-epoch's ``start_claimed`` (issue
+        #341) only when that same epoch still owns the session's
+        observation — a successor registration that advanced the epoch in
+        the meantime never inherits a predecessor's start claim.
         """
         try:
-            check_turn_start_identity(
+            corroboration = check_turn_start_identity(
                 self._pool_provider(),
                 classifier=self._source,
                 workspace_id=entry.workspace_id,
@@ -888,6 +1197,24 @@ class DetachedTurnObservationHost:
                 type(error).__name__,
                 entry.task_agent_session_id,
             )
+            return
+        if corroboration is not TurnStartCorroboration.CORROBORATED:
+            return
+        with self._lock:
+            if (
+                self._sessions.get(entry.task_agent_session_id) is entry
+                and entry.attestation_epoch is epoch
+                and epoch is not None
+            ):
+                # The attributed start opens this epoch's own evidence
+                # window (issue #341): any qualifying activity observed
+                # before it belonged to a predecessor turn or to the
+                # queue-wait window and never attests this turn. The claim
+                # resets the activity fact so only activity observed since
+                # this start attests; a pulse racing the claim's write is
+                # re-corroborated by the turn's next qualifying event.
+                epoch.start_claimed = True
+                epoch.activity_observed = False
 
     def _cleanup_after_settlement(self, entry: _SessionObservation, lease: int) -> None:
         """Release the session's observation unless a successor renewed it.
@@ -914,8 +1241,12 @@ class DetachedTurnObservationHost:
                 return None  # a successor registration renewed the observation
             lease_handle = entry.observation_lease
             entry.observation_lease = None
+            driver = entry.cost_evaluation
+            entry.cost_evaluation = None
             del self._sessions[entry.task_agent_session_id]
-            return lease_handle
+        if driver is not None:
+            driver.dispose()
+        return lease_handle
 
     def _reconcile_reconnected_connection(self, *, connection_id: UUID) -> None:
         """Re-establish observation after a fresh attachment replaced a dead one.
@@ -1041,5 +1372,9 @@ class DetachedTurnObservationHost:
                 return None
             lease = entry.observation_lease
             entry.observation_lease = None
+            driver = entry.cost_evaluation
+            entry.cost_evaluation = None
             del self._sessions[entry.task_agent_session_id]
-            return lease
+        if driver is not None:
+            driver.dispose()
+        return lease

@@ -391,8 +391,9 @@ def test_the_evaluation_handoff_never_drops_a_pending_notification(
     observer = _observer(blocking_adapter)
     hook_lock = _ReleaseHookLock()
     # The deterministic handoff seam: swap in a lock wrapper that fires an
-    # armed hook exactly once, right after a release.
-    observer._lock = hook_lock  # type: ignore[assignment]
+    # armed hook exactly once, right after a release. The single-flight
+    # evaluation engine (issue #341 extraction) owns that lock.
+    observer._driver._lock = hook_lock  # type: ignore[assignment]
     observer.start()
 
     def emit_second() -> None:

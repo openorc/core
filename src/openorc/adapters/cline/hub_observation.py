@@ -13,6 +13,19 @@ Shared application code consumes only the neutral evidence envelopes and
 verdicts; no Hub payload, event name, status token, or identity comparison
 crosses this boundary upward.
 
+The exact-session observation (issue #341) also subscribes the session's
+live event stream beside its Hub run stream: projected through the same D6c
+mapping and the E6 qualifying classification the adapter's activity surface
+uses, only two content-free neutral envelopes are delivered — that
+qualified model-backed activity was observed for the exact session
+(``TURN_ACTIVITY``), or that a usage signal arrived (``TURN_USAGE``), the
+latter being the cost path's cumulative re-read trigger. Every kind, tool
+name, commentary, and payload detail stays inside this integration. The
+bounded cumulative usage consultation (``consult_session_usage``) reads the
+runtime's session-wide aggregate through the already-attached backend and
+exposes only the sanitized neutral reading — the same aggregate-only cost
+rule the adapter's snapshot read applies.
+
 Failures of the source's own bounded transport mechanics surface as the
 neutral :class:`DetachedTurnObservationSourceError` with a safe reason;
 unexpected exceptions propagate unchanged.
@@ -26,6 +39,13 @@ from collections.abc import Callable, Sequence
 from typing import Final, Protocol
 from uuid import UUID
 
+from openorc.adapters.cline.activity import (
+    ClineActivityKind,
+    aggregate_usage_cost_usd,
+    project_qualifying_pulse,
+    project_session_event,
+    project_usage_summary,
+)
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
 from openorc.adapters.cline.classification import classify_backend_failure
 from openorc.adapters.cline.contract import ClineSdkBackend
@@ -39,6 +59,7 @@ from openorc.adapters.cline.hub_projection import (
 from openorc.adapters.cline.values import (
     ClineHubEvent,
     ClineRemoteConfig,
+    ClineSessionEvent,
     JsonObject,
     Subscription,
 )
@@ -47,7 +68,9 @@ from openorc.domain.detached_turns import (
     NativeTurnEvidence,
     ObservationLease,
     ObservedTurnEvidence,
+    SessionUsageReading,
     TurnAttribution,
+    TurnEvidenceFamily,
     TurnStatusEvidenceVerdict,
     TurnTerminalClassification,
 )
@@ -64,6 +87,7 @@ logger = logging.getLogger(__name__)
 
 _CONNECT_OPERATION: Final[str] = "connect"
 _SUBSCRIBE_OPERATION: Final[str] = "subscribe_hub"
+_SUBSCRIBE_ACTIVITY_OPERATION: Final[str] = "subscribe"
 
 
 class _AttachmentInputs(Protocol):
@@ -115,10 +139,31 @@ class _ClineStatusRecordsEvidence(NativeTurnEvidence):
         return f"_ClineStatusRecordsEvidence({len(self.records)} records)"
 
 
+class _ClineActivityPulseEvidence(NativeTurnEvidence):
+    """Content-free carrier of one qualified activity/usage pulse (issue #341).
+
+    The E6 pulse discipline applies: the carrier proves only that qualified
+    model-backed activity (or a usage signal) was observed for the exact
+    session — no kind, detail, session, or event content crosses this
+    boundary. The observation's own session identity rides the neutral
+    envelope; the carrier holds nothing at all.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "_ClineActivityPulseEvidence(<content-free>)"
+
+
 class _ClineObservationLease(ObservationLease):
     """The source's own handle of one established session observation."""
 
-    __slots__ = ("connection_id", "external_session_id", "subscription")
+    __slots__ = (
+        "activity_subscription",
+        "connection_id",
+        "external_session_id",
+        "subscription",
+    )
 
     def __init__(
         self,
@@ -126,10 +171,12 @@ class _ClineObservationLease(ObservationLease):
         connection_id: UUID,
         external_session_id: str,
         subscription: Subscription,
+        activity_subscription: Subscription,
     ) -> None:
         self.connection_id = connection_id
         self.external_session_id = external_session_id
         self.subscription: Subscription | None = subscription
+        self.activity_subscription: Subscription | None = activity_subscription
 
 
 class ClineHubTurnObservationSource:
@@ -231,6 +278,7 @@ class ClineHubTurnObservationSource:
             for key in [key for key in self._observations if key[0] == connection_id]:
                 lease = self._observations.pop(key)
                 lease.subscription = None
+                lease.activity_subscription = None
         if backend is not None:
             try:
                 backend.dispose()
@@ -253,9 +301,19 @@ class ClineHubTurnObservationSource:
         for lease in leases:
             subscription = lease.subscription
             lease.subscription = None
+            activity_subscription = lease.activity_subscription
+            lease.activity_subscription = None
             if subscription is not None:
                 try:
                     subscription.unsubscribe()
+                except Exception as error:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        "detached-turn observation unsubscribe failed during disposal (%s)",
+                        type(error).__name__,
+                    )
+            if activity_subscription is not None:
+                try:
+                    activity_subscription.unsubscribe()
                 except Exception as error:  # noqa: BLE001 - best-effort teardown
                     logger.warning(
                         "detached-turn observation unsubscribe failed during disposal (%s)",
@@ -279,11 +337,14 @@ class ClineHubTurnObservationSource:
         external_session_id: str,
         deliver: Callable[[ObservedTurnEvidence], None],
     ) -> ObservationLease:
-        """Subscribe the exact session's Hub events and return its lease.
+        """Subscribe the exact session's Hub events and live activity, and return its lease.
 
         The delivered envelopes are this integration's own neutral evidence
         wrapping: only qualified turn observations with their own session
-        identity are delivered, each carrying its opaque native carrier.
+        identity are delivered from the Hub run stream (start and terminal),
+        and only content-free qualified activity/usage pulses are delivered
+        from the session's live event stream (issue #341), each carrying its
+        opaque native carrier.
         """
         backend = self._connection_backend(connection_id)
         try:
@@ -303,16 +364,53 @@ class ClineHubTurnObservationSource:
             raise DetachedTurnObservationSourceError(
                 DetachedTurnObservationSourceError.SUBSCRIPTION_FAILED
             ) from None
+        try:
+            activity_subscription = backend.subscribe(
+                external_session_id,
+                self._make_activity_listener(external_session_id, deliver),
+            )
+        except Exception as error:
+            # The hub subscription is released before the refusal: a partially
+            # established observation is never left behind.
+            try:
+                subscription.unsubscribe()
+            except Exception as unsubscribe_error:  # noqa: BLE001 - best-effort teardown
+                logger.warning(
+                    "detached-turn observation unsubscribe failed after the activity "
+                    "subscription failure (%s) for session %s",
+                    type(unsubscribe_error).__name__,
+                    external_session_id,
+                )
+            if not isinstance(error, ClineSdkBackendError):
+                raise
+            failure = classify_backend_failure(error, operation=_SUBSCRIBE_ACTIVITY_OPERATION)
+            logger.warning(
+                "detached-turn observation activity subscription failed (%s) for session %s",
+                type(failure).__name__,
+                external_session_id,
+            )
+            raise DetachedTurnObservationSourceError(
+                DetachedTurnObservationSourceError.SUBSCRIPTION_FAILED
+            ) from None
         lease = _ClineObservationLease(
             connection_id=connection_id,
             external_session_id=external_session_id,
             subscription=subscription,
+            activity_subscription=activity_subscription,
         )
         with self._lock:
             if self._disposed:
                 lease.subscription = None
+                lease.activity_subscription = None
                 try:
                     subscription.unsubscribe()
+                except Exception as error:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        "detached-turn observation unsubscribe failed during disposal (%s)",
+                        type(error).__name__,
+                    )
+                try:
+                    activity_subscription.unsubscribe()
                 except Exception as error:  # noqa: BLE001 - best-effort teardown
                     logger.warning(
                         "detached-turn observation unsubscribe failed during disposal (%s)",
@@ -334,16 +432,26 @@ class ClineHubTurnObservationSource:
                 stored = None
         subscription = lease.subscription
         lease.subscription = None
-        if subscription is None:
-            return  # the attachment drop already owned it
-        try:
-            subscription.unsubscribe()
-        except Exception as error:  # noqa: BLE001 - best-effort teardown
-            logger.warning(
-                "detached-turn observation unsubscribe failed (%s) for session %s",
-                type(error).__name__,
-                lease.external_session_id,
-            )
+        activity_subscription = lease.activity_subscription
+        lease.activity_subscription = None
+        if subscription is not None:
+            try:
+                subscription.unsubscribe()
+            except Exception as error:  # noqa: BLE001 - best-effort teardown
+                logger.warning(
+                    "detached-turn observation unsubscribe failed (%s) for session %s",
+                    type(error).__name__,
+                    lease.external_session_id,
+                )
+        if activity_subscription is not None:
+            try:
+                activity_subscription.unsubscribe()
+            except Exception as error:  # noqa: BLE001 - best-effort teardown
+                logger.warning(
+                    "detached-turn observation activity unsubscribe failed (%s) for session %s",
+                    type(error).__name__,
+                    lease.external_session_id,
+                )
 
     def consult_status_evidence(
         self, *, connection_id: UUID, external_session_id: str
@@ -352,6 +460,24 @@ class ClineHubTurnObservationSource:
         backend = self._connection_backend(connection_id)
         records = backend.list_runs(external_session_id)
         return _ClineStatusRecordsEvidence(records)
+
+    def consult_session_usage(
+        self, *, connection_id: UUID, external_session_id: str
+    ) -> SessionUsageReading:
+        """Read one bounded cumulative usage consultation (issue #341).
+
+        The runtime's session-wide accumulated usage through the
+        already-attached backend, projected through the same pinned-usage
+        mapping the adapter's snapshot read applies and exposed as the
+        neutral sanitized reading — only the session-wide aggregate scope
+        is a cost source, and an absent, malformed, or non-finite reading
+        is unknown (``None``), never substituted or invented. This is SDK
+        I/O: the caller keeps no database transaction open across it.
+        """
+        backend = self._connection_backend(connection_id)
+        summary = backend.get_accumulated_usage(external_session_id)
+        _root, aggregate = project_usage_summary(summary)
+        return SessionUsageReading(aggregate_total_usd=aggregate_usage_cost_usd(aggregate))
 
     # --- the neutral evidence classification seam ----------------------------------
 
@@ -422,3 +548,46 @@ class ClineHubTurnObservationSource:
             family=family,
             native_evidence=_ClineHubEventEvidence(event),
         )
+
+    def _make_activity_listener(
+        self, external_session_id: str, deliver: Callable[[ObservedTurnEvidence], None]
+    ) -> Callable[[ClineSessionEvent], None]:
+        """Wrap one session's live activity deliveries into neutral pulses."""
+
+        def listener(event: ClineSessionEvent) -> None:
+            for evidence in self._wrap_session_activity(
+                event, expected_session_id=external_session_id
+            ):
+                deliver(evidence)
+
+        return listener
+
+    def _wrap_session_activity(
+        self, event: ClineSessionEvent, *, expected_session_id: str
+    ) -> list[ObservedTurnEvidence]:
+        """Wrap one live session event into its neutral activity/usage pulses.
+
+        The event is projected through the same D6c mapping the adapter's
+        activity surface applies, and only two content-free families are
+        recognized: a usage observation is a ``TURN_USAGE`` pulse (the cost
+        path's cumulative re-read trigger), and an observation satisfying
+        the E6 qualifying classification is a ``TURN_ACTIVITY`` pulse. Every
+        other projected kind, and every unprojected or malformed event, is
+        not delivered — nothing is invented from absence.
+        """
+        pulses: list[ObservedTurnEvidence] = []
+        for observation in project_session_event(event, expected_session_id=expected_session_id):
+            if observation.kind is ClineActivityKind.USAGE_OBSERVED:
+                family = TurnEvidenceFamily.TURN_USAGE
+            elif project_qualifying_pulse(observation):
+                family = TurnEvidenceFamily.TURN_ACTIVITY
+            else:
+                continue
+            pulses.append(
+                ObservedTurnEvidence(
+                    external_session_id=expected_session_id,
+                    family=family,
+                    native_evidence=_ClineActivityPulseEvidence(),
+                )
+            )
+        return pulses
