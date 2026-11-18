@@ -514,7 +514,7 @@ def _wire_dispatch(
     *,
     record: TaskResumeIntent,
     task: Task,
-    adapter: _FakeAdapter,
+    adapter: _FakeAdapter | _FakeDetachedAdapter,
 ) -> None:
     from contextlib import contextmanager
 
@@ -1390,7 +1390,7 @@ def _wire_detached_dispatch(
     *,
     record: TaskResumeIntent,
     task: Task,
-    adapter: _FakeDetachedAdapter,
+    adapter: _FakeAdapter | _FakeDetachedAdapter,
     registrar: _FakeRegistrar,
     handoff: _FakeHandoff,
     attach_outcome: Any,
@@ -1411,6 +1411,8 @@ def _wire_detached_dispatch(
 
     def _claim_and_flip(pool, *, task_resume_intent_id):
         claimed = blocking_claim(pool, task_resume_intent_id=task_resume_intent_id)
+        if claimed is None:  # pragma: no cover - the wired claim never refuses
+            raise AssertionError("the wired resume claim could not claim the record")
         state["record"] = claimed
         return claimed
 
