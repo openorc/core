@@ -529,6 +529,34 @@ def test_record_resume_intent_outcome_advances_once_to_a_terminal_status() -> No
     assert isinstance(params[1], Jsonb)
 
 
+def test_record_resume_intent_outcome_advances_to_the_failed_post_effect_terminal() -> None:
+    """The positively observed post-effect terminal failure (issue #343) is a
+    first-class outcome target from the same nonterminal states — truthfully
+    distinct from the pre-effect ``non_delivered``."""
+    fake_conn = FakeConnection(_resume_row(status="failed"))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    recorded = record_task_resume_intent_outcome(
+        pool,
+        task_resume_intent_id=uuid.uuid4(),
+        status=TaskResumeIntentStatus.FAILED,
+        outcome={
+            "result": "observed_failure",
+            "failure_kind": "observed_run_failure",
+            "error_code": "external_operation_failed",
+        },
+    )
+
+    assert recorded is not None
+    assert recorded.status is TaskResumeIntentStatus.FAILED
+    sql, params = fake_conn.executed[0]
+    assert "status in ('authorized', 'dispatched')" in sql
+    assert params is not None
+    assert params[0] == "failed"
+    assert isinstance(params[1], Jsonb)
+    assert params[1].obj["result"] == "observed_failure"
+
+
 def test_record_resume_intent_outcome_rejects_superseded_as_an_outcome_target() -> None:
     pool = cast(DatabasePool, FakePool(FakeConnection()))
 

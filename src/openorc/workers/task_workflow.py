@@ -2084,15 +2084,26 @@ def _compose_task_session_resume(
     The one-shot continuation the Owner Resume action's authorization
     committed: the durable record's routing context is re-derived from
     committed state, the record is claimed exactly once (or its proven
-    never-dispatched supersession is recorded), the fixed-prompt same-session
-    dispatch runs strictly outside any transaction, and the resumed formal
-    result routes through the original workflow operation's existing
-    completion logic. The handler owns no workflow rules of its own.
+    never-dispatched supersession is recorded), and the fixed-prompt
+    same-session dispatch runs strictly outside any transaction. In regular
+    mode the continuation is one detached agent turn (issue #343): the
+    fixed authorized resume instruction is admitted as one independent
+    detached run on the exact original session and the worker returns after
+    the acknowledgement attach — the independently observed completion owns
+    the settlement and the ONE post-commit handoff owns the continuations.
+    The queue-mode interim (until #328) keeps the blocking composition and
+    the in-process result routing. The handler owns no workflow rules of
+    its own.
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
+    observation_registrar = (
+        dependencies.detached_turn_observer()
+        if dependencies.settings.execution_mode is ExecutionMode.REGULAR
+        else None
+    )
     outcome = dispatch_authorized_task_resume(
         pool,
         workspace_id=workspace_id,
@@ -2109,6 +2120,12 @@ def _compose_task_session_resume(
         github=github,
         bootstrap_composition=dependencies.task_bootstrap_runtime_composition(),
         attempt_evidence=attempt_evidence,
+        observation_registrar=observation_registrar,
+        completion_handoff=(
+            build_detached_completion_handoff(dependencies)
+            if observation_registrar is not None
+            else None
+        ),
     )
     if outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH:
         if outcome.follow_up_state_token is None:

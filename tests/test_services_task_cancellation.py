@@ -52,7 +52,10 @@ from openorc.domain.intents import (
     TaskPullRequestCloseIntentStatus,
     TaskResumeIntentStatus,
 )
-from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.operational_failures import (
+    FailureEffectEvidence,
+    OriginalAttemptKind,
+)
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
@@ -2604,6 +2607,147 @@ def test_a_proven_non_delivered_reviewer_resume_lineage_permits_cancel(
 
     # The full accounting guard passes: no veto remains for the proven
     # non-delivered resumed review interaction.
+    task_cancellation._require_runtime_work_accounted(
+        cast(DatabasePool, object()),
+        task=_blocked_task(),
+    )
+
+
+def test_a_positively_failed_reviewer_resume_lineage_permits_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #343 failure path: the Type B gate's Cancel proceeds.
+
+    A positively observed post-effect terminal failure of the resumed
+    Reviewer REVIEW escalates to the Type B diagnostic block with the
+    original review iteration still unfinalized; the accounting recognizes
+    the FAILED record's lineage — the record's truthful terminal outcome
+    pairs with the escalation block's ``known_failed`` effect evidence and
+    the positively settled original Abort episode for the record's own
+    session — so the gate's only Owner action, Cancel Task, is never vetoed
+    solely by the record (the run definitively ended).
+    """
+    from openorc.domain.reviews import ReviewIteration, ReviewLoop, ReviewLoopPurpose
+
+    reviewer_session_id = uuid4()
+    original_block_id = uuid4()
+    escalated_block_id = uuid4()
+    episode_id = uuid4()
+    record_id = uuid4()
+
+    def _pull_request() -> Any:
+        return TaskPullRequest(
+            id=uuid4(),
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            repository_id=uuid4(),
+            github_pr_id=91,
+            github_pr_number=9,
+            head_ref="feature",
+            base_ref="main",
+            head_sha="b" * 40,
+            state=TaskPullRequestState.OPEN,
+            merged_at=None,
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        )
+
+    pull_request_row = _pull_request()
+    loop = ReviewLoop(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        purpose=ReviewLoopPurpose.PR_REVIEW,
+        iteration_limit=5,
+        status=ReviewLoopStatus.OPEN,
+        closed_at=None,
+        created_at=_OBSERVED,
+    )
+    iteration = ReviewIteration(
+        id=uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        review_loop_id=loop.id,
+        iteration_number=1,
+        plan_revision_id=None,
+        task_pull_request_id=pull_request_row.id,
+        reviewed_head_sha=pull_request_row.head_sha,
+        outcome=None,
+        summary=None,
+        findings=None,
+        decided_at=None,
+        created_at=_OBSERVED,
+    )
+    lineage_record = SimpleNamespace(
+        id=record_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=reviewer_session_id,
+        task_block_id=original_block_id,
+        workflow_role=SimpleNamespace(value="reviewer"),
+        status=TaskResumeIntentStatus.FAILED,
+        routing={
+            "control": "owner_resume",
+            "operation": "reviewer_review",
+            "subject_kind": "review_iteration",
+            "subject_id": str(iteration.id),
+            "restored_status": "reviewing",
+            "authorized_state_token": str(uuid4()),
+        },
+        outcome={
+            "result": "observed_failure",
+            "failure_kind": "observed_run_failure",
+            "error_code": "external_operation_failed",
+        },
+    )
+    escalated_block = SimpleNamespace(
+        id=escalated_block_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        context={
+            "failure_episode_id": str(episode_id),
+            "effect_evidence": FailureEffectEvidence.KNOWN_FAILED.value,
+            "original_attempt_kind": "owner_control_intent",
+            "original_attempt_id": str(record_id),
+        },
+    )
+    episode = SimpleNamespace(
+        id=episode_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        escalated_task_block_id=escalated_block_id,
+    )
+    settled_reviewer_intent = SimpleNamespace(
+        status=TaskInterruptIntentStatus.SETTLED,
+        task_agent_session_id=reviewer_session_id,
+        task_block_id=original_block_id,
+    )
+
+    _wire(
+        monkeypatch,
+        pull_request=pull_request_row,
+        loops=[loop],
+        loop_iterations=[iteration],
+        interrupt_intents=[settled_reviewer_intent],
+        resume_records=[lineage_record],
+    )
+    monkeypatch.setattr(
+        task_cancellation.failure_records,
+        "get_operational_failure_episode_by_original_attempt",
+        lambda pool, *, original_attempt_kind, original_attempt_id: (
+            episode if original_attempt_id == record_id else None
+        ),
+    )
+    monkeypatch.setattr(
+        task_cancellation.block_records,
+        "get_task_block",
+        lambda pool, *, task_block_id: (
+            escalated_block if task_block_id == escalated_block_id else None
+        ),
+    )
+
+    # The full accounting guard passes: no veto remains for the positively
+    # observed terminal failure of the resumed review interaction.
     task_cancellation._require_runtime_work_accounted(
         cast(DatabasePool, object()),
         task=_blocked_task(),

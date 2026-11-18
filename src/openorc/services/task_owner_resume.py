@@ -18,12 +18,23 @@ never a reason to reopen them.
 action hands off through the existing operation-invocation boundary. It
 re-derives everything from committed state, claims the record one-shot
 under the Task row lock (or records the proven never-dispatched
-supersession when a newer Owner decision re-blocked the Task first),
-dispatches the adapter-owned fixed continuation prompt to the exact
-original session strictly outside any transaction, and routes the resumed
-turn's formal result through the original workflow operation's EXISTING
-completion logic — the same logical operation continuing, never a
-replacement Execution, ReviewIteration, session, or dispatcher.
+supersession when a newer Owner decision re-blocked the Task first), and
+dispatches the fixed continuation to the exact original session strictly
+outside any transaction. In the queue-mode interim the dispatch is the
+adapter's blocking same-session resume and the resumed turn's formal
+result routes in-process through the original workflow operation's
+EXISTING completion logic. In regular mode the continuation is one
+detached agent turn (issue #343): the claim transaction also commits the
+``session_resume`` detached-turn receipt companion, the fixed authorized
+resume instruction is admitted verbatim as one independent detached run on
+the exact original still-live session, and the dispatching worker exits
+after the acknowledgement attach — the independently observed completion
+settles through the shared correlation seam, which completes the ORIGINAL
+workflow operation, settles the record's truthful terminal outcome
+(``settled``/``interrupted``/``failed``, never re-opening the resolved
+gate), and hands the ONE post-commit handoff to the original family. The
+same logical operation continues in both modes — never a replacement
+Execution, ReviewIteration, session, or dispatcher.
 
 The command has exactly three atomic boundaries:
 
@@ -46,37 +57,48 @@ The command has exactly three atomic boundaries:
   ``authorized`` → ``dispatched`` exactly once, while a moved-on Task
   positively establishes that the Resume was never dispatched (the claim
   is the only path to the adapter and it never committed) and records the
-  terminal ``superseded`` outcome without touching the newer episode.
-- **Result routing** (the owning service's own transaction discipline): the
-  resumed formal result completes the SAME Execution, ReviewIteration,
-  dispatch claim, or bootstrap stage through that service's existing
-  finalize functions, and the record settles exactly once with the
-  processed result.
+  terminal ``superseded`` outcome without touching the newer episode. In
+  regular mode the same transaction commits the record's ``session_resume``
+  detached-turn receipt companion (issue #343).
+- **Result routing** (the owning service's own transaction discipline): in
+  the queue-mode interim the resumed formal result completes the SAME
+  Execution, ReviewIteration, dispatch claim, or bootstrap stage through
+  that service's existing finalize functions, and the record settles
+  exactly once with the processed result. In regular mode the routing
+  happens when the independently observed terminal arrives, through the
+  shared correlation seam's own settlement composition.
 
 Operational failures of the continuation are Level 1 failures of the
 ``TASK_SESSION_RESUME`` operation family: the coordinator reports them
 against the record's durable identity and the existing Level 2 triage
-escalates them through the standard Type B ``BLOCK_RESOLUTION`` fallback.
+escalates them through the standard Type B ``BLOCK_RESOLUTION`` fallback —
+the family has no authorized-retry path, so a positively observed
+post-effect terminal failure settles the record's truthful ``failed``
+outcome and the Owner Cancel action stays reachable through the
+cancellation accounting's resume lineage (issue #343).
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeConfigurationRejectedError,
     AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
     AgentRuntimeUnavailableError,
+    AgentRuntimeUncertainOutcomeError,
     AgentSessionNotFoundError,
 )
+from openorc.adapters.agent_runtime.instructions import RESUMPTION_INSTRUCTION
 from openorc.adapters.agent_runtime.results import AgentTextResponse
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.blocking_cases import (
@@ -85,6 +107,7 @@ from openorc.domain.blocking_cases import (
     validate_blocking_case_evidence,
 )
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import TaskDetachedTurnReceipt
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
@@ -120,6 +143,7 @@ from openorc.persistence import (
 from openorc.persistence import (
     tasks as task_records,
 )
+from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.gates import resolve_owner_gate as resolve_gate_records
 from openorc.persistence.intents import (
     claim_task_resume_dispatch,
@@ -144,13 +168,17 @@ from openorc.protocol.models import (
     WorkspaceResult,
 )
 from openorc.services import event_coordination
+from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.cline_attachment import ClineAttachmentPhase, attach_cline_runtime
 from openorc.services.errors import (
+    ApplicationError,
     ConflictError,
     ExternalOperationFailedError,
+    ExternalOperationRejectedError,
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    ObservationRegistrationRefusedError,
     StaleOperationError,
 )
 from openorc.services.event_coordination import owner_actor
@@ -160,6 +188,7 @@ from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_authorized_implementation_execution import (
     complete_resumed_implementation_result,
 )
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_implementation_authorization import (
     open_implementation_authorization,
     require_resolution_applied,
@@ -201,6 +230,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AuthorizedTaskResume",
+    "SessionResumeObservationRegistrar",
     "SessionResumeOutcome",
     "SessionResumeOutcomeKind",
     "dispatch_authorized_task_resume",
@@ -217,6 +247,32 @@ ProducerRuntimeAttachmentFactory = Callable[[], AbstractContextManager[AgentRunt
 ReviewerRuntimeAttachmentFactory = Callable[
     [TaskAgentSession], AbstractContextManager[AgentRuntimeAdapter]
 ]
+
+
+@runtime_checkable
+class SessionResumeObservationRegistrar(Protocol):
+    """The structural registration seam of the process's detached-turn observer.
+
+    The same positively-required pre-admission gate the detached
+    establishment, implementation, plan, review, and discussion dispatches
+    consume (issues #323/#333–#339): the detached Owner Resume dispatch
+    (issue #343) registers the exact bound original session before any
+    admission, so an unreplayable resumed turn can never be produced
+    without active observation. Failures are the observer's typed refusals,
+    routed through the pre-effect failure machinery.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Establish the positive detached-turn observation of one exact session."""
+        ...
 
 
 @runtime_checkable
@@ -839,8 +895,24 @@ class SessionResumeFollowUp(StrEnum):
 
 
 class SessionResumeOutcomeKind(StrEnum):
-    """The typed outcome of one authorized session-resume continuation."""
+    """The typed outcome of one authorized session-resume continuation.
 
+    ``admitted`` (issue #343) is the regular-mode detached dispatch: the
+    one-shot continuation was durably admitted as one independent detached
+    turn and the dispatching worker returned after the acknowledgement
+    attach; the independently observed completion owns the settlement
+    through the shared correlation seam, so no in-process result routing
+    happened. ``completed`` means the resumed turn's formal result was
+    routed through its original workflow operation's completion logic and
+    the record settled (the blocking path); ``interrupted`` means the
+    runtime positively terminated the resumed turn by interruption (a
+    newer Owner decision's episode governs); ``superseded`` means the
+    record was proven never-dispatched and was terminally superseded
+    before any runtime effect. Failures raise the typed operational errors
+    for the coordinator's Level 2 handoff.
+    """
+
+    ADMITTED = "admitted"
     COMPLETED = "completed"
     INTERRUPTED = "interrupted"
     SUPERSEDED = "superseded"
@@ -907,6 +979,8 @@ def dispatch_authorized_task_resume(
     github: GitHubAppClient,
     bootstrap_composition: TaskBootstrapRuntimeComposition | None,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    observation_registrar: SessionResumeObservationRegistrar | None = None,
+    completion_handoff: DetachedTurnCompletionHandoff | None = None,
 ) -> SessionResumeOutcome:
     """Dispatch one authorized session-resume continuation, exactly once.
 
@@ -916,15 +990,35 @@ def dispatch_authorized_task_resume(
     and claims ``authorized`` → ``dispatched`` exactly once — or, when a
     newer Owner decision re-blocked the Task first, positively establishes
     the never-dispatched supersession and records the terminal
-    ``superseded`` outcome without touching the newer episode. The adapter-
-    owned fixed continuation prompt is then dispatched to the exact original
-    session strictly outside any transaction, and the resumed turn's formal
-    result routes through the original workflow operation's EXISTING
-    completion logic. Definite pre-effect refusals record the terminal
+    ``superseded`` outcome without touching the newer episode.
+
+    With no bound observation registrar — the queue-mode interim until its
+    own parity leaf (#328) — the adapter-owned fixed continuation prompt is
+    then dispatched to the exact original session strictly outside any
+    transaction as one blocking send, and the resumed turn's formal result
+    routes through the original workflow operation's EXISTING completion
+    logic. Definite pre-effect refusals record the terminal
     ``non_delivered`` outcome and propagate for the Level 2 escalation;
     uncertain outcomes leave the record conservatively ``dispatched`` and
     are never replayed; an interrupted resumed turn settles the newer
     episode's intent and records the terminal ``interrupted`` outcome.
+
+    With a bound observation registrar — the regular-mode detached dispatch
+    (issue #343) — the same one-shot claim transaction additionally commits
+    the ``session_resume`` detached-turn receipt companion of the record
+    (the ORIGINAL owner-control-intent identity, expecting the record
+    routing's original formal family), and the fixed authorized resume
+    instruction is admitted verbatim as one independent detached turn on
+    the exact original still-live session — never the original
+    planning/review/implementation prompt, never a new session, never a new
+    Execution/ReviewIteration/PlanRevision, and no workflow authority ever
+    derived from the acknowledged turn reference. Proven pre-effect
+    failures refuse the receipt and record the terminal ``non_delivered``
+    outcome; an uncertain admission leaves the receipt conservatively
+    claimed and the record ``dispatched`` and is never replayed. The
+    independently observed completion settles through the shared
+    correlation seam, which completes the ORIGINAL workflow operation and
+    hands the ONE post-commit handoff to that original family.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -999,9 +1093,60 @@ def dispatch_authorized_task_resume(
                     original_attempt_id=record.id,
                     phase="session_resume_dispatch",
                 )
+            expected_family_value = record.routing.get("expected_response_family")
+            if not isinstance(expected_family_value, str) or not expected_family_value.strip():
+                raise ConflictError("the session-resume record carries no expected response family")
+            receipt: TaskDetachedTurnReceipt | None = None
+            if observation_registrar is not None:
+                # The detached dispatch's receipt companion (issue #343):
+                # committed inside the SAME one-shot claim transaction,
+                # strictly before any runtime effect, so the
+                # single-outstanding invariant and the receipt lifecycle are
+                # durable from the first possible effect. The receipt roots
+                # at the record's own owner-control-intent identity and
+                # expects the record routing's ORIGINAL formal family.
+                receipt = turn_correlation.record_task_detached_turn_receipt(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    task_agent_session_id=record.task_agent_session_id,
+                    operation=PendingTaskRuntimeInteractionOperation.SESSION_RESUME,
+                    original_attempt_kind=OriginalAttemptKind.OWNER_CONTROL_INTENT,
+                    original_attempt_id=record.id,
+                    expected_formal_family=expected_family_value,
+                )
+
+        if observation_registrar is not None:
+            # The regular-mode detached dispatch (issue #343): the claimed
+            # record and its receipt companion are durable; the fixed
+            # authorized resume instruction is admitted as one independent
+            # detached turn on the exact original session and the worker
+            # returns after the acknowledgement attach.
+            if completion_handoff is None:
+                raise InvalidCommandError(
+                    "the detached session-resume dispatch carries no completion handoff"
+                )
+            if receipt is None:  # pragma: no cover - paired with the registrar
+                raise ConflictError(
+                    "the detached session-resume dispatch carries no receipt companion"
+                )
+            return _dispatch_authorized_resume_detached(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                record=record,
+                receipt=receipt,
+                expected_family=expected_family_value,
+                producer_runtime_factory=producer_runtime_factory,
+                reviewer_runtime_factory=reviewer_runtime_factory,
+                observation_registrar=observation_registrar,
+                completion_handoff=completion_handoff,
+            )
 
         # --- Boundary B2: the one fixed-prompt dispatch to the exact
-        # original session (external, no transaction open). ---
+        # original session (external, no transaction open). The queue-mode
+        # interim keeps the established blocking composition unchanged
+        # (until its own parity leaf, #328). ---
         if record.workflow_role is WorkflowRole.PRODUCER:
             if producer_runtime_factory is None:
                 raise InvalidCommandError(
@@ -1023,9 +1168,6 @@ def dispatch_authorized_task_resume(
             factory_cm = lambda: reviewer_runtime_factory(  # noqa: E731
                 reviewer_session
             )
-        expected_family_value = record.routing.get("expected_response_family")
-        if not isinstance(expected_family_value, str) or not expected_family_value.strip():
-            raise ConflictError("the session-resume record carries no expected response family")
         with factory_cm() as attached_adapter:
             try:
                 resume_runtime = cast(_ResumeCapableRuntime, attached_adapter)
@@ -1094,6 +1236,323 @@ def dispatch_authorized_task_resume(
             response=response,
             attempt_evidence=attempt_evidence,
         )
+
+
+_RESUME_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
+_RESUME_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+
+
+def _refuse_resume_dispatch_quietly(
+    pool: DatabasePool,
+    receipt: TaskDetachedTurnReceipt,
+    *,
+    refusal_kind: str,
+) -> None:
+    """Mark a claimed resume receipt refused after a proven pre-effect failure.
+
+    Best-effort containment: a persistence failure here must never mask the
+    typed refusal the caller raises. The claimed receipt stays the honest
+    unresolved state under the accepted v1 recovery bounds and the failure
+    is logged selectively. The record's own terminal ``non_delivered``
+    outcome is recorded by the caller's typed failure path.
+    """
+    try:
+        refused = refuse_task_detached_turn_receipt(
+            pool,
+            receipt_id=receipt.id,
+            task_id=receipt.task_id,
+            workspace_id=receipt.workspace_id,
+            refusal_kind=refusal_kind,
+        )
+    except Exception as error:  # noqa: BLE001 - containment, never masking
+        logger.warning(
+            "the refused session-resume receipt could not be durably marked (%s); "
+            "the claimed receipt stays the honest unresolved state",
+            type(error).__name__,
+        )
+        refused = None
+    if refused is None:  # pragma: no cover - a claimed receipt refuses once
+        logger.warning(
+            "the session-resume receipt was no longer claimed when its pre-effect "
+            "refusal was recorded"
+        )
+
+
+def _dispatch_authorized_resume_detached(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    record: TaskResumeIntent,
+    receipt: TaskDetachedTurnReceipt,
+    expected_family: str,
+    producer_runtime_factory: ProducerRuntimeAttachmentFactory | None,
+    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory | None,
+    observation_registrar: SessionResumeObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff,
+) -> SessionResumeOutcome:
+    """Admit the authorized resume instruction as one detached agent turn.
+
+    The detached Owner-authorized same-session Resume's runtime boundary
+    (issue #343), mirroring the established detached-dispatch mechanics: the
+    runtime lease and the detached capability are acquired and duck-typed
+    fail-closed (the claim and its receipt companion are already durable —
+    a capability-less runtime is a proven pre-effect non-delivery of the
+    just-claimed record), one positively-required observation registration
+    gates the admission, one detached-turn admission carries the fixed
+    authorized resume instruction verbatim — the ONLY content the
+    independent run ever receives, never the original
+    planning/review/implementation prompt — and the acknowledgement attach
+    consumes any staged early completion exactly once. No ``send`` and no
+    blocking wait exists in this path, and no database transaction is ever
+    held across a runtime call. The dispatching worker returns after the
+    attach; the independently observed completion owns the settlement
+    through the shared correlation seam, whose routing completes the
+    ORIGINAL workflow operation and hands the ONE post-commit handoff to
+    that original family.
+
+    Proven pre-effect failures refuse the receipt, record the record's
+    terminal ``non_delivered`` outcome, and raise the typed
+    operational-failure classes the F5b coordinator triages under the
+    record's own family. An uncertain admission leaves the receipt
+    conservatively claimed and the record ``dispatched`` and is never
+    re-dispatched. The original gate and block stay resolved history
+    whatever subsequently happens to the continuation.
+    """
+    register = getattr(observation_registrar, "register_session", None)
+    if not callable(register):
+        raise InvalidCommandError(
+            "the session-resume observation registrar does not implement the "
+            "established-session registration seam"
+        )
+    external_session_id = record.external_session_id
+    if not external_session_id.strip():
+        raise ConflictError(
+            "the session-resume record's binding carries no external session identity"
+        )
+    if record.workflow_role is WorkflowRole.PRODUCER:
+        if producer_runtime_factory is None:
+            raise InvalidCommandError(
+                "the continuation carries no producer runtime attachment factory"
+            )
+        factory_cm: Callable[[], AbstractContextManager[AgentRuntimeAdapter]] = (
+            producer_runtime_factory
+        )
+    else:
+        if reviewer_runtime_factory is None:
+            raise InvalidCommandError(
+                "the continuation carries no reviewer runtime attachment factory"
+            )
+        reviewer_session = session_records.get_task_agent_session(
+            pool, task_id=task_id, role=WorkflowRole.REVIEWER
+        )
+        if reviewer_session is None:
+            raise ConflictError("the reviewer session binding is not available for this task")
+        factory_cm = lambda: reviewer_runtime_factory(  # noqa: E731
+            reviewer_session
+        )
+
+    # __RESUME_DETACHED_ADMIT__
+
+    if expected_family != receipt.expected_formal_family:  # pragma: no cover - same transaction
+        raise ConflictError(
+            "the detached session-resume receipt's expected family disagrees with "
+            "the record routing; the dispatch is stale"
+        )
+
+    def _record_non_delivered(*, refusal: str) -> None:
+        outcome = record_task_resume_intent_outcome(
+            pool,
+            task_resume_intent_id=record.id,
+            status=TaskResumeIntentStatus.NON_DELIVERED,
+            outcome={"dispatch": "non_delivered", "refusal": refusal},
+        )
+        if outcome is None:  # pragma: no cover - the claimed record is non-terminal
+            logger.warning(
+                "the session-resume record was no longer non-terminal when its "
+                "proven pre-effect non-delivery was recorded"
+            )
+
+    with ExitStack() as attachment_stack:
+        runtime = attachment_stack.enter_context(factory_cm())
+        # The detached capability is duck-typed fail-closed BEFORE the
+        # admission effect: a runtime without it cannot serve the detached
+        # dispatch, and the just-claimed record carries its proven pre-effect
+        # non-delivery — nothing could ever have been enqueued.
+        admit = getattr(runtime, "admit_detached_turn", None)
+        if not callable(admit):
+            _record_non_delivered(refusal="no_detached_capability")
+            raise ExternalOperationFailedError(
+                "the runtime does not implement the detached turn capability; "
+                "the resume dispatch failed before any effect"
+            )
+        admit_detached_turn = cast(Callable[[str, str], AgentTurnAdmission], admit)
+
+        # --- The positive pre-admission observation registration: the
+        # positively-required gate. A refusal is a proven pre-effect failure:
+        # the receipt is refused and the record carries its terminal
+        # non-delivery, so a never-dispatched turn holds neither the
+        # session's single-outstanding slot nor the record's authorization. ---
+        binding = session_records.get_task_agent_session(
+            pool, task_id=task_id, role=record.workflow_role
+        )
+        if (
+            binding is None
+            or binding.id != record.task_agent_session_id
+            or binding.workspace_id != workspace_id
+            or binding.external_session_id != external_session_id
+        ):
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_REGISTRATION_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="binding_unresolved")
+            raise ExternalOperationFailedError(
+                "the session-resume record's binding does not resolve to its "
+                "addressed session; the dispatch failed before any effect"
+            )
+        try:
+            register(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                task_agent_session_id=record.task_agent_session_id,
+                connection_id=binding.connection_id,
+                external_session_id=external_session_id,
+            )
+        except ObservationRegistrationRefusedError as error:
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_REGISTRATION_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="observation_registration_refused")
+            raise ExternalOperationFailedError(
+                "the session-resume observation registration was refused before "
+                "any admission; the instruction never dispatched"
+            ) from error
+        except Exception as error:
+            logger.warning(
+                "the session-resume observation registration failed (%s) before "
+                "any admission; the receipt is refused and the instruction never "
+                "dispatched",
+                type(error).__name__,
+            )
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_REGISTRATION_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="observation_registration_failed")
+            raise ExternalOperationFailedError(
+                "the session-resume observation registration failed before any "
+                "admission; the instruction never dispatched"
+            ) from error
+
+        # --- The admission (external, no transaction held). One
+        # detached-turn admission of the fixed authorized resume instruction
+        # verbatim — the only content the independent run ever receives. ---
+        try:
+            admission = admit_detached_turn(external_session_id, RESUMPTION_INSTRUCTION)
+        except AgentRuntimeUncertainOutcomeError as error:
+            logger.warning(
+                "the detached session-resume admission ended with an uncertain "
+                "outcome; the receipt stays conservatively claimed and the record "
+                "stays dispatched and is never re-dispatched"
+            )
+            raise ExternalOperationUncertainError(
+                "the outcome of the session-resume admission is unknown; the "
+                "receipt stays conservatively claimed and the record stays "
+                "dispatched and the instruction is never re-dispatched"
+            ) from error
+        except AgentRuntimeError as error:
+            # A positively identified refusal (unreachable before effect,
+            # runtime rejection, exact-session absence): proven pre-effect, so
+            # the receipt is refused and the record carries its terminal
+            # non-delivery.
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_ADMISSION_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="admission_refused")
+            raise ExternalOperationRejectedError(
+                "the session-resume admission was refused before any effect; "
+                "the receipt is refused and the instruction never dispatched"
+            ) from error
+
+        # --- The acknowledgement attach (one short transaction). A staged
+        # early completion is consumed exactly once here and routed through
+        # the ordinary settlement, so a resumed result that finished before
+        # the acknowledgement was persisted is correlated, never ignored. ---
+        try:
+            outcome: turn_correlation.TurnSettlementOutcome = (
+                turn_correlation.attach_acknowledged_turn(
+                    pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt_id=receipt.id,
+                    admitted_turn_reference=admission.turn_reference,
+                )
+            )
+        except ApplicationError:
+            raise
+        except Exception as error:
+            raise ExternalOperationFailedError(
+                "the session-resume acknowledgement could not be durably attached "
+                "after its known admission; authoritative recovery is required "
+                "and the instruction is never re-dispatched"
+            ) from error
+
+    # The attachment is released; the handoffs are strictly post-dispatch
+    # and never hold the runtime lease.
+    if outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_VALIDATED_RESULT:
+        # A staged early completion settled the original operation and the
+        # receipt within this dispatch: the ONE post-commit completion
+        # handoff owns the family routing — by the ORIGINAL operation family
+        # the outcome carries, exactly as it routes that family's ordinary
+        # detached settlements. Strictly post-commit, contained, never a
+        # workflow authority; a failed routing leaves the durable state to
+        # the existing recovery semantics.
+        handoff_operation = (
+            outcome.handoff_operation
+            if outcome.handoff_operation is not None
+            else outcome.receipt.operation
+            if outcome.receipt is not None
+            else None
+        )
+        if handoff_operation is not None:
+            try:
+                completion_handoff.handoff_settled_completion(
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    operation=handoff_operation,
+                )
+            except Exception as error:  # noqa: BLE001 - contained handoff
+                logger.warning(
+                    "the post-dispatch session-resume completion handoff failed "
+                    "(%s); the durable state owns recovery",
+                    type(error).__name__,
+                )
+    if (
+        outcome.kind is turn_correlation.TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+        and outcome.receipt is not None
+    ):
+        # A staged interrupted completion settled the receipt within this
+        # dispatch (issue #342's shared interrupted routing, which also
+        # settles the record's terminal ``interrupted`` outcome): the ONE
+        # post-commit completion handoff owns the Interrupt settlement — the
+        # attached adapter's D6b guard release and the annotated intent's
+        # outcome recording. Strictly post-attach, contained best-effort
+        # inside the handoff, never a workflow authority.
+        completion_handoff.handoff_settled_interrupt(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            task_agent_session_id=outcome.receipt.task_agent_session_id,
+            external_session_id=external_session_id,
+        )
+    reloaded = get_task_resume_intent(pool, task_resume_intent_id=record.id)
+    if reloaded is None:  # pragma: no cover - the claimed record cannot vanish
+        raise NotFoundError(
+            "the addressed session-resume record is not available after its dispatch"
+        )
+    return SessionResumeOutcome(
+        kind=SessionResumeOutcomeKind.ADMITTED,
+        resume=reloaded,
+        detail="detached_resume_admitted",
+    )
 
 
 def _settle_resume_record(pool: DatabasePool, *, task_resume_intent_id: UUID) -> TaskResumeIntent:

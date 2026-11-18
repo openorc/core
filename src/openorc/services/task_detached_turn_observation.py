@@ -1176,7 +1176,11 @@ class DetachedTurnObservationHost:
                 self._completion_handoff.handoff_settled_completion(
                     workspace_id=entry.workspace_id,
                     task_id=entry.task_id,
-                    operation=outcome.receipt.operation,
+                    operation=(
+                        outcome.handoff_operation
+                        if outcome.handoff_operation is not None
+                        else outcome.receipt.operation
+                    ),
                     validated_result=(
                         outcome.formal_result
                         if outcome.receipt.operation
