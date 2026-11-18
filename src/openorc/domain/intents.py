@@ -33,12 +33,13 @@ representation.
   continuation exactly-once across crashes and concurrent commands. Its
   status is forward-only: ``authorized`` is the committed-but-never-
   dispatched authorization, ``dispatched`` is the claimed in-flight resumed
-  turn, and ``settled``/``non_delivered``/``interrupted``/``superseded`` are
-  terminal outcome records. At most one non-terminal record may exist per
-  session binding. Its immutable ``routing`` mapping is the safe machine
-  context established at authorization — the original workflow operation it
-  continues, the expected formal response family, the exact durable subject
-  reference, the restored Task status, and the authorization token.
+  turn, and ``settled``/``non_delivered``/``interrupted``/``superseded``/
+  ``failed`` are terminal outcome records. At most one non-terminal record
+  may exist per session binding. Its immutable ``routing`` mapping is the
+  safe machine context established at authorization — the original workflow
+  operation it continues, the expected formal response family, the exact
+  durable subject reference, the restored Task status, and the
+  authorization token.
 - ``outcome`` is a small canonical JSON object of safe machine facts only:
   stable internal identifiers, role names, and classified outcome labels.
   Tokens, credentials, transcript content, prompts, and raw provider errors
@@ -312,9 +313,14 @@ class TaskResumeIntentStatus(StrEnum):
     ``settled`` (the resumed turn's result was durably processed by its
     original workflow owner), ``non_delivered`` (a positively proven
     pre-effect refusal — nothing reached the runtime), ``interrupted`` (the
-    runtime positively terminated the resumed turn by interruption), and
+    runtime positively terminated the resumed turn by interruption),
     ``superseded`` (proven never-dispatched supersession: a later Owner
-    decision re-blocked the Task before the dispatch claim committed).
+    decision re-blocked the Task before the dispatch claim committed), and
+    ``failed`` (a positively observed post-effect terminal of the detached
+    resumed run — the run definitively ended without a result its original
+    workflow owner could process, truthfully distinct from a pre-effect
+    non-delivery, and the failure was dispositioned through the existing
+    Level 2 path; issue #343).
     """
 
     AUTHORIZED = "authorized"
@@ -323,6 +329,7 @@ class TaskResumeIntentStatus(StrEnum):
     NON_DELIVERED = "non_delivered"
     INTERRUPTED = "interrupted"
     SUPERSEDED = "superseded"
+    FAILED = "failed"
 
 
 TERMINAL_TASK_RESUME_INTENT_STATUSES: frozenset[TaskResumeIntentStatus] = frozenset(
@@ -331,6 +338,7 @@ TERMINAL_TASK_RESUME_INTENT_STATUSES: frozenset[TaskResumeIntentStatus] = frozen
         TaskResumeIntentStatus.NON_DELIVERED,
         TaskResumeIntentStatus.INTERRUPTED,
         TaskResumeIntentStatus.SUPERSEDED,
+        TaskResumeIntentStatus.FAILED,
     }
 )
 

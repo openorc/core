@@ -1677,12 +1677,14 @@ def _resume_episode_lineage_sessions(
     episode is the Level 2 escalation of a Resume continuation failure, its
     sanitized context roots at the durable session-resume record; a record
     that terminally recorded a positively proven pre-effect non-delivery
-    hands the accounting the settled-intent sessions of the record's OWN
-    OWNER_ABORT episode — the interrupted Executions the Owner's Resume was
-    authorized to continue. Every other record state or context shape
-    exempts nothing: a settled record's episode resolved with its workflow,
-    and an interrupted/superseded resume never coexists with an escalation
-    block (fail closed).
+    (``non_delivered``, issue #292) or a positively observed post-effect
+    terminal failure (``failed``, issue #343) hands the accounting the
+    settled-intent sessions of the record's OWN OWNER_ABORT episode — the
+    interrupted Executions the Owner's Resume was authorized to continue.
+    Every other record state or context shape exempts nothing: a settled
+    record's episode resolved with its workflow, and an
+    interrupted/superseded resume never coexists with an escalation block
+    (fail closed).
     """
     context = current_block.context
     if not isinstance(context, Mapping):
@@ -1700,7 +1702,10 @@ def _resume_episode_lineage_sessions(
         return set()
     if record is None or record.task_id != current_block.task_id:
         return set()
-    if record.status is not TaskResumeIntentStatus.NON_DELIVERED:
+    if record.status not in (
+        TaskResumeIntentStatus.NON_DELIVERED,
+        TaskResumeIntentStatus.FAILED,
+    ):
         return set()
     return {
         intent.task_agent_session_id
@@ -1719,15 +1724,17 @@ def _review_iteration_resume_lineage_accounted(
     """Whether the iteration is accounted through its Resume lineage (F8g).
 
     The narrow composition the Owner Resume failure path requires: a
-    terminal ``non_delivered`` session-resume record whose immutable routing
-    names EXACTLY this iteration as its continued subject, whose failure
-    episode is terminally escalated with the positive pre-effect
-    non-delivery evidence on the escalated block, and whose ORIGINAL
+    terminal session-resume record whose immutable routing names EXACTLY
+    this iteration as its continued subject, whose failure episode is
+    terminally escalated with the record's coherent effect evidence on the
+    escalated block (the positive pre-effect non-delivery for a
+    ``non_delivered`` record, the positively observed post-effect terminal
+    failure for a ``failed`` record — issue #343), and whose ORIGINAL
     OWNER_ABORT episode is positively settled for the record's own session —
     the interrupted review interaction the Owner's Resume was authorized to
-    continue never reached the runtime. Every other state vetoes: a
-    dispatched or uncertain record is potentially active work, and any
-    unrelated review work keeps its own accounting.
+    continue never produced an accountable result. Every other state
+    vetoes: a dispatched or uncertain record is potentially active work,
+    and any unrelated review work keeps its own accounting.
     """
     for record in intent_records.list_task_resume_intents(transaction_pool, task_id=task.id):
         if record.workspace_id != task.workspace_id:
@@ -1737,7 +1744,11 @@ def _review_iteration_resume_lineage_accounted(
             iteration.id
         ):
             continue
-        if record.status is not TaskResumeIntentStatus.NON_DELIVERED:
+        if record.status is TaskResumeIntentStatus.NON_DELIVERED:
+            expected_evidence: str = FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED.value
+        elif record.status is TaskResumeIntentStatus.FAILED:
+            expected_evidence = FailureEffectEvidence.KNOWN_FAILED.value
+        else:
             return False
         episode = failure_records.get_operational_failure_episode_by_original_attempt(
             transaction_pool,
@@ -1763,7 +1774,7 @@ def _review_iteration_resume_lineage_accounted(
         context = escalated_block.context
         if (
             context.get("failure_episode_id") != str(episode.id)
-            or context.get("effect_evidence") != FailureEffectEvidence.PRE_EFFECT_NOT_APPLIED.value
+            or context.get("effect_evidence") != expected_evidence
             or context.get("original_attempt_id") != str(record.id)
         ):
             return False

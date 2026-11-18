@@ -234,6 +234,8 @@ def _receipt_row(
     contradicted: bool = False,
     created_external_session_id: str | None = None,
     original_attempt_id: UUID = _EXECUTION_ID,
+    original_attempt_kind: str = "execution",
+    expected_family: str = "implementation_result",
 ) -> tuple[Any, ...]:
     admitted_at = _OBSERVED if status in ("admitted", "settled") else None
     settled_at = _OBSERVED if status in ("settled", "refused") else None
@@ -247,9 +249,9 @@ def _receipt_row(
         _TASK_ID,
         _SESSION_ID,
         operation,
-        "execution",
+        original_attempt_kind,
         original_attempt_id,
-        "implementation_result",
+        expected_family,
         admitted_turn_reference,
         status,
         outcome if outcome is not None else {},
@@ -341,7 +343,12 @@ def _remediation_admitted_row() -> tuple[Any, ...]:
 
 
 def _settled_row(
-    label: str, *, marker: int | None = 41, original_attempt_id: UUID = _EXECUTION_ID
+    label: str,
+    *,
+    marker: int | None = 41,
+    original_attempt_id: UUID = _EXECUTION_ID,
+    original_attempt_kind: str = "execution",
+    expected_family: str = "implementation_result",
 ) -> tuple[Any, ...]:
     outcome: dict[str, Any] = {SETTLEMENT_OUTCOME_LABEL_KEY: label}
     if marker is not None:
@@ -351,6 +358,8 @@ def _settled_row(
         admitted_turn_reference=_TURN_REFERENCE,
         outcome=outcome,
         original_attempt_id=original_attempt_id,
+        original_attempt_kind=original_attempt_kind,
+        expected_family=expected_family,
     )
 
 
@@ -3416,3 +3425,377 @@ def test_a_failed_pr_compose_terminal_reports_level_2_under_the_claim_family(
     assert call["operation"].original_attempt_kind.value == "runtime_send_claim"
     assert call["operation"].original_attempt_id == _PR_CLAIM_ID
     assert call["report"].error_code is OperationalFailureCode.EXTERNAL_OPERATION_FAILED
+
+
+# --- the detached Owner-authorized same-session Resume (issue #343) -------------
+
+_RESUME_RECORD_ID = uuid4()
+_RESUME_BLOCK_ID = uuid4()
+_RESUME_OWNER_PROFILE_ID = uuid4()
+_RESUME_STATE_TOKEN = uuid4()
+
+
+def _resume_record_row(
+    *,
+    status: str = "dispatched",
+    routing: dict[str, Any] | None = None,
+    outcome: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    return (
+        _RESUME_RECORD_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _SESSION_ID,
+        _RESUME_BLOCK_ID,
+        WorkflowRole.PRODUCER.value,
+        _EXTERNAL_SESSION,
+        _RESUME_OWNER_PROFILE_ID,
+        status,
+        routing
+        if routing is not None
+        else {
+            "operation": "implementation_execution",
+            "subject_kind": "execution",
+            "subject_id": str(_EXECUTION_ID),
+            "expected_response_family": "implementation_result",
+            "restored_status": "implementing",
+            "authorized_state_token": str(_RESUME_STATE_TOKEN),
+        },
+        outcome if outcome is not None else {},
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def _resume_receipt_row(*, status: str = "claimed") -> tuple[Any, ...]:
+    return _receipt_row(
+        status=status,
+        admitted_turn_reference=_TURN_REFERENCE if status != "claimed" else None,
+        operation="session_resume",
+        original_attempt_id=_RESUME_RECORD_ID,
+        original_attempt_kind="owner_control_intent",
+        expected_family="implementation_result",
+    )
+
+
+def _resume_settled_row(label: str) -> tuple[Any, ...]:
+    return _settled_row(
+        label,
+        original_attempt_id=_RESUME_RECORD_ID,
+        original_attempt_kind="owner_control_intent",
+        expected_family="implementation_result",
+    )
+
+
+def _script_resume_record_read(conn: ScriptedConnection, row: Any, *, repeat: bool = False) -> None:
+    register = conn.on_repeat if repeat else conn.on
+    register(_sql_has("from openorc.task_resume_intents", "where id = %s"), row)
+
+
+def _script_resume_record_outcome(conn: ScriptedConnection, row: Any) -> None:
+    conn.on(_sql_has("update openorc.task_resume_intents", "set status = %s"), row)
+
+
+def test_attach_settles_a_validated_resumed_implementation_result_atomically(
+    triage: _RecordingTriage,
+) -> None:
+    """The resumed turn is the ORIGINAL interrupted IMPLEMENT continuing: the
+    validated ``implementation_result`` finalizes the SAME Execution through
+    the owning settlement, and the record's ``settled`` outcome and the
+    receipt's validated settlement commit in one composition — with the
+    handoff routed by the ORIGINAL family, never ``session_resume``."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(candidate=_RESULT_CANDIDATE))
+    _script_resume_record_read(conn, _resume_record_row())
+    _script_execution_read(conn, _execution_row())
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row())
+    _script_complete_execution(conn)
+    _script_event_insert(conn, event_type=WorkflowEventType.EXECUTION_COMPLETED)
+    _script_resume_record_outcome(
+        conn, _resume_record_row(status="settled", outcome={"result": "processed"})
+    )
+    _script_settle(conn, _resume_settled_row(SETTLEMENT_VALIDATED_RESULT))
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.status is TaskDetachedTurnReceiptStatus.SETTLED
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
+    assert isinstance(outcome.formal_result, ImplementationResult)
+    # The ONE post-commit handoff routes by the ORIGINAL workflow family.
+    assert (
+        outcome.handoff_operation is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    )
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    record_at = next(
+        index
+        for index, sql in enumerate(executed)
+        if sql.startswith("update openorc.task_resume_intents")
+    )
+    settle_at = next(index for index, sql in enumerate(executed) if "set status = 'settled'" in sql)
+    assert record_at < settle_at
+
+
+def test_the_observed_failure_of_a_resumed_turn_settles_the_record_failed(
+    triage: _RecordingTriage,
+) -> None:
+    """A positively observed failed resumed run settles the receipt truthfully
+    AND the record's truthful terminal ``failed`` outcome atomically with the
+    Level 2 report under the record's own SESSION_RESUME family — post-effect
+    evidence is never a pre-effect non-delivery, the original Execution stays
+    exactly as it is, and the record stops vetoing Cancel (issue #343)."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(kind="run.failed"))
+    _script_resume_record_read(conn, _resume_record_row(), repeat=True)
+    _script_resume_record_outcome(
+        conn,
+        _resume_record_row(
+            status="failed",
+            outcome={
+                "result": "observed_failure",
+                "failure_kind": "observed_run_failure",
+                "error_code": "external_operation_failed",
+            },
+        ),
+    )
+    _script_settle(conn, _resume_settled_row("observed_failure"))
+    _script_current_task(conn)
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == "observed_failure"
+    assert len(triage.calls) == 1
+    call = triage.calls[0]
+    # The Level 2 report roots at the record's own durable identity, at the
+    # restored Task status the Owner authorization committed.
+    assert call["operation"].family.value == "session_resume"
+    assert call["operation"].original_attempt_kind.value == "owner_control_intent"
+    assert call["operation"].original_attempt_id == _RESUME_RECORD_ID
+    assert call["expected_status"].value == "implementing"
+    assert call["report"].error_code is OperationalFailureCode.EXTERNAL_OPERATION_FAILED
+    assert call["report"].effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+    record_params = next(
+        params
+        for sql, params in conn.executed
+        if "update openorc.task_resume_intents" in " ".join(sql.split())
+    )
+    assert record_params is not None
+    assert record_params[0] == "failed"
+    # A post-effect failure never touches the original attempt's subjects.
+    assert not any("from openorc.executions" in sql for sql, _ in conn.executed)
+
+
+def test_a_malformed_resumed_result_is_a_protocol_failure_with_the_record_failed(
+    triage: _RecordingTriage,
+) -> None:
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(candidate="not a formal response"))
+    _script_resume_record_read(conn, _resume_record_row(), repeat=True)
+    _script_execution_read(conn, _execution_row())
+    _script_resume_record_outcome(
+        conn,
+        _resume_record_row(
+            status="failed",
+            outcome={
+                "result": "observed_failure",
+                "failure_kind": "malformed_run_result",
+                "error_code": "runtime_protocol",
+            },
+        ),
+    )
+    _script_settle(conn, _resume_settled_row("observed_failure"))
+    _script_current_task(conn)
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(triage.calls) == 1
+    assert triage.calls[0]["report"].error_code is OperationalFailureCode.RUNTIME_PROTOCOL
+    record_params = next(
+        params
+        for sql, params in conn.executed
+        if "update openorc.task_resume_intents" in " ".join(sql.split())
+    )
+    assert record_params is not None
+    assert record_params[0] == "failed"
+    assert record_params[1].obj == {
+        "result": "observed_failure",
+        "failure_kind": "malformed_run_result",
+        "error_code": "runtime_protocol",
+    }
+
+
+def test_a_reinterrupted_resumed_turn_settles_the_record_interrupted(
+    triage: _RecordingTriage,
+) -> None:
+    """The resumed turn itself positively ended by interruption: the receipt
+    settles ``interrupted_turn`` and the record settles its truthful terminal
+    ``interrupted`` outcome in the same composition — a newer Owner decision's
+    episode governs and no Level 2 report is ever made (issues #342/#343)."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _resume_receipt_row(status="admitted"))
+    _script_last_consumed_sequence(conn, None)
+    _script_interrupt_intents(conn, [_interrupt_intent_row()])
+    conn.on(
+        _INTENT_ANNOTATE,
+        _interrupt_intent_row(outcome={"observed_resolution": "interrupted_turn"}),
+    )
+    _script_resume_record_read(conn, _resume_record_row())
+    _script_resume_record_outcome(
+        conn, _resume_record_row(status="interrupted", outcome={"dispatch": "interrupted"})
+    )
+    _script_settle(conn, _resume_settled_row(SETTLEMENT_INTERRUPTED_TURN))
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(interrupted=True),
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_INTERRUPTED_TURN
+    record_params = next(
+        params
+        for sql, params in conn.executed
+        if "update openorc.task_resume_intents" in " ".join(sql.split())
+    )
+    assert record_params is not None
+    assert record_params[0] == "interrupted"
+    assert triage.calls == []
+
+
+def test_a_moved_on_resumed_subject_settles_result_not_applied_with_the_record_failed(
+    triage: _RecordingTriage,
+) -> None:
+    """A validated result whose subject moved on settles the receipt
+    ``result_not_applied`` and the record's truthful terminal ``failed``
+    outcome with the not-applied provenance — the run ended, its result was
+    never processed, and neither the receipt nor the record holds the
+    session's continuation authorization open against newer episodes."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(candidate=_RESULT_CANDIDATE))
+    _script_resume_record_read(conn, _resume_record_row())
+    _script_execution_read(conn, _execution_row())
+    # The Task moved on from the restored implementing status: the owning
+    # settlement's subject reproof returns None.
+    _script_task_lock(conn, status="reviewing")
+    _script_resume_record_outcome(
+        conn, _resume_record_row(status="failed", outcome={"result": "result_not_applied"})
+    )
+    _script_settle(conn, _resume_settled_row(SETTLEMENT_RESULT_NOT_APPLIED))
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    record_params = next(
+        params
+        for sql, params in conn.executed
+        if "update openorc.task_resume_intents" in " ".join(sql.split())
+    )
+    assert record_params is not None
+    assert record_params[0] == "failed"
+    assert record_params[1].obj == {"result": "result_not_applied"}
+    # A moved-on subject is a truthful not-applied settlement, never a
+    # Level 2 operational failure.
+    assert triage.calls == []
+
+
+def test_a_resume_receipt_with_a_missing_record_is_left_unresolved(
+    triage: _RecordingTriage,
+) -> None:
+    """The receipt's owner-control-intent record is the attribution root: a
+    record that does not resolve in the addressed scope leaves the
+    observation unresolved — never a fabricated match (fail closed)."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(candidate=_RESULT_CANDIDATE))
+    _script_resume_record_read(conn, None)
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
+    assert not any(
+        "update openorc.task_resume_intents" in " ".join(sql.split()) for sql, _ in conn.executed
+    )
+    assert not any("set status = 'settled'" in sql for sql, _ in conn.executed)
+    assert triage.calls == []
+
+
+def test_a_resume_receipt_with_a_family_conflict_is_left_unresolved(
+    triage: _RecordingTriage,
+) -> None:
+    """The record routing's original formal family is immutable authorization
+    context: a receipt expecting a different family is an incoherent durable
+    shape and the observation is left unresolved instead of guessing."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _resume_receipt_row())
+    _script_attach(conn, _resume_receipt_row(status="admitted"))
+    _script_staged(conn, _staged_row(candidate=_RESULT_CANDIDATE))
+    _script_resume_record_read(
+        conn,
+        _resume_record_row(
+            routing={
+                "operation": "initial_plan_dispatch",
+                "subject_kind": "runtime_send_claim",
+                "subject_id": str(uuid4()),
+                "expected_response_family": "plan_result",
+                "restored_status": "planning",
+                "authorized_state_token": str(_RESUME_STATE_TOKEN),
+            }
+        ),
+    )
+    _script_consume(conn)
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+    assert outcome.kind is TurnSettlementKind.LEFT_UNRESOLVED
+    assert not any(
+        "update openorc.task_resume_intents" in " ".join(sql.split()) for sql, _ in conn.executed
+    )
+    assert triage.calls == []

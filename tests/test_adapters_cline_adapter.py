@@ -4290,3 +4290,61 @@ def test_read_conversation_projects_the_runtime_messages_defensively() -> None:
     adapter.read_conversation(session_id)
     sends_after = sum(1 for call in backend.calls() if call.operation == "send")
     assert sends_after == sends_before
+
+
+# --- the detached admission's quiescence guard parity (issue #343) ---------------
+
+
+def test_admit_detached_turn_refuses_until_the_acknowledged_abort_settles() -> None:
+    """The same D6a discipline as the blocking resume (issue #343): an
+    acknowledged-but-unsettled interruption refuses the detached admission
+    before any enqueue — the resumption instruction is never admitted into a
+    session whose activity interruption is not durably settled; D6b's
+    positive settlement returns the guard to NONE and the admission then
+    enqueues."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    adapter.abort_activity(session_id)  # acknowledged, deliberately unresolved
+
+    with pytest.raises(AgentRuntimeUnavailableError, match="not settled"):
+        adapter.admit_detached_turn(session_id, _INITIALIZATION)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort"]
+
+    outcome = adapter.settle_abort(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is True
+
+    backend.queue_enqueue(
+        session_id, ClineRunAdmission(run_id="run-343", accepted_at=7, queue_position=0)
+    )
+    admitted = adapter.admit_detached_turn(session_id, _INITIALIZATION)
+    assert admitted.turn_reference == "run-343"
+    assert [call.operation for call in backend.calls()] == ["start", "send", "abort", "enqueue"]
+
+
+def test_admit_detached_turn_refuses_while_uncertain_effects_remain() -> None:
+    """An unresolved uncertain-send latch vetoes the detached admission; the
+    explicit per-kind settlement releases it — the same D6b discipline the
+    blocking resume observes (issue #343)."""
+    adapter, backend, resolver, session_id = _ready_adapter()
+    _bind_checkout(resolver, session_id)
+    backend.queue_send(session_id, ClineBackendUncertainOutcomeError("dropped"))
+    with pytest.raises(AgentRuntimeDeliveryUncertainError):
+        adapter.send(session_id, "interrupted turn")
+
+    with pytest.raises(AgentRuntimeUncertainOutcomeError):
+        adapter.admit_detached_turn(session_id, _INITIALIZATION)
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send"]
+
+    outcome = adapter.settle_uncertain_send(
+        session_id, runtime_work_settled=True, operation_accounted_for=True
+    )
+    assert outcome.settled is True
+
+    backend.queue_enqueue(
+        session_id, ClineRunAdmission(run_id="run-343b", accepted_at=8, queue_position=0)
+    )
+    admitted = adapter.admit_detached_turn(session_id, _INITIALIZATION)
+    assert admitted.turn_reference == "run-343b"
+    assert [call.operation for call in backend.calls()] == ["start", "send", "send", "enqueue"]

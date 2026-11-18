@@ -10,18 +10,29 @@ constraint behavior is proven by the integration-marked suite.
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
 
+from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
+    AgentRuntimeError,
     AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
     AgentSessionNotFoundError,
 )
+from openorc.adapters.agent_runtime.instructions import RESUMPTION_INSTRUCTION
 from openorc.domain.blocks import TaskBlock, TaskBlockReason
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.detached_turns import (
+    SETTLEMENT_OUTCOME_LABEL_KEY,
+    SETTLEMENT_OUTCOME_SEQUENCE_KEY,
+    SETTLEMENT_VALIDATED_RESULT,
+    TaskDetachedTurnReceipt,
+    TaskDetachedTurnReceiptStatus,
+)
 from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
 from openorc.domain.intents import (
@@ -30,12 +41,18 @@ from openorc.domain.intents import (
     TaskResumeIntent,
     TaskResumeIntentStatus,
 )
+from openorc.domain.operational_failures import OriginalAttemptKind
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence.gates import OwnerGateResolution, OwnerGateResolutionOutcome
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_owner_resume as resume_module
-from openorc.services.errors import ConflictError, StaleOperationError
+from openorc.services.errors import (
+    ConflictError,
+    ObservationRegistrationRefusedError,
+    StaleOperationError,
+)
 from openorc.services.task_owner_resume import (
     SessionResumeFollowUp,
     SessionResumeOutcomeKind,
@@ -195,6 +212,9 @@ class _RecordingCalls:
         self.outcomes: list[dict[str, Any]] = []
         self.record_created_record: TaskResumeIntent | None = None
         self.dispatch_factory: Any = None
+        self.record_receipts: list[dict[str, Any]] = []
+        self.refusals: list[dict[str, Any]] = []
+        self.attaches: list[dict[str, Any]] = []
 
 
 def _wire_authorization(monkeypatch: pytest.MonkeyPatch, calls: _RecordingCalls) -> None:
@@ -494,7 +514,7 @@ def _wire_dispatch(
     *,
     record: TaskResumeIntent,
     task: Task,
-    adapter: _FakeAdapter,
+    adapter: _FakeAdapter | _FakeDetachedAdapter,
 ) -> None:
     from contextlib import contextmanager
 
@@ -1263,3 +1283,540 @@ def test_the_exhausted_planning_review_settles_inside_the_finalization(
         )
     assert len(settle_depths) == 2
     assert all(settle_depths), "the result recording and the settlement share the transaction"
+
+
+# --- the detached Owner-authorized same-session Resume dispatch (issue #343) ----
+
+
+class _FakeDetachedAdapter:
+    """A runtime fake exposing ONLY the detached-turn capability: the
+    detached Resume dispatch must never fall back to a blocking send."""
+
+    def __init__(self, outcome: str) -> None:
+        self._outcome = outcome
+        self.admissions: list[tuple[str, str]] = []
+
+    def admit_detached_turn(self, session_id: str, content: str) -> AgentTurnAdmission:
+        self.admissions.append((session_id, content))
+        if self._outcome == "uncertain":
+            raise AgentRuntimeUncertainOutcomeError("unknown admission outcome")
+        if self._outcome == "refused":
+            raise AgentRuntimeError("the runtime refused the admission")
+        return AgentTurnAdmission(turn_reference="fake-run-343")
+
+
+class _FakeRegistrar:
+    def __init__(self, *, refuse: bool = False) -> None:
+        self.refuse = refuse
+        self.registered: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        task_id: uuid.UUID,
+        task_agent_session_id: uuid.UUID,
+        connection_id: uuid.UUID,
+        external_session_id: str,
+    ) -> None:
+        self.registered.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self.refuse:
+            raise ObservationRegistrationRefusedError(
+                "registration refused",
+                reason="fixture_refused",
+            )
+
+
+class _FakeHandoff:
+    def __init__(self) -> None:
+        self.completions: list[dict[str, Any]] = []
+        self.interrupts: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        task_id: uuid.UUID,
+        operation: Any,
+        validated_result: Any = None,
+    ) -> None:
+        self.completions.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        task_id: uuid.UUID,
+        task_agent_session_id: uuid.UUID,
+        external_session_id: str,
+    ) -> None:
+        self.interrupts.append({"task_agent_session_id": task_agent_session_id})
+
+
+def _detached_receipt() -> TaskDetachedTurnReceipt:
+    return TaskDetachedTurnReceipt(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=_SESSION_ID,
+        operation=PendingTaskRuntimeInteractionOperation.SESSION_RESUME,
+        original_attempt_kind=OriginalAttemptKind.OWNER_CONTROL_INTENT,
+        original_attempt_id=uuid.uuid4(),
+        expected_formal_family="implementation_result",
+        admitted_turn_reference=None,
+        status=TaskDetachedTurnReceiptStatus.CLAIMED,
+        outcome={},
+        contradicted_at=None,
+        claimed_at=_NOW,
+        admitted_at=None,
+        settled_at=None,
+        updated_at=_NOW,
+    )
+
+
+def _wire_detached_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: _RecordingCalls,
+    *,
+    record: TaskResumeIntent,
+    task: Task,
+    adapter: _FakeAdapter | _FakeDetachedAdapter,
+    registrar: _FakeRegistrar,
+    handoff: _FakeHandoff,
+    attach_outcome: Any,
+) -> TaskDetachedTurnReceipt:
+    """The blocking-dispatch wiring plus the detached-turn seams."""
+    _wire_dispatch(monkeypatch, calls, record=record, task=task, adapter=adapter)
+    receipt = _detached_receipt()
+    # The record read is stateful: the claim flips the durable row to
+    # ``dispatched``, so the dispatch-tail reload sees the claimed record.
+    state: dict[str, TaskResumeIntent] = {"record": record}
+    monkeypatch.setattr(
+        resume_module,
+        "get_task_resume_intent",
+        lambda pool, *, task_resume_intent_id: state["record"],
+    )
+
+    blocking_claim = resume_module.claim_task_resume_dispatch
+
+    def _claim_and_flip(pool, *, task_resume_intent_id):
+        claimed = blocking_claim(pool, task_resume_intent_id=task_resume_intent_id)
+        if claimed is None:  # pragma: no cover - the wired claim never refuses
+            raise AssertionError("the wired resume claim could not claim the record")
+        state["record"] = claimed
+        return claimed
+
+    monkeypatch.setattr(resume_module, "claim_task_resume_dispatch", _claim_and_flip)
+
+    def _record_receipt(transaction_pool, **kwargs: Any) -> TaskDetachedTurnReceipt:
+        calls.record_receipts.append(dict(kwargs))
+        return receipt
+
+    monkeypatch.setattr(
+        resume_module.turn_correlation, "record_task_detached_turn_receipt", _record_receipt
+    )
+
+    def _refuse(pool, *, receipt_id: Any, task_id: Any, workspace_id: Any, refusal_kind: str):
+        calls.refusals.append({"receipt_id": receipt_id, "refusal_kind": refusal_kind})
+        return receipt
+
+    monkeypatch.setattr(resume_module, "refuse_task_detached_turn_receipt", _refuse)
+
+    def _attach(
+        pool, *, workspace_id: Any, task_id: Any, receipt_id: Any, admitted_turn_reference: str
+    ):
+        calls.attaches.append(
+            {"receipt_id": receipt_id, "admitted_turn_reference": admitted_turn_reference}
+        )
+        return attach_outcome
+
+    monkeypatch.setattr(resume_module.turn_correlation, "attach_acknowledged_turn", _attach)
+
+    session = _session()
+    monkeypatch.setattr(
+        resume_module.session_records,
+        "get_task_agent_session",
+        lambda pool, *, task_id, role: session if role is WorkflowRole.PRODUCER else None,
+    )
+    return receipt
+
+
+def test_a_detached_resume_admits_the_fixed_instruction_and_returns_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regular-mode dispatch claims the record, commits its receipt
+    companion in the SAME one-shot claim transaction, registers the exact
+    original session, admits the fixed authorized resume instruction
+    verbatim as one detached turn — never a blocking send, never the
+    original workflow prompt — and returns ``admitted`` with no in-process
+    result routing."""
+    from openorc.services.task_detached_turn_correlation import (
+        TurnSettlementKind,
+        TurnSettlementOutcome,
+    )
+
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    adapter = _FakeDetachedAdapter("ok")
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=adapter,
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=TurnSettlementOutcome(kind=TurnSettlementKind.ADMITTED, receipt=None),
+    )
+    outcome = dispatch_authorized_task_resume(
+        _POOL,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_resume_intent_id=record.id,
+        profile_id=_OWNER_PROFILE_ID,
+        expected_state_token=_STATE_TOKEN,
+        producer_runtime_factory=calls.dispatch_factory,
+        reviewer_runtime_factory=cast(Any, None),
+        github=cast(Any, None),
+        bootstrap_composition=cast(Any, None),
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+    )
+    assert outcome.kind is SessionResumeOutcomeKind.ADMITTED
+    assert outcome.resume.status is TaskResumeIntentStatus.DISPATCHED
+    # The receipt companion roots at the record's own identity with the
+    # ORIGINAL workflow family.
+    assert len(calls.record_receipts) == 1
+    receipt_kwargs = calls.record_receipts[0]
+    assert receipt_kwargs["operation"] is PendingTaskRuntimeInteractionOperation.SESSION_RESUME
+    assert receipt_kwargs["original_attempt_kind"] is OriginalAttemptKind.OWNER_CONTROL_INTENT
+    assert receipt_kwargs["original_attempt_id"] == record.id
+    assert receipt_kwargs["expected_formal_family"] == "implementation_result"
+    assert receipt_kwargs["task_agent_session_id"] == _SESSION_ID
+    # The positive pre-admission registration addresses the exact binding.
+    assert registrar.registered == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _SESSION_ID,
+            "connection_id": registrar.registered[0]["connection_id"],
+            "external_session_id": _EXTERNAL_SESSION_ID,
+        }
+    ]
+    # The admission carries exactly the fixed authorized resume instruction.
+    assert adapter.admissions == [(_EXTERNAL_SESSION_ID, RESUMPTION_INSTRUCTION)]
+    assert calls.attaches == [{"receipt_id": receipt.id, "admitted_turn_reference": "fake-run-343"}]
+    # No staged completion: no handoff, and the blocking send never ran.
+    assert handoff.completions == []
+    assert handoff.interrupts == []
+    assert calls.outcomes == []
+
+
+def test_a_detached_resume_observation_refusal_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused observation registration is a proven pre-effect failure: the
+    receipt is refused, the record carries its terminal ``non_delivered``
+    outcome, and nothing is ever admitted."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    adapter = _FakeDetachedAdapter("ok")
+    registrar = _FakeRegistrar(refuse=True)
+    handoff = _FakeHandoff()
+    _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=adapter,
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    with pytest.raises(Exception, match="registration was refused"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert adapter.admissions == []
+    assert len(calls.refusals) == 1
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+
+
+def test_an_uncertain_detached_resume_admission_keeps_the_record_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertain admission leaves the receipt conservatively claimed and
+    the record ``dispatched`` — never re-dispatched, never refused."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    adapter = _FakeDetachedAdapter("uncertain")
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=adapter,
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    with pytest.raises(Exception, match="unknown"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert len(adapter.admissions) == 1
+    assert calls.refusals == []
+    assert calls.outcomes == []
+
+
+def test_a_detached_resume_admission_refusal_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positively refused admission is a proven pre-effect failure: the
+    receipt is refused and the record carries its terminal ``non_delivered``
+    outcome."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    adapter = _FakeDetachedAdapter("refused")
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=adapter,
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    with pytest.raises(Exception, match="refused before any effect"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert len(calls.refusals) == 1
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+
+
+def test_a_staged_resumed_completion_hands_off_by_the_original_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged early completion consumed by the acknowledgement attach hands
+    the ONE post-commit completion handoff the ORIGINAL operation family the
+    settlement carries — never ``session_resume`` (issue #343)."""
+    from openorc.services.task_detached_turn_correlation import (
+        TurnSettlementKind,
+        TurnSettlementOutcome,
+    )
+
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    adapter = _FakeDetachedAdapter("ok")
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=adapter,
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    settled_receipt = replace(
+        receipt,
+        status=TaskDetachedTurnReceiptStatus.SETTLED,
+        admitted_turn_reference="fake-run-343",
+        admitted_at=_NOW,
+        settled_at=_NOW,
+        outcome={
+            SETTLEMENT_OUTCOME_LABEL_KEY: SETTLEMENT_VALIDATED_RESULT,
+            SETTLEMENT_OUTCOME_SEQUENCE_KEY: 41,
+        },
+    )
+    _wire_receipt = resume_module.turn_correlation.attach_acknowledged_turn
+
+    def _attach_with_settlement(
+        pool, *, workspace_id, task_id, receipt_id, admitted_turn_reference
+    ):
+        calls.attaches.append(
+            {"receipt_id": receipt_id, "admitted_turn_reference": admitted_turn_reference}
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+            receipt=settled_receipt,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        )
+
+    monkeypatch.setattr(
+        resume_module.turn_correlation, "attach_acknowledged_turn", _attach_with_settlement
+    )
+    outcome = dispatch_authorized_task_resume(
+        _POOL,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_resume_intent_id=record.id,
+        profile_id=_OWNER_PROFILE_ID,
+        expected_state_token=_STATE_TOKEN,
+        producer_runtime_factory=calls.dispatch_factory,
+        reviewer_runtime_factory=cast(Any, None),
+        github=cast(Any, None),
+        bootstrap_composition=cast(Any, None),
+        observation_registrar=registrar,
+        completion_handoff=handoff,
+    )
+    assert outcome.kind is SessionResumeOutcomeKind.ADMITTED
+    assert handoff.completions == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        }
+    ]
+    assert handoff.interrupts == []
+
+
+def test_a_failed_runtime_attachment_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime attachment that fails to construct AFTER the one-shot claim
+    is a positively proven pre-effect non-delivery (issue #343 review): the
+    receipt is refused and the record carries its terminal ``non_delivered``
+    outcome before the classified failure propagates — a stranded
+    ``dispatched`` record with a ``claimed`` receipt and no native turn would
+    otherwise permanently veto the Owner Cancel action behind the Type B
+    escalation's blocking gate."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=_FakeDetachedAdapter("ok"),
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+
+    class _BrokenAttachment:
+        def __enter__(self):
+            raise RuntimeError("the bridge process failed to start")
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    calls.dispatch_factory = lambda: _BrokenAttachment()
+    with pytest.raises(Exception, match="runtime attachment failed"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert calls.refusals == [
+        {"receipt_id": receipt.id, "refusal_kind": "runtime_attachment_failed"}
+    ]
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+    assert calls.outcomes[-1]["outcome"]["refusal"] == "runtime_attachment_failed"
+
+
+def test_a_capability_less_runtime_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capability refusal's complete receipt lifecycle (issue #343
+    review): the duck-typed fail-closed check refuses the claimed receipt AND
+    records the record's terminal ``non_delivered`` outcome — the
+    never-admitted turn holds neither the session's single-outstanding slot
+    nor the record's authorization."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        # The blocking-path fake exposes no detached capability at all.
+        adapter=_FakeAdapter("ok"),
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    with pytest.raises(Exception, match="detached turn capability"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert calls.refusals == [{"receipt_id": receipt.id, "refusal_kind": "no_detached_capability"}]
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+    assert calls.outcomes[-1]["outcome"]["refusal"] == "no_detached_capability"

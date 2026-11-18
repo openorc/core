@@ -57,3 +57,45 @@ def test_no_grant_statements_and_no_data_conversion_exist() -> None:
     assert re.search(r"(?im)^\s*grant\s", body) is None
     assert re.search(r"(?im)^\s*update\s+openorc\.", body) is None
     assert re.search(r"(?im)^\s*insert\s+into\s", body) is None
+
+
+# --- the post-effect terminal outcome extension (issue #343) ---------------------
+
+
+def _failed_outcome_migration_text_raw() -> str:
+    matches = sorted(
+        p.name for p in MIGRATIONS_DIR.glob("*_add_task_resume_intent_failed_outcome.sql")
+    )
+    assert len(matches) == 1, matches
+    return (MIGRATIONS_DIR / matches[0]).read_text()
+
+
+def test_the_failed_outcome_migration_replaces_the_unnamed_vocabulary_check() -> None:
+    body = _failed_outcome_migration_text_raw()
+    assert "drop constraint task_resume_intents_status_check;" in body
+    assert "add constraint task_resume_intents_status_vocab check (" in body
+
+
+def test_the_named_vocabulary_admits_exactly_the_extended_forward_only_vocabulary() -> None:
+    body = _failed_outcome_migration_text_raw()
+    for token in (
+        "'authorized',",
+        "'dispatched',",
+        "'settled',",
+        "'non_delivered',",
+        "'interrupted',",
+        "'superseded',",
+        "'failed'",
+    ):
+        assert token in body, token
+    # The historical table migration stays exactly as committed: the new
+    # terminal is introduced only by the replacement constraint.
+    original = _migration_text_raw()
+    assert "'failed'" not in original
+
+
+def test_the_failed_outcome_migration_grants_nothing_and_converts_nothing() -> None:
+    body = _failed_outcome_migration_text_raw()
+    assert re.search(r"(?im)^\s*grant\s", body) is None
+    assert re.search(r"(?im)^\s*insert\s+into\s", body) is None
+    assert re.search(r"(?im)^\s*update\s+openorc\.", body) is None

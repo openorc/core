@@ -131,6 +131,7 @@ from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeUncertainOutcomeError,
     AgentSessionNotFoundError,
 )
+from openorc.adapters.agent_runtime.instructions import RESUMPTION_INSTRUCTION
 from openorc.adapters.agent_runtime.results import (
     AgentSessionAllocation,
     AgentSessionCreated,
@@ -204,9 +205,11 @@ _SUCCESSFUL_FINISH: Final = "completed"
 
 # The D9 fixed synthetic continuation instruction (issue #300), qualified
 # live against the pinned 0.0.90 remote baseline as the Cline-native
-# same-session Resume shape. Adapter-owned and deliberately fixed: no
-# Owner prose, no replayed task prompt, no session or mode semantics.
-_RESUMPTION_INSTRUCTION: Final = "[TASK RESUMPTION] Please continue where you left off."
+# same-session Resume shape. Deliberately fixed: no Owner prose, no replayed
+# task prompt, no session or mode semantics. Issue #343 hoists the literal
+# into the shared runtime-neutral instruction seam so the blocking send and
+# the detached Resume admission enqueue the identical authorized instruction.
+_RESUMPTION_INSTRUCTION = RESUMPTION_INSTRUCTION
 
 
 def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
@@ -684,6 +687,33 @@ class ClineAdapter(AgentRuntimeAdapter):
                 # this instance's memory is never a substitute for it and a
                 # resolver miss fails closed before any runtime effect.
                 self._resolve_bound_context(session_id)
+            # The same D6a/D6b quiescence discipline as the blocking
+            # same-session resume (issue #343): a session whose earlier
+            # interaction ended with an unresolved uncertain outcome, or
+            # whose registered activity interruption is not yet settled,
+            # never accepts a new detached turn. The admission fails closed
+            # before any enqueue — a detached Owner Resume dispatch whose
+            # attached adapter still carries latched guard state is a proven
+            # pre-effect non-delivery, never a partially delivered effect —
+            # and the per-kind settlement releases each latch exactly as the
+            # blocking path's discipline requires. The coordination lock
+            # guards the checks only and is released before the enqueue,
+            # exactly so an Owner Abort can always register and reach the
+            # runtime while an admitted turn is in flight.
+            with self._abort_coordination:
+                if self._uncertain_effects.get(session_id):
+                    raise AgentRuntimeUncertainOutcomeError(
+                        "an earlier interaction on this session ended with an "
+                        "uncertain outcome; the detached admission is declined"
+                    )
+                guard = self._abort_guards.get(session_id)
+                if guard is not None and (
+                    guard.outstanding > 0 or guard.state is not _AbortState.NONE
+                ):
+                    raise AgentRuntimeUnavailableError(
+                        "the session's activity interruption is not settled; "
+                        "the detached admission is declined before dispatch"
+                    )
             admission = self._backend_operation(
                 "enqueue",
                 lambda: self._backend.enqueue(session_id, content),

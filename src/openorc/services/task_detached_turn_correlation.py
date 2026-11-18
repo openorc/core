@@ -77,10 +77,12 @@ evidence.
 v1 scope note: the execution families (E6 implementation and E9
 PR-remediation), the session-initialization establishment (issue #324), the
 detached workspace-preparation PREPARE control (issue #334), the plan-result
-families (issue #335), and the planning-REVIEW family (issue #336) carry
-settlement routing here; the remaining operation families gain theirs with
-their own detached migrations (#325), and routing refuses them fail-closed
-until then.
+families (issue #335), the planning-REVIEW family (issue #336), and the
+Owner-authorized same-session Resume family (issue #343, whose settlement
+completes the record routing's ORIGINAL operation and hands the post-commit
+routing to that original family) carry settlement routing here; the
+remaining operation families gain theirs with their own detached migrations
+(#325), and routing refuses them fail-closed until then.
 """
 
 from __future__ import annotations
@@ -116,6 +118,7 @@ from openorc.domain.detached_turns import (
     TurnTerminalOutcome,
 )
 from openorc.domain.events import WorkflowEventActor
+from openorc.domain.intents import TaskResumeIntent, TaskResumeIntentStatus
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     OperationalFailureCode,
@@ -234,7 +237,27 @@ _FAMILY_EXPECTED_TASK_STATUS: Final[Mapping[PendingTaskRuntimeInteractionOperati
     PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH: TaskStatus.PLANNING,
     PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW: TaskStatus.PLANNING,
     PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH: TaskStatus.WAITING_FOR_OWNER,
+    # The session-resume family's flat fallback (issue #343): the expected
+    # status resolves from the record's immutable restored_status; this
+    # entry only covers a record that is already gone, where the Level 2
+    # report is a typed no-op regardless.
+    PendingTaskRuntimeInteractionOperation.SESSION_RESUME: TaskStatus.PLANNING,
 }
+
+# The original operations a session-resume receipt's routing may name: the
+# closed set of interrupted automated workflow operations the Owner Resume
+# authorization derives. Any other decoded value is an unexpected durable
+# shape and the observation fails closed.
+_RESUME_SETTLEMENT_OPERATIONS: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = frozenset(
+    {
+        PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        PendingTaskRuntimeInteractionOperation.PR_REMEDIATION_EXECUTION,
+        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+        PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
+        PendingTaskRuntimeInteractionOperation.PLANNING_BOOTSTRAP_PREPARE,
+    }
+)
 
 # The plan-result families with detached settlement routing in this seam
 # (issue #335): the Producer plan dispatches whose validated ``plan_result``
@@ -350,12 +373,22 @@ class TurnSettlementOutcome:
     ``formal_result`` carries the parsed formal response exactly when a
     validated result completed the attempt; ``disposition`` carries the
     Level 2 disposition exactly when an observed failure was reported.
+    ``handoff_operation`` carries the explicit family the ONE post-commit
+    completion handoff must route, exactly when the settled receipt's own
+    operation is a delivery-mechanics family whose continuation belongs to
+    the ORIGINAL workflow operation (issue #343): the session-resume
+    receipt's settlement completes the original attempt through the owning
+    services, so the handoff routes by the record's original operation
+    family — never by ``session_resume`` itself. ``None`` routes by the
+    receipt's own operation, so every existing family's handoff behavior is
+    unchanged.
     """
 
     kind: TurnSettlementKind
     receipt: TaskDetachedTurnReceipt | None
     formal_result: FormalResponse | None = None
     disposition: object | None = None
+    handoff_operation: PendingTaskRuntimeInteractionOperation | None = None
 
 
 class TurnStatusClassificationKind(StrEnum):
@@ -500,6 +533,25 @@ def record_task_detached_turn_receipt(
                 "non-formal discussion family"
             )
         expected_formal_family = OWNER_REVIEWER_DISCUSSION_FAMILY
+    elif operation is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        # The detached Owner-authorized same-session Resume receipt
+        # (issue #343): its identity is the exact one-shot session-resume
+        # record (the owner-control intent family the E10 intent identities
+        # reserve) and its expected family is the ORIGINAL interrupted
+        # workflow operation's canonical formal family, carried from the
+        # record's immutable routing context — the resumed turn's result
+        # validates against the original family's schema, never a
+        # resume-specific one.
+        if original_attempt_kind is not OriginalAttemptKind.OWNER_CONTROL_INTENT:
+            raise InvalidCommandError(
+                "a session-resume detached-turn receipt roots at its exact "
+                "owner-control intent identity"
+            )
+        if expected_formal_family is None or expected_formal_family not in FORMAL_RESPONSE_FAMILIES:
+            raise InvalidCommandError(
+                "a session-resume detached-turn receipt expects the original "
+                "workflow operation's canonical formal family"
+            )
     elif expected_formal_family is None or expected_formal_family not in FORMAL_RESPONSE_FAMILIES:
         raise InvalidCommandError(
             "the receipt requires its expected formal family to name a canonical v1 response family"
@@ -710,6 +762,15 @@ def _route_observed_terminal(
             outcome=outcome,
             ordering_marker=ordering_marker,
         )
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        return _route_session_resume_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
+        )
     if receipt.operation in _DISCUSSION_SETTLEMENT_FAMILIES:
         return _route_discussion_terminal(
             transaction_pool,
@@ -785,6 +846,30 @@ def _route_interrupted_terminal(
             task_interrupt_intent_id=intents[0].id,
             outcome={"observed_resolution": "interrupted_turn"},
         )
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        # The resumed turn itself was positively interrupted (issue #343):
+        # the resume record settles its truthful terminal ``interrupted``
+        # outcome in the same composition — a newer Owner decision's episode
+        # governs, the resolved gate stays history, and the record stops
+        # holding the session's continuation authorization while keeping its
+        # truthful provenance. An already-terminal record is an unexpected
+        # durable shape under the locked admitted receipt: fail closed.
+        recorded = intent_records.record_task_resume_intent_outcome(
+            transaction_pool,
+            task_resume_intent_id=receipt.original_attempt_id,
+            status=TaskResumeIntentStatus.INTERRUPTED,
+            outcome={"dispatch": "interrupted"},
+        )
+        if recorded is None:
+            logger.warning(
+                "the interrupted session-resume record was no longer "
+                "non-terminal when its interrupted outcome was recorded; "
+                "failing the observation closed"
+            )
+            raise ConflictError(
+                "the session-resume record could not record its interrupted "
+                "outcome; the observation is left unresolved"
+            )
     settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
         receipt_id=receipt.id,
@@ -1293,6 +1378,395 @@ def _route_discussion_terminal(
     )
 
 
+def _resumed_record_routing(
+    record: TaskResumeIntent,
+) -> tuple[PendingTaskRuntimeInteractionOperation, UUID, str] | None:
+    """Decode one session-resume record's immutable routing context.
+
+    Returns the ORIGINAL interrupted workflow operation, its exact durable
+    subject identity, and the original expected formal family; an
+    incoherent mapping is ``None`` — the observation is left unresolved
+    instead of guessing. The routing was written once at the Owner Resume
+    authorization and is never mutated.
+    """
+    operation_value = record.routing.get("operation")
+    subject_value = record.routing.get("subject_id")
+    family_value = record.routing.get("expected_response_family")
+    if (
+        not isinstance(operation_value, str)
+        or not isinstance(subject_value, str)
+        or not isinstance(family_value, str)
+        or not family_value.strip()
+    ):
+        return None
+    try:
+        operation = PendingTaskRuntimeInteractionOperation(operation_value)
+        subject_id = UUID(subject_value)
+    except ValueError:
+        return None
+    return operation, subject_id, family_value
+
+
+def _route_session_resume_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the resumed turn.
+
+    The detached Owner-authorized same-session Resume's settlement routing
+    (issue #343). The attribution congruence is proved first: the receipt's
+    owner-control-intent record must exist in the addressed scope, still be
+    the claimed in-flight ``dispatched`` authorization anchored to exactly
+    the receipt's session binding, and its immutable routing context must
+    decode coherently, carry exactly the receipt's expected formal family,
+    and name a supported original operation. A concrete attribution
+    conflict leaves the observation unresolved — never a fabricated match.
+
+    The resumed turn is the ORIGINAL interrupted workflow operation
+    continuing, so a completion's formal result validates against the
+    ORIGINAL pending family's schema and exact current subject and
+    finalizes through the owning services' EXISTING detached settlements —
+    never a resume-specific settlement engine, never a new
+    Execution/ReviewIteration/PlanRevision, never a re-created prompt, and
+    no workflow authority is ever derived from the turn reference. The
+    owning settlement, the record's terminal outcome, and the receipt's
+    settlement are one composition. A moved-on subject settles the receipt
+    ``result_not_applied`` with the record's truthful ``failed`` terminal
+    (its provenance names the not-applied result — the run ended, its
+    result was never processed); a validated result returns the ORIGINAL
+    operation family as the ``handoff_operation``, so the ONE post-commit
+    completion handoff routes the settled completion exactly as it routes
+    that family's ordinary detached settlements.
+    """
+    record = intent_records.get_task_resume_intent(
+        transaction_pool, task_resume_intent_id=receipt.original_attempt_id
+    )
+    if (
+        record is None
+        or record.workspace_id != workspace_id
+        or record.task_id != task_id
+        or record.status is not TaskResumeIntentStatus.DISPATCHED
+        or record.task_agent_session_id != receipt.task_agent_session_id
+    ):
+        logger.warning(
+            "the observed terminal completion conflicts with the receipt's "
+            "session-resume record binding; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    routing = _resumed_record_routing(record)
+    if routing is None or routing[2] != receipt.expected_formal_family:
+        logger.warning(
+            "the session-resume record's routing context conflicts with the "
+            "receipt's expected formal family; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    operation, subject_id, _expected_family = routing
+    if operation not in _RESUME_SETTLEMENT_OPERATIONS:
+        logger.warning(
+            "the session-resume record's routing names an unsupported original "
+            "operation; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
+        # The resumed run's positively observed terminal failure: the same
+        # truthful failure path as every family, reported under the
+        # SESSION_RESUME family rooted at the record's own identity (which
+        # also settles the record's terminal ``failed`` outcome).
+        return _settle_observed_turn_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+            failure_kind=OBSERVED_RUN_FAILURE_KIND,
+        )
+
+    def _protocol_failure() -> TurnSettlementOutcome:
+        return _settle_observed_turn_failure(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            ordering_marker=ordering_marker,
+            error_code=OperationalFailureCode.RUNTIME_PROTOCOL,
+            failure_kind=_MALFORMED_RUN_RESULT_FAILURE_KIND,
+        )
+
+    # A genuinely attributed completion must carry a usable formal result
+    # for the ORIGINAL family. A missing candidate, a shared-contract
+    # rejection, or an unexpected family type is a positively established
+    # protocol failure of the turn — never silently unresolved evidence.
+    parsed: FormalResponse | None
+    if outcome.result_candidate is not None:
+        try:
+            parsed = parse_formal_response(
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            parsed = None
+    else:
+        parsed = None
+
+    # __RESUME_ROUTE_FAMILIES__
+
+    if operation in _EXECUTION_SETTLEMENT_FAMILIES:
+        execution = execution_records.get_execution(transaction_pool, execution_id=subject_id)
+        if (
+            execution is None
+            or execution.workspace_id != workspace_id
+            or execution.task_id != task_id
+            or execution.producer_session_id != receipt.task_agent_session_id
+        ):
+            logger.warning(
+                "the observed terminal completion conflicts with the resumed "
+                "turn's execution binding; the observation is left unresolved"
+            )
+            return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        if not isinstance(parsed, ImplementationResult):
+            return _protocol_failure()
+        finalized = settle_observed_implementation_result(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            execution_id=subject_id,
+            subject=_EXECUTION_FAMILY_SUBJECTS[operation],
+            result=parsed,
+        )
+    elif operation in (
+        PendingTaskRuntimeInteractionOperation.INITIAL_PLAN_DISPATCH,
+        PendingTaskRuntimeInteractionOperation.PLANNING_REVISE_DISPATCH,
+    ):
+        # Deferred import: the owning service imports this module's dispatch
+        # mechanics at module level.
+        from openorc.services.task_plan_production import (  # noqa: PLC0415
+            settle_observed_plan_result,
+        )
+
+        claim = send_claim_records.get_task_runtime_send_claim(
+            transaction_pool, claim_id=subject_id
+        )
+        if (
+            claim is None
+            or claim.workspace_id != workspace_id
+            or claim.task_id != task_id
+            or claim.kind.value != operation.value
+            or claim.status is not TaskRuntimeSendClaimStatus.CLAIMED
+            or claim.task_agent_session_id != receipt.task_agent_session_id
+        ):
+            logger.warning(
+                "the observed terminal completion conflicts with the resumed "
+                "turn's dispatch claim binding; the observation is left unresolved"
+            )
+            return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        if not isinstance(parsed, PlanResult):
+            return _protocol_failure()
+        finalized = settle_observed_plan_result(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            send_claim=claim,
+            result=parsed,
+        )
+
+    elif operation is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
+        # Deferred imports: the owning decision services import this
+        # module's dispatch mechanics at module level.
+        from openorc.services.task_planning_review_decision import (  # noqa: PLC0415
+            settle_observed_planning_review,
+        )
+        from openorc.services.task_pr_review_decision import (  # noqa: PLC0415
+            settle_observed_pr_review,
+        )
+
+        iteration = review_iteration_records.get_review_iteration(
+            transaction_pool, review_iteration_id=subject_id
+        )
+        if (
+            iteration is None
+            or iteration.workspace_id != workspace_id
+            or iteration.task_id != task_id
+            or iteration.outcome is not None
+        ):
+            logger.warning(
+                "the observed terminal completion conflicts with the resumed "
+                "turn's reserved review attempt binding; the observation is "
+                "left unresolved"
+            )
+            return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        binding = get_task_agent_session(
+            transaction_pool, task_id=task_id, role=WorkflowRole.REVIEWER
+        )
+        if (
+            binding is None
+            or binding.id != receipt.task_agent_session_id
+            or binding.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        ):
+            logger.warning(
+                "the observed terminal completion conflicts with the resumed "
+                "turn's reviewer session binding; the observation is left "
+                "unresolved"
+            )
+            return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        if not isinstance(parsed, ReviewResult):
+            return _protocol_failure()
+        if iteration.plan_revision_id is not None:
+            # The planning flavor (issue #336): the owning planning-review
+            # decision settlement over the exact current PlanRevision.
+            finalized = settle_observed_planning_review(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                review_iteration_id=subject_id,
+                expected_reviewer_session_id=receipt.task_agent_session_id,
+                result=parsed,
+            )
+        else:
+            # The PR/head flavor (issue #338): the owning PR-review decision
+            # settlement over the exact canonical pull request/head.
+            finalized = settle_observed_pr_review(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                review_iteration_id=subject_id,
+                expected_reviewer_session_id=receipt.task_agent_session_id,
+                result=parsed,
+            )
+
+    else:
+        # The resumed bootstrap PREPARE control: the same subject proof and
+        # attributable workspace-result semantics as the ordinary PREPARE
+        # settlement routing (issue #334), over the record routing's exact
+        # claim-token subject.
+        from openorc.services.task_planning_bootstrap import (  # noqa: PLC0415
+            settle_observed_bootstrap_prepare_result,
+        )
+
+        current = task_records.get_task(transaction_pool, task_id=task_id)
+        if current is None or current.workspace_id != workspace_id:
+            logger.warning(
+                "the observed workspace-preparation completion conflicts with "
+                "the resumed turn's task; the observation is left unresolved"
+            )
+            return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+        evidence = task_records.get_task_planning_bootstrap_evidence(
+            transaction_pool, task_id=task_id
+        )
+        if (
+            evidence is None
+            or evidence.claim_token != subject_id
+            or current.status is not TaskStatus.PLANNING
+            or current.current_plan_revision_id is not None
+            or evidence.stage not in (None, TaskPlanningBootstrapStage.PREPARE_DISPATCHED)
+        ):
+            # A moved-on subject: the bootstrap resolved past the resumed
+            # PREPARE work. The truthful not-applied settlement with the
+            # record's terminal outcome — never manufactured stage history.
+            logger.warning(
+                "the resumed workspace-preparation subject moved on; settling "
+                "the validated observation as not applied"
+            )
+            finalized = False
+        else:
+            if not isinstance(parsed, WorkspaceResult):
+                return _protocol_failure()
+            if (
+                parsed.operation != WORKSPACE_OPERATION_PREPARE
+                or parsed.status != _WORKSPACE_RESULT_COMPLETED
+            ):
+                # The agent's validated honest report: the requested
+                # preparation did not complete. The same truthful failure
+                # path as every resumed turn failure.
+                logger.warning(
+                    "the resumed workspace-preparation result reports the "
+                    "requested preparation as not completed; classifying the "
+                    "positively established failure"
+                )
+                return _settle_observed_turn_failure(
+                    transaction_pool,
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    receipt=receipt,
+                    ordering_marker=ordering_marker,
+                    error_code=OperationalFailureCode.EXTERNAL_OPERATION_FAILED,
+                    failure_kind=_FAILED_WORKSPACE_RESULT_FAILURE_KIND,
+                )
+            applied = settle_observed_bootstrap_prepare_result(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                claim_token=subject_id,
+            )
+            finalized = applied
+
+    if not finalized:
+        # A moved-on subject: the validated result can no longer apply to
+        # current work. The receipt settles ``result_not_applied`` and the
+        # record settles its truthful terminal ``failed`` outcome with the
+        # not-applied provenance — the run ended, its result was never
+        # processed — so neither the receipt nor the record holds the
+        # session's continuation authorization open against newer episodes.
+        recorded = intent_records.record_task_resume_intent_outcome(
+            transaction_pool,
+            task_resume_intent_id=receipt.original_attempt_id,
+            status=TaskResumeIntentStatus.FAILED,
+            outcome={"result": "result_not_applied"},
+        )
+        if recorded is None:
+            logger.warning(
+                "the session-resume record was no longer non-terminal when "
+                "its not-applied outcome was recorded; failing the observation "
+                "closed"
+            )
+            raise ConflictError(
+                "the session-resume record could not record its not-applied "
+                "outcome; the observation is left unresolved"
+            )
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    recorded = intent_records.record_task_resume_intent_outcome(
+        transaction_pool,
+        task_resume_intent_id=receipt.original_attempt_id,
+        status=TaskResumeIntentStatus.SETTLED,
+        outcome={"result": "processed"},
+    )
+    if recorded is None:
+        logger.warning(
+            "the session-resume record was no longer non-terminal when its "
+            "settled outcome was recorded; failing the observation closed"
+        )
+        raise ConflictError(
+            "the session-resume record could not settle with its processed "
+            "result; the observation is left unresolved"
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, ordering_marker),
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=settled,
+        formal_result=parsed,
+        handoff_operation=operation,
+    )
+
+
 def _expected_failure_status(
     transaction_pool: DatabasePool, receipt: TaskDetachedTurnReceipt
 ) -> TaskStatus:
@@ -1308,6 +1782,23 @@ def _expected_failure_status(
     when it no longer addresses current work.
     """
     family_status = _FAMILY_EXPECTED_TASK_STATUS[receipt.operation]
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        # The resume record's immutable routing carries the restored Task
+        # status the Owner authorization committed (issue #343). A missing
+        # or malformed record falls back to the family's flat expectation —
+        # immaterial in practice, because the triage's own verification
+        # makes a record-less report a typed no-op.
+        record = intent_records.get_task_resume_intent(
+            transaction_pool, task_resume_intent_id=receipt.original_attempt_id
+        )
+        if record is not None:
+            restored = record.routing.get("restored_status")
+            if isinstance(restored, str):
+                try:
+                    return TaskStatus(restored)
+                except ValueError:
+                    pass
+        return family_status
     if receipt.operation is not PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW:
         return family_status
     iteration = review_iteration_records.get_review_iteration(
@@ -1339,6 +1830,13 @@ def _settle_observed_turn_failure(
     observed run failure or a malformed result is post-effect evidence,
     never a proven pre-effect non-delivery. The report is a typed no-op when
     it no longer addresses current work.
+
+    For a SESSION_RESUME receipt (issue #343) the composition additionally
+    records the resume record's truthful terminal ``failed`` outcome —
+    post-effect evidence with safe classified provenance — atomically with
+    the receipt settlement and the Level 2 report, so the Owner Cancel
+    action is never permanently vetoed by a record whose resumed run has
+    definitively ended.
     """
     settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
@@ -1347,6 +1845,30 @@ def _settle_observed_turn_failure(
         workspace_id=workspace_id,
         outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
     )
+    if receipt.operation is PendingTaskRuntimeInteractionOperation.SESSION_RESUME:
+        recorded = intent_records.record_task_resume_intent_outcome(
+            transaction_pool,
+            task_resume_intent_id=receipt.original_attempt_id,
+            status=TaskResumeIntentStatus.FAILED,
+            outcome={
+                "result": "observed_failure",
+                "failure_kind": failure_kind,
+                "error_code": error_code.value,
+            },
+        )
+        if recorded is None:
+            # An already-terminal record under the locked admitted receipt is
+            # an unexpected durable shape: fail the whole observation closed
+            # instead of reporting a failure about settled work.
+            logger.warning(
+                "the failed session-resume record was no longer non-terminal "
+                "when its failed outcome was recorded; failing the observation "
+                "closed"
+            )
+            raise ConflictError(
+                "the session-resume record could not record its failed "
+                "outcome; the observation is left unresolved"
+            )
     current = task_records.get_task(transaction_pool, task_id=task_id)
     if current is None or current.workspace_id != workspace_id:
         # Unreachable for a Task-scoped receipt; kept explicit for fail-closed
