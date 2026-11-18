@@ -1240,6 +1240,8 @@ def dispatch_authorized_task_resume(
 
 _RESUME_REGISTRATION_REFUSAL_KIND: Final[str] = "observation_registration_refused"
 _RESUME_ADMISSION_REFUSAL_KIND: Final[str] = "admission_refused"
+_RESUME_ATTACHMENT_REFUSAL_KIND: Final[str] = "runtime_attachment_failed"
+_RESUME_CAPABILITY_REFUSAL_KIND: Final[str] = "no_detached_capability"
 
 
 def _refuse_resume_dispatch_quietly(
@@ -1319,14 +1321,42 @@ def _dispatch_authorized_resume_detached(
     re-dispatched. The original gate and block stay resolved history
     whatever subsequently happens to the continuation.
     """
+
+    def _record_non_delivered(*, refusal: str) -> None:
+        outcome = record_task_resume_intent_outcome(
+            pool,
+            task_resume_intent_id=record.id,
+            status=TaskResumeIntentStatus.NON_DELIVERED,
+            outcome={"dispatch": "non_delivered", "refusal": refusal},
+        )
+        if outcome is None:  # pragma: no cover - the claimed record is non-terminal
+            logger.warning(
+                "the session-resume record was no longer non-terminal when its "
+                "proven pre-effect non-delivery was recorded"
+            )
+
     register = getattr(observation_registrar, "register_session", None)
     if not callable(register):
+        # A misconfigured registrar can never gate an admission: the proven
+        # pre-effect accounting applies (issue #343 review) — the receipt is
+        # refused and the record carries its terminal non-delivery.
+        _refuse_resume_dispatch_quietly(
+            pool, receipt, refusal_kind=_RESUME_REGISTRATION_REFUSAL_KIND
+        )
+        _record_non_delivered(refusal="registrar_misconfigured")
         raise InvalidCommandError(
             "the session-resume observation registrar does not implement the "
             "established-session registration seam"
         )
     external_session_id = record.external_session_id
     if not external_session_id.strip():
+        # The record's binding incoherence positively establishes that no
+        # admission can ever address the session: same proven pre-effect
+        # accounting (issue #343 review).
+        _refuse_resume_dispatch_quietly(
+            pool, receipt, refusal_kind=_RESUME_REGISTRATION_REFUSAL_KIND
+        )
+        _record_non_delivered(refusal="binding_unresolved")
         raise ConflictError(
             "the session-resume record's binding carries no external session identity"
         )
@@ -1360,27 +1390,49 @@ def _dispatch_authorized_resume_detached(
             "the record routing; the dispatch is stale"
         )
 
-    def _record_non_delivered(*, refusal: str) -> None:
-        outcome = record_task_resume_intent_outcome(
-            pool,
-            task_resume_intent_id=record.id,
-            status=TaskResumeIntentStatus.NON_DELIVERED,
-            outcome={"dispatch": "non_delivered", "refusal": refusal},
-        )
-        if outcome is None:  # pragma: no cover - the claimed record is non-terminal
-            logger.warning(
-                "the session-resume record was no longer non-terminal when its "
-                "proven pre-effect non-delivery was recorded"
-            )
-
     with ExitStack() as attachment_stack:
-        runtime = attachment_stack.enter_context(factory_cm())
+        # The runtime lease is acquired before any admission effect: an
+        # attachment-construction failure (a bridge process that cannot
+        # start, a connection that cannot attach) is a positively proven
+        # pre-effect non-delivery — nothing could ever have been enqueued —
+        # so the receipt is refused and the record carries its terminal
+        # non-delivery before the classified failure propagates. A stranded
+        # ``dispatched`` record with a ``claimed`` receipt and NO native turn
+        # would otherwise permanently veto the Owner Cancel action behind the
+        # escalation's Type B blocking gate (issue #343 review).
+        try:
+            runtime = attachment_stack.enter_context(factory_cm())
+        except ApplicationError:
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_ATTACHMENT_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="runtime_attachment_failed")
+            raise
+        except Exception as error:
+            logger.warning(
+                "the session-resume runtime attachment failed (%s) before any "
+                "admission; the receipt is refused and the instruction never "
+                "dispatched",
+                type(error).__name__,
+            )
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_ATTACHMENT_REFUSAL_KIND
+            )
+            _record_non_delivered(refusal="runtime_attachment_failed")
+            raise ExternalOperationFailedError(
+                "the session-resume runtime attachment failed before any "
+                "admission; the receipt is refused and the instruction never "
+                "dispatched"
+            ) from error
         # The detached capability is duck-typed fail-closed BEFORE the
         # admission effect: a runtime without it cannot serve the detached
         # dispatch, and the just-claimed record carries its proven pre-effect
         # non-delivery — nothing could ever have been enqueued.
         admit = getattr(runtime, "admit_detached_turn", None)
         if not callable(admit):
+            _refuse_resume_dispatch_quietly(
+                pool, receipt, refusal_kind=_RESUME_CAPABILITY_REFUSAL_KIND
+            )
             _record_non_delivered(refusal="no_detached_capability")
             raise ExternalOperationFailedError(
                 "the runtime does not implement the detached turn capability; "

@@ -1720,3 +1720,101 @@ def test_a_staged_resumed_completion_hands_off_by_the_original_family(
         }
     ]
     assert handoff.interrupts == []
+
+
+def test_a_failed_runtime_attachment_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime attachment that fails to construct AFTER the one-shot claim
+    is a positively proven pre-effect non-delivery (issue #343 review): the
+    receipt is refused and the record carries its terminal ``non_delivered``
+    outcome before the classified failure propagates — a stranded
+    ``dispatched`` record with a ``claimed`` receipt and no native turn would
+    otherwise permanently veto the Owner Cancel action behind the Type B
+    escalation's blocking gate."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        adapter=_FakeDetachedAdapter("ok"),
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+
+    class _BrokenAttachment:
+        def __enter__(self):
+            raise RuntimeError("the bridge process failed to start")
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    calls.dispatch_factory = lambda: _BrokenAttachment()
+    with pytest.raises(Exception, match="runtime attachment failed"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert calls.refusals == [
+        {"receipt_id": receipt.id, "refusal_kind": "runtime_attachment_failed"}
+    ]
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+    assert calls.outcomes[-1]["outcome"]["refusal"] == "runtime_attachment_failed"
+
+
+def test_a_capability_less_runtime_refuses_the_receipt_and_records_non_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capability refusal's complete receipt lifecycle (issue #343
+    review): the duck-typed fail-closed check refuses the claimed receipt AND
+    records the record's terminal ``non_delivered`` outcome — the
+    never-admitted turn holds neither the session's single-outstanding slot
+    nor the record's authorization."""
+    calls = _RecordingCalls()
+    record = _resume_record(TaskResumeIntentStatus.AUTHORIZED)
+    registrar = _FakeRegistrar()
+    handoff = _FakeHandoff()
+    receipt = _wire_detached_dispatch(
+        monkeypatch,
+        calls,
+        record=record,
+        task=_task(status=TaskStatus.IMPLEMENTING),
+        # The blocking-path fake exposes no detached capability at all.
+        adapter=_FakeAdapter("ok"),
+        registrar=registrar,
+        handoff=handoff,
+        attach_outcome=None,
+    )
+    with pytest.raises(Exception, match="detached turn capability"):
+        dispatch_authorized_task_resume(
+            _POOL,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_resume_intent_id=record.id,
+            profile_id=_OWNER_PROFILE_ID,
+            expected_state_token=_STATE_TOKEN,
+            producer_runtime_factory=calls.dispatch_factory,
+            reviewer_runtime_factory=cast(Any, None),
+            github=cast(Any, None),
+            bootstrap_composition=cast(Any, None),
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        )
+    assert calls.refusals == [{"receipt_id": receipt.id, "refusal_kind": "no_detached_capability"}]
+    assert calls.outcomes[-1]["status"] is TaskResumeIntentStatus.NON_DELIVERED
+    assert calls.outcomes[-1]["outcome"]["refusal"] == "no_detached_capability"
