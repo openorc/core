@@ -16,24 +16,33 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
-from openorc.adapters.cline import ClineHubEvent, Subscription, resolve_connection_control_endpoint
+from openorc.adapters.cline import (
+    ClineHubEvent,
+    ClineSessionEvent,
+    Subscription,
+    resolve_connection_control_endpoint,
+)
 from openorc.adapters.cline import hub_observation as source_module
 from openorc.adapters.cline.errors import ClineBackendUncertainOutcomeError
 from openorc.adapters.cline.hub_observation import ClineHubTurnObservationSource
 from openorc.domain.connections import AdapterType
 from openorc.domain.detached_turns import (
+    OWNER_REVIEWER_DISCUSSION_FAMILY,
     ObservedTurnEvidence,
     TaskDetachedTurnReceiptStatus,
+    TurnActivityAttestation,
     TurnEvidenceFamily,
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.persistence.pool import DatabasePool
+from openorc.services import task_cost_accounting
 from openorc.services import task_detached_turn_observation as observation_module
 from openorc.services.connection_credentials import ControlEndpointSecret
 from openorc.services.errors import (
@@ -348,6 +357,7 @@ def _make_observer(
     conn: ScriptedConnection,
     *,
     backends: list[FakeClineSdkBackend],
+    cost_limit_interrupt_dispatch: Any = None,
 ) -> DetachedTurnObservationHost:
     pool = _pool(conn)
     pending = list(backends)
@@ -357,6 +367,7 @@ def _make_observer(
         observation_source=source,
         runtime_credential_resolver=_fake_credential_resolver,
         control_endpoint_resolver=resolve_connection_control_endpoint,
+        cost_limit_interrupt_dispatch=cost_limit_interrupt_dispatch,
     )
     host.start()
     return host
@@ -1171,3 +1182,538 @@ def test_validated_execution_settlement_fires_the_completion_handoff_with_its_fa
             "validated_result": None,
         }
     ]
+
+
+# --- the receipt-epoch attestation and the detached cost path (issue #341) --------
+
+_RECEIPT_B_ID = uuid4()
+_RUN_B_ID = "hub-run-2"
+
+
+def _receipt_row_for(
+    *,
+    receipt_id: UUID = _RECEIPT_ID,
+    run_reference: str = _RUN_ID,
+    expected_family: str = "implementation_result",
+) -> tuple[Any, ...]:
+    """One outstanding admitted receipt row with overridable identity/family."""
+    row = list(_admitted_receipt_row())
+    row[0] = receipt_id
+    row[7] = expected_family
+    row[8] = run_reference
+    return tuple(row)
+
+
+def _activity_pulse() -> ClineSessionEvent:
+    """One qualifying model-backed activity event (thinking began)."""
+    return ClineSessionEvent(
+        session_id=_EXTERNAL_SESSION,
+        kind="agent_event",
+        payload={"event": {"type": "content_start", "contentType": "reasoning"}},
+    )
+
+
+def _usage_pulse() -> ClineSessionEvent:
+    """One live usage signal event."""
+    return ClineSessionEvent(
+        session_id=_EXTERNAL_SESSION,
+        kind="agent_event",
+        payload={"event": {"type": "usage"}},
+    )
+
+
+def _started_event(*, sequence: int = 3, request_id: str = _RUN_ID) -> ClineHubEvent:
+    return ClineHubEvent(
+        session_id=_EXTERNAL_SESSION,
+        kind="run.started",
+        sequence=sequence,
+        payload={"requestId": request_id},
+    )
+
+
+def _attest(
+    observer: DetachedTurnObservationHost,
+    *,
+    task_agent_session_id: UUID = _SESSION_ID,
+    external_session_id: str = _EXTERNAL_SESSION,
+) -> TurnActivityAttestation:
+    return observer.attest_session_activity(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=task_agent_session_id,
+        connection_id=_CONNECTION_ID,
+        external_session_id=external_session_id,
+    )
+
+
+def _attestation_observer(
+    monkeypatch: pytest.MonkeyPatch,
+    conn: ScriptedConnection,
+    *,
+    backends: list[FakeClineSdkBackend],
+    receipts: _ReceiptRow | None = None,
+    cost_limit_interrupt_dispatch: Any = None,
+) -> DetachedTurnObservationHost:
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(
+        conn, receipts or _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()})
+    )
+    observer = _make_observer(
+        conn,
+        backends=backends,
+        cost_limit_interrupt_dispatch=cost_limit_interrupt_dispatch,
+    )
+    _register(observer)
+    return observer
+
+
+def test_attestation_requires_the_attributed_start_and_qualifying_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The exact outstanding turn attests only through positively corroborated
+    # native evidence: its own attributed start plus qualifying model-backed
+    # activity since that start. Admission, a start claim alone, and silence
+    # never attest (issue #341) — the pinned #320 started-then-failed
+    # qualification cannot become a cost-interruptible state.
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend])
+
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+    # Qualifying activity before any attributed start never attests.
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+    # The pinned start attribution, through the real corroboration seam.
+    backend.emit_hub(_started_event())
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+    # The turn's own qualifying activity since that start attests it.
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+
+def test_a_discussion_receipt_never_attests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The Owner-Reviewer discussion turn is not a cost-interruptible
+    # autonomous turn: no amount of qualifying activity on its session
+    # attests a discussion receipt's epoch (issue #341).
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    receipts = _ReceiptRow(
+        rows={_SESSION_ID: _receipt_row_for(expected_family=OWNER_REVIEWER_DISCUSSION_FAMILY)}
+    )
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend], receipts=receipts)
+
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+
+def test_a_pre_start_usage_signal_triggers_the_evaluation_but_never_attests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A usage signal requests the cumulative evaluation — the same
+    # usage-only evaluation trigger as the lease-attached observer — and
+    # its observed crossing checkpoints truthfully without blocking while
+    # the start attribution is still missing (issue #341; the idle/
+    # unattested crossing rule).
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    dispatches: list[Any] = []
+
+    def dispatch(intent: Any, external_session_id: str) -> None:
+        dispatches.append((intent, external_session_id))
+
+    observer = _attestation_observer(
+        monkeypatch,
+        conn,
+        backends=[backend],
+        cost_limit_interrupt_dispatch=dispatch,
+    )
+    observations: list[dict[str, Any]] = []
+
+    def observe(pool: DatabasePool, **kwargs: Any) -> Any:
+        observations.append(kwargs)
+        return SimpleNamespace(interrupt_dispatches=())
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", observe)
+    backend.queue_get_accumulated_usage(_EXTERNAL_SESSION, {"aggregateUsage": {"totalCost": 26.0}})
+
+    backend.emit(_usage_pulse())
+
+    assert len(observations) == 1
+    # The exact-scope checkpoint re-proves the identity tuple; the crossing
+    # is unattested (no attributed start yet) and checkpoints only.
+    assert observations[0]["workspace_id"] == _WORKSPACE_ID
+    assert observations[0]["task_agent_session_id"] == _SESSION_ID
+    assert observations[0]["aggregate_total_cost"] == Decimal("26.0")
+    assert observations[0]["send_in_flight"] is False
+    assert dispatches == []
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+
+def test_an_attested_activity_crossing_blocks_and_dispatches_through_the_composition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The retained cost rule on the detached path: an attested crossing of
+    # the cumulative threshold composes the existing E10b COST_LIMIT block
+    # through the unchanged accounting service, and the post-commit
+    # Interrupt dispatches route through the composition-rooted dispatcher
+    # (issue #341). No adapter or observer-local policy exists.
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    dispatches: list[Any] = []
+    intent = SimpleNamespace(id="intent-1")
+
+    def dispatch(recorded_intent: Any, external_session_id: str) -> None:
+        dispatches.append((recorded_intent, external_session_id))
+
+    observer = _attestation_observer(
+        monkeypatch,
+        conn,
+        backends=[backend],
+        cost_limit_interrupt_dispatch=dispatch,
+    )
+    observations: list[dict[str, Any]] = []
+
+    def observe(pool: DatabasePool, **kwargs: Any) -> Any:
+        observations.append(kwargs)
+        return SimpleNamespace(
+            interrupt_dispatches=((intent, _EXTERNAL_SESSION),),
+        )
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", observe)
+    backend.queue_get_accumulated_usage(_EXTERNAL_SESSION, {"aggregateUsage": {"totalCost": 31.0}})
+
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    backend.emit(_usage_pulse())
+
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+    assert len(observations) == 1
+    assert observations[0]["send_in_flight"] is True
+    assert observations[0]["aggregate_total_cost"] == Decimal("31.0")
+    assert dispatches == [(intent, _EXTERNAL_SESSION)]
+
+
+def test_a_delivered_terminal_clears_the_attestation_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A delivered terminal observation ends the observed run: the epoch's
+    # in-progress evidence clears at delivery, before the settlement even
+    # routes, so a finished turn is never left attested (issue #341).
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend])
+    start = _StartRecorder()
+    monkeypatch.setattr(observation_module, "check_turn_start_identity", start, raising=True)
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    backend.emit_hub(_terminal_event())
+
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+
+def test_a_successor_registration_resets_the_attestation_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The attestation epoch binds to the exact outstanding receipt: a
+    # successor registration over the SAME reused subscription replaces the
+    # whole epoch, so turn A's start claim and qualifying activity can never
+    # attest turn B, and turn A's post-settlement cleanup cannot erase turn
+    # B's own evidence (issue #341 review).
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    receipts = _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()})
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend], receipts=receipts)
+    start = _StartRecorder()
+    monkeypatch.setattr(observation_module, "check_turn_start_identity", start, raising=True)
+
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+    epoch_a = observer._sessions[_SESSION_ID].attestation_epoch
+    assert epoch_a is not None and epoch_a.receipt_id == _RECEIPT_ID
+
+    settle_calls: list[Any] = []
+    registered_successor = False
+
+    def interleaving_settle(
+        pool: DatabasePool,
+        *,
+        classifier: Any,
+        workspace_id: UUID,
+        connection_id: UUID,
+        evidence: ObservedTurnEvidence,
+    ) -> Any:
+        # Run A's settlement: turn B registers FIRST — renewing the live
+        # subscription and advancing to receipt B — and B's own attributed
+        # start and qualifying activity arrive before A's cleanup runs.
+        nonlocal registered_successor
+        if not registered_successor:
+            registered_successor = True
+            receipts.rows[_SESSION_ID] = _receipt_row_for(
+                receipt_id=_RECEIPT_B_ID, run_reference=_RUN_B_ID
+            )
+            _register(observer)
+            # Turn B is honestly UNATTESTED even though turn A was attested
+            # moments earlier: the successor's epoch replaced A's wholesale.
+            assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+            backend.emit_hub(_started_event(sequence=5, request_id=_RUN_B_ID))
+            backend.emit(_activity_pulse())
+        settle_calls.append((workspace_id, connection_id, evidence))
+        return TurnSettlementOutcome(kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT, receipt=None)
+
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", interleaving_settle)
+
+    backend.emit_hub(_terminal_event())
+
+    assert registered_successor is True
+    epoch_b = observer._sessions[_SESSION_ID].attestation_epoch
+    assert epoch_b is not epoch_a
+    assert epoch_b is not None and epoch_b.receipt_id == _RECEIPT_B_ID
+    # A's cleanup ran against its delivery-time lease: the renewal deferred
+    # it, and B's own evidence survived.
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+
+def test_the_attestation_scoping_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The attestation resolves only the exact identity tuple this host
+    # actively observes; any foreign scope, unknown session, malformed
+    # command, or disposed host is honestly unattested or fails closed.
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend])
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    assert (
+        observer.attest_session_activity(
+            workspace_id=uuid4(),
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            connection_id=_CONNECTION_ID,
+            external_session_id=_EXTERNAL_SESSION,
+        )
+        is TurnActivityAttestation.UNATTESTED
+    )
+    assert (
+        observer.attest_session_activity(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            connection_id=_CONNECTION_ID,
+            external_session_id="another-session",
+        )
+        is TurnActivityAttestation.UNATTESTED
+    )
+    assert (
+        observer.attest_session_activity(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            task_agent_session_id=uuid4(),
+            connection_id=_CONNECTION_ID,
+            external_session_id=_EXTERNAL_SESSION,
+        )
+        is TurnActivityAttestation.UNATTESTED
+    )
+    with pytest.raises(InvalidCommandError):
+        observer.attest_session_activity(
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            task_id=_TASK_ID,
+            task_agent_session_id=_SESSION_ID,
+            connection_id=_CONNECTION_ID,
+            external_session_id=_EXTERNAL_SESSION,
+        )
+    observer.dispose()
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+
+def test_a_failed_usage_consultation_is_contained_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failed cumulative usage consultation is a contained best-effort
+    # reading failure: the evaluation never runs, never retries, and never
+    # disrupts the source's delivery thread (issue #341).
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    dispatches: list[Any] = []
+    observer = _attestation_observer(
+        monkeypatch,
+        conn,
+        backends=[backend],
+        cost_limit_interrupt_dispatch=lambda intent, session: dispatches.append((intent, session)),
+    )
+    observations: list[dict[str, Any]] = []
+
+    def observe(pool: DatabasePool, **kwargs: Any) -> Any:
+        observations.append(kwargs)
+        return SimpleNamespace(interrupt_dispatches=())
+
+    monkeypatch.setattr(task_cost_accounting, "observe_session_usage", observe)
+    backend.queue_get_accumulated_usage(
+        _EXTERNAL_SESSION, ClineBackendUncertainOutcomeError("the hub attachment is unusable")
+    )
+
+    backend.emit(_usage_pulse())
+
+    # The pulse itself still landed as activity evidence, but without the
+    # attributed start the epoch stays honestly unattested.
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+    assert observations == []
+    assert dispatches == []
+
+
+def _ingest_foreign_pulse(
+    observer: DetachedTurnObservationHost, family: TurnEvidenceFamily
+) -> None:
+    observer._ingest_evidence(
+        _SESSION_ID,
+        ObservedTurnEvidence(
+            external_session_id="ext-foreign-session",
+            family=family,
+            native_evidence=source_module._ClineActivityPulseEvidence(),
+        ),
+    )
+
+
+def _ingest_foreign_terminal(observer: DetachedTurnObservationHost) -> None:
+    observer._ingest_evidence(
+        _SESSION_ID,
+        ObservedTurnEvidence(
+            external_session_id="ext-foreign-session",
+            family=TurnEvidenceFamily.TURN_TERMINAL,
+            native_evidence=source_module._ClineHubEventEvidence(
+                ClineHubEvent(
+                    session_id="ext-foreign-session",
+                    kind="run.completed",
+                    sequence=99,
+                    payload={},
+                )
+            ),
+        ),
+    )
+
+
+def test_foreign_session_evidence_never_touches_the_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exact-session isolation (issue #341 review): a foreign identity
+    # envelope delivered to a registered session's listener is never routed
+    # and never mutates the session's attestation epoch — foreign activity
+    # can never attest, and a foreign terminal can never erase valid
+    # attestation.
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    observer = _attestation_observer(monkeypatch, conn, backends=[backend])
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+
+    _ingest_foreign_pulse(observer, TurnEvidenceFamily.TURN_ACTIVITY)
+    _ingest_foreign_pulse(observer, TurnEvidenceFamily.TURN_USAGE)
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    _ingest_foreign_pulse(observer, TurnEvidenceFamily.TURN_ACTIVITY)
+    _ingest_foreign_pulse(observer, TurnEvidenceFamily.TURN_USAGE)
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    _ingest_foreign_terminal(observer)
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+    assert settle.calls == []  # the foreign terminal was never routed to the seam
+
+
+def test_observation_loss_invalidates_attestation_until_fresh_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicitly lost observation attests nothing (issue #341 review):
+    # the attestation is UNATTESTED the moment the attachment is dropped,
+    # reconnection alone never regains it, and only fresh corroborated
+    # start + qualifying activity on the re-established observation attests
+    # again.
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    dead_backend = FakeClineSdkBackend()
+    fresh_backend = FakeClineSdkBackend()
+    dispatches: list[Any] = []
+    observer = _make_observer(
+        conn,
+        backends=[dead_backend, fresh_backend],
+        cost_limit_interrupt_dispatch=lambda intent, session: dispatches.append((intent, session)),
+    )
+    _register(observer)
+
+    dead_backend.emit_hub(_started_event())
+    dead_backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    # The dead attachment is explicitly dropped: the observation is lost.
+    observer._drop_attachment(_CONNECTION_ID)
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+    # Re-registration re-attaches through the fresh backend; the reconnect
+    # reconciliation re-observes the session and consults its status-only
+    # read (a completed status alone is never evidence). The re-established
+    # observation starts from a fresh evidence-less epoch: reconnection
+    # alone never manufactures current activity.
+    fresh_backend.queue_list_runs(_EXTERNAL_SESSION, [{"runId": _RUN_ID, "state": "completed"}])
+    _register(observer)
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+    fresh_backend.emit_hub(_started_event(sequence=7, request_id=_RUN_ID))
+    fresh_backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+    assert dispatches == []  # no evaluation ran: no usage signal arrived
+
+
+def test_status_only_settlement_clears_only_the_matching_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When the bounded status-only reconciliation positively settles a
+    # receipt's turn, the epoch bound to THAT receipt is invalidated — a
+    # different (successor) epoch on the same session stays untouched
+    # (issue #341 review).
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    receipts = _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()})
+    _script_outstanding_receipts(conn, receipts)
+    backend = FakeClineSdkBackend()
+    observer = _make_observer(conn, backends=[backend])
+    _register(observer)
+    backend.emit_hub(_started_event())
+    backend.emit(_activity_pulse())
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+    entry = observer._sessions[_SESSION_ID]
+
+    # A reconciliation classified for a DIFFERENT receipt never touches
+    # this session's epoch.
+    observer._classify_reconnected_receipt(
+        entry,
+        uuid4(),
+        source_module._ClineStatusRecordsEvidence([]),
+    )
+    assert _attest(observer) is TurnActivityAttestation.ACTIVE
+
+    # The positive failure classification of THIS receipt clears it.
+    classify = _ClassifyRecorder()
+    monkeypatch.setattr(
+        observation_module, "classify_acknowledged_turn_status", classify, raising=True
+    )
+    backend.queue_list_runs(
+        _EXTERNAL_SESSION, [{"runId": _RUN_ID, "state": "failed", "error": "session not found"}]
+    )
+    observer._reconcile_session_receipt(entry)
+
+    assert len(classify.calls) == 1
+    assert _attest(observer) is TurnActivityAttestation.UNATTESTED

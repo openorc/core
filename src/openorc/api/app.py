@@ -24,6 +24,7 @@ from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
+from openorc.services.cline_attachment import dispatch_cost_limit_interrupt
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
 from openorc.services.errors import ApplicationError
 from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
@@ -85,6 +86,19 @@ def _serving_lifespan(
                 runtime_credential_resolver=resolve_connection_runtime_credential,
                 control_endpoint_resolver=resolve_connection_control_endpoint,
                 completion_handoff=build_detached_completion_handoff(dependencies),
+                # The composition-rooted post-commit cost-limit Interrupt
+                # dispatcher (issue #341): the host drives the shared cost
+                # evaluation with it so a threshold crossing observed while
+                # the dispatch worker is gone enforces through the existing
+                # E10b machinery. Resolved through the process pool provider
+                # per dispatch.
+                cost_limit_interrupt_dispatch=lambda intent, external_session_id: (
+                    dispatch_cost_limit_interrupt(
+                        dependencies.database_pool(),
+                        intent=intent,
+                        external_session_id=external_session_id,
+                    )
+                ),
             )
             observer.start()
             dependencies.bind_regular_process_detached_turn_observer(observer)

@@ -73,6 +73,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Final
 
@@ -80,6 +81,7 @@ from openorc.adapters.cline.values import ClineSessionEvent, JsonObject
 from openorc.protocol.models import FORMAL_RESPONSE_FAMILIES
 
 __all__ = [
+    "aggregate_usage_cost_usd",
     "ClineAccumulatedUsage",
     "ClineActivityDetail",
     "ClineActivityKind",
@@ -998,6 +1000,36 @@ def _accumulated_usage(scope: object) -> ClineAccumulatedUsage | None:
     ):
         return None
     return usage
+
+
+def aggregate_usage_cost_usd(usage: ClineAccumulatedUsage | None) -> Decimal | None:
+    """Extract the exact aggregate USD total from one accumulated-usage scope.
+
+    The integration-owned conversion behind the cost path's aggregate
+    extraction: only the scope's own ``total_cost`` is a cost source, an
+    absent scope or reading is unknown (``None``), and a malformed,
+    non-numeric, or non-finite value is unusable rather than invented. The
+    returned value is an exact decimal, never a binary float. Which scope
+    is a cost source is the caller's rule — this function never substitutes
+    one scope for another.
+    """
+    if usage is None:
+        return None
+    total = usage.total_cost
+    if total is None:
+        return None
+    if isinstance(total, Decimal):
+        value: Decimal | None = total
+    elif isinstance(total, (int, float)) and not isinstance(total, bool):
+        try:
+            value = Decimal(str(total))
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    return value
 
 
 # The runtime-neutral qualifying-activity vocabulary (issue #246): the D6c
