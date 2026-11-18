@@ -74,6 +74,7 @@ __all__ = [
     "SessionUsageReading",
     "SETTLEMENT_DISCUSSION_EXCHANGE",
     "SETTLEMENT_DISCUSSION_FORMAL_CONTINUATION",
+    "SETTLEMENT_INTERRUPTED_TURN",
     "SETTLEMENT_OBSERVED_FAILURE",
     "SETTLEMENT_OUTCOME_LABEL_KEY",
     "SETTLEMENT_OUTCOME_SEQUENCE_KEY",
@@ -119,6 +120,12 @@ SETTLEMENT_OUTCOME_SEQUENCE_KEY: Final[str] = "consumed_sequence"
 SETTLEMENT_VALIDATED_RESULT: Final[str] = "validated_result"
 SETTLEMENT_OBSERVED_FAILURE: Final[str] = "observed_failure"
 SETTLEMENT_RESULT_NOT_APPLIED: Final[str] = "result_not_applied"
+# The interrupted-turn settlement label (issue #342): the consumed terminal
+# observation's own native evidence positively identified the turn as ended
+# by interruption. It asserts the turn's terminal resolution only — never a
+# workflow outcome, never an Owner decision, and never a failure
+# classification.
+SETTLEMENT_INTERRUPTED_TURN: Final[str] = "interrupted_turn"
 # The discussion family's own settlement labels (issue #339): the ordinary
 # recorded exchange and the formal continuation dispatched through an owning
 # E3c/E9 settlement. No conversation text ever enters the outcome payload.
@@ -376,10 +383,18 @@ class TurnTerminalOutcome:
     formal validation, never parsed or repaired. A completed turn without
     a candidate is a legitimate classification that cannot settle a
     validated result.
+
+    ``interrupted`` (issue #342) is the integration's own positive verdict
+    that its native terminal evidence identified the turn as ended by
+    interruption — the same normalized signal the blocking-send path maps
+    onto ``AgentRuntimeInterruptedTurnError``. It is the only evidence the
+    shared Interrupt settlement consumes; its absence is never invented
+    from an event kind, a missing response, or any other shape.
     """
 
     kind: DetachedTurnObservationKind
     result_candidate: str | None
+    interrupted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, DetachedTurnObservationKind):
@@ -390,6 +405,8 @@ class TurnTerminalOutcome:
             raise ValueError(
                 "TurnTerminalOutcome.result_candidate must be None or a non-empty string"
             )
+        if not isinstance(self.interrupted, bool):
+            raise ValueError("TurnTerminalOutcome.interrupted must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,6 +629,7 @@ class TaskDetachedTurnEarlyCompletion:
     kind: DetachedTurnObservationKind
     ordering_marker: int | None
     result_candidate: str | None
+    interrupted: bool
     staged_at: datetime
 
     def __post_init__(self) -> None:
@@ -632,6 +650,8 @@ class TaskDetachedTurnEarlyCompletion:
                 "TaskDetachedTurnEarlyCompletion.result_candidate must be None or "
                 "a non-empty string"
             )
+        if not isinstance(self.interrupted, bool):
+            raise ValueError("TaskDetachedTurnEarlyCompletion.interrupted must be a boolean")
         _require_instant(self.staged_at, "staged_at")
 
 

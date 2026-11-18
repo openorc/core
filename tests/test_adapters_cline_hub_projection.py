@@ -220,6 +220,69 @@ def test_an_uninterpretable_status_record_fails_closed_instead_of_being_dropped(
         )
 
 
+def test_a_terminal_interruption_marker_is_the_only_positive_interrupted_verdict() -> None:
+    """The R2b-qualified native finish reason — read kind-agnostically from
+    either terminal event — is the only positive interrupted verdict; every
+    other shape is never invented into interruption evidence (issue #342)."""
+    completed_interrupted = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.completed",
+        sequence=9,
+        payload={"reason": "finished", "result": {"finishReason": "aborted"}},
+    )
+    failed_interrupted = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.failed",
+        sequence=10,
+        payload={"reason": "error", "result": {"finishReason": "aborted"}},
+    )
+    finished = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.completed",
+        sequence=11,
+        payload={"reason": "finished", "result": {"finishReason": "completed", "text": "x"}},
+    )
+    failed_other = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.failed",
+        sequence=12,
+        payload={"reason": "error", "result": {"finishReason": "error"}},
+    )
+    no_result = ClineHubEvent(
+        session_id="sess-1", kind="run.failed", sequence=13, payload={"reason": "error"}
+    )
+    non_string = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.completed",
+        sequence=14,
+        payload={"result": {"finishReason": 7}},
+    )
+
+    assert (
+        classify_terminal_hub_run(
+            completed_interrupted, consumed_ordering_markers=()
+        ).outcome.interrupted
+        is True
+    )
+    assert (
+        classify_terminal_hub_run(
+            failed_interrupted, consumed_ordering_markers=()
+        ).outcome.interrupted
+        is True
+    )
+    for event in (finished, failed_other, no_result, non_string):
+        classification = classify_terminal_hub_run(event, consumed_ordering_markers=())
+        assert classification.outcome.interrupted is False
+    # The verdict never manufactures a candidate either: an interrupted
+    # result carries the candidate exactly as extracted, verbatim or None.
+    assert (
+        classify_terminal_hub_run(
+            completed_interrupted, consumed_ordering_markers=()
+        ).outcome.result_candidate
+        is None
+    )
+
+
 def test_a_native_fixture_variation_normalizes_locally_to_the_same_verdicts() -> None:
     """A coordinated SDK revision that renames native fields is absorbed by a
     local interpretation change: the variant fixture normalizes to identical

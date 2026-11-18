@@ -358,6 +358,7 @@ def _make_observer(
     *,
     backends: list[FakeClineSdkBackend],
     cost_limit_interrupt_dispatch: Any = None,
+    interrupt_settlement: Any = None,
 ) -> DetachedTurnObservationHost:
     pool = _pool(conn)
     pending = list(backends)
@@ -368,6 +369,7 @@ def _make_observer(
         runtime_credential_resolver=_fake_credential_resolver,
         control_endpoint_resolver=resolve_connection_control_endpoint,
         cost_limit_interrupt_dispatch=cost_limit_interrupt_dispatch,
+        interrupt_settlement=interrupt_settlement,
     )
     host.start()
     return host
@@ -518,6 +520,104 @@ def test_a_duplicate_delivery_is_rejected_and_the_observation_is_kept(
 
     assert len(settle.calls) == 2  # both deliveries routed; the seam rejected the stale one
     assert len(_subscribe_calls(backend)) == 1
+
+
+# --- the post-commit Interrupt settlement (issue #342) -----------------------------
+
+
+def test_a_settled_interrupted_turn_invokes_the_post_commit_settlement_and_releases_the_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
+    _script_bindings(conn, bindings)
+    backend = FakeClineSdkBackend()
+    settle = _SettleRecorder(
+        outcome_kind=TurnSettlementKind.SETTLED_INTERRUPTED_TURN,
+        receipt=SimpleNamespace(
+            operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+        ),
+    )
+    settlements: list[dict[str, Any]] = []
+    observer = _make_observer(
+        conn,
+        backends=[backend],
+        interrupt_settlement=lambda **facts: settlements.append(dict(facts)),
+    )
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+    _register(observer)
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+    assert settlements == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "task_agent_session_id": _SESSION_ID,
+            "external_session_id": _EXTERNAL_SESSION,
+        }
+    ]
+    # The terminal classification releases the session's observation: the
+    # interrupted turn is settled and nothing further observes it.
+    backend.emit_hub(_terminal_event(sequence=42))
+    assert len(settle.calls) == 1
+    assert len(settlements) == 1
+    assert len(_subscribe_calls(backend)) == 1
+
+
+def test_a_failing_post_commit_interrupt_settlement_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The post-commit settlement is best-effort hygiene: its failure never
+    # disrupts the delivery thread and never un-commits the durable
+    # settlement — the annotated intent remains the truth.
+    conn = ScriptedConnection()
+    bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
+    _script_bindings(conn, bindings)
+    backend = FakeClineSdkBackend()
+    settle = _SettleRecorder(
+        outcome_kind=TurnSettlementKind.SETTLED_INTERRUPTED_TURN,
+        receipt=SimpleNamespace(
+            operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+        ),
+    )
+    observer = _make_observer(
+        conn,
+        backends=[backend],
+        interrupt_settlement=lambda **_facts: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+    _register(observer)
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+
+
+def test_a_settled_interrupted_turn_without_the_settlement_seam_stands_on_the_durable_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A composition without the post-commit settlement seam keeps the
+    # durable settlement exactly as committed: no crash, no second routing,
+    # and the Owner-facing settlement branch remains the authority.
+    conn = ScriptedConnection()
+    bindings = _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()})
+    _script_bindings(conn, bindings)
+    backend = FakeClineSdkBackend()
+    settle = _SettleRecorder(
+        outcome_kind=TurnSettlementKind.SETTLED_INTERRUPTED_TURN,
+        receipt=SimpleNamespace(
+            operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+        ),
+    )
+    observer = _make_observer(conn, backends=[backend])
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+    _register(observer)
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
 
 
 def test_a_terminal_event_before_the_acknowledgement_is_staged_and_observation_is_kept(

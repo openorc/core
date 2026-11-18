@@ -24,7 +24,10 @@ from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
-from openorc.services.cline_attachment import dispatch_cost_limit_interrupt
+from openorc.services.cline_attachment import (
+    dispatch_cost_limit_interrupt,
+    settle_observed_detached_interrupt,
+)
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
 from openorc.services.errors import ApplicationError
 from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
@@ -98,6 +101,16 @@ def _serving_lifespan(
                         intent=intent,
                         external_session_id=external_session_id,
                     )
+                ),
+                # The composition-rooted post-commit Interrupt settlement
+                # (issue #342): after a settled interrupted-turn observation
+                # commits, the attached adapter's D6b guard release and the
+                # annotated intent's outcome recording run through it —
+                # strictly post-commit, no transaction across the adapter
+                # call, resolved through the process pool provider per call.
+                interrupt_settlement=lambda **session_facts: settle_observed_detached_interrupt(
+                    dependencies.database_pool(),
+                    **session_facts,
                 ),
             )
             observer.start()

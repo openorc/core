@@ -24,6 +24,8 @@ from openorc.adapters.agent_runtime.errors import (
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import (
+    AgentRuntimeSettlementOutcome,
+    AgentRuntimeSettlementRefusal,
     AgentSessionAllocation,
     AgentSessionCreated,
     AgentSessionCreationRequest,
@@ -37,6 +39,8 @@ __all__ = [
     "AgentRuntimeError",
     "AgentRuntimeInterruptedTurnError",
     "AgentRuntimeProtocolFailureError",
+    "AgentRuntimeSettlementOutcome",
+    "AgentRuntimeSettlementRefusal",
     "AgentRuntimeTimeoutError",
     "AgentRuntimeTransportError",
     "AgentRuntimeUnavailableError",

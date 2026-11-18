@@ -1980,6 +1980,7 @@ def _staged_pr_completion_row(*, kind: str = "run.completed") -> tuple[Any, ...]
         kind,
         7,
         json.dumps(pr_result_candidate(title=_TITLE, body=_BODY)),
+        False,
         _OBSERVED,
     )
 

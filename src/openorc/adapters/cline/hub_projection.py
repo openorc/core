@@ -64,6 +64,7 @@ from openorc.domain.detached_turns import (
 
 __all__ = [
     "HubRunClassificationError",
+    "SDK_INTERRUPTED_FINISH_REASON",
     "classify_hub_run_start",
     "classify_hub_run_statuses",
     "classify_terminal_hub_run",
@@ -77,6 +78,14 @@ _TERMINAL_EVENT_KINDS: Final[dict[str, DetachedTurnObservationKind]] = {
     "run.completed": DetachedTurnObservationKind.COMPLETED,
     "run.failed": DetachedTurnObservationKind.FAILED,
 }
+
+#: The pinned SDK-native interruption marker (R2b-qualified, issue #342):
+#: the finish reason the runtime reports when a dispatched turn was ended by
+#: interruption rather than completion. The blocking-send path normalizes it
+#: onto ``AgentRuntimeInterruptedTurnError``; the Hub terminal-event
+#: classification exposes it as the neutral ``TurnTerminalOutcome.interrupted``
+#: verdict. Never leaked past the integration.
+SDK_INTERRUPTED_FINISH_REASON: Final[str] = "aborted"
 
 #: The qualified run-start event name whose ``requestId`` payload field is
 #: the only event-side run handle (verified equal to the acknowledged
@@ -136,12 +145,25 @@ def classify_terminal_hub_run(
     newer than any provided consumed marker is a stale replay, and a
     sequence-less envelope carries no ordering evidence and is never
     ordered.
+
+    The neutral ``interrupted`` verdict (issue #342) is set only when the
+    native result's ``finishReason`` carries the pinned SDK's own
+    interruption marker — the same R2b-qualified signal the blocking-send
+    path classifies as the normalized interrupted-turn outcome, read
+    kind-agnostically from either terminal event. Every other shape —
+    a missing, non-string, or different finish reason — is never invented
+    into interruption evidence: an unqualified event kind, a missing formal
+    response, or a status token alone never proves an interrupted turn.
     """
     kind = _TERMINAL_EVENT_KINDS[event.kind]
     result = event.payload.get("result")
     candidate: str | None = None
+    interrupted = False
     if isinstance(result, dict):
         candidate = _non_blank_str(result.get("text"))
+        finish_reason = result.get("finishReason")
+        if isinstance(finish_reason, str) and finish_reason == SDK_INTERRUPTED_FINISH_REASON:
+            interrupted = True
     marker = event.sequence
     if marker is None:
         freshness = TurnFreshness.UNORDERED
@@ -151,7 +173,7 @@ def classify_terminal_hub_run(
         freshness = TurnFreshness.FRESH
     return TurnTerminalClassification(
         freshness=freshness,
-        outcome=TurnTerminalOutcome(kind=kind, result_candidate=candidate),
+        outcome=TurnTerminalOutcome(kind=kind, result_candidate=candidate, interrupted=interrupted),
         ordering_marker=marker,
     )
 

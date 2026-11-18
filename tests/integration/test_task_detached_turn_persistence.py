@@ -362,8 +362,10 @@ def test_the_staged_completion_is_unique_per_receipt_and_consumed_once(
         kind=DetachedTurnObservationKind.COMPLETED,
         ordering_marker=41,
         result_candidate='{"type": "implementation_result"}',
+        interrupted=False,
     )
     assert staged.ordering_marker == 41
+    assert staged.interrupted is False
     # A second terminal delivery for the same single outstanding run is a
     # duplicate, never a second staged row.
     with pytest.raises(UniqueViolation):
@@ -375,6 +377,7 @@ def test_the_staged_completion_is_unique_per_receipt_and_consumed_once(
             kind=DetachedTurnObservationKind.FAILED,
             ordering_marker=42,
             result_candidate=None,
+            interrupted=True,
         )
     locked = get_task_detached_turn_early_completion_for_update(pool, receipt_id=receipt.id)
     assert locked is not None and locked.id == staged.id

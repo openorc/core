@@ -166,9 +166,17 @@ _CLEANUP_SETTLEMENT_KINDS: Final[frozenset[TurnSettlementKind]] = frozenset(
         TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
         TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED,
+        TurnSettlementKind.SETTLED_INTERRUPTED_TURN,
         TurnSettlementKind.NO_OUTSTANDING_RUN,
     }
 )
+
+# The composition-rooted post-commit Interrupt-settlement seam (issue #342):
+# invoked strictly after a settled interrupted-turn observation committed,
+# with the exact session's durable facts, to release the attached adapter's
+# D6b guard discipline and record the intent's outcome. The host contains
+# every failure — the durable intent remains the authority either way.
+InterruptSettlement = Callable[..., object]
 
 
 class ObservationRegistrationRefusalReason(StrEnum):
@@ -396,6 +404,7 @@ class DetachedTurnObservationHost:
         control_endpoint_resolver: EndpointResolver,
         completion_handoff: DetachedTurnCompletionHandoff | None = None,
         cost_limit_interrupt_dispatch: InterruptDispatch | None = None,
+        interrupt_settlement: InterruptSettlement | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
         self._source = observation_source
@@ -411,6 +420,14 @@ class DetachedTurnObservationHost:
         # triggers a cost evaluation: a cost-limit block is never composed
         # without a dispatch path for its registered Interrupts.
         self._cost_limit_interrupt_dispatch = cost_limit_interrupt_dispatch
+        # The composition-rooted post-commit Interrupt-settlement seam
+        # (issue #342): after a settled interrupted-turn observation commits,
+        # the attached adapter's D6b guard release and the intent's outcome
+        # recording run strictly post-commit through it. Without the seam the
+        # durable settlement stands on its own — the annotated intent keeps
+        # its recorded status and the Owner-facing settlement branch remains
+        # the authority.
+        self._interrupt_settlement = interrupt_settlement
         self._usage_consultation = getattr(observation_source, "consult_session_usage", None)
         self._cost_evaluation_supported = (
             callable(self._usage_consultation) and cost_limit_interrupt_dispatch is not None
@@ -1187,6 +1204,33 @@ class DetachedTurnObservationHost:
                 logger.warning(
                     "the detached-completion handoff failed (%s) after the "
                     "validated settlement for task session %s",
+                    type(error).__name__,
+                    entry.task_agent_session_id,
+                )
+        if (
+            outcome.kind is TurnSettlementKind.SETTLED_INTERRUPTED_TURN
+            and outcome.receipt is not None
+            and self._interrupt_settlement is not None
+        ):
+            # A settled interrupted-turn observation committed (issue #342):
+            # the ONE post-commit Interrupt settlement owns the attached
+            # adapter's D6b guard release and the annotated intent's outcome
+            # recording, strictly after the settlement composition committed
+            # and with no database transaction across it. Contained,
+            # best-effort, never a workflow authority: a failed settlement
+            # leaves the durable annotated intent exactly as committed — the
+            # Owner-facing settlement branch remains the authority.
+            try:
+                self._interrupt_settlement(
+                    workspace_id=entry.workspace_id,
+                    task_id=entry.task_id,
+                    task_agent_session_id=entry.task_agent_session_id,
+                    external_session_id=entry.external_session_id,
+                )
+            except Exception as error:  # noqa: BLE001 - best-effort settlement
+                logger.warning(
+                    "the post-commit Interrupt settlement failed (%s) after the "
+                    "interrupted-turn settlement for task session %s",
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )

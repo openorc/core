@@ -1690,6 +1690,7 @@ def _staged_early_completion_row() -> tuple[Any, ...]:
         "run.completed",
         41,
         json.dumps(_RESULT_CANDIDATE),
+        False,
         _OBSERVED,
     )
 

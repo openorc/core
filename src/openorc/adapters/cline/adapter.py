@@ -156,6 +156,7 @@ from openorc.adapters.cline.construction import (
 )
 from openorc.adapters.cline.contract import ClineSdkBackend
 from openorc.adapters.cline.errors import ClineSdkBackendError
+from openorc.adapters.cline.hub_projection import SDK_INTERRUPTED_FINISH_REASON
 from openorc.adapters.cline.reconciliation import (
     ClineDispatchCheckpoint,
     ClineReconciliationResult,
@@ -195,12 +196,11 @@ _TRACER_SCOPE: Final = "openorc.adapters.cline"
 # reason that carries a usable reply candidate (qualified R2b/R3 baseline).
 _SUCCESSFUL_FINISH: Final = "completed"
 
-# The pinned SDK-native interruption marker: the finish reason the runtime
-# reports when a dispatched turn was ended by interruption rather than
-# completion (R2b-qualified: an in-flight send resolves with it, the session
-# stays live, and protocol continuity holds). Normalized onto
-# ``AgentRuntimeInterruptedTurnError`` — never leaked past the adapter.
-_INTERRUPTED_FINISH: Final = "aborted"
+# The pinned SDK-native interruption marker is the shared integration
+# constant (``SDK_INTERRUPTED_FINISH_REASON``, issue #342) — the same
+# R2b-qualified finish reason the blocking send path normalizes onto
+# ``AgentRuntimeInterruptedTurnError`` and the Hub terminal-event
+# classification exposes as the neutral interrupted verdict.
 
 # The D9 fixed synthetic continuation instruction (issue #300), qualified
 # live against the pinned 0.0.90 remote baseline as the Cline-native
@@ -245,7 +245,7 @@ def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
             raise AgentRuntimeConfigurationRejectedError(
                 "the cline session readiness turn did not complete successfully"
             )
-        if finish_reason == _INTERRUPTED_FINISH:
+        if finish_reason == SDK_INTERRUPTED_FINISH_REASON:
             raise AgentRuntimeInterruptedTurnError(
                 "the cline runtime turn was interrupted before a usable response"
             )
