@@ -46,14 +46,14 @@ path: cleanup failures stay contained typed dispositions, and there is no
 retry, no Owner gate, and no cleanup-scheduler machinery anywhere in this
 leaf.
 
-The detached cleanup admission (issue #344) converts the regular-mode
-cleanup attempt from blocking send to ONE promptly admitted independent run
-on the original session, without weakening the terminal commitment or the
-one-shot safety. The execution mode is selected EXPLICITLY by the worker
-layer (never inferred from registrar presence): the explicitly selected
-queue-mode interim keeps the blocking realization byte-for-byte (until
-#328); the regular-mode detached dispatch establishes cleanup eligibility
-and outstanding-work safety BEFORE any claim (a positively established
+The detached cleanup admission (issues #344/#347) converts the cleanup
+attempt from blocking send to ONE promptly admitted independent run
+on the original session, in both execution modes, without weakening the
+terminal commitment or the one-shot safety. The execution mode is selected
+EXPLICITLY by the worker layer (never inferred from registrar presence
+inside this service): both modes' detached dispatch establishes cleanup
+eligibility and outstanding-work safety BEFORE any claim (a positively
+established
 ineligible or unsafe terminalization takes the archive-only path without a
 claim or receipt), takes the one-shot claim and its runtime-neutral
 detached-turn receipt companion in one short transaction, gates the
@@ -129,7 +129,6 @@ from openorc.services.task_terminal_cleanup import (
     TerminalCheckoutCleanupRuntime,
     TerminalCleanupEstablishmentKind,
     establish_terminal_checkout_cleanup,
-    execute_terminal_checkout_cleanup,
 )
 from openorc.services.transaction_composition import composed_transaction
 
@@ -188,22 +187,19 @@ class TerminalFinalizationSubmissionOutcome(StrEnum):
 
 
 class TerminalCleanupDispatchSelection(StrEnum):
-    """The explicitly selected cleanup execution mode (issue #344).
+    """The explicitly selected cleanup execution mode (issues #344/#347).
 
-    Resolved by the worker layer from the executing process's execution
-    mode — never inferred from registrar presence inside this service.
+    Resolved by the worker layer — never inferred from registrar presence
+    inside this service.
 
-    ``BLOCKING_QUEUE_INTERIM`` keeps the established blocking realization
-    byte-for-byte (the #317 behavior, until the queue-mode parity leaf
-    #328). ``DETACHED_REGULAR`` dispatches the cleanup as ONE independently
-    observed detached turn. ``OBSERVATION_UNAVAILABLE`` is a regular-mode
-    process whose detached-turn observation could not resolve: optional
-    housekeeping is skipped positively (no claim, no receipt, no blocking
-    send) and the mandatory archival proceeds — unavailable observation
-    never selects blocking execution and never strands a terminalization.
+    ``DETACHED_REGULAR`` dispatches the cleanup as ONE independently observed
+    detached turn. ``OBSERVATION_UNAVAILABLE`` is a process whose detached-turn
+    observation could not resolve: optional housekeeping is skipped positively
+    (no claim, no receipt, no blocking send) and the mandatory archival
+    proceeds — unavailable observation never selects blocking execution and
+    never strands a terminalization.
     """
 
-    BLOCKING_QUEUE_INTERIM = "blocking_queue_interim"
     DETACHED_REGULAR = "detached_regular"
     OBSERVATION_UNAVAILABLE = "observation_unavailable"
 
@@ -480,10 +476,10 @@ def finalize_task_terminalization(
     wiring.
 
     The optional cleanup's execution mode is the caller's EXPLICIT
-    ``dispatch`` selection (issue #344) — defaulting to the established
-    blocking behavior so every existing caller and the archive-only fallback
-    keep the #317 semantics. The blocking selection keeps that flow
-    byte-for-byte. The detached selection establishes eligibility and
+    ``dispatch`` selection (issues #344/#347) — an absent dispatch with a
+    present runtime is the observation-unavailable selection, so an unwired
+    dispatch can never silently select blocking execution. The detached
+    selection establishes eligibility and
     outstanding-work safety BEFORE any claim, commits the one-shot claim and
     its detached-turn receipt companion in one short transaction, gates the
     admission behind a positively required observation registration, and
@@ -543,7 +539,7 @@ def finalize_task_terminalization(
             selection = (
                 dispatch.selection
                 if dispatch is not None
-                else TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
+                else TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
             )
             if selection is TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE:
                 # The regular-mode detached-turn observation could not
@@ -576,54 +572,14 @@ def finalize_task_terminalization(
                     # archiving. A ``None`` result continues to the
                     # established archive-only finalization below.
                     return outcome
-            else:
-                # The explicitly selected queue-mode interim (until #328):
-                # the established blocking flow byte-for-byte.
-                claimed = None
-                try:
-                    claimed = task_records.claim_task_terminal_cleanup_send(pool, task_id)
-                except Exception as error:  # noqa: BLE001 - contained; classified from a fresh read
-                    logger.warning(
-                        "terminal cleanup send claim failed (error type %s)",
-                        type(error).__name__,
-                    )
-                if claimed is not None:
-                    # This invocation owns the attempt: one bounded send, then
-                    # the settle closes the window whatever the observed outcome.
-                    try:
-                        try:
-                            execute_terminal_checkout_cleanup(
-                                pool, runtime, workspace_id=workspace_id, task_id=task_id
-                            )
-                        except Exception as error:  # noqa: BLE001 - optional housekeeping never blocks archival
-                            logger.warning(
-                                "terminal checkout cleanup attempt failed (error type %s)",
-                                type(error).__name__,
-                            )
-                    finally:
-                        try:
-                            task_records.settle_task_terminal_cleanup_send(pool, task_id)
-                        except Exception as error:  # noqa: BLE001 - contained; the archival recheck owns the window
-                            logger.warning(
-                                "terminal cleanup send settle failed (error type %s)",
-                                type(error).__name__,
-                            )
-                else:
-                    # The claim was not taken by this invocation. Classify
-                    # the current claim state from a fresh read (issue #345):
-                    # an unsettled claim inside its finite deadline defers
-                    # archival — never end a session, or release capacity,
-                    # mid-attempt; a past-deadline or settled claim stops
-                    # waiting and the archival transaction rechecks and owns
-                    # the window under the Task row lock, which is the
-                    # authoritative guard.
-                    current = task_records.get_task(pool, task_id)
-                    if current is not None:
-                        disposition = _claimed_cleanup_disposition(
-                            pool, current, workspace_id=workspace_id, task_id=task_id
-                        )
-                        if disposition is not None:
-                            return disposition
+            else:  # pragma: no cover - the closed selection enum
+                # Defensive fail-closed classification: the closed selection
+                # enum carries no blocking member (issue #347 retired the
+                # blocking queue-mode interim) — an unknown selection is
+                # never silently executed.
+                raise ConflictError(
+                    f"unsupported terminal cleanup dispatch selection {selection.value!r}"
+                )
 
         return _archive_committed_terminalization(pool, workspace_id=workspace_id, task_id=task_id)
 
