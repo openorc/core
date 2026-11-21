@@ -11,15 +11,15 @@ decision. Technical evaluation belongs to the Reviewer; OpenOrc owns only
 the deterministic decision and its workflow consequences.
 
 The decision consumes durable identity, never a process-local continuation
-object (issue #336): the blocking entry (:func:`finalize_planning_review_decision`)
-serves the queue-mode and Owner-resume compositions, and the detached
-settlement entry (:func:`settle_observed_planning_review`) is the owning
-service the correlation seam invokes inside its own settlement transaction
+object (issue #336): the detached settlement entry
+(:func:`settle_observed_planning_review`) is the owning service the
+correlation seam invokes inside its own settlement transaction
 when the independently observed REVIEW completion carries a validated
-``review_result``. Both share one decision composition; the post-commit
+``review_result`` (issue #347: every execution mode dispatches the REVIEW
+as one detached turn, so no blocking decision entry remains). The post-commit
 workflow continuation (the routed REVISE dispatch, the
 IMPLEMENTATION_AUTHORIZATION presentation) belongs to the ONE completion
-handoff in the detached world, never to this seam.
+handoff, never to this seam.
 
 Scope discipline (Phase 2E): this seam never assesses plan semantics,
 never settles REVIEW_RESOLUTION gates (E3c), never creates
@@ -62,12 +62,12 @@ Durable decision semantics:
   mutating the Task. E5's Owner approval closes the loop atomically; a
   closed loop never reopens and never gains a second loop.
 - A within-budget ``CHANGES_REQUESTED`` keeps the Task PLANNING and the
-  loop OPEN; the exact finalized findings are routed to merged E2
-  (:func:`openorc.services.task_plan_production.revise_task_plan`) OUTSIDE
-  any database transaction. Only E2's newly persisted current
+  loop OPEN; the exact finalized findings are routed to the detached
+  Producer REVISE dispatch (issue #335) by the ONE completion handoff
+  outside this settlement. Only E2's newly persisted current
   PlanRevision and post-update token may launch E3a's next ordinary REVIEW
   (the amended E3a admission guard refuses re-reviewing an
-  already-reviewed revision). An uncertain E2 operation is never resent
+  already-reviewed revision). An uncertain REVISE dispatch is never resent
   here: the finalized review stays durable and recovery belongs to E2's
   own seam and later orchestration.
 
@@ -102,7 +102,6 @@ from openorc.domain.reviews import (
 )
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
-from openorc.observability import annotate_span, application_span
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.gates import create_owner_gate, list_task_owner_gates
@@ -120,29 +119,24 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
-from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
-    revise_task_plan,
     settle_resumed_task_record,
 )
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
 )
-from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
     "PlanningReviewDecision",
     "TaskPlanningReviewDecisionOutcome",
-    "finalize_planning_review_decision",
     "settle_observed_planning_review",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_decision"
-_DECISION_SPAN_NAME = "task_planning_review_decision.finalize_planning_review_decision"
 
 # The safe logical actor identities this seam records events under: the
 # exact REVIEWER session carries the Reviewer's decision; OpenOrc carries
@@ -680,116 +674,6 @@ def _apply_decision(
 
 
 # --- the decision operation -----------------------------------------------------
-
-
-def finalize_planning_review_decision(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
-    github: GitHubAppClient,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    review_iteration_id: UUID,
-    review_result: ReviewResult,
-    expected_reviewer_session_id: UUID,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-    task_resume_intent_id: UUID | None = None,
-) -> TaskPlanningReviewDecisionOutcome:
-    """Finalize one reserved planning review and commit its durable decision.
-
-    The blocking decision entry (the queue-mode composition and the
-    Owner-resume continuation, issue #336): the exact reserved ReviewIteration
-    identity and the validated typed ``ReviewResult`` — every exact subject
-    re-derived from durable state, never from a process-local continuation
-    object — are rechecked in one short composed transaction, the result is
-    finalized once, and the durable next decision commits with its safe
-    audit events.
-
-    On an in-budget ``CHANGES_REQUESTED``, the exact finalized findings
-    route to merged E2 (:func:`revise_task_plan`) with NO database
-    transaction open; only E2's newly persisted current PlanRevision and
-    post-update token may launch E3a's next ordinary REVIEW, and an
-    uncertain E2 operation is never resent here. On exhaustion the
-    exact-plan pending REVIEW_RESOLUTION gate is created and installed, the
-    Task moves to ``waiting_for_owner``, and exhausted findings are never
-    forwarded. On acceptance the loop stays OPEN (issue #219) and the
-    accepted evidence is yielded for E5 without creating
-    IMPLEMENTATION_AUTHORIZATION. The detached REVISE dispatch belongs to
-    the ONE post-commit completion handoff, never to this entry.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _DECISION_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_uuid_command(review_iteration_id, "review_iteration_id")
-        _require_uuid_command(expected_reviewer_session_id, "expected_reviewer_session_id")
-        github_client = _require_github(github)
-        result = _require_review_result(review_result)
-        # The blocking revise keeps its attached-runtime requirement,
-        # validated before any effect so a malformed dependency can never
-        # strand an already-finalized review.
-        _require_runtime(runtime)
-        annotate_span(
-            span,
-            operation=_DECISION_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: decision finalization (database only). ---
-        with composed_transaction(pool) as transaction_pool:
-            finalization = _finalize_decision_composition(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                review_iteration_id=review_iteration_id,
-                result=result,
-                expected_reviewer_session_id=expected_reviewer_session_id,
-                task_resume_intent_id=task_resume_intent_id,
-            )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        if finalization.decision is _Phase1Decision.ROUTE_REVISION:
-            production = revise_task_plan(
-                pool,
-                runtime,
-                github_client,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                profile_id=profile_id,
-                expected_state_token=expected_state_token,
-                prior_plan_revision_id=finalization.reviewed_revision.id,
-                review_iteration_id=finalization.finalized_iteration.id,
-                attempt_evidence=attempt_evidence,
-            )
-            return TaskPlanningReviewDecisionOutcome(
-                decision=PlanningReviewDecision.REVISION_ROUTED,
-                review_iteration=finalization.finalized_iteration,
-                plan_revision=finalization.reviewed_revision,
-                review_loop=finalization.loop,
-                task=production.task,
-                revision_production=production,
-                resolution_gate=None,
-            )
-
-        return TaskPlanningReviewDecisionOutcome(
-            decision=(
-                PlanningReviewDecision.ACCEPTED_CLEAR
-                if finalization.decision is _Phase1Decision.ACCEPTED
-                else PlanningReviewDecision.EXHAUSTED
-            ),
-            review_iteration=finalization.finalized_iteration,
-            plan_revision=finalization.reviewed_revision,
-            review_loop=finalization.loop,
-            task=finalization.task,
-            revision_production=None,
-            resolution_gate=finalization.resolution_gate,
-        )
 
 
 def settle_observed_planning_review(

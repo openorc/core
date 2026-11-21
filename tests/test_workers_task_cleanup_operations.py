@@ -124,16 +124,19 @@ class _RecordingSubmitter:
         return self.outcome
 
 
-def _dependencies(settings: Settings, runtime: Any) -> OperationDependencies:
+def _dependencies(settings: Settings, runtime: Any, detached_registrar: Any = None) -> Any:
     pool: Any = object()
     github: Any = object()
-    return OperationDependencies(
-        settings=settings,
-        database_pool_provider=lambda _settings: pool,
-        github_client_provider=lambda _settings: github,
-        continuation_submitter_provider=lambda _settings: _RecordingSubmitter(),
-        terminal_cleanup_runtime_provider=lambda _settings: runtime,
-    )
+    providers: dict[str, Any] = {
+        "settings": settings,
+        "database_pool_provider": lambda _settings: pool,
+        "github_client_provider": lambda _settings: github,
+        "continuation_submitter_provider": lambda _settings: _RecordingSubmitter(),
+        "terminal_cleanup_runtime_provider": lambda _settings: runtime,
+    }
+    if detached_registrar is not None:
+        providers["detached_turn_observer_provider"] = lambda _settings: detached_registrar
+    return OperationDependencies(**providers)
 
 
 class _FakeQueue:
@@ -296,7 +299,8 @@ def test_the_finalization_wire_form_is_strictly_decoded_and_dispatched_in_queue_
     harness = cleanup_service_harness
     settings = _settings(execution_mode=ExecutionMode.QUEUE)
     submitter = invocation.RQQueueOperationSubmission(settings)
-    dependencies = _dependencies(settings, _RecordingRuntime())
+    registrar = object()
+    dependencies = _dependencies(settings, _RecordingRuntime(), detached_registrar=registrar)
 
     result = submitter.submit(_cleanup_invocation())
 
@@ -314,12 +318,15 @@ def test_the_finalization_wire_form_is_strictly_decoded_and_dispatched_in_queue_
         dependencies=dependencies,
     )
     assert [call["workspace_id"] for call in harness.calls] == [_WORKSPACE_ID]
-    # The queue-mode worker explicitly keeps the blocking interim (until
-    # #328); the blocking selection carries no observation registrar.
+    # The queue-mode worker dispatches the cleanup detached through the #346
+    # remote registrar proxy: the detached selection carries the resolved
+    # registrar seam and the process's ONE post-commit completion handoff
+    # (issues #344/#345/#347).
     dispatch = harness.calls[0]["dispatch"]
     assert dispatch is not None
-    assert dispatch.selection is TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
-    assert dispatch.observation_registrar is None
+    assert dispatch.selection is TerminalCleanupDispatchSelection.DETACHED_REGULAR
+    assert dispatch.observation_registrar is registrar
+    assert callable(dispatch.completion_handoff.handoff_settled_completion)
     assert queue_wire["client_settings"] == [settings]
 
 

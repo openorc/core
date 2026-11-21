@@ -83,9 +83,6 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
-    AgentRuntimeInterruptedTurnError,
-    AgentRuntimeProtocolFailureError,
-    AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
@@ -139,7 +136,6 @@ from openorc.services.github_user_authorization import ProfileUserAccessTokenRes
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.pull_request_publication import TaskPullRequestPublicationOutcome
-from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import (
     ObservationRegistrationRefusedError,
@@ -165,14 +161,12 @@ __all__ = [
     "ProducerRuntimeAttachmentFactory",
     "SettledTaskPrPublication",
     "TaskPrPublished",
-    "compose_and_publish_task_pr",
     "dispatch_pr_compose_detached",
     "publish_settled_task_pr_composition",
     "settle_observed_pr_compose_result",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_composition"
-_COMPOSE_SPAN_NAME = "task_pr_composition.compose_and_publish_task_pr"
 _DISPATCH_COMPOSE_SPAN_NAME = "task_pr_composition.dispatch_pr_compose_detached"
 _PUBLISH_SETTLED_SPAN_NAME = "task_pr_composition.publish_settled_task_pr_composition"
 
@@ -594,58 +588,6 @@ def _resolve_publication_route_subjects(
     )
 
 
-def _require_unchanged_publication_subjects(
-    transaction_pool: DatabasePool,
-    *,
-    admitted: _PublicationSubjects,
-    workspace_id: UUID,
-    task_id: UUID,
-    owner_gate_id: UUID,
-    expected_state_token: UUID,
-) -> _PublicationSubjects:
-    """Re-admit and require the exact same subjects after acquisition.
-
-    The fresh composition revalidates the identical approval facts, route,
-    Producer binding, and still-absent canonical PR before it may publish —
-    after the runtime interaction, Producer prose is never authorization to
-    publish a moved-on subject.
-    """
-    current = _admit_publication_subjects(
-        transaction_pool,
-        profile_id=admitted.approving_profile_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        owner_gate_id=owner_gate_id,
-        expected_state_token=expected_state_token,
-    )
-    if current.gate.id != admitted.gate.id or (
-        current.gate.subject_head_sha != admitted.gate.subject_head_sha
-    ):
-        raise StaleOperationError(
-            "the approved pr authorization gate moved on during composition; "
-            "the publication is stale"
-        )
-    if current.canonical_branch != admitted.canonical_branch or (
-        current.base_ref != admitted.base_ref
-    ):
-        raise StaleOperationError(
-            "the publication route moved on during composition; the publication is stale"
-        )
-    if (current.continuation_pull_request is None) != (admitted.continuation_pull_request is None):
-        raise StaleOperationError(
-            "the task's canonical pull request moved on during composition; "
-            "the publication is stale"
-        )
-    if admitted.producer_session is not None and (
-        current.producer_session is None
-        or current.producer_session.id != admitted.producer_session.id
-    ):
-        raise StaleOperationError(
-            "the producer session binding moved on during composition; the publication is stale"
-        )
-    return current
-
-
 # --- the recoverable stale-publication block -----------------------------------------
 
 
@@ -1018,270 +960,7 @@ def _finalize_or_block(
 # --- the one PR_COMPOSE interaction --------------------------------------------------
 
 
-def _compose_pr_with_producer(
-    pool: DatabasePool,
-    runtime_factory: ProducerRuntimeAttachmentFactory,
-    *,
-    admitted: _PublicationSubjects,
-    send_claim: TaskRuntimeSendClaim,
-    workspace_id: UUID,
-    task_id: UUID,
-    owner_gate_id: UUID,
-    expected_state_token: UUID,
-) -> PrResult:
-    """The one PR_COMPOSE interaction on the exact pre-existing binding.
-
-    The deferred attachment seam is entered, the same publication subjects
-    are revalidated after acquisition and before realization (R1), and one
-    ``realize_control`` sends the rendered ``pr_compose`` prose expecting the
-    ``pr_result`` family through the shared #67 → #65 formal funnel. The
-    exact subject was durably claimed before this effect (issue #87):
-    uncertain outcomes are never resent; a transport or protocol failure can
-    arise only after the send has done work, so it is an unresolved outcome
-    — never a proven non-delivery; a positively proven pre-effect failure
-    records the truthful known non-delivery on the claim and never
-    reclassifies. No durable effect exists on any failure.
-    """
-    session = admitted.producer_session
-    if session is None or session.external_session_id is None:
-        # Narrowed by admission; kept explicit for fail-closed safety.
-        raise ConflictError("the producer session binding carries no external session identity")
-    external_session_id = session.external_session_id
-    with ExitStack() as attachment_stack:
-        try:
-            runtime = attachment_stack.enter_context(runtime_factory())
-        except ExternalOperationUncertainError:
-            raise
-        except ExternalOperationFailedError:
-            raise
-        # R1: authority revalidation after acquisition, before realization.
-        with composed_transaction(pool) as transaction_pool:
-            _require_unchanged_publication_subjects(
-                transaction_pool,
-                admitted=admitted,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-            )
-        interaction = PrComposeInteraction(
-            repository_full_name=admitted.repository_full_name,
-            issue_number=admitted.task.github_issue_number,
-            guidance=admitted.guidance,
-        )
-        try:
-            realized = runtime.realize_control(
-                external_session_id,
-                interaction,
-                message=interaction.render(),
-                expected_family=PR_RESULT_FAMILY,
-            )
-        except AgentRuntimeInterruptedTurnError as error:
-            settle_observed_task_interrupt(
-                pool, runtime, task_id=task_id, external_session_id=external_session_id
-            )
-            logger.warning(
-                "the pr composition ended with the runtime interrupting the send; the "
-                "compose dispatch claim stays unresolved"
-            )
-            raise ExternalOperationUncertainError(
-                "the pr composition's send was interrupted by the runtime; the compose "
-                "dispatch is never resent"
-            ) from error
-        except AgentRuntimeUncertainOutcomeError as error:
-            raise ExternalOperationUncertainError(
-                "the outcome of the pr composition is unknown; the compose "
-                "request may have been delivered and is never resent"
-            ) from error
-        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
-            logger.warning(
-                "the pr composition ended with a post-send runtime failure; the "
-                "compose dispatch claim stays unresolved"
-            )
-            raise ExternalOperationUncertainError(
-                "the pr composition's send may have been delivered but its response "
-                "could not be interpreted; the compose dispatch is never resent"
-            ) from error
-        except AgentRuntimeError as error:
-            # The remaining normalized taxonomy classes (configuration
-            # rejection, runtime unavailability, and a not-live addressed
-            # session) are positively proven to precede any effect: the claim
-            # records the truthful known non-delivery first.
-            record_send_claim_known_non_delivery(
-                pool,
-                claim=send_claim,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                failure_kind=RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise ExternalOperationFailedError(
-                "the pr composition failed as a known non-delivery before any effect"
-            ) from error
-        if not isinstance(realized, PrResult):
-            raise ExternalOperationUncertainError(
-                "the pr composition ended without a validated pr_result after "
-                "possible composition work; the compose dispatch is never resent"
-            )
-        return realized
-
-
 # --- the public E8 orchestration -----------------------------------------------------
-
-
-def compose_and_publish_task_pr(
-    pool: DatabasePool,
-    github: GitHubAppClient,
-    user_token_resolver: ProfileUserAccessTokenResolver,
-    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    owner_gate_id: UUID,
-    expected_state_token: UUID,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-    terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
-) -> TaskPrPublished:
-    """Compose the Producer's PR presentation and publish the canonical PR.
-
-    The next proven manual Producer handoff after E7's durable approval:
-    admission re-derives the persisted approved ``PR_AUTHORIZATION`` gate,
-    its exact head-SHA subject, and the OWNER-attributed approving Profile
-    from durable state; the fresh path runs the one ``PR_COMPOSE``
-    interaction on the exact pre-existing READY Producer binding, normalizes
-    the deterministic closing reference, and invokes the existing race-safe
-    publication primitive exactly once under the approving Profile's GitHub
-    user-to-server authorization; the narrow continuation path reconciles
-    this module's own interrupted publication authoritatively instead. Only
-    a clean ``PUBLISHED`` result — or a still-valid reconciled record —
-    finalizes ``waiting_for_owner → reviewing`` with the one ``pr_created``
-    audit; every other outcome fails closed truthfully, blocking the Task
-    recoverably where it is still current and mutating nothing when it has
-    already moved on. No Reviewer dispatch, no second create, no adoption,
-    and no database transaction spanning the runtime or GitHub calls.
-    """
-    _require_uuid_command(profile_id, "profile_id")
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(owner_gate_id, "owner_gate_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    runtime_factory = _require_producer_factory(producer_runtime_factory)
-    with application_span(_SERVICE_TRACER_SCOPE, _COMPOSE_SPAN_NAME) as span:
-        annotate_span(
-            span,
-            operation=_COMPOSE_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-        # --- one short admission transaction (DB-only) ---
-        with composed_transaction(pool) as transaction_pool:
-            subjects = _admit_publication_subjects(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-            )
-        if subjects.continuation_pull_request is not None:
-            # --- the narrow continuation: authoritative reconciliation with
-            # no transaction open, then the same atomic finalization. The
-            # composition and the create are never repeated. ---
-            task_pull_request_reconciliation.reconcile_task_pull_request(
-                pool, github, workspace_id=workspace_id, task_id=task_id
-            )
-            return _finalize_or_block(
-                pool,
-                subjects=subjects,
-                expected_github_pr_id=None,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-                terminal_finalization_submission=terminal_finalization_submission,
-            )
-
-        # --- the durable pre-send dispatch claim (database only) ---
-        approved_head_sha = subjects.gate.subject_head_sha
-        if approved_head_sha is None:
-            # Narrowed by admission; kept explicit for fail-closed safety.
-            raise ConflictError(
-                "the pr authorization gate does not carry the exact head-sha subject"
-            )
-        producer_session = subjects.producer_session
-        if producer_session is None:
-            # Narrowed by admission (the fresh path always carries the
-            # exact READY Producer binding); kept explicit for fail-closed
-            # safety.
-            raise ConflictError("the fresh pr composition carries no producer session binding")
-        # Committed strictly before any runtime effect on the fresh
-        # composition path for the exact approved gate/head: a replayed or
-        # raced continuation never composes again, whatever the prior
-        # attempt's outcome. The interrupted-publication continuation never
-        # reaches this claim.
-        send_claim = claim_pr_compose_send(
-            pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            owner_gate=subjects.gate,
-            producer=producer_session,
-        )
-        # --- the one PR_COMPOSE interaction (external, no transaction) ---
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's committed
-            # PR_COMPOSE dispatch claim identity (#262).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.PR_COMPOSE_DISPATCH,
-                original_attempt_kind=OriginalAttemptKind.RUNTIME_SEND_CLAIM,
-                original_attempt_id=send_claim.id,
-                phase="pr_compose_dispatch",
-            )
-        pr_result = _compose_pr_with_producer(
-            pool,
-            runtime_factory,
-            admitted=subjects,
-            send_claim=send_claim,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            owner_gate_id=owner_gate_id,
-            expected_state_token=expected_state_token,
-        )
-        # --- post-interaction revalidation + claim settlement before any
-        # publication: the validated pr_result completed the composition, so
-        # the send claim settles exactly once in the same short transaction —
-        # without pretending GitHub publication has completed. ---
-        with composed_transaction(pool) as transaction_pool:
-            _require_unchanged_publication_subjects(
-                transaction_pool,
-                admitted=subjects,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                owner_gate_id=owner_gate_id,
-                expected_state_token=expected_state_token,
-            )
-            settle_pr_compose_send_claim(
-                transaction_pool,
-                claim=send_claim,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                subject_head_sha=approved_head_sha,
-            )
-        # --- deterministic closing reference + the one B8 invocation + the
-        # outcome handling: finalize clean, block recoverably, or fail closed
-        # truthfully (shared with the detached continuation, issue #337). ---
-        return _publish_and_finalize(
-            pool,
-            github,
-            user_token_resolver,
-            subjects=subjects,
-            pr_result=pr_result,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            owner_gate_id=owner_gate_id,
-            expected_state_token=expected_state_token,
-            terminal_finalization_submission=terminal_finalization_submission,
-        )
 
 
 def _publish_and_finalize(

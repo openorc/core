@@ -11,12 +11,13 @@ cross-family wiring: settled family → wired handoff route → next typed F1
 submission or detached dispatch, re-derived from committed state, with no
 recursive in-process chain and no blocking model call.
 
-The documented blocking exceptions the survey names are the queue-mode
-interim entry points (until #328), the F10 terminal cleanup (#327), and the
-bounded native ACT mode controls. Every ordinary model turn — including the
-F5c authorized-implementation retry, whose registered F1 operation is
+The #347 transport-parity completion: every ordinary model turn — including
+the F5c authorized-implementation retry, whose registered F1 operation is
 directly invocable for an already-due F4 authorization — routes detached in
-regular mode; F12 (#316) owns submitting due authorized retries.
+BOTH execution modes, and the queue-mode blocking interim entries are
+retired. The survey proves the retired blocking model-turn helpers are gone
+from their owning services and that no worker composition reaches a
+blocking model turn; F12 (#316) owns submitting due authorized retries.
 """
 
 from __future__ import annotations
@@ -651,45 +652,56 @@ def _caller_roots(calls: dict[str, set[str]], target: str) -> set[str]:
     }
 
 
-def test_blocking_model_turn_helpers_are_reachable_only_from_queue_mode_interims() -> None:
-    """The targeted survey (#340): each owning service's blocking model-turn
-    helper is reachable only from its documented queue-mode interim entry
-    points (until #328) — no regular-mode path reaches a blocking send."""
-    sanctioned = (
+def test_no_blocking_model_turn_entry_remains_in_the_migrated_services() -> None:
+    """The #347 completion survey: the queue-mode interim blocking model-turn
+    entries and their private realize/send helpers are retired from their
+    owning services — no production path can reach a blocking send."""
+    retired = (
         (
             "src/openorc/services/task_plan_production.py",
-            "_realize_plan_control",
-            {"produce_initial_task_plan", "revise_task_plan"},
+            ("produce_initial_task_plan", "revise_task_plan", "_realize_plan_control"),
         ),
         (
             "src/openorc/services/task_planning_review_dispatch.py",
-            "_realize_review_control",
-            {"dispatch_planning_review"},
+            ("dispatch_planning_review", "_realize_review_control"),
         ),
         (
             "src/openorc/services/task_pr_review_dispatch.py",
-            "_realize_pr_review_control",
-            {"dispatch_pr_review"},
+            ("dispatch_pr_review", "_realize_pr_review_control"),
         ),
         (
             "src/openorc/services/task_pr_composition.py",
-            "_compose_pr_with_producer",
-            {"compose_and_publish_task_pr"},
+            ("compose_and_publish_task_pr", "_compose_pr_with_producer"),
         ),
         (
             "src/openorc/services/task_pr_remediation.py",
-            "_send_remediation_revision",
-            {"route_pr_remediation"},
+            ("route_pr_remediation", "_send_remediation_revision"),
         ),
         (
             "src/openorc/services/task_authorized_implementation_execution.py",
-            "_send_and_finalize",
-            {"execute_authorized_implementation"},
+            ("execute_authorized_implementation", "_send_and_finalize"),
+        ),
+        (
+            "src/openorc/services/task_authorized_implementation_retry.py",
+            ("execute_authorized_implementation_retry",),
+        ),
+        (
+            "src/openorc/services/task_planning_review_decision.py",
+            ("finalize_planning_review_decision",),
+        ),
+        (
+            "src/openorc/services/task_pr_review_decision.py",
+            ("finalize_pr_review_decision",),
+        ),
+        (
+            "src/openorc/services/task_terminal_cleanup.py",
+            ("execute_terminal_checkout_cleanup",),
         ),
     )
-    for module, helper, expected_roots in sanctioned:
-        actual_roots = _caller_roots(_function_calls(module), helper)
-        assert actual_roots == expected_roots, (module, sorted(actual_roots))
+    for module, names in retired:
+        calls = _function_calls(module)
+        for name in names:
+            assert name not in calls, (module, name)
 
 
 def test_the_bootstrap_prepare_split_dispatches_detached_from_its_own_entry() -> None:
@@ -706,12 +718,12 @@ def test_the_f10_terminal_cleanup_realize_stays_inside_the_bounded_cleanup() -> 
     assert "realize_control" in calls["cleanup_checkout"]
 
 
-def test_every_regular_mode_composition_splits_to_its_detached_dispatch() -> None:
-    """Each worker composition that carries a blocking model-turn entry also
-    calls its owning service's detached dispatch in the regular-mode branch
-    (#340): the mode split exists in all five migrated compositions."""
+def test_every_task_workflow_composition_dispatches_detached_only() -> None:
+    """Each Task-workflow model-turn composition calls exactly its owning
+    service's detached dispatch and no retired blocking entry (#347): both
+    execution modes run the same detached composition."""
     calls = _function_calls("src/openorc/workers/task_workflow.py")
-    splits = (
+    compositions = (
         (
             "_compose_task_planning_bootstrap_and_initial_plan",
             "dispatch_initial_plan_detached",
@@ -738,38 +750,33 @@ def test_every_regular_mode_composition_splits_to_its_detached_dispatch() -> Non
             ("compose_and_publish_task_pr",),
         ),
         ("_compose_task_pr_review", "dispatch_pr_review_detached", ("dispatch_pr_review",)),
+        (
+            "_compose_task_session_resume",
+            "dispatch_authorized_task_resume",
+            (),
+        ),
     )
-    for composition, detached, blocking_entries in splits:
+    for composition, detached, retired_entries in compositions:
         assert composition in calls, composition
         assert detached in calls[composition], composition
-        for entry in blocking_entries:
-            assert entry in calls[composition], (composition, entry)
+        for entry in retired_entries:
+            assert entry not in calls[composition], (composition, entry)
 
 
-def test_the_shared_blocking_external_phase_serves_only_the_blocking_entries() -> None:
-    """The shared blocking E6 external phase is consumed only by the two
-    blocking execution entries — the initial E6 execute and the F5c retry
-    execute, both queue-mode interims (#340). No other module path reaches a
-    blocking model-turn send through it."""
+def test_the_shared_blocking_external_phase_is_retired() -> None:
+    """The shared blocking E6 external phase existed only for the two blocking
+    execution entries (#340); #347 retires the interim and the phase with it."""
     execution_calls = _function_calls(
         "src/openorc/services/task_authorized_implementation_execution.py"
     )
     retry_calls = _function_calls("src/openorc/services/task_authorized_implementation_retry.py")
-    callers: set[str] = set()
     for calls in (execution_calls, retry_calls):
-        for name, called in calls.items():
-            if "_execute_external_phase" in called:
-                callers.add(name)
-    assert callers == {
-        "execute_authorized_implementation",
-        "execute_authorized_implementation_retry",
-    }
+        assert "_execute_external_phase" not in calls
 
 
 def test_the_f5c_retry_boundary_is_documented_in_place() -> None:
-    """The F5c retry composition documents its detached regular-mode routing
-    and the F12 (#316) wakeup ownership where the blocking queue-mode interim
-    is defined, so the boundary is not implicit (#340 review)."""
+    """The F5c retry composition documents its detached routing and the F12
+    (#316) wakeup ownership, so the boundary is not implicit (#340 review)."""
     tree = ast.parse((_REPO_ROOT / "src/openorc/workers/task_workflow.py").read_text())
     retry = next(
         node
@@ -782,4 +789,4 @@ def test_the_f5c_retry_boundary_is_documented_in_place() -> None:
     calls = _function_calls("src/openorc/workers/task_workflow.py")
     retry_calls = calls["_compose_task_authorized_implementation_retry"]
     assert "dispatch_authorized_implementation_retry_detached" in retry_calls
-    assert "execute_authorized_implementation_retry" in retry_calls
+    assert "execute_authorized_implementation_retry" not in retry_calls

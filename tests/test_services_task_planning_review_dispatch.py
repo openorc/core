@@ -44,39 +44,23 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import StatusCode
-from psycopg.errors import UniqueViolation
 
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeDeliveryUncertainError,
-    AgentRuntimeUnavailableError,
     AgentSessionNotFoundError,
 )
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.operational_failures import OriginalAttemptKind
-from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.planning import PlanRevision
-from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
-from openorc.observability import TASK_ID, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.interaction import PlanReviewSubject, ReviewInteraction
-from openorc.protocol.models import ReviewResult
+from openorc.protocol.interaction import ReviewInteraction
 from openorc.services.errors import (
-    ConflictError,
     ExternalOperationFailedError,
     ExternalOperationRejectedError,
     ExternalOperationUncertainError,
-    InvalidCommandError,
-    NotFoundError,
-    StaleOperationError,
 )
-from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_detached_turn_observation import (
     ObservationRegistrationRefusalReason,
     ObservationRegistrationRefusedError,
@@ -86,15 +70,11 @@ from openorc.services.task_plan_production import (
 )
 from openorc.services.task_planning_review_dispatch import (
     DispatchedPlanningReview,
-    TaskPlanningReviewDispatchOutcome,
-    dispatch_planning_review,
     dispatch_planning_review_detached,
 )
 from tests.fakes.agent_runtime import (
     FakeAgentRuntimeAdapter,
-    accepted_review_result_candidate,
     changes_requested_review_result_candidate,
-    plan_result_candidate,
     session_ready_candidate,
 )
 from tests.fakes.task_rows import task_row
@@ -668,885 +648,6 @@ def _assert_no_task_mutation(conn: ScriptedConnection) -> None:
     assert not any(_TASK_WRITE(sql, None) for sql, _ in conn.executed)
 
 
-class _Dispatch:
-    """Assembled deterministic fixtures for one review-dispatch invocation."""
-
-    def __init__(self) -> None:
-        self.conn = ScriptedConnection()
-        self.pool = FakePool(self.conn)
-        self.attachment: Any = None
-
-    def prepared_reviewer_adapter(self, outcomes: Sequence[Any]) -> _ProbedAdapter:
-        return _prepared_reviewer_adapter(self.pool, outcomes)
-
-    def run(
-        self,
-        *,
-        adapter: FakeAgentRuntimeAdapter | None = None,
-        reviewer_attachment: Any = None,
-        plan_production: Any = None,
-        workspace_id: Any = _WORKSPACE_ID,
-        task_id: Any = _TASK_ID,
-        profile_id: Any = _OWNER_PROFILE_ID,
-        attempt_evidence: Any = None,
-    ) -> Any:
-        runtime = (
-            adapter
-            if adapter is not None
-            else self.prepared_reviewer_adapter([_review_candidate()])
-        )
-        attachment = (
-            reviewer_attachment
-            if reviewer_attachment is not None
-            else _ReviewerAttachment(runtime, self.conn)
-        )
-        self.attachment = attachment
-        return dispatch_planning_review(
-            cast(DatabasePool, self.pool),
-            attachment,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            profile_id=profile_id,
-            plan_production=(
-                plan_production if plan_production is not None else _production_outcome()
-            ),
-            attempt_evidence=attempt_evidence,
-        )
-
-
-def test_first_review_creates_one_loop_one_pending_iteration_and_returns_the_typed_result() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        loop_row=_loop_row(limit=5),
-        iteration_row=_iteration_row(
-            iteration_id=_ITERATION_1_ID,
-            number=1,
-            plan_revision_id=_REVISION_1_ID,
-        ),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    outcome = env.run(adapter=adapter)
-
-    assert isinstance(outcome, TaskPlanningReviewDispatchOutcome)
-    # Exactly one OPEN planning loop with the Workspace's snapshotted limit.
-    assert outcome.review_loop.id == _LOOP_ID
-    assert outcome.review_loop.purpose is ReviewLoopPurpose.PLANNING
-    assert outcome.review_loop.status is ReviewLoopStatus.OPEN
-    assert outcome.review_loop.iteration_limit == 5
-    # Exactly one pending iteration bound to the exact current plan.
-    assert outcome.review_iteration.id == _ITERATION_1_ID
-    assert outcome.review_iteration.iteration_number == 1
-    assert outcome.review_iteration.plan_revision_id == _REVISION_1_ID
-    assert outcome.review_iteration.outcome is None
-    assert outcome.review_iteration.summary is None
-    assert outcome.review_iteration.findings is None
-    assert outcome.review_iteration.decided_at is None
-    # The typed Reviewer result is input for E3b, never a verdict or gate.
-    assert isinstance(outcome.review_result, ReviewResult)
-    assert outcome.review_result.outcome == "CHANGES_REQUESTED"
-    assert outcome.review_result.summary == "Needs work"
-    assert [(finding.summary, finding.details) for finding in outcome.review_result.findings] == [
-        ("Clarify scope", "Say which module changes.")
-    ]
-    assert outcome.reviewer_session.id == _REVIEWER_SESSION_ID
-    assert outcome.reviewer_session.lifecycle_status is TaskSessionLifecycleStatus.READY
-    # The send happened with no database transaction open, and E3a recorded
-    # no verdict, result, or Task mutation.
-    assert env.pool.active_connections == 0
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-
-
-def test_review_message_and_typed_subject_carry_the_persisted_plan_and_identity() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    env.run(adapter=adapter)
-
-    (control,) = adapter.realized_controls(_REVIEWER_EXTERNAL_ID)
-    assert control.expected_family == "review_result"
-    assert control.message is not None
-    assert control.message == (
-        f"Plan review for {_FULL_NAME} issue #42.\n"
-        f"Review plan revision 1 (plan_revision_id {_REVISION_1_ID}).\n\n"
-        f"{_PLAN_TEXT}"
-    )
-    interaction = control.interaction
-    assert isinstance(interaction, ReviewInteraction)
-    subject = interaction.subject
-    assert isinstance(subject, PlanReviewSubject)
-    assert subject.plan_revision_id == str(_REVISION_1_ID)
-    assert subject.repository_full_name == _FULL_NAME
-    assert subject.issue_number == 42
-    assert subject.plan == _PLAN_TEXT
-    (send,) = adapter.submitted_sends(_REVIEWER_EXTERNAL_ID)
-    assert send.formal is True
-    assert send.expected_family == "review_result"
-    assert send.message == control.message
-    # One REVIEW to the exact Reviewer session and nothing else.
-    assert len(adapter.realized_controls()) == 1
-
-
-def test_subsequent_plan_reuses_the_loop_and_next_number_despite_a_workspace_edit() -> None:
-    env = _Dispatch()
-    _script_reuse_entry(
-        env.conn,
-        task_row=_task_row(current_plan_revision_id=_REVISION_2_ID),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(
-            revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT
-        ),
-        # The Workspace setting was edited after the first review (7), but
-        # the loop's stored budget (3) is what the loop keeps using.
-        workspace_row=_ws_row(limit=7),
-        existing_loops=[_loop_row(limit=3)],
-        loop_row=_loop_row(limit=3),
-        loop_iterations=[
-            _iteration_row(
-                iteration_id=_ITERATION_1_ID,
-                number=1,
-                outcome="changes_requested",
-                summary="Needs work",
-                findings=_REVIEW_FINDINGS,
-                decided_at=_OBSERVED,
-                plan_revision_id=_REVISION_1_ID,
-            )
-        ],
-        iteration_row=_iteration_row(
-            iteration_id=_ITERATION_2_ID,
-            number=2,
-            plan_revision_id=_REVISION_2_ID,
-        ),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    outcome = env.run(
-        adapter=adapter,
-        plan_production=_production_outcome(
-            revision_id=_REVISION_2_ID,
-            number=2,
-            content=_REVISED_PLAN_TEXT,
-            current_plan_revision_id=_REVISION_2_ID,
-        ),
-    )
-
-    # The same loop is reused — no second loop, stored budget preserved.
-    assert outcome.review_loop.id == _LOOP_ID
-    assert outcome.review_loop.iteration_limit == 3
-    assert not any(_LOOP_INSERT(sql, None) for sql, _ in env.conn.executed)
-    # The next iteration number is reserved for the exact current plan.
-    assert outcome.review_iteration.iteration_number == 2
-    assert outcome.review_iteration.plan_revision_id == _REVISION_2_ID
-    assert outcome.review_iteration.outcome is None
-    # The subject carries the persisted revised content.
-    (control,) = adapter.realized_controls(_REVIEWER_EXTERNAL_ID)
-    interaction = control.interaction
-    assert isinstance(interaction, ReviewInteraction)
-    subject = interaction.subject
-    assert isinstance(subject, PlanReviewSubject)
-    assert subject.plan_revision_id == str(_REVISION_2_ID)
-    assert subject.plan == _REVISED_PLAN_TEXT
-
-
-def test_stale_plan_revision_refuses_dispatch() -> None:
-    env = _Dispatch()
-    # The Task's current plan pointer has moved on to revision 2 while the
-    # supplied E2 outcome still names revision 1.
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(current_plan_revision_id=_REVISION_2_ID),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(revision_id=_REVISION_1_ID),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    _assert_no_verdict_recorded(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_foreign_plan_revision_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    foreign = TaskPlanProductionOutcome(
-        plan_revision=PlanRevision(
-            id=_REVISION_1_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_OTHER_TASK_ID,
-            revision_number=1,
-            content=_PLAN_TEXT,
-            repository_base_sha=_BASE_SHA,
-            created_at=_OBSERVED,
-        ),
-        task=_task_domain(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(InvalidCommandError):
-        env.run(adapter=adapter, plan_production=foreign)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_tampered_outcome_content_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    tampered = TaskPlanProductionOutcome(
-        plan_revision=_revision_domain(_REVISION_1_ID, number=1, content=_REVISED_PLAN_TEXT),
-        task=_task_domain(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(adapter=adapter, plan_production=tampered)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_unready_reviewer_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=None, lifecycle="connecting"
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_missing_reviewer_binding_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=None,
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(NotFoundError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_archived_task_refuses_dispatch() -> None:
-    env = _Dispatch()
-    # An archived Task has reached a terminal outcome, so it is no longer
-    # current: the dispatch is stale and applies nothing.
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(status="cancelled", archived_at=_OBSERVED),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_stale_task_token_refuses_dispatch() -> None:
-    env = _Dispatch()
-    # The Task's token rotated after E2's post-update token: the
-    # continuation is stale and applies nothing.
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(state_token=uuid.uuid4()),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_task_not_in_planning_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(status="waiting_for_owner"),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_non_owner_profile_refuses_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(NotFoundError):
-        env.run(adapter=adapter, profile_id=_OTHER_PROFILE_ID)
-
-    # No adapter is ever acquired before the authorization transaction
-    # commits (issue #268).
-    assert env.attachment is not None
-    assert env.attachment.acquisitions == 0
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_closed_planning_loop_refuses_dispatch_without_creating_a_new_one() -> None:
-    env = _Dispatch()
-    _script_reuse_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        existing_loops=[_loop_row(status="closed", closed_at=_OBSERVED)],
-        loop_row=_loop_row(status="closed", closed_at=_OBSERVED),
-        loop_iterations=[],
-        iteration_row=_iteration_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(adapter=adapter)
-
-    # The closed loop is never silently reopened or replaced with a second
-    # loop: no new loop and no iteration can appear.
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_multiple_open_planning_loops_fail_closed() -> None:
-    env = _Dispatch()
-    _script_reuse_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        existing_loops=[_loop_row(), _loop_row(loop_id=_OTHER_LOOP_ID)],
-        loop_row=_loop_row(),
-        loop_iterations=[],
-        iteration_row=_iteration_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(adapter=adapter)
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_unresolved_older_attempt_blocks_a_new_dispatch() -> None:
-    env = _Dispatch()
-    # An unfinalized iteration is still pending on the older revision: no
-    # new REVIEW for the current plan may bypass it.
-    _script_reuse_entry(
-        env.conn,
-        task_row=_task_row(current_plan_revision_id=_REVISION_2_ID),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(
-            revision_id=_REVISION_2_ID, number=2, content=_REVISED_PLAN_TEXT
-        ),
-        existing_loops=[_loop_row()],
-        loop_row=_loop_row(),
-        loop_iterations=[
-            _iteration_row(
-                iteration_id=_ITERATION_1_ID,
-                number=1,
-                plan_revision_id=_REVISION_1_ID,
-            )
-        ],
-        iteration_row=_iteration_row(iteration_id=_ITERATION_2_ID, number=2),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        env.run(
-            adapter=adapter,
-            plan_production=_production_outcome(
-                revision_id=_REVISION_2_ID,
-                number=2,
-                content=_REVISED_PLAN_TEXT,
-                current_plan_revision_id=_REVISION_2_ID,
-            ),
-        )
-
-    _assert_no_reservation(env.conn)
-    assert adapter.submitted_sends() == ()
-
-
-def test_competing_iteration_reservation_is_a_stale_operation() -> None:
-    env = _Dispatch()
-    _script_entry_prefix(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    env.conn.on(_LOOPS_LIST, [])
-    env.conn.on(_LOOP_INSERT, _loop_row(limit=5))
-    env.conn.on(_LOOP_READ_LOCKED, _loop_row(limit=5))
-    env.conn.on(_ITERATIONS_LIST, [])
-    env.conn.on(_LOOP_GUARD_LOCKED, ("open", "planning"))
-    # The unique per-loop numbering rejected the insert: a competing
-    # reservation committed first, so this dispatch is stale.
-    env.conn.on(
-        _ITERATION_INSERT,
-        UniqueViolation("a competing review iteration committed first"),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter)
-
-    assert adapter.submitted_sends() == ()
-
-
-def test_known_send_failure_leaves_the_attempt_unresolved() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter(
-        [AgentRuntimeUnavailableError("the runtime is unreachable")]
-    )
-
-    with pytest.raises(ExternalOperationFailedError):
-        env.run(adapter=adapter)
-
-    # The attempt stays reserved and unresolved; the known failure is never
-    # retried or resent here.
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
-    _assert_no_verdict_recorded(env.conn)
-    assert len(adapter.submitted_sends(_REVIEWER_EXTERNAL_ID)) == 1
-
-
-def test_untyped_formal_answer_refuses_the_dispatch() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    # A valid-looking formal response of the wrong family is a known
-    # non-answer for the REVIEW interaction.
-    adapter = env.prepared_reviewer_adapter([plan_result_candidate(_PLAN_TEXT)])
-
-    with pytest.raises(ExternalOperationFailedError):
-        env.run(adapter=adapter)
-
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
-    _assert_no_verdict_recorded(env.conn)
-    assert len(adapter.submitted_sends(_REVIEWER_EXTERNAL_ID)) == 1
-
-
-def test_typed_accepted_result_is_returned_for_e3b() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([accepted_review_result_candidate("Looks good")])
-
-    outcome = env.run(adapter=adapter)
-
-    assert isinstance(outcome.review_result, ReviewResult)
-    assert outcome.review_result.outcome == "ACCEPTED"
-    assert outcome.review_result.summary == "Looks good"
-    assert outcome.review_result.findings == ()
-    # E3a still records no verdict of its own: the typed result is only the
-    # continuation input for the E3b decision finalization.
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-
-
-def test_uncertain_send_cannot_silently_produce_a_second_review_or_a_verdict() -> None:
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter(
-        [AgentRuntimeDeliveryUncertainError("the delivery outcome is unknown")]
-    )
-
-    with pytest.raises(ExternalOperationUncertainError):
-        env.run(adapter=adapter)
-
-    # The attempt was durably reserved before the send and stays unresolved:
-    # no verdict is inferred, and nothing is resent.
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-    assert len(adapter.submitted_sends(_REVIEWER_EXTERNAL_ID)) == 1
-
-    # A later dispatch against the same loop state is refused: the
-    # unresolved attempt cannot be bypassed by a new REVIEW.
-    second = _Dispatch()
-    _script_reuse_entry(
-        second.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        existing_loops=[_loop_row(limit=5)],
-        loop_row=_loop_row(limit=5),
-        loop_iterations=[
-            _iteration_row(
-                iteration_id=_ITERATION_1_ID,
-                number=1,
-                plan_revision_id=_REVISION_1_ID,
-            )
-        ],
-        iteration_row=_iteration_row(iteration_id=_ITERATION_2_ID, number=2),
-    )
-    second_adapter = second.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        second.run(adapter=second_adapter)
-
-    _assert_no_reservation(second.conn)
-    assert second_adapter.submitted_sends() == ()
-
-
-def test_service_span_carries_only_safe_annotations_and_fails_closed_safely() -> None:
-    provider = TracerProvider()
-    exporter = InMemorySpanExporter()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-    with injected_tracer_source(lambda name: provider.get_tracer(name)):
-        env.run(adapter=adapter)
-    (span,) = [
-        candidate
-        for candidate in exporter.get_finished_spans()
-        if candidate.name == "task_planning_review_dispatch.dispatch_planning_review"
-    ]
-    attributes = span.attributes or {}
-    assert attributes[WORKSPACE_ID] == str(_WORKSPACE_ID)
-    assert attributes[TASK_ID] == str(_TASK_ID)
-    assert span.status is not None
-    assert span.status.status_code is StatusCode.UNSET
-
-    failed_provider = TracerProvider()
-    failed_exporter = InMemorySpanExporter()
-    failed_provider.add_span_processor(SimpleSpanProcessor(failed_exporter))
-    failing = _Dispatch()
-    _script_first_review_entry(
-        failing.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    failing_adapter = failing.prepared_reviewer_adapter(
-        [AgentRuntimeDeliveryUncertainError("the delivery outcome is unknown")]
-    )
-    with (
-        injected_tracer_source(lambda name: failed_provider.get_tracer(name)),
-        pytest.raises(ExternalOperationUncertainError),
-    ):
-        failing.run(adapter=failing_adapter)
-    (failed_span,) = [
-        candidate
-        for candidate in failed_exporter.get_finished_spans()
-        if candidate.name == "task_planning_review_dispatch.dispatch_planning_review"
-    ]
-    assert failed_span.status is not None
-    assert failed_span.status.status_code is StatusCode.ERROR
-    # The failure telemetry is a safe classification only: the description
-    # is the exception type name, never arbitrary message content.
-    assert failed_span.status.description == "ExternalOperationUncertainError"
-
-
-def test_replaying_a_reviewed_revision_production_outcome_cannot_dispatch_again() -> None:
-    """Issue #210: after an in-budget finalization, the still-current token
-    cannot launch another ordinary REVIEW of the same plan before E2
-    publishes the next revision — protecting an in-flight E2 operation from
-    being superseded by a duplicate same-plan iteration."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    _script_reuse_entry(
-        conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        existing_loops=[_loop_row(limit=5)],
-        loop_row=_loop_row(limit=5),
-        loop_iterations=[
-            _iteration_row(
-                outcome="changes_requested",
-                summary="Needs work",
-                findings=_REVIEW_FINDINGS,
-                decided_at=_OBSERVED,
-            )
-        ],
-        iteration_row=_iteration_row(),
-    )
-    adapter = _prepared_reviewer_adapter(fake_pool, [_review_candidate()])
-
-    with pytest.raises(ConflictError):
-        dispatch_planning_review(
-            _pool(conn),
-            _ReviewerAttachment(adapter, conn),
-            profile_id=_OWNER_PROFILE_ID,
-            workspace_id=_WORKSPACE_ID,
-            task_id=_TASK_ID,
-            plan_production=_production_outcome(),
-        )
-
-    _assert_no_reservation(conn)
-    _assert_no_task_mutation(conn)
-    assert len(adapter.realized_controls(_REVIEWER_EXTERNAL_ID)) == 0
-
-
-def test_reservation_commits_before_the_reviewer_attachment_is_acquired() -> None:
-    """F5e: no adapter is ever acquired before the Phase-1 reservation has
-    committed — the acquisition observes the committed iteration insert and
-    receives exactly the Phase-1-resolved READY Reviewer binding."""
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    outcome = env.run(adapter=adapter)
-
-    attachment = env.attachment
-    assert attachment is not None
-    assert attachment.acquisitions == 1
-    assert attachment.disposals == 1
-    # The acquisition happened after the reservation committed: the reserved
-    # iteration insert is already among the executed statements.
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in attachment.statements_at_acquisition)
-    (binding,) = attachment.bindings
-    assert binding.id == _REVIEWER_SESSION_ID
-    assert binding.lifecycle_status is TaskSessionLifecycleStatus.READY
-    assert isinstance(outcome, TaskPlanningReviewDispatchOutcome)
-    assert env.pool.active_connections == 0
-
-
-def test_attachment_failure_after_the_reservation_carries_the_reserved_identity() -> None:
-    """F5e acceptance: a Reviewer attachment failure after the committed
-    reservation raises the typed error with zero sends, leaves the reserved
-    iteration unfinalized, and carries the exact ReviewIteration identity in
-    the invocation's attempt evidence — recorded before the failing
-    acquisition — so F5b's family verification and F4's disposition consume
-    the Task instead of leaving it without a consumer."""
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-    evidence = InvocationAttemptEvidence()
-
-    with pytest.raises(ExternalOperationFailedError):
-        env.run(
-            adapter=adapter,
-            reviewer_attachment=_FailingAttachment(
-                ExternalOperationFailedError("the cline runtime attachment failed"),
-                env.conn,
-            ),
-            attempt_evidence=evidence,
-        )
-
-    # The reservation committed and the evidence was recorded before the
-    # failing acquisition: the identity is the exact reserved iteration.
-    identity = evidence.latest_identity
-    assert identity is not None
-    assert identity.family is PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW
-    assert identity.original_attempt_kind is OriginalAttemptKind.REVIEW_ITERATION
-    assert identity.original_attempt_id == _ITERATION_1_ID
-    assert identity.phase == "planning_review_dispatch"
-    failing = env.attachment
-    assert failing is not None
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in failing.statements_at_failure)
-    # The never-dispatched attempt: no send, no verdict, no Task mutation,
-    # and no database transaction held across the failure.
-    assert adapter.submitted_sends() == ()
-    assert len(adapter.realized_controls()) == 0
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-    assert env.pool.active_connections == 0
-
-
-def test_a_subject_moved_during_attachment_refuses_without_sending() -> None:
-    """The post-attachment proof: a Task that moved on while the Reviewer
-    attachment was acquired refuses the dispatch without sending; the
-    reserved iteration stays unfinalized as an explicit recoverable dead
-    letter bound to the reserved subjects."""
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        # The Task moved on between the reservation and the post-attachment
-        # proof: a different token refuses the dispatch.
-        revalidation_task_row=_task_row(state_token=uuid.uuid4()),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-    evidence = InvocationAttemptEvidence()
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter, attempt_evidence=evidence)
-
-    # The reservation committed and its identity still reaches the F5b
-    # handoff facts; nothing was sent, recorded, or mutated.
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
-    identity = evidence.latest_identity
-    assert identity is not None
-    assert identity.original_attempt_id == _ITERATION_1_ID
-    assert adapter.submitted_sends() == ()
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-    assert env.pool.active_connections == 0
-
-
-def test_a_moved_reviewer_binding_during_attachment_refuses_without_sending() -> None:
-    """The post-attachment proof: a Reviewer binding that moved on during
-    attachment acquisition refuses the dispatch without sending."""
-    env = _Dispatch()
-    _script_first_review_entry(
-        env.conn,
-        task_row=_task_row(),
-        reviewer_row=_session_row(
-            "reviewer", session_id=_REVIEWER_SESSION_ID, external_id=_REVIEWER_EXTERNAL_ID
-        ),
-        revision_row=_revision_row(),
-        revalidation_reviewer_row=_session_row(
-            "reviewer", session_id=uuid.uuid4(), external_id=_REVIEWER_EXTERNAL_ID
-        ),
-    )
-    adapter = env.prepared_reviewer_adapter([_review_candidate()])
-
-    with pytest.raises(StaleOperationError):
-        env.run(adapter=adapter)
-
-    assert any(_ITERATION_INSERT(sql, None) for sql, _ in env.conn.executed)
-    assert adapter.submitted_sends() == ()
-    _assert_no_verdict_recorded(env.conn)
-    _assert_no_task_mutation(env.conn)
-    assert env.pool.active_connections == 0
-
-
 # --- the detached regular-mode REVIEW dispatch (issue #336) --------------------
 
 _RECEIPT_ID = uuid.uuid4()
@@ -1679,8 +780,156 @@ def _script_attach(conn: ScriptedConnection) -> None:
     conn.on(_EARLY_COMPLETION_READ, None)
 
 
+# --- the detached regular-mode REVIEW dispatch (issue #336) --------------------
+
+
+class _DispatchEnv:
+    """The scripted-connection environment one detached dispatch test uses.
+
+    Since #347 the blocking dispatch entry is retired; the detached dispatch
+    tests reuse only this fixture's scripted connection.
+    """
+
+    def __init__(self) -> None:
+        self.conn = ScriptedConnection()
+        self.pool = FakePool(self.conn)
+
+    def prepared_reviewer_adapter(self, outcomes: Sequence[Any]) -> Any:
+        return _prepared_reviewer_adapter(self.pool, outcomes)
+
+
+_RECEIPT_ID = uuid.uuid4()
+_TURN_REFERENCE = "fake-run-1"
+
+_RECEIPT_INSERT = _sql_has("insert into openorc.task_hub_run_receipts")
+_RECEIPT_FOR_UPDATE = _sql_has("from openorc.task_hub_run_receipts", "where id = %s for update")
+_RECEIPT_ATTACH = _sql_has("update openorc.task_hub_run_receipts", "set status = 'admitted'")
+_RECEIPT_REFUSE = _sql_has("update openorc.task_hub_run_receipts", "set status = 'refused'")
+_EARLY_COMPLETION_READ = _sql_has("from openorc.task_hub_run_early_completions", "for update")
+
+
+def _detached_receipt_row(
+    *,
+    status: str = "claimed",
+    admitted_turn_reference: str | None = None,
+) -> tuple[Any, ...]:
+    admitted_at = _OBSERVED if status in ("admitted", "settled") else None
+    settled_at = _OBSERVED if status in ("settled", "refused") else None
+    if status == "settled":
+        outcome: dict[str, Any] = {"settlement": "validated_result"}
+    elif status == "refused":
+        outcome = {"refusal_kind": "admission_refused"}
+    else:
+        outcome = {}
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _REVIEWER_SESSION_ID,
+        "reviewer_review",
+        "review_iteration",
+        _ITERATION_1_ID,
+        "review_result",
+        admitted_turn_reference,
+        status,
+        outcome,
+        None,
+        _OBSERVED,
+        admitted_at,
+        settled_at,
+        _OBSERVED,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+class _RecordingRegistrar:
+    """Records the pre-admission observation registrations (issue #323 seam)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.registrations: list[dict[str, Any]] = []
+
+    def register_session(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        connection_id: Any,
+        external_session_id: Any,
+    ) -> None:
+        self.registrations.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "connection_id": connection_id,
+                "external_session_id": external_session_id,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+
+
+class _RecordingHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #336)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.interrupt_calls: list[dict[str, Any]] = []
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        operation: Any,
+    ) -> None:
+        self.calls.append(
+            {"workspace_id": workspace_id, "task_id": task_id, "operation": operation}
+        )
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        task_agent_session_id: Any,
+        external_session_id: str,
+    ) -> None:
+        self.interrupt_calls.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "task_agent_session_id": task_agent_session_id,
+                "external_session_id": external_session_id,
+            }
+        )
+
+
+def _receipt_insert_params(conn: ScriptedConnection) -> tuple[Any, ...]:
+    for sql, params in conn.executed:
+        if _RECEIPT_INSERT(sql, None):
+            assert params is not None
+            return params
+    raise AssertionError("no detached-turn receipt insert executed")
+
+
+def _script_attach(conn: ScriptedConnection) -> None:
+    """The acknowledgement attach (claimed → admitted, no staged completion)."""
+    conn.on(_RECEIPT_FOR_UPDATE, _detached_receipt_row())
+    conn.on(
+        _RECEIPT_ATTACH,
+        _detached_receipt_row(status="admitted", admitted_turn_reference=_TURN_REFERENCE),
+    )
+    conn.on(_EARLY_COMPLETION_READ, None)
+
+
 def _run_detached(
-    env: _Dispatch,
+    env: _DispatchEnv,
     *,
     adapter: FakeAgentRuntimeAdapter,
     registrar: Any,
@@ -1703,7 +952,7 @@ def test_the_detached_review_dispatch_reserves_records_registers_admits_and_atta
     iteration's ``review_result`` receipt companion commits strictly before
     the positive observation registration and the verbatim admission, and
     the dispatching call returns with no blocking send and no verdict."""
-    env = _Dispatch()
+    env = _DispatchEnv()
     _script_first_review_entry(
         env.conn,
         task_row=_task_row(),
@@ -1766,7 +1015,7 @@ def test_a_refused_observation_registration_refuses_the_receipt_before_any_admis
     """A positively refused pre-admission registration is a proven pre-effect
     failure: the just-recorded receipt is marked refused so a never-dispatched
     turn cannot hold the session's single-outstanding slot."""
-    env = _Dispatch()
+    env = _DispatchEnv()
     _script_first_review_entry(
         env.conn,
         task_row=_task_row(),
@@ -1805,7 +1054,7 @@ def test_a_refused_observation_registration_refuses_the_receipt_before_any_admis
 def test_a_refused_admission_refuses_the_receipt_and_never_repeats() -> None:
     """A positively identified admission refusal is proven pre-effect: the
     receipt is marked refused and the canonical instruction never dispatched."""
-    env = _Dispatch()
+    env = _DispatchEnv()
     _script_first_review_entry(
         env.conn,
         task_row=_task_row(),
@@ -1839,7 +1088,7 @@ def test_a_refused_admission_refuses_the_receipt_and_never_repeats() -> None:
 def test_an_uncertain_admission_leaves_the_receipt_claimed_and_never_repeats() -> None:
     """An uncertain admission outcome stays conservatively claimed: the
     receipt is never re-dispatched and the durable state owns recovery."""
-    env = _Dispatch()
+    env = _DispatchEnv()
     _script_first_review_entry(
         env.conn,
         task_row=_task_row(),

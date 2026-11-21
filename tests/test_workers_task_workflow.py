@@ -40,7 +40,6 @@ from openorc.services.errors import (
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
-from openorc.services.task_planning_review_decision import PlanningReviewDecision
 from openorc.services.task_pr_composition import SettledTaskPrPublication, TaskPrPublished
 from openorc.services.task_pr_review_decision import PrReviewDecision
 from openorc.services.task_start import TaskStartStatus
@@ -55,7 +54,6 @@ from openorc.workers.invocation import (
     OperationSubmitter,
     RQQueueOperationSubmission,
     SubmissionOutcome,
-    SubmissionRefusalReason,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
     TaskAuthorizedImplementationRetryPayload,
@@ -182,11 +180,11 @@ def make_dependencies(
 
 
 def make_queue_dependencies(**providers: Any) -> tuple[OperationDependencies, FakeSubmitter]:
-    """Dependencies pinned to the queue-mode interim (until #328).
+    """Queue-mode dependencies: the same detached composition seams.
 
-    The blocking E6 composition and the blocking establishment are the
-    queue-mode interim behavior the regular-mode detached dispatch replaces;
-    these dependencies keep those compositions testable.
+    Since the #347 transport parity, queue mode runs the identical detached
+    compositions; the resolved observation registrar stands in for the #346
+    remote proxy and the continuation submitter is the recording queue seam.
     """
     return make_dependencies(
         settings=Settings(
@@ -266,20 +264,23 @@ def patched_workflow_environment(
             lambda _pool, *, workspace_id, task_id: producer_checkout or _CHECKOUT_DIRECTORY
         ),
     }
+    # The #347 seam mapping: every model-turn family the compositions invoke
+    # is the owning service's detached dispatch; the retired blocking
+    # interim seams no longer exist on the worker module. The recording
+    # parameter names keep their historical roles (produce/dispatch/finalize)
+    # so the surviving tests stay readable.
     service_patches: dict[str, Any] = {
         "prepare_task_for_planning": prepare,
-        "produce_initial_task_plan": produce,
-        "dispatch_planning_review": dispatch_planning,
-        "finalize_planning_review_decision": finalize_planning,
+        "dispatch_initial_plan_detached": produce,
+        "dispatch_planning_review_detached": dispatch_planning,
         "open_implementation_authorization": open_implementation,
-        "execute_authorized_implementation": execute_implementation,
-        "execute_authorized_implementation_retry": execute_implementation_retry,
+        "dispatch_authorized_implementation_detached": execute_implementation,
+        "dispatch_authorized_implementation_retry_detached": execute_implementation_retry,
         "execute_authorized_merge_retry": execute_merge_retry,
         "execute_authorized_pr_authorization_retry": execute_pr_authorization_retry,
         "open_pr_authorization": open_pr,
-        "compose_and_publish_task_pr": compose_pr,
-        "dispatch_pr_review": dispatch_pr,
-        "finalize_pr_review_decision": finalize_pr,
+        "dispatch_pr_compose_detached": compose_pr,
+        "dispatch_pr_review_detached": dispatch_pr,
     }
     for name, service in service_patches.items():
         if service is not None:
@@ -592,416 +593,6 @@ def test_seam_dispatches_the_registered_composition(monkeypatch: pytest.MonkeyPa
     assert submitter.submissions == []
 
 
-def test_planning_bootstrap_composition_chains_prepare_and_produce_and_submits_the_review(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dependencies, submitter = make_queue_dependencies()
-    preparation = fake_preparation()
-    production = fake_production()
-    prepare = RecordingService(result=preparation)
-    produce = RecordingService(result=production)
-    with patched_workflow_environment(monkeypatch, prepare=prepare, produce=produce) as environment:
-        payload = TaskPlanningBootstrapAndInitialPlanPayload(
-            task=_TASK_SCOPE_PRODUCER,
-            profile_id=str(_PROFILE_ID),
-            expected_state_token=str(_STATE_TOKEN),
-        )
-
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN, payload=payload
-            ),
-            dependencies=dependencies,
-        )
-
-        # The exact bootstrap subjects and the deployment's reviewer-neutral
-        # directory reached the E1b service. The queue-mode interim keeps the
-        # blocking establishment: no observation host is wired, while the ONE
-        # post-commit completion handoff stays wired for the settled
-        # bootstrap families (issues #324/#333/#334; queue interim until
-        # #328).
-        assert prepare.call_count == 1
-        passed_kwargs = dict(prepare.calls[0]["kwargs"])
-        assert passed_kwargs.pop("observation_registrar") is None
-        assert passed_kwargs.pop("completion_handoff") is not None
-        assert passed_kwargs == {
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "profile_id": _PROFILE_ID,
-            "expected_state_token": _STATE_TOKEN,
-            "reviewer_neutral_directory": _NEUTRAL_DIRECTORY,
-        }
-        # The initial PLAN was produced with the same logical invocation's
-        # preparation outcome (never re-derived, never serialized).
-        assert produce.call_count == 1
-        assert len(produce.calls[0]["args"]) == 3
-        assert produce.calls[0]["kwargs"]["preparation"] is preparation
-        # The BOUND Producer attachment used the preparation's exact session
-        # identity and checkout directory.
-        producer_acquisitions = [
-            acquisition
-            for acquisition in environment["attachments"].acquisitions
-            if acquisition["role"] is WorkflowRole.PRODUCER
-        ]
-        assert len(producer_acquisitions) == 1
-        assert producer_acquisitions[0]["phase"] is task_workflow.ClineAttachmentPhase.BOUND
-        assert producer_acquisitions[0]["external_session_id"] == _PRODUCER_EXTERNAL_SESSION_ID
-        assert producer_acquisitions[0]["working_directory"] == _CHECKOUT_DIRECTORY
-        # The exact post-E2 token authorizes the first review round.
-        assert len(submitter.submissions) == 1
-        submitted = submitter.submissions[0]
-        assert submitted.kind is OperationKind.TASK_PLANNING_REVIEW
-        assert isinstance(submitted.payload, TaskPlanningReviewPayload)
-        assert submitted.payload.task == _TASK_SCOPE_REVIEWER
-        assert submitted.payload.profile_id == str(_PROFILE_ID)
-        assert submitted.payload.expected_state_token == str(production.task.state_token)
-
-
-def test_planning_review_composition_runs_dispatch_and_decision_in_process(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dependencies, submitter = make_queue_dependencies()
-    production = fake_production(_STATE_TOKEN)
-    routed_production = fake_production(_NEXT_TOKEN)
-    dispatch = RecordingService(result=fake_dispatch_outcome())
-    finalize = RecordingService(
-        result=fake_planning_decision(
-            PlanningReviewDecision.REVISION_ROUTED, revision_production=routed_production
-        )
-    )
-    with patched_workflow_environment(
-        monkeypatch,
-        dispatch_planning=dispatch,
-        finalize_planning=finalize,
-        reloaded_plan_production=production,
-        bound_session_id=_REVIEWER_EXTERNAL_SESSION_ID,
-    ) as environment:
-        payload = TaskPlanningReviewPayload(
-            task=_TASK_SCOPE_REVIEWER,
-            profile_id=str(_PROFILE_ID),
-            expected_state_token=str(_STATE_TOKEN),
-        )
-
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(kind=OperationKind.TASK_PLANNING_REVIEW, payload=payload),
-            dependencies=dependencies,
-        )
-
-        # The reloaded production subject reached the dispatch service.
-        assert dispatch.call_count == 1
-        assert dispatch.calls[0]["kwargs"]["plan_production"] is production
-        assert dispatch.calls[0]["kwargs"]["profile_id"] == _PROFILE_ID
-        # E3a receives the composed deferred Reviewer attachment factory
-        # (F5e): the Reviewer runtime is acquired inside the dispatch
-        # service, strictly after its reservation, so an attachment failure
-        # is attributable to the reserved iteration through the Level 2
-        # handoff instead of stranding the planning Task.
-        assert len(dispatch.calls[0]["args"]) == 2
-        factory = dispatch.calls[0]["args"][1]
-        # The composed factory binds the exact service-resolved Reviewer
-        # session at the reviewer-neutral directory as a BOUND attachment.
-        with factory(SimpleNamespace(external_session_id=_REVIEWER_EXTERNAL_SESSION_ID)):
-            pass
-        reviewer_acquisition = environment["attachments"].acquisitions[-1]
-        assert reviewer_acquisition["role"] is WorkflowRole.REVIEWER
-        assert reviewer_acquisition["phase"] is task_workflow.ClineAttachmentPhase.BOUND
-        assert reviewer_acquisition["external_session_id"] == _REVIEWER_EXTERNAL_SESSION_ID
-        assert reviewer_acquisition["working_directory"] == _NEUTRAL_DIRECTORY
-        # The decision attachment was the BOUND Producer at the prepared
-        # checkout (the merged E2 revise continues there).
-        producer_acquisitions = [
-            acquisition
-            for acquisition in environment["attachments"].acquisitions
-            if acquisition["role"] is WorkflowRole.PRODUCER
-        ]
-        assert len(producer_acquisitions) == 1
-        assert producer_acquisitions[0]["working_directory"] == _CHECKOUT_DIRECTORY
-        assert finalize.calls[0]["kwargs"]["expected_state_token"] == production.task.state_token
-        # The next review round is authorized by the fresh post-revise token.
-        assert len(submitter.submissions) == 1
-        submitted = submitter.submissions[0]
-        assert submitted.kind is OperationKind.TASK_PLANNING_REVIEW
-        assert isinstance(submitted.payload, TaskPlanningReviewPayload)
-        assert submitted.payload.expected_state_token == str(routed_production.task.state_token)
-
-
-def test_planning_review_acceptance_presents_the_implementation_gate_without_approving_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-mode interim (until #328/#336): the in-process decision's
-    accepted clearance presents the exact-plan gate in the composition."""
-    dependencies, submitter = make_queue_dependencies()
-    decision_token = _NEXT_TOKEN
-    open_implementation = RecordingService(
-        result=SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
-    )
-    finalize = RecordingService(
-        result=fake_planning_decision(
-            PlanningReviewDecision.ACCEPTED_CLEAR, state_token=decision_token
-        )
-    )
-    with patched_workflow_environment(
-        monkeypatch,
-        dispatch_planning=RecordingService(result=fake_dispatch_outcome()),
-        finalize_planning=finalize,
-        open_implementation=open_implementation,
-        reloaded_plan_production=fake_production(_STATE_TOKEN),
-    ):
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_REVIEW,
-                payload=TaskPlanningReviewPayload(
-                    task=_TASK_SCOPE_REVIEWER,
-                    profile_id=str(_PROFILE_ID),
-                    expected_state_token=str(_STATE_TOKEN),
-                ),
-            ),
-            dependencies=dependencies,
-        )
-
-        # The exact-plan IMPLEMENTATION_AUTHORIZATION gate was presented with
-        # the exact post-decision token — presenting, never approving.
-        assert open_implementation.call_count == 1
-        assert open_implementation.calls[0]["kwargs"] == {
-            "profile_id": _PROFILE_ID,
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "expected_state_token": decision_token,
-        }
-        # Acceptance launches no implementation operation and no Owner
-        # approval is ever inferred.
-        assert submitter.submissions == []
-
-
-def test_planning_review_exhaustion_ends_at_the_resolution_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-mode interim (until #328/#336): the exhausting decision's
-    REVIEW_RESOLUTION gate already stands and nothing further is sent."""
-    dependencies, submitter = make_queue_dependencies()
-    finalize = RecordingService(
-        result=fake_planning_decision(PlanningReviewDecision.EXHAUSTED, state_token=_NEXT_TOKEN)
-    )
-    with patched_workflow_environment(
-        monkeypatch,
-        dispatch_planning=RecordingService(result=fake_dispatch_outcome()),
-        finalize_planning=finalize,
-        reloaded_plan_production=fake_production(_STATE_TOKEN),
-    ):
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_REVIEW,
-                payload=TaskPlanningReviewPayload(
-                    task=_TASK_SCOPE_REVIEWER,
-                    profile_id=str(_PROFILE_ID),
-                    expected_state_token=str(_STATE_TOKEN),
-                ),
-            ),
-            dependencies=dependencies,
-        )
-
-        assert finalize.call_count == 1
-        assert submitter.submissions == []
-
-
-def test_authorized_implementation_composition_presents_the_pr_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-mode interim (until #328) keeps the blocking composition."""
-    dependencies, submitter = make_queue_dependencies()
-    execution = fake_execution()
-    execute = RecordingService(result=execution)
-    open_pr = RecordingService(
-        result=SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
-    )
-    with patched_workflow_environment(monkeypatch, execute_implementation=execute, open_pr=open_pr):
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION,
-                payload=TaskAuthorizedImplementationPayload(
-                    task=_TASK_SCOPE_PRODUCER,
-                    profile_id=str(_PROFILE_ID),
-                    expected_state_token=str(_STATE_TOKEN),
-                ),
-            ),
-            dependencies=dependencies,
-        )
-
-        # The E6 service received the exact subjects and the zero-arg
-        # Producer attachment factory.
-        assert execute.call_count == 1
-        execute_kwargs = execute.calls[0]["kwargs"]
-        assert execute_kwargs["profile_id"] == _PROFILE_ID
-        assert execute_kwargs["workspace_id"] == _WORKSPACE_ID
-        assert execute_kwargs["task_id"] == _TASK_ID
-        assert execute_kwargs["expected_state_token"] == _STATE_TOKEN
-        assert callable(execute_kwargs["producer_runtime_factory"])
-        # The exact-head PR_AUTHORIZATION gate was presented with the exact
-        # post-execution token and finalized Execution identity.
-        assert open_pr.call_count == 1
-        assert len(open_pr.calls[0]["args"]) == 2
-        assert open_pr.calls[0]["kwargs"] == {
-            "profile_id": _PROFILE_ID,
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "expected_state_token": execution.task.state_token,
-            "execution_id": _EXECUTION_ID,
-        }
-        # Presenting the gate launches no publication; E7 approval is an
-        # explicit Owner command.
-        assert submitter.submissions == []
-
-
-def test_authorized_implementation_retry_composition_consumes_and_presents_the_pr_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-mode interim (until #328) keeps the blocking composition."""
-    dependencies, submitter = make_queue_dependencies()
-    execution = fake_execution()
-    execute_retry = RecordingService(result=execution)
-    open_pr = RecordingService(
-        result=SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
-    )
-    with patched_workflow_environment(
-        monkeypatch, execute_implementation_retry=execute_retry, open_pr=open_pr
-    ):
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
-                payload=TaskAuthorizedImplementationRetryPayload(
-                    task=_TASK_SCOPE_PRODUCER,
-                    profile_id=str(_PROFILE_ID),
-                    retry_attempt_id=str(_OWNER_GATE_ID),
-                    expected_state_token=str(_STATE_TOKEN),
-                ),
-            ),
-            dependencies=dependencies,
-        )
-
-        # The F5c service received the exact subjects, the exact F4 retry
-        # attempt identity, and the zero-arg Producer attachment factory.
-        assert execute_retry.call_count == 1
-        retry_kwargs = execute_retry.calls[0]["kwargs"]
-        assert retry_kwargs["profile_id"] == _PROFILE_ID
-        assert retry_kwargs["workspace_id"] == _WORKSPACE_ID
-        assert retry_kwargs["task_id"] == _TASK_ID
-        assert retry_kwargs["expected_state_token"] == _STATE_TOKEN
-        assert retry_kwargs["retry_attempt_id"] == _OWNER_GATE_ID
-        assert callable(retry_kwargs["producer_runtime_factory"])
-        # The exact-head PR_AUTHORIZATION gate was presented with the exact
-        # post-execution token and the NEW Execution identity.
-        assert open_pr.call_count == 1
-        assert open_pr.calls[0]["kwargs"] == {
-            "profile_id": _PROFILE_ID,
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "expected_state_token": execution.task.state_token,
-            "execution_id": _EXECUTION_ID,
-        }
-        assert submitter.submissions == []
-
-
-def test_pr_composition_composition_submits_the_pr_review(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The blocking compose-publish-review interim is the queue-mode behavior
-    # (until #328); the regular-mode composition dispatches the composition
-    # turn detached (issue #337).
-    dependencies, submitter = make_queue_dependencies()
-    published = fake_published()
-    compose = RecordingService(result=published)
-    with patched_workflow_environment(monkeypatch, compose_pr=compose):
-        payload = TaskPrCompositionPayload(
-            task=_TASK_SCOPE_PRODUCER,
-            profile_id=str(_PROFILE_ID),
-            owner_gate_id=str(_OWNER_GATE_ID),
-            expected_state_token=str(_STATE_TOKEN),
-        )
-
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(kind=OperationKind.TASK_PR_COMPOSITION, payload=payload),
-            dependencies=dependencies,
-        )
-
-        # The E8 service received the exact gate/token subjects and the
-        # accountable Profile-driven resolver seam.
-        assert compose.call_count == 1
-        assert len(compose.calls[0]["args"]) == 4
-        assert compose.calls[0]["kwargs"] == {
-            "profile_id": _PROFILE_ID,
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "owner_gate_id": _OWNER_GATE_ID,
-            "expected_state_token": _STATE_TOKEN,
-        }
-        # The exact post-publication token and canonical PR identity
-        # authorize the PR review dispatch.
-        assert len(submitter.submissions) == 1
-        submitted = submitter.submissions[0]
-        assert submitted.kind is OperationKind.TASK_PR_REVIEW
-        assert isinstance(submitted.payload, TaskPrReviewPayload)
-        assert submitted.payload.task_pull_request_id == str(published.pull_request.id)
-        assert submitted.payload.expected_state_token == str(published.task.state_token)
-
-
-def test_pr_review_composition_loops_finalize_over_remediation_in_process(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-mode interim (until #328): the blocking in-process loop.
-
-    Regular mode dispatches the PR review as one detached turn and never
-    re-enters this loop (issue #338); the queue-mode composition keeps the
-    blocking dispatch/decision/remediation interim, so this proof is pinned
-    to the queue execution mode.
-    """
-    dependencies, submitter = make_queue_dependencies()
-    published = fake_published(_STATE_TOKEN)
-    first_dispatch = fake_dispatch_outcome(_NEXT_TOKEN)
-    remediated_dispatch = fake_dispatch_outcome(_THIRD_TOKEN)
-    dispatch = RecordingService(result=first_dispatch)
-    finalize = RecordingService(
-        results=[
-            fake_pr_decision(fake_remediation(remediated_dispatch)),
-            fake_pr_decision(None),
-        ]
-    )
-    with patched_workflow_environment(
-        monkeypatch,
-        dispatch_pr=dispatch,
-        finalize_pr=finalize,
-        reloaded_published=published,
-    ) as environment:
-        payload = TaskPrReviewPayload(
-            task=_TASK_SCOPE_REVIEWER,
-            profile_id=str(_PROFILE_ID),
-            task_pull_request_id=str(_PR_RECORD_ID),
-            expected_state_token=str(_STATE_TOKEN),
-        )
-
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(kind=OperationKind.TASK_PR_REVIEW, payload=payload),
-            dependencies=dependencies,
-        )
-
-        # The reloaded published subjects reached the dispatch service.
-        assert dispatch.call_count == 1
-        assert dispatch.calls[0]["kwargs"]["published"] is published
-        assert dispatch.calls[0]["kwargs"]["expected_state_token"] == published.task.state_token
-        # The remediation chain finalized in the same process: the re-entered
-        # dispatch outcome was finalized immediately, never serialized.
-        assert finalize.call_count == 2
-        assert finalize.calls[0]["kwargs"]["dispatch"] is first_dispatch
-        assert finalize.calls[1]["kwargs"]["dispatch"] is remediated_dispatch
-        # One BOUND Producer attachment per decision round.
-        producer_acquisitions = [
-            acquisition
-            for acquisition in environment["attachments"].acquisitions
-            if acquisition["role"] is WorkflowRole.PRODUCER
-        ]
-        assert len(producer_acquisitions) == 2
-        assert submitter.submissions == []
-
-
 def test_stale_reload_refuses_before_any_service_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1069,40 +660,6 @@ def test_stale_published_subject_refuses_before_the_dispatch(
         assert finalize.call_count == 0
         assert environment["attachments"].acquisitions == []
         assert submitter.submissions == []
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        SubmissionResult.refused(SubmissionRefusalReason.EXECUTOR_SATURATED),
-        SubmissionResult.uncertain(),
-    ],
-)
-def test_continuation_submission_refusal_or_uncertainty_does_not_fail_the_operation(
-    monkeypatch: pytest.MonkeyPatch, outcome: SubmissionResult
-) -> None:
-    dependencies, submitter = make_queue_dependencies()
-    submitter.outcomes = [outcome]
-    prepare = RecordingService(result=fake_preparation())
-    produce = RecordingService(result=fake_production())
-    with patched_workflow_environment(monkeypatch, prepare=prepare, produce=produce):
-        task_workflow.execute_task_workflow_operation(
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
-                payload=TaskPlanningBootstrapAndInitialPlanPayload(
-                    task=_TASK_SCOPE_PRODUCER,
-                    profile_id=str(_PROFILE_ID),
-                    expected_state_token=str(_STATE_TOKEN),
-                ),
-            ),
-            dependencies=dependencies,
-        )
-
-        # The completed operation's effects stand; the non-accepted
-        # continuation submission is never retried and never fails it.
-        assert prepare.call_count == 1
-        assert produce.call_count == 1
-        assert len(submitter.submissions) == 1
 
 
 # --- minimal durable reloads (the former in-memory DTO handoffs) -------------
@@ -1620,21 +1177,17 @@ def test_pr_authorization_retry_composition_consumes_and_represents(
         assert submitter.submissions == []
 
 
-def test_the_implementation_compositions_thread_the_attempt_evidence_collector_into_e7(
+def test_the_implementation_compositions_thread_the_attempt_evidence_collector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Both implementation compositions (initial and F5c-authorized retry)
-    thread the invocation's attempt-evidence collector into the E7
-    presentation — the same application path, so an E7 failure after a
-    successful E6 attributes truthfully in either composition."""
+    thread the invocation's attempt-evidence collector into their detached
+    dispatch — the same application path, so an operational failure
+    attributes the invocation's own Level 1 attempt identity in either
+    composition (the E7 presentation is the completion handoff's seam)."""
     dependencies, submitter = make_queue_dependencies()
-    execution = fake_execution()
+    dispatched = SimpleNamespace(task=None, execution=None, producer_session=None, receipt=None)
     evidence = InvocationAttemptEvidence()
-    presentations: list[dict[str, Any]] = []
-
-    def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
-        presentations.append(dict(kwargs))
-        return SimpleNamespace(task=SimpleNamespace(state_token=_THIRD_TOKEN))
 
     cases = [
         (
@@ -1644,6 +1197,7 @@ def test_the_implementation_compositions_thread_the_attempt_evidence_collector_i
                 profile_id=str(_PROFILE_ID),
                 expected_state_token=str(_STATE_TOKEN),
             ),
+            "dispatch_authorized_implementation_detached",
         ),
         (
             OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
@@ -1653,28 +1207,162 @@ def test_the_implementation_compositions_thread_the_attempt_evidence_collector_i
                 retry_attempt_id=str(_OWNER_GATE_ID),
                 expected_state_token=str(_STATE_TOKEN),
             ),
+            "dispatch_authorized_implementation_retry_detached",
         ),
     ]
-    for kind, payload in cases:
-        presentations.clear()
-        execute = RecordingService(result=execution)
-        if kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION:
-            monkeypatch.setattr(task_workflow, "execute_authorized_implementation", execute)
-        else:
-            monkeypatch.setattr(task_workflow, "execute_authorized_implementation_retry", execute)
+    for kind, payload, seam_name in cases:
         # The raw recording stub (not the comparison-filtering
         # RecordingService) proves the collector threading itself.
-        monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr)
+        dispatch_calls: list[dict[str, Any]] = []
+
+        def recording_dispatch(
+            *args: Any,
+            _calls: list[dict[str, Any]] = dispatch_calls,
+            **kwargs: Any,
+        ) -> Any:
+            _calls.append(
+                {key: value for key, value in kwargs.items() if key != "attempt_evidence"}
+                | {"_has_attempt_evidence": "attempt_evidence" in kwargs}
+            )
+            return dispatched
+
+        monkeypatch.setattr(task_workflow, seam_name, recording_dispatch, raising=True)
         task_workflow.execute_task_workflow_operation(
             OperationInvocation(kind=kind, payload=payload),
             dependencies=dependencies,
             attempt_evidence=evidence,
         )
-        assert len(presentations) == 1
-        assert presentations[0]["attempt_evidence"] is evidence
-        assert presentations[0]["expected_state_token"] == execution.task.state_token
-        assert presentations[0]["execution_id"] == _EXECUTION_ID
+        assert len(dispatch_calls) == 1
+        assert dispatch_calls[0]["_has_attempt_evidence"] is True
     assert submitter.submissions == []
+
+
+# --- the #347 queue-mode transport parity -------------------------------------
+
+
+def test_queue_mode_composition_dispatches_detached_and_returns_before_the_model_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #347 queue parity: the queue dispatch worker runs the same detached
+    composition — the owning service's detached dispatch receives the
+    queue-resolved registrar seam (the #346 remote proxy stand-in) and the
+    ONE completion handoff, and the worker returns after the durable
+    admission without any runtime attachment or model turn (the
+    independently observed completion settles later)."""
+    registrar = object()
+    dependencies, submitter = make_queue_dependencies(
+        detached_turn_observer_provider=lambda _settings: registrar
+    )
+    review_dispatch = RecordingService(
+        result=SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
+    )
+    monkeypatch.setattr(
+        task_workflow, "dispatch_planning_review_detached", review_dispatch, raising=True
+    )
+    production = fake_production(_STATE_TOKEN)
+    with patched_workflow_environment(
+        monkeypatch, reloaded_plan_production=production
+    ) as environment:
+        task_workflow.execute_task_workflow_operation(
+            OperationInvocation(
+                kind=OperationKind.TASK_PLANNING_REVIEW,
+                payload=TaskPlanningReviewPayload(
+                    task=_TASK_SCOPE_REVIEWER,
+                    profile_id=str(_PROFILE_ID),
+                    expected_state_token=str(_STATE_TOKEN),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+        assert review_dispatch.call_count == 1
+        dispatch_kwargs = review_dispatch.calls[0]["kwargs"]
+        assert dispatch_kwargs["observation_registrar"] is registrar
+        assert callable(dispatch_kwargs["completion_handoff"].handoff_settled_completion)
+        # The worker exits before any model response: no runtime attachment
+        # is acquired and no continuation is submitted by the dispatching
+        # job — the durable state owns recovery.
+        assert environment["attachments"].acquisitions == []
+        assert submitter.submissions == []
+
+
+def test_queue_mode_observation_refusal_is_a_proven_pre_effect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue dispatch worker cannot attest a live observer registration:
+    the resolved registrar's typed refusal propagates as a proven pre-effect
+    failure before any admission, with no runtime attachment acquired and no
+    continuation submitted (issues #346/#347)."""
+    from openorc.services.errors import ObservationRegistrationRefusedError
+
+    def refusing_registrar(_settings: Any) -> Any:
+        raise ObservationRegistrationRefusedError(
+            "the queue registration transport refused",
+            reason="observer_unavailable",
+        )
+
+    dependencies, submitter = make_queue_dependencies(
+        detached_turn_observer_provider=refusing_registrar
+    )
+    production = fake_production(_STATE_TOKEN)
+    with patched_workflow_environment(
+        monkeypatch, reloaded_plan_production=production
+    ) as environment:
+        with pytest.raises(ObservationRegistrationRefusedError):
+            task_workflow.execute_task_workflow_operation(
+                OperationInvocation(
+                    kind=OperationKind.TASK_PLANNING_REVIEW,
+                    payload=TaskPlanningReviewPayload(
+                        task=_TASK_SCOPE_REVIEWER,
+                        profile_id=str(_PROFILE_ID),
+                        expected_state_token=str(_STATE_TOKEN),
+                    ),
+                ),
+                dependencies=dependencies,
+            )
+
+        # The refusal is pre-effect: no runtime attachment was acquired and
+        # nothing was submitted; the durable claim/receipt state owns the
+        # settled refusal.
+        assert environment["attachments"].acquisitions == []
+        assert submitter.submissions == []
+
+
+def test_queue_mode_duplicate_job_refuses_before_any_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicate or stale RQ job never re-dispatches: the composition's
+    durable subject reload refuses the stale second delivery before any
+    detached dispatch, runtime attachment, or continuation submission."""
+    dependencies, submitter = make_queue_dependencies()
+    review_dispatch = RecordingService(
+        result=SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
+    )
+    monkeypatch.setattr(
+        task_workflow, "dispatch_planning_review_detached", review_dispatch, raising=True
+    )
+    production = fake_production(_STATE_TOKEN)
+    payload = TaskPlanningReviewPayload(
+        task=_TASK_SCOPE_REVIEWER,
+        profile_id=str(_PROFILE_ID),
+        expected_state_token=str(_STATE_TOKEN),
+    )
+    invocation = OperationInvocation(kind=OperationKind.TASK_PLANNING_REVIEW, payload=payload)
+    with patched_workflow_environment(monkeypatch, reloaded_plan_production=production):
+        task_workflow.execute_task_workflow_operation(invocation, dependencies=dependencies)
+        assert review_dispatch.call_count == 1
+
+        # The replayed job's durable reload classifies the moved-on state as
+        # stale: the duplicate delivery is refused before any service effect.
+        monkeypatch.setattr(
+            task_workflow,
+            "_reload_plan_production_outcome",
+            RecordingService(result=StaleOperationError("the task state has moved on")),
+        )
+        with pytest.raises(StaleOperationError):
+            task_workflow.execute_task_workflow_operation(invocation, dependencies=dependencies)
+        assert review_dispatch.call_count == 1
+        assert submitter.submissions == []
 
 
 # --- the ONE post-commit completion handoff (issues #324/#333) -------------------
@@ -2087,18 +1775,12 @@ def test_authorized_implementation_composition_dispatches_detached_in_regular_mo
         task_workflow, "dispatch_authorized_implementation_detached", dispatch, raising=True
     )
 
-    def refusing_blocking_execution(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("the blocking E6 composition must not run in regular mode")
-
     presentations: list[dict[str, Any]] = []
 
     def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
         presentations.append(dict(kwargs))
         return SimpleNamespace()
 
-    monkeypatch.setattr(
-        task_workflow, "execute_authorized_implementation", refusing_blocking_execution
-    )
     monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr, raising=True)
 
     task_workflow.execute_task_workflow_operation(
@@ -2150,18 +1832,12 @@ def test_authorized_implementation_retry_composition_dispatches_detached_in_regu
         raising=True,
     )
 
-    def refusing_blocking_retry(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("the blocking F5c composition must not run in regular mode")
-
     presentations: list[dict[str, Any]] = []
 
     def recording_open_pr(pool: Any, github: Any, **kwargs: Any) -> Any:
         presentations.append(dict(kwargs))
         return SimpleNamespace()
 
-    monkeypatch.setattr(
-        task_workflow, "execute_authorized_implementation_retry", refusing_blocking_retry
-    )
     monkeypatch.setattr(task_workflow, "open_pr_authorization", recording_open_pr, raising=True)
 
     task_workflow.execute_task_workflow_operation(
@@ -2277,11 +1953,6 @@ def test_planning_bootstrap_composition_dispatches_the_initial_plan_detached_in_
     dispatched = SimpleNamespace(task=None, send_claim=None, receipt=None, producer_session=None)
     dispatch = RecordingService(result=dispatched)
     monkeypatch.setattr(task_workflow, "dispatch_initial_plan_detached", dispatch, raising=True)
-
-    def refusing_blocking_production(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("the blocking initial plan production must not run in regular mode")
-
-    monkeypatch.setattr(task_workflow, "produce_initial_task_plan", refusing_blocking_production)
     prepare = RecordingService(result=fake_preparation())
     with patched_workflow_environment(monkeypatch, prepare=prepare):
         task_workflow.execute_task_workflow_operation(
@@ -2325,7 +1996,6 @@ def test_planning_review_composition_dispatches_the_review_detached_in_regular_m
         task_workflow, "dispatch_planning_review_detached", review_dispatch, raising=True
     )
     finalize = RecordingService(result=None)
-    monkeypatch.setattr(task_workflow, "finalize_planning_review_decision", finalize, raising=True)
     production = fake_production(_STATE_TOKEN)
     with patched_workflow_environment(monkeypatch, reloaded_plan_production=production):
         task_workflow.execute_task_workflow_operation(
@@ -2950,13 +2620,7 @@ def test_pr_review_composition_dispatches_detached_in_regular_mode(
         result=SimpleNamespace(task=SimpleNamespace(state_token=_NEXT_TOKEN))
     )
     monkeypatch.setattr(task_workflow, "dispatch_pr_review_detached", review_dispatch, raising=True)
-
-    def refusing_blocking_dispatch(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("the blocking PR-review dispatch must not run in regular mode")
-
-    monkeypatch.setattr(task_workflow, "dispatch_pr_review", refusing_blocking_dispatch)
     finalize = RecordingService(result=None)
-    monkeypatch.setattr(task_workflow, "finalize_pr_review_decision", finalize, raising=True)
     published = fake_published(_STATE_TOKEN)
     with patched_workflow_environment(monkeypatch, reloaded_published=published):
         task_workflow.execute_task_workflow_operation(

@@ -40,10 +40,10 @@ Durable settlement semantics:
   that gate, never authorizes implementation, and never closes the loop.
 - A formal CHANGES_REQUESTED settles the gate, moves the Task
   ``waiting_for_owner`` → ``planning``, and routes ONLY the newly
-  finalized findings to merged E2
-  (:func:`openorc.services.task_plan_production.revise_task_plan`)
-  OUTSIDE any transaction — the historic exhausted findings are never
-  rerouted, and an uncertain E2 operation is never resent (the finalized
+  finalized findings to the detached Producer REVISE dispatch (issue
+  #335) through the ONE completion handoff — the historic exhausted
+  findings are never
+  rerouted, and an uncertain REVISE dispatch is never resent (the finalized
   settlement stays durable; recovery belongs to E2's own seam and later
   orchestration). Only E2's newly persisted revision and post-update
   token may launch E3a's next ordinary REVIEW; the following
@@ -90,7 +90,6 @@ from openorc.domain.reviews import (
 )
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
-from openorc.observability import annotate_span, application_span
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.gates import OwnerGateResolutionOutcome, OwnerGateSupersessionOutcome
@@ -113,7 +112,7 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.task_plan_production import TaskPlanProductionOutcome, revise_task_plan
+from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_plan_revision,
@@ -128,16 +127,10 @@ __all__ = [
     "TaskPlanningGateChangeRequestOutcome",
     "TaskPlanningReviewResolutionOutcome",
     "settle_observed_planning_review_resolution",
-    "settle_planning_review_resolution",
     "supersede_observed_implementation_authorization_with_changes",
-    "supersede_implementation_authorization_with_changes",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_resolution"
-_SETTLEMENT_SPAN_NAME = "task_planning_review_resolution.settle_planning_review_resolution"
-_GATE_CHANGE_REQUEST_SPAN_NAME = (
-    "task_planning_review_resolution.supersede_implementation_authorization_with_changes"
-)
 
 # The settled protocol outcome vocabulary mapped onto the domain outcome
 # enum; the protocol funnel guarantees exactly these two spellings, and a
@@ -737,7 +730,7 @@ def settle_observed_planning_review_resolution(
 
     The detached discussion settlement's entry point (issue #339): the exact
     durable Phase-1 settlement transaction of
-    :func:`settle_planning_review_resolution`, composed inside the caller's
+    :func:`settle_observed_planning_review_resolution`, composed inside the caller's
     already-open transaction (the nested composition becomes a SAVEPOINT), so
     the gate's ``SETTLED`` stamp, the NEW finalized settlement iteration, the
     audit events, and the direction-only discussion audit commit atomically
@@ -772,7 +765,7 @@ def supersede_observed_implementation_authorization_with_changes(
 
     The detached discussion settlement's entry point (issue #339): the exact
     durable Phase-1 supersession transaction of
-    :func:`supersede_implementation_authorization_with_changes`, composed
+    :func:`supersede_observed_implementation_authorization_with_changes`, composed
     inside the caller's already-open transaction (the nested composition
     becomes a SAVEPOINT), so the gate's supersession, the NEW finalized
     change-request iteration, the audit events, and the direction-only
@@ -791,129 +784,6 @@ def supersede_observed_implementation_authorization_with_changes(
         result=result,
         record_discussion_message_events=record_discussion_message_events,
     )
-
-
-def settle_planning_review_resolution(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter | None,
-    github: GitHubAppClient | None,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    review_result: ReviewResult,
-    record_discussion_message_events: bool = False,
-) -> TaskPlanningReviewResolutionOutcome:
-    """Settle the Task's exact current REVIEW_RESOLUTION gate with a formal result.
-
-    Consumes E4's future formal-result recognition input: the validated
-    typed ``ReviewResult`` recognized at the Task's pending current
-    REVIEW_RESOLUTION gate. Every exact subject is rechecked in one short
-    composed transaction — authenticated Owner Task scope, current
-    token/subject, the unchanged exact current PlanRevision, the OPEN
-    planning loop, and the exact existing admitted READY Reviewer binding
-    (verified after E4's external send, which happens before this entry) —
-    and the settlement commits atomically: the NEW next-numbered finalized
-    settlement iteration for the unchanged revision, the safe REVIEWER
-    audit events, the gate's ``SETTLED`` stamp with Reviewer provenance,
-    the cleared current-gate pointer, and the rotated Task token.
-
-    On a formal ACCEPTED the planning ReviewLoop stays OPEN (issue #219)
-    and the accepted evidence returns for E5's normal
-    IMPLEMENTATION_AUTHORIZATION flow — no gate is issued, no
-    implementation is authorized, and the loop is not closed here. On a
-    formal CHANGES_REQUESTED the Task returns to ``planning`` and the
-    exact newly finalized findings route to merged E2
-    (:func:`revise_task_plan`) with NO database transaction open; only
-    E2's newly persisted current PlanRevision and post-update token may
-    launch E3a's next ordinary REVIEW, and an uncertain E2 operation is
-    never resent here.
-
-    ``record_discussion_message_events`` (issue #79) records E4's two
-    direction-only Owner ↔ Reviewer discussion message events inside this
-    settlement's transaction when the settlement is dispatched through
-    E4's formal-result path, so the exchange audit and the authoritative
-    settlement commit atomically; the default leaves the event sequence
-    exactly as before this parameter existed.
-
-    The E2 continuation dependencies (the Producer-side runtime adapter
-    and the GitHub client) are proven before the settlement commits
-    exactly when the validated result routes to E2 — the same
-    no-stranding guarantee as before, now scoped to the routing outcome.
-    A formal ACCEPTED never touches them, so E4's formal acceptance can
-    dispatch this settlement without acquiring a Producer attachment or
-    a GitHub client.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _SETTLEMENT_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        result = _require_formal_result(review_result)
-        # The routing decision is fully determined by the validated result
-        # outcome, so the E2 dependencies are proven BEFORE the settlement
-        # transaction exactly when the result routes to E2; an invalid or
-        # missing dependency can never strand an already-settled gate.
-        routes_to_e2 = _resolution_outcome(result) is ReviewOutcome.CHANGES_REQUESTED
-        runtime_adapter = _require_runtime(runtime) if routes_to_e2 else None
-        github_client = _require_github(github) if routes_to_e2 else None
-        annotate_span(
-            span,
-            operation=_SETTLEMENT_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: gate settlement (database only). ---
-        settlement = _settle_resolution_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            result=result,
-            record_discussion_message_events=record_discussion_message_events,
-        )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        if settlement.decision is PlanningReviewResolutionDecision.CONTINUATION_ROUTED:
-            if runtime_adapter is None or github_client is None:
-                # Unreachable: the CONTINUATION_ROUTED decision is derived
-                # from the same validated outcome that proved both E2
-                # dependencies at entry. Refuse rather than proceed with a
-                # half-proved continuation.
-                raise ConflictError("the E2 continuation dependencies are unavailable")
-            production = revise_task_plan(
-                pool,
-                runtime_adapter,
-                github_client,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                profile_id=profile_id,
-                expected_state_token=settlement.task.state_token,
-                prior_plan_revision_id=settlement.settled_revision.id,
-                review_iteration_id=settlement.finalized_iteration.id,
-            )
-            return TaskPlanningReviewResolutionOutcome(
-                decision=PlanningReviewResolutionDecision.CONTINUATION_ROUTED,
-                review_iteration=settlement.finalized_iteration,
-                plan_revision=settlement.settled_revision,
-                review_loop=settlement.loop,
-                task=production.task,
-                resolution_gate=settlement.settled_gate,
-                revision_production=production,
-            )
-
-        return TaskPlanningReviewResolutionOutcome(
-            decision=PlanningReviewResolutionDecision.SETTLED_ACCEPTED,
-            review_iteration=settlement.finalized_iteration,
-            plan_revision=settlement.settled_revision,
-            review_loop=settlement.loop,
-            task=settlement.task,
-            resolution_gate=settlement.settled_gate,
-            revision_production=None,
-        )
 
 
 # --- the implementation-gate change-request handoff (issue #219) -------------
@@ -1075,113 +945,4 @@ def _supersede_implementation_gate_transaction(
             loop=locked_loop,
             task=superseded_task,
             superseded_gate=supersession.gate,
-        )
-
-
-def supersede_implementation_authorization_with_changes(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter | None,
-    github: GitHubAppClient | None,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    review_result: ReviewResult,
-    record_discussion_message_events: bool = False,
-) -> TaskPlanningGateChangeRequestOutcome:
-    """Hand one Reviewer change request at the implementation gate back to planning.
-
-    E4's formal-result recognition at a still-current plan-subject
-    IMPLEMENTATION_AUTHORIZATION gate (issue #219) supplies the validated
-    typed CHANGES_REQUESTED ``ReviewResult``; this seam rechecks every
-    exact subject and, in ONE short composed transaction, allocates and
-    finalizes a NEW next-numbered immutable ReviewIteration for the
-    unchanged exact PlanRevision, records the safe REVIEWER
-    ``PLAN_REVIEWED`` audit event, supersedes the exact current pending
-    implementation gate (pointer clear, ``waiting_for_owner`` →
-    ``planning``, token rotation — the gate stays historically PENDING
-    with no terminal stamp and no fabricated ``OWNER_GATE_RESOLVED``
-    event), and commits the durable continuation. A raced Owner
-    approval/cancellation serializes on the same Task row lock; only one
-    can succeed.
-
-    The E2 continuation dependencies are proven at entry — at this gate
-    the only formal outcome routes to E2 — so an unavailable Producer-side
-    runtime adapter or GitHub client can never strand an already-superseded
-    gate (the same no-stranding guarantee as the settlement seam). The
-    external E2 send happens with NO transaction open and an uncertain
-    outcome is never resent here: the supersession stays durable and
-    recovery belongs to E2's own seam and later orchestration. Only E2's
-    newly persisted revision and post-update token may launch E3a's next
-    ordinary REVIEW; the Reviewer's later ACCEPTED reaches E5 and creates
-    a NEW implementation gate.
-
-    Scope discipline (Phase 2E): this seam never assesses plan semantics,
-    never dispatches REVIEW (E3a), never decides the ordinary bounded
-    budget (E3b), never implements discussion transport (E4), never
-    creates or resolves gates beyond the one supersession, never issues
-    IMPLEMENTATION_AUTHORIZATION (E5), and never touches PR/head subjects.
-    A stale, foreign, replayed, superseded, non-READY, or non-formal input
-    never supersedes the gate: it fails closed with the typed vocabulary
-    and applies nothing.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _GATE_CHANGE_REQUEST_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        result = _require_formal_result(review_result)
-        if _resolution_outcome(result) is not ReviewOutcome.CHANGES_REQUESTED:
-            # Issue #219: only a change request is actionable at an
-            # implementation gate; an ACCEPTED reply is E4's advisory
-            # conversation and never reaches this seam.
-            raise InvalidCommandError(
-                "only a CHANGES_REQUESTED review result supersedes an "
-                "implementation authorization gate"
-            )
-        # The routing decision is fixed for this seam — the change request
-        # always routes to E2 — so both continuation dependencies are
-        # proven BEFORE the supersession transaction; an invalid or missing
-        # dependency can never strand an already-superseded gate.
-        runtime_adapter = _require_runtime(runtime)
-        github_client = _require_github(github)
-        annotate_span(
-            span,
-            operation=_GATE_CHANGE_REQUEST_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: gate supersession (database only). ---
-        change_request = _supersede_implementation_gate_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            result=result,
-            record_discussion_message_events=record_discussion_message_events,
-        )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        production = revise_task_plan(
-            pool,
-            runtime_adapter,
-            github_client,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            profile_id=profile_id,
-            expected_state_token=change_request.task.state_token,
-            prior_plan_revision_id=change_request.superseded_revision.id,
-            review_iteration_id=change_request.finalized_iteration.id,
-        )
-        return TaskPlanningGateChangeRequestOutcome(
-            decision=PlanningGateChangeRequestDecision.PLANNING_CONTINUATION_ROUTED,
-            review_iteration=change_request.finalized_iteration,
-            plan_revision=change_request.superseded_revision,
-            review_loop=change_request.loop,
-            task=production.task,
-            superseded_gate=change_request.superseded_gate,
-            revision_production=production,
         )

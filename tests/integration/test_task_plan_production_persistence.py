@@ -38,27 +38,16 @@ from psycopg.errors import ForeignKeyViolation
 
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.github import (
-    GitHubAppClient,
     GitHubBranchObservation,
     GitHubRepositoryObservation,
 )
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
-from openorc.domain.reviews import (
-    DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
-    ReviewLoopPurpose,
-    ReviewOutcome,
-)
 from openorc.persistence import events as event_repositories
 from openorc.persistence import planning as planning_repositories
-from openorc.persistence import reviews as review_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
-from openorc.services.task_plan_production import (
-    produce_initial_task_plan,
-    revise_task_plan,
-)
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.transaction_composition import composed_transaction
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
@@ -319,149 +308,6 @@ def _planning_fixture(
             "profile_id": profile_id,
             "preparation": preparation,
         },
-    )
-
-
-def test_initial_production_commits_revision_pointer_and_event_atomically(
-    conn: Connection[Any],
-) -> None:
-    pool, adapter, github, producer_external_id, facts = _planning_fixture(conn)
-    adapter.queue_send(
-        producer_external_id, {"type": "plan_result", "schema_version": 1, "plan": _PLAN_TEXT}
-    )
-
-    outcome = produce_initial_task_plan(
-        pool,
-        adapter,
-        cast(GitHubAppClient, github),
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        profile_id=facts["profile_id"],
-        preparation=facts["preparation"],
-    )
-
-    # The exact typed outcome: revision 1 with the branch-observed base and
-    # the post-pointer Task token.
-    assert outcome.plan_revision.revision_number == 1
-    assert outcome.plan_revision.content == _PLAN_TEXT
-    assert outcome.plan_revision.repository_base_sha == _BASE_SHA
-    assert outcome.task.current_plan_revision_id == outcome.plan_revision.id
-    assert outcome.task.state_token != facts["preparation"].task.state_token
-
-    # The three durable facts committed together, exactly once each.
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.plan_revisions where task_id = %s",
-            (facts["task_id"],),
-        )
-        == 1
-    )
-    reloaded = task_repositories.get_task(pool, facts["task_id"])
-    assert reloaded is not None
-    assert reloaded.current_plan_revision_id == outcome.plan_revision.id
-    assert reloaded.state_token == outcome.task.state_token
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'plan_revision_created' and subject_type = 'plan_revision' "
-            "and subject_id = %s and actor_type = 'producer'",
-            (facts["task_id"], outcome.plan_revision.id),
-        )
-        == 1
-    )
-    # The observation used the routed stable identities.
-    assert github.repository_calls == [(_EXTERNAL_INSTALLATION_ID, _GITHUB_REPOSITORY_ID)]
-
-
-def test_revision_production_commits_next_revision_pointer_and_event(
-    conn: Connection[Any],
-) -> None:
-    pool, adapter, github, producer_external_id, facts = _planning_fixture(conn)
-    adapter.queue_send(
-        producer_external_id, {"type": "plan_result", "schema_version": 1, "plan": _PLAN_TEXT}
-    )
-    initial = produce_initial_task_plan(
-        pool,
-        adapter,
-        cast(GitHubAppClient, github),
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        profile_id=facts["profile_id"],
-        preparation=facts["preparation"],
-    )
-
-    # The E3-shaped finalized planning change request against revision 1.
-    loop = review_repositories.create_review_loop(
-        pool,
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        purpose=ReviewLoopPurpose.PLANNING,
-        iteration_limit=DEFAULT_REVIEW_LOOP_ITERATION_LIMIT,
-    )
-    iteration = review_repositories.create_review_iteration(
-        pool,
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        review_loop_id=loop.id,
-        iteration_number=1,
-        plan_revision_id=initial.plan_revision.id,
-    )
-    assert iteration is not None
-    finalized = review_repositories.record_review_iteration_result(
-        pool,
-        review_iteration_id=iteration.id,
-        outcome=ReviewOutcome.CHANGES_REQUESTED,
-        summary="Needs work",
-        findings=[{"summary": "Clarify scope", "details": "Say which module changes."}],
-    )
-    assert finalized is not None
-
-    adapter.queue_send(
-        producer_external_id,
-        {"type": "plan_result", "schema_version": 1, "plan": _REVISED_PLAN_TEXT},
-    )
-    revised = revise_task_plan(
-        pool,
-        adapter,
-        cast(GitHubAppClient, github),
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        profile_id=facts["profile_id"],
-        expected_state_token=initial.task.state_token,
-        prior_plan_revision_id=initial.plan_revision.id,
-        review_iteration_id=iteration.id,
-    )
-
-    assert revised.plan_revision.revision_number == 2
-    assert revised.plan_revision.content == _REVISED_PLAN_TEXT
-    assert revised.plan_revision.repository_base_sha == _BASE_SHA
-    assert revised.task.current_plan_revision_id == revised.plan_revision.id
-    assert revised.task.state_token != initial.task.state_token
-
-    # Revision 1 stays intact; the pointer and the revised event moved on.
-    first = planning_repositories.get_plan_revision(pool, plan_revision_id=initial.plan_revision.id)
-    assert first is not None
-    assert first.revision_number == 1
-    assert first.content == _PLAN_TEXT
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'plan_revision_created'",
-            (facts["task_id"],),
-        )
-        == 1
-    )
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'plan_revision_revised' and subject_id = %s",
-            (facts["task_id"], revised.plan_revision.id),
-        )
-        == 1
     )
 
 

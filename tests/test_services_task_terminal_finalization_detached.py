@@ -445,12 +445,6 @@ def _wire_detached(
         )
 
     monkeypatch.setattr(finalization_module, "_archive_committed_terminalization", _archive)
-
-    def _blocking(pool: Any, runtime: Any, *, workspace_id: UUID, task_id: UUID) -> Any:
-        calls.blocking_executions.append({"workspace_id": workspace_id, "task_id": task_id})
-        raise AssertionError("the detached dispatch tests never reach the blocking realization")
-
-    monkeypatch.setattr(finalization_module, "execute_terminal_checkout_cleanup", _blocking)
     return made_receipt
 
 
@@ -889,46 +883,6 @@ def test_an_under_lock_claim_race_never_enqueues(
     assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
 
 
-def test_the_queue_mode_interim_keeps_the_blocking_realization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The explicitly selected blocking interim keeps the established #317
-    flow — the blocking realization is invoked, never the detached admission,
-    and the claim settles in the invocation as before."""
-    calls = _DetachedCalls()
-    runtime = _DetachedCleanupRuntime()
-    registrar = _CleanupRegistrar()
-    _wire_detached(monkeypatch, calls, establishment=_eligible_establishment())
-    # Unblock the blocking seam for this test: it records the execution.
-    monkeypatch.setattr(
-        finalization_module,
-        "execute_terminal_checkout_cleanup",
-        lambda pool, runtime, *, workspace_id, task_id: calls.blocking_executions.append(
-            {"workspace_id": workspace_id, "task_id": task_id}
-        ),
-    )
-
-    outcome = finalize_task_terminalization(
-        _pool(),
-        runtime,
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        dispatch=TerminalCleanupDispatch(
-            selection=TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
-        ),
-    )
-
-    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
-    assert calls.blocking_executions == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
-    # The detached seams never ran.
-    assert calls.receipts == []
-    assert runtime.admissions == []
-    assert registrar.registered == []
-    # The blocking interim settles the claim in the invocation, as before.
-    assert calls.settles == [_TASK_ID]
-    assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
-
-
 def test_a_staged_early_completion_consumes_once_at_the_attach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1163,12 +1117,9 @@ def test_a_past_deadline_outstanding_attempt_archives_without_any_redispatch(
 def test_a_dispatch_construction_rejects_a_handoff_outside_the_detached_selection() -> None:
     """The inconsistent-construction discipline: only the detached-regular
     selection carries the completion handoff, so a mode can never be inferred
-    from handoff presence (issue #345)."""
-    with pytest.raises(ValueError):
-        TerminalCleanupDispatch(
-            selection=TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM,
-            completion_handoff=_RecordingCleanupHandoff(),
-        )
+    from handoff presence (issue #345); the blocking interim member itself is
+    retired (issue #347)."""
+    assert not hasattr(TerminalCleanupDispatchSelection, "BLOCKING_QUEUE_INTERIM")
     with pytest.raises(ValueError):
         TerminalCleanupDispatch(
             selection=TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE,

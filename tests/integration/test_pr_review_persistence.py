@@ -26,14 +26,13 @@ suite consumes the explicitly supplied non-production branch database per
 from __future__ import annotations
 
 import uuid
-from contextlib import contextmanager
 from typing import Any, cast
 
 import pytest
 from psycopg import Connection
 from psycopg.errors import UniqueViolation
 
-from openorc.domain.gates import OwnerGateStatus, OwnerGateType
+from openorc.domain.gates import OwnerGateType
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import executions as execution_repositories
@@ -43,10 +42,6 @@ from openorc.persistence import tasks as task_repositories
 from openorc.persistence.executions import ExecutionStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.models import ReviewFinding, ReviewResult
-from openorc.services import event_coordination
-from openorc.services.task_pr_review_decision import (
-    PrMergeGateChangeRequestDecision,
-)
 from tests.integration.test_task_planning_gate_change_request_persistence import (
     _insert_connection,
     _insert_installation,
@@ -212,137 +207,6 @@ def _changes_requested_result() -> ReviewResult:
         summary="The retry loop leaks the connection.",
         findings=(ReviewFinding(summary="Fix the leak", details="Close it in finally."),),
     )
-
-
-def _retire_call(pool: DatabasePool, facts: dict[str, Any], **overrides: Any) -> Any:
-    from openorc.services.task_pr_review_decision import (
-        retire_pr_merge_decision_with_changes as _retire,
-    )
-
-    class _UnusedAdapter:
-        def send(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stubbed seam
-            raise AssertionError("the remediation routing is stubbed in this suite")
-
-        def realize_control(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-            raise AssertionError("the remediation routing is stubbed in this suite")
-
-    class _UnusedGitHub:
-        def get_installation_repository(self, **_kwargs: Any) -> Any:  # pragma: no cover
-            raise AssertionError("the remediation routing is stubbed in this suite")
-
-        def get_repository_pull_request(self, **_kwargs: Any) -> Any:  # pragma: no cover
-            raise AssertionError("the remediation routing is stubbed in this suite")
-
-    # The remediation routing is stubbed at the module seam in this suite,
-    # so the continuation dependencies are structurally present but unused.
-    return _retire(
-        pool,
-        cast(Any, _UnusedAdapter()),
-        cast(Any, _UnusedGitHub()),
-        cast(Any, lambda binding: contextmanager(lambda: iter([_UnusedAdapter()]))()),
-        profile_id=facts["profile_id"],
-        workspace_id=facts["workspace_id"],
-        task_id=facts["task_id"],
-        expected_state_token=facts["state_token"],
-        review_result=_changes_requested_result(),
-        **overrides,
-    )
-
-
-def test_the_merge_gate_change_request_retirement_commits_atomically(
-    conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    facts = _pr_review_fixture(conn)
-    pool = facts["pool"]
-    remediation_calls: list[dict[str, Any]] = []
-
-    def _stub_remediation(*args: Any, **kwargs: Any) -> Any:
-        remediation_calls.append(kwargs)
-        return "routed"
-
-    monkeypatch.setattr(
-        "openorc.services.task_pr_review_decision.route_pr_remediation", _stub_remediation
-    )
-
-    outcome = _retire_call(pool, facts, record_discussion_message_events=True)
-
-    assert outcome.decision is PrMergeGateChangeRequestDecision.MERGE_GATE_RETIRED
-    # The NEW same-head finalized iteration is durable history.
-    iterations = review_repositories.list_review_loop_iterations(
-        pool, review_loop_id=facts["loop_id"]
-    )
-    assert [iteration.iteration_number for iteration in iterations] == [1, 2]
-    assert iterations[1].outcome is ReviewOutcome.CHANGES_REQUESTED
-    assert iterations[1].reviewed_head_sha == _HEAD_SHA
-    assert iterations[1].task_pull_request_id == facts["pr_id"]
-    # The retired gate stays pending history: no terminal stamp, and the
-    # Task's pointer cleared with the token rotated into ``reviewing``.
-    retired = gate_repositories.get_owner_gate(pool, owner_gate_id=facts["gate_id"])
-    assert retired is not None
-    assert retired.status is OwnerGateStatus.PENDING
-    assert retired.decided_at is None
-    task = task_repositories.get_task(pool, facts["task_id"])
-    assert task is not None
-    assert task.status is TaskStatus.REVIEWING
-    assert task.current_owner_gate_id is None
-    assert task.state_token != facts["state_token"]
-    # Exactly the safe audit sequence: the REVIEWER pr_reviewed event and the
-    # two direction-only discussion events — never a false gate resolution.
-    assert len(remediation_calls) == 1
-    assert remediation_calls[0]["expected_state_token"] == task.state_token
-    row = conn.execute(
-        "select event_type, count(*) from openorc.workflow_events "
-        "where task_id = %s group by event_type order by event_type",
-        (facts["task_id"],),
-    ).fetchall()
-    types = {event_type: count for event_type, count in row}
-    assert types.get("pr_reviewed") == 1
-    assert types.get("owner_reviewer_discussion_message") == 2
-    assert "owner_gate_resolved" not in types
-
-
-def test_a_late_retirement_failure_rolls_the_whole_composition_back(
-    conn: Connection[Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    facts = _pr_review_fixture(conn)
-    pool = facts["pool"]
-
-    def _boom(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("forced late discussion audit failure")
-
-    monkeypatch.setattr(
-        event_coordination,
-        "record_owner_reviewer_discussion_message_event",
-        _boom,
-    )
-    monkeypatch.setattr(
-        "openorc.services.task_pr_review_decision.route_pr_remediation",
-        lambda *args: (_ for _ in ()).throw(AssertionError("unreachable")),
-    )
-
-    with pytest.raises(RuntimeError, match="forced late discussion audit failure"):
-        _retire_call(pool, facts, record_discussion_message_events=True)
-
-    # Nothing committed: the gate is still pending AND current, the Task is
-    # untouched at its original token, and no retirement facts exist.
-    retired = gate_repositories.get_owner_gate(pool, owner_gate_id=facts["gate_id"])
-    assert retired is not None
-    assert retired.status is OwnerGateStatus.PENDING
-    task = task_repositories.get_task(pool, facts["task_id"])
-    assert task is not None
-    assert task.status is TaskStatus.WAITING_FOR_OWNER
-    assert task.current_owner_gate_id == facts["gate_id"]
-    assert task.state_token == facts["state_token"]
-    iterations = review_repositories.list_review_loop_iterations(
-        pool, review_loop_id=facts["loop_id"]
-    )
-    assert [iteration.iteration_number for iteration in iterations] == [1]
-    row = conn.execute(
-        "select count(*) from openorc.workflow_events where task_id = %s",
-        (facts["task_id"],),
-    ).fetchone()
-    assert row is not None
-    assert int(row[0]) == 0
 
 
 def test_the_remediation_claim_partial_unique_index_is_one_shot(

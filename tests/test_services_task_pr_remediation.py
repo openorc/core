@@ -27,44 +27,29 @@ import uuid
 from typing import Any, cast
 
 import pytest
-from psycopg.errors import UniqueViolation
 
-from openorc.adapters.agent_runtime.errors import (
-    AgentRuntimeTransportError,
-    AgentRuntimeUncertainOutcomeError,
-)
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.adapters.github import GitHubPullRequestObservation
 from openorc.domain.connections import WorkflowRole
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_pr_remediation
 from openorc.services.errors import (
-    ConflictError,
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
     StaleOperationError,
 )
-from openorc.services.review_result_envelope import serialize_review_result
-from openorc.services.task_detached_turn_observation import (
-    ObservationRegistrationRefusalReason,
-    ObservationRegistrationRefusedError,
-)
 from openorc.services.task_pr_remediation import (
     SettledPrRemediationVerification,
-    dispatch_pr_remediation_detached,
-    route_pr_remediation,
     verify_settled_pr_remediation_push,
 )
 from tests.fakes.agent_runtime import (
     FakeAgentRuntimeAdapter,
-    implementation_result_candidate,
     session_ready_candidate,
 )
 from tests.test_services_task_pr_review_dispatch import (
     _ACCOUNT_BARRIER,
     _ACCOUNT_OPERATIONAL_ROW,
     _BRANCH,
-    _CONNECTION_ID,
     _EXECUTIONS_LIST,
     _HEAD_SHA,
     _IMPLEMENTATION_PAYLOAD,
@@ -229,17 +214,6 @@ def _prepared_producer_adapter(
     return adapter
 
 
-def _stub_dispatch(monkeypatch: pytest.MonkeyPatch):
-    calls: list[dict[str, Any]] = []
-
-    def _stub(pool: Any, *args: Any, **kwargs: Any):
-        calls.append(kwargs)
-        return types.SimpleNamespace(task=_task_domain())
-
-    monkeypatch.setattr(task_pr_remediation, "dispatch_pr_review", _stub)
-    return calls
-
-
 def _noop_attachment(adapter: FakeAgentRuntimeAdapter) -> Any:
     from contextlib import contextmanager
 
@@ -300,27 +274,6 @@ class _GitHubClient:
             merged=self._observed_merged,
             merged_at=self._observed_merged_at,
         )
-
-
-def _remediation_call(
-    pool: DatabasePool,
-    adapter: FakeAgentRuntimeAdapter,
-    github: Any,
-    *,
-    expected_state_token: Any = _STATE_TOKEN,
-) -> Any:
-    return route_pr_remediation(
-        pool,
-        adapter,
-        github,
-        _noop_attachment(adapter),
-        profile_id=_OWNER_PROFILE_ID,
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=expected_state_token,
-        review_result=_review_result(),
-        addressed_iteration=_addressed_iteration_domain(),
-    )
 
 
 def _script_claim(
@@ -392,273 +345,6 @@ def _script_send_phase(
 _REPOSITORY_ROW_READ = _sql_has("from openorc.repositories where id")
 _REPOSITORY_ROW_LOCKED = _sql_has("from openorc.repositories where id", "for update")
 _INSTALLATION_READ = _sql_has("from openorc.github_installations where id")
-
-
-def test_the_one_shot_claim_allocates_one_attempt_and_sends_one_revise(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    _script_send_phase(conn)
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[
-            implementation_result_candidate(
-                branch=_BRANCH,
-                summary="Implemented the requested changes.",
-                changes=["fix: applied review findings"],
-                validation=["pytest green"],
-            )
-        ],
-    )
-    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    outcome = _remediation_call(pool, adapter, github.as_client())
-
-    # The durable claim: the next attempt row binds the addressed iteration.
-    insert_params = next(params for sql, params in conn.executed if _EXECUTION_INSERT(sql, None))
-    assert insert_params is not None
-    assert insert_params[5] == _REVIEW_ITERATION_ID
-    # Exactly one REVISE on the original Producer session, the entire message
-    # being the canonical review_result JSON with no remediation prose.
-    (control,) = adapter.realized_controls(_PRODUCER_EXTERNAL_ID)
-    assert control.message is not None
-    assert control.expected_family == "implementation_result"
-    assert control.message.startswith('{"type": "review_result"')
-    assert _HEAD_SHA not in control.message
-    # The completion is recorded exactly once with the completed audit.
-    assert _count(conn, _COMPLETE_UPDATE) == 1
-    # The fresh head is GitHub-confirmed and the ordinary dispatch is
-    # re-entered for it with the new evidence facts.
-    assert outcome.new_head_sha == _NEW_HEAD_SHA
-    assert len(dispatch_calls) == 1
-    assert dispatch_calls[0]["expected_state_token"] == _STATE_TOKEN
-    assert dispatch_calls[0]["published"].pull_request.head_sha == _NEW_HEAD_SHA
-
-
-def test_replaying_the_claim_after_completion_allocates_no_second_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    # The partial unique index refuses the second claim for the same
-    # iteration — the durable one-shot invariant, token-independent.
-    _script_claim(conn, execution_insert_result=UniqueViolation("duplicate claim"))
-    adapter = _prepared_producer_adapter(fake_pool)
-    github = _GitHubClient(fake_pool)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(StaleOperationError):
-        _remediation_call(pool, adapter, github.as_client())
-
-    assert _count(conn, _CLAIM_UPDATE) == 0
-    assert _count(conn, _EVENT_INSERT) == 0
-    assert len(adapter.realized_controls()) == 0
-    assert dispatch_calls == []
-
-
-def test_replaying_the_claim_with_the_rotated_current_token_still_refuses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(
-        conn,
-        execution_insert_result=UniqueViolation("duplicate claim"),
-        task_state_token=_ROTATED_TOKEN,
-    )
-    adapter = _prepared_producer_adapter(fake_pool)
-    github = _GitHubClient(fake_pool)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(StaleOperationError):
-        _remediation_call(pool, adapter, github.as_client(), expected_state_token=_ROTATED_TOKEN)
-
-    assert _count(conn, _EXECUTION_INSERT) == 1
-    assert len(adapter.realized_controls()) == 0
-    assert dispatch_calls == []
-
-
-def test_an_unchanged_reconciled_head_fails_closed_after_the_recorded_completion(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    # The Producer reported completion but never pushed: the reconciliation
-    # observes the SAME head and the re-dispatch never happens.
-    _script_send_phase(conn, observed_head=_HEAD_SHA)
-    conn.on(_PR_UPDATE, _pr_row(head_sha=_HEAD_SHA))
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[
-            implementation_result_candidate(
-                branch=_BRANCH,
-                summary="Implemented the requested changes.",
-                changes=["fix: applied review findings"],
-                validation=["pytest green"],
-            )
-        ],
-    )
-    github = _GitHubClient(fake_pool, observed_head=_HEAD_SHA)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(ExternalOperationFailedError):
-        _remediation_call(pool, adapter, github.as_client())
-
-    # The completion stays truthfully recorded; no success is invented and
-    # no new review is launched.
-    assert _count(conn, _COMPLETE_UPDATE) == 1
-    assert dispatch_calls == []
-
-
-def test_a_wrong_branch_claim_fails_closed_before_any_github_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    _script_send_phase(conn)
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[
-            implementation_result_candidate(
-                branch="some/other-branch",
-                summary="Implemented the requested changes.",
-                changes=["fix: applied review findings"],
-                validation=["pytest green"],
-            )
-        ],
-    )
-    github = _GitHubClient(fake_pool)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(ConflictError):
-        _remediation_call(pool, adapter, github.as_client())
-
-    assert github.repository_calls == []
-    assert github.pull_request_calls == []
-    assert dispatch_calls == []
-
-
-def test_an_uncertain_send_leaves_the_claimed_attempt_running(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    # R1 revalidation runs; the realization ends uncertain.
-    conn.on(_TASK_READ, _task_row())
-    conn.on(_REPOSITORY_ROW_READ, _repository_row())
-    conn.on(_TASK_READ_LOCKED, _task_row())
-    conn.on(_TASK_READ, _task_row())
-    conn.on(_SESSION_READ, _producer_session_row())
-    conn.on(_PR_READ, _pr_row())
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[AgentRuntimeUncertainOutcomeError("the outcome is unknown")],
-    )
-    github = _GitHubClient(fake_pool)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(ExternalOperationUncertainError):
-        _remediation_call(pool, adapter, github.as_client())
-
-    # The potentially-dispatched record: the attempt is never finalized and
-    # the single possibly-delivered send is never resent.
-    assert _count(conn, _COMPLETE_UPDATE) == 0
-    assert len(adapter.realized_controls()) == 1
-    assert dispatch_calls == []
-
-
-def test_a_transport_failure_is_never_marked_a_known_pre_effect_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The F2 misclassification fix (issue #87): a transport/protocol failure
-    after a possible dispatch is never positively proven to precede the
-    effect — the claimed attempt stays unresolved and the send claim is
-    never settled with a known non-delivery."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    # R1 revalidation runs; the realization fails at the transport layer.
-    conn.on(_TASK_READ, _task_row())
-    conn.on(_REPOSITORY_ROW_READ, _repository_row())
-    conn.on(_TASK_READ_LOCKED, _task_row())
-    conn.on(_TASK_READ, _task_row())
-    conn.on(_SESSION_READ, _producer_session_row())
-    conn.on(_PR_READ, _pr_row())
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[AgentRuntimeTransportError("the transport dropped mid-send")],
-    )
-    github = _GitHubClient(fake_pool)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    with pytest.raises(ExternalOperationUncertainError):
-        _remediation_call(pool, adapter, github.as_client())
-
-    # The conservative outcome: no truthful finalize of the attempt, no
-    # known-non-delivery claim settlement, and the single send is never
-    # replayed.
-    assert _count(conn, _COMPLETE_UPDATE) == 0
-    assert len(adapter.realized_controls()) == 1
-    assert dispatch_calls == []
-
-
-def test_a_push_reconciled_during_the_interaction_still_records_the_completion(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Finding 3 regression: GitHub reconciles the Producer's push (a webhook
-    or another B7 invocation) while the Producer is still working, so the
-    persisted canonical PR head advances BEFORE the runtime returns the
-    validated completion. The completion must persist exactly once against
-    the claimed Execution — the old head is deliberately not required to
-    remain current after the send — and the authoritative reconciliation
-    then confirms the new head and re-enters the ordinary dispatch for it
-    without resending REVISE."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    _script_send_phase(conn, observed_head=_NEW_HEAD_SHA)
-    # The completion transaction's PR identity read already observes the
-    # webhook-reconciled NEW head; identity matches, old-head currency is
-    # deliberately not required after the send.
-    adapter = _prepared_producer_adapter(
-        fake_pool,
-        producer_outcomes=[
-            implementation_result_candidate(
-                branch=_BRANCH,
-                summary="Implemented the requested changes.",
-                changes=["fix: applied review findings"],
-                validation=["pytest green"],
-            )
-        ],
-    )
-    github = _GitHubClient(fake_pool, observed_head=_NEW_HEAD_SHA)
-    dispatch_calls = _stub_dispatch(monkeypatch)
-
-    outcome = _remediation_call(pool, adapter, github.as_client())
-
-    # Exactly one REVISE was ever sent; the genuine completion persisted
-    # exactly once despite the advanced head; and the confirmed new head
-    # launched exactly one ordinary dispatch.
-    assert len(adapter.realized_controls(_PRODUCER_EXTERNAL_ID)) == 1
-    assert _count(conn, _COMPLETE_UPDATE) == 1
-    assert _count(conn, _CLAIM_UPDATE) == 1
-    assert outcome.new_head_sha == _NEW_HEAD_SHA
-    assert len(dispatch_calls) == 1
-    assert dispatch_calls[0]["published"].pull_request.head_sha == _NEW_HEAD_SHA
 
 
 # --- the detached Producer remediation dispatch and the settled continuation
@@ -787,27 +473,6 @@ def _producer_factory(adapter: FakeAgentRuntimeAdapter) -> Any:
     return _ctx
 
 
-def _detached_remediation_call(
-    pool: DatabasePool,
-    adapter: FakeAgentRuntimeAdapter,
-    *,
-    registrar: Any,
-    handoff: Any,
-    expected_state_token: Any = _STATE_TOKEN,
-) -> Any:
-    return dispatch_pr_remediation_detached(
-        pool,
-        profile_id=_OWNER_PROFILE_ID,
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        expected_state_token=expected_state_token,
-        addressed_iteration=_addressed_iteration_domain(),
-        producer_runtime_factory=_producer_factory(adapter),
-        observation_registrar=registrar,
-        completion_handoff=handoff,
-    )
-
-
 def _script_r1(conn: ScriptedConnection) -> None:
     """R1: the post-attachment authority revalidation before the receipt."""
     conn.on(_TASK_READ_LOCKED, _task_row())
@@ -832,154 +497,6 @@ def _execution_insert_id(conn: ScriptedConnection) -> Any:
     params = next(params for sql, params in conn.executed if _EXECUTION_INSERT(sql, None))
     assert params is not None
     return params[0]
-
-
-def test_the_detached_remediation_enqueue_admits_one_verbatim_revise_turn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(task_pr_remediation, "dispatch_pr_review", _stub_dispatch(monkeypatch))
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    claimed_row = _claimed_execution_row()
-    _script_claim(conn, execution_insert_result=claimed_row, claim_row=claimed_row)
-    _script_r1(conn)
-    conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
-    _script_attach(conn)
-    # The post-dispatch durable task reload.
-    conn.on(_TASK_READ, _task_row())
-    adapter = _prepared_producer_adapter(fake_pool)
-    registrar = _RecordingRegistrar()
-    handoff = _RecordingHandoff()
-
-    outcome = _detached_remediation_call(pool, adapter, registrar=registrar, handoff=handoff)
-
-    # The claimed Execution and the addressed finalized iteration.
-    execution_id = claimed_row[0]
-    assert outcome.execution.id == execution_id
-    assert outcome.addressed_iteration.id == _REVIEW_ITERATION_ID
-    assert outcome.producer_session.id == _PRODUCER_SESSION_ID
-    assert outcome.task.state_token == _STATE_TOKEN
-    # The receipt companion expects the canonical implementation_result family
-    # and roots at the claimed Execution identity.
-    receipt_params = next(params for sql, params in conn.executed if _RECEIPT_INSERT(sql, None))
-    assert receipt_params is not None
-    assert receipt_params[3] == "pr_remediation_execution"
-    assert receipt_params[4] == "execution"
-    assert receipt_params[5] == execution_id
-    assert receipt_params[6] == "implementation_result"
-    # One positive observation registration on the exact bound Producer
-    # session.
-    assert registrar.registrations == [
-        {
-            "workspace_id": _WORKSPACE_ID,
-            "task_id": _TASK_ID,
-            "task_agent_session_id": _PRODUCER_SESSION_ID,
-            "connection_id": _CONNECTION_ID,
-            "external_session_id": _PRODUCER_EXTERNAL_ID,
-        }
-    ]
-    # The canonical REVISE instruction — the persisted finalized iteration's
-    # review_result JSON, rebuilt verbatim — was admitted verbatim and no
-    # blocking send ran; no completion was recorded during the dispatch.
-    assert len(adapter.detached_admissions()) == 1
-    admitted_session, admitted_message = adapter.detached_admissions()[0]
-    assert admitted_session == _PRODUCER_EXTERNAL_ID
-    assert admitted_message == serialize_review_result(_review_result())
-    assert adapter.realized_controls(_PRODUCER_EXTERNAL_ID) == ()
-    assert _count(conn, _COMPLETE_UPDATE) == 0
-    assert not any("update openorc.tasks" in sql for sql, _ in conn.executed)
-    assert fake_pool.active_connections == 0
-    assert handoff.calls == []
-
-
-def test_a_replayed_remediation_claim_allocates_no_attempt_and_never_admits(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The one-shot claim is durable and token-independent: a replayed claim
-    for an already-claimed iteration applies nothing and never admits a turn."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn, execution_insert_result=UniqueViolation("claim", "unique", "idx"))
-    adapter = _prepared_producer_adapter(fake_pool)
-
-    with pytest.raises(StaleOperationError, match="already claimed"):
-        _detached_remediation_call(
-            pool,
-            adapter,
-            registrar=_RecordingRegistrar(),
-            handoff=_RecordingHandoff(),
-        )
-
-    assert not any(_RECEIPT_INSERT(sql, None) for sql, _ in conn.executed)
-    assert adapter.detached_admissions() == ()
-
-
-def test_a_refused_remediation_registration_refuses_the_receipt_and_finalizes_the_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A positively refused pre-admission registration is a proven pre-effect
-    failure: the receipt is marked refused and the never-dispatched attempt
-    finalizes truthfully as failed_transient."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    _script_r1(conn)
-    conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
-    conn.on(_RECEIPT_REFUSE, _remediation_receipt_row(status="refused"))
-    conn.on(
-        _EXECUTION_STATUS_UPDATE,
-        _claimed_execution_row(status="failed_transient"),
-    )
-    conn.on(_EVENT_INSERT, _event_returned_row("execution_failed"))
-    adapter = _prepared_producer_adapter(fake_pool)
-
-    with pytest.raises(ObservationRegistrationRefusedError):
-        _detached_remediation_call(
-            pool,
-            adapter,
-            registrar=_RecordingRegistrar(
-                error=ObservationRegistrationRefusedError(
-                    "refused",
-                    reason=ObservationRegistrationRefusalReason.OBSERVATION_REGISTRATION_FAILED,
-                )
-            ),
-            handoff=_RecordingHandoff(),
-        )
-
-    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
-    assert _count(conn, _EXECUTION_STATUS_UPDATE) == 1
-    assert adapter.detached_admissions() == ()
-
-
-def test_an_uncertain_remediation_admission_leaves_the_receipt_claimed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An uncertain admission outcome leaves the claimed attempt conservatively
-    running and the receipt conservatively claimed — never re-dispatched."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    _script_r1(conn)
-    conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
-    adapter = _prepared_producer_adapter(fake_pool)
-    adapter.queue_detached_admission(AgentRuntimeUncertainOutcomeError("unknown"))
-
-    with pytest.raises(ExternalOperationUncertainError, match="admission is unknown"):
-        _detached_remediation_call(
-            pool,
-            adapter,
-            registrar=_RecordingRegistrar(),
-            handoff=_RecordingHandoff(),
-        )
-
-    assert not any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
-    assert _count(conn, _COMPLETE_UPDATE) == 0
-    assert _count(conn, _EXECUTION_STATUS_UPDATE) == 0
-    assert len(adapter.detached_admissions()) == 1
 
 
 # The Level 3 block installation's SQL predicates and canned rows (the shared
@@ -1025,83 +542,6 @@ def _event_types(conn: ScriptedConnection) -> list[str]:
         if _EVENT_INSERT(sql, None) and params is not None:
             types.append(str(params[2]))
     return types
-
-
-def test_a_failed_receipt_recording_aborts_the_dispatch_before_any_admission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The one-shot E9 claim and its detached-turn receipt companion commit in
-    ONE short transaction (issue #338): a receipt failure — a concurrent
-    outstanding receipt for the session binding — fails the whole composition
-    as the typed conflict, so a claimed Execution can never exist without its
-    correlation receipt and nothing is ever registered or admitted."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    conn.on(
-        _RECEIPT_INSERT,
-        UniqueViolation("receipt", "unique", "one unsettled receipt per session"),
-    )
-    adapter = _prepared_producer_adapter(fake_pool)
-
-    with pytest.raises(ConflictError, match="outstanding detached-turn receipt"):
-        _detached_remediation_call(
-            pool,
-            adapter,
-            registrar=_RecordingRegistrar(),
-            handoff=_RecordingHandoff(),
-        )
-
-    # The receipt insert and the claim's own statements ran inside the same
-    # attempted composition; the typed conflict surfaced before any
-    # registration or admission, and durable atomicity (the whole claim
-    # rolling back with the receipt) is proven by the integration-marked
-    # suite against a real database.
-    assert _count(conn, _RECEIPT_INSERT) == 1
-    assert _count(conn, _EXECUTION_INSERT) == 1
-    assert adapter.detached_admissions() == ()
-
-
-def test_an_r1_authority_movement_after_the_claim_refuses_the_receipt_and_finalizes_the_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Authority moving on after the claim-and-receipt commit, before any
-    runtime effect, finalizes the never-dispatched attempt truthfully as
-    ``failed_final`` and refuses the just-recorded receipt — a never-dispatched
-    turn never holds the session's single-outstanding slot."""
-    conn = ScriptedConnection()
-    fake_pool = FakePool(conn)
-    pool = _pool(conn)
-    _script_claim(conn)
-    conn.on(_RECEIPT_INSERT, _remediation_receipt_row())
-    # R1: the post-attachment currentness proof fails on a rotated token.
-    conn.on(_TASK_READ_LOCKED, _task_row())
-    conn.on(_TASK_READ, StaleOperationError("the task state has moved on"))
-    conn.on(_RECEIPT_REFUSE, _remediation_receipt_row(status="refused"))
-    conn.on(
-        _EXECUTION_STATUS_UPDATE,
-        _claimed_execution_row(status="failed_final"),
-    )
-    conn.on(_EVENT_INSERT, _event_returned_row("execution_failed"))
-    adapter = _prepared_producer_adapter(fake_pool)
-
-    with pytest.raises(StaleOperationError):
-        _detached_remediation_call(
-            pool,
-            adapter,
-            registrar=_RecordingRegistrar(),
-            handoff=_RecordingHandoff(),
-        )
-
-    assert any(_RECEIPT_REFUSE(sql, None) for sql, _ in conn.executed)
-    final_params = [
-        params
-        for sql, params in conn.executed
-        if _EXECUTION_STATUS_UPDATE(sql, None) and params is not None
-    ]
-    assert any(str(params[0]) == "failed_final" for params in final_params)
-    assert adapter.detached_admissions() == ()
 
 
 def _verification_pool_setup(
