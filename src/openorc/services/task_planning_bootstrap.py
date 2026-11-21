@@ -172,7 +172,6 @@ __all__ = [
     "TaskPlanningBootstrapDispatchOutcome",
     "TaskPlanningPreparationOutcome",
     "WorkspacePreparationFailedError",
-    "complete_resumed_bootstrap_prepare",
     "complete_settled_bootstrap_prepare_transition",
     "settle_observed_bootstrap_prepare_result",
     "find_resumable_bootstrap_continuation",
@@ -1850,63 +1849,6 @@ def settle_observed_bootstrap_prepare_result(
         task_id=task_id,
         claim_token=claim_token,
         stage=TaskPlanningBootstrapStage.PREPARED,
-    )
-
-
-def complete_resumed_bootstrap_prepare(
-    pool: DatabasePool,
-    runtime_composition: TaskBootstrapRuntimeComposition,
-    *,
-    workspace_id: UUID,
-    profile_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    result: WorkspaceResult,
-) -> TaskPlanningPreparationOutcome:
-    """Complete the resumed bootstrap PREPARE stage with its validated result.
-
-    The Owner Resume routing's boundary-C composition for the interrupted
-    E1b PREPARE control (issue #292): the ORIGINAL bootstrap claim identity
-    and both READY bindings are re-derived from durable state — completed
-    establishment effects are never repeated — and the resumed turn's
-    validated ``workspace_result`` continues the SAME logical operation
-    through the one shared post-PREPARE tail. An already-settled stage (a
-    PREPARED-but-untransitioned bootstrap, whose outstanding fact is the
-    planning-context reconstruction rather than an interrupted turn) fails
-    closed.
-    """
-    evidence = get_task_planning_bootstrap_evidence(pool, task_id=task_id)
-    if evidence is None:
-        raise ConflictError("the task carries no planning bootstrap claim; the resume is stale")
-    if evidence.stage is not None:
-        raise ConflictError("the bootstrap PREPARE stage is already settled; the resume is stale")
-    producer = _require_ready_binding(
-        pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.PRODUCER
-    )
-    reviewer = _require_ready_binding(
-        pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.REVIEWER
-    )
-    with composed_transaction(pool) as transaction_pool:
-        original_base = _producer_snapshot_repository_base(
-            transaction_pool, producer, workspace_id=workspace_id
-        )
-    checkout_directory = f"{original_base}/{task_id}"
-    failure = _canonical_absolute_path_failure(checkout_directory)
-    if failure is not None:
-        raise ConflictError(f"the selected task checkout directory {failure}")
-    _require_prepared_workspace_result(result)
-    return _complete_prepared_bootstrap_tail(
-        pool,
-        runtime_composition,
-        workspace_id=workspace_id,
-        profile_id=profile_id,
-        task_id=task_id,
-        claim_token=evidence.claim_token,
-        expected_state_token=expected_state_token,
-        producer=producer,
-        reviewer=reviewer,
-        checkout_directory=checkout_directory,
-        attempt_evidence=None,
     )
 
 

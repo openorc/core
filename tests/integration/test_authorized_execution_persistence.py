@@ -56,11 +56,6 @@ from openorc.persistence import reviews as review_repositories
 from openorc.persistence import sessions as session_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
-from openorc.protocol.models import IMPLEMENTATION_RESULT_FAMILY
-from openorc.services.errors import ConflictError
-from openorc.services.task_authorized_implementation_execution import (
-    execute_authorized_implementation,
-)
 from openorc.services.task_implementation_authorization import (
     approve_implementation_authorization,
     open_implementation_authorization,
@@ -457,126 +452,7 @@ def _prepared_runtime(facts: dict[str, Any]) -> FakeAgentRuntimeAdapter:
     return adapter
 
 
-def _execute_call(
-    pool: DatabasePool,
-    facts: dict[str, Any],
-    *,
-    producer_runtime_factory: Any,  # noqa: ANN401
-    activity_subscription_factory: Any | None = None,  # noqa: ANN401
-) -> Any:  # noqa: ANN401 - the typed outcome
-    return execute_authorized_implementation(
-        pool,
-        profile_id=cast(uuid.UUID, facts["profile_id"]),
-        workspace_id=cast(uuid.UUID, facts["workspace_id"]),
-        task_id=cast(uuid.UUID, facts["task_id"]),
-        expected_state_token=cast(uuid.UUID, facts["state_token"]),
-        producer_runtime_factory=producer_runtime_factory,
-        activity_subscription_factory=activity_subscription_factory,
-    )
-
-
 # --- the end-to-end durable round trip --------------------------------------------
-
-
-def test_the_authorized_execution_round_trips_result_and_marker_end_to_end(
-    conn: Connection[Any],
-) -> None:
-    """One E6 attempt persists the validated result and the activity marker
-    with its succeeded finalize, records the matched Producer-attributed
-    audit, and leaves the Task/gate/plan authority untouched for E7."""
-    facts = _authorized_fixture(conn)
-    pool = facts["pool"]
-    subscription = _ScriptedActivitySubscription(pulses=1)
-    runtime = _prepared_runtime(facts)
-
-    outcome = _execute_call(
-        pool,
-        facts,
-        producer_runtime_factory=_ProducerAttachment(runtime),
-        activity_subscription_factory=subscription,
-    )
-
-    assert outcome.execution.status is ExecutionStatus.SUCCEEDED
-    assert outcome.execution.execution_number == 1
-    assert outcome.execution.implementation_result == dict(_RESULT_CANDIDATE)
-    assert outcome.execution.last_qualifying_activity_at is not None
-    assert outcome.task.status is TaskStatus.IMPLEMENTING
-    assert outcome.producer_session.id == facts["session_id"]
-    (control,) = runtime.realized_controls()
-    assert control.interaction.kind.name == "IMPLEMENT"
-    (send,) = runtime.submitted_sends()
-    assert send.expected_family == IMPLEMENTATION_RESULT_FAMILY
-
-    # The durable row carries exactly the canonical validated payload.
-    persisted = execution_repositories.get_execution(pool, execution_id=outcome.execution.id)
-    assert persisted is not None
-    assert persisted.status is ExecutionStatus.SUCCEEDED
-    assert persisted.implementation_result == dict(_RESULT_CANDIDATE)
-    assert persisted.last_qualifying_activity_at is not None
-
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'execution_started' and actor_type = 'producer' "
-            "and actor_id = %s and subject_type = 'execution' and subject_id = %s",
-            (facts["task_id"], str(facts["session_id"]), outcome.execution.id),
-        )
-        == 1
-    )
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'execution_completed' and actor_type = 'producer' "
-            "and subject_type = 'execution' and subject_id = %s",
-            (facts["task_id"], outcome.execution.id),
-        )
-        == 1
-    )
-
-
-def test_a_replayed_start_against_durable_history_refuses_before_effects(
-    conn: Connection[Any],
-) -> None:
-    """The replayed E6 start refuses on the first attempt's durable history:
-    no second reservation, claim, send, or audit ever happens."""
-    facts = _authorized_fixture(conn)
-    pool = facts["pool"]
-    first = _execute_call(
-        pool,
-        facts,
-        producer_runtime_factory=_ProducerAttachment(_prepared_runtime(facts)),
-    )
-    assert first.execution.status is ExecutionStatus.SUCCEEDED
-
-    replay_runtime = _prepared_runtime(facts)
-    with pytest.raises(ConflictError):
-        _execute_call(
-            pool,
-            facts,
-            producer_runtime_factory=_ProducerAttachment(replay_runtime),
-        )
-
-    assert replay_runtime.realized_controls() == ()
-    assert replay_runtime.submitted_sends() == ()
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.executions where task_id = %s",
-            (facts["task_id"],),
-        )
-        == 1
-    )
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type in ('execution_started', 'execution_completed')",
-            (facts["task_id"],),
-        )
-        == 2
-    )
 
 
 # --- the guarded one-shot primitives on real rows ---------------------------------

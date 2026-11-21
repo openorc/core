@@ -41,7 +41,7 @@ Runtime (no live runtime, GitHub, or Supabase access).
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -57,7 +57,6 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
 )
 from openorc.domain.connections import WorkflowRole
-from openorc.domain.executions import ExecutionStatus
 from openorc.domain.github_issues import github_issue_requirements_fingerprint
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
@@ -77,13 +76,6 @@ from openorc.persistence import sessions as session_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination
-from openorc.services.errors import ExternalOperationFailedError, StaleOperationError
-from openorc.services.task_authorized_implementation_execution import (
-    execute_authorized_implementation,
-)
-from openorc.services.task_authorized_implementation_retry import (
-    execute_authorized_implementation_retry,
-)
 from openorc.services.task_implementation_authorization import (
     approve_implementation_authorization,
     open_implementation_authorization,
@@ -512,47 +504,6 @@ def _authorize_one_retry(
     return disposition.retry_attempt
 
 
-def _retry_call(
-    facts: dict[str, Any],
-    *,
-    retry_attempt_id: uuid.UUID,
-    runtime: FakeAgentRuntimeAdapter,
-    clock: Callable[[], datetime],
-) -> Any:
-    return execute_authorized_implementation_retry(
-        cast(DatabasePool, facts["pool"]),
-        profile_id=cast(uuid.UUID, facts["profile_id"]),
-        workspace_id=cast(uuid.UUID, facts["workspace_id"]),
-        task_id=cast(uuid.UUID, facts["task_id"]),
-        expected_state_token=cast(uuid.UUID, facts["state_token"]),
-        retry_attempt_id=retry_attempt_id,
-        producer_runtime_factory=_ProducerAttachment(runtime),
-        clock=clock,
-    )
-
-
-def _failing_initial_attempt(conn: Connection[Any], facts: dict[str, Any]) -> Any:
-    """Run the real E6 initial execution with a provably pre-effect failing
-    runtime: the claimed attempt finalizes ``failed_transient`` with the
-    safe ``runtime_pre_effect`` audit, and the Task stays implementing."""
-    pool = cast(DatabasePool, facts["pool"])
-    with pytest.raises(ExternalOperationFailedError):
-        execute_authorized_implementation(
-            pool,
-            profile_id=cast(uuid.UUID, facts["profile_id"]),
-            workspace_id=cast(uuid.UUID, facts["workspace_id"]),
-            task_id=cast(uuid.UUID, facts["task_id"]),
-            expected_state_token=cast(uuid.UUID, facts["state_token"]),
-            producer_runtime_factory=_ProducerAttachment(_FailingRealizeRuntime()),
-        )
-    task = task_repositories.get_task(pool, cast(uuid.UUID, facts["task_id"]))
-    assert task is not None and task.status is TaskStatus.IMPLEMENTING
-    history = execution_repositories.list_task_executions(pool, task_id=task.id)
-    assert len(history) == 1
-    assert history[0].status is ExecutionStatus.FAILED_TRANSIENT
-    return history[0]
-
-
 def _remove_committed_rows(conn: Connection[Any], facts: dict[str, Any]) -> None:
     """The committed rows are removed so the branch database stays clean for
     the rest of the session (the same committed-fixture cleanup discipline
@@ -560,176 +511,6 @@ def _remove_committed_rows(conn: Connection[Any], facts: dict[str, Any]) -> None
     conn.execute("delete from openorc.workspaces where id = %s", (facts["workspace_id"],))
     conn.execute("delete from auth.users where id = %s", (facts["profile_id"],))
     conn.commit()
-
-
-def test_the_authorized_retry_round_trips_and_binds_set_once_end_to_end(
-    conn: Connection[Any],
-) -> None:
-    """The full chain on real rows: proven pre-effect failure → real F4
-    authorization → one retry Execution reserved, claimed, audited, and
-    bound set-once in the admission composition → successful finalize of the
-    new row only; the binding lookup resolves the exact attempt and a replay
-    refuses without minting anything."""
-    facts = _authorized_fixture(conn)
-    # The committed multi-transaction flow: the fixture commits first, then
-    # every service phase below runs as its own committed transaction (the
-    # same commit boundaries production exercises), and the committed rows
-    # are removed at the end.
-    conn.commit()
-    failed_execution = _failing_initial_attempt(conn, facts)
-    retry_attempt = _authorize_one_retry(
-        conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
-    )
-
-    outcome = _retry_call(
-        facts,
-        retry_attempt_id=retry_attempt.id,
-        runtime=_prepared_runtime(facts),
-        clock=lambda: _BASE_TIME + timedelta(seconds=3),
-    )
-
-    # The new Execution is a distinct row (number 2), successfully finalized
-    # with the validated canonical result.
-    assert outcome.execution.id != failed_execution.id
-    assert outcome.execution.execution_number == 2
-    assert outcome.execution.status is ExecutionStatus.SUCCEEDED
-    assert outcome.execution.implementation_result == dict(_RESULT_CANDIDATE)
-
-    # The F4 authorization is bound set-once to exactly this Execution: the
-    # durable lookup the F5b coordinator relies on resolves it.
-    bound = failure_repositories.find_operational_failure_attempt_by_resulting_execution(
-        cast(DatabasePool, facts["pool"]), resulting_execution_id=outcome.execution.id
-    )
-    assert bound is not None
-    assert bound.id == retry_attempt.id
-    assert bound.resulting_execution_id == outcome.execution.id
-
-    # Same-commit artifacts of the admission composition: the started audit
-    # and the completed audit name exactly the new row.
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'execution_started' and subject_type = 'execution' "
-            "and subject_id = %s",
-            (facts["task_id"], outcome.execution.id),
-        )
-        == 1
-    )
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.workflow_events where task_id = %s "
-            "and event_type = 'execution_completed' and subject_type = 'execution' "
-            "and subject_id = %s",
-            (facts["task_id"], outcome.execution.id),
-        )
-        == 1
-    )
-
-    # A replayed consumption of the same authorization is a no-effect
-    # refusal: no second Execution, no adapter acquisition.
-    replay_attachment = _ProducerAttachment(_prepared_runtime(facts))
-    with pytest.raises(StaleOperationError):
-        execute_authorized_implementation_retry(
-            cast(DatabasePool, facts["pool"]),
-            profile_id=cast(uuid.UUID, facts["profile_id"]),
-            workspace_id=cast(uuid.UUID, facts["workspace_id"]),
-            task_id=cast(uuid.UUID, facts["task_id"]),
-            expected_state_token=cast(uuid.UUID, facts["state_token"]),
-            retry_attempt_id=retry_attempt.id,
-            producer_runtime_factory=replay_attachment,
-            clock=lambda: _BASE_TIME + timedelta(seconds=3),
-        )
-    assert replay_attachment.acquisitions == 0
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.executions where task_id = %s",
-            (facts["task_id"],),
-        )
-        == 2
-    )
-    _remove_committed_rows(conn, facts)
-
-
-def test_a_premature_wakeup_refuses_and_leaves_the_authorization_consumable(
-    conn: Connection[Any],
-) -> None:
-    """The persisted due instant is enforced at actual admission: an early
-    invocation refuses before any effect, and the same authorization still
-    executes exactly once when due."""
-    facts = _authorized_fixture(conn)
-    conn.commit()  # the committed multi-transaction flow, as in production
-    failed_execution = _failing_initial_attempt(conn, facts)
-    retry_attempt = _authorize_one_retry(
-        conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
-    )
-
-    with pytest.raises(StaleOperationError):
-        _retry_call(
-            facts,
-            retry_attempt_id=retry_attempt.id,
-            runtime=_FailingRealizeRuntime(),
-            clock=lambda: _BASE_TIME + timedelta(seconds=1),
-        )
-
-    # The refusal left no durable trace: still one execution, the
-    # authorization still unbound and consumable.
-    assert (
-        _row_count(
-            conn,
-            "select count(*) from openorc.executions where task_id = %s",
-            (facts["task_id"],),
-        )
-        == 1
-    )
-    attempt = failure_repositories.get_operational_failure_attempt(
-        cast(DatabasePool, facts["pool"]), attempt_id=retry_attempt.id
-    )
-    assert attempt is not None and attempt.resulting_execution_id is None
-
-    outcome = _retry_call(
-        facts,
-        retry_attempt_id=retry_attempt.id,
-        runtime=_prepared_runtime(facts),
-        clock=lambda: _BASE_TIME + timedelta(seconds=3),
-    )
-    assert outcome.execution.execution_number == 2
-    assert outcome.execution.status is ExecutionStatus.SUCCEEDED
-    _remove_committed_rows(conn, facts)
-
-
-def test_the_pre_effect_corroboration_survives_tied_event_timestamps(
-    conn: Connection[Any],
-) -> None:
-    """Tied audit commit timestamps make the newest-first subject-event
-    ordering ambiguous: the F4 corroboration must still find the exact
-    ``execution_failed`` event of the failed attempt when the started event
-    sits above it in the ordered window, so the real triage authorizes the
-    retry instead of failing closed."""
-    facts = _authorized_fixture(conn)
-    conn.commit()  # the committed multi-transaction flow, as in production
-    failed_execution = _failing_initial_attempt(conn, facts)
-
-    # Tie both audit events of the failed attempt to one exact instant: the
-    # ordered window may return either row first, and the corroboration must
-    # find the failure event regardless.
-    conn.execute(
-        "update openorc.workflow_events set created_at = %s "
-        "where task_id = %s and subject_type = 'execution' and subject_id = %s",
-        (_BASE_TIME, facts["task_id"], failed_execution.id),
-    )
-    conn.commit()
-
-    retry_attempt = _authorize_one_retry(
-        conn, facts, execution_id=cast(uuid.UUID, failed_execution.id)
-    )
-    attempt = failure_repositories.get_operational_failure_attempt(
-        cast(DatabasePool, facts["pool"]), attempt_id=retry_attempt.id
-    )
-    assert attempt is not None and attempt.resulting_execution_id is None
-    _remove_committed_rows(conn, facts)
 
 
 def test_the_set_once_binding_and_number_backstops_enforce_the_single_consumption(

@@ -92,7 +92,6 @@ is installed.
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
@@ -103,7 +102,6 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.detached import DetachedTurnRuntime
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
-    AgentRuntimeInterruptedTurnError,
     AgentRuntimeProtocolFailureError,
     AgentRuntimeTransportError,
     AgentRuntimeUncertainOutcomeError,
@@ -158,7 +156,6 @@ from openorc.services.review_result_envelope import (
     accepted_review_result_from_iteration,
     serialize_review_result,
 )
-from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_subject_guards import (
     require_current_plan_revision,
@@ -181,9 +178,7 @@ __all__ = [
     "ProducerRuntimeAttachmentFactory",
     "QualifyingActivityPulse",
     "REMEDIATION_SETTLEMENT_SUBJECT",
-    "complete_resumed_implementation_result",
     "dispatch_authorized_implementation_detached",
-    "execute_authorized_implementation",
     "finalize_observed_implementation_failure",
     "settle_observed_implementation_result",
 ]
@@ -306,41 +301,6 @@ class _ReservedAttempt:
     execution: Execution
 
 
-class _QualifyingActivityHeartbeat:
-    """The coalescing F5 marker listener for one running attempt.
-
-    Runtime-neutral qualifying-activity pulses (issue #246) advance the
-    Execution's ``last_qualifying_activity_at`` through a short conditional
-    write. The pulse carries nothing: exact bound external-session identity
-    and vendor-specific qualification are enforced by the supplying adapter
-    before the pulse fires, so the listener only coalesces and writes. Late
-    callbacks after finalization are dropped by the conditional write.
-    Every failure — subscription, observation, or write — is advisory and
-    must never alter workflow authority or break the attempt.
-    """
-
-    def __init__(self, pool: DatabasePool, *, execution_id: UUID) -> None:
-        self._pool = pool
-        self._execution_id = execution_id
-        self._last_write_monotonic: float | None = None
-
-    def __call__(self) -> None:
-        now = time.monotonic()
-        if (
-            self._last_write_monotonic is not None
-            and now - self._last_write_monotonic < _ACTIVITY_WRITE_MIN_INTERVAL_SECONDS
-        ):
-            return
-        self._last_write_monotonic = now
-        try:
-            execution_records.record_execution_activity(self._pool, execution_id=self._execution_id)
-        except Exception:  # noqa: BLE001 - advisory telemetry never breaks the attempt
-            logger.debug(
-                "the execution activity marker write failed; the observation is "
-                "advisory and dropped"
-            )
-
-
 # --- command validation -----------------------------------------------------------
 
 
@@ -358,18 +318,6 @@ def _require_producer_factory(value: object) -> ProducerRuntimeAttachmentFactory
             "attachment context manager for the exact resolved Producer session"
         )
     return cast(ProducerRuntimeAttachmentFactory, value)
-
-
-def _require_activity_factory(value: object) -> ActivitySubscriptionFactory | None:
-    """Require the optional runtime-neutral qualifying-activity subscription factory."""
-    if value is None:
-        return None
-    if not callable(value):
-        raise InvalidCommandError(
-            "activity_subscription_factory must be a callable returning one "
-            "subscription context manager for the exact bound Producer session"
-        )
-    return cast(ActivitySubscriptionFactory, value)
 
 
 def _require_observation_registrar(value: object) -> ImplementationObservationRegistrar:
@@ -734,270 +682,6 @@ def _finalize_implementation_attempt(
 
 
 # --- the dispatch phase and the service entry -------------------------------------
-
-
-def _execute_external_phase(
-    pool: DatabasePool,
-    *,
-    reserved: _ReservedAttempt,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    message: str,
-    producer_factory: ProducerRuntimeAttachmentFactory,
-    activity_factory: ActivitySubscriptionFactory | None,
-) -> AuthorizedImplementationExecution:
-    """The authority-gated external phase: attach, realize, send, finalize."""
-    producer_external_session_id = reserved.producer_session.external_session_id
-    if producer_external_session_id is None:
-        # Narrowed by the subject loader; kept explicit for fail-closed safety.
-        raise ConflictError("the producer session binding carries no external session identity")
-    with ExitStack() as attachment_stack:
-        try:
-            runtime = attachment_stack.enter_context(producer_factory())
-        except ExternalOperationUncertainError:
-            # Uncertain attachment: the claimed attempt stays conservatively
-            # running (the potentially-dispatched record) and nothing resends.
-            raise
-        except ExternalOperationFailedError:
-            # A known attachment failure provably occurred before any effect.
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=reserved.execution.id,
-                producer_session_id=reserved.producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise
-        # --- R1: authority revalidation after acquisition, before realization. ---
-        try:
-            with composed_transaction(pool) as transaction_pool:
-                _revalidate_reserved_subjects(
-                    transaction_pool,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    expected_state_token=expected_state_token,
-                    reserved=reserved,
-                    require_ready_producer=True,
-                )
-        except (NotFoundError, ConflictError, StaleOperationError):
-            # Authority moved on during attachment, before any runtime effect:
-            # the never-dispatched attempt finalizes truthfully.
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=reserved.execution.id,
-                producer_session_id=reserved.producer_session.id,
-                next_status=ExecutionStatus.FAILED_FINAL,
-                failure_kind=_AUTHORITY_STALE_FAILURE_KIND,
-            )
-            raise
-        # --- the one native ACT handoff on the same external session ID. ---
-        try:
-            runtime.realize_control(producer_external_session_id, ImplementInteraction())
-        except AgentRuntimeUncertainOutcomeError as error:
-            raise ExternalOperationUncertainError(
-                "the outcome of the native ACT reconstruction is unknown; the implementation "
-                "attempt remains unresolved and nothing is resent"
-            ) from error
-        except (AgentRuntimeTransportError, AgentRuntimeProtocolFailureError) as error:
-            # A transport or protocol failure can arise only after the ACT
-            # handoff has done work (issue #87): the send was delivered, so
-            # implementation work may have begun. The claimed attempt stays
-            # conservatively running — never a proven non-delivery, never a
-            # safe retry.
-            logger.warning(
-                "the native ACT reconstruction ended with a post-send runtime "
-                "failure; the claimed attempt remains potentially dispatched"
-            )
-            raise ExternalOperationUncertainError(
-                "the native ACT handoff was delivered but its response could not "
-                "be interpreted; the implementation attempt remains potentially "
-                "dispatched and is never resent"
-            ) from error
-        except AgentRuntimeError as error:
-            # The remaining normalized taxonomy classes (configuration
-            # rejection, runtime unavailability, and a not-live addressed
-            # session) are positively proven to precede any effect.
-            _finalize_pre_effect_failure(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                execution_id=reserved.execution.id,
-                producer_session_id=reserved.producer_session.id,
-                next_status=ExecutionStatus.FAILED_TRANSIENT,
-                failure_kind=_RUNTIME_PRE_EFFECT_FAILURE_KIND,
-            )
-            raise ExternalOperationFailedError(
-                "the native ACT reconstruction failed before any implementation work was dispatched"
-            ) from error
-
-        return _send_and_finalize(
-            pool,
-            reserved=reserved,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            message=message,
-            runtime=runtime,
-            producer_external_session_id=producer_external_session_id,
-            activity_factory=activity_factory,
-        )
-
-
-def _send_and_finalize(
-    pool: DatabasePool,
-    *,
-    reserved: _ReservedAttempt,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    message: str,
-    runtime: AgentRuntimeAdapter,
-    producer_external_session_id: str,
-    activity_factory: ActivitySubscriptionFactory | None,
-) -> AuthorizedImplementationExecution:
-    """The subscription, R2, the one send, and the one-shot finalize."""
-    heartbeat = _QualifyingActivityHeartbeat(pool, execution_id=reserved.execution.id)
-    with ExitStack() as subscription_stack:
-        if activity_factory is not None:
-            try:
-                subscription_stack.enter_context(
-                    activity_factory(runtime, producer_external_session_id, heartbeat)
-                )
-            except Exception:  # noqa: BLE001 - advisory telemetry never gates the attempt
-                logger.debug("the execution activity subscription failed; observation is advisory")
-        try:
-            with composed_transaction(pool) as transaction_pool:
-                _revalidate_reserved_subjects(
-                    transaction_pool,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    expected_state_token=expected_state_token,
-                    reserved=reserved,
-                    require_ready_producer=True,
-                )
-        except (NotFoundError, ConflictError, StaleOperationError) as error:
-            # Realization already touched the runtime session, so an effect
-            # may have begun: the attempt stays conservatively running.
-            raise ExternalOperationUncertainError(
-                "implementation authority moved on during the ACT reconstruction; the "
-                "implementation send was refused and the attempt remains unresolved"
-            ) from error
-        try:
-            result = runtime.send(
-                producer_external_session_id,
-                message,
-                expected_family=IMPLEMENTATION_RESULT_FAMILY,
-            )
-        except AgentRuntimeInterruptedTurnError as error:
-            settle_observed_task_interrupt(
-                pool,
-                runtime,
-                task_id=task_id,
-                external_session_id=producer_external_session_id,
-            )
-            raise ExternalOperationUncertainError(
-                "the implementation send was interrupted by the runtime after possible "
-                "implementation work; the attempt remains unresolved and is never resent"
-            ) from error
-        except AgentRuntimeUncertainOutcomeError as error:
-            raise ExternalOperationUncertainError(
-                "the outcome of the implementation send is unknown; the attempt remains "
-                "potentially dispatched and is never resent"
-            ) from error
-        except AgentRuntimeError as error:
-            raise ExternalOperationUncertainError(
-                "the implementation send ended without a validated formal completion after "
-                "possible implementation work; the attempt remains unresolved and is never "
-                "resent"
-            ) from error
-        if not isinstance(result, ImplementationResult):
-            raise ExternalOperationUncertainError(
-                "the implementation completion was not the expected formal result family; "
-                "the attempt remains unresolved and is never resent"
-            )
-    # --- the one-shot finalize (subscription closed; the lease is still open). ---
-    with composed_transaction(pool) as transaction_pool:
-        # Any revalidation failure here leaves the attempt conservatively
-        # running: after effects may have begun, history is never rewritten
-        # and no false outcome is fabricated.
-        current_task = _revalidate_reserved_subjects(
-            transaction_pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            reserved=reserved,
-            require_ready_producer=False,
-        )
-        finalized = _finalize_implementation_attempt(
-            transaction_pool, task=current_task, execution=reserved.execution, result=result
-        )
-    return AuthorizedImplementationExecution(
-        task=current_task,
-        execution=finalized,
-        implementation_result=result,
-        producer_session=reserved.producer_session,
-        owner_gate=reserved.owner_gate,
-    )
-
-
-def execute_authorized_implementation(
-    pool: DatabasePool,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
-    activity_subscription_factory: ActivitySubscriptionFactory | None = None,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-) -> AuthorizedImplementationExecution:
-    """Execute the E5-authorized implementation in the existing Producer session.
-
-    One Owner-authenticated, exact-subject seam: the exact approved gate/plan
-    handoff is re-derived from durable state (never caller-supplied), the
-    original READY Producer session is resolved, and exactly one initial
-    implementation attempt is reserved, dispatched, validated, and finalized.
-    The caller cannot supply a free-text acceptance, choose a different
-    Producer session, or replay a dispatched attempt.
-    """
-    _require_uuid_command(profile_id, "profile_id")
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    producer_factory = _require_producer_factory(producer_runtime_factory)
-    activity_factory = _require_activity_factory(activity_subscription_factory)
-    with application_span(_SERVICE_TRACER_SCOPE, _EXECUTE_SPAN_NAME) as span:
-        annotate_span(
-            span,
-            operation=_EXECUTE_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-        # --- Phase 1: admission and the durable attempt reservation. ---
-        reserved, message = _reserve_authorized_attempt(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            attempt_evidence=attempt_evidence,
-        )
-        # --- Phases 2 and 3: the authority-gated effects and the finalize. ---
-        return _execute_external_phase(
-            pool,
-            reserved=reserved,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            message=message,
-            producer_factory=producer_factory,
-            activity_factory=activity_factory,
-        )
 
 
 def _reserve_authorized_attempt(
@@ -1501,58 +1185,6 @@ def _dispatch_detached_external_phase(
         producer_session=reserved.producer_session,
         receipt=outcome.receipt if outcome.receipt is not None else receipt,
     )
-
-
-def complete_resumed_implementation_result(
-    transaction_pool: DatabasePool,
-    *,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    execution_id: UUID,
-    result: ImplementationResult,
-) -> tuple[Task, Execution]:
-    """Complete the resumed implementation attempt with its formal result.
-
-    The Owner Resume routing's boundary-C composition for the interrupted
-    E6 implementation execution (issue #292): the exact Task/token/status
-    currentness and the full authorized-subject derivation are re-proven
-    from durable state under the caller's Task row lock, the addressed
-    Execution must still be the running attempt anchored to the Task's
-    Producer session, and the resumed formal result completes it through
-    the one shared finalize. No new attempt is ever created, no original
-    prompt is replayed, and the interrupted attempt's history is preserved:
-    the resumed turn continues the SAME logical operation.
-    """
-    locked = task_records.get_task_for_update(transaction_pool, task_id)
-    if locked is None or locked.workspace_id != workspace_id:
-        raise NotFoundError("the requested task is not available in this workspace")
-    task = require_current_task(
-        transaction_pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=expected_state_token,
-    )
-    _require_implementing_task(task)
-    _gate, _revision, _loop, _iteration, producer_session = _load_authorized_subjects(
-        transaction_pool, task=task, require_ready_producer=False
-    )
-    execution = execution_records.get_execution(transaction_pool, execution_id=execution_id)
-    if (
-        execution is None
-        or execution.workspace_id != workspace_id
-        or execution.task_id != task_id
-        or execution.producer_session_id != producer_session.id
-        or execution.status is not ExecutionStatus.RUNNING
-    ):
-        raise StaleOperationError(
-            "the addressed implementation attempt is not the task's running "
-            "producer attempt; the resumed result cannot complete it"
-        )
-    finalized = _finalize_implementation_attempt(
-        transaction_pool, task=task, execution=execution, result=result
-    )
-    return task, finalized
 
 
 # --- detached Hub-run settlement (issue #322) --------------------------------------

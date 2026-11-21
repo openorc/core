@@ -50,7 +50,7 @@ from openorc.services.task_cancellation import (
     TaskPrClosureOutcomeKind,
     cancel_task_for_confirmed_pr_closure,
 )
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_installation,
     _insert_profile,
     _insert_repository,

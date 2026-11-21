@@ -101,7 +101,6 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
-    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.adapters.github import GitHubAppClient
@@ -131,7 +130,6 @@ from openorc.persistence.executions import ExecutionStatus
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
-from openorc.protocol.interaction import PrReviewSubject, ReviewInteraction
 from openorc.protocol.models import (
     IMPLEMENTATION_RESULT_FAMILY,
     REVIEW_RESULT_FAMILY,
@@ -151,10 +149,8 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
-from openorc.services.task_pr_composition import TaskPrPublished
 from openorc.services.task_pull_request_reconciliation import (
     TaskPullRequestReconciliation,
     reconcile_task_pull_request,
@@ -171,13 +167,11 @@ __all__ = [
     "PrReviewObservationRegistrar",
     "ReviewerRuntimeAttachmentFactory",
     "TaskPrReviewDispatchOutcome",
-    "dispatch_pr_review",
     "dispatch_pr_review_detached",
     "serialize_implementation_result_message",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_review_dispatch"
-_DISPATCH_SPAN_NAME = "task_pr_review_dispatch.dispatch_pr_review"
 _DISPATCH_DETACHED_SPAN_NAME = "task_pr_review_dispatch.dispatch_pr_review_detached"
 
 # The positively established pre-effect refusal kinds the detached dispatch's
@@ -258,24 +252,6 @@ def _require_github(value: object) -> GitHubAppClient:
         if not callable(getattr(value, capability, None)):
             raise InvalidCommandError("github must be a GitHubAppClient")
     return cast(GitHubAppClient, value)
-
-
-def _require_published(value: object) -> TaskPrPublished:
-    """Require E8's typed publication facts as the triggering command.
-
-    The facts are triggering, never authority: every authority-bearing fact
-    is re-derived from current persistence and from the authoritative
-    reconciliation. Only the shape is validated here, before telemetry.
-    """
-    if not isinstance(value, TaskPrPublished):
-        raise InvalidCommandError(
-            "published must be the TaskPrPublished facts of the canonical PR publication"
-        )
-    if not isinstance(value.task, Task) or not isinstance(value.pull_request, TaskPullRequest):
-        raise InvalidCommandError(
-            "published must carry the post-publication Task and canonical TaskPullRequest facts"
-        )
-    return value
 
 
 def _require_ready_reviewer(
@@ -676,59 +652,6 @@ def _require_review_eligible_pull_request(
 # --- the ONE send -------------------------------------------------------------------
 
 
-def _realize_pr_review_control(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
-    session_id: str,
-    *,
-    task_id: UUID,
-    interaction: ReviewInteraction,
-    message: str,
-) -> ReviewResult:
-    """Send ONE established REVIEW interaction to the exact Reviewer session.
-
-    The #67 shared funnel performs the formal validation; the service never
-    adds an E-specific parser, inspects review semantics, or manages runtime
-    modes. Known failure and uncertain outcome stay distinct, and neither is
-    ever retried or resent here: an uncertain send leaves the reserved
-    attempt unresolved for the decision finalization to reconcile.
-    """
-    try:
-        outcome = runtime.realize_control(
-            session_id, interaction, message=message, expected_family=REVIEW_RESULT_FAMILY
-        )
-    except AgentRuntimeInterruptedTurnError as error:
-        settle_observed_task_interrupt(
-            pool, runtime, task_id=task_id, external_session_id=session_id
-        )
-        raise ExternalOperationFailedError(
-            "the agent runtime pr review interaction was interrupted by the runtime; "
-            "the reserved review attempt remains unresolved"
-        ) from error
-    except AgentRuntimeUncertainOutcomeError as error:
-        logger.warning(
-            "pr review dispatch ended with an uncertain runtime outcome; "
-            "the reserved review attempt remains unresolved"
-        )
-        raise ExternalOperationUncertainError(
-            "the outcome of the agent runtime pr review interaction is unknown; "
-            "the reserved review attempt remains unresolved"
-        ) from error
-    except AgentRuntimeError as error:
-        raise ExternalOperationFailedError(
-            "the agent runtime pr review interaction failed; the reserved review "
-            "attempt remains unresolved"
-        ) from error
-    if not isinstance(outcome, ReviewResult):
-        # A formal send with an expected family returns a typed formal
-        # result or raises; anything else is a known non-answer.
-        raise ExternalOperationFailedError(
-            "the agent runtime did not return a typed review result; the "
-            "reserved review attempt remains unresolved"
-        )
-    return outcome
-
-
 def _revalidate_reserved_subjects(
     pool: DatabasePool,
     *,
@@ -985,148 +908,6 @@ def _reserve_pr_review_attempt(
         head_sha=head_sha,
         message_payload=payload,
     )
-
-
-def dispatch_pr_review(
-    pool: DatabasePool,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    github: GitHubAppClient,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    published: TaskPrPublished,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-) -> TaskPrReviewDispatchOutcome:
-    """Dispatch the canonical PR's ordinary review to the admitted Reviewer.
-
-    Ordered phases (authorization before every adapter acquisition):
-
-    **Phase A0 — authenticated admission (database only, closed before any
-    external call):** the account-operational barrier and the exact
-    authenticated Owner Workspace/Task scope. Nothing else; no durable
-    workflow effects. A foreign or cross-Owner invocation is rejected here,
-    before any GitHub read or PR-snapshot write can occur.
-
-    **Phase A — authoritative reconciliation (no transaction open):** B7
-    reconciles the canonical PR against GitHub; the reconciled record must be
-    open/unmerged, on the canonical head branch, on the workflow base routing,
-    with the fresh reconciled head SHA. The latest appropriate successful
-    ``implementation_result`` is resolved as durable evidence for the head.
-
-    **Phase B — reservation transaction (database only):** the account
-    barrier and Owner scope are re-proved under the Task row ``FOR UPDATE``;
-    the Task must be non-archived ``REVIEWING`` at the expected token with no
-    current OwnerGate and a bound canonical feature branch; the canonical PR
-    must still carry exactly the reconciled head; the exact admitted READY
-    Reviewer session is resolved; the single OPEN ``PR_REVIEW`` loop is
-    established once if absent (snapshotting the Workspace limit); and, under
-    the loop row lock, one next-numbered unfinalized PR/head iteration is
-    reserved — after refusing unresolved earlier attempts and duplicate
-    dispatch for an already-reviewed head.
-
-    **Phase C — the post-attachment currentness proof (one short
-    database-only transaction, no GitHub I/O):** after the exact Reviewer
-    attachment is acquired, the reserved Task/token/``REVIEWING`` status,
-    the canonical PR identity/head, and the exact Reviewer binding are
-    re-proven under the Task row ``FOR UPDATE``; any moved subject fails
-    closed without sending.
-
-    **Phase D — the ONE send (outside transactions):** with the revalidation
-    transaction closed, ONE ``ReviewInteraction`` with an exact
-    ``PrReviewSubject`` is realized with ``expected_family=REVIEW_RESULT_FAMILY``
-    on the original external session, the entire message being the serialized
-    persisted ``implementation_result``. Known failure and uncertain outcome
-    stay distinct; an uncertain send leaves the reserved iteration unresolved.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
-        # --- Phase 0: command shape (no I/O). ---
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
-        github_client = _require_github(github)
-        published_facts = _require_published(published)
-        annotate_span(
-            span,
-            operation=_DISPATCH_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phases A0/A/B: the shared authenticated admission, the
-        # authoritative reconciliation, and the atomic reservation. The
-        # triggering publication facts must name exactly the reconciled
-        # canonical record. ---
-        reserved = _reserve_pr_review_attempt(
-            pool,
-            github_client,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            expected_pull_request_id=published_facts.pull_request.id,
-        )
-
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's committed
-            # reserved PR/head review iteration identity (#262).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
-                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
-                original_attempt_id=reserved.iteration.id,
-                phase="pr_review_dispatch",
-            )
-
-        # --- Phases C and D: the ONE send, with NO database transaction open. ---
-        subject = PrReviewSubject(
-            repository_full_name=reserved.repository_full_name,
-            pull_request_number=reserved.pull_request.github_pr_number,
-            head_sha=reserved.head_sha,
-            issue_number=reserved.task.github_issue_number,
-        )
-        interaction = ReviewInteraction(subject=subject)
-        message = serialize_implementation_result_message(reserved.message_payload)
-        with reviewer_factory(reserved.reviewer) as runtime:
-            # Phase C: the post-attachment currentness proof — one short
-            # database-only transaction re-proving the exact reserved
-            # Task/token/status, PR identity/head, and Reviewer binding after
-            # acquisition and immediately before the send. The transaction
-            # closes before the send; no database transaction spans it.
-            _revalidate_reserved_subjects(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=reserved.task.state_token,
-                expected_pull_request_id=reserved.pull_request.id,
-                reserved_head_sha=reserved.head_sha,
-                reviewer_session=reserved.reviewer,
-            )
-            review_result = _realize_pr_review_control(
-                pool,
-                runtime,
-                reserved.reviewer.external_session_id or "",
-                task_id=task_id,
-                interaction=interaction,
-                message=message,
-            )
-
-        # --- the internal continuation input for the decision. ---
-        # No verdict is recorded and no workflow consequence is applied here:
-        # the decision module records the iteration result and its consequence
-        # in one transaction, rechecking the exact Task/token/PR/head/session
-        # subjects this dispatch proved.
-        return TaskPrReviewDispatchOutcome(
-            review_loop=reserved.loop,
-            review_iteration=reserved.iteration,
-            review_result=review_result,
-            reviewer_session=reserved.reviewer,
-            task=reserved.task,
-            pull_request=reserved.pull_request,
-            reconciled_head_sha=reserved.head_sha,
-        )
 
 
 # --- the detached regular-mode dispatch (issue #338) ---------------------------------

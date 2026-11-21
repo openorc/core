@@ -82,7 +82,6 @@ from openorc.domain.intents import TaskInterruptIntentStatus
 from openorc.domain.runtime_requests import RuntimeRequestStatus
 from openorc.domain.send_claims import TaskRuntimeSendClaimStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
-from openorc.observability import annotate_span, application_span
 from openorc.persistence import detached_turns as detached_turn_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
@@ -108,7 +107,6 @@ __all__ = [
     "TerminalCleanupEstablishmentKind",
     "TerminalCheckoutCleanupRuntime",
     "establish_terminal_checkout_cleanup",
-    "execute_terminal_checkout_cleanup",
 ]
 
 logger = logging.getLogger(__name__)
@@ -279,55 +277,6 @@ def _producer_work_quiescent(
     )
 
 
-def execute_terminal_checkout_cleanup(
-    pool: DatabasePool,
-    runtime: TerminalCheckoutCleanupRuntime,
-    *,
-    workspace_id: UUID,
-    task_id: UUID,
-) -> TerminalCheckoutCleanupExecution:
-    """Run one bounded terminal checkout cleanup attempt (issue #256, #317).
-
-    Rechecks every current terminalization, identity, and safety fact from
-    durable state — the caller carries only the scoped Workspace/Task
-    identifiers, so a replayed or delayed execution is harmless and a
-    duplicate terminal observation never re-attempts unsafely. Skips
-    (bounded dispositions) are legitimate outcomes, not failures: no
-    cleanup state is recorded here, the Task and its history are never
-    touched, and no gate, block, escalation, or retry ever follows. No
-    database transaction is held across the runtime realization. The
-    eligibility establishment is the shared derivation the detached
-    admission consumes (issue #344); this entry point is the blocking
-    realization the explicitly selected queue-mode interim keeps.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _EXECUTE_SPAN_NAME) as span:
-        annotate_span(
-            span,
-            operation=_EXECUTE_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-        establishment = establish_terminal_checkout_cleanup(
-            pool, workspace_id=workspace_id, task_id=task_id
-        )
-        if establishment.kind is not TerminalCleanupEstablishmentKind.ELIGIBLE:
-            return TerminalCheckoutCleanupExecution(
-                disposition=TerminalCheckoutCleanupDisposition(establishment.kind.value)
-            )
-        task, _binding, external_session_id, original_base, interaction = _established_subjects(
-            establishment
-        )
-        return _realize_cleanup(
-            pool,
-            runtime,
-            workspace_id=workspace_id,
-            task_id=task.id,
-            external_session_id=external_session_id,
-            original_base=original_base,
-            interaction=interaction,
-        )
-
-
 def establish_terminal_checkout_cleanup(
     pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
 ) -> TerminalCheckoutCleanupEstablishment:
@@ -432,72 +381,3 @@ def _require_cleanup_session_id(binding: TaskAgentSession) -> str:
         # explicit for fail-closed safety and type narrowing.
         raise ApplicationError("the producer binding carries no external session identity")
     return external_session_id
-
-
-def _established_subjects(
-    establishment: TerminalCheckoutCleanupEstablishment,
-) -> tuple[Task, TaskAgentSession, str, str, CleanupWorkspaceInteraction]:
-    """Unpack an eligible establishment's exact subjects, fail-closed."""
-    if (
-        establishment.task is None
-        or establishment.binding is None
-        or establishment.external_session_id is None
-        or establishment.original_base is None
-        or establishment.interaction is None
-    ):
-        # Unreachable: the establishment's own coherence validation
-        # guarantees the subjects for ELIGIBLE. Kept explicit for
-        # fail-closed safety and type narrowing.
-        raise ApplicationError("the cleanup establishment carries no eligible subjects")
-    return (
-        establishment.task,
-        establishment.binding,
-        establishment.external_session_id,
-        establishment.original_base,
-        establishment.interaction,
-    )
-
-
-def _realize_cleanup(
-    pool: DatabasePool,
-    runtime: TerminalCheckoutCleanupRuntime,
-    *,
-    workspace_id: UUID,
-    task_id: UUID,
-    external_session_id: str,
-    original_base: str,
-    interaction: CleanupWorkspaceInteraction,
-) -> TerminalCheckoutCleanupExecution:
-    """Realize the composed authorized cleanup; contain failures."""
-    try:
-        result = runtime.cleanup_checkout(
-            pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            external_session_id=external_session_id,
-            working_directory=original_base,
-            interaction=interaction,
-        )
-    except Exception as error:  # noqa: BLE001 - contained with safe classification
-        logger.warning(
-            "terminal checkout cleanup realization failed (error type %s)",
-            type(error).__name__,
-        )
-        return TerminalCheckoutCleanupExecution(
-            disposition=TerminalCheckoutCleanupDisposition.CONTAINED_FAILURE
-        )
-    if (
-        not isinstance(result, WorkspaceResult)
-        or result.operation != _CLEANUP_OPERATION
-        or result.status not in _ACCEPTED_CLEANUP_STATUSES
-    ):
-        # The typed result must address the requested operation; an
-        # uncertain/mismatched answer is never independent filesystem proof
-        # and never triggers another send.
-        logger.warning("terminal checkout cleanup realized an unusable workspace result")
-        return TerminalCheckoutCleanupExecution(
-            disposition=TerminalCheckoutCleanupDisposition.CONTAINED_FAILURE
-        )
-    return TerminalCheckoutCleanupExecution(
-        disposition=TerminalCheckoutCleanupDisposition.CLEANUP_SENT
-    )

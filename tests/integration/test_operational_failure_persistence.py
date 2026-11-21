@@ -64,7 +64,7 @@ from openorc.services.task_operational_failure_triage import (
     OperationalFailureReport,
     triage_operational_failure,
 )
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_connection,
     _insert_installation,
     _insert_profile,

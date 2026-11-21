@@ -81,11 +81,9 @@ from openorc.services.operation_attempt_evidence import InvocationAttemptEvidenc
 from openorc.services.task_authorized_implementation_execution import (
     ProducerRuntimeAttachmentFactory,
     dispatch_authorized_implementation_detached,
-    execute_authorized_implementation,
 )
 from openorc.services.task_authorized_implementation_retry import (
     dispatch_authorized_implementation_retry_detached,
-    execute_authorized_implementation_retry,
 )
 from openorc.services.task_authorized_merge_retry import (
     execute_authorized_merge_retry,
@@ -94,14 +92,12 @@ from openorc.services.task_authorized_pr_authorization_retry import (
     execute_authorized_pr_authorization_retry,
 )
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
-from openorc.services.task_detached_turn_observation import DetachedTurnObservationRegistrar
 from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
 )
 from openorc.services.task_owner_resume import (
     AuthorizedTaskResume,
-    SessionResumeFollowUp,
     dispatch_authorized_task_resume,
 )
 from openorc.services.task_owner_reviewer_discussion import (
@@ -111,7 +107,6 @@ from openorc.services.task_plan_production import (
     TaskPlanProductionOutcome,
     dispatch_initial_plan_detached,
     dispatch_planning_revise_detached,
-    produce_initial_task_plan,
 )
 from openorc.services.task_planning_bootstrap import (
     ResumableBootstrapContinuation,
@@ -123,30 +118,21 @@ from openorc.services.task_planning_bootstrap import (
     find_resumable_bootstrap_continuation,
     prepare_task_for_planning,
 )
-from openorc.services.task_planning_review_decision import (
-    PlanningReviewDecision,
-    finalize_planning_review_decision,
-)
 from openorc.services.task_planning_review_dispatch import (
-    dispatch_planning_review,
     dispatch_planning_review_detached,
 )
 from openorc.services.task_pr_authorization import ApprovedPrAuthorization, open_pr_authorization
 from openorc.services.task_pr_composition import (
     TaskPrPublished,
-    compose_and_publish_task_pr,
     dispatch_pr_compose_detached,
     publish_settled_task_pr_composition,
 )
 from openorc.services.task_pr_remediation import (
-    TaskPrRemediationOutcome,
     dispatch_pr_remediation_detached,
     verify_settled_pr_remediation_push,
 )
-from openorc.services.task_pr_review_decision import finalize_pr_review_decision
 from openorc.services.task_pr_review_dispatch import (
     ReviewerRuntimeAttachmentFactory,
-    dispatch_pr_review,
     dispatch_pr_review_detached,
 )
 from openorc.services.task_start import TaskStartOutcome, TaskStartStatus
@@ -160,7 +146,6 @@ from openorc.services.task_workflow_operation_coordinator import (
     coordinate_task_workflow_operation,
 )
 from openorc.workers.invocation import (
-    ExecutionMode,
     InvalidInvocationError,
     OperationDependencies,
     OperationHandler,
@@ -1397,13 +1382,18 @@ def _compose_task_planning_bootstrap_and_initial_plan(
     and the payload's exact post-start token authorizes the whole operation.
     On success the exact post-E2 token authorizes the first review round.
 
-    In regular mode the mandatory initialization is dispatched as detached
-    agent turns (issue #324): the preparation returns the dispatched
-    suspension, this composition returns without waiting for
-    ``session_ready``, and the observed completions settle readiness and
-    resume the bootstrap through the post-commit continuation trigger. The
-    queue-mode interim (until #328) keeps the blocking establishment and the
-    full in-process sequence.
+    The mandatory initialization is dispatched as detached agent turns
+    (issue #324): the preparation returns the dispatched suspension, this
+    composition returns without waiting for ``session_ready``, and the
+    observed completions settle readiness and resume the bootstrap through
+    the post-commit continuation trigger. The initial PLAN is itself
+    dispatched as one detached agent turn (issue #335): the composition
+    returns after the durable admission — no ``send`` and no blocking wait —
+    and the independently observed completion settles the validated plan
+    result, with the ONE post-commit completion handoff submitting the typed
+    planning REVIEW from committed state (issue #347: both execution modes
+    run this same detached composition; queue mode resolves the remote
+    registrar proxy over the #346 registration handshake).
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -1415,12 +1405,11 @@ def _compose_task_planning_bootstrap_and_initial_plan(
     expected_state_token = UUID(payload.expected_state_token)
 
     # The detached establishment needs the executing process's detached-turn
-    # observation registration seam — a regular-mode process dependency
-    # (issue #323). Queue mode resolves none and keeps the blocking
-    # establishment interim.
-    observation_registrar: DetachedTurnObservationRegistrar | None = None
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        observation_registrar = dependencies.detached_turn_observer()
+    # observation registration seam — a process dependency in both execution
+    # modes (issues #323/#346): regular mode resolves the serving process's
+    # own observation host; queue mode resolves the remote registrar proxy
+    # over the private authenticated registration handshake.
+    observation_registrar = dependencies.detached_turn_observer()
 
     preparation = prepare_task_for_planning(
         pool,
@@ -1441,70 +1430,30 @@ def _compose_task_planning_bootstrap_and_initial_plan(
         # information only and the durable resumable state owns recovery.
         return
     assert isinstance(preparation, TaskPlanningPreparationOutcome)
-    # The regular-mode initial PLAN is dispatched as one detached agent turn
-    # (issue #335): the composition returns after the durable admission — no
+    # The initial PLAN is dispatched as one detached agent turn (issue
+    # #335): the composition returns after the durable admission — no
     # ``send`` and no blocking wait — and the independently observed
     # completion settles the validated plan result, with the ONE post-commit
     # completion handoff submitting the typed planning REVIEW from committed
-    # state. The queue-mode interim (until #328) keeps the blocking
-    # composition and the in-process review submission.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatch_initial_plan_detached(
-            pool,
-            github,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            profile_id=profile_id,
-            preparation=preparation,
-            producer_runtime_factory=_producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        # The detached dispatch is durably admitted: the worker returns
-        # without waiting for the plan result. The observed completion owns
-        # the settlement; submission outcomes are transport information only
-        # and the durable state owns recovery.
-        return
-    # The initial PLAN is produced in the prepared Producer session's
-    # planning checkout, using the same logical invocation's preparation
-    # outcome (never re-derived, never serialized).
-    with attach_cline_runtime(
+    # state.
+    dispatch_initial_plan_detached(
         pool,
+        github,
         workspace_id=workspace_id,
         task_id=task_id,
-        role=WorkflowRole.PRODUCER,
-        phase=ClineAttachmentPhase.BOUND,
-        external_session_id=_require_external_session_id(preparation.producer_session, "producer"),
-        working_directory=preparation.producer_checkout_directory,
-    ) as attached:
-        production = produce_initial_task_plan(
-            pool,
-            attached.adapter,
-            github,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            profile_id=profile_id,
-            preparation=preparation,
-            attempt_evidence=attempt_evidence,
-        )
-    _submit_continuation(
-        dependencies,
-        OperationInvocation(
-            kind=OperationKind.TASK_PLANNING_REVIEW,
-            payload=TaskPlanningReviewPayload(
-                task=TaskScope(
-                    workspace_id=payload.task.workspace_id,
-                    task_id=payload.task.task_id,
-                    role=WorkflowRoleRef.REVIEWER,
-                ),
-                profile_id=payload.profile_id,
-                expected_state_token=str(production.task.state_token),
-            ),
+        profile_id=profile_id,
+        preparation=preparation,
+        producer_runtime_factory=_producer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
         ),
+        observation_registrar=observation_registrar,
+        completion_handoff=build_detached_completion_handoff(dependencies),
+        attempt_evidence=attempt_evidence,
     )
+    # The detached dispatch is durably admitted: the worker returns without
+    # waiting for the plan result. The observed completion owns the
+    # settlement; submission outcomes are transport information only and the
+    # durable state owns recovery.
 
 
 def _compose_task_planning_review(
@@ -1515,32 +1464,25 @@ def _compose_task_planning_review(
 ) -> None:
     """Run one planning review round.
 
-    Regular mode (issue #336): the REVIEW dispatch is itself one detached
-    agent turn — the composition re-derives the round's exact
-    plan-production subject from committed state under the payload's exact
-    token, reserves exactly one next-numbered unfinalized ReviewIteration
-    for that exact plan (the OPEN planning loop established on first review
-    with the Workspace's snapshotted budget), commits the iteration's
-    detached-turn receipt companion, and admits the composed canonical
-    REVIEW message verbatim on the exact READY Reviewer session before
-    returning. No ``send`` and no blocking wait exists here; the
-    independently observed completion settles the validated ``review_result``
-    through the owning E3b decision settlement, and the ONE post-commit
-    completion handoff owns the workflow continuation from committed state
-    (the exact-plan IMPLEMENTATION_AUTHORIZATION presentation on acceptance,
-    the detached Producer REVISE dispatch on an in-budget change request,
-    and nothing on exhaustion — the REVIEW_RESOLUTION gate already stands).
-    A stale, duplicate, or late REVIEW observation can never decide twice.
-
-    Queue mode keeps the blocking E3a dispatch and the in-process E3b
-    decision with the merged E2 revise until #328: on an in-budget change
-    request the fresh post-revise token authorizes the next round's
-    submission; on acceptance the exact-plan implementation gate is
-    presented (never approved); on exhaustion the REVIEW_RESOLUTION gate
-    already stands.
+    The REVIEW dispatch is itself one detached agent turn (issue #336): the
+    composition re-derives the round's exact plan-production subject from
+    committed state under the payload's exact token, reserves exactly one
+    next-numbered unfinalized ReviewIteration for that exact plan (the OPEN
+    planning loop established on first review with the Workspace's
+    snapshotted budget), commits the iteration's detached-turn receipt
+    companion, and admits the composed canonical REVIEW message verbatim on
+    the exact READY Reviewer session before returning. No ``send`` and no
+    blocking wait exists here; the independently observed completion settles
+    the validated ``review_result`` through the owning E3b decision
+    settlement, and the ONE post-commit completion handoff owns the workflow
+    continuation from committed state (the exact-plan
+    IMPLEMENTATION_AUTHORIZATION presentation on acceptance, the detached
+    Producer REVISE dispatch on an in-budget change request, and nothing on
+    exhaustion — the REVIEW_RESOLUTION gate already stands). A stale,
+    duplicate, or late REVIEW observation can never decide twice (issue
+    #347: both execution modes run this same detached composition).
     """
     pool = dependencies.database_pool()
-    github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
     profile_id = UUID(payload.profile_id)
@@ -1549,31 +1491,13 @@ def _compose_task_planning_review(
     production = _reload_plan_production_outcome(
         pool, workspace_id=workspace_id, task_id=task_id, expected_state_token=expected_state_token
     )
-    # The regular-mode REVIEW dispatch is itself one detached agent turn
-    # (issue #336): no Reviewer attachment is acquired in this composition
-    # and no decision runs in-process — the reserved ReviewIteration, its
-    # detached-turn receipt companion, and the verbatim admission commit
-    # here, and the independently observed completion owns the decision
-    # settlement with the ONE post-commit completion handoff owning the
-    # workflow continuation from committed state.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatch_planning_review_detached(
-            pool,
-            _reviewer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            plan_production=production,
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        return
-    # The blocking queue-mode interim (until #328): the blocking E3a Reviewer
-    # dispatch and the in-process E3b decision with the merged E2 revise.
-    dispatch_outcome = dispatch_planning_review(
+    # No Reviewer attachment is acquired in this composition and no decision
+    # runs in-process — the reserved ReviewIteration, its detached-turn
+    # receipt companion, and the verbatim admission commit here, and the
+    # independently observed completion owns the decision settlement with
+    # the ONE post-commit completion handoff owning the workflow continuation
+    # from committed state.
+    dispatch_planning_review_detached(
         pool,
         _reviewer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
@@ -1582,76 +1506,14 @@ def _compose_task_planning_review(
         workspace_id=workspace_id,
         task_id=task_id,
         plan_production=production,
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
         attempt_evidence=attempt_evidence,
     )
-    with attach_cline_runtime(
-        pool,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        role=WorkflowRole.PRODUCER,
-        phase=ClineAttachmentPhase.BOUND,
-        external_session_id=_bound_session_external_id(
-            pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.PRODUCER
-        ),
-        working_directory=_producer_checkout_directory(
-            pool, workspace_id=workspace_id, task_id=task_id
-        ),
-    ) as attached:
-        decision = finalize_planning_review_decision(
-            pool,
-            attached.adapter,
-            github,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=production.task.state_token,
-            review_iteration_id=dispatch_outcome.review_iteration.id,
-            review_result=dispatch_outcome.review_result,
-            expected_reviewer_session_id=dispatch_outcome.reviewer_session.id,
-            attempt_evidence=attempt_evidence,
-        )
-    if decision.decision is PlanningReviewDecision.REVISION_ROUTED:
-        routed_production = decision.revision_production
-        if routed_production is None:
-            # Defensive invariant: a revision-routed decision always carries
-            # the produced revision continuation.
-            raise ConflictError(
-                "the revision-routed planning decision carried no produced revision"
-            )
-        _submit_continuation(
-            dependencies,
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_REVIEW,
-                payload=TaskPlanningReviewPayload(
-                    task=TaskScope(
-                        workspace_id=payload.task.workspace_id,
-                        task_id=payload.task.task_id,
-                        role=WorkflowRoleRef.REVIEWER,
-                    ),
-                    profile_id=payload.profile_id,
-                    expected_state_token=str(routed_production.task.state_token),
-                ),
-            ),
-        )
-    elif decision.decision is PlanningReviewDecision.ACCEPTED_CLEAR:
-        # The ordinary authorized continuation of accepted formal review:
-        # present the exact-plan IMPLEMENTATION_AUTHORIZATION gate. No Owner
-        # decision is required to present it, and approval never follows from
-        # Reviewer acceptance — the explicit E5 approval remains an Owner
-        # command outside this module. The shared source-requirements
-        # pre-check (issue #289) freshly verifies the authoritative issue
-        # before the gate is presented; a confirmed requirements change
-        # blocks the Task through the shared atomic drift-block path.
-        open_implementation_authorization(
-            pool,
-            github,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=decision.task.state_token,
-        )
-    # EXHAUSTED ends here: the exact-plan REVIEW_RESOLUTION gate is already
-    # installed and its Owner-mediated resolution is not a workflow operation.
+    # The detached dispatch is durably admitted: the worker returns without
+    # waiting for the review result. The observed completion owns the
+    # settlement; submission outcomes are transport information only and the
+    # durable state owns recovery.
 
 
 def _compose_task_authorized_implementation(
@@ -1666,19 +1528,16 @@ def _compose_task_authorized_implementation(
     durable state (never caller-supplied) and reserves exactly one initial
     implementation attempt.
 
-    In regular mode the implementation is dispatched as one detached agent
-    turn (issues #325/#333): the composition returns after the durable
-    admission — no ``send`` and no blocking wait — and the independently
-    observed completion settles the attempt through the shared finalize,
-    with the ONE post-commit completion handoff presenting the exact-head
-    PR_AUTHORIZATION gate from committed state. The queue-mode interim
-    (until #328) keeps the blocking composition: on the successful
-    finalized execution, the ordinary authorized continuation presents the
-    exact-head PR_AUTHORIZATION gate with the exact post-execution token
-    and the finalized Execution identity — no Owner decision is required to
-    present it, the service's existing GitHub authority checks (including
-    the direct ``github_source_changed`` block) pass through unchanged, and
-    the explicit E7 approval remains an Owner command outside this module.
+    The implementation is dispatched as one detached agent turn (issues
+    #325/#333): the composition returns after the durable admission — no
+    ``send`` and no blocking wait — and the independently observed completion
+    settles the attempt through the shared finalize, with the ONE post-commit
+    completion handoff presenting the exact-head PR_AUTHORIZATION gate from
+    committed state — no Owner decision is required to present it, the
+    service's existing GitHub authority checks (including the direct
+    ``github_source_changed`` block) pass through unchanged, and the explicit
+    E7 approval remains an Owner command outside this module (issue #347:
+    both execution modes run this same detached composition).
     """
     pool = dependencies.database_pool()
     workspace_id = UUID(payload.task.workspace_id)
@@ -1687,30 +1546,10 @@ def _compose_task_authorized_implementation(
     expected_state_token = UUID(payload.expected_state_token)
 
     # The detached implementation dispatch needs the executing process's
-    # detached-turn observation host and the ONE post-commit completion
-    # handoff — regular-mode process dependencies (issues #323/#333). Queue
-    # mode resolves neither and keeps the blocking composition interim.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatch_authorized_implementation_detached(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            producer_runtime_factory=_producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        # The detached dispatch is durably admitted: the worker returns
-        # without waiting for the implementation result. The observed
-        # completion owns the settlement; submission outcomes are transport
-        # information only and the durable state owns recovery.
-        return
-    github = dependencies.github_client()
-    execution = execute_authorized_implementation(
+    # detached-turn observation seam and the ONE post-commit completion
+    # handoff — process dependencies in both execution modes (issues
+    # #323/#333/#346).
+    dispatch_authorized_implementation_detached(
         pool,
         profile_id=profile_id,
         workspace_id=workspace_id,
@@ -1719,18 +1558,14 @@ def _compose_task_authorized_implementation(
         producer_runtime_factory=_producer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
         ),
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
         attempt_evidence=attempt_evidence,
     )
-    open_pr_authorization(
-        pool,
-        github,
-        profile_id=profile_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=execution.task.state_token,
-        execution_id=execution.execution.id,
-        attempt_evidence=attempt_evidence,
-    )
+    # The detached dispatch is durably admitted: the worker returns without
+    # waiting for the implementation result. The observed completion owns
+    # the settlement; submission outcomes are transport information only and
+    # the durable state owns recovery.
 
 
 def _compose_task_authorized_implementation_retry(
@@ -1741,58 +1576,34 @@ def _compose_task_authorized_implementation_retry(
 ) -> None:
     """Execute the one F4-authorized implementation retry and present the PR gate.
 
-    The regular-mode composition dispatches the authorized retry as one
-    detached agent turn (issues #325/#340) through the shared F5c/E6 detached
-    external phase and returns after the durable admission; the independently
-    observed completion settles the NEW retry Execution and the completion
-    handoff owns the exact-head PR_AUTHORIZATION presentation. The queue-mode
-    interim keeps the blocking composition (execute then present) until #328,
-    and F12 (issue #316) owns submitting due authorized retries through this
-    registered operation in either mode.
-
     The F5c retry service atomically consumes the exact durably authorized
     F4 attempt for one new Execution (reserved, claimed, audited, and bound
     set-once before any external effect), then reuses the shared E6 external
-    mechanics on the original Producer session. On the successful finalized
-    execution, the ordinary authorized continuation presents the exact-head
-    PR_AUTHORIZATION gate with the exact post-execution token and the NEW
-    Execution identity — the same application path as the initial
-    composition, with no new Owner approval or recovery policy here. A
-    failed retry is reported to F4 by the F5b coordinator's existing durable
-    binding lookup, never by this module.
+    mechanics on the original Producer session. The authorized retry is
+    dispatched as one detached agent turn (issues #325/#340) through the
+    shared F5c/E6 detached external phase and the composition returns after
+    the durable admission; the independently observed completion settles the
+    NEW retry Execution and the completion handoff owns the exact-head
+    PR_AUTHORIZATION presentation. F12 (issue #316) owns submitting due
+    authorized retries through this registered operation in either mode
+    (issue #347: both execution modes run this same detached composition).
+
+    On the successful finalized execution, the ordinary authorized
+    continuation presents the exact-head PR_AUTHORIZATION gate with the
+    exact post-execution token and the NEW Execution identity — the same
+    application path as the initial composition, with no new Owner approval
+    or recovery policy here. A failed retry is reported to F4 by the F5b
+    coordinator's existing durable binding lookup, never by this module.
     """
     pool = dependencies.database_pool()
-    github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
     # The detached retry dispatch needs the executing process's detached-turn
-    # observation host and the ONE post-commit completion handoff —
-    # regular-mode process dependencies (issues #323/#333/#340). Queue mode
-    # resolves neither and keeps the blocking composition interim.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatch_authorized_implementation_retry_detached(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            retry_attempt_id=UUID(payload.retry_attempt_id),
-            producer_runtime_factory=_producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        # The detached dispatch is durably admitted: the worker returns
-        # without waiting for the implementation result. The observed
-        # completion owns the settlement; submission outcomes are transport
-        # information only and the durable state owns recovery.
-        return
-
-    execution = execute_authorized_implementation_retry(
+    # observation seam and the ONE post-commit completion handoff — process
+    # dependencies in both execution modes (issues #323/#333/#340/#346).
+    dispatch_authorized_implementation_retry_detached(
         pool,
         profile_id=profile_id,
         workspace_id=workspace_id,
@@ -1802,18 +1613,14 @@ def _compose_task_authorized_implementation_retry(
         producer_runtime_factory=_producer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
         ),
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
         attempt_evidence=attempt_evidence,
     )
-    open_pr_authorization(
-        pool,
-        github,
-        profile_id=profile_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=execution.task.state_token,
-        execution_id=execution.execution.id,
-        attempt_evidence=attempt_evidence,
-    )
+    # The detached dispatch is durably admitted: the worker returns without
+    # waiting for the implementation result. The observed completion owns
+    # the settlement; submission outcomes are transport information only and
+    # the durable state owns recovery.
 
 
 def _compose_task_authorized_merge_retry(
@@ -1886,27 +1693,18 @@ def _compose_task_pr_composition(
 ) -> None:
     """Compose and publish the canonical PR under the approving Profile.
 
-    Regular mode (issue #337): the composition turn is itself one detached
-    agent turn — the E8 admission, the one-shot PR_COMPOSE send claim with
-    its detached-turn receipt companion, and the verbatim admission on the
-    exact Producer session commit here, and the worker returns after the
+    The composition turn is itself one detached agent turn (issue #337):
+    the E8 admission, the one-shot PR_COMPOSE send claim with its
+    detached-turn receipt companion, and the verbatim admission on the exact
+    Producer session commit here, and the worker returns after the
     acknowledgement attach without waiting for any model turn. The
     independently observed completion settles the validated ``pr_result``
     through the owning settlement, and the ONE post-commit completion
     handoff owns the bounded publication and the PR-review submission from
     committed state. The narrow interrupted-publication continuation owns
     no detached turn: the dispatch reconciles and finalizes it inline, and
-    this composition submits the PR review for the finalized publication.
-
-    Queue mode keeps the blocking compose-publish-review interim until #328:
-    the E8 service re-derives the persisted approved PR_AUTHORIZATION gate,
-    its exact head-SHA subject, and the OWNER-attributed approving Profile
-    from durable state, and publishes through the approving Profile's own
-    user-to-server authorization — the payload's accountable Profile is
-    resolved through its existing user-token resolver seam, never
-    substituted with installation authorization. On the clean published
-    result the exact post-publication token and canonical PR identity
-    authorize the PR review dispatch.
+    this composition submits the PR review for the finalized publication
+    (issue #347: both execution modes run this same detached composition).
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -1917,58 +1715,35 @@ def _compose_task_pr_composition(
     owner_gate_id = UUID(payload.owner_gate_id)
     expected_state_token = UUID(payload.expected_state_token)
 
-    # The detached PR-composition dispatch needs the executing process's
-    # detached-turn observation host and the ONE post-commit completion
-    # handoff — regular-mode process dependencies (issues #323/#333). Queue
-    # mode resolves neither and keeps the blocking composition interim.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatched = dispatch_pr_compose_detached(
-            pool,
-            github,
-            user_token_resolver,
-            _producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            owner_gate_id=owner_gate_id,
-            expected_state_token=expected_state_token,
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            terminal_finalization_submission=F1TerminalFinalizationSubmission(
-                dependencies.continuation_submitter()
-            ),
-            attempt_evidence=attempt_evidence,
-        )
-        if dispatched.published is None:
-            # The fresh composition is durably admitted: the worker returns
-            # without waiting for the pr_result. The observed completion owns
-            # the settlement; submission outcomes are transport information
-            # only and the durable state owns recovery.
-            return
-        # The narrow continuation finalized this invocation's own
-        # interrupted publication (no composition ran): the same authorized
-        # PR-review submission the clean published result always performs.
-        published = dispatched.published
-    else:
-        published = compose_and_publish_task_pr(
-            pool,
-            github,
-            user_token_resolver,
-            _producer_runtime_attachment_factory(
-                dependencies, workspace_id=workspace_id, task_id=task_id
-            ),
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            owner_gate_id=owner_gate_id,
-            expected_state_token=expected_state_token,
-            attempt_evidence=attempt_evidence,
-            terminal_finalization_submission=F1TerminalFinalizationSubmission(
-                dependencies.continuation_submitter()
-            ),
-        )
+    dispatched = dispatch_pr_compose_detached(
+        pool,
+        github,
+        user_token_resolver,
+        _producer_runtime_attachment_factory(
+            dependencies, workspace_id=workspace_id, task_id=task_id
+        ),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=expected_state_token,
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(
+            dependencies.continuation_submitter()
+        ),
+        attempt_evidence=attempt_evidence,
+    )
+    if dispatched.published is None:
+        # The fresh composition is durably admitted: the worker returns
+        # without waiting for the pr_result. The observed completion owns
+        # the settlement; submission outcomes are transport information
+        # only and the durable state owns recovery.
+        return
+    # The narrow continuation finalized this invocation's own
+    # interrupted publication (no composition ran): the same authorized
+    # PR-review submission the clean published result always performs.
+    published = dispatched.published
     _submit_continuation(
         dependencies,
         OperationInvocation(
@@ -1995,32 +1770,26 @@ def _compose_task_pr_review(
 ) -> None:
     """Run one PR review round.
 
-    Regular mode (issue #338): the REVIEW dispatch is itself one detached
-    agent turn — the composition re-derives the round's exact published
-    subjects from committed state under the payload's exact token and
-    canonical PR identity, and the owning service reserves exactly one
-    next-numbered unfinalized PR/head ReviewIteration for the freshly
-    reconciled head (the OPEN PR loop established on first review with the
-    Workspace's snapshotted budget), commits the iteration's detached-turn
-    receipt companion, and admits the composed canonical REVIEW message
-    verbatim on the exact READY Reviewer session before returning. No
-    ``send`` and no blocking wait exists here, and the worker's ``while
-    True`` dependency on a nonserialized dispatch outcome is gone: the
-    independently observed completion settles the validated ``review_result``
-    through the owning PR-review decision settlement, and the ONE post-commit
-    completion handoff owns the workflow continuation from committed state —
-    the detached E9 remediation enqueue on an in-budget change request
-    (whose own observed completion re-proves the subjects, verifies the
-    GitHub-confirmed new head, and submits the next typed ``TASK_PR_REVIEW``
-    through F1), with the MERGE_DECISION and REVIEW_RESOLUTION gates owning
-    their Owner seams. A stale, duplicate, or late REVIEW observation can
-    never decide twice, and duplicate/stale/ambiguous output never advances
-    a newer head.
-
-    Queue mode keeps the blocking E9 dispatch/decision/remediation interim
-    until #328: the in-process loop re-enters the ordinary dispatch after
-    each routed remediation round until a decision ends the loop with the
-    MERGE_DECISION or REVIEW_RESOLUTION gate — both Owner seams.
+    The REVIEW dispatch is itself one detached agent turn (issue #338): the
+    composition re-derives the round's exact published subjects from
+    committed state under the payload's exact token and canonical PR
+    identity, and the owning service reserves exactly one next-numbered
+    unfinalized PR/head ReviewIteration for the freshly reconciled head (the
+    OPEN PR loop established on first review with the Workspace's
+    snapshotted budget), commits the iteration's detached-turn receipt
+    companion, and admits the composed canonical REVIEW message verbatim on
+    the exact READY Reviewer session before returning. No ``send`` and no
+    blocking wait exists here: the independently observed completion settles
+    the validated ``review_result`` through the owning PR-review decision
+    settlement, and the ONE post-commit completion handoff owns the workflow
+    continuation from committed state — the detached E9 remediation enqueue
+    on an in-budget change request (whose own observed completion re-proves
+    the subjects, verifies the GitHub-confirmed new head, and submits the
+    next typed ``TASK_PR_REVIEW`` through F1), with the MERGE_DECISION and
+    REVIEW_RESOLUTION gates owning their Owner seams. A stale, duplicate, or
+    late REVIEW observation can never decide twice, and duplicate/stale/
+    ambiguous output never advances a newer head (issue #347: both execution
+    modes run this same detached composition).
     """
     pool = dependencies.database_pool()
     github = dependencies.github_client()
@@ -2038,29 +1807,14 @@ def _compose_task_pr_review(
         expected_state_token=UUID(payload.expected_state_token),
         task_pull_request_id=UUID(payload.task_pull_request_id),
     )
-    # The regular-mode REVIEW dispatch is itself one detached agent turn
-    # (issue #338): no Reviewer attachment is acquired in this composition,
-    # no decision runs in-process, and the remediation chain never re-enters
-    # this worker — the reserved PR/head iteration, its detached-turn receipt
-    # companion, and the verbatim admission commit in the owning dispatch
-    # service, and the independently observed completion owns the decision
-    # settlement with the ONE post-commit completion handoff owning the
-    # remediation enqueue and every later continuation from committed state.
-    if dependencies.settings.execution_mode is ExecutionMode.REGULAR:
-        dispatch_pr_review_detached(
-            pool,
-            reviewer_runtime_factory,
-            github,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=published.task.state_token,
-            observation_registrar=dependencies.detached_turn_observer(),
-            completion_handoff=build_detached_completion_handoff(dependencies),
-            attempt_evidence=attempt_evidence,
-        )
-        return
-    dispatch_outcome = dispatch_pr_review(
+    # No Reviewer attachment is acquired in this composition, no decision
+    # runs in-process, and the remediation chain never re-enters this worker
+    # — the reserved PR/head iteration, its detached-turn receipt companion,
+    # and the verbatim admission commit in the owning dispatch service, and
+    # the independently observed completion owns the decision settlement
+    # with the ONE post-commit completion handoff owning the remediation
+    # enqueue and every later continuation from committed state.
+    dispatch_pr_review_detached(
         pool,
         reviewer_runtime_factory,
         github,
@@ -2068,50 +1822,14 @@ def _compose_task_pr_review(
         workspace_id=workspace_id,
         task_id=task_id,
         expected_state_token=published.task.state_token,
-        published=published,
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
         attempt_evidence=attempt_evidence,
     )
-    while True:
-        # The decision may route remediation: the Producer session continues
-        # the finalized change request in its Task checkout.
-        with attach_cline_runtime(
-            pool,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            role=WorkflowRole.PRODUCER,
-            phase=ClineAttachmentPhase.BOUND,
-            external_session_id=_bound_session_external_id(
-                pool, workspace_id=workspace_id, task_id=task_id, role=WorkflowRole.PRODUCER
-            ),
-            working_directory=_producer_checkout_directory(
-                pool, workspace_id=workspace_id, task_id=task_id
-            ),
-        ) as attached:
-            decision = finalize_pr_review_decision(
-                pool,
-                attached.adapter,
-                github,
-                reviewer_runtime_factory,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=dispatch_outcome.task.state_token,
-                dispatch=dispatch_outcome,
-                attempt_evidence=attempt_evidence,
-            )
-        remediation = decision.remediation
-        if remediation is None:
-            break
-        # The decision module types the routed remediation loosely; its own
-        # contract always returns the typed remediation outcome whose
-        # re-entered dispatch carries the GitHub-confirmed new head.
-        typed_remediation = cast(TaskPrRemediationOutcome, remediation)
-        remediated_dispatch = typed_remediation.dispatch
-        if remediated_dispatch is None:
-            raise ConflictError(
-                "the remediation-routed decision carried no re-entered dispatch outcome"
-            )
-        dispatch_outcome = remediated_dispatch
+    # The detached dispatch is durably admitted: the worker returns without
+    # waiting for the review result. The observed completion owns the
+    # settlement; submission outcomes are transport information only and the
+    # durable state owns recovery.
 
 
 def _compose_task_session_resume(
@@ -2125,27 +1843,19 @@ def _compose_task_session_resume(
     The one-shot continuation the Owner Resume action's authorization
     committed: the durable record's routing context is re-derived from
     committed state, the record is claimed exactly once (or its proven
-    never-dispatched supersession is recorded), and the fixed-prompt
-    same-session dispatch runs strictly outside any transaction. In regular
-    mode the continuation is one detached agent turn (issue #343): the
-    fixed authorized resume instruction is admitted as one independent
-    detached run on the exact original session and the worker returns after
-    the acknowledgement attach — the independently observed completion owns
-    the settlement and the ONE post-commit handoff owns the continuations.
-    The queue-mode interim (until #328) keeps the blocking composition and
-    the in-process result routing. The handler owns no workflow rules of
-    its own.
+    never-dispatched supersession is recorded), and the fixed authorized
+    resume instruction is admitted as one independent detached agent turn on
+    the exact original session (issue #343) — the worker returns after the
+    acknowledgement attach, the independently observed completion owns the
+    settlement, and the ONE post-commit handoff owns the continuations (the
+    original workflow operation's own family routes them). The handler owns
+    no workflow rules of its own (issue #347: both execution modes run this
+    same detached composition).
     """
     pool = dependencies.database_pool()
-    github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
-    observation_registrar = (
-        dependencies.detached_turn_observer()
-        if dependencies.settings.execution_mode is ExecutionMode.REGULAR
-        else None
-    )
-    outcome = dispatch_authorized_task_resume(
+    dispatch_authorized_task_resume(
         pool,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -2158,39 +1868,10 @@ def _compose_task_session_resume(
         reviewer_runtime_factory=_reviewer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
         ),
-        github=github,
-        bootstrap_composition=dependencies.task_bootstrap_runtime_composition(),
         attempt_evidence=attempt_evidence,
-        observation_registrar=observation_registrar,
-        completion_handoff=(
-            build_detached_completion_handoff(dependencies)
-            if observation_registrar is not None
-            else None
-        ),
+        observation_registrar=dependencies.detached_turn_observer(),
+        completion_handoff=build_detached_completion_handoff(dependencies),
     )
-    if outcome.follow_up is SessionResumeFollowUp.PLANNING_REVIEW_DISPATCH:
-        if outcome.follow_up_state_token is None:
-            raise ConflictError("the planning-review follow-up carried no continuation token")
-        # The ordinary authorized continuation of a produced planning
-        # revision: the fresh post-production token authorizes the next
-        # planning REVIEW round, submitted through the same seam the ordinary
-        # planning handlers use. Submission outcomes are transport
-        # information only, never Task truth.
-        _submit_continuation(
-            dependencies,
-            OperationInvocation(
-                kind=OperationKind.TASK_PLANNING_REVIEW,
-                payload=TaskPlanningReviewPayload(
-                    task=TaskScope(
-                        workspace_id=payload.task.workspace_id,
-                        task_id=payload.task.task_id,
-                        role=WorkflowRoleRef.REVIEWER,
-                    ),
-                    profile_id=payload.profile_id,
-                    expected_state_token=str(outcome.follow_up_state_token),
-                ),
-            ),
-        )
 
 
 # --- the single composition seam and the production handler table ------------

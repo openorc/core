@@ -40,7 +40,7 @@ from openorc.services.task_abort import (
     CostLimitBlockOutcomeKind,
     establish_owner_authorized_cost_limit_block,
 )
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_connection,
     _insert_installation,
     _insert_profile,

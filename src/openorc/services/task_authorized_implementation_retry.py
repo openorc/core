@@ -113,16 +113,12 @@ from openorc.services.review_result_envelope import (
 # the retry on exactly the established authority-revalidation, dispatch, and
 # finalization semantics instead of a divergent copy.
 from openorc.services.task_authorized_implementation_execution import (
-    ActivitySubscriptionFactory,
-    AuthorizedImplementationExecution,
     DetachedTurnCompletionHandoff,
     DispatchedImplementationExecution,
     ImplementationObservationRegistrar,
     ProducerRuntimeAttachmentFactory,
     _dispatch_detached_external_phase,
-    _execute_external_phase,
     _load_authorized_subjects,
-    _require_activity_factory,
     _require_completion_handoff,
     _require_implementing_task,
     _require_observation_registrar,
@@ -142,7 +138,6 @@ from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
     "dispatch_authorized_implementation_retry_detached",
-    "execute_authorized_implementation_retry",
 ]
 
 logger = logging.getLogger(__name__)
@@ -333,81 +328,6 @@ def _consume_authorized_retry(
         producer_session=producer_session,
         execution=claimed,
     )
-
-
-def execute_authorized_implementation_retry(
-    pool: DatabasePool,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    retry_attempt_id: UUID,
-    producer_runtime_factory: ProducerRuntimeAttachmentFactory,
-    activity_subscription_factory: ActivitySubscriptionFactory | None = None,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-    clock: Callable[[], datetime] | None = None,
-) -> AuthorizedImplementationExecution:
-    """Execute the one F4-authorized additional implementation attempt.
-
-    One Owner-accountable, exact-subject seam: the F4 authorization is
-    atomically consumed for exactly one new Execution (reserved, claimed,
-    audited, and bound set-once in the same short composition), the new
-    Execution identity is recorded for the F5b failure handoff, and the
-    shared E6 external mechanics dispatch the implementation on the original
-    Producer session and finalize the new row truthfully. The caller cannot
-    replay a consumed authorization, revive a terminal episode, run an
-    undiscounted premature wakeup, or bypass any exact-subject revalidation.
-    """
-    _require_uuid_command(profile_id, "profile_id")
-    _require_uuid_command(workspace_id, "workspace_id")
-    _require_uuid_command(task_id, "task_id")
-    _require_uuid_command(expected_state_token, "expected_state_token")
-    _require_uuid_command(retry_attempt_id, "retry_attempt_id")
-    producer_factory = _require_producer_factory(producer_runtime_factory)
-    activity_factory = _require_activity_factory(activity_subscription_factory)
-    now = clock if clock is not None else (lambda: datetime.now(UTC))
-    with application_span(_SERVICE_TRACER_SCOPE, _EXECUTE_SPAN_NAME) as span:
-        annotate_span(
-            span,
-            operation=_EXECUTE_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-        # --- Phase 1: atomic admission, consumption, and reservation. ---
-        with composed_transaction(pool) as transaction_pool:
-            reserved = _consume_authorized_retry(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                retry_attempt_id=retry_attempt_id,
-                now=now,
-            )
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's newly
-            # produced retry Execution identity (#263) — never the original
-            # episode Execution. F5b's durable binding lookup turns a later
-            # failure into F4's PRIOR_AUTHORIZED report.
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
-                original_attempt_kind=OriginalAttemptKind.EXECUTION,
-                original_attempt_id=reserved.execution.id,
-                phase="authorized_implementation_retry",
-            )
-        message = serialize_review_result(reserved.accepted_review)
-        # --- Phases 2 and 3: the shared authority-gated effects and finalize. ---
-        return _execute_external_phase(
-            pool,
-            reserved=reserved,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            message=message,
-            producer_factory=producer_factory,
-            activity_factory=activity_factory,
-        )
 
 
 def dispatch_authorized_implementation_retry_detached(

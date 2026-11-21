@@ -61,7 +61,7 @@ from openorc.services import event_coordination, task_cancellation
 from openorc.services.task_abort import abort_task_activity, settle_observed_task_interrupt
 from openorc.services.task_cancellation import cancel_task
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_connection,
     _insert_installation,
     _insert_profile,

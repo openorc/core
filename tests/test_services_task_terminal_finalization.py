@@ -427,66 +427,6 @@ def test_a_missing_commitment_is_a_stale_refusal(monkeypatch: pytest.MonkeyPatch
 # --- the one-shot cleanup claim lifecycle ------------------------------------------
 
 
-def test_an_owned_cleanup_attempt_runs_before_the_archival_and_settles(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_seams(monkeypatch)
-    runtime = _RecordingRuntime()
-    monkeypatch.setattr(task_terminal_finalization, "execute_terminal_checkout_cleanup", runtime)
-    pool, conn = _pool(
-        [
-            _committed_row(),
-            (_OBSERVED,),  # the one-shot claim CAS
-            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),  # the settle
-            (True,),
-            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),
-            _archived_row(),
-            None,
-            None,
-            None,
-            None,
-        ]
-    )
-
-    outcome = finalize_task_terminalization(
-        pool, cast(Any, object()), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
-    assert runtime.calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
-    # The bounded attempt (and its settle) complete strictly before the
-    # mandatory archival.
-    assert _archive_update_index(conn) > next(
-        index
-        for index, (sql, _params) in enumerate(conn.executed)
-        if "cleanup_send_settled_at = now()" in sql
-    )
-
-
-def test_a_concurrently_unsettled_claim_defers_the_archival(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_seams(monkeypatch)
-    _deadline_open(monkeypatch, within=True)
-    runtime = _RecordingRuntime()
-    monkeypatch.setattr(task_terminal_finalization, "execute_terminal_checkout_cleanup", runtime)
-    pool, conn = _pool(
-        [
-            _committed_row(),
-            None,  # the claim CAS: another finalizer owns the attempt
-            _committed_row(claimed=_OBSERVED),  # the fresh read: unsettled, within deadline
-        ]
-    )
-
-    outcome = finalize_task_terminalization(
-        pool, cast(Any, object()), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert outcome.kind is TerminalFinalizationKind.CLEANUP_IN_FLIGHT
-    assert runtime.calls == []
-    assert conn.executed == [conn.executed[0], conn.executed[1], conn.executed[2]]
-
-
 def test_a_present_unsettled_claim_defers_at_the_entry_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,64 +510,6 @@ def test_a_past_deadline_unsettled_claim_stops_waiting_and_archives(
         for index, (sql, _params) in enumerate(conn.executed)
         if "cleanup_send_settled_at = now()" in sql
     )
-    assert not any("cleanup_send_claimed_at = now()" in sql for sql, _params in conn.executed)
-
-
-def test_a_failed_claim_read_classifies_from_a_fresh_durable_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_seams(monkeypatch)
-    pool, conn = _pool(
-        [
-            _committed_row(),
-            RuntimeError("claim read failed"),  # contained: unknown claim state
-            _committed_row(),  # the fresh read: unclaimed → archive-only
-            (True,),
-            _committed_row(),
-            _archived_row(),
-            None,
-            None,
-            None,
-            None,
-        ]
-    )
-
-    outcome = finalize_task_terminalization(
-        pool, cast(Any, object()), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
-
-
-def test_a_settled_claim_never_resends_and_proceeds_to_archival(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A settled prior attempt (issue #345): the one-shot window is closed at
-    entry, so the archival proceeds directly — the cleanup establishment
-    never re-runs, no claim CAS is ever attempted, and no second dispatch
-    follows."""
-    _install_seams(monkeypatch)
-    runtime = _RecordingRuntime()
-    monkeypatch.setattr(task_terminal_finalization, "execute_terminal_checkout_cleanup", runtime)
-    pool, conn = _pool(
-        [
-            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),  # entry read: settled
-            (True,),
-            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),
-            _archived_row(),
-            None,
-            None,
-            None,
-            None,
-        ]
-    )
-
-    outcome = finalize_task_terminalization(
-        pool, cast(Any, object()), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
-    )
-
-    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
-    assert runtime.calls == []
     assert not any("cleanup_send_claimed_at = now()" in sql for sql, _params in conn.executed)
 
 

@@ -14,13 +14,19 @@ Composition rules enforced by this module:
   database pool, cleanup runtime composition, and EXPLICIT cleanup dispatch
   selection, and invokes the existing ``finalize_task_terminalization``
   service with only the decoded scoped Workspace/Task identifiers plus that
-  selection. The selection is resolved from the executing process's own
-  execution mode (issue #344): queue mode explicitly keeps the established
-  blocking interim (until #328); regular mode resolves the process-local
-  detached-turn observation host explicitly, and a host that cannot resolve
-  is the explicit observation-unavailable selection — positively skipping
-  the optional cleanup (no claim, no receipt, no blocking send) and never
-  silently selecting blocking execution. The service reloads the committed
+  selection. The selection is resolved by the executing process explicitly
+  (issues #344/#347): both execution modes resolve the detached-turn
+  observation registrar seam — the process-local observation host in regular
+  mode, the remote registrar proxy over the #346 private authenticated
+  registration handshake in queue mode — and a registrar that cannot resolve
+  is the explicit observation-unavailable selection, positively skipping the
+  optional cleanup (no claim, no receipt, no blocking send) and never
+  silently selecting blocking execution. The detached selection additionally
+  carries the process's ONE post-commit completion handoff (issue #345),
+  which the dispatching invocation routes when the acknowledgement attach
+  consumes a staged early completion, and which the same handoff's
+  ``TERMINAL_CLEANUP`` route re-invokes after an independently observed
+  settlement. The service reloads the committed
   terminalization from durable state, re-derives the exact checkout and the
   original bound Producer session, rechecks every current safety fact
   before the one bounded cleanup attempt, settles the one-shot claim where
@@ -55,7 +61,7 @@ import logging
 from typing import Any, cast
 from uuid import UUID
 
-from openorc.config import ExecutionMode, Settings
+from openorc.config import Settings
 from openorc.services.cline_terminal_cleanup import ClineTerminalCleanupComposition
 from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 from openorc.services.task_terminal_finalization import (
@@ -89,27 +95,26 @@ def resolve_terminal_cleanup_dispatch(
 ) -> TerminalCleanupDispatch:
     """Resolve the executing process's EXPLICIT cleanup dispatch selection.
 
-    The mode comes from the executing process's own execution mode — never
-    inferred from registrar presence. Queue mode keeps the established
-    blocking interim until #328. Regular mode resolves the process-local
-    detached-turn observation host; a host that cannot resolve (an unwired
-    late-bound provider, a misconfigured composition) is the explicit
+    Both execution modes resolve the executing process's detached-turn
+    observation registrar seam (issues #323/#346/#347): regular mode resolves
+    the process-local observation host; queue mode resolves the remote
+    registrar proxy over the private authenticated registration handshake
+    against the serving API/control-plane process. A registrar that cannot
+    resolve (an unwired late-bound provider, a misconfigured composition, a
+    missing queue registration transport configuration) is the explicit
     observation-unavailable selection: the optional cleanup is positively
-    skipped and the mandatory archival proceeds. The detached-regular
-    selection also carries the process's ONE post-commit completion handoff
-    (issue #345), which the dispatching invocation routes when the
-    acknowledgement attach consumes a staged early completion.
+    skipped and the mandatory archival proceeds — never an inferred blocking
+    fallback. The detached selection also carries the process's ONE
+    post-commit completion handoff (issue #345), which the dispatching
+    invocation routes when the acknowledgement attach consumes a staged
+    early completion.
     """
-    if dependencies.settings.execution_mode is not ExecutionMode.REGULAR:
-        return TerminalCleanupDispatch(
-            selection=TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
-        )
     try:
         registrar = dependencies.detached_turn_observer()
     except Exception as error:  # noqa: BLE001 - contained; the archival owns the outcome
         logger.warning(
-            "the detached-turn observation host could not be resolved for the terminal "
-            "cleanup dispatch (%s); skipping the optional cleanup archive-only",
+            "the detached-turn observation registrar could not be resolved for the "
+            "terminal cleanup dispatch (%s); skipping the optional cleanup archive-only",
             type(error).__name__,
         )
         return TerminalCleanupDispatch(

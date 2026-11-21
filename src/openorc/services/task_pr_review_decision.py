@@ -5,21 +5,23 @@ Three focused seams share one transactional discipline (database only, the
 Task row ``FOR UPDATE`` taken FIRST, every exact subject re-proven under the
 lock, external consequences strictly outside):
 
-- ``finalize_pr_review_decision`` is the ordinary decision seam the dispatch
-  (``task_pr_review_dispatch``) feeds: given the reserved exact-head attempt
-  and the validated typed ``ReviewResult``, it rechecks every subject and in
+- ``settle_observed_pr_review`` is the ordinary decision seam the
+  correlation seam feeds (issue #338): given the reserved exact-head attempt
+  and the validated typed ``ReviewResult`` observed on the admitted detached
+  REVIEW turn, it rechecks every subject and in
   ONE short composed transaction finalizes the iteration once, records the
   safe REVIEWER-attributed ``PR_REVIEWED`` event whose primary subject is the
   ReviewIteration, and commits the durable next decision. A within-budget
   ``CHANGES_REQUESTED`` keeps the Task ``REVIEWING`` and the loop OPEN and
-  routes that result to the Producer remediation OUTSIDE the transaction; an
+  the ONE completion handoff dispatches the Producer remediation as one
+  detached turn outside the transaction; an
   exhausted or sticky ``CHANGES_REQUESTED`` atomically creates and installs
   one exact PR/head ``REVIEW_RESOLUTION`` and moves ``REVIEWING →
   WAITING_FOR_OWNER`` without routing; an ``ACCEPTED`` atomically creates and
   installs one exact-head ``MERGE_DECISION`` and moves to
   ``WAITING_FOR_OWNER`` with the loop deliberately left OPEN (only a
   GitHub-confirmed merge or terminal cancellation closes it, in E10).
-- ``settle_pr_review_resolution`` is the PR/head-subject sibling of E3c's
+- ``settle_observed_pr_review_resolution`` is the PR/head-subject sibling of E3c's
   Reviewer-driven settlement, consumed through E4's formal-result routing: a
   new, standalone, schema-valid ``review_result`` at the Task's current
   PR/head ``REVIEW_RESOLUTION`` gate appends a NEW next-numbered finalized
@@ -29,10 +31,11 @@ lock, external consequences strictly outside):
   ``SETTLED`` primitive with truthful Reviewer provenance, clears the current
   pointer, and rotates the token. A formal ``ACCEPTED`` proceeds to a NEW
   ordinary exact-head ``MERGE_DECISION``; a formal ``CHANGES_REQUESTED``
-  returns the Task to ``REVIEWING`` and routes only the new result to the
-  Producer remediation outside the transaction. Later disagreement
+  returns the Task to ``REVIEWING`` and the ONE completion handoff dispatches
+  the new remediation round as one detached turn outside the transaction.
+  Later disagreement
   immediately reopens resolution; prior results are immutable.
-- ``retire_pr_merge_decision_with_changes`` is issue #219's narrow
+- ``retire_observed_pr_merge_decision_with_changes`` is issue #219's narrow
   supersession pattern applied to the merge gate: at the Task's current
   pending PR/head ``MERGE_DECISION`` gate, ordinary discussion, malformed or
   embedded JSON, and even a standalone formal ``ACCEPTED`` stay advisory
@@ -108,7 +111,6 @@ from openorc.domain.reviews import (
 )
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.domain.tasks import Task, TaskStatus
-from openorc.observability import annotate_span, application_span
 from openorc.persistence import gates as gate_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import tasks as task_records
@@ -131,14 +133,11 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
-from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_plan_production import settle_resumed_task_record
 from openorc.services.task_pr_remediation import (
     ReviewerRuntimeAttachmentFactory,
-    route_pr_remediation,
 )
-from openorc.services.task_pr_review_dispatch import TaskPrReviewDispatchOutcome
 from openorc.services.task_subject_guards import (
     require_current_owner_gate,
     require_current_task,
@@ -155,18 +154,12 @@ __all__ = [
     "TaskPrMergeGateChangeRequestOutcome",
     "TaskPrReviewDecisionOutcome",
     "TaskPrReviewGateResolutionOutcome",
-    "finalize_pr_review_decision",
     "retire_observed_pr_merge_decision_with_changes",
-    "retire_pr_merge_decision_with_changes",
     "settle_observed_pr_review",
     "settle_observed_pr_review_resolution",
-    "settle_pr_review_resolution",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_pr_review_decision"
-_DECISION_SPAN_NAME = "task_pr_review_decision.finalize_pr_review_decision"
-_SETTLEMENT_SPAN_NAME = "task_pr_review_decision.settle_pr_review_resolution"
-_MERGE_CHANGE_REQUEST_SPAN_NAME = "task_pr_review_decision.retire_pr_merge_decision_with_changes"
 
 logger = logging.getLogger(__name__)
 
@@ -715,107 +708,6 @@ def _finalize_pr_decision_transaction(
         )
 
 
-def finalize_pr_review_decision(
-    pool: DatabasePool,
-    producer_runtime: AgentRuntimeAdapter,
-    github: GitHubAppClient,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    dispatch: TaskPrReviewDispatchOutcome,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-    task_resume_intent_id: UUID | None = None,
-) -> TaskPrReviewDecisionOutcome:
-    """Record the bounded PR review decision atomically and commit its effect.
-
-    Every exact subject the dispatch proved is rechecked in one short
-    composed transaction; the result is finalized once with the safe REVIEWER
-    ``PR_REVIEWED`` audit; and the durable next decision commits:
-
-    - within-budget ``CHANGES_REQUESTED`` keeps ``REVIEWING`` and routes the
-      exact finalized result to the Producer remediation with NO database
-      transaction open, then re-enters the ordinary dispatch for the
-      GitHub-confirmed new head;
-    - exhausted or sticky ``CHANGES_REQUESTED`` installs the exact PR/head
-      ``REVIEW_RESOLUTION``, moves ``REVIEWING → WAITING_FOR_OWNER``, and
-      never routes the exhausted result;
-    - ``ACCEPTED`` installs the exact-head ``MERGE_DECISION`` and leaves the
-      PR loop OPEN — acceptance alone never merges.
-
-    ``REVIEW_LIMIT_REACHED`` is recorded on the first exhaustion only. A
-    stale, duplicate, cancelled/merged, changed-head, or uncertain input
-    applies nothing.
-    """
-    if not isinstance(dispatch, TaskPrReviewDispatchOutcome):
-        raise InvalidCommandError("dispatch must be the pr review dispatch outcome")
-    with application_span(_SERVICE_TRACER_SCOPE, _DECISION_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        _require_producer_runtime(producer_runtime)
-        _require_github(github)
-        _require_reviewer_factory(reviewer_runtime_factory)
-        _resolution_outcome(dispatch.review_result)
-        annotate_span(
-            span,
-            operation=_DECISION_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: decision finalization (database only). ---
-        (
-            decision,
-            finalized,
-            loop,
-            task,
-            pull_request,
-            gate,
-            _reviewer,
-        ) = _finalize_pr_decision_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            task_resume_intent_id=task_resume_intent_id,
-            expected_state_token=expected_state_token,
-            review_result=dispatch.review_result,
-            review_iteration_id=dispatch.review_iteration.id,
-            expected_reviewer_session_id=dispatch.reviewer_session.id,
-        )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        remediation = None
-        if decision is PrReviewDecision.REMEDIATION_ROUTED:
-            remediation = route_pr_remediation(
-                pool,
-                producer_runtime,
-                github,
-                reviewer_runtime_factory,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=expected_state_token,
-                review_result=dispatch.review_result,
-                addressed_iteration=finalized,
-                attempt_evidence=attempt_evidence,
-            )
-
-        return TaskPrReviewDecisionOutcome(
-            decision=decision,
-            review_iteration=finalized,
-            review_loop=loop,
-            task=task,
-            pull_request=pull_request,
-            gate=gate,
-            remediation=remediation,
-        )
-
-
 def settle_observed_pr_review(
     transaction_pool: DatabasePool,
     *,
@@ -1112,7 +1004,7 @@ def settle_observed_pr_review_resolution(
     """Settle the exact PR/head REVIEW_RESOLUTION gate inside the caller's transaction.
 
     The detached discussion settlement's entry point (issue #339): the exact
-    durable settlement transaction of :func:`settle_pr_review_resolution`,
+    durable settlement transaction of :func:`settle_observed_pr_review_resolution`,
     composed inside the caller's already-open transaction (the nested
     composition becomes a SAVEPOINT), so the gate's ``SETTLED`` stamp, the
     NEW finalized same-head iteration, the audit events, and the
@@ -1150,7 +1042,7 @@ def retire_observed_pr_merge_decision_with_changes(
 
     The detached discussion settlement's entry point (issue #339): the exact
     durable retirement transaction of
-    :func:`retire_pr_merge_decision_with_changes`, composed inside the
+    :func:`retire_observed_pr_merge_decision_with_changes`, composed inside the
     caller's already-open transaction (the nested composition becomes a
     SAVEPOINT), so the NEW finalized same-head iteration, the audit events,
     the guarded gate supersession, the pointer clear, and the token rotation
@@ -1169,122 +1061,6 @@ def retire_observed_pr_merge_decision_with_changes(
         result=result,
         record_discussion_message_events=record_discussion_message_events,
     )
-
-
-def settle_pr_review_resolution(
-    pool: DatabasePool,
-    producer_runtime: AgentRuntimeAdapter | None,
-    github: GitHubAppClient | None,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    review_result: ReviewResult,
-    record_discussion_message_events: bool = False,
-) -> TaskPrReviewGateResolutionOutcome:
-    """Settle the Task's exact current PR/head REVIEW_RESOLUTION gate.
-
-    Consumes E4's formal-result recognition input for the PR/head subject
-    form. Every exact subject is rechecked in one short composed transaction
-    and the settlement commits atomically: the NEW next-numbered finalized
-    same-head iteration, the safe REVIEWER audit events, the gate's
-    ``SETTLED`` stamp with Reviewer provenance, the cleared current-gate
-    pointer, and the rotated Task token.
-
-    On a formal ``ACCEPTED`` a NEW ordinary exact-head ``MERGE_DECISION`` is
-    installed for the still-current head and the PR loop stays OPEN. On a
-    formal ``CHANGES_REQUESTED`` the Task returns to ``REVIEWING`` and the
-    exact newly finalized result routes to the Producer remediation with NO
-    database transaction open; only the remediation's GitHub-confirmed new
-    head may launch the next ordinary review.
-
-    ``record_discussion_message_events`` records E4's two direction-only
-    discussion message events inside this settlement's transaction when the
-    settlement is dispatched through E4's formal-result path, so the exchange
-    audit and the authoritative settlement commit atomically.
-
-    The remediation dependencies (the Producer runtime adapter, the GitHub
-    client, and the deferred Reviewer attachment factory for the re-entered
-    dispatch) are proven before the settlement commits exactly when the
-    validated result routes to remediation — the same no-stranding guarantee
-    as merged #219. A formal ACCEPTED never touches them.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _SETTLEMENT_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        result = _require_formal_result(review_result)
-        # The routing decision is fully determined by the validated result
-        # outcome, so the remediation dependencies are proven BEFORE the
-        # settlement transaction exactly when the result routes there; an
-        # invalid or missing dependency can never strand an already-settled
-        # gate.
-        routes_to_remediation = _resolution_outcome(result) is ReviewOutcome.CHANGES_REQUESTED
-        producer_adapter = (
-            _require_producer_runtime(producer_runtime) if routes_to_remediation else None
-        )
-        github_client = _require_github(github) if routes_to_remediation else None
-        reviewer_factory = (
-            _require_reviewer_factory(reviewer_runtime_factory) if routes_to_remediation else None
-        )
-        annotate_span(
-            span,
-            operation=_SETTLEMENT_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: the settlement (database only). ---
-        (
-            decision,
-            finalized,
-            loop,
-            task,
-            pull_request,
-            settled_gate,
-            merge_gate,
-            _reviewer,
-        ) = _settle_pr_resolution_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            result=result,
-            record_discussion_message_events=record_discussion_message_events,
-        )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        remediation = None
-        if decision is PrReviewGateResolutionDecision.CONTINUATION_ROUTED:
-            assert producer_adapter is not None and github_client is not None
-            assert reviewer_factory is not None
-            remediation = route_pr_remediation(
-                pool,
-                producer_adapter,
-                github_client,
-                reviewer_factory,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=task.state_token,
-                review_result=result,
-                addressed_iteration=finalized,
-            )
-
-        return TaskPrReviewGateResolutionOutcome(
-            decision=decision,
-            review_iteration=finalized,
-            review_loop=loop,
-            task=task,
-            pull_request=pull_request,
-            settled_gate=settled_gate,
-            merge_decision_gate=merge_gate,
-            remediation=remediation,
-        )
 
 
 # --- the merge-gate change-request retirement (E4 formal continuation) ----------------
@@ -1417,99 +1193,3 @@ def _retire_pr_merge_decision_transaction(
                 direction=event_coordination.OwnerReviewerDiscussionDirection.REVIEWER_TO_OWNER,
             )
         return finalized, loop, superseded_task, pull_request, gate, reviewer
-
-
-def retire_pr_merge_decision_with_changes(
-    pool: DatabasePool,
-    producer_runtime: AgentRuntimeAdapter,
-    github: GitHubAppClient,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    expected_state_token: UUID,
-    review_result: ReviewResult,
-    record_discussion_message_events: bool = False,
-) -> TaskPrMergeGateChangeRequestOutcome:
-    """Retire the pending PR/head MERGE_DECISION gate on a change request.
-
-    Issue #219's narrow supersession pattern applied to the merge gate: only
-    a standalone valid Reviewer ``CHANGES_REQUESTED`` is actionable here (E4
-    routes nothing else); ordinary discussion, malformed or embedded JSON,
-    and a standalone formal ``ACCEPTED`` stay advisory at the gate. The
-    actionable change request atomically appends the NEW same-head PR
-    iteration with its REVIEWER ``PR_REVIEWED`` audit, retires G1 as
-    no-longer-current through the guarded ``reviewing`` destination (pending
-    history — never Owner stamped, never Reviewer SETTLED, no false
-    gate-resolution event, no intervening REVIEW_RESOLUTION), and moves
-    ``WAITING_FOR_OWNER → REVIEWING`` under the rotated token; the exact new
-    result then routes to the Producer remediation outside the transaction.
-    A later accepted head yields a fresh MERGE_DECISION; the history of
-    mediation keeps the loop sticky.
-
-    The remediation dependencies are proven BEFORE the retirement commits —
-    the routing outcome is fixed for this seam — so no unusable dependency
-    can strand an already-retired gate.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _MERGE_CHANGE_REQUEST_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        _require_uuid_command(expected_state_token, "expected_state_token")
-        result = _require_formal_result(review_result)
-        if _resolution_outcome(result) is not ReviewOutcome.CHANGES_REQUESTED:
-            raise InvalidCommandError(
-                "only a CHANGES_REQUESTED review result retires a merge decision gate"
-            )
-        producer_adapter = _require_producer_runtime(producer_runtime)
-        github_client = _require_github(github)
-        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
-        annotate_span(
-            span,
-            operation=_MERGE_CHANGE_REQUEST_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: the retirement (database only). ---
-        (
-            finalized,
-            loop,
-            task,
-            pull_request,
-            retired_gate,
-            _reviewer,
-        ) = _retire_pr_merge_decision_transaction(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=expected_state_token,
-            result=result,
-            record_discussion_message_events=record_discussion_message_events,
-        )
-
-        # --- Phase 2: the external consequence, with NO transaction open. ---
-        remediation = route_pr_remediation(
-            pool,
-            producer_adapter,
-            github_client,
-            reviewer_factory,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            expected_state_token=task.state_token,
-            review_result=result,
-            addressed_iteration=finalized,
-        )
-
-        return TaskPrMergeGateChangeRequestOutcome(
-            decision=PrMergeGateChangeRequestDecision.MERGE_GATE_RETIRED,
-            review_iteration=finalized,
-            review_loop=loop,
-            task=task,
-            pull_request=pull_request,
-            retired_gate=retired_gate,
-            remediation=remediation,
-        )

@@ -126,7 +126,6 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.agent_runtime.detached import AgentTurnAdmission
 from openorc.adapters.agent_runtime.errors import (
     AgentRuntimeError,
-    AgentRuntimeInterruptedTurnError,
     AgentRuntimeUncertainOutcomeError,
 )
 from openorc.domain.connections import WorkflowRole
@@ -150,7 +149,6 @@ from openorc.persistence.detached_turns import refuse_task_detached_turn_receipt
 from openorc.persistence.ownership import get_repository, get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
-from openorc.protocol.interaction import PlanReviewSubject, ReviewInteraction
 from openorc.protocol.models import REVIEW_RESULT_FAMILY, ReviewResult
 from openorc.services import task_detached_turn_correlation as turn_correlation
 from openorc.services.errors import (
@@ -165,7 +163,6 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
-from openorc.services.task_abort import settle_observed_task_interrupt
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_observation import ObservationRegistrationRefusedError
 from openorc.services.task_plan_production import (
@@ -183,12 +180,10 @@ __all__ = [
     "DispatchedPlanningReview",
     "ReviewerRuntimeAttachmentFactory",
     "TaskPlanningReviewDispatchOutcome",
-    "dispatch_planning_review",
     "dispatch_planning_review_detached",
 ]
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_planning_review_dispatch"
-_DISPATCH_SPAN_NAME = "task_planning_review_dispatch.dispatch_planning_review"
 _DISPATCH_DETACHED_SPAN_NAME = "task_planning_review_dispatch.dispatch_planning_review_detached"
 
 # Safe refusal-kind tokens for a receipt's durable refusal outcome after a
@@ -503,59 +498,6 @@ def _compose_review_message(
     )
 
 
-def _realize_review_control(
-    pool: DatabasePool,
-    runtime: AgentRuntimeAdapter,
-    session_id: str,
-    *,
-    task_id: UUID,
-    interaction: ReviewInteraction,
-    message: str,
-) -> ReviewResult:
-    """Send ONE established REVIEW interaction to the exact Reviewer session.
-
-    The #67 shared funnel performs the formal validation; the service never
-    adds an E-specific parser, inspects review semantics, or manages runtime
-    modes. Known failure and uncertain outcome stay distinct, and neither is
-    ever retried or resent here: an uncertain send leaves the reserved
-    attempt unresolved for the E3b finalization to reconcile.
-    """
-    try:
-        outcome = runtime.realize_control(
-            session_id, interaction, message=message, expected_family=REVIEW_RESULT_FAMILY
-        )
-    except AgentRuntimeInterruptedTurnError as error:
-        settle_observed_task_interrupt(
-            pool, runtime, task_id=task_id, external_session_id=session_id
-        )
-        raise ExternalOperationFailedError(
-            "the agent runtime review interaction was interrupted by the runtime; the "
-            "reserved review attempt remains unresolved"
-        ) from error
-    except AgentRuntimeUncertainOutcomeError as error:
-        logger.warning(
-            "planning review dispatch ended with an uncertain runtime outcome; "
-            "the reserved review attempt remains unresolved"
-        )
-        raise ExternalOperationUncertainError(
-            "the outcome of the agent runtime review interaction is unknown; "
-            "the reserved review attempt remains unresolved"
-        ) from error
-    except AgentRuntimeError as error:
-        raise ExternalOperationFailedError(
-            "the agent runtime review interaction failed; the reserved review "
-            "attempt remains unresolved"
-        ) from error
-    if not isinstance(outcome, ReviewResult):
-        # A formal send with an expected family returns a typed formal
-        # result or raises; anything else is a known non-answer.
-        raise ExternalOperationFailedError(
-            "the agent runtime did not return a typed review result; the "
-            "reserved review attempt remains unresolved"
-        )
-    return outcome
-
-
 # --- the dispatch operation --------------------------------------------------
 
 
@@ -623,116 +565,6 @@ def _revalidate_reserved_subjects(
                 "reserved attempt stays unfinalized for recovery"
             )
         return task
-
-
-def dispatch_planning_review(
-    pool: DatabasePool,
-    reviewer_runtime_factory: ReviewerRuntimeAttachmentFactory,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    task_id: UUID,
-    plan_production: TaskPlanProductionOutcome,
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-) -> TaskPlanningReviewDispatchOutcome:
-    """Reserve one exact-plan REVIEW attempt, attach the Reviewer, send it.
-
-    Consumes the exact successful E2 plan-production outcome
-    (:class:`TaskPlanProductionOutcome`): the post-update Task token
-    authorizes the continuation, the persisted current PlanRevision is the
-    exact REVIEW subject, and the exact admitted READY Reviewer binding is
-    the only dispatch target. On first review the OPEN planning ReviewLoop
-    is established with the Workspace's current budget snapshot; the
-    next-numbered unfinalized ReviewIteration is reserved atomically before
-    the deferred Reviewer attachment and the external send, so an attachment
-    failure or a lost or uncertain send leaves a durable, unresolved attempt
-    carrying the invocation's own F5b handoff identity instead of a silent
-    hole (issue #268). The typed ``ReviewResult`` is returned as E3b's
-    continuation input — never finalized here.
-    """
-    with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
-        _require_uuid_command(profile_id, "profile_id")
-        _require_uuid_command(workspace_id, "workspace_id")
-        _require_uuid_command(task_id, "task_id")
-        reviewer_factory = _require_reviewer_factory(reviewer_runtime_factory)
-        production = _require_plan_production(plan_production)
-        annotate_span(
-            span,
-            operation=_DISPATCH_SPAN_NAME,
-            workspace_id=str(workspace_id),
-            task_id=str(task_id),
-        )
-
-        # --- Phase 1: entry validation + atomic reservation (database only). ---
-        reserved = _reserve_review_attempt(
-            pool,
-            profile_id=profile_id,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            plan_production=production,
-        )
-
-        if attempt_evidence is not None:
-            # The F5b coordinator's handoff fact: this invocation's committed
-            # reserved review iteration identity (#262). Recorded immediately
-            # after the reservation commit, before anything below — the
-            # attachment acquisition included — can fail (issue #268).
-            attempt_evidence.record_attempt(
-                family=PendingTaskRuntimeInteractionOperation.REVIEWER_REVIEW,
-                original_attempt_kind=OriginalAttemptKind.REVIEW_ITERATION,
-                original_attempt_id=reserved.iteration.id,
-                phase="planning_review_dispatch",
-            )
-
-        # --- Phases 2 and 3: the deferred Reviewer attachment, the
-        # post-attachment currentness proof, and the ONE REVIEW send — with
-        # NO database transaction open across the attachment or the send. ---
-        subject = PlanReviewSubject(
-            plan_revision_id=str(reserved.revision.id),
-            repository_full_name=reserved.repository_full_name,
-            issue_number=reserved.task.github_issue_number,
-            plan=reserved.revision.content,
-        )
-        interaction = ReviewInteraction(subject=subject)
-        message = _compose_review_message(
-            repository_full_name=reserved.repository_full_name,
-            issue_number=reserved.task.github_issue_number,
-            revision=reserved.revision,
-        )
-        with reviewer_factory(reserved.reviewer) as runtime_adapter:
-            # The attachment is acquired strictly after the reservation
-            # commit, so a failure here is attributable to the exact reserved
-            # ReviewIteration recorded above (issue #268). The post-attachment
-            # proof re-proves the reserved subjects under the Task row lock
-            # and closes before the send.
-            _revalidate_reserved_subjects(
-                pool,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                expected_state_token=reserved.task.state_token,
-                reserved_revision=reserved.revision,
-                reviewer_session=reserved.reviewer,
-            )
-            review_result = _realize_review_control(
-                pool,
-                runtime_adapter,
-                reserved.reviewer.external_session_id or "",
-                task_id=task_id,
-                interaction=interaction,
-                message=message,
-            )
-
-        # --- Phase 3: the internal continuation input for E3b. ---
-        # No verdict is recorded and no workflow consequence is applied here:
-        # E3b records the iteration result and its consequence in one
-        # transaction, rechecking the exact Task/token/current-plan/session
-        # subject this dispatch proved.
-        return TaskPlanningReviewDispatchOutcome(
-            review_loop=reserved.loop,
-            review_iteration=reserved.iteration,
-            review_result=review_result,
-            reviewer_session=reserved.reviewer,
-        )
 
 
 # --- the shared reservation and the detached regular-mode dispatch (issue #336) ---

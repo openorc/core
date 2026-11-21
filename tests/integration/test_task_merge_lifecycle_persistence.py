@@ -54,7 +54,7 @@ from openorc.services.task_merge_lifecycle import (
     request_task_merge,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_installation,
     _insert_profile,
     _insert_repository,

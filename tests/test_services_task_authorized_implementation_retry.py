@@ -42,33 +42,20 @@ from typing import Any, Final, cast
 
 import pytest
 
-from openorc.adapters.agent_runtime.errors import (
-    AgentRuntimeTimeoutError,
-    AgentRuntimeUnavailableError,
-)
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.executions import ExecutionStatus
-from openorc.domain.gates import OwnerGateStatus, OwnerGateType
-from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
-from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import InteractionKind
-from openorc.protocol.models import IMPLEMENTATION_RESULT_FAMILY
 from openorc.services.errors import (
     ConflictError,
-    ExternalOperationFailedError,
-    ExternalOperationUncertainError,
-    InvalidCommandError,
     NotFoundError,
     StaleOperationError,
 )
-from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.task_authorized_implementation_retry import (
     dispatch_authorized_implementation_retry_detached,
-    execute_authorized_implementation_retry,
 )
 from openorc.services.task_detached_turn_observation import (
     ObservationRegistrationRefusalReason,
@@ -742,141 +729,7 @@ def _arrange(
     return pool, runtime, attachment
 
 
-def _retry_call(
-    pool: DatabasePool,
-    *,
-    producer_runtime_factory: Any,  # noqa: ANN401 - typed at the service boundary
-    attempt_evidence: InvocationAttemptEvidence | None = None,
-    clock: Callable[[], datetime] | None = None,
-    expected_state_token: Any = _STATE_TOKEN,
-    profile_id: Any = _OWNER_PROFILE_ID,
-    workspace_id: Any = _WORKSPACE_ID,
-    task_id: Any = _TASK_ID,
-    retry_attempt_id: Any = _ATTEMPT_ID,
-) -> Any:  # noqa: ANN401 - the typed outcome
-    return execute_authorized_implementation_retry(
-        pool,
-        profile_id=profile_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        expected_state_token=expected_state_token,
-        retry_attempt_id=retry_attempt_id,
-        producer_runtime_factory=producer_runtime_factory,
-        attempt_evidence=attempt_evidence,
-        clock=clock,
-    )
-
-
-def _refused_before_effects(
-    conn: ScriptedConnection,
-    error_type: type[Exception],
-    **call_kwargs: Any,
-) -> None:
-    """Run a refusal case and prove nothing effectful happened."""
-    pool, runtime, attachment = _arrange(conn)
-    call_kwargs.setdefault("producer_runtime_factory", attachment)
-    with pytest.raises(error_type):
-        _retry_call(cast(DatabasePool, pool), **call_kwargs)
-    # No attempt row was reserved or claimed, no authorization was bound,
-    # no audit was written, and the adapter was never acquired.
-    assert _count(conn, _EXECUTION_INSERT) == 0
-    assert _count(conn, _EXECUTION_CLAIM) == 0
-    assert _count(conn, _BIND_UPDATE) == 0
-    assert _event_types(conn) == []
-    assert attachment.acquisitions == 0
-    assert runtime.realized_controls() == () and runtime.submitted_sends() == ()
-
-
 # --- manual-flow fidelity --------------------------------------------------------
-
-
-def test_the_authorized_due_retry_reserves_binds_and_completes_exactly_once() -> None:
-    """One due authorized retry reserves Execution #2, binds its F4 attempt
-    set-once inside the same admission composition with the started audit,
-    then realizes and sends exactly once on the original Producer session and
-    finalizes only the new row."""
-    conn = ScriptedConnection()
-    _script_success_path(conn, complete_row=_COMPLETE_RESULT_ROW)
-    pool, runtime, attachment = _arrange(conn, send_outcomes=[_RESULT_CANDIDATE])
-    evidence = InvocationAttemptEvidence()
-    outcome = _retry_call(
-        cast(DatabasePool, pool),
-        producer_runtime_factory=attachment,
-        attempt_evidence=evidence,
-        clock=lambda: _OBSERVED,
-    )
-
-    # The typed successful outcome carries the NEW Execution (number 2), the
-    # validated result, the Task, the Producer binding, and the approved gate.
-    assert outcome.execution.id == _RETRY_EXECUTION_ID
-    assert outcome.execution.status is ExecutionStatus.SUCCEEDED
-    assert outcome.execution.execution_number == 2
-    assert outcome.execution.implementation_result == dict(_RESULT_CANDIDATE)
-    assert outcome.task.status is TaskStatus.IMPLEMENTING
-    assert outcome.task.state_token == _STATE_TOKEN
-    assert outcome.producer_session.id == _SESSION_ID
-    assert outcome.owner_gate.status is OwnerGateStatus.APPROVED
-    assert outcome.owner_gate.gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION
-
-    # Exactly one native realization on the exact external session ID and one
-    # formal send carrying the persisted accepted Reviewer envelope.
-    (control,) = runtime.realized_controls()
-    assert control.external_session_id == _EXTERNAL_SESSION_ID
-    assert control.interaction.kind is InteractionKind.IMPLEMENT
-    assert control.message is None and control.native_action is True
-    (send,) = runtime.submitted_sends()
-    assert send.external_session_id == _EXTERNAL_SESSION_ID
-    assert send.expected_family == IMPLEMENTATION_RESULT_FAMILY
-    assert json.loads(send.message) == {
-        "type": "review_result",
-        "schema_version": 1,
-        "outcome": "accepted",
-        "summary": _SUMMARY,
-        "findings": [],
-    }
-    assert len(runtime.creation_requests()) == 1  # the harness's fake registration only
-
-    # Reservation: exactly one attempt row inserted (number 2) and claimed;
-    # the F4 authorization was bound set-once to that exact Execution; no
-    # guarded rewrite of any finalized row happened anywhere in the flow.
-    assert _count(conn, _EXECUTION_INSERT) == 1
-    (inserted_params,) = [params for sql, params in conn.executed if _EXECUTION_INSERT(sql, None)]
-    assert inserted_params is not None
-    assert inserted_params[2] == _SESSION_ID and inserted_params[3] == 2
-    assert _count(conn, _EXECUTION_CLAIM) == 1
-    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
-    (bound_params,) = [params for sql, params in conn.executed if _BIND_UPDATE(sql, None)]
-    assert bound_params == (
-        _RETRY_EXECUTION_ID,
-        _ATTEMPT_ID,
-        _TASK_ID,
-        _WORKSPACE_ID,
-        _RETRY_EXECUTION_ID,
-    )
-    (complete_params,) = [params for sql, params in conn.executed if _EXECUTION_COMPLETE(sql, None)]
-    assert complete_params is not None
-    assert complete_params[0].obj == dict(_RESULT_CANDIDATE)
-    assert complete_params[1] == _RETRY_EXECUTION_ID
-
-    # Matched Producer-attributed start/complete audit for the NEW row only.
-    assert _event_types(conn) == ["execution_started", "execution_completed"]
-    (started,) = _event_params_of_type(conn, "execution_started")
-    assert started[3] == "producer" and started[4] == str(_SESSION_ID)
-    assert started[5] == "execution" and started[6] == _RETRY_EXECUTION_ID
-    (completed,) = _event_params_of_type(conn, "execution_completed")
-    assert completed[6] == _RETRY_EXECUTION_ID
-
-    # The invocation's own evidence names the NEW retry Execution identity.
-    identity = evidence.latest_identity
-    assert identity is not None
-    assert identity.family is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
-    assert identity.original_attempt_kind is OriginalAttemptKind.EXECUTION
-    assert identity.original_attempt_id == _RETRY_EXECUTION_ID
-    assert identity.effect_attempt_id is None
-    assert identity.phase == "authorized_implementation_retry"
-
-    assert attachment.acquisitions == 1 and attachment.disposals == 1
-    assert pool.active_connections == 0
 
 
 # --- the refusal table: every refusal precedes any effect ------------------------
@@ -1022,134 +875,7 @@ def _refusal_cases() -> list[tuple[str, type[Exception], dict[str, Any]]]:
     ]
 
 
-def test_the_representative_refusal_table_refuses_before_any_effect() -> None:
-    """Every refusal family leaves no reservation, claim, binding, audit, or
-    adapter acquisition."""
-    for _name, error_type, script_kwargs in _refusal_cases():
-        conn = ScriptedConnection()
-        _script_admission(conn, **script_kwargs)
-        _refused_before_effects(conn, error_type, clock=lambda: _OBSERVED)
-
-
-def test_non_owner_callers_and_malformed_commands_fail_closed() -> None:
-    # A Profile that does not own the Workspace is uniformly not found.
-    conn = ScriptedConnection()
-    _script_repeating_reads(conn)
-    _refused_before_effects(conn, NotFoundError, profile_id=uuid.uuid4(), clock=lambda: _OBSERVED)
-
-    # Malformed commands are rejected before any state is touched.
-    pool, _runtime, attachment = _arrange(ScriptedConnection())
-    for kwargs in (
-        {"retry_attempt_id": "not-a-uuid"},
-        {"expected_state_token": "not-a-uuid"},
-        {"profile_id": "not-a-uuid"},
-        {"workspace_id": "not-a-uuid"},
-        {"task_id": "not-a-uuid"},
-    ):
-        with pytest.raises(InvalidCommandError):
-            _retry_call(
-                cast(DatabasePool, pool),
-                producer_runtime_factory=attachment,
-                **cast("dict[str, Any]", kwargs),
-            )
-    with pytest.raises(InvalidCommandError):
-        _retry_call(cast(DatabasePool, pool), producer_runtime_factory="not-callable")
-
-
 # --- failure discipline identical to E6 -------------------------------------------
-
-
-def test_proven_pre_effect_runtime_failure_finalizes_the_new_row_only() -> None:
-    """A positively proven pre-effect runtime failure finalizes the NEW
-    Execution ``failed_transient`` with its safe ``execution_failed`` audit;
-    the predecessor history is never rewritten."""
-    conn = ScriptedConnection()
-    _script_admission(conn)
-    _script_subject_reads(conn)  # R1 (the failure happens during realization)
-    conn.on(
-        _EXECUTION_GUARDED_UPDATE,
-        _execution_row(execution_id=_RETRY_EXECUTION_ID, number=2, status="failed_transient"),
-    )
-    pool, runtime, attachment = _arrange(
-        conn, realize_error=AgentRuntimeUnavailableError("the runtime is unavailable")
-    )
-    with pytest.raises(ExternalOperationFailedError):
-        _retry_call(
-            cast(DatabasePool, pool), producer_runtime_factory=attachment, clock=lambda: _OBSERVED
-        )
-
-    # The realization was attempted but never completed: no recorded
-    # realization and nothing was sent.
-    assert runtime.realized_controls() == ()
-    assert runtime.submitted_sends() == ()
-
-    # The NEW row finalized failed_transient with the matched audit.
-    (guarded,) = [params for sql, params in conn.executed if _EXECUTION_GUARDED_UPDATE(sql, None)]
-    assert guarded is not None
-    assert guarded[0] == "failed_transient" and guarded[1] == _RETRY_EXECUTION_ID
-    assert guarded[2] == "running"
-    assert _event_types(conn) == ["execution_started", "execution_failed"]
-    (failed,) = _event_params_of_type(conn, "execution_failed")
-    assert failed[5] == "execution" and failed[6] == _RETRY_EXECUTION_ID
-    assert failed[7].obj == {"failure_kind": "runtime_pre_effect"}
-    # The authorization stays bound to the failed Execution (never re-driven).
-    assert _count(conn, _BIND_UPDATE) == 1
-    assert _count(conn, _EXECUTION_COMPLETE) == 0
-    assert attachment.acquisitions == 1 and attachment.disposals == 1
-
-
-def test_uncertain_retry_outcomes_leave_the_new_execution_running() -> None:
-    """An uncertain send outcome is neither success nor known failure: the
-    claimed Execution stays conservatively running and nothing resends."""
-    conn = ScriptedConnection()
-    _script_admission(conn)
-    _script_subject_reads(conn)  # R1
-    _script_subject_reads(conn)  # R2 (the send outcome is uncertain)
-    outcome = AgentRuntimeTimeoutError("the send exceeded its deadline")
-    pool, runtime, attachment = _arrange(conn, send_outcomes=[outcome])
-    with pytest.raises(ExternalOperationUncertainError):
-        _retry_call(
-            cast(DatabasePool, pool), producer_runtime_factory=attachment, clock=lambda: _OBSERVED
-        )
-
-    assert _count(conn, _EXECUTION_GUARDED_UPDATE) == 0
-    assert _count(conn, _EXECUTION_COMPLETE) == 0
-    assert _event_types(conn) == ["execution_started"]
-    assert attachment.acquisitions == 1 and attachment.disposals == 1
-
-
-def test_authority_stale_during_attachment_finalizes_failed_final() -> None:
-    """Authority moving on during attachment refuses reconstruction, finalizes
-    the never-dispatched attempt ``failed_final`` truthfully, and never
-    reaches the runtime."""
-    conn = ScriptedConnection()
-    _script_admission(conn)
-    _script_subject_reads(conn, task_row=_task_row(state_token=_TOKEN_2))  # R1 goes stale
-    conn.on(
-        _EXECUTION_GUARDED_UPDATE,
-        _execution_row(execution_id=_RETRY_EXECUTION_ID, number=2, status="failed_final"),
-    )
-    pool, runtime, attachment = _arrange(conn)
-    with pytest.raises(StaleOperationError):
-        _retry_call(
-            cast(DatabasePool, pool), producer_runtime_factory=attachment, clock=lambda: _OBSERVED
-        )
-
-    assert runtime.realized_controls() == () and runtime.submitted_sends() == ()
-    (guarded,) = [params for sql, params in conn.executed if _EXECUTION_GUARDED_UPDATE(sql, None)]
-    assert guarded is not None
-    assert guarded[0] == "failed_final" and guarded[1] == _RETRY_EXECUTION_ID
-    assert _event_types(conn) == ["execution_started", "execution_failed"]
-    (failed,) = _event_params_of_type(conn, "execution_failed")
-    assert failed[7].obj == {"failure_kind": "authority_stale"}
-
-
-def test_replayed_consumption_after_binding_never_reaches_the_adapter() -> None:
-    """Reinvoking a consumed authorization is a no-effect refusal even though
-    its Execution may be failed, succeeded, or still running."""
-    conn = ScriptedConnection()
-    _script_admission(conn, attempt=_attempt_row(resulting_execution_id=_RETRY_EXECUTION_ID))
-    _refused_before_effects(conn, StaleOperationError, clock=lambda: _OBSERVED)
 
 
 # --- the detached retry dispatch (issues #325/#340) ---------------------------------
