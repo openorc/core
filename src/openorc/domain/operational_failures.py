@@ -184,6 +184,14 @@ class OriginalAttemptKind(StrEnum):
     # roots at no Execution, no interrupt intent, and no one-shot automated
     # attempt.
     OWNER_GATE_DISCUSSION = "owner_gate_discussion"
+    # Detached terminal cleanup (issue #344): the existing Task-scoped
+    # terminal cleanup one-shot fact. The receipt's ``original_attempt_id``
+    # is the exact terminalized Task UUID, with the claim's committed
+    # timestamp and the Task's terminal commitment re-proven at correlation
+    # time — cleanup invents no Execution, bootstrap claim, or control
+    # intent, and no parallel effect ledger exists beside the Task row's
+    # ``cleanup_send_claimed_at``/``cleanup_send_settled_at`` evidence pair.
+    TERMINAL_CLEANUP_CLAIM = "terminal_cleanup_claim"
 
 
 class GitHubMergeOperation(StrEnum):

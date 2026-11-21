@@ -3799,3 +3799,210 @@ def test_a_resume_receipt_with_a_family_conflict_is_left_unresolved(
         "update openorc.task_resume_intents" in " ".join(sql.split()) for sql, _ in conn.executed
     )
     assert triage.calls == []
+
+
+# --- the detached terminal cleanup (issue #344) ----------------------------------
+
+
+def _cleanup_receipt_row(
+    *, status: str = "admitted", outcome: dict[str, Any] | None = None
+) -> tuple[Any, ...]:
+    return _receipt_row(
+        status=status,
+        admitted_turn_reference=_TURN_REFERENCE if status in ("admitted", "settled") else None,
+        outcome=outcome,
+        operation="terminal_cleanup",
+        original_attempt_id=_TASK_ID,
+        original_attempt_kind="terminal_cleanup_claim",
+        expected_family="workspace_result",
+    )
+
+
+def _cleanup_settled_row(label: str) -> tuple[Any, ...]:
+    outcome: dict[str, Any] = {
+        SETTLEMENT_OUTCOME_LABEL_KEY: label,
+        SETTLEMENT_OUTCOME_SEQUENCE_KEY: 41,
+    }
+    return _cleanup_receipt_row(status="settled", outcome=outcome)
+
+
+def _script_committed_cleanup_subject(conn: ScriptedConnection, *, settled: bool = False) -> None:
+    """Script the terminalization-exception subject reproof read: a committed
+    terminalization with a present, unsettled one-shot cleanup claim (the
+    Task carries no ordinary currentness gate)."""
+    conn.on(
+        _sql_has("from openorc.tasks where id = %s for update"),
+        task_row(
+            id=_TASK_ID,
+            workspace_id=_WORKSPACE_ID,
+            status="waiting_for_owner",
+            state_token=_STATE_TOKEN,
+            source_requirements_fingerprint="a" * 64,
+            terminalization_outcome="cancelled",
+            terminalization_origin="owner_cancelled",
+            terminalization_established_at=_OBSERVED,
+            cleanup_send_claimed_at=_OBSERVED,
+            cleanup_send_settled_at=_OBSERVED if settled else None,
+        ),
+    )
+
+
+def test_a_validated_cleanup_result_settles_the_receipt_once_without_archiving(
+    triage: _RecordingTriage,
+) -> None:
+    """The observed CLEANUP_WORKSPACE completion validates against the
+    canonical ``workspace_result`` family and settles the receipt truthfully
+    exactly once — and NOTHING else: no Level 2 report, no claim settlement,
+    and no archival (the owning finalization's disposition is issue #345)."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _cleanup_receipt_row())
+    _script_receipt_for_update(conn, _cleanup_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_committed_cleanup_subject(conn)
+    _script_settle(conn, _cleanup_settled_row(SETTLEMENT_VALIDATED_RESULT))
+
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            marker=41,
+            candidate=_workspace_result_candidate(operation="CLEANUP", status="COMPLETED"),
+        ),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.operation.value == "terminal_cleanup"
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_VALIDATED_RESULT
+    assert outcome.formal_result is not None
+    # The terminalization exception: no Level 2 machinery, no claim
+    # settlement, and no archival from the routing itself.
+    assert triage.calls == []
+    executed = [" ".join(sql.split()) for sql, _ in conn.executed]
+    assert not any("cleanup_send_settled_at = now()" in sql for sql in executed)
+    assert not any("archived_at = now()" in sql for sql in executed)
+
+
+def test_a_moved_on_cleanup_subject_settles_result_not_applied(
+    triage: _RecordingTriage,
+) -> None:
+    """A late observation whose one-shot claim window already closed (the
+    owning disposition settled the claim) settles the receipt
+    ``result_not_applied`` — it can never re-open cleanup, change the
+    terminal truth, or undo an archival."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _cleanup_receipt_row())
+    _script_receipt_for_update(conn, _cleanup_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_committed_cleanup_subject(conn, settled=True)
+    _script_settle(conn, _cleanup_settled_row(SETTLEMENT_RESULT_NOT_APPLIED))
+
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            marker=41,
+            candidate=_workspace_result_candidate(operation="CLEANUP", status="COMPLETED"),
+        ),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_RESULT_NOT_APPLIED
+    assert triage.calls == []
+
+
+def test_an_observed_cleanup_failure_settles_truthfully_without_any_report(
+    triage: _RecordingTriage,
+) -> None:
+    """A natively failed cleanup run settles the receipt ``observed_failure``
+    and stops: no Level 2 report, no disposition, no block, and no second
+    send — the claim stays the owning disposition's subject (issue #345)."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _cleanup_receipt_row())
+    _script_receipt_for_update(conn, _cleanup_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_committed_cleanup_subject(conn)
+    _script_settle(conn, _cleanup_settled_row(SETTLEMENT_OBSERVED_FAILURE))
+
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            kind=DetachedTurnObservationKind.FAILED,
+            marker=41,
+        ),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert outcome.receipt is not None
+    assert outcome.receipt.outcome[SETTLEMENT_OUTCOME_LABEL_KEY] == SETTLEMENT_OBSERVED_FAILURE
+    assert triage.calls == []
+
+
+def test_an_unusable_cleanup_result_settles_the_failure_and_never_re_sends(
+    triage: _RecordingTriage,
+) -> None:
+    """A positively established unusable result (addressing another
+    operation) settles the receipt truthfully as an observed failure — the
+    same containment the blocking realization applied, never a re-send and
+    never a disposition decision of its own."""
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(conn, _cleanup_receipt_row())
+    _script_receipt_for_update(conn, _cleanup_receipt_row())
+    _script_last_consumed_sequence(conn, None)
+    _script_committed_cleanup_subject(conn)
+    _script_settle(conn, _cleanup_settled_row(SETTLEMENT_OBSERVED_FAILURE))
+
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(
+            marker=41,
+            candidate=_workspace_result_candidate(operation="PREPARE", status="COMPLETED"),
+        ),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert triage.calls == []
+
+
+def test_attach_consumes_a_staged_cleanup_result_through_the_new_routing(
+    triage: _RecordingTriage,
+) -> None:
+    """An early CLEANUP_WORKSPACE completion staged during the admission race
+    is consumed exactly once by the acknowledgement attach and routed through
+    the terminal-cleanup settlement — never left stranded in a routing
+    failure."""
+    conn = ScriptedConnection()
+    _script_receipt_for_update(conn, _cleanup_receipt_row(status="claimed"))
+    _script_attach(conn, _cleanup_receipt_row())
+    _script_staged(conn, _staged_row(candidate=_workspace_result_candidate("CLEANUP")))
+    _script_committed_cleanup_subject(conn)
+    _script_settle(conn, _cleanup_settled_row(SETTLEMENT_VALIDATED_RESULT))
+    _script_consume(conn)
+
+    outcome = attach_acknowledged_turn(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        receipt_id=_RECEIPT_ID,
+        admitted_turn_reference=_TURN_REFERENCE,
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+    assert outcome.receipt is not None
+    assert outcome.receipt.status.value == "settled"
+    assert triage.calls == []

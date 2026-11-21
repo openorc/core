@@ -103,9 +103,11 @@ def test_the_domain_vocabulary_stays_aligned_with_the_migration() -> None:
     for value in (member.value for member in PRAuthorizationPresentationOperation):
         assert f"'{value}'" in _collapsed(_migration_text_raw())
     for value in (member.value for member in OriginalAttemptKind):
-        # Every identity kind is admitted by the (unchanged) episode CHECK.
+        # Every identity kind is admitted by the (re-created) episode CHECK —
+        # the terminal-cleanup receipt migration (issue #344) last re-created
+        # it with the full vocabulary.
         assert f"'{value}'" in _collapsed(
             (
-                MIGRATIONS_DIR / "20261117000000_add_owner_reviewer_discussion_receipts.sql"
+                MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql"
             ).read_text(encoding="utf-8")
         )

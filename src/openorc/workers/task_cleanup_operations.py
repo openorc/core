@@ -1,4 +1,4 @@
-"""F10 terminal finalization operation composition (issues #256/#317).
+"""F10 terminal finalization operation composition (issues #256/#317/#344).
 
 The production handler for the one declared Task-scoped terminal
 finalization operation kind, the F1-backed submission bridge the terminal
@@ -11,17 +11,26 @@ of its own.
 Composition rules enforced by this module:
 
 - Finalization execution: the handler resolves the executing process's
-  database pool and cleanup runtime composition and invokes the existing
-  ``finalize_task_terminalization`` service with only the decoded scoped
-  Workspace/Task identifiers. The service reloads the committed
+  database pool, cleanup runtime composition, and EXPLICIT cleanup dispatch
+  selection, and invokes the existing ``finalize_task_terminalization``
+  service with only the decoded scoped Workspace/Task identifiers plus that
+  selection. The selection is resolved from the executing process's own
+  execution mode (issue #344): queue mode explicitly keeps the established
+  blocking interim (until #328); regular mode resolves the process-local
+  detached-turn observation host explicitly, and a host that cannot resolve
+  is the explicit observation-unavailable selection — positively skipping
+  the optional cleanup (no claim, no receipt, no blocking send) and never
+  silently selecting blocking execution. The service reloads the committed
   terminalization from durable state, re-derives the exact checkout and the
   original bound Producer session, rechecks every current safety fact
-  before the one bounded cleanup attempt, settles the one-shot claim, and
-  archives the Task atomically with its terminal audit and the ENDED
-  transition of its remaining active session bindings; the invocation never
-  carries or trusts paths, session identities, or outcomes. A late or
-  duplicate invocation is the idempotent no-op; a concurrently unsettled
-  cleanup claim defers the archival to its owning attempt.
+  before the one bounded cleanup attempt, settles the one-shot claim where
+  the selected mode owns one, and archives the Task atomically with its
+  terminal audit and the ENDED transition of its remaining active session
+  bindings when the selected mode's cleanup is complete-or-skipped; the
+  invocation never carries or trusts paths, session identities, or
+  outcomes. A late or duplicate invocation is the idempotent no-op; a
+  concurrently unsettled cleanup claim defers the archival to its owning
+  attempt.
 - Submission arrangement: the bridge implements the finalization service's
   submission seam over a supplied process-local F1
   :class:`OperationSubmitter` — the serving process's bounded local
@@ -42,13 +51,16 @@ Composition rules enforced by this module:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 from uuid import UUID
 
-from openorc.config import Settings
+from openorc.config import ExecutionMode, Settings
 from openorc.services.cline_terminal_cleanup import ClineTerminalCleanupComposition
 from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 from openorc.services.task_terminal_finalization import (
+    TerminalCleanupDispatch,
+    TerminalCleanupDispatchSelection,
     TerminalFinalizationSubmissionOutcome,
     finalize_task_terminalization,
 )
@@ -62,6 +74,8 @@ from openorc.workers.invocation import (
     TerminalFinalizationPayload,
 )
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "F1TerminalFinalizationSubmission",
     "build_terminal_cleanup_operation_handlers",
@@ -69,17 +83,50 @@ __all__ = [
 ]
 
 
+def _terminal_cleanup_dispatch(dependencies: OperationDependencies) -> TerminalCleanupDispatch:
+    """Resolve the executing process's EXPLICIT cleanup dispatch selection.
+
+    The mode comes from the executing process's own execution mode — never
+    inferred from registrar presence. Queue mode keeps the established
+    blocking interim until #328. Regular mode resolves the process-local
+    detached-turn observation host; a host that cannot resolve (an unwired
+    late-bound provider, a misconfigured composition) is the explicit
+    observation-unavailable selection: the optional cleanup is positively
+    skipped and the mandatory archival proceeds.
+    """
+    if dependencies.settings.execution_mode is not ExecutionMode.REGULAR:
+        return TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
+        )
+    try:
+        registrar = dependencies.detached_turn_observer()
+    except Exception as error:  # noqa: BLE001 - contained; the archival owns the outcome
+        logger.warning(
+            "the detached-turn observation host could not be resolved for the terminal "
+            "cleanup dispatch (%s); skipping the optional cleanup archive-only",
+            type(error).__name__,
+        )
+        return TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
+        )
+    return TerminalCleanupDispatch(
+        selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+        observation_registrar=registrar,
+    )
+
+
 def _finalize_task_terminalization_handler(
     payload: Any, *, dependencies: OperationDependencies
 ) -> None:
-    """Run one terminal finalization attempt (F10, issues #256/#317).
+    """Run one terminal finalization attempt (F10, issues #256/#317/#344).
 
     The handler only decodes and delegates: the executing process resolves
-    its database pool and cleanup runtime composition here, and the shared
-    finalization service owns every durable-state recheck, the one-shot
-    claim, the bounded optional cleanup, and the mandatory atomic archival
-    with its session finalization. Handler failures are never swallowed into
-    reported success — F1's sanitized execution-error containment owns them.
+    its database pool, cleanup runtime composition, and explicit cleanup
+    dispatch selection here, and the shared finalization service owns every
+    durable-state recheck, the one-shot claim, the bounded optional cleanup
+    in the selected mode, and the mandatory atomic archival with its session
+    finalization. Handler failures are never swallowed into reported
+    success — F1's sanitized execution-error containment owns them.
     """
     finalization_payload = cast(TerminalFinalizationPayload, payload)
     pool = dependencies.database_pool()
@@ -88,6 +135,7 @@ def _finalize_task_terminalization_handler(
         dependencies.terminal_cleanup_runtime(),
         workspace_id=UUID(finalization_payload.workspace_id),
         task_id=UUID(finalization_payload.task_id),
+        dispatch=_terminal_cleanup_dispatch(dependencies),
     )
 
 

@@ -83,6 +83,16 @@ class PendingTaskRuntimeInteractionOperation(StrEnum):
     # advisory conversation carries no operational retry/block semantics;
     # observed failures settle the receipt truthfully and stop.
     OWNER_REVIEWER_DISCUSSION = "owner_reviewer_discussion"
+    # Detached terminal cleanup (issue #344): the single enqueued
+    # CLEANUP_WORKSPACE run on the exact original Producer session for a
+    # committed, not-yet-archived terminalization. It is a receipt-operation
+    # vocabulary member (its detached-turn receipt is the outstanding run)
+    # and it is deliberately NOT a Level 2 operational-failure family and
+    # NOT subject to the ordinary currentness gates that reject terminal
+    # commitment — the terminalization exception. Its original claim
+    # identity is the Task row's own one-shot cleanup evidence pair; the
+    # Task's terminal commitment stays sole workflow authority.
+    TERMINAL_CLEANUP = "terminal_cleanup"
 
 
 @dataclass(frozen=True, slots=True)
