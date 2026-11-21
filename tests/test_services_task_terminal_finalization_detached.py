@@ -208,6 +208,43 @@ class _CleanupRegistrar:
             )
 
 
+class _RecordingCleanupHandoff:
+    """Records the ONE post-commit completion handoff invocations (issue #345)."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.error = error
+
+    def handoff_settled_completion(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        operation: Any,
+        validated_result: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "workspace_id": workspace_id,
+                "task_id": task_id,
+                "operation": operation,
+                "validated_result": validated_result,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+
+    def handoff_settled_interrupt(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        raise AssertionError("the terminal cleanup dispatch never routes Interrupt settlements")
+
+
 class _DetachedCalls:
     """Every recorded seam crossing of the detached dispatch tests."""
 
@@ -897,12 +934,17 @@ def test_a_staged_early_completion_consumes_once_at_the_attach(
 ) -> None:
     """A terminal observation that resolved to the receipt during the
     admission race is consumed exactly once by the acknowledgement attach and
-    routes through the terminal-cleanup settlement; the dispatch still exits
-    ``CLEANUP_OUTSTANDING`` with the claim unsettled — the archival
-    disposition stays the owning finalization's (issue #345)."""
+    routes through the terminal-cleanup settlement — whose attributable
+    composition settles the receipt and the one-shot claim atomically (the
+    correlation seam's own proven matrix; this suite proves the dispatch-side
+    recognition). The dispatching invocation then routes the SAME ONE
+    post-commit completion handoff the independent observer uses (issue
+    #345) and exits ``CLEANUP_EARLY_SETTLED``: never a re-dispatch, never a
+    second archival service."""
     calls = _DetachedCalls()
     runtime = _DetachedCleanupRuntime()
     registrar = _CleanupRegistrar()
+    handoff = _RecordingCleanupHandoff()
     receipt = _wire_detached(
         monkeypatch,
         calls,
@@ -910,7 +952,145 @@ def test_a_staged_early_completion_consumes_once_at_the_attach(
         attach_outcome=TurnSettlementOutcome(
             kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
             receipt=None,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
         ),
+    )
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.CLEANUP_EARLY_SETTLED
+    assert outcome.task is not None and outcome.task.archived_at is None
+    assert calls.attaches == [{"receipt_id": receipt.id, "admitted_turn_reference": "fake-run-344"}]
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+            "validated_result": None,
+        }
+    ]
+    assert calls.archive_calls == []  # the archival belongs to the routed finalization
+    assert calls.refusals == []
+
+
+def test_a_staged_early_observed_failure_routes_the_same_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged early completion that settles as an observed failure (a
+    native run failure or an unusable result) routes the same ONE post-commit
+    completion handoff (issue #345): the stale checkout is accepted without
+    any redispatch, and the invocation exits ``CLEANUP_EARLY_SETTLED``."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime()
+    registrar = _CleanupRegistrar()
+    handoff = _RecordingCleanupHandoff()
+    _wire_detached(
+        monkeypatch,
+        calls,
+        establishment=_eligible_establishment(),
+        attach_outcome=TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+            receipt=None,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+        ),
+    )
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.CLEANUP_EARLY_SETTLED
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+            "validated_result": None,
+        }
+    ]
+
+
+def test_a_failing_early_completion_handoff_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The early-completion handoff is best-effort and idempotent (issue
+    #345): a handoff that raises is contained — the durably settled attempt
+    owns recovery through a later explicitly invoked finalizer or the finite
+    deadline disposition, and the dispatching invocation never raises."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime()
+    registrar = _CleanupRegistrar()
+    handoff = _RecordingCleanupHandoff(error=RuntimeError("the finalization failed"))
+    _wire_detached(
+        monkeypatch,
+        calls,
+        establishment=_eligible_establishment(),
+        attach_outcome=TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+            receipt=None,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+        ),
+    )
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+            completion_handoff=handoff,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.CLEANUP_EARLY_SETTLED
+    assert len(handoff.calls) == 1  # the handoff was attempted exactly once
+
+
+def test_a_settled_prior_attempt_archives_without_any_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled prior attempt (issue #345): the one-shot window is closed at
+    entry, so the archival proceeds directly — the cleanup establishment
+    never re-runs, no claim is attempted, and no second dispatch follows."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime()
+    registrar = _CleanupRegistrar()
+    _wire_detached(
+        monkeypatch,
+        calls,
+        establishment=_eligible_establishment(),
+    )
+    settled_task = SimpleNamespace(
+        **{
+            **{name: getattr(_cleanup_task(), name) for name in vars(_cleanup_task())},
+            "cleanup_send_claimed_at": _OBSERVED,
+            "cleanup_send_settled_at": _OBSERVED,
+        }
+    )
+    monkeypatch.setattr(
+        finalization_module.task_records,
+        "get_task",
+        lambda pool, task_id: settled_task if task_id == _TASK_ID else None,
     )
 
     outcome = finalize_task_terminalization(
@@ -924,8 +1104,79 @@ def test_a_staged_early_completion_consumes_once_at_the_attach(
         ),
     )
 
-    assert outcome.kind is TerminalFinalizationKind.CLEANUP_OUTSTANDING
-    assert calls.attaches == [{"receipt_id": receipt.id, "admitted_turn_reference": "fake-run-344"}]
-    assert calls.settles == []
-    assert calls.refusals == []
-    assert calls.archive_calls == []
+    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
+    assert calls.claims == []
+    assert calls.receipts == []
+    assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_a_past_deadline_outstanding_attempt_archives_without_any_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The established finite deadline elapsed while the admitted (or
+    conservatively uncertain) attempt stayed unobserved (issue #345): a later
+    invoked finalizer conservatively stops waiting and archives — never a
+    redispatch, and the receipt is deliberately left as-is because a timeout
+    proves nothing about the native turn."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime()
+    registrar = _CleanupRegistrar()
+    _wire_detached(
+        monkeypatch,
+        calls,
+        establishment=_eligible_establishment(),
+    )
+    claimed_task = SimpleNamespace(
+        **{
+            **{name: getattr(_cleanup_task(), name) for name in vars(_cleanup_task())},
+            "cleanup_send_claimed_at": _OBSERVED,
+        }
+    )
+    monkeypatch.setattr(
+        finalization_module.task_records,
+        "get_task",
+        lambda pool, task_id: claimed_task if task_id == _TASK_ID else None,
+    )
+    monkeypatch.setattr(
+        finalization_module,
+        "_cleanup_claim_deadline_open",
+        lambda _claimed_at: False,
+    )
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
+    assert calls.claims == []
+    assert calls.receipts == []
+    assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_a_dispatch_construction_rejects_a_handoff_outside_the_detached_selection() -> None:
+    """The inconsistent-construction discipline: only the detached-regular
+    selection carries the completion handoff, so a mode can never be inferred
+    from handoff presence (issue #345)."""
+    with pytest.raises(ValueError):
+        TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM,
+            completion_handoff=_RecordingCleanupHandoff(),
+        )
+    with pytest.raises(ValueError):
+        TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE,
+            completion_handoff=_RecordingCleanupHandoff(),
+        )
+    carried = TerminalCleanupDispatch(
+        selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+        observation_registrar=_CleanupRegistrar(),
+        completion_handoff=_RecordingCleanupHandoff(),
+    )
+    assert carried.completion_handoff is not None

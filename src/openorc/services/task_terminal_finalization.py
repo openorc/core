@@ -64,8 +64,17 @@ inside the Cline integration), and exits upon admission/refusal/uncertainty.
 A proven pre-effect refusal (including an unwired or failed observation
 path) refuses the receipt, settles the claim, and continues to the
 established archive-only finalization; an admitted or uncertain outstanding
-attempt stays claimed for the independent settlement/deadline disposition
-(#345) with capacity preserved. The cleanup family is the terminalization
+attempt stays claimed with capacity preserved for the independently observed
+settlement (issue #345): the attributable completion settles the receipt
+truthfully and the one-shot claim atomically with it and names the
+``TERMINAL_CLEANUP`` handoff family, so the ONE post-commit completion
+handoff — the observation host's, or the dispatching invocation's own when
+its acknowledgement attach consumes a staged early completion — re-invokes
+this idempotent finalization, whose entry classification and under-lock
+window guard proceed archive-only to the mandatory atomic archival and, on
+the established finite cleanup deadline, settle a past-deadline claim inline
+before archiving. Never a redispatch, no scheduler, no watchdog. The cleanup
+family is the terminalization
 exception: it is never gated by ordinary currentness machinery and never
 enrolled in Level 2/3 — the Task's terminal commitment stays sole authority.
 """
@@ -74,6 +83,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 from uuid import UUID
@@ -108,7 +118,9 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_correlation import (
+    TurnSettlementKind,
     attach_acknowledged_turn,
     record_task_detached_turn_receipt,
 )
@@ -201,13 +213,17 @@ class TerminalCleanupDispatch:
     """The worker-resolved explicit cleanup dispatch selection (issue #344).
 
     One typed value the finalizer dispatches on. The regular-mode detached
-    selection carries the process's observation registrar; every other
-    selection carries none, and an inconsistent construction is rejected
-    so a mode can never be inferred from registrar presence.
+    selection carries the process's observation registrar and — issue #345 —
+    the process's ONE post-commit completion handoff, which the dispatching
+    invocation routes when the acknowledgement attach consumes a staged early
+    completion; every other selection carries neither, and an inconsistent
+    construction is rejected so a mode can never be inferred from
+    registrar or handoff presence.
     """
 
     selection: TerminalCleanupDispatchSelection
     observation_registrar: TerminalCleanupObservationRegistrar | None = None
+    completion_handoff: DetachedTurnCompletionHandoff | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, TerminalCleanupDispatchSelection):
@@ -220,6 +236,13 @@ class TerminalCleanupDispatch:
         elif self.observation_registrar is not None:
             raise ValueError(
                 "only a detached-regular cleanup dispatch carries an observation registrar"
+            )
+        if (
+            self.selection is not TerminalCleanupDispatchSelection.DETACHED_REGULAR
+            and self.completion_handoff is not None
+        ):
+            raise ValueError(
+                "only a detached-regular cleanup dispatch carries a completion handoff"
             )
 
 
@@ -275,15 +298,78 @@ class TerminalFinalizationKind(StrEnum):
     ``CLEANUP_OUTSTANDING`` (issue #344) is the owning attempt's own
     outcome when an admitted or uncertain detached cleanup run is
     outstanding on its unsettled claim: the dispatching invocation exits
-    without settling, archival stays deferred to the independent
-    settlement/deadline disposition (#345) or a later eligible finalizer
-    call, and capacity stays held while the attempt is outstanding.
+    without settling, and the independently observed settlement routes the
+    ONE post-commit completion handoff back to this finalization (issue
+    #345). ``CLEANUP_EARLY_SETTLED`` (issue #345) is the dispatching
+    invocation's own outcome when the acknowledgement attach consumed a
+    staged early completion: the receipt and the one-shot claim settled
+    atomically inside the attach and the handoff was routed best-effort —
+    the returned fresh Task snapshot shows whether that handoff's own
+    finalization already archived (``archived_at`` set) or the mandatory
+    archival stays with a later explicitly invoked finalizer or the finite
+    deadline disposition.
     """
 
     ARCHIVED = "archived"
     ALREADY_ARCHIVED = "already_archived"
     CLEANUP_IN_FLIGHT = "cleanup_in_flight"
     CLEANUP_OUTSTANDING = "cleanup_outstanding"
+    CLEANUP_EARLY_SETTLED = "cleanup_early_settled"
+
+
+# The established finite terminal-cleanup deadline (issue #345): the bounded
+# magnitude of the #317 blocking realization's own request window (the Cline
+# bridge process's bounded request timeout) applied to the detached
+# admission's outstanding one-shot claim. It is consumed ONLY by an actually
+# invoked finalizer — never by a scheduler, watchdog, or any automatic
+# worker-death detector (the accepted v1 limitation on issue #317).
+_TERMINAL_CLEANUP_DEADLINE: Final[timedelta] = timedelta(seconds=900)
+
+
+def _cleanup_claim_deadline_open(claimed_at: datetime) -> bool:
+    """Whether the claimed cleanup attempt is still inside its finite deadline.
+
+    The claim timestamp is the DB-clock instant the one-shot claim committed;
+    the comparison uses this process's UTC clock, bounded well beyond any
+    realistic application/database skew by the deadline's magnitude.
+    """
+    return datetime.now(UTC) - claimed_at < _TERMINAL_CLEANUP_DEADLINE
+
+
+def _claimed_cleanup_disposition(
+    pool: DatabasePool,
+    task: Task,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+) -> TerminalFinalizationOutcome | None:
+    """The committed one-shot claim's owning disposition (issue #345).
+
+    ``None`` when the Task is genuinely unclaimed — the normal state of a
+    fresh terminalization whose first eligible finalizer invocation still
+    owns the full cleanup establishment and one-shot dispatch path. A settled
+    prior attempt archives archive-only: the one-shot window is closed, so
+    the establishment never re-runs and no second dispatch ever follows. An
+    unsettled attempt inside its finite deadline defers the archival exactly
+    as the authoritative under-lock window guard does — a concurrent attempt
+    owns its window, and ending sessions or releasing capacity mid-attempt
+    is forbidden. An unsettled attempt past the deadline stops waiting
+    conservatively: the archival's under-lock guard settles the claim and
+    archives, the stale checkout is accepted, the receipt is left as-is
+    (a timeout proves nothing about the native turn), and no second cleanup
+    dispatch ever follows.
+    """
+    if task.cleanup_send_claimed_at is None:
+        return None
+    if task.cleanup_send_settled_at is not None or not _cleanup_claim_deadline_open(
+        task.cleanup_send_claimed_at
+    ):
+        return _archive_committed_terminalization(pool, workspace_id=workspace_id, task_id=task_id)
+    return TerminalFinalizationOutcome(
+        kind=TerminalFinalizationKind.CLEANUP_IN_FLIGHT,
+        task=task,
+        released_session_bindings=(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +528,16 @@ def finalize_task_terminalization(
                 released_session_bindings=(),
             )
 
+        # --- The committed one-shot claim's disposition (issue #345). A
+        # genuinely unclaimed commitment falls through to the dispatch
+        # selection below: the first eligible finalizer invocation keeps the
+        # full cleanup establishment and one-shot dispatch path. ---
+        claimed = _claimed_cleanup_disposition(
+            pool, task, workspace_id=workspace_id, task_id=task_id
+        )
+        if claimed is not None:
+            return claimed
+
         # --- The optional bounded cleanup under its one-shot claim. ---
         if runtime is not None:
             selection = (
@@ -470,6 +566,9 @@ def finalize_task_terminalization(
                     workspace_id=workspace_id,
                     task_id=task_id,
                     observation_registrar=registrar,
+                    completion_handoff=(
+                        dispatch.completion_handoff if dispatch is not None else None
+                    ),
                 )
                 if outcome is not None:
                     # The detached attempt owns an outstanding (or settled)
@@ -510,24 +609,21 @@ def finalize_task_terminalization(
                                 type(error).__name__,
                             )
                 else:
-                    # The claim was not taken by this invocation. Classify the
-                    # current claim state from a fresh read: an unsettled claim
-                    # owned by a concurrent attempt defers archival — never end a
-                    # session, or release capacity, mid-attempt. A settled claim
-                    # (or an unclaimed one after a failed claim read) proceeds;
-                    # the archival transaction rechecks the claim state under the
-                    # Task row lock, which is the authoritative window guard.
+                    # The claim was not taken by this invocation. Classify
+                    # the current claim state from a fresh read (issue #345):
+                    # an unsettled claim inside its finite deadline defers
+                    # archival — never end a session, or release capacity,
+                    # mid-attempt; a past-deadline or settled claim stops
+                    # waiting and the archival transaction rechecks and owns
+                    # the window under the Task row lock, which is the
+                    # authoritative guard.
                     current = task_records.get_task(pool, task_id)
-                    if (
-                        current is not None
-                        and current.cleanup_send_claimed_at is not None
-                        and current.cleanup_send_settled_at is None
-                    ):
-                        return TerminalFinalizationOutcome(
-                            kind=TerminalFinalizationKind.CLEANUP_IN_FLIGHT,
-                            task=current,
-                            released_session_bindings=(),
+                    if current is not None:
+                        disposition = _claimed_cleanup_disposition(
+                            pool, current, workspace_id=workspace_id, task_id=task_id
                         )
+                        if disposition is not None:
+                            return disposition
 
         return _archive_committed_terminalization(pool, workspace_id=workspace_id, task_id=task_id)
 
@@ -664,6 +760,7 @@ def _attempt_detached_terminal_cleanup(
     workspace_id: UUID,
     task_id: UUID,
     observation_registrar: TerminalCleanupObservationRegistrar,
+    completion_handoff: DetachedTurnCompletionHandoff | None,
 ) -> TerminalFinalizationOutcome | None:
     """Dispatch the optional cleanup as ONE independently observed detached run.
 
@@ -688,10 +785,14 @@ def _attempt_detached_terminal_cleanup(
     guard owns the archival decision. Returns ``CLEANUP_OUTSTANDING`` when
     the run was admitted (or the admission ended uncertain): the receipt
     records the acknowledged truth (or stays conservatively claimed), the
-    claim stays unsettled for the independent settlement/deadline
-    disposition (#345), capacity stays held, and the dispatching worker
-    exits. A successful enqueue was never cleanup success, and the Task's
-    terminal commitment stays sole workflow authority.
+    claim stays unsettled for the independently observed settlement (issue
+    #345), capacity stays held, and the dispatching worker exits. Returns
+    ``CLEANUP_EARLY_SETTLED`` when the acknowledgement attach consumed a
+    staged early completion: the receipt and the claim settled atomically
+    inside the attach and this invocation routed the ONE post-commit
+    completion handoff best-effort (issue #345). A successful enqueue was
+    never cleanup success, and the Task's terminal commitment stays sole
+    workflow authority.
     """
     establishment = establish_terminal_checkout_cleanup(
         pool, workspace_id=workspace_id, task_id=task_id
@@ -820,8 +921,8 @@ def _attempt_detached_terminal_cleanup(
         # An unclassified failure inside the composition: whether the turn
         # was enqueued cannot be ruled out, so the attempt stays
         # conservatively outstanding — never a proven non-delivery, never a
-        # re-send, and the independent settlement/deadline disposition
-        # (issue #345) owns the later disposition.
+        # re-send, and the independently observed settlement (issue #345)
+        # owns the later disposition.
         logger.warning(
             "the detached terminal cleanup admission failed with an unclassified "
             "error (%s); the receipt stays conservatively claimed and the claim "
@@ -842,7 +943,7 @@ def _attempt_detached_terminal_cleanup(
     # terminal-cleanup settlement routing, so an early result that finished
     # before the acknowledgement was persisted is correlated, never ignored. ---
     try:
-        attach_acknowledged_turn(
+        attach_outcome = attach_acknowledged_turn(
             pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -857,6 +958,42 @@ def _attempt_detached_terminal_cleanup(
             "after its known admission; authoritative recovery is required and "
             "the instruction is never re-dispatched"
         ) from error
+    if (
+        attach_outcome.kind
+        in (
+            TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+            TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+        )
+        and attach_outcome.handoff_operation is not None
+    ):
+        # A staged early completion settled the one-shot attempt inside the
+        # attach composition (issue #345): the receipt and the claim settled
+        # atomically there, so no later observer event is guaranteed. This
+        # dispatching invocation routes the SAME ONE post-commit completion
+        # handoff the independent observer uses — best-effort and idempotent.
+        # A failed handoff leaves the durably settled state to a later
+        # explicitly invoked finalizer or the finite deadline disposition:
+        # never a re-dispatch, never a second archival service.
+        if completion_handoff is not None:
+            try:
+                completion_handoff.handoff_settled_completion(
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    operation=attach_outcome.handoff_operation,
+                    validated_result=None,
+                )
+            except Exception as error:  # noqa: BLE001 - best-effort handoff
+                logger.warning(
+                    "the terminal cleanup early-completion handoff failed (%s); the "
+                    "durably settled attempt owns recovery through a later finalizer",
+                    type(error).__name__,
+                )
+        else:
+            logger.warning(
+                "the terminal cleanup dispatch carries no completion handoff; the "
+                "early-settled attempt's archival waits for a later finalizer invocation"
+            )
+        return _cleanup_early_settled_outcome(pool, workspace_id=workspace_id, task_id=task_id)
     return _cleanup_outstanding_outcome(pool, workspace_id=workspace_id, task_id=task_id)
 
 
@@ -867,15 +1004,39 @@ def _cleanup_outstanding_outcome(
 
     The one-shot claim deliberately stays unsettled: the admitted (or
     conservatively uncertain) run is outstanding, capacity stays held, and
-    the archival stays deferred to the independent settlement/deadline
-    disposition (#345) or a later eligible finalizer call — a competing
-    finalizer's window guard defers exactly the same way.
+    the archival stays deferred to the independently observed settlement —
+    which routes the ONE post-commit completion handoff back to this
+    finalization (issue #345) — or to the finite deadline disposition. A
+    competing finalizer's window guard defers exactly the same way.
     """
     task = task_records.get_task(pool, task_id)
     if task is None or task.workspace_id != workspace_id:  # pragma: no cover
         raise NotFoundError("the requested task is not available in this workspace")
     return TerminalFinalizationOutcome(
         kind=TerminalFinalizationKind.CLEANUP_OUTSTANDING,
+        task=task,
+        released_session_bindings=(),
+    )
+
+
+def _cleanup_early_settled_outcome(
+    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> TerminalFinalizationOutcome:
+    """The attach-settled attempt's ``CLEANUP_EARLY_SETTLED`` outcome (#345).
+
+    A staged early completion settled the receipt and the one-shot claim
+    atomically inside the acknowledgement attach and the ONE post-commit
+    completion handoff was routed best-effort: the returned fresh Task
+    snapshot shows whether that handoff's own finalization already archived
+    (``archived_at`` set) or the mandatory archival stays with a later
+    explicitly invoked finalizer or the finite deadline disposition — never
+    a re-dispatch, never a second archival service.
+    """
+    task = task_records.get_task(pool, task_id)
+    if task is None or task.workspace_id != workspace_id:  # pragma: no cover
+        raise NotFoundError("the requested task is not available in this workspace")
+    return TerminalFinalizationOutcome(
+        kind=TerminalFinalizationKind.CLEANUP_EARLY_SETTLED,
         task=task,
         released_session_bindings=(),
     )
@@ -919,16 +1080,31 @@ def _archive_committed_terminalization(
                 released_session_bindings=(),
             )
         if locked.cleanup_send_claimed_at is not None and locked.cleanup_send_settled_at is None:
-            # The authoritative under-lock window guard: a concurrent cleanup
-            # attempt owns its bounded response-or-timeout window, and this
-            # transaction must not archive — ending sessions or releasing
-            # capacity — mid-attempt. The owning attempt (or a later
-            # delivery, after the settle) finalizes the archival.
-            return TerminalFinalizationOutcome(
-                kind=TerminalFinalizationKind.CLEANUP_IN_FLIGHT,
-                task=locked,
-                released_session_bindings=(),
-            )
+            if _cleanup_claim_deadline_open(locked.cleanup_send_claimed_at):
+                # The authoritative under-lock window guard: a concurrent cleanup
+                # attempt owns its bounded response-or-timeout window, and this
+                # transaction must not archive — ending sessions or releasing
+                # capacity — mid-attempt. The owning attempt (or a later
+                # delivery, after the settle) finalizes the archival.
+                return TerminalFinalizationOutcome(
+                    kind=TerminalFinalizationKind.CLEANUP_IN_FLIGHT,
+                    task=locked,
+                    released_session_bindings=(),
+                )
+            # The established finite deadline elapsed while the attempt stayed
+            # unobserved (issue #345): conservatively stop waiting — settle
+            # the one-shot claim inline in this same transaction and archive.
+            # The receipt is deliberately left as-is (a timeout proves
+            # nothing about the native turn), the stale checkout is accepted,
+            # and no second cleanup dispatch ever follows. Under the row lock
+            # held since the reproof the settle CAS cannot fail; a
+            # hypothetical miss defers.
+            if task_records.settle_task_terminal_cleanup_send(transaction_pool, task_id) is None:
+                return TerminalFinalizationOutcome(
+                    kind=TerminalFinalizationKind.CLEANUP_IN_FLIGHT,
+                    task=locked,
+                    released_session_bindings=(),
+                )
         archived = task_records.archive_task(
             transaction_pool,
             task_id,

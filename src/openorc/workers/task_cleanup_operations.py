@@ -80,10 +80,13 @@ __all__ = [
     "F1TerminalFinalizationSubmission",
     "build_terminal_cleanup_operation_handlers",
     "default_terminal_cleanup_runtime_provider",
+    "resolve_terminal_cleanup_dispatch",
 ]
 
 
-def _terminal_cleanup_dispatch(dependencies: OperationDependencies) -> TerminalCleanupDispatch:
+def resolve_terminal_cleanup_dispatch(
+    dependencies: OperationDependencies,
+) -> TerminalCleanupDispatch:
     """Resolve the executing process's EXPLICIT cleanup dispatch selection.
 
     The mode comes from the executing process's own execution mode — never
@@ -92,7 +95,10 @@ def _terminal_cleanup_dispatch(dependencies: OperationDependencies) -> TerminalC
     detached-turn observation host; a host that cannot resolve (an unwired
     late-bound provider, a misconfigured composition) is the explicit
     observation-unavailable selection: the optional cleanup is positively
-    skipped and the mandatory archival proceeds.
+    skipped and the mandatory archival proceeds. The detached-regular
+    selection also carries the process's ONE post-commit completion handoff
+    (issue #345), which the dispatching invocation routes when the
+    acknowledgement attach consumes a staged early completion.
     """
     if dependencies.settings.execution_mode is not ExecutionMode.REGULAR:
         return TerminalCleanupDispatch(
@@ -109,9 +115,14 @@ def _terminal_cleanup_dispatch(dependencies: OperationDependencies) -> TerminalC
         return TerminalCleanupDispatch(
             selection=TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
         )
+    # Deferred import: this module is imported by the worker workflow module
+    # that owns the ONE post-commit completion handoff builder.
+    from openorc.workers.task_workflow import build_detached_completion_handoff
+
     return TerminalCleanupDispatch(
         selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
         observation_registrar=registrar,
+        completion_handoff=build_detached_completion_handoff(dependencies),
     )
 
 
@@ -135,7 +146,7 @@ def _finalize_task_terminalization_handler(
         dependencies.terminal_cleanup_runtime(),
         workspace_id=UUID(finalization_payload.workspace_id),
         task_id=UUID(finalization_payload.task_id),
-        dispatch=_terminal_cleanup_dispatch(dependencies),
+        dispatch=resolve_terminal_cleanup_dispatch(dependencies),
     )
 
 

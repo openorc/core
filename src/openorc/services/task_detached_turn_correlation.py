@@ -300,12 +300,13 @@ _DISCUSSION_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOp
 )
 
 # The terminal-cleanup family with detached settlement routing in this seam
-# (issue #344): the terminalization exception's CLEANUP_WORKSPACE run whose
-# validated ``workspace_result`` settles the receipt truthfully. The route
-# settles neither the Task's one-shot cleanup claim nor the archival — that
-# disposition (including the established finite deadline) is the owning
-# finalization's (issue #345) — and the family is deliberately NOT a Level 2
-# operational-failure family.
+# (issues #344/#345): the terminalization exception's CLEANUP_WORKSPACE run
+# whose validated ``workspace_result`` settles the receipt truthfully —
+# atomically with the one-shot cleanup claim's own settle — and whose
+# ``handoff_operation`` routes the ONE post-commit completion handoff to the
+# owning finalization's atomic archival. The route still never archives
+# itself and the family is deliberately NOT a Level 2 operational-failure
+# family.
 _TERMINAL_CLEANUP_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
     frozenset({PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP})
 )
@@ -392,7 +393,9 @@ class TurnSettlementOutcome:
     the ORIGINAL workflow operation (issue #343): the session-resume
     receipt's settlement completes the original attempt through the owning
     services, so the handoff routes by the record's original operation
-    family — never by ``session_resume`` itself. ``None`` routes by the
+    family — never by ``session_resume`` itself — and the terminal-cleanup
+    settlement (issue #345) names ``TERMINAL_CLEANUP`` so the handoff routes
+    the owning finalization's mandatory archival. ``None`` routes by the
     receipt's own operation, so every existing family's handoff behavior is
     unchanged.
     """
@@ -1442,19 +1445,20 @@ def _route_terminal_cleanup_terminal(
 ) -> TurnSettlementOutcome:
     """Route one attributed terminal observation onto the terminal cleanup run.
 
-    The terminalization exception (issue #344): the subject reproof checks
-    the exact Task UUID's durable terminalization commitment and its one-shot
-    cleanup claim — the claim's committed timestamp must match the receipt's
-    own ``claimed_at`` — never an ordinary currentness gate that rejects
-    terminal commitment, and no Level 2/3 machinery follows. The observed
-    candidate is validated as the canonical ``workspace_result``
-    (``operation=CLEANUP``, ``COMPLETED|FAILED``); a validated result, a
-    native run failure, or a positively established unusable result settles
-    the receipt truthfully exactly once. The route settles neither the Task's
-    cleanup claim nor the archival: that disposition — including the
-    established finite deadline — is the owning finalization's (issue #345),
-    so a validated result alone never archives here and a successful enqueue
-    was never cleanup success.
+    The terminalization exception (issues #344/#345): the subject reproof
+    checks the exact Task UUID's durable terminalization commitment and its
+    one-shot cleanup claim — the claim's committed timestamp must match the
+    receipt's own ``claimed_at`` — never an ordinary currentness gate that
+    rejects terminal commitment, and no Level 2/3 machinery follows. The
+    observed candidate is validated as the canonical ``workspace_result``
+    (``operation=CLEANUP``, ``COMPLETED|FAILED``). On every attributable
+    outcome the one-shot claim settles exactly once, atomically with the
+    receipt's truthful settlement, in this same short transaction, and the
+    settlement names ``TERMINAL_CLEANUP`` as the ``handoff_operation`` so the
+    ONE post-commit completion handoff routes the owning finalization's
+    mandatory atomic archival (issue #345). The route itself never archives:
+    a successful enqueue was never cleanup success, and the archival's own
+    under-lock window guard re-derives every fact from committed state.
     """
     locked = task_records.get_task_for_update(transaction_pool, task_id)
     if locked is None or locked.workspace_id != workspace_id or locked.id != task_id:
@@ -1493,11 +1497,36 @@ def _route_terminal_cleanup_terminal(
         return TurnSettlementOutcome(
             kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
         )
+    # The attributable disposition (issue #345): the one-shot claim settles
+    # exactly once — atomically with this receipt's truthful settlement, in
+    # this same short transaction — so the one-shot window closes with the
+    # observation instead of holding the archival hostage to a later
+    # invocation. Under the row lock held since the reproof the settle CAS
+    # cannot fail; a hypothetical miss could only be a subject that moved on
+    # under a different instant, never a re-opened window.
+    settled_claim = task_records.settle_task_terminal_cleanup_send(transaction_pool, task_id)
+    if settled_claim is None:  # pragma: no cover - unreachable under the row lock
+        logger.warning(
+            "the terminal-cleanup receipt's claim settled concurrently; "
+            "settling the observation as not applied"
+        )
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
     if outcome.kind is DetachedTurnObservationKind.FAILED:
         # The cleanup run's observed native failure: the receipt settles
-        # truthfully and stops. No Level 2 report, no disposition, no block,
-        # and no second send — the claim stays the owning disposition's
-        # subject (issue #345).
+        # truthfully with the claim and stops. No Level 2 report, no
+        # disposition, no block, and no second send — the ONE post-commit
+        # completion handoff routes the owning finalization's archival, and
+        # the stale checkout is accepted without any redispatch (issue
+        # #345).
         settled = turn_records.settle_task_detached_turn_receipt(
             transaction_pool,
             receipt_id=receipt.id,
@@ -1506,7 +1535,9 @@ def _route_terminal_cleanup_terminal(
             outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
         )
         return TurnSettlementOutcome(
-            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE, receipt=settled
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+            receipt=settled,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
         )
     parsed: WorkspaceResult | None
     if outcome.result_candidate is not None:
@@ -1526,8 +1557,10 @@ def _route_terminal_cleanup_terminal(
     ):
         # A positively established unusable result (missing, protocol-invalid,
         # or addressing another operation): the receipt settles truthfully
-        # and stops — the same containment the blocking realization applied,
-        # never a re-send, never a disposition decision of its own.
+        # with the claim and stops — the same containment the blocking
+        # realization applied, never a re-send, never a disposition decision
+        # of its own; the ONE post-commit completion handoff routes the
+        # owning finalization's archival (issue #345).
         logger.warning(
             "the observed terminal cleanup completion carries no usable "
             "workspace result for its expected family; settling the receipt "
@@ -1541,7 +1574,9 @@ def _route_terminal_cleanup_terminal(
             outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
         )
         return TurnSettlementOutcome(
-            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE, receipt=settled
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+            receipt=settled,
+            handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
         )
     settled = turn_records.settle_task_detached_turn_receipt(
         transaction_pool,
@@ -1554,6 +1589,7 @@ def _route_terminal_cleanup_terminal(
         kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=settled,
         formal_result=parsed,
+        handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
     )
 
 

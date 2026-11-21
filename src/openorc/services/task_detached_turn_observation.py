@@ -1158,20 +1158,34 @@ class DetachedTurnObservationHost:
         if outcome.kind in _CLEANUP_SETTLEMENT_KINDS:
             self._cleanup_after_settlement(entry, lease)
         if (
-            outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+            outcome.kind
+            in (
+                TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+                TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+            )
             and outcome.receipt is not None
             and self._completion_handoff is not None
+            and (
+                outcome.handoff_operation is not None
+                or outcome.kind is TurnSettlementKind.SETTLED_VALIDATED_RESULT
+            )
         ):
-            # A validated result settlement committed (issues #324/#333):
-            # the ONE post-commit completion handoff owns the explicit
-            # family routing and the resumption. Strictly post-commit,
-            # contained, never a workflow authority; a failed routing
-            # leaves the durable state to the existing recovery semantics.
-            # The in-memory validated result is forwarded only for the
-            # PR_COMPOSE family (issue #337): its presentation material is
-            # deliberately not durable, so the same invocation's bounded
-            # publication continuation receives it here; every other family
-            # re-derives its continuation from committed durable state.
+            # A settled completion committed (issues #324/#333/#345): the ONE
+            # post-commit completion handoff owns the explicit family routing
+            # and the resumption. Strictly post-commit, contained, never a
+            # workflow authority; a failed routing leaves the durable state to
+            # the existing recovery semantics. A validated result routes by
+            # the receipt's own operation unless the settlement named the
+            # original family explicitly (issue #343); an observed failure
+            # routes ONLY when the settlement named an explicit handoff
+            # family — the terminalization exception's terminal-cleanup route
+            # (issue #345) — because the ordinary families' observed-failure
+            # settlements report Level 2 and stop, never routing a
+            # continuation. The in-memory validated result is forwarded only
+            # for the PR_COMPOSE family (issue #337): its presentation
+            # material is deliberately not durable, so the same invocation's
+            # bounded publication continuation receives it here; every other
+            # family re-derives its continuation from committed durable state.
             try:
                 self._completion_handoff.handoff_settled_completion(
                     workspace_id=entry.workspace_id,
@@ -1191,7 +1205,7 @@ class DetachedTurnObservationHost:
             except Exception as error:  # noqa: BLE001 - best-effort handoff
                 logger.warning(
                     "the detached-completion handoff failed (%s) after the "
-                    "validated settlement for task session %s",
+                    "settlement for task session %s",
                     type(error).__name__,
                     entry.task_agent_session_id,
                 )

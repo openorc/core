@@ -3359,3 +3359,68 @@ def test_the_pr_remediation_handoff_is_a_noop_for_moved_on_subjects(
 
     assert verify.call_count == 0
     assert submitter.submissions == []
+
+
+def test_the_completion_handoff_terminal_cleanup_route_invokes_the_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TERMINAL_CLEANUP route (issue #345) re-invokes the ONE idempotent
+    terminal finalization with the executing process's explicit dispatch
+    selection: the one-shot claim already settled atomically with the settled
+    receipt, so the finalization re-derives archive-only — never a
+    redispatch, never a second claim."""
+    dependencies, submitter = make_dependencies(
+        terminal_cleanup_runtime_provider=lambda _settings: object()
+    )
+    calls: list[dict[str, Any]] = []
+
+    def recording_finalize(pool: Any, runtime: Any, **kwargs: Any) -> Any:
+        calls.append({"pool": pool, "runtime": runtime, **kwargs})
+        return SimpleNamespace(kind="archived", task=None, released_session_bindings=())
+
+    monkeypatch.setattr(task_workflow, "finalize_task_terminalization", recording_finalize)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["workspace_id"] == _WORKSPACE_ID
+    assert calls[0]["task_id"] == _TASK_ID
+    # The explicit selection is resolved from the executing process's own
+    # execution mode — never inferred, never a blocking fallback.
+    dispatch = calls[0]["dispatch"]
+    assert dispatch is not None
+    assert dispatch.selection.value in {
+        "detached_regular",
+        "observation_unavailable",
+    }
+    assert submitter.submissions == []
+
+
+def test_the_completion_handoff_terminal_cleanup_route_propagates_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The route propagates like the completion routes it sits beside; the
+    containment is the settlement-observing callers' contract (the observation
+    host and the dispatching acknowledgement attach), never the route's own."""
+    dependencies, submitter = make_dependencies(
+        terminal_cleanup_runtime_provider=lambda _settings: object()
+    )
+
+    def failing_finalize(_pool: Any, _runtime: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("the archival failed")
+
+    monkeypatch.setattr(task_workflow, "finalize_task_terminalization", failing_finalize)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    with pytest.raises(RuntimeError):
+        handoff.handoff_settled_completion(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+        )
+    assert submitter.submissions == []
