@@ -42,7 +42,7 @@ from openorc.persistence import tasks as task_repositories
 from openorc.persistence.executions import ExecutionStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.models import ReviewFinding, ReviewResult
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_connection,
     _insert_installation,
     _insert_profile,

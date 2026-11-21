@@ -41,7 +41,7 @@ from openorc.persistence.pool import DatabasePool
 from openorc.services import event_coordination
 from openorc.services.errors import StaleOperationError
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
-from tests.integration.test_task_planning_gate_change_request_persistence import (
+from tests.integration.persistence_fixtures import (
     _insert_installation,
     _insert_profile,
     _insert_repository,

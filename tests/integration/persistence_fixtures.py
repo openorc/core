@@ -15,6 +15,7 @@ from psycopg import Connection
 
 _EXTERNAL_INSTALLATION_ID = 77_000_004
 
+
 def _insert_project(conn: Connection[Any], workspace_id: uuid.UUID) -> uuid.UUID:
     project_id = uuid.uuid4()
     conn.execute(
@@ -22,6 +23,7 @@ def _insert_project(conn: Connection[Any], workspace_id: uuid.UUID) -> uuid.UUID
         (project_id, workspace_id, "project"),
     )
     return project_id
+
 
 class _SingleConnectionPool:
     """Minimal DatabasePool adapter sharing the test connection and transaction."""
