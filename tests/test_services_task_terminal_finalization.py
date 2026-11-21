@@ -236,6 +236,21 @@ def _install_seams(
     return recorder
 
 
+def _deadline_open(monkeypatch: pytest.MonkeyPatch, *, within: bool) -> None:
+    """Pin the finite cleanup-deadline clock (issue #345) deterministically.
+
+    The suite's claim timestamps are fixed instants, so the deadline check is
+    pinned explicitly instead of drifting with the host clock: ``within``
+    keeps the attempt inside its deadline (the deferral paths), ``False``
+    places it past the deadline (the stop-waiting disposition).
+    """
+    monkeypatch.setattr(
+        task_terminal_finalization,
+        "_cleanup_claim_deadline_open",
+        lambda _claimed_at: within,
+    )
+
+
 def _archive_update_index(conn: ScriptedConnection) -> int:
     return next(
         index for index, (sql, _params) in enumerate(conn.executed) if "archived_at = now()" in sql
@@ -452,13 +467,14 @@ def test_a_concurrently_unsettled_claim_defers_the_archival(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_seams(monkeypatch)
+    _deadline_open(monkeypatch, within=True)
     runtime = _RecordingRuntime()
     monkeypatch.setattr(task_terminal_finalization, "execute_terminal_checkout_cleanup", runtime)
     pool, conn = _pool(
         [
             _committed_row(),
             None,  # the claim CAS: another finalizer owns the attempt
-            _committed_row(claimed=_OBSERVED),  # the fresh read: unsettled
+            _committed_row(claimed=_OBSERVED),  # the fresh read: unsettled, within deadline
         ]
     )
 
@@ -471,15 +487,39 @@ def test_a_concurrently_unsettled_claim_defers_the_archival(
     assert conn.executed == [conn.executed[0], conn.executed[1], conn.executed[2]]
 
 
+def test_a_present_unsettled_claim_defers_at_the_entry_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claimed, unsettled, within-deadline attempt present at entry (issue
+    #345): the one-shot claim disposition defers before any dispatch
+    selection — the concurrent attempt owns its window, and no cleanup
+    establishment, admission, or archival runs."""
+    _install_seams(monkeypatch)
+    _deadline_open(monkeypatch, within=True)
+    pool, conn = _pool([_committed_row(claimed=_OBSERVED)])
+
+    outcome = finalize_task_terminalization(
+        pool, None, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.CLEANUP_IN_FLIGHT
+    assert len(conn.executed) == 1
+    assert all("archived_at = now()" not in sql for sql, _params in conn.executed)
+
+
 def test_an_unsettled_claim_blocks_the_archival_under_the_task_row_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A claim that races in between the entry read and the archival's locked
+    re-read still blocks the archival under the Task row lock (issue #345):
+    the within-deadline window guard defers exactly as the #317 guard."""
     _install_seams(monkeypatch)
+    _deadline_open(monkeypatch, within=True)
     pool, conn = _pool(
         [
-            _committed_row(claimed=_OBSERVED),  # archive-only mode sees the claim
+            _committed_row(),  # the entry read: unclaimed
             (True,),
-            _committed_row(claimed=_OBSERVED),  # the locked re-read confirms it
+            _committed_row(claimed=_OBSERVED),  # the locked re-read: claimed, unsettled
         ]
     )
 
@@ -489,6 +529,48 @@ def test_an_unsettled_claim_blocks_the_archival_under_the_task_row_lock(
 
     assert outcome.kind is TerminalFinalizationKind.CLEANUP_IN_FLIGHT
     assert all("archived_at = now()" not in sql for sql, _params in conn.executed)
+    assert any("pg_advisory_xact_lock" in sql for sql, _params in conn.executed)
+    assert not any("cleanup_send_settled_at = now()" in sql for sql, _params in conn.executed)
+
+
+def test_a_past_deadline_unsettled_claim_stops_waiting_and_archives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The established finite deadline elapsed while the admitted (or
+    conservatively uncertain) attempt stayed unobserved (issue #345): a later
+    invoked finalizer conservatively stops waiting — the under-lock guard
+    settles the one-shot claim inline and archives. Never a redispatch, never
+    a receipt settlement (the timeout proves nothing about the native turn),
+    and the stale checkout is accepted."""
+    _install_seams(monkeypatch)
+    _deadline_open(monkeypatch, within=False)
+    pool, conn = _pool(
+        [
+            _committed_row(claimed=_OBSERVED),  # the entry read: unsettled, past deadline
+            (True,),
+            _committed_row(claimed=_OBSERVED),  # the locked re-read: still unsettled
+            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),  # the inline claim settle
+            _archived_row(),
+            None,
+            None,
+            None,
+            None,
+        ]
+    )
+
+    outcome = finalize_task_terminalization(
+        pool, None, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
+    # The one-shot claim settled inline before the archival, and no cleanup
+    # dispatch ever followed: no claim CAS, no establishment, no admission.
+    assert _archive_update_index(conn) > next(
+        index
+        for index, (sql, _params) in enumerate(conn.executed)
+        if "cleanup_send_settled_at = now()" in sql
+    )
+    assert not any("cleanup_send_claimed_at = now()" in sql for sql, _params in conn.executed)
 
 
 def test_a_failed_claim_read_classifies_from_a_fresh_durable_read(
@@ -520,14 +602,16 @@ def test_a_failed_claim_read_classifies_from_a_fresh_durable_read(
 def test_a_settled_claim_never_resends_and_proceeds_to_archival(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A settled prior attempt (issue #345): the one-shot window is closed at
+    entry, so the archival proceeds directly — the cleanup establishment
+    never re-runs, no claim CAS is ever attempted, and no second dispatch
+    follows."""
     _install_seams(monkeypatch)
     runtime = _RecordingRuntime()
     monkeypatch.setattr(task_terminal_finalization, "execute_terminal_checkout_cleanup", runtime)
     pool, conn = _pool(
         [
-            _committed_row(),
-            None,  # the claim CAS: already claimed
-            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),  # fresh read: settled
+            _committed_row(claimed=_OBSERVED, settled=_OBSERVED),  # entry read: settled
             (True,),
             _committed_row(claimed=_OBSERVED, settled=_OBSERVED),
             _archived_row(),
@@ -544,6 +628,7 @@ def test_a_settled_claim_never_resends_and_proceeds_to_archival(
 
     assert outcome.kind is TerminalFinalizationKind.ARCHIVED
     assert runtime.calls == []
+    assert not any("cleanup_send_claimed_at = now()" in sql for sql, _params in conn.executed)
 
 
 # --- the arrangement seam -----------------------------------------------------------

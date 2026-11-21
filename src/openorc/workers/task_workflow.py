@@ -155,6 +155,7 @@ from openorc.services.task_subject_guards import (
     require_current_plan_revision,
     require_current_task,
 )
+from openorc.services.task_terminal_finalization import finalize_task_terminalization
 from openorc.services.task_workflow_operation_coordinator import (
     coordinate_task_workflow_operation,
 )
@@ -180,7 +181,10 @@ from openorc.workers.invocation import (
     TaskSessionResumePayload,
     WorkflowRoleRef,
 )
-from openorc.workers.task_cleanup_operations import F1TerminalFinalizationSubmission
+from openorc.workers.task_cleanup_operations import (
+    F1TerminalFinalizationSubmission,
+    resolve_terminal_cleanup_dispatch,
+)
 
 __all__ = [
     "build_task_workflow_handlers",
@@ -583,7 +587,11 @@ class _DetachedCompletionHandoff:
     enqueue on the exact Task checkout for an in-budget PR/head change
     request — and the PR-remediation route re-proves the settled round,
     verifies the GitHub-confirmed new head, and submits the next typed
-    TASK_PR_REVIEW through F1 from committed state. A settled family
+    TASK_PR_REVIEW through F1 from committed state; and the terminal-cleanup
+    route (issue #345) re-invokes the ONE idempotent terminal finalization —
+    the one-shot claim already settled atomically with the settled receipt,
+    so the finalization proceeds archive-only to the mandatory atomic
+    archival without ever redispatching cleanup. A settled family
     without a wired route is a fail-closed conflict that its own detached
     migration wires; no gate or workflow policy lives here beyond the
     routing and the committed-state re-derivation itself.
@@ -655,6 +663,11 @@ class _DetachedCompletionHandoff:
                 self._dependencies, workspace_id=workspace_id, task_id=task_id
             )
             return
+        if operation is PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP:
+            _handoff_terminal_cleanup_completion(
+                self._dependencies, workspace_id=workspace_id, task_id=task_id
+            )
+            return
         raise ConflictError(
             "the settled operation family has no detached completion handoff "
             "route yet; its own detached migration wires it"
@@ -694,6 +707,33 @@ class _DetachedCompletionHandoff:
                 type(error).__name__,
                 task_agent_session_id,
             )
+
+
+def _handoff_terminal_cleanup_completion(
+    dependencies: OperationDependencies, *, workspace_id: UUID, task_id: UUID
+) -> None:
+    """The TERMINAL_CLEANUP route (issue #345): the owning finalization.
+
+    Re-invokes the ONE idempotent terminal finalization with the executing
+    process's explicit cleanup dispatch selection. The settled completion
+    already settled the one-shot claim atomically with its receipt — by the
+    shared correlation seam's attributable routing or the acknowledgement
+    attach's staged early completion — so the finalizer's re-derived claim
+    classification proceeds archive-only: never a redispatch, never a second
+    claim, never a re-run of the cleanup establishment. Its archival
+    rechecks the one-shot window under the Task row lock; a concurrently
+    pending window defers exactly as the #317 window guard always has.
+    Contained by the handoff contract: a failed finalization leaves the
+    durably settled attempt to a later explicitly invoked finalizer or the
+    finite deadline disposition.
+    """
+    finalize_task_terminalization(
+        dependencies.database_pool(),
+        dependencies.terminal_cleanup_runtime(),
+        workspace_id=workspace_id,
+        task_id=task_id,
+        dispatch=resolve_terminal_cleanup_dispatch(dependencies),
+    )
 
 
 def build_detached_completion_handoff(

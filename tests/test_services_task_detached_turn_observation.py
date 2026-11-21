@@ -285,6 +285,7 @@ class _SettleRecorder:
 
     outcome_kind: TurnSettlementKind
     receipt: Any = None
+    handoff_operation: Any = None
     calls: list[tuple[UUID, UUID, ObservedTurnEvidence]] = field(default_factory=list)
 
     def __call__(
@@ -297,7 +298,11 @@ class _SettleRecorder:
         evidence: ObservedTurnEvidence,
     ) -> TurnSettlementOutcome:
         self.calls.append((workspace_id, connection_id, evidence))
-        return TurnSettlementOutcome(kind=self.outcome_kind, receipt=self.receipt)
+        return TurnSettlementOutcome(
+            kind=self.outcome_kind,
+            receipt=self.receipt,
+            handoff_operation=self.handoff_operation,
+        )
 
 
 @dataclass
@@ -1298,6 +1303,72 @@ def test_validated_execution_settlement_fires_the_completion_handoff_with_its_fa
             "validated_result": None,
         }
     ]
+
+
+def test_an_explicit_observed_failure_handoff_family_routes_the_completion_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminalization exception's observed-failure settlement (issue
+    #345): the terminal-cleanup route names TERMINAL_CLEANUP as the explicit
+    handoff family, so the ONE post-commit completion handoff routes the
+    owning finalization's atomic archival even though the run failed."""
+    handoff = _RecordingHandoff()
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    settle = _SettleRecorder(
+        outcome_kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+        receipt=cast(
+            Any, SimpleNamespace(operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP)
+        ),
+        handoff_operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+    )
+    observer = _make_handoff_observer(conn, backends=[backend], handoff=handoff)
+    _register(observer)
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+    assert handoff.calls == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "task_id": _TASK_ID,
+            "operation": PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+            "validated_result": None,
+        }
+    ]
+
+
+def test_an_observed_failure_without_an_explicit_handoff_family_routes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary families' observed-failure settlements report Level 2 and
+    stop: without an explicitly named handoff family the ONE post-commit
+    completion handoff never routes a continuation."""
+    handoff = _RecordingHandoff()
+    backend = FakeClineSdkBackend()
+    conn = ScriptedConnection()
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    settle = _SettleRecorder(
+        outcome_kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE,
+        receipt=cast(
+            Any,
+            SimpleNamespace(
+                operation=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+            ),
+        ),
+    )
+    observer = _make_handoff_observer(conn, backends=[backend], handoff=handoff)
+    _register(observer)
+    monkeypatch.setattr(observation_module, "settle_observed_turn_completion", settle, raising=True)
+
+    backend.emit_hub(_terminal_event())
+
+    assert len(settle.calls) == 1
+    assert handoff.calls == []
 
 
 # --- the receipt-epoch attestation and the detached cost path (issue #341) --------

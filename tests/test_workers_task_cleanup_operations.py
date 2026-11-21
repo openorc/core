@@ -363,3 +363,44 @@ def test_the_wire_payload_rejects_unexpected_fields_and_malformed_uuids() -> Non
         )
     with pytest.raises(InvalidInvocationError):
         TerminalFinalizationPayload(workspace_id=str(_WORKSPACE_ID), task_id="")
+
+
+def test_the_regular_mode_dispatch_carries_the_completion_handoff() -> None:
+    """The detached-regular dispatch (issue #345) carries the process's ONE
+    post-commit completion handoff beside its observation registrar, so a
+    staged early completion consumed at the acknowledgement attach routes the
+    owning finalization's archival; the non-detached selections carry
+    neither."""
+    settings = _settings()
+    pool: Any = object()
+    runtime: Any = _RecordingRuntime()
+    observer: Any = object()
+    dependencies = OperationDependencies(
+        settings=settings,
+        database_pool_provider=lambda _settings: pool,
+        terminal_cleanup_runtime_provider=lambda _settings: runtime,
+        detached_turn_observer_provider=lambda _settings: observer,
+    )
+
+    dispatch = task_cleanup_operations.resolve_terminal_cleanup_dispatch(dependencies)
+
+    assert dispatch.selection is TerminalCleanupDispatchSelection.DETACHED_REGULAR
+    assert dispatch.observation_registrar is not None
+    assert dispatch.completion_handoff is not None
+
+
+def test_the_observation_unavailable_dispatch_carries_no_completion_handoff() -> None:
+    settings = _settings()
+    pool: Any = object()
+    runtime: Any = _RecordingRuntime()
+    dependencies = OperationDependencies(
+        settings=settings,
+        database_pool_provider=lambda _settings: pool,
+        terminal_cleanup_runtime_provider=lambda _settings: runtime,
+    )
+
+    dispatch = task_cleanup_operations.resolve_terminal_cleanup_dispatch(dependencies)
+
+    assert dispatch.selection is TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
+    assert dispatch.observation_registrar is None
+    assert dispatch.completion_handoff is None
