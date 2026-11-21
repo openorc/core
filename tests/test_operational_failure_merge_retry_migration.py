@@ -138,9 +138,9 @@ def test_the_domain_vocabulary_stays_aligned_with_the_migration() -> None:
         # last re-created it with the full vocabulary, so the alignment is
         # asserted there.
         assert f"'{value}'" in _collapsed(
-            (
-                MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql"
-            ).read_text(encoding="utf-8")
+            (MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql").read_text(
+                encoding="utf-8"
+            )
         )
     for value in (member.value for member in OperationalFailureCode):
         assert f"'{value}'" in _collapsed(_migration_text_raw())

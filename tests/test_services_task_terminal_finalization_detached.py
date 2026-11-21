@@ -57,7 +57,12 @@ from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import CleanupWorkspaceInteraction
 from openorc.protocol.models import WORKSPACE_RESULT_FAMILY
 from openorc.services import task_terminal_finalization as finalization_module
-from openorc.services.errors import ConflictError, ObservationRegistrationRefusedError
+from openorc.services.errors import (
+    ConflictError,
+    ExternalOperationFailedError,
+    ExternalOperationUncertainError,
+    ObservationRegistrationRefusedError,
+)
 from openorc.services.task_detached_turn_correlation import (
     TurnSettlementKind,
     TurnSettlementOutcome,
@@ -141,6 +146,17 @@ class _DetachedCleanupRuntime(TerminalCheckoutCleanupRuntime):
             raise AgentRuntimeUncertainOutcomeError("unknown admission outcome")
         if self._outcome == "refused":
             raise AgentRuntimeError("the runtime refused the admission")
+        if self._outcome == "attachment_failed":
+            raise ExternalOperationFailedError(
+                "the cline runtime attachment failed before any workflow effect"
+            )
+        if self._outcome == "attachment_uncertain":
+            raise ExternalOperationUncertainError(
+                "the outcome of the cline runtime attachment is unknown; "
+                "no workflow effect was dispatched and nothing is retried here"
+            )
+        if self._outcome == "unexpected":
+            raise RuntimeError("an unclassified composition failure")
         return AgentTurnAdmission(turn_reference="fake-run-344")
 
 
@@ -629,6 +645,104 @@ def test_a_proven_admission_refusal_settles_the_claim_and_archives(
     assert calls.settles == [_TASK_ID]
     assert calls.attaches == []
     assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_a_proven_attachment_failure_settles_the_claim_and_archives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production composition's attachment seam (issue #344 review) fails
+    with typed application errors strictly BEFORE the enqueue is ever
+    reached — the seam attests no workflow effect was dispatched. The proven
+    pre-effect failure refuses the receipt, settles the claim, and continues
+    the archive-only finalization instead of stranding the terminalization."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime(outcome="attachment_failed")
+    registrar = _CleanupRegistrar()
+    receipt = _wire_detached(monkeypatch, calls, establishment=_eligible_establishment())
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
+    assert calls.claims == [_TASK_ID]
+    assert calls.refusals == [
+        {"receipt_id": receipt.id, "refusal_kind": "runtime_attachment_failed"}
+    ]
+    assert calls.settles == [_TASK_ID]
+    assert calls.attaches == []
+    assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_an_uncertain_attachment_is_a_proven_pre_effect_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertain ATTACHMENT is not an uncertain ADMISSION: the attachment
+    lease's own classification attests no workflow effect was dispatched (the
+    attach precedes the enqueue), so the proven pre-effect accounting applies
+    — receipt refused, claim settled, archive-only — while an uncertain
+    enqueue outcome would stay conservatively outstanding."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime(outcome="attachment_uncertain")
+    registrar = _CleanupRegistrar()
+    receipt = _wire_detached(monkeypatch, calls, establishment=_eligible_establishment())
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.ARCHIVED
+    assert calls.refusals == [
+        {"receipt_id": receipt.id, "refusal_kind": "runtime_attachment_failed"}
+    ]
+    assert calls.settles == [_TASK_ID]
+    assert calls.attaches == []
+    assert calls.archive_calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_an_unclassified_admission_failure_stays_conservatively_outstanding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unclassified failure inside the composition: whether the turn was
+    enqueued cannot be ruled out, so the attempt stays conservatively
+    outstanding — never a proven non-delivery, never a re-send, and the
+    independent settlement/deadline disposition (#345) owns the later
+    disposition."""
+    calls = _DetachedCalls()
+    runtime = _DetachedCleanupRuntime(outcome="unexpected")
+    registrar = _CleanupRegistrar()
+    _wire_detached(monkeypatch, calls, establishment=_eligible_establishment())
+
+    outcome = finalize_task_terminalization(
+        _pool(),
+        runtime,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        dispatch=TerminalCleanupDispatch(
+            selection=TerminalCleanupDispatchSelection.DETACHED_REGULAR,
+            observation_registrar=registrar,
+        ),
+    )
+
+    assert outcome.kind is TerminalFinalizationKind.CLEANUP_OUTSTANDING
+    assert calls.refusals == []
+    assert calls.settles == []
+    assert calls.attaches == []
+    assert calls.archive_calls == []
 
 
 def test_an_uncertain_admission_stays_claimed_and_defers_archival(

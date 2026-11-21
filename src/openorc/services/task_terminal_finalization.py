@@ -798,6 +798,37 @@ def _attempt_detached_terminal_cleanup(
             pool, receipt, refusal_kind=_CLEANUP_ADMISSION_REFUSAL_KIND
         )
         return None
+    except ApplicationError as error:
+        # The production composition's attachment seam (the #190 lease and
+        # the same-ID reconstruction it guards) fails with typed application
+        # errors strictly BEFORE the adapter's enqueue is ever reached — the
+        # seam's own classification attests "no workflow effect was
+        # dispatched". A proven pre-effect failure refuses the receipt,
+        # settles the claim, and continues the established archive-only
+        # finalization (issue #344 review); the terminalization is never
+        # stranded by an attachment failure.
+        logger.warning(
+            "the detached terminal cleanup attachment failed before any effect "
+            "(%s); the receipt is refused and the claim settles",
+            type(error).__name__,
+        )
+        _refuse_cleanup_receipt_and_settle_claim(
+            pool, receipt, refusal_kind=_CLEANUP_ATTACHMENT_REFUSAL_KIND
+        )
+        return None
+    except Exception as error:  # noqa: BLE001 - unclassified: the effect cannot be ruled out
+        # An unclassified failure inside the composition: whether the turn
+        # was enqueued cannot be ruled out, so the attempt stays
+        # conservatively outstanding — never a proven non-delivery, never a
+        # re-send, and the independent settlement/deadline disposition
+        # (issue #345) owns the later disposition.
+        logger.warning(
+            "the detached terminal cleanup admission failed with an unclassified "
+            "error (%s); the receipt stays conservatively claimed and the claim "
+            "stays unsettled",
+            type(error).__name__,
+        )
+        return _cleanup_outstanding_outcome(pool, workspace_id=workspace_id, task_id=task_id)
     if not isinstance(admission, AgentTurnAdmission):
         # Defensive composition invariant: the detached capability returns
         # the acknowledged admission. Never guessed around.

@@ -139,7 +139,10 @@ class ClineTerminalCleanupComposition(TerminalCheckoutCleanupRuntime):
         transport evidence the caller correlates; the adapter's own
         classification surfaces a positively identified pre-enqueue refusal
         or an uncertain admission as the normalized adapter errors the
-        caller contains.
+        caller contains, and the attachment lease beneath the reconstruction
+        surfaces its own typed application-level failures — always
+        pre-enqueue, since the lease and the reconstruction precede the
+        enqueue — through the same boundary.
         """
         with attach_cline_runtime(
             pool,

@@ -107,7 +107,7 @@ def test_the_domain_vocabulary_stays_aligned_with_the_migration() -> None:
         # the terminal-cleanup receipt migration (issue #344) last re-created
         # it with the full vocabulary.
         assert f"'{value}'" in _collapsed(
-            (
-                MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql"
-            ).read_text(encoding="utf-8")
+            (MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql").read_text(
+                encoding="utf-8"
+            )
         )
