@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
@@ -20,6 +21,9 @@ from openorc.api.request_correlation import (
 )
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
+from openorc.api.routers.internal_queue_observer import (
+    router as internal_queue_observer_router,
+)
 from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
 from openorc.config import ExecutionMode, Settings
@@ -29,6 +33,7 @@ from openorc.services.connection_credentials import resolve_connection_runtime_c
 from openorc.services.errors import ApplicationError
 from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
 from openorc.workers.invocation import (
+    OperationDependencies,
     build_default_operation_dependencies,
     build_operation_submitter,
     build_production_handlers,
@@ -37,6 +42,41 @@ from openorc.workers.local_executor import BoundedLocalExecutor
 from openorc.workers.task_workflow import build_detached_completion_handoff
 
 API_TITLE = "OpenOrc API"
+
+
+def _build_detached_turn_observer(
+    dependencies: OperationDependencies,
+) -> DetachedTurnObservationHost:
+    """Build the serving process's one detached-turn observation host.
+
+    The composition root (issue #348): only this concrete composition
+    selects the Cline integration's observation source and its trusted
+    credential/endpoint resolution, beside the post-commit completion
+    handoff and the cost-limit Interrupt dispatcher. Both execution modes
+    host through this one composition — the regular-mode serving process
+    beside its bounded local executor, and the queue-mode API/control-plane
+    process independently of any workhorse (issue #346).
+    """
+    return DetachedTurnObservationHost(
+        dependencies.database_pool,
+        observation_source=ClineHubTurnObservationSource(backend_factory=ClineBridgeProcessBackend),
+        runtime_credential_resolver=resolve_connection_runtime_credential,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
+        completion_handoff=build_detached_completion_handoff(dependencies),
+        # The composition-rooted post-commit cost-limit Interrupt
+        # dispatcher (issue #341): the host drives the shared cost
+        # evaluation with it so a threshold crossing observed while
+        # the dispatch worker is gone enforces through the existing
+        # E10b machinery. Resolved through the process pool provider
+        # per dispatch.
+        cost_limit_interrupt_dispatch=lambda intent, external_session_id: (
+            dispatch_cost_limit_interrupt(
+                dependencies.database_pool(),
+                intent=intent,
+                external_session_id=external_session_id,
+            )
+        ),
+    )
 
 
 def _serving_lifespan(
@@ -50,15 +90,21 @@ def _serving_lifespan(
 
     In regular execution mode the lifespan starts and owns exactly one
     bounded local executor per serving process (issue #86) and exactly one
-    process-owned detached-turn observation host (issue #323) — started before the
-    executor so observation exists before any dispatch, and disposed after
-    the executor drained. Queue mode starts neither and never touches the
-    queue backend. No executor or observer is created by module import,
-    ``create_app()``, or a request. Observability teardown deliberately
-    performs no process-global shutdown; the terminal flush is owned by the
-    process-exit hook registered by initialization (issue #108). Executor
-    teardown stops new admission and drains within the bounded default
-    timeout, asserting nothing about any outstanding operation's outcome.
+    process-owned detached-turn observation host (issue #323) — started
+    before the executor so observation exists before any dispatch, and
+    disposed after the executor drained. In queue mode the serving
+    API/control-plane process starts exactly one long-lived detached-turn
+    observation host of its own (issue #346) — never in an RQ job, never
+    inside a workhorse — performs its one bounded durable restart
+    reconciliation off the event loop, and never creates an executor: queue
+    operations are delivered by RQ and the private registration handshake
+    routes to this host. No executor or observer is created by module
+    import, ``create_app()``, or a request. Observability teardown
+    deliberately performs no process-global shutdown; the terminal flush is
+    owned by the process-exit hook registered by initialization (issue
+    #108). Executor teardown stops new admission and drains within the
+    bounded default timeout, asserting nothing about any outstanding
+    operation's outcome.
     """
 
     @asynccontextmanager
@@ -66,40 +112,17 @@ def _serving_lifespan(
         initialize_observability(settings, ObservabilitySurface.API)
         executor: BoundedLocalExecutor | None = None
         observer: DetachedTurnObservationHost | None = None
+        dependencies = build_default_operation_dependencies(settings)
         if settings.execution_mode is ExecutionMode.REGULAR:
-            dependencies = build_default_operation_dependencies(settings)
             # The process-owned detached-turn observation host (issue #323):
             # started before any operation can dispatch and disposed after
             # the executor drained, so a registration from an in-flight
             # operation is still served during teardown. Its post-commit
             # completion handoff (issues #324/#333) routes each settled
-            # validated completion by its explicit operation family — the
-            # detached-established planning bootstrap resumption and the
-            # initial-IMPLEMENT PR authorization presentation — resolving
-            # every dependency lazily so the binding order of executor and
-            # observer does not matter.
-            observer = DetachedTurnObservationHost(
-                dependencies.database_pool,
-                observation_source=ClineHubTurnObservationSource(
-                    backend_factory=ClineBridgeProcessBackend
-                ),
-                runtime_credential_resolver=resolve_connection_runtime_credential,
-                control_endpoint_resolver=resolve_connection_control_endpoint,
-                completion_handoff=build_detached_completion_handoff(dependencies),
-                # The composition-rooted post-commit cost-limit Interrupt
-                # dispatcher (issue #341): the host drives the shared cost
-                # evaluation with it so a threshold crossing observed while
-                # the dispatch worker is gone enforces through the existing
-                # E10b machinery. Resolved through the process pool provider
-                # per dispatch.
-                cost_limit_interrupt_dispatch=lambda intent, external_session_id: (
-                    dispatch_cost_limit_interrupt(
-                        dependencies.database_pool(),
-                        intent=intent,
-                        external_session_id=external_session_id,
-                    )
-                ),
-            )
+            # validated completion by its explicit operation family,
+            # resolving every dependency lazily so the binding order of
+            # executor and observer does not matter.
+            observer = _build_detached_turn_observer(dependencies)
             observer.start()
             dependencies.bind_regular_process_detached_turn_observer(observer)
             executor = BoundedLocalExecutor(
@@ -112,6 +135,18 @@ def _serving_lifespan(
             # continuation submitter: authorized follow-up operations are
             # admitted back into the same bounded executor (issue #253).
             dependencies.bind_regular_process_submitter(executor)
+        else:
+            # The queue-mode hosting (issue #346): the serving
+            # API/control-plane process owns the ONE long-lived observation
+            # host independently of every RQ workhorse process, then runs its
+            # one bounded durable restart reconciliation off the event loop
+            # so a host restart re-proves the durable outstanding receipts
+            # through the existing registration gates. The v1 single-host
+            # deployment assumption is explicit: multiple API instances must
+            # not silently split session registrations.
+            observer = _build_detached_turn_observer(dependencies)
+            observer.start()
+            await asyncio.to_thread(observer.reconcile_durable_outstanding_sessions)
         app.state.operation_executor = executor
         app.state.detached_turn_observer = observer
         app.state.operation_submitter = build_operation_submitter(settings, local_executor=executor)
@@ -158,6 +193,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(github_webhooks_router)
     app.include_router(role_bindings_router)
     app.include_router(tasks_router)
+    # The private queue-mode detached-turn observation registration transport
+    # (issue #346): deployment-only, authenticated, and nonpublic; it serves
+    # the serving process's own observation host and is never an application
+    # command or Owner-authority surface.
+    app.include_router(internal_queue_observer_router)
     app.state.settings = resolved
     return app
 

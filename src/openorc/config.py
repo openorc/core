@@ -11,6 +11,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Final
 from urllib.parse import urlparse
 
 ENVIRONMENT_VAR = "OPENORC_ENV"
@@ -90,6 +91,25 @@ OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 EXECUTION_MODE_VAR = "OPENORC_EXECUTION_MODE"
 EXECUTION_MODE_REGULAR = "regular"
 EXECUTION_MODE_QUEUE = "queue"
+# The queue-mode detached-turn observation registration transport (issue #346):
+# the base URL of the serving API/control-plane process that hosts the one
+# long-lived detached-turn observation host, plus the deployment-level shared
+# secret a queue dispatch worker must present on the private registration
+# handshake BEFORE it may admit a detached turn. Both are required (fail fast)
+# only in queue mode; regular mode hosts its observer in-process and requires
+# neither. The URL is deployment network configuration; the secret is
+# deployment/bootstrap secret material with the same discipline as the webhook
+# secret: never Workspace data, never stored in ordinary openorc.* tables,
+# never stored in Supabase Vault, never returned through ordinary APIs, never
+# logged or attached to telemetry. The handshake route is private/authenticated
+# and nonpublic; it is never an application command or Owner authority.
+QUEUE_OBSERVER_REGISTRATION_URL_VAR = "OPENORC_QUEUE_OBSERVER_REGISTRATION_URL"
+QUEUE_OBSERVER_REGISTRATION_SECRET_VAR = "OPENORC_QUEUE_OBSERVER_REGISTRATION_SECRET"
+# The single private handshake path both ends of the transport agree on: the
+# serving router mounts it and the queue dispatch worker's registrar proxy
+# addresses it under the configured base URL. One neutral constant so the two
+# process surfaces never drift (and the worker never imports the API package).
+QUEUE_OBSERVER_REGISTRATION_PATH: Final[str] = "/internal/observer/registrations"
 # Bounded local-executor capacity (issue #86): fixed bounded parallelism
 # (active workers) and a separate bounded pending-admission capacity, both
 # per serving process. Both running and waiting work must stay bounded.
@@ -152,6 +172,12 @@ _VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
 # conninfo URLs). Driver-qualified schemes (e.g. SQLAlchemy-style suffixes)
 # are not part of this configuration boundary.
 _DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
+
+# Schemes accepted for the queue-mode observer registration transport base URL
+# (issue #346). Plain http is the same-network reference form; https is the
+# production form. Network isolation owns the nonpublic expectation of the
+# private handshake route.
+_QUEUE_OBSERVER_URL_SCHEMES = frozenset({"http", "https"})
 
 # Schemes accepted for the Supabase project URL (the auth issuer/JWKS root).
 # https is the production form; http is accepted for the documented local
@@ -282,6 +308,15 @@ class Settings:
     # (issue #86): no implicit localhost default is selected, so an unset or
     # blank value is None and queue-mode configuration fails without it.
     valkey_url: str | None = None
+    # The queue-mode detached-turn observation registration transport (issue
+    # #346): the serving API/control-plane base URL hosting the one observer
+    # host and the deployment-level shared secret for its private
+    # authenticated registration handshake. Required (fail fast) only in queue
+    # mode; regular mode hosts its observer in-process and requires neither.
+    # The secret is representation-safe: excluded from the dataclass repr/str,
+    # opaque, never logged or returned.
+    queue_observer_registration_url: str | None = None
+    queue_observer_registration_secret: str | None = field(default=None, repr=False)
     database_url: str = DEFAULT_DATABASE_URL
     db_pool_min: int = DEFAULT_DB_POOL_MIN
     db_pool_max: int = DEFAULT_DB_POOL_MAX
@@ -399,6 +434,43 @@ class Settings:
                 f"supplied {VALKEY_URL_VAR}: no implicit localhost queue backend "
                 "is selected"
             )
+
+        # The queue-mode detached-turn observation registration transport
+        # (issue #346): required (fail fast) only in queue mode, mirroring the
+        # queue backend requirement. Regular mode hosts its observation host
+        # in-process and requires neither value. A supplied URL is
+        # scheme-validated so misconfiguration surfaces at startup; the secret
+        # is opaque deployment material whose blank value fails closed without
+        # echoing it (per _read_secret).
+        queue_observer_registration_url = _read(source, QUEUE_OBSERVER_REGISTRATION_URL_VAR)
+        if queue_observer_registration_url is not None:
+            scheme = urlparse(queue_observer_registration_url).scheme.lower()
+            if (
+                scheme not in _QUEUE_OBSERVER_URL_SCHEMES
+                or not urlparse(queue_observer_registration_url).netloc
+            ):
+                raise ConfigurationError(
+                    f"{QUEUE_OBSERVER_REGISTRATION_URL_VAR} must be an http(s) "
+                    f"base URL, got {queue_observer_registration_url!r}"
+                )
+        queue_observer_registration_secret = _read_secret(
+            source, QUEUE_OBSERVER_REGISTRATION_SECRET_VAR
+        )
+        if execution_mode is ExecutionMode.QUEUE:
+            if queue_observer_registration_url is None:
+                raise ConfigurationError(
+                    f"{EXECUTION_MODE_QUEUE!r} execution mode requires an explicitly "
+                    f"supplied {QUEUE_OBSERVER_REGISTRATION_URL_VAR}: the queue "
+                    "dispatch worker must attest a live detached-turn observation "
+                    "registration before any admission"
+                )
+            if queue_observer_registration_secret is None:
+                raise ConfigurationError(
+                    f"{EXECUTION_MODE_QUEUE!r} execution mode requires an explicitly "
+                    f"supplied {QUEUE_OBSERVER_REGISTRATION_SECRET_VAR}: the private "
+                    "registration handshake is authenticated by the deployment-level "
+                    "shared secret"
+                )
 
         database_url = _read(source, DATABASE_URL_VAR) or DEFAULT_DATABASE_URL
         db_scheme = urlparse(database_url).scheme.lower()
@@ -551,6 +623,8 @@ class Settings:
             api_reload=api_reload,
             execution_mode=execution_mode,
             valkey_url=valkey_url,
+            queue_observer_registration_url=queue_observer_registration_url,
+            queue_observer_registration_secret=queue_observer_registration_secret,
             database_url=database_url,
             db_pool_min=db_pool_min,
             db_pool_max=db_pool_max,

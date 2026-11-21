@@ -60,7 +60,10 @@ from openorc.workers.queues import queue_name
 
 if TYPE_CHECKING:
     from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
-    from openorc.services.task_detached_turn_observation import DetachedTurnObservationHost
+    from openorc.services.task_detached_turn_observation import (
+        DetachedTurnObservationHost,
+        DetachedTurnObservationRegistrar,
+    )
     from openorc.services.task_planning_bootstrap import TaskBootstrapRuntimeComposition
     from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 
@@ -1126,7 +1129,7 @@ UserTokenResolverProvider = Callable[[Settings], "ProfileUserAccessTokenResolver
 ReviewerNeutralDirectoryProvider = Callable[[Settings], str]
 ContinuationSubmitterProvider = Callable[[Settings], "OperationSubmitter"]
 TerminalCleanupRuntimeProvider = Callable[[Settings], "TerminalCheckoutCleanupRuntime"]
-DetachedTurnObserverProvider = Callable[[Settings], "DetachedTurnObservationHost"]
+DetachedTurnObserverProvider = Callable[[Settings], "DetachedTurnObservationRegistrar"]
 
 
 class LateBoundDetachedTurnObserver:
@@ -1137,18 +1140,19 @@ class LateBoundDetachedTurnObserver:
     the dependencies object exists, exactly like the process's own
     continuation submitter. Until bound, resolution fails closed; the
     binding carries no credentials, live handles, or workflow authority.
-    Queue mode never binds one: no long-lived observer runs inside a queue
-    worker (issue #323 non-goal).
+    Queue mode wires a different provider (the remote registration proxy,
+    issue #346) and never binds a process-local one: no long-lived observer
+    runs inside a queue worker (issue #323 non-goal).
     """
 
     def __init__(self) -> None:
-        self._observer: DetachedTurnObservationHost | None = None
+        self._observer: DetachedTurnObservationRegistrar | None = None
 
     def bind(self, observer: DetachedTurnObservationHost) -> None:
         """Bind the serving process's own detached-turn observation host."""
         self._observer = observer
 
-    def __call__(self, settings: Settings) -> DetachedTurnObservationHost:
+    def __call__(self, settings: Settings) -> DetachedTurnObservationRegistrar:
         if self._observer is None:
             raise ExecutionModeDependencyError(
                 "no process-local detached-turn observer is bound for detached-turn observation"
@@ -1181,6 +1185,35 @@ class LateBoundProcessSubmitter:
                 "no process-local operation submitter is bound for continuation submission"
             )
         return self._submitter
+
+
+class QueueDetachedTurnObserverRegistration:
+    """The queue-mode remote detached-turn observation registrar provider (issue #346).
+
+    Queue-mode dispatch workers never host an observer: resolving the
+    registration seam yields the remote registrar proxy over the private
+    authenticated handshake against the serving API/control-plane process
+    that hosts the one long-lived observation host. Configuration is
+    required (fail fast) in queue mode; the resolution constructs only the
+    transport and no credentials, live handles, or workflow authority.
+    """
+
+    def __call__(self, settings: Settings) -> DetachedTurnObservationRegistrar:
+        from openorc.workers.queue_observer_registration import (
+            QueueDetachedTurnObservationRegistrar,
+        )
+
+        registration_url = settings.queue_observer_registration_url
+        registration_secret = settings.queue_observer_registration_secret
+        if registration_url is None or registration_secret is None:
+            raise ExecutionModeDependencyError(
+                "queue execution mode requires the detached-turn observation "
+                "registration transport configuration"
+            )
+        return QueueDetachedTurnObservationRegistrar(
+            registration_url=registration_url,
+            registration_secret=registration_secret,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1282,8 +1315,14 @@ class OperationDependencies:
             )
         provider.bind(submitter)
 
-    def detached_turn_observer(self) -> DetachedTurnObservationHost:
-        """Resolve the executing process's hub-run observation host."""
+    def detached_turn_observer(self) -> DetachedTurnObservationRegistrar:
+        """Resolve the executing process's detached-turn observation seam.
+
+        Regular mode resolves the serving process's own observation host;
+        queue mode (issue #346) resolves the remote registrar proxy over the
+        private authenticated registration handshake against the hosting
+        API/control-plane process.
+        """
         if self.detached_turn_observer_provider is None:
             raise ExecutionModeDependencyError(
                 "no hub-run observer provider is configured for operation dependencies"
@@ -1329,10 +1368,17 @@ def build_default_operation_dependencies(settings: Settings) -> OperationDepende
     )
 
     continuation_provider: ContinuationSubmitterProvider
+    detached_turn_observer_provider: DetachedTurnObserverProvider
     if settings.execution_mode is ExecutionMode.REGULAR:
         continuation_provider = LateBoundProcessSubmitter()
+        detached_turn_observer_provider = LateBoundDetachedTurnObserver()
     else:
         continuation_provider = RQQueueOperationSubmission
+        # Queue mode (issue #346): the dispatch worker resolves the remote
+        # registration proxy over the private authenticated handshake; the
+        # one long-lived observation host lives in the serving
+        # API/control-plane process, never inside a workhorse.
+        detached_turn_observer_provider = QueueDetachedTurnObserverRegistration()
     return OperationDependencies(
         settings=settings,
         database_pool_provider=get_database_pool,
@@ -1342,7 +1388,7 @@ def build_default_operation_dependencies(settings: Settings) -> OperationDepende
         reviewer_neutral_directory_provider=default_reviewer_neutral_directory_provider,
         continuation_submitter_provider=continuation_provider,
         terminal_cleanup_runtime_provider=default_terminal_cleanup_runtime_provider,
-        detached_turn_observer_provider=LateBoundDetachedTurnObserver(),
+        detached_turn_observer_provider=detached_turn_observer_provider,
     )
 
 
