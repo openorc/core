@@ -1853,7 +1853,6 @@ def _compose_task_session_resume(
     same detached composition).
     """
     pool = dependencies.database_pool()
-    github = dependencies.github_client()
     workspace_id = UUID(payload.task.workspace_id)
     task_id = UUID(payload.task.task_id)
     dispatch_authorized_task_resume(
@@ -1869,8 +1868,6 @@ def _compose_task_session_resume(
         reviewer_runtime_factory=_reviewer_runtime_attachment_factory(
             dependencies, workspace_id=workspace_id, task_id=task_id
         ),
-        github=github,
-        bootstrap_composition=dependencies.task_bootstrap_runtime_composition(),
         attempt_evidence=attempt_evidence,
         observation_registrar=dependencies.detached_turn_observer(),
         completion_handoff=build_detached_completion_handoff(dependencies),
