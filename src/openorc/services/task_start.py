@@ -1,16 +1,24 @@
-"""Authoritative Task start, structural capacity, and durable FIFO admission (issue #76).
+"""Authoritative queue-first Task start and the durable FIFO admission processor (issues #76/#257).
 
 Start an already-intaken, current, ``ready_to_plan`` Task only after fresh
-authoritative GitHub eligibility; fairly arbitrate the required Producer and
-Reviewer capacity across the Owner-configured Connection routes; durably
-queue the Task when capacity is temporarily occupied; and claim the Task for
-bootstrap (``planning``) atomically with both role reservations AND the
-frozen requirements baseline. The queue
-order is the durable ``(queued_at, id)`` Task fact — never an RQ/Valkey job,
-a second queue table, or process memory — and every decision is one short,
-database-only transaction.
+authoritative GitHub eligibility. A successful Owner Start ONLY enqueues: it
+freezes the freshly verified requirements fingerprint and the then-current
+Workspace Task-budget authorization in the SAME guarded ``queued`` write,
+stamps the original durable ``queued_at``, and reserves nothing — it never
+scans or admits older Tasks and never directly enters ``planning``. Every
+successfully started Task, even with an empty queue and free capacity,
+advances exclusively through the ONE bounded FIFO processor,
+:func:`reevaluate_queued_tasks`, which alone admits the required Producer and
+Reviewer session reservations, commits ``queued → planning``, and whose
+admitted outcome carries the exact post-claim token and accountable Owner
+facts the next planning-bootstrap handoff addresses (the #319 detached-turn
+implementation owns everything after that handoff; this module never
+submits, executes, or settles agent work). The queue order is the durable
+``(queued_at, id)`` Task fact — never an RQ/Valkey job, a second queue
+table, or process memory — and every decision is one short, database-only
+transaction.
 
-The two invocable commands:
+The invocable commands:
 
 - ``start_task_for_owner`` (authenticated Owner): an authorization phase
   composes the account-operational barrier FIRST and the exact Workspace/Task
@@ -33,18 +41,36 @@ The two invocable commands:
   the account barrier FIRST again, the per-Workspace advisory arbitration
   lock, the locked Task re-read bound to the caller's exact ``state_token``,
   the durable projection-based eligibility guard (against the fingerprint
-  being frozen), the structural feasibility verdict, one bounded FIFO
-  establishment pass, and the target's own decision — which freezes the
-  freshly verified fingerprint atomically with the ``planning`` claim or the
-  durable ``queued`` entry (a capacity-queued Task has started for
+  being frozen), and the structural feasibility verdict — a permanently
+  infeasible route is the actionable typed configuration error, never an
+  indefinite capacity wait — and then durably queues the target, freezing
+  the freshly verified fingerprint and the original Task budget in the SAME
+  guarded ``queued`` write (a capacity-queued Task has started for
   authority/baseline purposes even though agents have not yet run); a
-  losing, stale, or failed start leaves no baseline.
+  losing, stale, or failed start leaves no baseline. Strictly after that
+  commit the start arranges one Task-queue wake invitation through the
+  optional :class:`~openorc.services.task_queue_wake.TaskQueueWakeSubmission`
+  seam — never inside the transaction, and never submitting this Task's
+  bootstrap itself: the ONE FIFO processor owns every admission.
 - ``reevaluate_queued_tasks`` (system invocation over existing exact
   subjects; never a new Owner authorization and never changing the
-  accountable Owner): bounded per-page arbitration units that scan the
-  Workspace's queued Tasks in durable ``(queued_at, id)`` order and attempt
-  admission for each currently admissible candidate, so older eligible Tasks
-  actually advance instead of waiting.
+  accountable Owner): the single bounded FIFO processor. Bounded per-page
+  arbitration units scan the Workspace's queued Tasks in durable
+  ``(queued_at, id)`` order and attempt admission for each currently
+  admissible candidate, so older eligible Tasks actually advance instead of
+  waiting; an older currently unadmittable, structurally invalid, or
+  known-ineligible candidate never indefinitely blocks a feasible follower.
+  When the candidate budget bounds the sweep before exhausting the queued
+  set, the returned outcome exposes the keyset continuation cursor past the
+  examined tail — a paging hint, never Task or scheduling authority — so the
+  wake caller arranges bounded continuation through the unexamined tail
+  instead of repeatedly revisiting the same prefix.
+- ``find_unclaimed_bootstrap_handoff`` (read-only recovery classification,
+  issue #257): the restart/recovery seam that positively proves a committed
+  ``planning`` Task's F1 bootstrap handoff was never consumed — its E1b
+  one-shot ``planning_bootstrap_claim_token`` is still NULL — so the bounded
+  recovery may arrange exactly one current-token bootstrap handoff; any
+  claimed, admitted, or uncertain runtime turn is never replayed here.
 
 Structural feasibility (the session-admission seam) is computed from the
 complete required role-to-Connection multiset — existing valid Task
@@ -61,9 +87,7 @@ arbitrations and the capacity-releasing lifecycle transitions in
 :mod:`openorc.services.session_runtime` — composes the same per-Workspace
 transaction-scoped advisory lock (``lock_workspace_task_arbitration``) before
 any occupancy read it must trust, so a capacity release can never commit
-between a scan and a decision. Where bounded work cannot establish that no
-older candidate is bypassed, the newer Task durably queues itself with its
-own timestamp instead of claiming — FIFO order is preserved in every case.
+between a scan and a decision.
 
 A queued Task is waiting for session capacity — a scheduling state, not a
 failure, not health, not a TaskBlock: ``Task.status`` plus ``queued_at`` are
@@ -74,10 +98,12 @@ actionable per-candidate condition instead of waiting forever (its original
 ``queued_at`` is never rewritten to hide the condition). Successful admission
 establishes/reuses exactly the two distinct role reservations (CONNECTING or
 already READY), commits ``Task.status = planning`` and exactly one
-``planning_started`` event as one durable logical claim, and returns the
-rotated token plus both exact role bindings for the E1b handoff (issue #203).
-``planning`` here means capacity admitted and startup claimed — nothing more.
-No runtime, model, Cline, or filesystem work happens here.
+``planning_started`` event as one durable logical claim, and its admitted
+outcome exposes the exact post-claim token and accountable Workspace Owner
+the next F1 planning-bootstrap handoff addresses (issue #257) — the facts
+are captured from the actual claim, never synthesized from an ``ADMITTED``
+marker alone. ``planning`` here means capacity admitted and startup claimed —
+nothing more. No runtime, model, Cline, or filesystem work happens here.
 """
 
 from __future__ import annotations
@@ -96,7 +122,6 @@ from openorc.adapters.github import GitHubAppClient
 from openorc.domain.connections import WorkflowRole
 from openorc.domain.events import WorkflowEventActor
 from openorc.domain.github_issues import GitHubIssueState
-from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import tasks as task_records
@@ -126,6 +151,10 @@ from openorc.services.session_admission import (
     assess_structural_route_feasibility,
 )
 from openorc.services.task_intake import IssueBlockedEligibilityError
+from openorc.services.task_queue_wake import (
+    TaskQueueWakeSubmission,
+    arrange_task_queue_wake,
+)
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_task
 
@@ -139,9 +168,8 @@ __all__ = [
     "TaskEligibilityFailure",
     "TaskSourceIdentityLossError",
     "TaskStartOutcome",
-    "TaskStartQueueReason",
     "TaskStartStateConflictError",
-    "TaskStartStatus",
+    "find_unclaimed_bootstrap_handoff",
     "reevaluate_queued_tasks",
     "start_task_for_owner",
 ]
@@ -260,35 +288,20 @@ class TaskEligibilityContradictedError(ConflictError):
         self.reason = reason
 
 
-class TaskStartStatus(StrEnum):
-    """The two durable outcomes of one Task-start arbitration."""
-
-    PLANNING = "planning"
-    QUEUED = "queued"
-
-
-class TaskStartQueueReason(StrEnum):
-    """Why a startably routed Task durably queued instead of claiming."""
-
-    AWAITING_CAPACITY = "awaiting_capacity"
-    ARBITRATION_DEFERRED = "arbitration_deferred"
-
-
 @dataclass(frozen=True, slots=True)
 class TaskStartOutcome:
-    """The complete result of one Task-start invocation (issue #76).
+    """The complete result of one queue-first Task-start invocation (issue #257).
 
-    ``PLANNING`` carries the post-write Task (rotated token, ``queued_at``
-    cleared) and both exact role bindings for the #203 handoff. ``QUEUED``
-    carries the post-write Task with its durable ``queued_at`` entry
-    timestamp, no reservations, and the queue reason. ``PLANNING`` means
-    capacity admitted and startup claimed — nothing more.
+    A successful start ONLY reports the durable ``queued`` outcome: the
+    post-write Task carries the frozen requirements fingerprint and budget,
+    the original ``queued_at`` entry timestamp, and the rotated
+    ``state_token``. There is no synchronous ``planning`` result, no session
+    reservations, and no bootstrap submission from Start — the ONE FIFO
+    processor owns every admission, and its ``ADMITTED`` outcomes carry the
+    post-claim facts the next F1 handoff addresses.
     """
 
-    status: TaskStartStatus
     task: Task
-    sessions: Mapping[WorkflowRole, TaskAgentSession]
-    queue_reason: TaskStartQueueReason | None
 
 
 class QueuedCandidateDisposition(StrEnum):
@@ -304,26 +317,40 @@ class QueuedCandidateDisposition(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class QueuedCandidateOutcome:
-    """One queued Task's per-candidate arbitration outcome (safe facts only)."""
+    """One queued Task's per-candidate arbitration outcome (safe facts only).
+
+    An ``ADMITTED`` outcome additionally carries the exact durable post-claim
+    facts the next F1 planning-bootstrap handoff addresses — the claimed
+    Task with its rotated ``state_token``, and the accountable Workspace
+    Owner identity — captured from the actual claim, never synthesized from
+    the ``ADMITTED`` marker alone (issue #257). Every other disposition
+    carries neither.
+    """
 
     task_id: UUID
     github_issue_number: int
     disposition: QueuedCandidateDisposition
     eligibility_reason: TaskEligibilityFailure | None = None
+    admitted_task: Task | None = None
+    owner_profile_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class QueuedSweepOutcome:
-    """The result of one queued-Tasks re-evaluation sweep (issue #76).
+    """The result of one queued-Tasks FIFO re-evaluation sweep (issues #76/#257).
 
     ``exhausted`` is true when the bounded sweep examined the Workspace's
-    entire queued set; false means the candidate budget bounded the sweep
-    and the remaining candidates stay queued for the next wakeup, in durable
-    FIFO order.
+    entire queued set; false means the candidate budget bounded the sweep and
+    the unexamined tail stays queued in durable FIFO order. When the sweep is
+    not exhausted, ``continuation_cursor`` is the keyset position past the
+    last examined candidate — a paging hint the wake caller may arrange one
+    bounded continuation sweep after, never Task or scheduling authority, and
+    every resumed candidate is revalidated on execution.
     """
 
     outcomes: tuple[QueuedCandidateOutcome, ...]
     exhausted: bool
+    continuation_cursor: tuple[datetime, UUID] | None = None
 
 
 def _require_uuid_command(value: object, name: str) -> None:
@@ -532,11 +559,21 @@ def _arbitrate_queued_candidate(
                     github_issue_number=current.github_issue_number,
                     disposition=QueuedCandidateDisposition.STILL_QUEUED,
                 )
-            _claim_task_for_planning(transaction_pool, task=current, actor=_OPENORC_ACTOR)
+            claimed = _claim_task_for_planning(transaction_pool, task=current, actor=_OPENORC_ACTOR)
+            if claimed.status is not TaskStatus.PLANNING:  # pragma: no cover
+                # The claim write is the only source of this outcome's facts;
+                # it cannot legally return a non-planning row. Fail closed
+                # rather than report an admitted candidate without its
+                # post-claim facts.
+                raise StaleOperationError(
+                    "the planning claim did not persist its post-claim facts; the sweep is stale"
+                )
             return QueuedCandidateOutcome(
                 task_id=current.id,
                 github_issue_number=current.github_issue_number,
                 disposition=QueuedCandidateDisposition.ADMITTED,
+                admitted_task=claimed,
+                owner_profile_id=profile_id,
             )
     except TaskEligibilityContradictedError as error:
         return QueuedCandidateOutcome(
@@ -573,61 +610,6 @@ def _arbitrate_queued_candidate(
             github_issue_number=candidate.github_issue_number,
             disposition=QueuedCandidateDisposition.CONFLICT,
         )
-
-
-def _scan_and_advance_queue(
-    transaction_pool: DatabasePool,
-    *,
-    profile_id: UUID,
-    workspace_id: UUID,
-    target_task_id: UUID,
-) -> tuple[bool, list[QueuedCandidateOutcome]]:
-    """Advance admissible queued Tasks in durable FIFO order, bounded.
-
-    Repeated bounded keyset pages over the Workspace's queued Tasks,
-    oldest-first, arbitrating each candidate through
-    :func:`_arbitrate_queued_candidate`. Returns ``(established,
-    outcomes)``: ``established`` is true only when the scan reached a
-    fixpoint — every candidate present at scan time was examined under the
-    caller's serialization (so no admissible older candidate was skipped)
-    within the fixed work budget. ``False`` means the budget bounded the
-    scan: the caller must NOT claim the target on unexamined candidates and
-    durably queues it instead — its entry timestamp is later than every
-    examined candidate's, so FIFO order holds in every case.
-    """
-    outcomes: list[QueuedCandidateOutcome] = []
-    cursor: tuple[datetime, UUID] | None = None
-    examined = 0
-    while True:
-        page = task_records.list_queued_tasks(
-            transaction_pool,
-            workspace_id=workspace_id,
-            after_queued_at=None if cursor is None else cursor[0],
-            after_task_id=None if cursor is None else cursor[1],
-            limit=_QUEUE_PAGE_LIMIT,
-        )
-        if not page:
-            return True, outcomes
-        for candidate in page:
-            examined += 1
-            if examined > _ARBITRATION_CANDIDATE_BUDGET:
-                return False, outcomes
-            if candidate.id == target_task_id:
-                continue
-            outcomes.append(
-                _arbitrate_queued_candidate(
-                    transaction_pool,
-                    candidate=candidate,
-                    profile_id=profile_id,
-                    workspace_id=workspace_id,
-                )
-            )
-        last = page[-1]
-        if last.queued_at is None:  # pragma: no cover - queued rows carry the timestamp
-            raise StaleOperationError(
-                "the durable queue key disappeared during the scan; the decision is stale"
-            )
-        cursor = (last.queued_at, last.id)
 
 
 def _revalidate_fresh_github_eligibility(
@@ -711,6 +693,7 @@ def start_task_for_owner(
     workspace_id: UUID,
     task_id: UUID,
     expected_state_token: UUID,
+    queue_wake: TaskQueueWakeSubmission | None = None,
 ) -> TaskStartOutcome:
     """Start a ``ready_to_plan`` Task under the authenticated Owner boundary.
 
@@ -718,12 +701,16 @@ def start_task_for_owner(
     account-operational barrier FIRST, exact Workspace/Task ownership, the
     subject load and startability precheck — closed before external I/O);
     the fresh authoritative GitHub revalidation with no database transaction
-    open; and the one short arbitration transaction that claims the planning
-    startup with both role reservations or durably queues the Task. Raises
-    the typed authorization vocabulary uniformly for absent/foreign subjects
-    and the typed non-start conditions above for ineligible sources and
-    states; capacity waiting is a returned ``QUEUED`` outcome, never an
-    error.
+    open; and the one short arbitration transaction that durably queues the
+    Task with its frozen fingerprint and budget (issue #257 — Start never
+    reserves sessions or claims ``planning`` itself). Raises the typed
+    authorization vocabulary uniformly for absent/foreign subjects and the
+    typed non-start conditions above for ineligible sources and states;
+    queueing is the successful outcome, never an error. Strictly after the
+    commit the start arranges one Task-queue wake invitation through the
+    optional ``queue_wake`` seam — an unwired, refused, or uncertain wake
+    never fails or reverses the committed queue entry, and the durable
+    ``queued`` facts own recovery.
     """
     _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
@@ -755,8 +742,9 @@ def start_task_for_owner(
         # open (the B3/B4 critical path; an unobservable state fails closed).
         # The returned fingerprint is what a successful start freezes.
         fresh_fingerprint = _revalidate_fresh_github_eligibility(pool, github, task=task)
-        # Phase C: the arbitration decision under the serialization boundary.
-        return _arbitrate_target_start(
+        # Phase C: the arbitration decision under the serialization boundary,
+        # strictly followed by the post-commit queue-processor wake.
+        outcome = _arbitrate_target_start(
             pool,
             profile_id=profile_id,
             workspace_id=workspace_id,
@@ -764,6 +752,12 @@ def start_task_for_owner(
             expected_state_token=expected_state_token,
             source_requirements_fingerprint=fresh_fingerprint,
         )
+        arrange_task_queue_wake(
+            queue_wake,
+            workspace_id=workspace_id,
+            origin="owner_task_start",
+        )
+        return outcome
 
 
 def _arbitrate_target_start(
@@ -775,19 +769,22 @@ def _arbitrate_target_start(
     expected_state_token: UUID,
     source_requirements_fingerprint: str,
 ) -> TaskStartOutcome:
-    """One short arbitration: FIFO establishment pass, then the target's decision.
+    """One short arbitration: durably queue the target, freezing its authorization.
 
     The account-operational barrier is the FIRST lock acquisition; the
     per-Workspace advisory arbitration lock next — the same boundary every
     capacity-releasing lifecycle transition composes, so no occupancy
-    change can commit between the establishment scan and the decision. The
-    locked re-read binds the decision to the caller's exact
-    ``state_token``; the durable eligibility guard (against the freshly
-    verified fingerprint being frozen), the structural verdict, and the #68
-    all-or-nothing admission decide against one consistent occupancy
-    picture. A successful decision freezes
-    ``source_requirements_fingerprint`` in the same guarded statement that
-    claims ``planning`` or durably queues the Task (issue #233); a losing,
+    change can commit between the locked re-read and the queue entry. The
+    locked re-read binds the decision to the caller's exact ``state_token``;
+    the durable eligibility guard (against the freshly verified fingerprint
+    being frozen) and the structural feasibility verdict decide against one
+    consistent picture. A successful decision freezes
+    ``source_requirements_fingerprint`` and the then-current Workspace
+    ``authorized_task_budget_usd`` in the same guarded statement that
+    durably queues the Task (issues #233/#240) — Start never reserves
+    sessions, never scans or admits older Tasks, and never claims
+    ``planning`` itself: the ONE FIFO processor owns every admission and
+    derives queue eligibility from Postgres after the commit. A losing,
     stale, or failed decision rolls back with no baseline.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _ARBITRATION_SPAN_NAME) as span:
@@ -834,8 +831,9 @@ def _arbitrate_target_start(
             if workspace is None:
                 raise NotFoundError("the requested workspace is not available")
             # The fresh mirror Phase B just refreshed is the eligibility
-            # authority for the target's claim too; the compared baseline is
-            # the fingerprint this decision will freeze (issue #233).
+            # authority for the target's queue entry too; the compared
+            # baseline is the fingerprint this decision will freeze
+            # (issue #233).
             _require_durable_queue_eligibility(
                 transaction_pool,
                 task=task,
@@ -853,77 +851,66 @@ def _arbitrate_target_start(
                     "the task's routed roles can never complete admission on the "
                     "configured connections; change the role routing or capacity"
                 )
-            established, _ = _scan_and_advance_queue(
-                transaction_pool,
-                profile_id=profile_id,
-                workspace_id=workspace_id,
-                target_task_id=task_id,
-            )
-            if established:
-                admission = admit_task_agent_sessions(
-                    transaction_pool,
-                    profile_id=profile_id,
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    roles=_REQUIRED_ROLES,
-                )
-                if admission.status is AdmissionStatus.ADMITTED:
-                    claimed = _claim_task_for_planning(
-                        transaction_pool,
-                        task=task,
-                        actor=event_coordination.owner_actor(profile_id),
-                        source_requirements_fingerprint=source_requirements_fingerprint,
-                        authorized_task_budget_usd=workspace.default_task_budget_usd,
-                    )
-                    return TaskStartOutcome(
-                        status=TaskStartStatus.PLANNING,
-                        task=claimed,
-                        sessions=admission.sessions,
-                        queue_reason=None,
-                    )
-            # Temporary capacity contention — or bounded work that could not
-            # establish no-bypass: the target durably queues with its own
-            # entry timestamp, never rejected for having priority, and the
-            # next bounded wakeup advances it in FIFO order.
+            # The queue-only Start decision (issue #257): the target durably
+            # queues with its own entry timestamp — with free capacity or
+            # not — and the ONE FIFO processor admits it in durable FIFO
+            # order after this commit, exactly like every other queued
+            # candidate.
             queued = _queue_task_for_capacity(
                 transaction_pool,
                 task=task,
                 source_requirements_fingerprint=source_requirements_fingerprint,
                 authorized_task_budget_usd=workspace.default_task_budget_usd,
             )
-            return TaskStartOutcome(
-                status=TaskStartStatus.QUEUED,
-                task=queued,
-                sessions=MappingProxyType({}),
-                queue_reason=(
-                    TaskStartQueueReason.AWAITING_CAPACITY
-                    if established
-                    else TaskStartQueueReason.ARBITRATION_DEFERRED
-                ),
-            )
+            return TaskStartOutcome(task=queued)
 
 
-def reevaluate_queued_tasks(pool: DatabasePool, *, workspace_id: UUID) -> QueuedSweepOutcome:
+def reevaluate_queued_tasks(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    after_queued_at: datetime | None = None,
+    after_task_id: UUID | None = None,
+) -> QueuedSweepOutcome:
     """Re-evaluate the Workspace's queued Tasks after capacity may have freed.
 
-    The system invocation over existing exact Task subjects (issue #76):
-    never a new Owner authorization and never a change of the accountable
-    Owner — each candidate's claim carries the OPENORC system actor and the
-    accountable Profile is the Workspace's durable Owner. Bounded
-    per-page arbitration units scan the durable ``(queued_at, id)`` FIFO
-    order to exhaustion (or the candidate budget); every unit reads fresh
-    occupancy under its own locks, so capacity released between units is
-    respected, and each candidate's claim commits as its own atomic unit of
-    work. Classified conditions are per-candidate outcomes — an ineligible,
-    conflicted, or structurally infeasible candidate stays queued with its
-    original timestamp and the condition is surfaced, not swallowed; an
-    unclassified failure propagates and fails the sweep closed.
+    The ONE durable FIFO admission processor (issues #76/#257): the system
+    invocation over existing exact Task subjects, never a new Owner
+    authorization and never a change of the accountable Owner — each
+    candidate's claim carries the OPENORC system actor and the accountable
+    Profile is the Workspace's durable Owner. Bounded per-page arbitration
+    units scan the durable ``(queued_at, id)`` FIFO order to exhaustion (or
+    the candidate budget); every unit reads fresh occupancy under its own
+    locks, so capacity released between units is respected, and each
+    candidate's claim commits as its own atomic unit of work. Classified
+    conditions are per-candidate outcomes — an ineligible, conflicted, or
+    structurally infeasible candidate stays queued with its original
+    timestamp and the condition is surfaced, not swallowed, so it never
+    blocks a feasible follower; an unclassified failure propagates and fails
+    the sweep closed. The decision path is database-only: no GitHub network
+    read, SDK call, F1 submission, or other external I/O happens while a
+    transaction is open — the wake caller owns every post-commit handoff.
+
+    ``after_queued_at``/``after_task_id`` resume the scan after a prior
+    sweep's keyset continuation cursor (a paging hint, never authority); the
+    sweep requires both together or neither. A budget-bounded sweep returns
+    ``exhausted=False`` with the continuation cursor past its examined tail
+    so the wake caller arranges bounded continuation through the unexamined
+    tail instead of repeatedly revisiting the same prefix.
     """
     _require_uuid_command(workspace_id, "workspace_id")
+    if (after_queued_at is None) != (after_task_id is None):
+        raise InvalidCommandError(
+            "the sweep continuation cursor requires both its timestamp and task id"
+        )
     with application_span(_SERVICE_TRACER_SCOPE, _SWEEP_SPAN_NAME) as span:
         annotate_span(span, operation=_SWEEP_SPAN_NAME, workspace_id=str(workspace_id))
         outcomes: list[QueuedCandidateOutcome] = []
-        cursor: tuple[datetime, UUID] | None = None
+        last_examined: tuple[datetime, UUID] | None = (
+            None
+            if after_queued_at is None or after_task_id is None
+            else (after_queued_at, after_task_id)
+        )
         exhausted = False
         while not exhausted:
             with composed_transaction(pool) as transaction_pool:
@@ -938,8 +925,8 @@ def reevaluate_queued_tasks(pool: DatabasePool, *, workspace_id: UUID) -> Queued
                 page = task_records.list_queued_tasks(
                     transaction_pool,
                     workspace_id=workspace_id,
-                    after_queued_at=None if cursor is None else cursor[0],
-                    after_task_id=None if cursor is None else cursor[1],
+                    after_queued_at=None if last_examined is None else last_examined[0],
+                    after_task_id=None if last_examined is None else last_examined[1],
                     limit=_QUEUE_PAGE_LIMIT,
                 )
                 if not page:
@@ -957,13 +944,56 @@ def reevaluate_queued_tasks(pool: DatabasePool, *, workspace_id: UUID) -> Queued
                             workspace_id=workspace_id,
                         )
                     )
-                else:
-                    last = page[-1]
-                    if last.queued_at is None:  # pragma: no cover - queued rows carry it
+                    if candidate.queued_at is None:  # pragma: no cover - queued rows carry it
                         raise StaleOperationError(
                             "the durable queue key disappeared during the sweep; the sweep is stale"
                         )
-                    cursor = (last.queued_at, last.id)
+                    last_examined = (candidate.queued_at, candidate.id)
+                else:
                     continue
                 break
-        return QueuedSweepOutcome(outcomes=tuple(outcomes), exhausted=exhausted)
+        continuation_cursor = None if exhausted else last_examined
+        return QueuedSweepOutcome(
+            outcomes=tuple(outcomes),
+            exhausted=exhausted,
+            continuation_cursor=continuation_cursor,
+        )
+
+
+def find_unclaimed_bootstrap_handoff(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+) -> Task | None:
+    """Classify the lost F1 planning-bootstrap handoff state, read-only.
+
+    The bounded restart/recovery classification (issue #257): the Task must
+    be current, non-archived, coarse-``planning``, and its E1b one-shot
+    ``planning_bootstrap_claim_token`` still NULL — the claim is the
+    bootstrap's first durable effect, written exactly once strictly before
+    any establishment dispatch (issue #203), so a NULL claim positively
+    proves the F1 bootstrap invocation was never consumed and the admitted
+    ``PLANNING`` commit's handoff was lost. Presence means the current Task
+    is returned for the handoff's payload composition; ``None`` means the
+    durable state does not (or no longer) prove the unclaimed handoff and
+    the recovery submits nothing — the decision is re-derived from committed
+    state on every trigger, never assumed. A claimed, admitted, or uncertain
+    runtime turn is never replayed here: the claim's existence routes every
+    consumed effect to the existing detached correlation and the Level 1/2/3
+    machinery, and the accepted silent-worker-death limitation stands.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    with composed_transaction(pool) as transaction_pool:
+        task = task_records.get_task(transaction_pool, task_id=task_id)
+        if task is None or task.workspace_id != workspace_id:
+            return None
+        if task.status is not TaskStatus.PLANNING or task.archived_at is not None:
+            return None
+        if (
+            task_records.get_task_planning_bootstrap_claim(transaction_pool, task_id=task_id)
+            is not None
+        ):
+            return None
+        return task

@@ -65,6 +65,8 @@ __all__ = [
     "list_issue_attempts",
     "list_current_repository_tasks",
     "list_queued_tasks",
+    "list_task_queue_recovery_workspaces",
+    "list_unclaimed_planning_bootstrap_tasks",
     "list_workspace_tasks",
     "lock_workspace_task_arbitration",
     "record_planning_bootstrap_stage",
@@ -449,6 +451,54 @@ def list_queued_tasks(
             f"where workspace_id = %s and status = 'queued'{predicate} "
             "order by queued_at, id limit %s",
             tuple(params),
+        ).fetchall()
+    return [_task_from_row(row) for row in rows]
+
+
+def list_task_queue_recovery_workspaces(pool: DatabasePool, *, limit: int) -> list[UUID]:
+    """Return a bounded set of Workspaces holding current queued Tasks.
+
+    The bounded post-restart wake-recovery enumeration (issue #257): the
+    durable ``queued`` facts are the recovery candidates — a Workspace
+    listed here may have lost its last capacity-release or enqueue wake, and
+    the recovery arranges one wake invitation per listed Workspace. The
+    listing is a paging hint, never scheduling authority: each wake rederives
+    queue eligibility from Postgres, a duplicate wake is harmless, and the
+    limit bounds one pass (the next recovery trigger revisits the rest).
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select distinct workspace_id from openorc.tasks "
+            "where status = 'queued' and archived_at is null "
+            "order by workspace_id limit %s",
+            (limit,),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def list_unclaimed_planning_bootstrap_tasks(pool: DatabasePool, *, limit: int) -> list[Task]:
+    """Return a bounded set of planning Tasks whose bootstrap handoff is unclaimed.
+
+    The bounded post-restart bootstrap-handoff recovery enumeration
+    (issue #257): current ``planning`` Tasks whose E1b one-shot
+    ``planning_bootstrap_claim_token`` is still NULL — positively proving the
+    F1 bootstrap invocation was never consumed — are the lost-handoff
+    recovery candidates, deterministically ordered oldest-first. The listing
+    is a paging hint, never Task authority: the recovery classifier re-proves
+    every candidate from committed state before any handoff, a claimed or
+    uncertain runtime turn is never replayed, and the limit bounds one pass.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_TASK_COLUMNS} from openorc.tasks "
+            "where status = 'planning' and archived_at is null "
+            "and planning_bootstrap_claim_token is null "
+            "order by created_at, id limit %s",
+            (limit,),
         ).fetchall()
     return [_task_from_row(row) for row in rows]
 

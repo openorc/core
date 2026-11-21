@@ -124,6 +124,10 @@ from openorc.services.task_detached_turn_correlation import (
     attach_acknowledged_turn,
     record_task_detached_turn_receipt,
 )
+from openorc.services.task_queue_wake import (
+    TaskQueueWakeSubmission,
+    arrange_task_queue_wake,
+)
 from openorc.services.task_terminal_cleanup import (
     TerminalCheckoutCleanupEstablishment,
     TerminalCheckoutCleanupRuntime,
@@ -403,6 +407,7 @@ def arrange_task_terminal_finalization(
     *,
     workspace_id: UUID,
     task_id: UUID,
+    queue_wake: TaskQueueWakeSubmission | None = None,
 ) -> TerminalFinalizationArrangement:
     """Arrange one bounded terminal finalization strictly after the commitment.
 
@@ -419,6 +424,17 @@ def arrange_task_terminal_finalization(
     and nothing is polled. Submission failures are contained with safe
     classification; fallback finalization failures propagate like the inline
     archival failures they replace.
+
+    Strictly after an in-process fallback finalization whose archival
+    actually released occupancy (non-empty ``released_session_bindings``),
+    this hook arranges one Task-queue wake invitation through the optional
+    ``queue_wake`` seam (issue #257) — a no-op or duplicate finalization
+    released nothing and invents no wake. The F10 handler and the detached
+    cleanup settlement handoff — the finalizer's production completion and
+    settlement callers — wire the executing process's bridge themselves; an
+    authority caller that leaves this seam unwired leaves the fallback
+    release's wake to the bounded restart/recovery triggers, exactly like
+    every other wake the delivery channel can lose.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(task_id, "task_id")
@@ -430,11 +446,15 @@ def arrange_task_terminal_finalization(
             task_id=str(task_id),
         )
         if submission is None:
+            finalization = finalize_task_terminalization(
+                pool, None, workspace_id=workspace_id, task_id=task_id
+            )
+            _arrange_post_finalization_queue_wake(
+                queue_wake, finalization, workspace_id=workspace_id, origin="terminal_arrangement"
+            )
             return TerminalFinalizationArrangement(
                 submission_outcome=TerminalFinalizationSubmissionOutcome.KNOWN_REFUSED,
-                finalization=finalize_task_terminalization(
-                    pool, None, workspace_id=workspace_id, task_id=task_id
-                ),
+                finalization=finalization,
             )
         try:
             outcome = submission.submit(workspace_id=workspace_id, task_id=task_id)
@@ -448,13 +468,30 @@ def arrange_task_terminal_finalization(
                 finalization=None,
             )
         if outcome is TerminalFinalizationSubmissionOutcome.KNOWN_REFUSED:
+            finalization = finalize_task_terminalization(
+                pool, None, workspace_id=workspace_id, task_id=task_id
+            )
+            _arrange_post_finalization_queue_wake(
+                queue_wake, finalization, workspace_id=workspace_id, origin="terminal_arrangement"
+            )
             return TerminalFinalizationArrangement(
                 submission_outcome=outcome,
-                finalization=finalize_task_terminalization(
-                    pool, None, workspace_id=workspace_id, task_id=task_id
-                ),
+                finalization=finalization,
             )
         return TerminalFinalizationArrangement(submission_outcome=outcome, finalization=None)
+
+
+def _arrange_post_finalization_queue_wake(
+    queue_wake: TaskQueueWakeSubmission | None,
+    finalization: TerminalFinalizationOutcome,
+    *,
+    workspace_id: UUID,
+    origin: str,
+) -> None:
+    """Arrange the F11 queue wake for one in-process finalization's release."""
+    if not finalization.released_session_bindings:
+        return
+    arrange_task_queue_wake(queue_wake, workspace_id=workspace_id, origin=origin)
 
 
 def finalize_task_terminalization(

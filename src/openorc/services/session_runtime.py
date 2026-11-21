@@ -127,6 +127,10 @@ from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_detached_turn_observation import (
     ObservationRegistrationRefusalReason,
 )
+from openorc.services.task_queue_wake import (
+    TaskQueueWakeSubmission,
+    arrange_task_queue_wake,
+)
 from openorc.services.transaction_composition import composed_transaction
 
 __all__ = [
@@ -1082,6 +1086,7 @@ def record_task_agent_session_lost(
     task_id: UUID,
     role: WorkflowRole,
     evidence: AgentSessionNotFoundError,
+    queue_wake: TaskQueueWakeSubmission | None = None,
 ) -> TaskAgentSession:
     """Record genuine loss of the exact bound external session (READY -> LOST).
 
@@ -1100,6 +1105,13 @@ def record_task_agent_session_lost(
     ENDED binding terminated normally, so both are conflicts. A missing or
     mis-scoped binding is the uniform not-found outcome.
 
+    A freshly committed loss releases active Connection capacity, so this
+    service arranges one post-commit Task-queue wake invitation through the
+    optional ``queue_wake`` seam (issue #257) — an idempotent duplicate that
+    released nothing, an unwired seam, and a refused or uncertain wake never
+    fail, retry, or reverse the committed transition; the durable queued
+    facts own recovery.
+
     All command-shape validation happens inside the use-case span and before
     telemetry annotation (the #109 service-span contract).
     """
@@ -1115,6 +1127,8 @@ def record_task_agent_session_lost(
             task_id=str(task_id),
             workflow_role=role.value,
         )
+        result: TaskAgentSession
+        released = False
         with composed_transaction(pool) as transaction_pool:
             _require_workspace(transaction_pool, workspace_id)
             # The per-Workspace arbitration lock (issue #76): a READY -> LOST
@@ -1130,26 +1144,35 @@ def record_task_agent_session_lost(
                 transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
             )
             if binding.lifecycle_status is TaskSessionLifecycleStatus.LOST:
-                # Idempotent: loss is already recorded on this binding.
-                return binding
-            if binding.lifecycle_status is not TaskSessionLifecycleStatus.READY:
+                # Idempotent: loss is already recorded on this binding —
+                # nothing was released, so no wake is invented.
+                result = binding
+            elif binding.lifecycle_status is not TaskSessionLifecycleStatus.READY:
                 raise ConflictError(
                     "only a READY task/role session binding can record genuine session loss"
                 )
-            lost = mark_task_agent_session_lost(transaction_pool, task_id=task_id, role=role)
-            if lost is None:
-                # A concurrent transition committed between the classification
-                # read and the conditional write: reload and reclassify.
-                reloaded = _reload_scoped_binding(
-                    transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
-                )
-                if reloaded.lifecycle_status is TaskSessionLifecycleStatus.LOST:
-                    return reloaded
-                raise ConflictError(
-                    "the task/role session binding state changed concurrently; "
-                    "the loss record was not applied"
-                )
-            return lost
+            else:
+                lost = mark_task_agent_session_lost(transaction_pool, task_id=task_id, role=role)
+                if lost is None:
+                    # A concurrent transition committed between the
+                    # classification read and the conditional write: reload
+                    # and reclassify.
+                    reloaded = _reload_scoped_binding(
+                        transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
+                    )
+                    if reloaded.lifecycle_status is TaskSessionLifecycleStatus.LOST:
+                        result = reloaded
+                    else:
+                        raise ConflictError(
+                            "the task/role session binding state changed concurrently; "
+                            "the loss record was not applied"
+                        )
+                else:
+                    result = lost
+                    released = True
+        if released:
+            arrange_task_queue_wake(queue_wake, workspace_id=workspace_id, origin="session_lost")
+        return result
 
 
 def end_task_agent_session(
@@ -1158,6 +1181,7 @@ def end_task_agent_session(
     workspace_id: UUID,
     task_id: UUID,
     role: WorkflowRole,
+    queue_wake: TaskQueueWakeSubmission | None = None,
 ) -> TaskAgentSession:
     """Explicitly end a CONNECTING or READY binding (-> ENDED).
 
@@ -1170,6 +1194,13 @@ def end_task_agent_session(
     absorbing: explicit end cannot overwrite recorded loss. A missing or
     mis-scoped binding is the uniform not-found outcome. Later workflow
     services decide TaskBlock/recovery consequences.
+
+    A freshly committed end releases active Connection capacity, so this
+    service arranges one post-commit Task-queue wake invitation through the
+    optional ``queue_wake`` seam (issue #257) — an idempotent duplicate that
+    released nothing, an unwired seam, and a refused or uncertain wake never
+    fail, retry, or reverse the committed transition; the durable queued
+    facts own recovery.
 
     All command-shape validation happens inside the use-case span and before
     telemetry annotation (the #109 service-span contract).
@@ -1185,6 +1216,8 @@ def end_task_agent_session(
             task_id=str(task_id),
             workflow_role=role.value,
         )
+        result: TaskAgentSession
+        released = False
         with composed_transaction(pool) as transaction_pool:
             _require_workspace(transaction_pool, workspace_id)
             # The per-Workspace arbitration lock (issue #76): ending a
@@ -1198,24 +1231,33 @@ def end_task_agent_session(
                 transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
             )
             if binding.lifecycle_status is TaskSessionLifecycleStatus.ENDED:
-                # Idempotent: the binding already ended normally.
-                return binding
-            if binding.lifecycle_status is TaskSessionLifecycleStatus.LOST:
+                # Idempotent: the binding already ended normally — nothing
+                # was released, so no wake is invented.
+                result = binding
+            elif binding.lifecycle_status is TaskSessionLifecycleStatus.LOST:
                 raise ConflictError(
                     "a lost task/role session binding is absorbing; explicit end "
                     "cannot overwrite recorded loss"
                 )
-            ended = mark_task_agent_session_ended(transaction_pool, task_id=task_id, role=role)
-            if ended is None:
-                # A concurrent transition committed between the classification
-                # read and the conditional write: reload and reclassify.
-                reloaded = _reload_scoped_binding(
-                    transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
-                )
-                if reloaded.lifecycle_status is TaskSessionLifecycleStatus.ENDED:
-                    return reloaded
-                raise ConflictError(
-                    "the task/role session binding state changed concurrently; "
-                    "the end record was not applied"
-                )
-            return ended
+            else:
+                ended = mark_task_agent_session_ended(transaction_pool, task_id=task_id, role=role)
+                if ended is None:
+                    # A concurrent transition committed between the
+                    # classification read and the conditional write: reload
+                    # and reclassify.
+                    reloaded = _reload_scoped_binding(
+                        transaction_pool, workspace_id=workspace_id, task_id=task_id, role=role
+                    )
+                    if reloaded.lifecycle_status is TaskSessionLifecycleStatus.ENDED:
+                        result = reloaded
+                    else:
+                        raise ConflictError(
+                            "the task/role session binding state changed concurrently; "
+                            "the end record was not applied"
+                        )
+                else:
+                    result = ended
+                    released = True
+        if released:
+            arrange_task_queue_wake(queue_wake, workspace_id=workspace_id, origin="session_ended")
+        return result
