@@ -23,10 +23,11 @@ Boundary rules enforced by this module:
 - Dispatch fails closed when a kind has no registered handler. The
   production handler table registers the F5a Task-workflow handlers
   (``openorc.workers.task_workflow``), the F9 Task-less GitHub
-  handlers (``openorc.workers.github_operations``, issue #255), and the
+  handlers (``openorc.workers.github_operations``, issue #255), the
   F10 terminal finalization handler (``openorc.workers.task_cleanup_operations``,
-  issues #256/#317), which invoke the existing application services directly
-  with process-local dependencies.
+  issues #256/#317), and the F11 Task-queue wake handler
+  (``openorc.workers.task_queue_operations``, issue #257), which invoke the
+  existing application services directly with process-local dependencies.
 - Submission distinguishes accepted-for-delivery, known refusal/failure,
   and uncertain queue submission. Acceptance is never completion, external
   effect, or retry authorization; queue/job IDs are never operation
@@ -41,6 +42,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
@@ -54,6 +56,7 @@ from openorc.adapters.github import GitHubAppClient, HttpGitHubAppClient
 from openorc.config import ConfigurationError, ExecutionMode, Settings
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.pool import DatabasePool, get_database_pool
+from openorc.persistence.time import normalize_utc
 from openorc.services.errors import InvalidCommandError
 from openorc.workers.bootstrap import create_redis_client
 from openorc.workers.queues import queue_name
@@ -147,6 +150,15 @@ class OperationKind(StrEnum):
     # Owner-initiated advisory conversation carries no operational
     # retry/block semantics; the receipt lifecycle owns every failure.
     TASK_OWNER_REVIEWER_DISCUSSION = "task_owner_reviewer_discussion"
+    # F11 (issue #257): the bounded Task-queue wake — one workspace-scoped
+    # invitation to rederive queued-Task admission eligibility from Postgres
+    # after a capacity-relevant commit (a fresh QUEUED entry or a committed
+    # capacity-releasing session transition). The executing sweep is the
+    # bounded database-only FIFO processor; the wake is never admission
+    # authority, never durable workflow state, and a duplicate or lost wake
+    # is always harmless. Not enrolled in the F5b Level 2/3 triage — the
+    # durable queued facts own recovery.
+    TASK_QUEUE_WAKE = "task_queue_wake"
 
 
 class WorkflowRoleRef(StrEnum):
@@ -196,6 +208,25 @@ def _require_canonical_uuid(raw: object, field: str) -> str:
         raise InvalidInvocationError(
             f"the invocation field {field!r} must be a UUID string"
         ) from None
+
+
+def _require_utc_timestamp(raw: object, field: str) -> str:
+    """Require an ISO-8601 timestamp string and return its canonical UTC form."""
+    if not isinstance(raw, str):
+        raise InvalidInvocationError(
+            f"the invocation field {field!r} must be an ISO-8601 timestamp string"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        # No chaining: malformed-invocation failures stay fully sanitized in
+        # reported tracebacks.
+        raise InvalidInvocationError(
+            f"the invocation field {field!r} must be an ISO-8601 timestamp string"
+        ) from None
+    if parsed.tzinfo is None:
+        raise InvalidInvocationError(f"the invocation field {field!r} must carry a timezone offset")
+    return normalize_utc(parsed).isoformat()
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +702,42 @@ class TerminalFinalizationPayload:
         object.__setattr__(self, "task_id", _require_canonical_uuid(self.task_id, "task_id"))
 
 
+@dataclass(frozen=True, slots=True)
+class QueueWakePayload:
+    """The F11 Task-queue wake operation payload (issue #257).
+
+    The scoped durable Workspace identifier plus, optionally, the prior
+    sweep's keyset continuation cursor. The cursor is a paging hint only,
+    never Task or scheduling authority: the executing sweep re-derives every
+    candidate's current durable facts, and a stale or absent cursor only
+    changes where the bounded scan resumes.
+    """
+
+    workspace_id: str
+    after_queued_at: str | None = None
+    after_task_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "workspace_id", _require_canonical_uuid(self.workspace_id, "workspace_id")
+        )
+        if (self.after_queued_at is None) != (self.after_task_id is None):
+            raise InvalidInvocationError(
+                "the invocation queue-wake continuation cursor requires both of its key parts"
+            )
+        if self.after_queued_at is not None:
+            object.__setattr__(
+                self,
+                "after_queued_at",
+                _require_utc_timestamp(self.after_queued_at, "after_queued_at"),
+            )
+            object.__setattr__(
+                self,
+                "after_task_id",
+                _require_canonical_uuid(self.after_task_id, "after_task_id"),
+            )
+
+
 OperationPayload = (
     WebhookDeliveryDispatchPayload
     | ReconciliationSweepPayload
@@ -685,6 +752,7 @@ OperationPayload = (
     | TaskSessionResumePayload
     | TerminalFinalizationPayload
     | TaskOwnerReviewerDiscussionPayload
+    | QueueWakePayload
 )
 
 
@@ -720,6 +788,7 @@ _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: frozenset(
         {"task", "profile_id", "owner_gate_id", "receipt_id", "message"}
     ),
+    OperationKind.TASK_QUEUE_WAKE: frozenset({"workspace_id", "after_queued_at", "after_task_id"}),
 }
 
 # The typed payload each operation kind carries; construction-time
@@ -741,6 +810,7 @@ _PAYLOAD_TYPES: Mapping[OperationKind, type[OperationPayload]] = {
     OperationKind.TASK_SESSION_RESUME: TaskSessionResumePayload,
     OperationKind.TASK_TERMINAL_FINALIZATION: TerminalFinalizationPayload,
     OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: TaskOwnerReviewerDiscussionPayload,
+    OperationKind.TASK_QUEUE_WAKE: QueueWakePayload,
 }
 
 
@@ -922,6 +992,26 @@ def _decode_task_owner_reviewer_discussion_payload(
     )
 
 
+def _decode_queue_wake_payload(raw: object) -> QueueWakePayload:
+    kind = OperationKind.TASK_QUEUE_WAKE
+    fields = _require_exact_fields(raw, _ALLOWED_PAYLOAD_FIELDS[kind])
+    after_queued_at = fields["after_queued_at"]
+    after_task_id = fields["after_task_id"]
+    return QueueWakePayload(
+        workspace_id=_require_canonical_uuid(fields["workspace_id"], "workspace_id"),
+        after_queued_at=(
+            None
+            if after_queued_at is None
+            else _require_utc_timestamp(after_queued_at, "after_queued_at")
+        ),
+        after_task_id=(
+            None
+            if after_task_id is None
+            else _require_canonical_uuid(after_task_id, "after_task_id")
+        ),
+    )
+
+
 _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: _decode_webhook_delivery_dispatch_payload,
     OperationKind.GITHUB_RECONCILIATION_SWEEP: _decode_reconciliation_sweep_payload,
@@ -938,6 +1028,7 @@ _PAYLOAD_DECODERS: Mapping[OperationKind, Callable[[object], OperationPayload]] 
     OperationKind.TASK_SESSION_RESUME: _decode_task_session_resume_payload,
     OperationKind.TASK_TERMINAL_FINALIZATION: _decode_terminal_finalization_payload,
     OperationKind.TASK_OWNER_REVIEWER_DISCUSSION: (_decode_task_owner_reviewer_discussion_payload),
+    OperationKind.TASK_QUEUE_WAKE: _decode_queue_wake_payload,
 }
 
 
@@ -955,6 +1046,12 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
         kind is OperationKind.TASK_TERMINAL_FINALIZATION
     ):
         return {"workspace_id": payload.workspace_id, "task_id": payload.task_id}
+    if isinstance(payload, QueueWakePayload) and kind is OperationKind.TASK_QUEUE_WAKE:
+        return {
+            "workspace_id": payload.workspace_id,
+            "after_queued_at": payload.after_queued_at,
+            "after_task_id": payload.after_task_id,
+        }
     if isinstance(payload, TaskOwnerReviewerDiscussionPayload) and (
         kind is OperationKind.TASK_OWNER_REVIEWER_DISCUSSION
     ):
@@ -1423,11 +1520,13 @@ def build_production_handlers() -> Mapping[OperationKind, OperationHandler]:
     from openorc.workers.task_cleanup_operations import (
         build_terminal_cleanup_operation_handlers,
     )
+    from openorc.workers.task_queue_operations import build_task_queue_operation_handlers
     from openorc.workers.task_workflow import build_task_workflow_handlers
 
     handlers: dict[OperationKind, OperationHandler] = dict(build_task_workflow_handlers())
     handlers.update(build_github_operation_handlers())
     handlers.update(build_terminal_cleanup_operation_handlers())
+    handlers.update(build_task_queue_operation_handlers())
     return handlers
 
 

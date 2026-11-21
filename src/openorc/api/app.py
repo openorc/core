@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
@@ -39,9 +40,12 @@ from openorc.workers.invocation import (
     build_production_handlers,
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
+from openorc.workers.task_queue_operations import arrange_task_queue_recovery
 from openorc.workers.task_workflow import build_detached_completion_handoff
 
 API_TITLE = "OpenOrc API"
+
+logger = logging.getLogger(__name__)
 
 
 def _build_detached_turn_observer(
@@ -147,6 +151,26 @@ def _serving_lifespan(
             observer = _build_detached_turn_observer(dependencies)
             observer.start()
             await asyncio.to_thread(observer.reconcile_durable_outstanding_sessions)
+            # The F11 bounded post-restart Task-queue recovery (issue #257),
+            # beside the reconciliation above: re-arrange lost capacity wakes
+            # for the persisted queued Tasks and recover a lost F1
+            # planning-bootstrap handoff only where the durable state
+            # positively proves the bootstrap was never consumed. Scheduling
+            # only — a failed pass is contained and the next supported
+            # trigger revisits the rest; the durable queued facts own
+            # recovery.
+            try:
+                await asyncio.to_thread(
+                    arrange_task_queue_recovery,
+                    dependencies.database_pool(),
+                    build_operation_submitter(settings, local_executor=None),
+                )
+            except Exception as error:  # noqa: BLE001 - contained recovery pass
+                logger.warning(
+                    "the bounded task-queue recovery pass failed (error type %s); "
+                    "the durable queued facts own recovery until the next trigger",
+                    type(error).__name__,
+                )
         app.state.operation_executor = executor
         app.state.detached_turn_observer = observer
         app.state.operation_submitter = build_operation_submitter(settings, local_executor=executor)
