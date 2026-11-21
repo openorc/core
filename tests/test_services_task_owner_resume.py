@@ -644,57 +644,6 @@ def test_a_dispatched_record_refuses_the_one_shot_dispatch(
     assert adapter.calls == []
 
 
-def _review_iteration() -> Any:
-    from openorc.domain.reviews import ReviewIteration
-
-    return ReviewIteration(
-        id=uuid.uuid4(),
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        review_loop_id=uuid.uuid4(),
-        iteration_number=1,
-        plan_revision_id=uuid.uuid4(),
-        task_pull_request_id=None,
-        reviewed_head_sha=None,
-        outcome=None,
-        summary=None,
-        findings=None,
-        decided_at=None,
-        created_at=_NOW,
-    )
-
-
-def _review_loop(purpose: Any) -> Any:
-    from openorc.domain.reviews import ReviewLoop, ReviewLoopStatus
-
-    return ReviewLoop(
-        id=uuid.uuid4(),
-        workspace_id=_WORKSPACE_ID,
-        task_id=_TASK_ID,
-        purpose=purpose,
-        iteration_limit=5,
-        status=ReviewLoopStatus.OPEN,
-        closed_at=None,
-        created_at=_NOW,
-    )
-
-
-def _route_resumed_review_result_entry(
-    monkeypatch: pytest.MonkeyPatch, *, record: Any, subject_id: Any, response: Any
-) -> Any:
-    return resume_module._route_resumed_review_result(
-        _POOL,
-        cast(Any, None),
-        producer_runtime_factory=cast(Any, object()),
-        reviewer_runtime_factory=cast(Any, object()),
-        record=record,
-        subject_id=subject_id,
-        authorized_token=_STATE_TOKEN,
-        response=response,
-        profile_id=_OWNER_PROFILE_ID,
-    )
-
-
 # --- the detached Owner-authorized same-session Resume dispatch (issue #343) ----
 
 
