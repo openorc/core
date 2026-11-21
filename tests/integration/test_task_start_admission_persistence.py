@@ -55,8 +55,6 @@ from openorc.services.task_start import (
     QueuedCandidateDisposition,
     TaskAlreadyPlanningError,
     TaskCapacityConfigurationError,
-    TaskStartQueueReason,
-    TaskStartStatus,
     reevaluate_queued_tasks,
     start_task_for_owner,
 )
@@ -484,9 +482,31 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
         expected_state_token=state_token,
     )
 
-    assert outcome.status is TaskStartStatus.PLANNING
-    assert outcome.queue_reason is None
-    assert set(outcome.sessions) == {WorkflowRole.PRODUCER, WorkflowRole.REVIEWER}
+    # The queue-first Start (issue #257): the durable queue entry is the
+    # whole synchronous effect — the fresh fingerprint and budget frozen,
+    # no reservations, and no planning claim yet.
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert outcome.task.queued_at is not None
+    assert _active_session_count(conn, connection_id) == 0
+    assert _planning_event_count(conn, task_id) == 0
+    queued_row = conn.execute(
+        "select status, queued_at, state_token, source_requirements_fingerprint "
+        "from openorc.tasks where id = %s",
+        (task_id,),
+    ).fetchone()
+    assert queued_row is not None
+    assert queued_row[0] == "queued"
+    assert queued_row[1] is not None
+    assert queued_row[2] != state_token
+    # The successful start froze the freshly reconciled requirements
+    # fingerprint atomically with the queue entry (issue #233).
+    assert queued_row[3] == _FINGERPRINT
+
+    # The ONE FIFO processor then admits the started Task atomically against
+    # real rows: both reservations, the planning claim, and the event.
+    sweep = reevaluate_queued_tasks(pool, workspace_id=workspace_id)
+    assert [entry.disposition for entry in sweep.outcomes] == [QueuedCandidateDisposition.ADMITTED]
+    assert sweep.exhausted is True
     assert _active_session_count(conn, connection_id) == 2
     assert _planning_event_count(conn, task_id) == 1
     row = conn.execute(
@@ -497,9 +517,7 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
     assert row is not None
     assert row[0] == "planning"
     assert row[1] is None
-    assert row[2] != state_token
-    # The successful start froze the freshly reconciled requirements
-    # fingerprint atomically with the planning claim (issue #233).
+    assert row[2] != queued_row[2]
     assert row[3] == _FINGERPRINT
 
     # Replaying the start for the claimed Task never issues another
@@ -613,8 +631,7 @@ def test_sweep_never_overtakes_the_older_waiter_and_holds_the_release_boundary(
             task_id=newer_id,
             expected_state_token=newer_token,
         )
-        assert outcome.status is TaskStartStatus.QUEUED
-        assert outcome.queue_reason is TaskStartQueueReason.AWAITING_CAPACITY
+        assert outcome.task.status is TaskStatus.QUEUED
         newer_row = conn.execute(
             "select queued_at from openorc.tasks where id = %s", (newer_id,)
         ).fetchone()
@@ -860,7 +877,7 @@ def test_no_capacity_oversubscription_when_the_target_races_the_queue(
         task_id=second_id,
         expected_state_token=second_token,
     )
-    assert outcome.status is TaskStartStatus.QUEUED
+    assert outcome.task.status is TaskStatus.QUEUED
     assert _active_session_count(conn, connection_id) == 2
     second_row = conn.execute(
         "select status, queued_at from openorc.tasks where id = %s", (second_id,)

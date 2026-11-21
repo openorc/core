@@ -123,6 +123,86 @@ def test_reconciliation_sweep_payload_round_trips_without_a_tick() -> None:
     assert decoded.payload.sweep_tick is None
 
 
+def test_queue_wake_payload_round_trips_without_a_cursor() -> None:
+    original = OperationInvocation(
+        kind=OperationKind.TASK_QUEUE_WAKE,
+        payload=invocation.QueueWakePayload(workspace_id=UUID_A),
+    )
+
+    decoded = decode_operation_invocation(original.encode())
+
+    assert decoded == original
+    assert isinstance(decoded.payload, invocation.QueueWakePayload)
+    assert decoded.payload.workspace_id == UUID_A
+    assert decoded.payload.after_queued_at is None
+    assert decoded.payload.after_task_id is None
+
+
+def test_queue_wake_payload_round_trips_with_a_continuation_cursor() -> None:
+    original = OperationInvocation(
+        kind=OperationKind.TASK_QUEUE_WAKE,
+        payload=invocation.QueueWakePayload(
+            workspace_id=UUID_A,
+            after_queued_at="2026-11-21T23:00:00+00:00",
+            after_task_id=UUID_B,
+        ),
+    )
+
+    decoded = decode_operation_invocation(original.encode())
+
+    assert decoded == original
+    assert isinstance(decoded.payload, invocation.QueueWakePayload)
+    assert decoded.payload.after_queued_at == "2026-11-21T23:00:00+00:00"
+    assert decoded.payload.after_task_id == UUID_B
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (
+            {
+                "workspace_id": UUID_A,
+                "after_queued_at": "2026-01-01T00:00:00+00:00",
+                "after_task_id": None,
+            },
+            "both",
+        ),
+        ({"workspace_id": UUID_A, "after_queued_at": None, "after_task_id": UUID_B}, "both"),
+        (
+            {
+                "workspace_id": UUID_A,
+                "after_queued_at": "not-a-timestamp",
+                "after_task_id": UUID_B,
+            },
+            "timestamp",
+        ),
+        (
+            {
+                "workspace_id": UUID_A,
+                "after_queued_at": "2026-01-01T00:00:00",
+                "after_task_id": UUID_B,
+            },
+            "timezone",
+        ),
+        ({"workspace_id": "not-a-uuid", "after_queued_at": None, "after_task_id": None}, "UUID"),
+    ],
+)
+def test_a_malformed_queue_wake_wire_payload_is_refused_before_any_effect(
+    raw: dict[str, object], match: str
+) -> None:
+    with pytest.raises(InvalidInvocationError, match=match):
+        decode_operation_invocation({"kind": "task_queue_wake", "payload": raw})
+
+
+def test_a_half_continuation_cursor_is_refused_at_payload_construction() -> None:
+    with pytest.raises(InvalidInvocationError, match="both"):
+        invocation.QueueWakePayload(workspace_id=UUID_A, after_task_id=UUID_B)
+    with pytest.raises(InvalidInvocationError, match="both"):
+        invocation.QueueWakePayload(
+            workspace_id=UUID_A, after_queued_at="2026-01-01T00:00:00+00:00"
+        )
+
+
 def test_encoded_wire_form_is_stable_json() -> None:
     invocation_to_encode = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
@@ -295,7 +375,8 @@ def test_invoke_operation_fails_closed_for_an_unregistered_kind(
 def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
     # F5a (issue #253) registers the Task-workflow handlers; F9 (issue #255)
     # registers the two Task-less GitHub handlers over the same table; F10
-    # (issue #256) registers the post-terminal cleanup handler the same way.
+    # (issue #256) registers the post-terminal cleanup handler the same way;
+    # F11 (issue #257) registers the Task-queue wake handler the same way.
     handlers = invocation.build_production_handlers()
     assert set(handlers) == {
         invocation.OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH,
@@ -313,6 +394,9 @@ def test_production_handler_table_registers_the_task_and_github_kinds() -> None:
         # The detached discussion admission (issue #339): registered beside
         # the F5a table with its own non-coordinator handler.
         invocation.OperationKind.TASK_OWNER_REVIEWER_DISCUSSION,
+        # The F11 Task-queue wake (issue #257): registered beside the F10
+        # table with its own non-coordinator handler.
+        invocation.OperationKind.TASK_QUEUE_WAKE,
     }
 
 
