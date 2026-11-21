@@ -134,12 +134,13 @@ def test_the_domain_vocabulary_stays_aligned_with_the_migration() -> None:
         assert f"'{value}'" in _collapsed(_migration_text_raw())
     for value in (member.value for member in OriginalAttemptKind):
         # The episode CHECK's identity-kind vocabulary is shared across
-        # migrations; the discussion migration (issue #339) last re-created
-        # it with the full vocabulary, so the alignment is asserted there.
+        # migrations; the terminal-cleanup receipt migration (issue #344)
+        # last re-created it with the full vocabulary, so the alignment is
+        # asserted there.
         assert f"'{value}'" in _collapsed(
-            (
-                MIGRATIONS_DIR / "20261117000000_add_owner_reviewer_discussion_receipts.sql"
-            ).read_text(encoding="utf-8")
+            (MIGRATIONS_DIR / "20261121000000_add_terminal_cleanup_receipts.sql").read_text(
+                encoding="utf-8"
+            )
         )
     for value in (member.value for member in OperationalFailureCode):
         assert f"'{value}'" in _collapsed(_migration_text_raw())

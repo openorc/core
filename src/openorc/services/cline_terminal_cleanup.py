@@ -23,6 +23,19 @@ an uncertain operation, and never creates or replaces a session.
   issued; the ``ClineConstructionMode`` vocabulary stays inside this
   Cline-side composition, and the universal ``AgentRuntimeAdapter``
   surface is never expanded.
+- ``admit_cleanup_turn`` (issue #344) is the same serialized
+  same-external-session reconstruction — attach BOUND at the original
+  base, reconstruct the SAME external identity into ACT — ending in the
+  adapter's existing detached capability instead of a blocking
+  realization: the canonical cleanup control's prose is admitted verbatim
+  as ONE independent detached turn through the runtime's own nonblocking
+  admission (the native Hub enqueue stays inside the Cline integration,
+  with its established D6a/D6b quiescence discipline). The acknowledged
+  turn reference is transport evidence the caller correlates; admission is
+  neither delivery nor execution, and an uncertain admission is a typed
+  normalized uncertainty that never authorizes a resend. No database
+  transaction is ever held across the attach, the reconstruction, or the
+  Hub admission.
 
 Failures surface as the normalized #67 adapter-error taxonomy through the
 attachment composition's existing classification (the runtime-neutral
@@ -36,6 +49,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from uuid import UUID
 
+from openorc.adapters.agent_runtime import AgentTurnAdmission
 from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
 from openorc.adapters.cline.values import ClineConstructionMode
 from openorc.domain.connections import WorkflowRole
@@ -99,3 +113,52 @@ class ClineTerminalCleanupComposition(TerminalCheckoutCleanupRuntime):
             # guessed around.
             raise ConflictError("the cleanup realization returned no validated workspace result")
         return result
+
+    def admit_cleanup_turn(
+        self,
+        pool: DatabasePool,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        external_session_id: str,
+        working_directory: str,
+        interaction: CleanupWorkspaceInteraction,
+    ) -> AgentTurnAdmission:
+        """Admit the authorized cleanup control as one independent detached turn.
+
+        The serialized same-external-session reconstruction (issue #344):
+        the exact durable READY Producer binding is attached BOUND at the
+        caller-derived original repository base (outside the checkout being
+        removed), the SAME external session identity is reconstructed into
+        native Cline ACT preserving the raw conversation, and the
+        already-authorized cleanup control's canonical prose is admitted
+        verbatim as one detached turn through the adapter's existing
+        detached capability. No initialization is resent, no new session is
+        created, no replacement session exists, and the universal adapter
+        surface is never expanded. The acknowledged turn reference is
+        transport evidence the caller correlates; the adapter's own
+        classification surfaces a positively identified pre-enqueue refusal
+        or an uncertain admission as the normalized adapter errors the
+        caller contains, and the attachment lease beneath the reconstruction
+        surfaces its own typed application-level failures — always
+        pre-enqueue, since the lease and the reconstruction precede the
+        enqueue — through the same boundary.
+        """
+        with attach_cline_runtime(
+            pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role=WorkflowRole.PRODUCER,
+            phase=ClineAttachmentPhase.BOUND,
+            external_session_id=external_session_id,
+            working_directory=working_directory,
+            backend_factory=self._backend_factory,
+        ) as attached:
+            attached.adapter.reconstruct_session(
+                external_session_id,
+                target_mode=ClineConstructionMode.ACT,
+            )
+            return attached.adapter.admit_detached_turn(
+                external_session_id,
+                interaction.render(),
+            )

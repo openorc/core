@@ -36,7 +36,8 @@ Boundary rules enforced here:
   :func:`execute_terminal_checkout_cleanup` rechecks current durable
   outstanding-work facts (unsettled Interrupt intents, open resume
   records, open Executions, pending RuntimeRequests, conservatively
-  claimed runtime-send claims) as a narrow pre-send guard. Lack of
+  claimed runtime-send claims, and — issue #344 — any unsettled
+  detached-turn receipt on the binding) as a narrow pre-send guard. Lack of
   positive safety evidence is a skip — never a poll, retry, or recovery
   workflow. Owner Cancel's preterminal runtime-work veto is NOT imposed on
   GitHub-confirmed terminalization: an external terminalization while
@@ -54,6 +55,16 @@ The runtime mechanics stay behind :class:`TerminalCheckoutCleanupRuntime`
 (runtime-neutral seam); the production Cline composition lives in
 ``services/cline_terminal_cleanup``. No persistence migration, no queue
 semantics, no API routes or RQ jobs here.
+
+Issue #344 adds the detached admission beside the blocking realization:
+the shared :func:`establish_terminal_checkout_cleanup` derivation is the
+read-only eligibility establishment both paths consume, and concrete
+runtimes may OPTIONALLY expose ``admit_cleanup_turn`` — the same exact
+subjects and interaction, admitted as one independent detached turn
+through the runtime's own nonblocking admission instead of realized as a
+blocking send. The capability is duck-typed fail-closed (never a universal
+or expanded seam member); a runtime without it keeps the blocking
+realization.
 """
 
 from __future__ import annotations
@@ -72,6 +83,7 @@ from openorc.domain.runtime_requests import RuntimeRequestStatus
 from openorc.domain.send_claims import TaskRuntimeSendClaimStatus
 from openorc.domain.sessions import TaskSessionLifecycleStatus
 from openorc.observability import annotate_span, application_span
+from openorc.persistence import detached_turns as detached_turn_records
 from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
 from openorc.persistence import runtime_requests as runtime_request_records
@@ -91,8 +103,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "TerminalCheckoutCleanupDisposition",
+    "TerminalCheckoutCleanupEstablishment",
     "TerminalCheckoutCleanupExecution",
+    "TerminalCleanupEstablishmentKind",
     "TerminalCheckoutCleanupRuntime",
+    "establish_terminal_checkout_cleanup",
     "execute_terminal_checkout_cleanup",
 ]
 
@@ -140,6 +155,56 @@ class TerminalCheckoutCleanupExecution:
     disposition: TerminalCheckoutCleanupDisposition
 
 
+class TerminalCleanupEstablishmentKind(StrEnum):
+    """The bounded eligibility status of one cleanup establishment.
+
+    The read-only pre-claim establishment both cleanup paths consume
+    (issue #344): the skip members carry the exact same bounded facts the
+    blocking execution's dispositions carry, and ``ELIGIBLE`` carries the
+    exact derived subjects. An ineligible or unsafe terminalization skips
+    optional cleanup and proceeds to the mandatory archival — never a
+    claim, a receipt, or a runtime effect.
+    """
+
+    ELIGIBLE = "eligible"
+    SKIPPED_NO_TERMINAL_SUBJECT = "skipped_no_terminal_subject"
+    SKIPPED_NO_APPLICABLE_CHECKOUT = "skipped_no_applicable_checkout"
+    SKIPPED_SESSION_UNAVAILABLE = "skipped_session_unavailable"
+    SKIPPED_UNSAFE_OUTSTANDING_WORK = "skipped_unsafe_outstanding_work"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCheckoutCleanupEstablishment:
+    """The read-only eligibility establishment of one cleanup attempt.
+
+    Derived once from current durable state (issue #344) and consumed by
+    both the blocking realization and the detached admission: no claim is
+    taken, no receipt is recorded, and no runtime effect occurs here. The
+    exact subjects are present only for ``ELIGIBLE``.
+    """
+
+    kind: TerminalCleanupEstablishmentKind
+    task: Task | None = None
+    binding: TaskAgentSession | None = None
+    interaction: CleanupWorkspaceInteraction | None = None
+    external_session_id: str | None = None
+    original_base: str | None = None
+
+    def __post_init__(self) -> None:
+        eligible = self.kind is TerminalCleanupEstablishmentKind.ELIGIBLE
+        subjects = (
+            self.task is not None
+            and self.binding is not None
+            and self.interaction is not None
+            and self.external_session_id is not None
+            and self.original_base is not None
+        )
+        if eligible and not subjects:
+            raise ValueError("an eligible cleanup establishment carries its exact subjects")
+        if not eligible and subjects:
+            raise ValueError("a skipped cleanup establishment carries no subjects")
+
+
 class TerminalCheckoutCleanupRuntime(ABC):
     """The runtime-neutral seam of the checkout-cleanup realization.
 
@@ -175,15 +240,18 @@ class TerminalCheckoutCleanupRuntime(ABC):
         """
 
 
-def _producer_work_quiescent(pool: DatabasePool, *, task_id: UUID) -> bool:
+def _producer_work_quiescent(
+    pool: DatabasePool, *, task_id: UUID, task_agent_session_id: UUID
+) -> bool:
     """Whether applicable durable outstanding-work facts establish safety.
 
     The narrow, conservative pre-send guard: every applicable family is
     read from its own durable settlement/outcome facts. Unsettled
     Interrupt intents, open session-resume records, open Executions,
-    pending RuntimeRequests, and conservatively claimed runtime-send
-    claims all veto — without re-deriving per-claim subject currency, a
-    claimed claim stays outstanding (a skip is always acceptable).
+    pending RuntimeRequests, conservatively claimed runtime-send claims,
+    and any unsettled detached-turn receipt on the exact session binding
+    (issue #344) all veto — without re-deriving per-claim subject currency,
+    a claimed claim stays outstanding (a skip is always acceptable).
     Missing evidence is never proof of quiescence.
     """
     for intent in intent_records.list_task_interrupt_intents(pool, task_id=task_id):
@@ -200,7 +268,15 @@ def _producer_work_quiescent(pool: DatabasePool, *, task_id: UUID) -> bool:
     for claim in send_claim_records.list_task_runtime_send_claims(pool, task_id=task_id):
         if claim.status is TaskRuntimeSendClaimStatus.CLAIMED:
             return False
-    return True
+    # An outstanding detached turn (issue #344): the session binding's
+    # single-outstanding slot is held, and its run is Producer work the
+    # cleanup must never race.
+    return (
+        detached_turn_records.get_outstanding_task_detached_turn_receipt(
+            pool, task_agent_session_id=task_agent_session_id
+        )
+        is None
+    )
 
 
 def execute_terminal_checkout_cleanup(
@@ -219,7 +295,10 @@ def execute_terminal_checkout_cleanup(
     (bounded dispositions) are legitimate outcomes, not failures: no
     cleanup state is recorded here, the Task and its history are never
     touched, and no gate, block, escalation, or retry ever follows. No
-    database transaction is held across the runtime realization.
+    database transaction is held across the runtime realization. The
+    eligibility establishment is the shared derivation the detached
+    admission consumes (issue #344); this entry point is the blocking
+    realization the explicitly selected queue-mode interim keeps.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _EXECUTE_SPAN_NAME) as span:
         annotate_span(
@@ -228,64 +307,77 @@ def execute_terminal_checkout_cleanup(
             workspace_id=str(workspace_id),
             task_id=str(task_id),
         )
-
-        # --- Current terminal-subject recheck: the committed terminalization. ---
-        task = task_records.get_task(pool, task_id)
-        if (
-            task is None
-            or task.workspace_id != workspace_id
-            or task.terminalization_outcome is None
-            or task.archived_at is not None
-        ):
-            # A stale, duplicate, or non-committed observation — including a
-            # late one arriving after the archival already committed: the
-            # accepted no-op. Duplicate terminal observations never
-            # intentionally initiate fresh attempts, and a cleanup is never
-            # initiated after archival.
-            return TerminalCheckoutCleanupExecution(
-                disposition=TerminalCheckoutCleanupDisposition.SKIPPED_NO_TERMINAL_SUBJECT
-            )
-
-        # --- The original bound Producer session (never a replacement). ---
-        binding = session_records.get_task_agent_session(
-            pool, task_id=task_id, role=WorkflowRole.PRODUCER
+        establishment = establish_terminal_checkout_cleanup(
+            pool, workspace_id=workspace_id, task_id=task_id
         )
-        if binding is None or binding.workspace_id != workspace_id:
+        if establishment.kind is not TerminalCleanupEstablishmentKind.ELIGIBLE:
             return TerminalCheckoutCleanupExecution(
-                disposition=TerminalCheckoutCleanupDisposition.SKIPPED_NO_APPLICABLE_CHECKOUT
+                disposition=TerminalCheckoutCleanupDisposition(establishment.kind.value)
             )
-        if (
-            binding.lifecycle_status is not TaskSessionLifecycleStatus.READY
-            or binding.external_session_id is None
-        ):
-            # A lost/ended/uninitialized original binding is session-loss
-            # evidence for cleanup purposes: skip, never replace or resume.
-            return TerminalCheckoutCleanupExecution(
-                disposition=TerminalCheckoutCleanupDisposition.SKIPPED_SESSION_UNAVAILABLE
-            )
-        return _realize_checked_cleanup(
+        task, _binding, external_session_id, original_base, interaction = _established_subjects(
+            establishment
+        )
+        return _realize_cleanup(
             pool,
             runtime,
             workspace_id=workspace_id,
-            task=task,
-            binding=binding,
+            task_id=task.id,
+            external_session_id=external_session_id,
+            original_base=original_base,
+            interaction=interaction,
         )
 
 
-def _realize_checked_cleanup(
-    pool: DatabasePool,
-    runtime: TerminalCheckoutCleanupRuntime,
-    *,
-    workspace_id: UUID,
-    task: Task,
-    binding: TaskAgentSession,
-) -> TerminalCheckoutCleanupExecution:
-    """Derive the exact target, guard, compose, and realize the cleanup.
+def establish_terminal_checkout_cleanup(
+    pool: DatabasePool, *, workspace_id: UUID, task_id: UUID
+) -> TerminalCheckoutCleanupEstablishment:
+    """Establish one cleanup attempt's eligibility and exact subjects (issue #344).
 
-    All durable reads here are plain current durable reads: no transaction is
-    held, and the runtime realization runs with no database transaction
-    open.
+    The read-only derivation both cleanup paths consume, in the established
+    guard order: the committed terminalization subject, the original bound
+    READY Producer session (never a replacement), the fail-closed snapshot
+    recovery of the original repository base and the exact single checkout,
+    the conservative outstanding-work guard, and the durable repository
+    record behind the composed canonical interaction. No claim is taken, no
+    receipt is recorded, and no runtime effect occurs here: every skip is a
+    legitimate outcome the caller maps to its own disposition, and the
+    mandatory archival never depends on this establishment being eligible.
     """
+    # --- Current terminal-subject recheck: the committed terminalization. ---
+    task = task_records.get_task(pool, task_id)
+    if (
+        task is None
+        or task.workspace_id != workspace_id
+        or task.terminalization_outcome is None
+        or task.archived_at is not None
+    ):
+        # A stale, duplicate, or non-committed observation — including a
+        # late one arriving after the archival already committed: the
+        # accepted no-op. Duplicate terminal observations never
+        # intentionally initiate fresh attempts, and a cleanup is never
+        # initiated after archival.
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_TERMINAL_SUBJECT
+        )
+
+    # --- The original bound Producer session (never a replacement). ---
+    binding = session_records.get_task_agent_session(
+        pool, task_id=task_id, role=WorkflowRole.PRODUCER
+    )
+    if binding is None or binding.workspace_id != workspace_id:
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_APPLICABLE_CHECKOUT
+        )
+    if (
+        binding.lifecycle_status is not TaskSessionLifecycleStatus.READY
+        or binding.external_session_id is None
+    ):
+        # A lost/ended/uninitialized original binding is session-loss
+        # evidence for cleanup purposes: skip, never replace or resume.
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_SESSION_UNAVAILABLE
+        )
+
     # --- The exact destructive target, fail-closed snapshot recovery. ---
     try:
         original_base = _producer_snapshot_repository_base(pool, binding, workspace_id=workspace_id)
@@ -293,24 +385,42 @@ def _realize_checked_cleanup(
         # A missing/inconsistent snapshot (including any non-Cline admitted
         # configuration) fails closed: no OpenOrc-managed checkout cleanup
         # applies. No path is ever substituted.
-        return TerminalCheckoutCleanupExecution(
-            disposition=TerminalCheckoutCleanupDisposition.SKIPPED_NO_APPLICABLE_CHECKOUT
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_APPLICABLE_CHECKOUT
         )
     checkout_directory = f"{original_base}/{task.id}"
 
     # --- The narrow pre-send safety guard. ---
-    if not _producer_work_quiescent(pool, task_id=task.id):
-        return TerminalCheckoutCleanupExecution(
-            disposition=TerminalCheckoutCleanupDisposition.SKIPPED_UNSAFE_OUTSTANDING_WORK
+    if not _producer_work_quiescent(pool, task_id=task.id, task_agent_session_id=binding.id):
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_UNSAFE_OUTSTANDING_WORK
         )
-    return _compose_and_realize(
-        pool,
-        runtime,
-        workspace_id=workspace_id,
+
+    # --- The durable repository record behind the composed interaction. ---
+    repository = get_repository(pool, task.repository_id)
+    if repository is None or repository.workspace_id != workspace_id:
+        # An archived Task's repository is durable history; a divergence is
+        # an unexpected durable-state invariant failure. Contained as a skip
+        # with a sanitized log; cleanup never applies partially.
+        logger.warning(
+            "terminal checkout cleanup skipped: the task's repository record is not available"
+        )
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_APPLICABLE_CHECKOUT
+        )
+    interaction = CleanupWorkspaceInteraction(
+        repository_full_name=(f"{repository.metadata.owner_login}/{repository.metadata.name}"),
+        issue_number=task.github_issue_number,
+        task_uuid=task.id,
+        target_directory=checkout_directory,
+    )
+    return TerminalCheckoutCleanupEstablishment(
+        kind=TerminalCleanupEstablishmentKind.ELIGIBLE,
         task=task,
+        binding=binding,
+        interaction=interaction,
         external_session_id=_require_cleanup_session_id(binding),
         original_base=original_base,
-        checkout_directory=checkout_directory,
     )
 
 
@@ -324,39 +434,46 @@ def _require_cleanup_session_id(binding: TaskAgentSession) -> str:
     return external_session_id
 
 
-def _compose_and_realize(
+def _established_subjects(
+    establishment: TerminalCheckoutCleanupEstablishment,
+) -> tuple[Task, TaskAgentSession, str, str, CleanupWorkspaceInteraction]:
+    """Unpack an eligible establishment's exact subjects, fail-closed."""
+    if (
+        establishment.task is None
+        or establishment.binding is None
+        or establishment.external_session_id is None
+        or establishment.original_base is None
+        or establishment.interaction is None
+    ):
+        # Unreachable: the establishment's own coherence validation
+        # guarantees the subjects for ELIGIBLE. Kept explicit for
+        # fail-closed safety and type narrowing.
+        raise ApplicationError("the cleanup establishment carries no eligible subjects")
+    return (
+        establishment.task,
+        establishment.binding,
+        establishment.external_session_id,
+        establishment.original_base,
+        establishment.interaction,
+    )
+
+
+def _realize_cleanup(
     pool: DatabasePool,
     runtime: TerminalCheckoutCleanupRuntime,
     *,
     workspace_id: UUID,
-    task: Task,
+    task_id: UUID,
     external_session_id: str,
     original_base: str,
-    checkout_directory: str,
+    interaction: CleanupWorkspaceInteraction,
 ) -> TerminalCheckoutCleanupExecution:
-    """Compose the authorized interaction and realize it; contain failures."""
-    repository = get_repository(pool, task.repository_id)
-    if repository is None or repository.workspace_id != workspace_id:
-        # An archived Task's repository is durable history; a divergence is
-        # an unexpected durable-state invariant failure. Contained as a skip
-        # with a sanitized log; cleanup never applies partially.
-        logger.warning(
-            "terminal checkout cleanup skipped: the task's repository record is not available"
-        )
-        return TerminalCheckoutCleanupExecution(
-            disposition=TerminalCheckoutCleanupDisposition.SKIPPED_NO_APPLICABLE_CHECKOUT
-        )
-    interaction = CleanupWorkspaceInteraction(
-        repository_full_name=(f"{repository.metadata.owner_login}/{repository.metadata.name}"),
-        issue_number=task.github_issue_number,
-        task_uuid=task.id,
-        target_directory=checkout_directory,
-    )
+    """Realize the composed authorized cleanup; contain failures."""
     try:
         result = runtime.cleanup_checkout(
             pool,
             workspace_id=workspace_id,
-            task_id=task.id,
+            task_id=task_id,
             external_session_id=external_session_id,
             working_directory=original_base,
             interaction=interaction,

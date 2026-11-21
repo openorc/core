@@ -129,6 +129,7 @@ class _RecordFacts:
     executions: list[Any] = field(default_factory=list)
     runtime_requests: list[Any] = field(default_factory=list)
     send_claims: list[Any] = field(default_factory=list)
+    outstanding_receipt: Any = None
 
 
 def _install_facts(monkeypatch: pytest.MonkeyPatch, facts: _RecordFacts) -> None:
@@ -153,12 +154,21 @@ def _install_facts(monkeypatch: pytest.MonkeyPatch, facts: _RecordFacts) -> None
         assert repository_id == _REPOSITORY_ID
         return facts.repository
 
+    def _get_outstanding_receipt(_pool: Any, *, task_agent_session_id: UUID) -> Any:
+        assert facts.binding is None or task_agent_session_id == facts.binding.id
+        return facts.outstanding_receipt
+
     monkeypatch.setattr(task_terminal_cleanup.task_records, "get_task", _get_task)
     monkeypatch.setattr(
         task_terminal_cleanup.session_records, "get_task_agent_session", _get_binding
     )
     monkeypatch.setattr(task_terminal_cleanup, "_producer_snapshot_repository_base", _snapshot_base)
     monkeypatch.setattr(task_terminal_cleanup, "get_repository", _get_repository)
+    monkeypatch.setattr(
+        task_terminal_cleanup.detached_turn_records,
+        "get_outstanding_task_detached_turn_receipt",
+        _get_outstanding_receipt,
+    )
     monkeypatch.setattr(
         task_terminal_cleanup.intent_records,
         "list_task_interrupt_intents",
@@ -459,6 +469,32 @@ def test_a_missing_repository_record_is_contained_as_a_skip(
 
     assert (
         execution.disposition is TerminalCheckoutCleanupDisposition.SKIPPED_NO_APPLICABLE_CHECKOUT
+    )
+    assert runtime.calls == []
+
+
+def test_an_unsettled_detached_receipt_vetoes_the_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The extended outstanding-work guard (issue #344): any unsettled
+    detached-turn receipt on the exact binding holds the session's
+    single-outstanding slot — the cleanup is a positively established skip,
+    never a race against another run's turn."""
+    facts = _RecordFacts(
+        task=_committed_task(),
+        binding=_ready_producer_binding(),
+        repository=_repository(),
+        outstanding_receipt=SimpleNamespace(id=uuid4(), status="admitted"),
+    )
+    _install_facts(monkeypatch, facts)
+    runtime = _RecordingRuntime()
+
+    execution = execute_terminal_checkout_cleanup(
+        _pool(), runtime, workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert (
+        execution.disposition is TerminalCheckoutCleanupDisposition.SKIPPED_UNSAFE_OUTSTANDING_WORK
     )
     assert runtime.calls == []
 

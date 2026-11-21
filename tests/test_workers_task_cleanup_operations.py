@@ -22,7 +22,10 @@ from uuid import UUID
 import pytest
 
 from openorc.config import ExecutionMode, Settings
-from openorc.services.task_terminal_finalization import TerminalFinalizationSubmissionOutcome
+from openorc.services.task_terminal_finalization import (
+    TerminalCleanupDispatchSelection,
+    TerminalFinalizationSubmissionOutcome,
+)
 from openorc.workers import invocation, task_cleanup_operations
 from openorc.workers.invocation import (
     InvalidInvocationError,
@@ -79,6 +82,7 @@ class _CleanupServiceHarness:
         *,
         workspace_id: UUID,
         task_id: UUID,
+        dispatch: Any = None,
     ) -> Any:
         self.calls.append(
             {
@@ -86,6 +90,7 @@ class _CleanupServiceHarness:
                 "runtime": runtime,
                 "workspace_id": workspace_id,
                 "task_id": task_id,
+                "dispatch": dispatch,
             }
         )
         self.started.set()
@@ -193,8 +198,17 @@ def test_the_finalization_handler_invokes_the_existing_service_with_the_scoped_i
             "runtime": runtime,
             "workspace_id": _WORKSPACE_ID,
             "task_id": _TASK_ID,
+            "dispatch": harness.calls[0]["dispatch"],
         }
     ]
+    # The explicit cleanup dispatch selection (issue #344): a regular-mode
+    # process with no observation host bound is the observation-unavailable
+    # selection — never an inferred blocking fallback.
+    assert harness.calls[0]["dispatch"] is not None
+    assert (
+        harness.calls[0]["dispatch"].selection
+        is TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
+    )
 
 
 # --- the submission bridge: F1 outcome mapping, truthfully -----------------------
@@ -262,6 +276,13 @@ def test_the_finalization_flows_through_the_regular_mode_executor_to_the_service
     assert drain.drained
     assert [call["workspace_id"] for call in harness.calls] == [_WORKSPACE_ID]
     assert [call["task_id"] for call in harness.calls] == [_TASK_ID]
+    # The regular-mode executor resolves the explicit selection: no bound
+    # observation host means the observation-unavailable skip, never an
+    # inferred blocking fallback (issue #344).
+    assert (
+        harness.calls[0]["dispatch"].selection
+        is TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
+    )
     # Regular mode never contacts the queue backend (issue #86 isolation):
     # the executor alone delivers the registered cleanup handler.
     assert queue_wire["client_settings"] == []
@@ -293,6 +314,12 @@ def test_the_finalization_wire_form_is_strictly_decoded_and_dispatched_in_queue_
         dependencies=dependencies,
     )
     assert [call["workspace_id"] for call in harness.calls] == [_WORKSPACE_ID]
+    # The queue-mode worker explicitly keeps the blocking interim (until
+    # #328); the blocking selection carries no observation registrar.
+    dispatch = harness.calls[0]["dispatch"]
+    assert dispatch is not None
+    assert dispatch.selection is TerminalCleanupDispatchSelection.BLOCKING_QUEUE_INTERIM
+    assert dispatch.observation_registrar is None
     assert queue_wire["client_settings"] == [settings]
 
 

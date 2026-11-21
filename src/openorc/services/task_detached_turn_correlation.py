@@ -146,7 +146,9 @@ from openorc.protocol.errors import ProtocolError
 from openorc.protocol.models import (
     FORMAL_RESPONSE_FAMILIES,
     IMPLEMENTATION_RESULT_FAMILY,
+    WORKSPACE_OPERATION_CLEANUP,
     WORKSPACE_OPERATION_PREPARE,
+    WORKSPACE_RESULT_FAMILY,
     FormalResponse,
     ImplementationResult,
     PlanResult,
@@ -295,6 +297,17 @@ _PR_COMPOSE_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOp
 # direction-only audit, all atomic with the receipt's settlement.
 _DISCUSSION_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
     frozenset({PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION})
+)
+
+# The terminal-cleanup family with detached settlement routing in this seam
+# (issue #344): the terminalization exception's CLEANUP_WORKSPACE run whose
+# validated ``workspace_result`` settles the receipt truthfully. The route
+# settles neither the Task's one-shot cleanup claim nor the archival — that
+# disposition (including the established finite deadline) is the owning
+# finalization's (issue #345) — and the family is deliberately NOT a Level 2
+# operational-failure family.
+_TERMINAL_CLEANUP_SETTLEMENT_FAMILIES: Final[frozenset[PendingTaskRuntimeInteractionOperation]] = (
+    frozenset({PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP})
 )
 
 # The safe failure-classification token the settlement records for a
@@ -552,6 +565,34 @@ def record_task_detached_turn_receipt(
                 "a session-resume detached-turn receipt expects the original "
                 "workflow operation's canonical formal family"
             )
+    elif operation is PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP:
+        # The detached terminal-cleanup receipt (issue #344): its identity
+        # is the exact terminalized Task's own one-shot cleanup claim — the
+        # receipt's original attempt is the Task UUID itself, with the
+        # claim's committed timestamp and the terminal commitment re-proven
+        # at correlation time. No Execution, bootstrap claim, or control
+        # intent, and no parallel effect ledger beside the Task row's
+        # ``cleanup_send_claimed_at``/``cleanup_send_settled_at`` evidence
+        # pair. The expected family is the canonical ``workspace_result``
+        # family the CLEANUP_WORKSPACE control answers; the operation is
+        # the terminalization exception and deliberately carries no Level
+        # 2/3 operational-failure semantics.
+        if original_attempt_kind is not OriginalAttemptKind.TERMINAL_CLEANUP_CLAIM:
+            raise InvalidCommandError(
+                "a terminal-cleanup detached-turn receipt roots at its exact "
+                "Task-scoped terminal_cleanup_claim identity"
+            )
+        if original_attempt_id != task_id:
+            raise InvalidCommandError(
+                "a terminal-cleanup detached-turn receipt is bound to the exact "
+                "terminalized Task UUID"
+            )
+        if expected_formal_family is not None and expected_formal_family != WORKSPACE_RESULT_FAMILY:
+            raise InvalidCommandError(
+                "a terminal-cleanup detached-turn receipt expects the canonical "
+                "workspace_result family"
+            )
+        expected_formal_family = WORKSPACE_RESULT_FAMILY
     elif expected_formal_family is None or expected_formal_family not in FORMAL_RESPONSE_FAMILIES:
         raise InvalidCommandError(
             "the receipt requires its expected formal family to name a canonical v1 response family"
@@ -773,6 +814,15 @@ def _route_observed_terminal(
         )
     if receipt.operation in _DISCUSSION_SETTLEMENT_FAMILIES:
         return _route_discussion_terminal(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            receipt=receipt,
+            outcome=outcome,
+            ordering_marker=ordering_marker,
+        )
+    if receipt.operation in _TERMINAL_CLEANUP_SETTLEMENT_FAMILIES:
+        return _route_terminal_cleanup_terminal(
             transaction_pool,
             workspace_id=workspace_id,
             task_id=task_id,
@@ -1375,6 +1425,135 @@ def _route_discussion_terminal(
     return TurnSettlementOutcome(
         kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
         receipt=settled,
+    )
+
+
+_ACCEPTED_CLEANUP_RESULT_STATUSES: Final[frozenset[str]] = frozenset({"COMPLETED", "FAILED"})
+
+
+def _route_terminal_cleanup_terminal(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    receipt: TaskDetachedTurnReceipt,
+    outcome: TurnTerminalOutcome,
+    ordering_marker: int | None,
+) -> TurnSettlementOutcome:
+    """Route one attributed terminal observation onto the terminal cleanup run.
+
+    The terminalization exception (issue #344): the subject reproof checks
+    the exact Task UUID's durable terminalization commitment and its one-shot
+    cleanup claim — the claim's committed timestamp must match the receipt's
+    own ``claimed_at`` — never an ordinary currentness gate that rejects
+    terminal commitment, and no Level 2/3 machinery follows. The observed
+    candidate is validated as the canonical ``workspace_result``
+    (``operation=CLEANUP``, ``COMPLETED|FAILED``); a validated result, a
+    native run failure, or a positively established unusable result settles
+    the receipt truthfully exactly once. The route settles neither the Task's
+    cleanup claim nor the archival: that disposition — including the
+    established finite deadline — is the owning finalization's (issue #345),
+    so a validated result alone never archives here and a successful enqueue
+    was never cleanup success.
+    """
+    locked = task_records.get_task_for_update(transaction_pool, task_id)
+    if locked is None or locked.workspace_id != workspace_id or locked.id != task_id:
+        logger.warning(
+            "the observed terminal cleanup completion conflicts with the receipt's "
+            "task subject; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if locked.terminalization_outcome is None or locked.cleanup_send_claimed_at is None:
+        # The durable claim identity diverged from the receipt: a cleanup
+        # receipt requires a committed terminalization and a present claim.
+        # Never fabricated — the observation is left unresolved.
+        logger.warning(
+            "the terminal-cleanup receipt's subject carries no committed "
+            "terminalization or cleanup claim; the observation is left unresolved"
+        )
+        return TurnSettlementOutcome(kind=TurnSettlementKind.LEFT_UNRESOLVED, receipt=receipt)
+    if (
+        locked.cleanup_send_settled_at is not None
+        or locked.cleanup_send_claimed_at != receipt.claimed_at
+    ):
+        # A moved-on subject: the owning disposition closed the one-shot
+        # claim window (or a different claim instant owns this Task), so a
+        # late observation settles as not applied — it can never re-open
+        # cleanup, change the terminal truth, or undo an archival.
+        logger.warning(
+            "the terminal-cleanup receipt's claim moved on; settling the observation as not applied"
+        )
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_RESULT_NOT_APPLIED, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_RESULT_NOT_APPLIED, receipt=settled
+        )
+    if outcome.kind is DetachedTurnObservationKind.FAILED:
+        # The cleanup run's observed native failure: the receipt settles
+        # truthfully and stops. No Level 2 report, no disposition, no block,
+        # and no second send — the claim stays the owning disposition's
+        # subject (issue #345).
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE, receipt=settled
+        )
+    parsed: WorkspaceResult | None
+    if outcome.result_candidate is not None:
+        try:
+            candidate = parse_formal_response(
+                outcome.result_candidate, expected_family=receipt.expected_formal_family
+            )
+        except ProtocolError:
+            candidate = None
+        parsed = candidate if isinstance(candidate, WorkspaceResult) else None
+    else:
+        parsed = None
+    if (
+        parsed is None
+        or parsed.operation != WORKSPACE_OPERATION_CLEANUP
+        or parsed.status not in _ACCEPTED_CLEANUP_RESULT_STATUSES
+    ):
+        # A positively established unusable result (missing, protocol-invalid,
+        # or addressing another operation): the receipt settles truthfully
+        # and stops — the same containment the blocking realization applied,
+        # never a re-send, never a disposition decision of its own.
+        logger.warning(
+            "the observed terminal cleanup completion carries no usable "
+            "workspace result for its expected family; settling the receipt "
+            "truthfully as an observed failure"
+        )
+        settled = turn_records.settle_task_detached_turn_receipt(
+            transaction_pool,
+            receipt_id=receipt.id,
+            task_id=task_id,
+            workspace_id=workspace_id,
+            outcome=_settlement_outcome(SETTLEMENT_OBSERVED_FAILURE, ordering_marker),
+        )
+        return TurnSettlementOutcome(
+            kind=TurnSettlementKind.SETTLED_OBSERVED_FAILURE, receipt=settled
+        )
+    settled = turn_records.settle_task_detached_turn_receipt(
+        transaction_pool,
+        receipt_id=receipt.id,
+        task_id=task_id,
+        workspace_id=workspace_id,
+        outcome=_settlement_outcome(SETTLEMENT_VALIDATED_RESULT, ordering_marker),
+    )
+    return TurnSettlementOutcome(
+        kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT,
+        receipt=settled,
+        formal_result=parsed,
     )
 
 
