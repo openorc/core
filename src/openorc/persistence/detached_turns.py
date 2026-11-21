@@ -44,6 +44,7 @@ from psycopg.types.json import Jsonb
 
 from openorc.domain.detached_turns import (
     DetachedTurnObservationKind,
+    OutstandingTurnObservationCandidate,
     TaskDetachedTurnEarlyCompletion,
     TaskDetachedTurnReceipt,
     TaskDetachedTurnReceiptStatus,
@@ -78,6 +79,7 @@ __all__ = [
     "get_outstanding_task_detached_turn_receipt",
     "get_outstanding_task_detached_turn_receipt_for_update",
     "get_task_detached_turn_early_completion_for_update",
+    "list_outstanding_turn_observation_candidates",
     "get_task_detached_turn_receipt",
     "get_task_detached_turn_receipt_for_update",
     "list_outstanding_session_initialization_receipts",
@@ -437,6 +439,68 @@ def list_outstanding_session_initialization_receipts(
             (task_id,),
         ).fetchall()
     return [_receipt_from_row(row) for row in rows]
+
+
+def list_outstanding_turn_observation_candidates(
+    pool: DatabasePool,
+    *,
+    limit: int,
+) -> list[OutstandingTurnObservationCandidate]:
+    """List the durable restart-reconciliation candidates, bounded and ordered.
+
+    The observation host's bounded restart reconciliation (issue #346): every
+    outstanding (``claimed``/``admitted``) detached-turn receipt joined to its
+    exact authoritative ``task_agent_sessions`` binding — the join supplies
+    the Connection identity the receipts table deliberately does not carry,
+    and projects both external-identity shapes the registration gates prove:
+
+    - the binding's immutable external identity (a READY/LOST session) for
+      the established-session registration gate;
+    - the outstanding ``session_initialization`` receipt's provisional
+      ``created_external_session_id`` for the establishment gate, because a
+      CONNECTING binding deliberately carries no bound external identity.
+
+    A receipt with neither provable identity still surfaces as a candidate
+    with both shapes ``None``: the reconciling host skips it without
+    recreating or redispatching anything, so the candidates are always facts
+    to re-prove, never proven identities. Deterministically ordered; the hard
+    ``limit`` (the host's own registry bound) keeps the read bounded — never
+    a table scan and never a poll.
+    """
+    if type(limit) is not int or limit < 1:
+        raise ValueError(
+            "detached-turn observation candidate listing limit must be a positive integer"
+        )
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select r.id, r.workspace_id, r.task_id, r.task_agent_session_id, "
+            "r.created_external_session_id, r.operation, "
+            "s.connection_id, s.external_session_id "
+            "from openorc.task_hub_run_receipts r "
+            "join openorc.task_agent_sessions s "
+            "on s.id = r.task_agent_session_id "
+            "and s.task_id = r.task_id and s.workspace_id = r.workspace_id "
+            "where r.status in ('claimed', 'admitted') "
+            "order by r.claimed_at, r.id "
+            "limit %s",
+            (limit,),
+        ).fetchall()
+    return [
+        OutstandingTurnObservationCandidate(
+            receipt_id=row[0],
+            workspace_id=row[1],
+            task_id=row[2],
+            task_agent_session_id=row[3],
+            connection_id=row[6],
+            session_bound_external_session_id=row[7],
+            provisional_external_session_id=(
+                row[4]
+                if row[5] == PendingTaskRuntimeInteractionOperation.SESSION_INITIALIZATION.value
+                else None
+            ),
+        )
+        for row in rows
+    ]
 
 
 def attach_task_detached_turn_acknowledgement(

@@ -1,10 +1,12 @@
 """The process-owned detached-turn observation host (detached agent turns,
 issues #323/#348).
 
-The regular-mode application-lifecycle component that receives detached-turn
-completions without keeping any OpenOrc local worker slot or bridge RPC
-blocked for the turn's lifetime. The host is a process/application-lifecycle
-concern owned by the serving lifespan; the shared settlement seam
+The application-lifecycle component that receives detached-turn completions
+without keeping any OpenOrc local worker slot or bridge RPC blocked for the
+turn's lifetime. The host is a process/application-lifecycle concern owned by
+the serving lifespan — the regular-mode API process and, since issue #346,
+the queue-mode API/control-plane process that hosts the one long-lived
+observer independent of RQ workhorse processes; the shared settlement seam
 (:mod:`openorc.services.task_detached_turn_correlation`) remains the sole
 workflow authority, and the owning Level 1 dispatch services (migrated in
 issue #325) remain the only intended callers of the registration seam.
@@ -57,7 +59,14 @@ interprets native evidence.
   gap-free host lifetime, and no invention of missing formal results: a host
   that died loses its in-memory registry by design, and previously
   outstanding receipts stay unresolved under the accepted v1 fail-closed
-  recovery bounds.
+  recovery bounds. The queue-mode hosting (issue #346) narrows exactly that
+  window with one bounded durable restart reconciliation at host start:
+  outstanding receipts are re-proven through the existing registration
+  gates — READY/LOST bindings through their immutable identity, CONNECTING
+  initialization sessions through their receipt's provisional identity — and
+  admitted receipts get the same bounded status-only consultation, where a
+  completed status alone still never fabricates a result and an unprovable
+  candidate is skipped without recreating or redispatching anything.
 - Each observation carries the receipt-epoch attestation of its exact
   outstanding turn (issue #341): the epoch binds to the outstanding
   receipt's identity and advances — resetting its evidence — whenever a
@@ -93,6 +102,7 @@ from openorc.domain.detached_turns import (
     NativeTurnEvidence,
     ObservationLease,
     ObservedTurnEvidence,
+    OutstandingTurnObservationCandidate,
     SessionUsageReading,
     TaskDetachedTurnReceiptStatus,
     TurnActivityAttestation,
@@ -103,6 +113,7 @@ from openorc.observability import annotate_span, application_span
 from openorc.persistence.detached_turns import (
     find_outstanding_session_initialization_receipt,
     get_outstanding_task_detached_turn_receipt,
+    list_outstanding_turn_observation_candidates,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import find_task_agent_session_binding
@@ -132,6 +143,7 @@ from openorc.services.task_detached_turn_correlation import (
 )
 
 __all__ = [
+    "DetachedTurnObservationRegistrar",
     "DetachedTurnObservationSourceError",
     "DetachedTurnObservationHost",
     "DetachedTurnObservationSource",
@@ -295,6 +307,46 @@ class SessionUsageConsultationSource(Protocol):
         self, *, connection_id: UUID, external_session_id: str
     ) -> SessionUsageReading:
         """Read one bounded cumulative usage consultation."""
+        ...
+
+
+class DetachedTurnObservationRegistrar(Protocol):
+    """The registration seam the detached dispatches gate their admission on.
+
+    The structural contract the Level 1 dispatch services duck-type
+    fail-closed (``register_session`` / ``register_establishment_session``):
+    the serving process's own :class:`DetachedTurnObservationHost` implements
+    it directly, and the queue-mode dispatch worker implements the same seam
+    over the private authenticated registration transport (issue #346) so its
+    pre-enqueue gate attests a live observation registration in the hosting
+    API/control-plane process. Both implementations raise the same typed
+    :class:`ObservationRegistrationRefusedError` refusal taxonomy; a refusal
+    is always a proven pre-effect condition and never degrades into an
+    unobserved admission.
+    """
+
+    def register_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Establish the positive observation of one established session."""
+        ...
+
+    def register_establishment_session(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        task_agent_session_id: UUID,
+        connection_id: UUID,
+        external_session_id: str,
+    ) -> None:
+        """Establish the positive observation of one initializing session."""
         ...
 
 
@@ -629,6 +681,97 @@ class DetachedTurnObservationHost:
                     receipt.expected_formal_family != OWNER_REVIEWER_DISCUSSION_FAMILY
                 ),
             )
+
+    def reconcile_durable_outstanding_sessions(self) -> None:
+        """Run the one bounded durable restart reconciliation (issue #346).
+
+        The queue-mode hosting composition invokes this once, after
+        ``start()``: the fresh process's empty registry would otherwise leave
+        every outstanding receipt unobserved until an unrelated registration
+        re-attached its connection. The reconciliation enumerates the durable
+        outstanding receipts (bounded by the host's own registry bound) and
+        re-proves each candidate through the existing registration gates —
+        never through a shortcut — so a candidate is never a proven identity:
+
+        - a READY/LOST binding's immutable external identity goes through
+          ``register_session`` (the gate re-proves the exact
+          Workspace/Connection/Task/session binding);
+        - a CONNECTING initialization session — deliberately carrying no
+          bound identity — goes through ``register_establishment_session``
+          with its outstanding initialization receipt's provisional
+          identity (the gate re-proves that receipt in the binding's own
+          Connection scope);
+        - a candidate with neither provable identity is skipped with a
+          contained warning: nothing is recreated, no session or run is
+          redispatched, and no identity is synthesized.
+
+        After a proven registration the same bounded status-only consultation
+        the reconnection policy uses applies to the now-observed session's
+        admitted receipt — where a completed status alone is never success
+        evidence and ambiguity stays honestly unresolved. Per-candidate
+        failures are contained and logged; the reconciliation never raises
+        past a refused candidate, never polls, and never creates workflow
+        work. Regular-mode hosting never invokes it: its accepted v1
+        restart limitation is unchanged.
+        """
+        self._require_running()
+        try:
+            candidates = list_outstanding_turn_observation_candidates(
+                self._pool_provider(), limit=_MAX_CONCURRENT_SESSION_OBSERVATIONS
+            )
+        except Exception as error:  # noqa: BLE001 - contained best-effort start-up reconciliation
+            logger.warning(
+                "detached-turn restart reconciliation could not enumerate the "
+                "durable outstanding receipts (%s); they stay honestly unobserved",
+                type(error).__name__,
+            )
+            return
+        for candidate in candidates:
+            try:
+                self._reconcile_candidate(candidate)
+            except ObservationRegistrationRefusedError as error:
+                logger.warning(
+                    "detached-turn restart reconciliation registration was refused "
+                    "(%s) for task session %s",
+                    error.reason,
+                    candidate.task_agent_session_id,
+                )
+            except Exception as error:  # noqa: BLE001 - per-candidate containment
+                logger.warning(
+                    "detached-turn restart reconciliation failed (%s) for task session %s",
+                    type(error).__name__,
+                    candidate.task_agent_session_id,
+                )
+
+    def _reconcile_candidate(self, candidate: OutstandingTurnObservationCandidate) -> None:
+        """Re-prove one durable candidate through its registration gate."""
+        if candidate.session_bound_external_session_id is not None:
+            self.register_session(
+                workspace_id=candidate.workspace_id,
+                task_id=candidate.task_id,
+                task_agent_session_id=candidate.task_agent_session_id,
+                connection_id=candidate.connection_id,
+                external_session_id=candidate.session_bound_external_session_id,
+            )
+        elif candidate.provisional_external_session_id is not None:
+            self.register_establishment_session(
+                workspace_id=candidate.workspace_id,
+                task_id=candidate.task_id,
+                task_agent_session_id=candidate.task_agent_session_id,
+                connection_id=candidate.connection_id,
+                external_session_id=candidate.provisional_external_session_id,
+            )
+        else:
+            logger.warning(
+                "detached-turn restart reconciliation skipped an outstanding receipt "
+                "with no provable external identity for task session %s",
+                candidate.task_agent_session_id,
+            )
+            return
+        with self._lock:
+            entry = self._sessions.get(candidate.task_agent_session_id)
+        if entry is not None and entry.observed:
+            self._reconcile_session_receipt(entry)
 
     def _register_proven_session(
         self,

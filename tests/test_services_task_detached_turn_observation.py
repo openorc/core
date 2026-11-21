@@ -1904,3 +1904,268 @@ def test_status_only_settlement_clears_only_the_matching_epoch(
 
     assert len(classify.calls) == 1
     assert _attest(observer) is TurnActivityAttestation.UNATTESTED
+
+
+# --- the bounded durable restart reconciliation (issue #346) ----------------------
+
+
+def _candidate_row(
+    receipt_id: UUID,
+    *,
+    task_agent_session_id: UUID,
+    operation: str,
+    created_external_session_id: str | None,
+    session_external_session_id: str | None,
+) -> tuple[Any, ...]:
+    """One scripted restart candidate: the receipt joined to its binding."""
+    return (
+        receipt_id,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        task_agent_session_id,
+        created_external_session_id,
+        operation,
+        _CONNECTION_ID,
+        session_external_session_id,
+    )
+
+
+def _script_restart_candidates(conn: ScriptedConnection, rows: list[tuple[Any, ...]]) -> None:
+    """Script the bounded outstanding-candidate enumeration query (issue #346).
+
+    Registered BEFORE the other receipt handlers: the candidates query is the
+    only one in these flows carrying the hard ``limit`` marker.
+    """
+    conn.on_repeat(_sql_has("from openorc.task_hub_run_receipts r", "limit %s"), rows)
+
+
+def _list_runs_calls(backend: FakeClineSdkBackend) -> list[Any]:
+    return [call for call in backend.calls() if call.operation == "list_runs"]
+
+
+def _admitted_establishment_receipt_row(
+    task_agent_session_id: UUID, external_session_id: str
+) -> tuple[Any, ...]:
+    return (
+        _RECEIPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        task_agent_session_id,
+        "session_initialization",
+        "planning_bootstrap_claim",
+        uuid4(),
+        "session_ready",
+        _RUN_ID,
+        TaskDetachedTurnReceiptStatus.ADMITTED.value,
+        {},
+        None,
+        _OBSERVED,
+        _OBSERVED,
+        None,
+        _OBSERVED,
+        external_session_id,
+        {"adapter": "cline", "configuration": {}},
+        None,
+        None,
+    )
+
+
+def test_restart_reconciliation_reproves_both_identity_shapes_through_the_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    connecting_session_id = uuid4()
+    _script_restart_candidates(
+        conn,
+        [
+            # A READY binding's receipt: the immutable bound identity.
+            _candidate_row(
+                _RECEIPT_ID,
+                task_agent_session_id=_SESSION_ID,
+                operation="implementation_execution",
+                created_external_session_id=None,
+                session_external_session_id=_EXTERNAL_SESSION,
+            ),
+            # A CONNECTING initialization receipt: no bound identity, the
+            # provisional one lives on the receipt alone.
+            _candidate_row(
+                uuid4(),
+                task_agent_session_id=connecting_session_id,
+                operation="session_initialization",
+                created_external_session_id="ext-init-9",
+                session_external_session_id=None,
+            ),
+        ],
+    )
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_establishment_receipts(
+        conn,
+        _EstablishmentReceiptRows(
+            rows={"ext-init-9": _establishment_receipt_row(connecting_session_id, "ext-init-9")}
+        ),
+    )
+    _script_outstanding_receipts(
+        conn,
+        _ReceiptRow(
+            rows={
+                _SESSION_ID: _admitted_receipt_row(),
+                connecting_session_id: _admitted_establishment_receipt_row(
+                    connecting_session_id, "ext-init-9"
+                ),
+            }
+        ),
+    )
+    backend = FakeClineSdkBackend()
+    classify = _ClassifyRecorder()
+    monkeypatch.setattr(
+        observation_module, "classify_acknowledged_turn_status", classify, raising=True
+    )
+    observer = _make_observer(conn, backends=[backend])
+
+    observer.reconcile_durable_outstanding_sessions()
+
+    # Both identity shapes were re-proven through their own gates and the
+    # exact sessions are actively observed again.
+    assert [call.session_id for call in _subscribe_calls(backend)] == [
+        _EXTERNAL_SESSION,
+        "ext-init-9",
+    ]
+    # Each re-observed session's admitted receipt got the bounded status-only
+    # consultation, and nothing was settled from it.
+    assert sorted(receipt_id for _w, _t, receipt_id, _e in classify.calls) == [
+        _RECEIPT_ID,
+        _RECEIPT_ID,
+    ]
+    assert [call.session_id for call in _list_runs_calls(backend)] == [
+        _EXTERNAL_SESSION,
+        "ext-init-9",
+    ]
+
+
+def test_restart_reconciliation_skips_receipts_with_no_provable_external_identity() -> None:
+    conn = ScriptedConnection()
+    _script_restart_candidates(
+        conn,
+        [
+            _candidate_row(
+                _RECEIPT_ID,
+                task_agent_session_id=_SESSION_ID,
+                operation="implementation_execution",
+                created_external_session_id=None,
+                session_external_session_id=None,
+            )
+        ],
+    )
+    backend = FakeClineSdkBackend()
+    observer = _make_observer(conn, backends=[backend])
+
+    observer.reconcile_durable_outstanding_sessions()
+
+    # The unprovable candidate was skipped: no subscription, no identity
+    # synthesized, nothing recreated or redispatched.
+    assert backend.calls() == ()
+
+
+def test_restart_reconciliation_contains_refused_candidates_and_keeps_going() -> None:
+    conn = ScriptedConnection()
+    refused_session_id = uuid4()
+    refused_connecting_id = uuid4()
+    _script_restart_candidates(
+        conn,
+        [
+            _candidate_row(
+                _RECEIPT_ID,
+                task_agent_session_id=refused_session_id,
+                operation="implementation_execution",
+                created_external_session_id=None,
+                session_external_session_id="ext-refused-1",
+            ),
+            _candidate_row(
+                uuid4(),
+                task_agent_session_id=refused_connecting_id,
+                operation="session_initialization",
+                created_external_session_id="ext-init-missing",
+                session_external_session_id=None,
+            ),
+            _candidate_row(
+                uuid4(),
+                task_agent_session_id=_SESSION_ID,
+                operation="implementation_execution",
+                created_external_session_id=None,
+                session_external_session_id=_EXTERNAL_SESSION,
+            ),
+        ],
+    )
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_establishment_receipts(
+        conn,
+        _EstablishmentReceiptRows(rows={}),  # the provisional identity resolves nothing
+    )
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    backend = FakeClineSdkBackend()
+    observer = _make_observer(conn, backends=[backend])
+
+    observer.reconcile_durable_outstanding_sessions()
+
+    # The refused candidates were contained and the later candidate was still
+    # proven and observed.
+    assert [call.session_id for call in _subscribe_calls(backend)] == [_EXTERNAL_SESSION]
+
+
+def test_restart_reconciliation_never_fabricates_success_from_a_completed_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = ScriptedConnection()
+    _script_restart_candidates(
+        conn,
+        [
+            _candidate_row(
+                _RECEIPT_ID,
+                task_agent_session_id=_SESSION_ID,
+                operation="implementation_execution",
+                created_external_session_id=None,
+                session_external_session_id=_EXTERNAL_SESSION,
+            )
+        ],
+    )
+    _script_bindings(conn, _BindingRow(rows={_EXTERNAL_SESSION: _binding_row()}))
+    _script_outstanding_receipts(conn, _ReceiptRow(rows={_SESSION_ID: _admitted_receipt_row()}))
+    # The seam's own receipt read for the real status classification.
+    conn.on(
+        _sql_has("from openorc.task_hub_run_receipts", "where id = %s"),
+        _admitted_receipt_row(),
+    )
+    backend = FakeClineSdkBackend()
+    backend.queue_list_runs(_EXTERNAL_SESSION, [{"runId": _RUN_ID, "state": "completed"}])
+    settle = _SettleRecorder(outcome_kind=TurnSettlementKind.SETTLED_VALIDATED_RESULT)
+    observer = _test_observer(monkeypatch, conn, backends=[backend], settle=settle)
+
+    observer.reconcile_durable_outstanding_sessions()
+
+    # The real seam classification of a completed status alone stays honestly
+    # unresolved: no settlement, no fabrication, and the observation is kept.
+    assert [call.session_id for call in _subscribe_calls(backend)] == [_EXTERNAL_SESSION]
+    assert settle.calls == []
+
+
+def test_reconciliation_requires_a_running_host() -> None:
+    conn = ScriptedConnection()
+    backend = FakeClineSdkBackend()
+    observer = DetachedTurnObservationHost(
+        lambda: _pool(conn),
+        observation_source=ClineHubTurnObservationSource(backend_factory=FakeClineSdkBackend),
+        runtime_credential_resolver=_fake_credential_resolver,
+        control_endpoint_resolver=resolve_connection_control_endpoint,
+    )
+
+    with pytest.raises(ObservationRegistrationRefusedError) as unavailable:
+        observer.reconcile_durable_outstanding_sessions()
+
+    assert unavailable.value.reason == ObservationRegistrationRefusalReason.OBSERVER_UNAVAILABLE
+    assert not conn.executed  # nothing was enumerated before the host ran
+    assert backend.calls() == ()
+
+    observer.start()
+    observer.dispose()
+    with pytest.raises(ObservationRegistrationRefusedError):
+        observer.reconcile_durable_outstanding_sessions()

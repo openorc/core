@@ -95,6 +95,7 @@ _SHARED_BOUNDARY_MODULES = (
     "src/openorc/services/task_pending_runtime_interactions.py",
     "src/openorc/services/task_authorized_implementation_execution.py",
     "src/openorc/workers/invocation.py",
+    "src/openorc/workers/queue_observer_registration.py",
     "src/openorc/workers/task_workflow.py",
 )
 

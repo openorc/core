@@ -69,6 +69,7 @@ __all__ = [
     "NativeTurnEvidence",
     "ObservationLease",
     "ObservedTurnEvidence",
+    "OutstandingTurnObservationCandidate",
     "OWNER_REVIEWER_DISCUSSION_FAMILY",
     "REFUSAL_OUTCOME_KIND_KEY",
     "SessionUsageReading",
@@ -90,6 +91,7 @@ __all__ = [
     "TurnStatusEvidenceVerdict",
     "TurnTerminalClassification",
     "TurnTerminalOutcome",
+    "outstanding_turn_observation_candidate_field_names",
     "task_detached_turn_early_completion_field_names",
     "task_detached_turn_receipt_field_names",
 ]
@@ -663,3 +665,60 @@ def task_detached_turn_receipt_field_names() -> frozenset[str]:
 def task_detached_turn_early_completion_field_names() -> frozenset[str]:
     """Return the exact field set a TaskDetachedTurnEarlyCompletion exposes."""
     return frozenset(field.name for field in fields(TaskDetachedTurnEarlyCompletion))
+
+
+@dataclass(frozen=True, slots=True)
+class OutstandingTurnObservationCandidate:
+    """One durable outstanding receipt's restart-reconciliation identity facts.
+
+    The bounded restart-reconciliation read (issue #346): an outstanding
+    (``claimed``/``admitted``) detached-turn receipt joined to its exact
+    authoritative ``task_agent_sessions`` binding — the join supplies the
+    Connection identity the receipts table deliberately does not carry, and
+    both external-identity shapes the two registration gates prove:
+
+    - ``session_bound_external_session_id`` is the binding's immutable
+      external identity (READY/LOST sessions) for the established-session
+      gate;
+    - ``provisional_external_session_id`` is the outstanding
+      ``session_initialization`` receipt's provisional
+      ``created_external_session_id`` (CONNECTING sessions carry no bound
+      identity by definition) for the establishment gate.
+
+    Candidates are facts to re-prove through the registration gates, never
+    proven identities: a candidate lacking any provable external identity is
+    skipped by the reconciling host without recreating or redispatching
+    anything.
+    """
+
+    receipt_id: UUID
+    workspace_id: UUID
+    task_id: UUID
+    task_agent_session_id: UUID
+    connection_id: UUID
+    session_bound_external_session_id: str | None
+    provisional_external_session_id: str | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "receipt_id",
+            "workspace_id",
+            "task_id",
+            "task_agent_session_id",
+            "connection_id",
+        ):
+            _require_uuid(getattr(self, name), name)
+        for name in (
+            "session_bound_external_session_id",
+            "provisional_external_session_id",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(
+                    f"OutstandingTurnObservationCandidate.{name} must be None or a non-empty string"
+                )
+
+
+def outstanding_turn_observation_candidate_field_names() -> frozenset[str]:
+    """Return the exact field set an OutstandingTurnObservationCandidate exposes."""
+    return frozenset(field.name for field in fields(OutstandingTurnObservationCandidate))

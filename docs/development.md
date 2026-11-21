@@ -39,7 +39,7 @@ uv is the dependency/build tool, not a runtime dependency: environments that rec
 `OPENORC_EXECUTION_MODE` selects where logical operations are delivered; both modes invoke the same shared application services, and Postgres remains the durable authority.
 
 - **`regular` (default):** the API process executes operations through one bounded local executor per serving process (`OPENORC_LOCAL_EXECUTOR_WORKERS`, default 2, minimum 1; `OPENORC_LOCAL_EXECUTOR_PENDING`, default 8, minimum 1 — both running and waiting work are bounded). No RQ worker and no queue backend are required, started, or contacted. The RQ worker refuses to start in regular mode.
-- **`queue` (opt-in):** operations are delivered through RQ/Valkey to independently deployed workers. This mode requires an explicitly supplied `VALKEY_URL` and fails configuration/startup without one; no implicit localhost backend is ever selected.
+- **`queue` (opt-in):** operations are delivered through RQ/Valkey to independently deployed workers. This mode requires an explicitly supplied `VALKEY_URL` and fails configuration/startup without one; no implicit localhost backend is ever selected. It additionally requires the detached-turn observation registration transport — `OPENORC_QUEUE_OBSERVER_REGISTRATION_URL` (the serving API/control-plane base URL hosting the one long-lived observer) and `OPENORC_QUEUE_OBSERVER_REGISTRATION_SECRET` (the deployment-level shared secret for its private authenticated handshake). The serving API process hosts the observation host, never an RQ workhorse; the v1 deployment assumption is one API instance per deployment.
 
 ### Runtime workspaces
 

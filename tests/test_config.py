@@ -30,6 +30,8 @@ from openorc.config import (
     LOCAL_EXECUTOR_PENDING_VAR,
     LOCAL_EXECUTOR_WORKERS_VAR,
     OTLP_ENDPOINT_VAR,
+    QUEUE_OBSERVER_REGISTRATION_SECRET_VAR,
+    QUEUE_OBSERVER_REGISTRATION_URL_VAR,
     VALKEY_URL_VAR,
     ConfigurationError,
     ExecutionMode,
@@ -149,7 +151,12 @@ def test_execution_mode_defaults_to_regular() -> None:
 
 def test_execution_mode_queue_is_accepted() -> None:
     settings = Settings.from_env(
-        {EXECUTION_MODE_VAR: "queue", VALKEY_URL_VAR: "redis://queue.example:6379/3"}
+        {
+            EXECUTION_MODE_VAR: "queue",
+            VALKEY_URL_VAR: "redis://queue.example:6379/3",
+            QUEUE_OBSERVER_REGISTRATION_URL_VAR: "http://control-plane.internal:3000",
+            QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: "deployment-registration-secret",
+        }
     )
 
     assert settings.execution_mode is ExecutionMode.QUEUE
@@ -158,7 +165,12 @@ def test_execution_mode_queue_is_accepted() -> None:
 
 def test_execution_mode_is_case_and_whitespace_tolerant() -> None:
     settings = Settings.from_env(
-        {EXECUTION_MODE_VAR: "  Queue ", VALKEY_URL_VAR: "redis://queue.example:6379/3"}
+        {
+            EXECUTION_MODE_VAR: "  Queue ",
+            VALKEY_URL_VAR: "redis://queue.example:6379/3",
+            QUEUE_OBSERVER_REGISTRATION_URL_VAR: "http://control-plane.internal:3000",
+            QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: "deployment-registration-secret",
+        }
     )
 
     assert settings.execution_mode is ExecutionMode.QUEUE
@@ -633,3 +645,90 @@ def test_sweep_partitions_override_from_the_environment() -> None:
 def test_malformed_sweep_partitions_are_rejected(raw: str) -> None:
     with pytest.raises(ConfigurationError, match="OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"):
         Settings.from_env({GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR: raw})
+
+
+_QUEUE_REGISTRATION_ENV = {
+    QUEUE_OBSERVER_REGISTRATION_URL_VAR: "http://control-plane.internal:3000",
+    QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: "deployment-registration-secret",
+}
+
+
+def test_queue_mode_requires_the_observer_registration_url() -> None:
+    with pytest.raises(ConfigurationError, match=QUEUE_OBSERVER_REGISTRATION_URL_VAR):
+        Settings.from_env({EXECUTION_MODE_VAR: "queue", VALKEY_URL_VAR: "redis://127.0.0.1:6379/9"})
+
+
+def test_queue_mode_requires_the_observer_registration_secret() -> None:
+    with pytest.raises(ConfigurationError, match=QUEUE_OBSERVER_REGISTRATION_SECRET_VAR):
+        Settings.from_env(
+            {
+                EXECUTION_MODE_VAR: "queue",
+                VALKEY_URL_VAR: "redis://127.0.0.1:6379/9",
+                QUEUE_OBSERVER_REGISTRATION_URL_VAR: "http://control-plane.internal:3000",
+            }
+        )
+
+
+def test_queue_mode_rejects_a_blank_observer_registration_secret() -> None:
+    with pytest.raises(ConfigurationError, match=QUEUE_OBSERVER_REGISTRATION_SECRET_VAR):
+        Settings.from_env(
+            {
+                EXECUTION_MODE_VAR: "queue",
+                VALKEY_URL_VAR: "redis://127.0.0.1:6379/9",
+                **_QUEUE_REGISTRATION_ENV,
+                QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: "   ",
+            }
+        )
+
+
+@pytest.mark.parametrize("raw", ["ftp://control-plane.internal", "not-a-url", "http://"])
+def test_queue_mode_rejects_a_malformed_observer_registration_url(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match=QUEUE_OBSERVER_REGISTRATION_URL_VAR):
+        Settings.from_env(
+            {
+                EXECUTION_MODE_VAR: "queue",
+                VALKEY_URL_VAR: "redis://127.0.0.1:6379/9",
+                QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: "deployment-registration-secret",
+                QUEUE_OBSERVER_REGISTRATION_URL_VAR: raw,
+            }
+        )
+
+
+def test_queue_mode_accepts_the_complete_observer_registration_configuration() -> None:
+    settings = Settings.from_env(
+        {
+            EXECUTION_MODE_VAR: "queue",
+            VALKEY_URL_VAR: "redis://127.0.0.1:6379/9",
+            **_QUEUE_REGISTRATION_ENV,
+        }
+    )
+
+    assert settings.execution_mode is ExecutionMode.QUEUE
+    assert settings.queue_observer_registration_url == "http://control-plane.internal:3000"
+    assert settings.queue_observer_registration_secret == "deployment-registration-secret"
+
+
+def test_regular_mode_requires_no_observer_registration_configuration() -> None:
+    settings = Settings.from_env({EXECUTION_MODE_VAR: "regular"})
+
+    assert settings.execution_mode is ExecutionMode.REGULAR
+    assert settings.queue_observer_registration_url is None
+    assert settings.queue_observer_registration_secret is None
+
+
+def test_the_observer_registration_secret_never_appears_in_settings_representation() -> None:
+    raw_secret = "deployment-registration-repr-leak-probe"
+    settings = Settings.from_env(
+        {
+            EXECUTION_MODE_VAR: "queue",
+            VALKEY_URL_VAR: "redis://127.0.0.1:6379/9",
+            QUEUE_OBSERVER_REGISTRATION_URL_VAR: "http://control-plane.internal:3000",
+            QUEUE_OBSERVER_REGISTRATION_SECRET_VAR: raw_secret,
+        }
+    )
+
+    # The generated dataclass repr/str must never carry the raw credential.
+    assert raw_secret not in repr(settings)
+    assert raw_secret not in str(settings)
+    # The representation stays useful for the non-secret transport field.
+    assert "http://control-plane.internal:3000" in repr(settings)
