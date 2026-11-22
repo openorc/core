@@ -1,4 +1,4 @@
-"""Deterministic tests for Task start, structural capacity, and FIFO admission (issue #76).
+"""Deterministic tests for queue-first Task start and FIFO admission (issues #76/#257).
 
 A scripted SQL-connection seam plus a scripted GitHub adapter seam prove the
 start contract on its critical path:
@@ -10,21 +10,26 @@ start contract on its critical path:
   advisory lock before its locked re-read;
 - no database transaction open across any external GitHub call (the fake
   pool tracks checked-out connections);
+- the queue-only Start: a successful start ONLY durably queues — with free
+  capacity or not — freezing the fresh fingerprint and the original Task
+  budget in the SAME guarded ``queued`` write, arranging exactly one
+  post-commit Task-queue wake, and never reserving sessions or claiming
+  ``planning`` itself;
 - the typed non-start conditions: already-planning, queued, a durable projection
   fingerprint, identity loss, blocked/closed issue — each fails closed
   WITHOUT a queue write and, for the precheck conditions, without any
   GitHub call;
 - structural feasibility from the complete required multiset: an impossible
   configuration is an actionable error, never a queue state;
-- temporary capacity occupation durably queues the Task with no
-  reservations;
-- the bounded FIFO establishment pass advances admissible older candidates
-  (OPENORC actor claims) before the target decides, examines every page,
-  and conservatively defers on budget exhaustion;
+- the ONE bounded FIFO processor admits admissible candidates in durable
+  ``(queued_at, id)`` order with the Workspace's durable Owner as the
+  barrier, exposes each admitted candidate's exact post-claim facts, stops
+  at its candidate budget with the keyset continuation cursor, and surfaces
+  per-candidate conditions without stalling followers;
 - the durable projection-based eligibility guard never advances a
   known-changed queued candidate and makes no GitHub call;
-- the sweep re-evaluation uses the Workspace's durable Owner and surfaces
-  per-candidate conditions without stalling.
+- the bounded restart/recovery classifier positively proves the unclaimed
+  F1 bootstrap handoff and never replays a claimed one.
 
 Durable concurrency semantics are proven by the integration-marked suite
 against a real Postgres. No live GitHub or Postgres access.
@@ -45,12 +50,12 @@ from openorc.adapters.github import (
     GitHubRelatedIssueObservation,
     GitHubRepositoryObservation,
 )
-from openorc.domain.connections import WorkflowRole
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_start
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 from openorc.services.task_intake import IssueBlockedEligibilityError
+from openorc.services.task_queue_wake import TaskQueueWakeSubmissionOutcome
 from openorc.services.task_start import (
     QueuedCandidateDisposition,
     TaskAlreadyPlanningError,
@@ -58,9 +63,8 @@ from openorc.services.task_start import (
     TaskEligibilityContradictedError,
     TaskEligibilityFailure,
     TaskSourceIdentityLossError,
-    TaskStartQueueReason,
     TaskStartStateConflictError,
-    TaskStartStatus,
+    find_unclaimed_bootstrap_handoff,
     reevaluate_queued_tasks,
     start_task_for_owner,
 )
@@ -82,6 +86,20 @@ _CONNECTION_ID = uuid.uuid4()
 
 _CannedResult = tuple[Any, ...] | list[tuple[Any, ...]] | None | Exception
 _Predicate = Callable[[str, tuple[Any, ...] | None], bool]
+
+
+class FakeQueueWake:
+    """Recording Task-queue wake seam fake (issue #257)."""
+
+    def __init__(self, outcome: TaskQueueWakeSubmissionOutcome | Exception) -> None:
+        self._outcome = outcome
+        self.workspaces: list[Any] = []
+
+    def submit(self, *, workspace_id: Any) -> TaskQueueWakeSubmissionOutcome:
+        self.workspaces.append(workspace_id)
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
 
 
 class FakeCursor:
@@ -617,26 +635,32 @@ def test_malformed_commands_fail_before_any_database_or_github_effect() -> None:
     assert github.calls == []
 
 
-def test_owner_start_claims_planning_with_both_reservations_and_one_owner_event() -> None:
+def test_owner_start_only_queues_and_arranges_the_post_commit_wake() -> None:
     conn = ScriptedConnection()
     pool = FakePool(conn)
     github = FakeGitHubAppClient(pool=pool)
-    producer_row = _session_row("producer")
-    reviewer_row = _session_row("reviewer")
-    _script_success_start(
-        conn, capacity=2, occupancy=[], producer_session=producer_row, reviewer_session=reviewer_row
-    )
+    wake = FakeQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+    _script_success_start(conn, capacity=2, occupancy=[])
     _queue_page(conn, [])
 
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs(), queue_wake=wake)
 
-    assert outcome.status is TaskStartStatus.PLANNING
-    assert outcome.queue_reason is None
-    assert outcome.task.status is TaskStatus.PLANNING
-    assert outcome.task.queued_at is None
-    assert set(outcome.sessions) == {WorkflowRole.PRODUCER, WorkflowRole.REVIEWER}
-    assert outcome.sessions[WorkflowRole.PRODUCER].id == producer_row[0]
-    assert outcome.sessions[WorkflowRole.REVIEWER].id == reviewer_row[0]
+    # The queue-only Start (issue #257): even with free capacity the start
+    # ONLY durably queues — no reservations, no synchronous planning claim,
+    # and no bootstrap submission from Start.
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert outcome.task.queued_at is not None
+    assert outcome.task.state_token != _STATE_TOKEN
+    assert outcome.task.source_requirements_fingerprint == _FINGERPRINT
+    _assert_no_session_reservations(conn)
+    assert not any("insert into openorc.workflow_events" in sql for sql, _ in conn.executed)
+    assert not any(
+        "update openorc.tasks" in sql and params is not None and params[0] == "planning"
+        for sql, params in conn.executed
+    )
+    # Exactly one post-commit wake invitation for the started Task's
+    # Workspace, arranged strictly after the arbitration transaction.
+    assert wake.workspaces == [_WORKSPACE_ID]
 
     # Phase A: the account-operational barrier is the FIRST statement, and
     # the exact ownership reads follow before the subject load.
@@ -654,32 +678,20 @@ def test_owner_start_claims_planning_with_both_reservations_and_one_owner_event(
         if "for update" in sql and "openorc.tasks" in sql
     )
     assert lock_index < re_read_index
-    # The claim is one logical fact: the planning write and exactly one
-    # planning_started event carry the OWNER actor.
-    planning_updates = [
+    # The queue entry is one guarded write: the fresh fingerprint and the
+    # then-current Workspace budget freeze in the SAME statement (capture
+    # parameter position 1), and the DB-clock CASE stamps queued_at exactly
+    # once on entering queued.
+    queued_updates = [
         (sql, params)
         for sql, params in conn.executed
-        if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
+        if "update openorc.tasks" in sql and params is not None and params[0] == "queued"
     ]
-    assert len(planning_updates) == 1
-    owner_events = [
-        params
-        for sql, params in conn.executed
-        if "insert into openorc.workflow_events" in sql
-        and params is not None
-        and params[3] == "owner"
-    ]
-    assert len(owner_events) == 1
-    assert owner_events[0][:7] == (
-        _WORKSPACE_ID,
-        _TASK_ID,
-        "planning_started",
-        "owner",
-        str(_OWNER_PROFILE_ID),
-        None,
-        None,
-    )
-    assert getattr(owner_events[0][7], "obj", owner_events[0][7]) == {}
+    assert len(queued_updates) == 1
+    assert queued_updates[0][1][1] == _FINGERPRINT
+    assert "coalesce(source_requirements_fingerprint" in queued_updates[0][0]
+    assert "coalesce(authorized_task_budget_usd" in queued_updates[0][0]
+    assert "when %s = 'queued' and status <> 'queued' then now()" in queued_updates[0][0]
     # Phase A closed before external I/O: every GitHub call saw zero checked
     # out pool connections.
     assert github.active_connections_during_calls == [0] * len(github.calls)
@@ -690,6 +702,56 @@ def test_owner_start_claims_planning_with_both_reservations_and_one_owner_event(
         "blocked_by",
         "resolve_related_endpoints",
     ]
+
+
+@pytest.mark.parametrize(
+    "wake_outcome",
+    [
+        TaskQueueWakeSubmissionOutcome.KNOWN_REFUSED,
+        TaskQueueWakeSubmissionOutcome.UNCERTAIN,
+    ],
+)
+def test_a_refused_or_uncertain_start_wake_never_fails_the_committed_queue_entry(
+    wake_outcome: TaskQueueWakeSubmissionOutcome,
+) -> None:
+    conn = ScriptedConnection()
+    github = FakeGitHubAppClient()
+    wake = FakeQueueWake(wake_outcome)
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs(), queue_wake=wake)
+
+    # The wake outcome is transport information only: the durable queued
+    # entry stands and no retry, poll, or reversal happens.
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert wake.workspaces == [_WORKSPACE_ID]
+    _assert_no_session_reservations(conn)
+
+
+def test_an_unwired_start_seam_arranges_nothing_and_the_queue_entry_still_stands() -> None:
+    conn = ScriptedConnection()
+    github = FakeGitHubAppClient()
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert outcome.task.queued_at is not None
+
+
+def test_a_failing_start_wake_seam_is_contained_as_an_uncertain_invitation() -> None:
+    conn = ScriptedConnection()
+    github = FakeGitHubAppClient()
+    wake = FakeQueueWake(RuntimeError("transport down"))
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs(), queue_wake=wake)
+
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert wake.workspaces == [_WORKSPACE_ID]
 
 
 @pytest.mark.parametrize(
@@ -771,18 +833,18 @@ def test_requirements_edited_since_intake_start_and_freeze_the_fresh_fingerprint
 
     outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
 
-    assert outcome.status is TaskStartStatus.PLANNING
+    assert outcome.task.status is TaskStatus.QUEUED
     # The frozen baseline is the freshly reconciled fingerprint, captured in
-    # the SAME guarded statement as the planning claim (capture parameter
+    # the SAME guarded statement as the queue entry (capture parameter
     # position 1; the coalesce can never rewrite an existing baseline).
-    planning_updates = [
+    queued_updates = [
         (sql, params)
         for sql, params in conn.executed
-        if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
+        if "update openorc.tasks" in sql and params is not None and params[0] == "queued"
     ]
-    assert len(planning_updates) == 1
-    assert planning_updates[0][1][1] == "b" * 64
-    assert "coalesce(source_requirements_fingerprint" in planning_updates[0][0]
+    assert len(queued_updates) == 1
+    assert queued_updates[0][1][1] == "b" * 64
+    assert "coalesce(source_requirements_fingerprint" in queued_updates[0][0]
 
 
 def test_a_stale_durable_projection_refuses_the_start_without_freezing_a_baseline() -> None:
@@ -918,11 +980,8 @@ def test_temporarily_occupied_capacity_queues_without_reservations() -> None:
 
     outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
 
-    assert outcome.status is TaskStartStatus.QUEUED
-    assert outcome.queue_reason is TaskStartQueueReason.AWAITING_CAPACITY
     assert outcome.task.status is TaskStatus.QUEUED
     assert outcome.task.queued_at is not None
-    assert outcome.sessions == {}
     # Queued with no reservations, and the queue entry write carried the
     # DB-clock CASE (the entering-queued branch).
     queued_updates = [
@@ -936,9 +995,8 @@ def test_temporarily_occupied_capacity_queues_without_reservations() -> None:
     assert not any("insert into openorc.workflow_events" in sql for sql, _ in conn.executed)
 
 
-def test_distinct_capacity_one_connections_admit_together() -> None:
+def test_distinct_capacity_one_connections_admit_together_through_the_processor() -> None:
     conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
     first_connection, second_connection = sorted((uuid.uuid4(), uuid.uuid4()))
     conn.on_repeat(
         _sql_has("openorc.connections", "for update"),
@@ -955,18 +1013,45 @@ def test_distinct_capacity_one_connections_admit_together() -> None:
         _role_is("reviewer")(_sql_has("workflow_role_bindings")),
         _binding_row("reviewer", first_connection),
     )
-    producer_row = _session_row("producer", second_connection)
-    reviewer_row = _session_row("reviewer", first_connection)
-    _script_success_start(
-        conn, occupancy=[], producer_session=producer_row, reviewer_session=reviewer_row
+    producer_row = _session_row("producer", second_connection, task_id=_CANDIDATE_ID)
+    reviewer_row = _session_row("reviewer", first_connection, task_id=_CANDIDATE_ID)
+    _script_baseline(conn)
+    _script_task_reads(conn, task_id=_TASK_ID, row=_task_row())
+    _script_task_reads(conn, task_id=_CANDIDATE_ID, row=_candidate_row())
+    _script_task_update(
+        conn,
+        task_id=_CANDIDATE_ID,
+        status_value="planning",
+        row=_task_row(
+            task_id=_CANDIDATE_ID,
+            status="planning",
+            state_token=_CANDIDATE_POST_CLAIM_TOKEN,
+            queued_at=None,
+            fingerprint=_FINGERPRINT,
+        ),
     )
+    _script_session_reads(conn, task_id=_CANDIDATE_ID)
+    _script_session_inserts(conn, producer=producer_row, reviewer=reviewer_row)
+    conn.on_repeat(_sql_has("select connection_id, count(*)"), [])
+    _script_events(conn)
+    conn.on_repeat(_sql_has("insert into openorc.workflow_events"), _event_row("github", None))
+    _queue_page(conn, [_candidate_row()])
     _queue_page(conn, [])
 
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+    outcome = reevaluate_queued_tasks(_pool(conn), workspace_id=_WORKSPACE_ID)
 
-    assert outcome.status is TaskStartStatus.PLANNING
-    assert outcome.sessions[WorkflowRole.PRODUCER].connection_id == second_connection
-    assert outcome.sessions[WorkflowRole.REVIEWER].connection_id == first_connection
+    # The FIFO processor admits both distinct capacity-1 Connections
+    # together, and the admitted outcome carries the exact post-claim facts
+    # the next F1 handoff addresses (issue #257).
+    assert outcome.exhausted is True
+    (admitted,) = outcome.outcomes
+    assert admitted.disposition is QueuedCandidateDisposition.ADMITTED
+    assert admitted.task_id == _CANDIDATE_ID
+    assert admitted.owner_profile_id == _OWNER_PROFILE_ID
+    assert admitted.admitted_task is not None
+    assert admitted.admitted_task.status is TaskStatus.PLANNING
+    assert admitted.admitted_task.state_token == _CANDIDATE_POST_CLAIM_TOKEN
+    assert admitted.admitted_task.queued_at is None
     lock_sql, lock_params = next(
         (sql, params)
         for sql, params in conn.executed
@@ -979,6 +1064,7 @@ def test_distinct_capacity_one_connections_admit_together() -> None:
 
 _CANDIDATE_ID = uuid.uuid4()
 _CANDIDATE_TOKEN = uuid.uuid4()
+_CANDIDATE_POST_CLAIM_TOKEN = uuid.uuid4()
 _CANDIDATE_QUEUED_AT = datetime(2026, 10, 18, 11, 0, 0, tzinfo=UTC)
 
 
@@ -1003,7 +1089,11 @@ def _script_candidate_claim(conn: ScriptedConnection, *, task_id: Any) -> None:
         task_id=task_id,
         status_value="planning",
         row=_task_row(
-            task_id=task_id, status="planning", state_token=uuid.uuid4(), fingerprint=_FINGERPRINT
+            task_id=task_id,
+            status="planning",
+            state_token=_CANDIDATE_POST_CLAIM_TOKEN,
+            queued_at=None,
+            fingerprint=_FINGERPRINT,
         ),
     )
     _script_session_reads(conn, task_id=task_id)
@@ -1014,169 +1104,79 @@ def _script_candidate_claim(conn: ScriptedConnection, *, task_id: Any) -> None:
     )
 
 
-def test_establishment_pass_advances_the_older_candidate_before_the_target() -> None:
-    conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
-    _script_success_start(conn)
-    _script_candidate_claim(conn, task_id=_CANDIDATE_ID)
-    _queue_page(conn, [_candidate_row()])
-    _queue_page(conn, [])
-
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
-
-    # The older queued candidate was advanced FIRST (FIFO), then the target
-    # claimed the remaining capacity.
-    assert outcome.status is TaskStartStatus.PLANNING
-    candidate_update_index = next(
-        index
-        for index, (sql, params) in enumerate(conn.executed)
-        if "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
-    )
-    target_update_index = next(
-        index
-        for index, (sql, params) in enumerate(conn.executed)
-        if "update openorc.tasks" in sql
-        and params is not None
-        and params[5] == _TASK_ID
-        and params[0] == "planning"
-    )
-    assert candidate_update_index < target_update_index
-    # The advanced candidate's claim carries the OPENORC system actor; the
-    # explicitly started Task carries the OWNER actor.
-    openorc_events = [
-        params
-        for sql, params in conn.executed
-        if "insert into openorc.workflow_events" in sql
-        and params is not None
-        and params[3] == "openorc"
-    ]
-    assert len(openorc_events) == 1
-    assert openorc_events[0][1] == _CANDIDATE_ID
-    owner_events = [
-        params
-        for sql, params in conn.executed
-        if "insert into openorc.workflow_events" in sql
-        and params is not None
-        and params[3] == "owner"
-    ]
-    assert owner_events[0][1] == _TASK_ID
-
-
-def test_establishment_pass_consuming_capacity_queues_the_target() -> None:
-    conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
-    # The candidate's admission consumes the connection's free slots; the
-    # target's subsequent admission decision observes the new occupancy.
-    conn.on(_sql_has("select connection_id, count(*)"), [])
-    conn.on(_sql_has("select connection_id, count(*)"), [(_CONNECTION_ID, 2)])
-    _script_success_start(conn)
-    _script_candidate_claim(conn, task_id=_CANDIDATE_ID)
-    _queue_page(conn, [_candidate_row()])
-    _queue_page(conn, [])
-
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
-
-    assert outcome.status is TaskStartStatus.QUEUED
-    assert outcome.queue_reason is TaskStartQueueReason.AWAITING_CAPACITY
-    assert outcome.task.status is TaskStatus.QUEUED
-    # The advanced candidate is not rolled back: its claim stands ahead of
-    # the target in FIFO order.
-    assert any(
-        "update openorc.tasks" in sql
-        and params is not None
-        and params[5] == _CANDIDATE_ID
-        and params[0] == "planning"
-        for sql, params in conn.executed
-    )
-
-
-def test_multi_page_queue_is_fully_examined_before_the_target_decides(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(task_start, "_QUEUE_PAGE_LIMIT", 1)
-    conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
-    candidate_b_id = uuid.uuid4()
-    _script_success_start(conn)
-    _script_candidate_claim(conn, task_id=_CANDIDATE_ID)
-    _script_candidate_claim(conn, task_id=candidate_b_id)
-    _queue_page(conn, [_candidate_row()])
-    _queue_page(conn, [_candidate_row(task_id=candidate_b_id)])
-    _queue_page(conn, [])
-
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
-
-    assert outcome.status is TaskStartStatus.PLANNING
-    # Every queued candidate across pages was claimed before the target.
-    planning_targets = [
-        params[5]
-        for sql, params in conn.executed
-        if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
-    ]
-    assert planning_targets == [_CANDIDATE_ID, candidate_b_id, _TASK_ID]
-
-
-def test_budget_exhaustion_defers_the_target_conservatively(
+def test_budget_bounded_sweep_reports_the_continuation_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(task_start, "_ARBITRATION_CANDIDATE_BUDGET", 1)
     conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
-    _script_success_start(conn)
+    follower_id = uuid.uuid4()
+    _script_baseline(conn)
+    _script_task_reads(conn, task_id=_TASK_ID, row=_task_row())
     _script_candidate_claim(conn, task_id=_CANDIDATE_ID)
-    _queue_page(conn, [_candidate_row(), _candidate_row(task_id=uuid.uuid4())])
-    _queue_page(conn, [])
+    conn.on_repeat(_sql_has("select connection_id, count(*)"), [])
+    _script_events(conn)
+    conn.on_repeat(_sql_has("insert into openorc.workflow_events"), _event_row("github", None))
+    _queue_page(conn, [_candidate_row(), _candidate_row(task_id=follower_id)])
 
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+    outcome = reevaluate_queued_tasks(_pool(conn), workspace_id=_WORKSPACE_ID)
 
-    # The budget bounded the scan after the first candidate: the target
-    # durably queues with the observable deferral reason instead of
-    # claiming on unexamined candidates.
-    assert outcome.status is TaskStartStatus.QUEUED
-    assert outcome.queue_reason is TaskStartQueueReason.ARBITRATION_DEFERRED
-    planning_updates = [
-        params[5]
-        for sql, params in conn.executed
-        if "update openorc.tasks" in sql and params is not None and params[0] == "planning"
-    ]
-    assert planning_updates == [_CANDIDATE_ID]
+    # The candidate budget bounded the sweep after the first candidate: the
+    # unexamined tail stays queued in FIFO order and the outcome exposes the
+    # keyset continuation cursor past the examined candidate — a paging hint
+    # the wake caller arranges bounded continuation after (issue #257).
+    assert outcome.exhausted is False
+    assert [entry.task_id for entry in outcome.outcomes] == [_CANDIDATE_ID]
+    assert outcome.continuation_cursor == (_CANDIDATE_QUEUED_AT, _CANDIDATE_ID)
 
 
-def test_durable_projection_contradiction_never_advances_the_candidate() -> None:
+def test_continuation_cursor_resumes_the_sweep_through_the_unexamined_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(task_start, "_ARBITRATION_CANDIDATE_BUDGET", 1)
     conn = ScriptedConnection()
-    github = FakeGitHubAppClient()
-    # Target's guard first (open), then the candidate's guard observes the
-    # durable mirror reporting the issue closed. Consumables register before
-    # the repeating baseline takes over for any later read.
+    follower_id = uuid.uuid4()
+    _script_baseline(conn)
+    _script_task_reads(conn, task_id=_TASK_ID, row=_task_row())
+    _script_candidate_claim(conn, task_id=follower_id)
+    conn.on_repeat(_sql_has("select connection_id, count(*)"), [])
+    _script_events(conn)
+    conn.on_repeat(_sql_has("insert into openorc.workflow_events"), _event_row("github", None))
+    # The resumed scan reads strictly after the prior sweep's cursor: only
+    # the unexamined follower is on the first resumed page, then the queue
+    # is exhausted.
     conn.on(
-        _sql_lacks(_sql_has("from openorc.github_issues"), "for update", "update openorc"),
-        _issue_projection_row(),
+        _sql_has("status = 'queued'", "(queued_at, id) >"),
+        [_candidate_row(task_id=follower_id)],
     )
-    conn.on(
-        _sql_lacks(_sql_has("from openorc.github_issues"), "for update", "update openorc"),
-        _issue_projection_row(state="closed"),
-    )
-    _script_success_start(conn)
-    _script_task_reads(conn, task_id=_CANDIDATE_ID, row=_candidate_row())
-    _queue_page(conn, [_candidate_row()])
-    _queue_page(conn, [])
+    conn.on_repeat(_sql_has("status = 'queued'", "(queued_at, id) >"), [])
 
-    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
-
-    assert outcome.status is TaskStartStatus.PLANNING
-    assert any(
-        "update openorc.tasks" in sql
-        and params is not None
-        and params[5] == _TASK_ID
-        and params[0] == "planning"
-        for sql, params in conn.executed
+    outcome = reevaluate_queued_tasks(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        after_queued_at=_CANDIDATE_QUEUED_AT,
+        after_task_id=_CANDIDATE_ID,
     )
-    # The contradicted candidate was never claimed and stayed queued with
-    # its original entry timestamp.
+
+    # The bounded continuation reaches the unexamined tail instead of
+    # revisiting the examined prefix, and the resumed sweep exhausts.
+    assert outcome.exhausted is True
+    assert [entry.task_id for entry in outcome.outcomes] == [follower_id]
+    assert outcome.continuation_cursor is None
     assert not any(
         "update openorc.tasks" in sql and params is not None and params[5] == _CANDIDATE_ID
         for sql, params in conn.executed
     )
+
+
+def test_a_partial_continuation_cursor_is_invalid_before_any_effect() -> None:
+    conn = ScriptedConnection()
+
+    with pytest.raises(InvalidCommandError):
+        reevaluate_queued_tasks(
+            _pool(conn), workspace_id=_WORKSPACE_ID, after_queued_at=_CANDIDATE_QUEUED_AT
+        )
+
+    assert conn.executed == []
 
 
 def test_target_eligibility_contradiction_comes_from_the_mirror_only() -> None:
@@ -1218,6 +1218,16 @@ def test_sweep_advances_candidates_with_the_workspace_owner_as_the_barrier() -> 
     assert [entry.disposition for entry in outcome.outcomes] == [
         QueuedCandidateDisposition.ADMITTED
     ]
+    # The admitted outcome carries the exact post-claim facts the next F1
+    # handoff addresses — never an ADMITTED marker alone (issue #257).
+    (admitted,) = outcome.outcomes
+    assert admitted.task_id == _CANDIDATE_ID
+    assert admitted.owner_profile_id == _OWNER_PROFILE_ID
+    assert admitted.admitted_task is not None
+    assert admitted.admitted_task.status is TaskStatus.PLANNING
+    assert admitted.admitted_task.state_token == _CANDIDATE_POST_CLAIM_TOKEN
+    assert admitted.admitted_task.queued_at is None
+    assert outcome.continuation_cursor is None
     # The system invocation composes the account barrier for the Workspace's
     # durable Owner and claims with the OPENORC actor.
     barrier_params = [
@@ -1426,3 +1436,124 @@ def test_missing_role_binding_is_a_candidate_conflict_that_never_stalls_follower
         and params[0] == "planning"
         for sql, params in conn.executed
     )
+
+
+def _planning_row(*, task_id: Any = _TASK_ID, state_token: Any = _STATE_TOKEN) -> tuple[Any, ...]:
+    return _task_row(
+        task_id=task_id, status="planning", state_token=state_token, fingerprint=_FINGERPRINT
+    )
+
+
+def _script_claim_read(conn: ScriptedConnection, *, task_id: Any, claim: Any) -> None:
+    """Script the focused one-shot bootstrap-claim read for one subject."""
+
+    def predicate(sql: str, params: tuple[Any, ...] | None) -> bool:
+        return (
+            "planning_bootstrap_claim_token" in sql and "update" not in sql and params == (task_id,)
+        )
+
+    conn.on_repeat(predicate, claim)
+
+
+def test_recovery_classifier_proves_the_unclaimed_bootstrap_handoff() -> None:
+    conn = ScriptedConnection()
+    _script_claim_read(conn, task_id=_TASK_ID, claim=None)
+    _script_task_reads(conn, task_id=_TASK_ID, row=_planning_row())
+
+    recovered = find_unclaimed_bootstrap_handoff(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    # A current planning Task with its E1b one-shot claim still NULL
+    # positively proves the F1 bootstrap handoff was never consumed (the
+    # claim is the bootstrap's first durable effect, issue #203): the
+    # recovery may arrange exactly one current-token handoff.
+    assert recovered is not None
+    assert recovered.id == _TASK_ID
+    assert recovered.status is TaskStatus.PLANNING
+    assert recovered.state_token == _STATE_TOKEN
+
+
+def test_a_claimed_bootstrap_is_never_a_recovery_candidate() -> None:
+    conn = ScriptedConnection()
+    _script_claim_read(conn, task_id=_TASK_ID, claim=(uuid.uuid4(),))
+    _script_task_reads(conn, task_id=_TASK_ID, row=_planning_row())
+
+    recovered = find_unclaimed_bootstrap_handoff(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    # A present claim means a bootstrap was durably claimed exactly once —
+    # every consumed effect routes to the existing detached correlation and
+    # Level 1/2/3 machinery, never to this recovery.
+    assert recovered is None
+
+
+def test_a_non_planning_subject_is_never_a_recovery_candidate() -> None:
+    conn = ScriptedConnection()
+    _script_claim_read(conn, task_id=_TASK_ID, claim=None)
+    _script_task_reads(
+        conn,
+        task_id=_TASK_ID,
+        row=_task_row(status="queued", queued_at=_OBSERVED, fingerprint=_FINGERPRINT),
+    )
+
+    recovered = find_unclaimed_bootstrap_handoff(
+        _pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+    )
+
+    assert recovered is None
+
+
+def test_a_foreign_or_missing_subject_is_never_a_recovery_candidate() -> None:
+    conn = ScriptedConnection()
+    _script_task_reads(
+        conn,
+        task_id=_TASK_ID,
+        row=task_row(
+            id=_TASK_ID,
+            workspace_id=uuid.uuid4(),
+            repository_id=_REPOSITORY_ID,
+            github_issue_id=_GITHUB_ISSUE_ID,
+            github_issue_number=_ISSUE_NUMBER,
+            status="planning",
+            state_token=_STATE_TOKEN,
+            source_requirements_fingerprint=_FINGERPRINT,
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+    )
+
+    assert (
+        find_unclaimed_bootstrap_handoff(_pool(conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID)
+        is None
+    )
+
+    missing_conn = ScriptedConnection()
+    _script_task_reads(missing_conn, task_id=_TASK_ID, row=cast(Any, None))
+    assert (
+        find_unclaimed_bootstrap_handoff(
+            _pool(missing_conn), workspace_id=_WORKSPACE_ID, task_id=_TASK_ID
+        )
+        is None
+    )
+
+
+def test_a_malformed_recovery_command_is_invalid_before_any_effect() -> None:
+    conn = ScriptedConnection()
+
+    with pytest.raises(InvalidCommandError):
+        find_unclaimed_bootstrap_handoff(
+            _pool(conn),
+            workspace_id=_WORKSPACE_ID,
+            task_id="not-a-uuid",  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(InvalidCommandError):
+        find_unclaimed_bootstrap_handoff(
+            _pool(conn),
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            task_id=_TASK_ID,
+        )
+
+    assert conn.executed == []

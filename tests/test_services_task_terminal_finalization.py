@@ -45,6 +45,7 @@ from openorc.domain.tasks import TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_terminal_finalization
 from openorc.services.errors import StaleOperationError
+from openorc.services.task_queue_wake import TaskQueueWakeSubmissionOutcome
 from openorc.services.task_terminal_finalization import (
     TerminalFinalizationKind,
     TerminalFinalizationSubmissionOutcome,
@@ -213,6 +214,18 @@ class _RecordingSubmission:
         if self.error is not None:
             raise self.error
         return self.outcome
+
+
+class _RecordingQueueWake:
+    """Recording Task-queue wake seam fake (issue #257)."""
+
+    def __init__(self, outcome: TaskQueueWakeSubmissionOutcome) -> None:
+        self._outcome = outcome
+        self.workspaces: list[UUID] = []
+
+    def submit(self, *, workspace_id: UUID) -> TaskQueueWakeSubmissionOutcome:
+        self.workspaces.append(workspace_id)
+        return self._outcome
 
 
 def _install_seams(
@@ -542,6 +555,71 @@ def test_a_known_refused_submission_falls_back_to_the_archive_only_finalization(
     assert arrangement.finalization is not None
     assert arrangement.finalization.kind is TerminalFinalizationKind.ARCHIVED
     assert submission.calls == [{"workspace_id": _WORKSPACE_ID, "task_id": _TASK_ID}]
+
+
+def test_the_fallback_release_arranges_one_post_commit_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_seams(monkeypatch)
+    submission = _RecordingSubmission(outcome=TerminalFinalizationSubmissionOutcome.KNOWN_REFUSED)
+    pool, _conn = _pool(
+        [
+            _committed_row(),
+            (True,),
+            _committed_row(),
+            _archived_row(),
+            _ended_session_row(role="producer"),
+            _ended_session_row(role="reviewer"),
+        ]
+    )
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    arrangement = arrange_task_terminal_finalization(
+        pool,
+        submission,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        queue_wake=wake,
+    )
+
+    # The in-process fallback archival released both bindings, so the
+    # arrangement wakes the FIFO processor strictly post-commit (issue #257).
+    assert arrangement.finalization is not None
+    assert arrangement.finalization.released_session_bindings != ()
+    assert wake.workspaces == [_WORKSPACE_ID]
+
+
+def test_the_fallback_release_without_occupancy_arranges_no_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_seams(monkeypatch)
+    submission = _RecordingSubmission(outcome=TerminalFinalizationSubmissionOutcome.KNOWN_REFUSED)
+    pool, _conn = _pool(
+        [
+            _committed_row(),
+            (True,),
+            _committed_row(),
+            _archived_row(),
+            None,
+            None,
+            None,
+            None,
+        ]
+    )
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    arrangement = arrange_task_terminal_finalization(
+        pool,
+        submission,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        queue_wake=wake,
+    )
+
+    # A finalization that released no occupancy invents no wake.
+    assert arrangement.finalization is not None
+    assert arrangement.finalization.released_session_bindings == ()
+    assert wake.workspaces == []
 
 
 def test_an_unwired_seam_falls_back_to_the_archive_only_finalization(

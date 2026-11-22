@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -45,6 +46,7 @@ from openorc.workers.task_cleanup_operations import (
     F1TerminalFinalizationSubmission,
     build_terminal_cleanup_operation_handlers,
 )
+from openorc.workers.task_queue_operations import F1TaskQueueWakeSubmission
 
 _WORKSPACE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000001")
 _TASK_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000002")
@@ -74,6 +76,7 @@ class _CleanupServiceHarness:
     calls: list[dict[str, Any]] = field(default_factory=list)
     started: threading.Event = field(default_factory=threading.Event)
     error: Exception | None = None
+    outcome: Any = None
 
     def __call__(
         self,
@@ -96,6 +99,9 @@ class _CleanupServiceHarness:
         self.started.set()
         if self.error is not None:
             raise self.error
+        if self.outcome is not None:
+            return self.outcome
+        return SimpleNamespace(kind="archived", task=None, released_session_bindings=())
 
 
 @pytest.fixture
@@ -212,6 +218,44 @@ def test_the_finalization_handler_invokes_the_existing_service_with_the_scoped_i
         harness.calls[0]["dispatch"].selection
         is TerminalCleanupDispatchSelection.OBSERVATION_UNAVAILABLE
     )
+
+
+# --- the F11 post-release queue wake (issue #257) ------------------------------
+
+
+def test_the_finalization_handler_arranges_one_wake_only_for_a_real_release(
+    cleanup_service_harness: _CleanupServiceHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = cleanup_service_harness
+    arrangements: list[dict[str, Any]] = []
+
+    def recording_arrange(queue_wake: Any, *, workspace_id: Any, origin: str) -> Any:
+        arrangements.append({"seam": queue_wake, "workspace_id": workspace_id, "origin": origin})
+        return None
+
+    monkeypatch.setattr(task_cleanup_operations, "arrange_task_queue_wake", recording_arrange)
+    settings = _settings()
+    runtime = _RecordingRuntime()
+    dependencies = _dependencies(settings, runtime)
+    handler = build_terminal_cleanup_operation_handlers()[OperationKind.TASK_TERMINAL_FINALIZATION]
+
+    # A finalization that released no occupancy invents no wake.
+    harness.outcome = SimpleNamespace(kind="archived", task=None, released_session_bindings=())
+    handler(_cleanup_invocation().payload, dependencies=dependencies)
+    assert arrangements == []
+
+    # A committed archival release arranges exactly one post-commit wake
+    # through the executing process's F1 wake bridge.
+    harness.outcome = SimpleNamespace(
+        kind="archived", task=None, released_session_bindings=(object(), object())
+    )
+    handler(_cleanup_invocation().payload, dependencies=dependencies)
+
+    assert len(arrangements) == 1
+    assert arrangements[0]["workspace_id"] == _WORKSPACE_ID
+    assert arrangements[0]["origin"] == "terminal_finalization_handler"
+    assert isinstance(arrangements[0]["seam"], F1TaskQueueWakeSubmission)
 
 
 # --- the submission bridge: F1 outcome mapping, truthfully -----------------------

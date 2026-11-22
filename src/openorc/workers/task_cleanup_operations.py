@@ -63,6 +63,7 @@ from uuid import UUID
 
 from openorc.config import Settings
 from openorc.services.cline_terminal_cleanup import ClineTerminalCleanupComposition
+from openorc.services.task_queue_wake import arrange_task_queue_wake
 from openorc.services.task_terminal_cleanup import TerminalCheckoutCleanupRuntime
 from openorc.services.task_terminal_finalization import (
     TerminalCleanupDispatch,
@@ -79,6 +80,7 @@ from openorc.workers.invocation import (
     SubmissionOutcome,
     TerminalFinalizationPayload,
 )
+from openorc.workers.task_queue_operations import F1TaskQueueWakeSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -143,16 +145,27 @@ def _finalize_task_terminalization_handler(
     in the selected mode, and the mandatory atomic archival with its session
     finalization. Handler failures are never swallowed into reported
     success — F1's sanitized execution-error containment owns them.
+
+    Strictly after a finalization whose archival actually released occupancy
+    (non-empty ``released_session_bindings``), the handler arranges one
+    post-commit Task-queue wake invitation (issue #257) — a no-op or
+    duplicate finalization released nothing and invents no wake.
     """
     finalization_payload = cast(TerminalFinalizationPayload, payload)
     pool = dependencies.database_pool()
-    finalize_task_terminalization(
+    outcome = finalize_task_terminalization(
         pool,
         dependencies.terminal_cleanup_runtime(),
         workspace_id=UUID(finalization_payload.workspace_id),
         task_id=UUID(finalization_payload.task_id),
         dispatch=resolve_terminal_cleanup_dispatch(dependencies),
     )
+    if outcome.released_session_bindings:
+        arrange_task_queue_wake(
+            F1TaskQueueWakeSubmission(dependencies.continuation_submitter()),
+            workspace_id=UUID(finalization_payload.workspace_id),
+            origin="terminal_finalization_handler",
+        )
 
 
 def build_terminal_cleanup_operation_handlers() -> dict[OperationKind, OperationHandler]:

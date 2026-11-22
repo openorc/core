@@ -48,6 +48,7 @@ from tests.test_services_task_detached_turn_observation import (
     _script_outstanding_receipts,
     _script_restart_candidates,
     _SettleRecorder,
+    _sql_has,
     _subscribe_calls,
     _terminal_event,
 )
@@ -107,6 +108,11 @@ def _queue_client(
 ) -> tuple[TestClient, Any]:
     """A serving queue-mode app whose lifespan reconciliation finds no candidates."""
     _script_restart_candidates(conn, [])
+    # The F11 bounded queue-recovery enumerations find no candidates either
+    # (issue #257): no workspace holds queued Tasks and no planning Task has
+    # an unclaimed bootstrap handoff.
+    conn.on_repeat(_sql_has("select distinct workspace_id from openorc.tasks"), [])
+    conn.on_repeat(_sql_has("planning_bootstrap_claim_token is null"), [])
     monkeypatch.setattr(
         app_module,
         "build_default_operation_dependencies",
@@ -325,6 +331,10 @@ def test_lifespan_hosts_exactly_one_observer_in_queue_mode(
     settings = settings_factory(**_QUEUE_SETTINGS)
     app = create_app(settings)
     _script_restart_candidates(conn, [])
+    # The F11 bounded queue-recovery enumerations find no candidates either
+    # (issue #257).
+    conn.on_repeat(_sql_has("select distinct workspace_id from openorc.tasks"), [])
+    conn.on_repeat(_sql_has("planning_bootstrap_claim_token is null"), [])
     monkeypatch.setattr(
         app_module,
         "build_default_operation_dependencies",

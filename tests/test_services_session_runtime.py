@@ -85,6 +85,7 @@ from openorc.services.session_runtime import (
     establish_task_agent_session,
     record_task_agent_session_lost,
 )
+from openorc.services.task_queue_wake import TaskQueueWakeSubmissionOutcome
 from tests.fakes.agent_runtime import FakeAgentRuntimeAdapter, session_ready_candidate
 from tests.fakes.cline_sdk_backend import FakeClineSdkBackend
 from tests.fakes.task_rows import task_row
@@ -1465,6 +1466,147 @@ def test_end_already_ended_binding_is_idempotent() -> None:
         "update openorc.task_agent_sessions set lifecycle_status = 'ended'" in sql
         for sql, _ in conn.executed
     )
+
+
+class _RecordingQueueWake:
+    """Recording Task-queue wake seam fake (issue #257)."""
+
+    def __init__(self, outcome: TaskQueueWakeSubmissionOutcome) -> None:
+        self._outcome = outcome
+        self.workspaces: list[Any] = []
+
+    def submit(self, *, workspace_id: Any) -> TaskQueueWakeSubmissionOutcome:
+        self.workspaces.append(workspace_id)
+        return self._outcome
+
+
+def test_a_committed_loss_arranges_one_post_commit_wake() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    ready_row = _reloaded_row(
+        workspace_id,
+        task_id,
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+    )
+    lost_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="lost",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
+    conn = _loss_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        binding_row=ready_row,
+        write_results=[lost_row],
+    )
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    session = record_task_agent_session_lost(
+        _pool(conn), **_loss_kwargs(workspace_id, task_id), queue_wake=wake
+    )
+
+    # The freshly committed capacity release arranges exactly one wake
+    # invitation strictly after the commit (issue #257).
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.LOST
+    assert wake.workspaces == [workspace_id]
+
+
+def test_an_idempotent_loss_arranges_no_wake() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    lost_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="lost",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
+    conn = _loss_results(workspace_id, owner_profile_id, task_id, binding_row=lost_row)
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    record_task_agent_session_lost(
+        _pool(conn), **_loss_kwargs(workspace_id, task_id), queue_wake=wake
+    )
+
+    # The idempotent duplicate released nothing and invents no wake.
+    assert wake.workspaces == []
+
+
+def test_a_committed_end_arranges_one_post_commit_wake() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    ready_row = _reloaded_row(
+        workspace_id,
+        task_id,
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+    )
+    ended_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ended",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+    )
+    conn = _loss_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        binding_row=ready_row,
+        write_results=[ended_row],
+    )
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    session = end_task_agent_session(
+        _pool(conn),
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        queue_wake=wake,
+    )
+
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.ENDED
+    assert wake.workspaces == [workspace_id]
+
+
+def test_an_idempotent_end_arranges_no_wake() -> None:
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    ended_row = _session_row(
+        workspace_id, task_id, "producer", connection_id, lifecycle_status="ended"
+    )
+    conn = _loss_results(workspace_id, owner_profile_id, task_id, binding_row=ended_row)
+    wake = _RecordingQueueWake(TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY)
+
+    end_task_agent_session(
+        _pool(conn),
+        workspace_id=workspace_id,
+        task_id=task_id,
+        role=WorkflowRole.PRODUCER,
+        queue_wake=wake,
+    )
+
+    assert wake.workspaces == []
 
 
 def test_end_lost_binding_is_a_conflict() -> None:

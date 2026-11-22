@@ -135,7 +135,7 @@ from openorc.services.task_pr_review_dispatch import (
     ReviewerRuntimeAttachmentFactory,
     dispatch_pr_review_detached,
 )
-from openorc.services.task_start import TaskStartOutcome, TaskStartStatus
+from openorc.services.task_queue_wake import arrange_task_queue_wake
 from openorc.services.task_subject_guards import (
     require_canonical_task_pull_request,
     require_current_plan_revision,
@@ -170,13 +170,13 @@ from openorc.workers.task_cleanup_operations import (
     F1TerminalFinalizationSubmission,
     resolve_terminal_cleanup_dispatch,
 )
+from openorc.workers.task_queue_operations import F1TaskQueueWakeSubmission
 
 __all__ = [
     "build_task_workflow_handlers",
     "execute_task_workflow_operation",
     "submit_authorized_implementation_after_approval",
     "submit_task_session_resume_after_authorization",
-    "submit_planning_bootstrap_after_start",
     "submit_pr_composition_after_approval",
 ]
 
@@ -391,45 +391,6 @@ def _submit_continuation(
 
 
 # --- explicit workflow entry continuations -----------------------------------
-
-
-def submit_planning_bootstrap_after_start(
-    outcome: TaskStartOutcome,
-    *,
-    profile_id: UUID,
-    dependencies: OperationDependencies,
-) -> SubmissionResult | None:
-    """Submit the planning bootstrap after one successful Task start (E1a to E1b).
-
-    The explicitly invoked application continuation of the E1a start
-    outcome: a ``PLANNING`` start carries the post-write Task with its
-    rotated ``state_token`` and both admitted role bindings — the #203
-    handoff — so this helper constructs the exact typed bootstrap invocation
-    from that outcome and submits it for delivery. A ``QUEUED`` start has no
-    continuation (``None``). The accountable Owner Profile is the starting
-    caller's own identity, supplied explicitly and re-proven by the
-    executing service. The returned submission outcome is transport
-    information only, never Task truth: a known refusal or uncertain
-    submission never fails the already-completed start and is never retried
-    here.
-    """
-    if outcome.status is not TaskStartStatus.PLANNING:
-        return None
-    return _submit_continuation(
-        dependencies,
-        OperationInvocation(
-            kind=OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN,
-            payload=TaskPlanningBootstrapAndInitialPlanPayload(
-                task=TaskScope(
-                    workspace_id=str(outcome.task.workspace_id),
-                    task_id=str(outcome.task.id),
-                    role=WorkflowRoleRef.PRODUCER,
-                ),
-                profile_id=str(profile_id),
-                expected_state_token=str(outcome.task.state_token),
-            ),
-        ),
-    )
 
 
 def submit_authorized_implementation_after_approval(
@@ -711,14 +672,27 @@ def _handoff_terminal_cleanup_completion(
     Contained by the handoff contract: a failed finalization leaves the
     durably settled attempt to a later explicitly invoked finalizer or the
     finite deadline disposition.
+
+    Strictly after a finalization whose archival actually released occupancy
+    (non-empty ``released_session_bindings``), this route arranges one
+    post-commit Task-queue wake invitation (issue #257) — a no-op or
+    duplicate finalization released nothing and invents no wake; the wake is
+    an invitation to rederive queue eligibility, never cleanup or
+    archival-relevant state.
     """
-    finalize_task_terminalization(
+    outcome = finalize_task_terminalization(
         dependencies.database_pool(),
         dependencies.terminal_cleanup_runtime(),
         workspace_id=workspace_id,
         task_id=task_id,
         dispatch=resolve_terminal_cleanup_dispatch(dependencies),
     )
+    if outcome.released_session_bindings:
+        arrange_task_queue_wake(
+            F1TaskQueueWakeSubmission(dependencies.continuation_submitter()),
+            workspace_id=workspace_id,
+            origin="terminal_cleanup_handoff",
+        )
 
 
 def build_detached_completion_handoff(

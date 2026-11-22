@@ -42,7 +42,6 @@ from openorc.services.task_plan_production import TaskPlanProductionOutcome
 from openorc.services.task_planning_bootstrap import TaskPlanningPreparationOutcome
 from openorc.services.task_pr_composition import SettledTaskPrPublication, TaskPrPublished
 from openorc.services.task_pr_review_decision import PrReviewDecision
-from openorc.services.task_start import TaskStartStatus
 from openorc.workers import task_workflow
 from openorc.workers.invocation import (
     ExecutionModeDependencyError,
@@ -52,6 +51,7 @@ from openorc.workers.invocation import (
     OperationKind,
     OperationPayload,
     OperationSubmitter,
+    QueueWakePayload,
     RQQueueOperationSubmission,
     SubmissionOutcome,
     SubmissionResult,
@@ -922,47 +922,6 @@ def test_entrypoint_delivers_task_operations_through_the_production_table(
 
 
 # --- explicit workflow entry continuations (review remediations) --------------
-
-
-def _fake_start_outcome(status: Any, state_token: UUID) -> Any:
-    return SimpleNamespace(
-        status=status,
-        task=SimpleNamespace(id=_TASK_ID, workspace_id=_WORKSPACE_ID, state_token=state_token),
-    )
-
-
-def test_start_continuation_submits_the_exact_bootstrap_invocation() -> None:
-    dependencies, submitter = make_dependencies()
-
-    result = task_workflow.submit_planning_bootstrap_after_start(
-        cast(Any, _fake_start_outcome(TaskStartStatus.PLANNING, _STATE_TOKEN)),
-        profile_id=_PROFILE_ID,
-        dependencies=dependencies,
-    )
-
-    assert result is not None
-    assert result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
-    assert len(submitter.submissions) == 1
-    submitted = submitter.submissions[0]
-    assert submitted.kind is OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN
-    assert isinstance(submitted.payload, TaskPlanningBootstrapAndInitialPlanPayload)
-    # The exact post-start token and the starting Owner's accountable Profile.
-    assert submitted.payload.task == _TASK_SCOPE_PRODUCER
-    assert submitted.payload.profile_id == str(_PROFILE_ID)
-    assert submitted.payload.expected_state_token == str(_STATE_TOKEN)
-
-
-def test_queued_start_has_no_bootstrap_continuation() -> None:
-    dependencies, submitter = make_dependencies()
-
-    result = task_workflow.submit_planning_bootstrap_after_start(
-        cast(Any, _fake_start_outcome(TaskStartStatus.QUEUED, _STATE_TOKEN)),
-        profile_id=_PROFILE_ID,
-        dependencies=dependencies,
-    )
-
-    assert result is None
-    assert submitter.submissions == []
 
 
 def test_implementation_approval_continuation_submits_the_exact_invocation() -> None:
@@ -3063,6 +3022,37 @@ def test_the_completion_handoff_terminal_cleanup_route_invokes_the_finalization(
         "observation_unavailable",
     }
     assert submitter.submissions == []
+
+
+def test_the_completion_handoff_terminal_cleanup_route_wakes_a_real_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, submitter = make_dependencies(
+        terminal_cleanup_runtime_provider=lambda _settings: object()
+    )
+    calls: list[dict[str, Any]] = []
+
+    def recording_finalize(pool: Any, runtime: Any, **kwargs: Any) -> Any:
+        calls.append({"pool": pool, "runtime": runtime, **kwargs})
+        return SimpleNamespace(
+            kind="archived", task=None, released_session_bindings=(object(), object())
+        )
+
+    monkeypatch.setattr(task_workflow, "finalize_task_terminalization", recording_finalize)
+
+    handoff = task_workflow.build_detached_completion_handoff(dependencies)
+    handoff.handoff_settled_completion(
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
+    )
+
+    # The settlement-driven re-finalization released occupancy, so the route
+    # arranges exactly one post-commit Task-queue wake (issue #257).
+    assert [entry.kind for entry in submitter.submissions] == [OperationKind.TASK_QUEUE_WAKE]
+    wake_payload = submitter.submissions[0].payload
+    assert isinstance(wake_payload, QueueWakePayload)
+    assert wake_payload.workspace_id == str(_WORKSPACE_ID)
 
 
 def test_the_completion_handoff_terminal_cleanup_route_propagates_failure(
