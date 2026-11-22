@@ -109,7 +109,9 @@ def test_the_lookup_enumerates_the_latest_outstanding_attempt_per_episode() -> N
 
 def test_the_lookup_scopes_the_enumeration_to_the_supported_families() -> None:
     """The family filter is the exact three-family roster with the per-family
-    outstanding predicates; the paging cursor and limit travel as parameters."""
+    outstanding predicates and the coarse family→status Task eligibility, so
+    moved-on Tasks never occupy the recovery budget; the paging cursor and
+    limit travel as parameters."""
     conn = ScriptedConnection()
     conn.on("from openorc.operational_failure_attempts", [])
 
@@ -121,6 +123,11 @@ def test_the_lookup_scopes_the_enumeration_to_the_supported_families() -> None:
     assert "a.ordinal = (select max(a2.ordinal)" in lowered
     assert "a.resulting_execution_id is null" in lowered
     assert "a.consumed_at is null" in lowered
+    # The coarse eligibility join: only Tasks still in the executing family's
+    # expected status are enumerated at all.
+    assert "join openorc.tasks t on t.id = a.task_id" in lowered
+    assert "t.status = 'implementing'" in lowered
+    assert "t.status = 'waiting_for_owner'" in lowered
     assert params is not None
     assert list(params[0]) == [
         PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
@@ -130,9 +137,13 @@ def test_the_lookup_scopes_the_enumeration_to_the_supported_families() -> None:
     assert params[1] == "implementation_execution"
     assert params[2] == "exact_head_merge"
     assert params[3] == "exact_head_pr_authorization_presentation"
-    assert params[4] is None  # no cursor: the first page
-    assert params[5] is None
-    assert params[6] == 25
+    # The family→status eligibility conditional reuses the same parameters.
+    assert params[4] == "implementation_execution"
+    assert params[5] == "exact_head_merge"
+    assert params[6] == "exact_head_pr_authorization_presentation"
+    assert params[7] is None  # no cursor: the first page
+    assert params[8] is None
+    assert params[9] == 25
 
 
 def test_the_lookup_pages_by_episode_id_keyset() -> None:
@@ -146,9 +157,9 @@ def test_the_lookup_pages_by_episode_id_keyset() -> None:
 
     (_sql, params) = conn.executed[0]
     assert params is not None
-    assert params[4] == _AFTER_EPISODE_ID
-    assert params[5] == _AFTER_EPISODE_ID
-    assert params[6] == 10
+    assert params[7] == _AFTER_EPISODE_ID
+    assert params[8] == _AFTER_EPISODE_ID
+    assert params[9] == 10
 
 
 def test_an_empty_enumeration_is_an_empty_pass() -> None:

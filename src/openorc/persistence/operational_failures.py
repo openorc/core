@@ -458,11 +458,21 @@ def list_outstanding_authorized_retry_attempts(
     bound resulting Execution, or a merge/presentation attempt without its
     consumption stamp. A predecessor attempt is always durably consumed by
     the time a successor is authorized, so the per-episode maximum ordinal is
-    the only candidate. Keyset paging orders by episode id —
-    ``after_episode_id`` is a paging hint, never authority — and ``limit``
-    bounds one pass; the next recovery pass revisits the rest. The read never
-    mutates the ledger, never clears or rewrites history, and yields no
-    workflow authority: the executing service re-proves everything.
+    the only candidate.
+
+    The enumeration is additionally scoped to the coarse Task status each
+    supported family's executing service expects (the SQL expression of the
+    recovery's family→status expectations): a candidate whose Task has since
+    moved on is never enumerated at all, so historical candidates cannot
+    occupy — or permanently starve — the recovery pass's bounded budget. The
+    arranging worker still re-derives the exact current Task facts from
+    committed state at arrangement time.
+
+    Keyset paging orders by episode id — ``after_episode_id`` is a paging
+    hint, never authority — and ``limit`` bounds one page; the caller's next
+    page revisits the rest. The read never mutates the ledger, never clears
+    or rewrites history, and yields no workflow authority: the executing
+    service re-proves everything.
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("the outstanding-retry lookup requires a positive limit")
@@ -474,6 +484,7 @@ def list_outstanding_authorized_retry_attempts(
             "e.operation_family, a.not_before "
             "from openorc.operational_failure_attempts a "
             "join openorc.operational_failure_episodes e on e.id = a.episode_id "
+            "join openorc.tasks t on t.id = a.task_id "
             "where e.escalated_task_block_id is null "
             "and e.operation_family = any(%s) "
             "and a.ordinal = (select max(a2.ordinal) "
@@ -481,11 +492,17 @@ def list_outstanding_authorized_retry_attempts(
             "where a2.episode_id = a.episode_id) "
             "and ((e.operation_family = %s and a.resulting_execution_id is null) "
             "or (e.operation_family in (%s, %s) and a.consumed_at is null)) "
+            "and ((e.operation_family = %s and t.status = 'implementing') "
+            "or (e.operation_family = %s and t.status = 'waiting_for_owner') "
+            "or (e.operation_family = %s and t.status = 'implementing')) "
             "and (%s::uuid is null or a.episode_id > %s::uuid) "
             "order by a.episode_id "
             "limit %s",
             (
                 list(_OUTSTANDING_RETRY_FAMILY_VALUES),
+                PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
+                GitHubMergeOperation.EXACT_HEAD_MERGE.value,
+                PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION.value,
                 PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
                 GitHubMergeOperation.EXACT_HEAD_MERGE.value,
                 PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION.value,

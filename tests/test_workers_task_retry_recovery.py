@@ -61,23 +61,40 @@ class _RecordingSubmitter:
 
 
 class _RecoveryHarness:
-    """Scripted recovery enumeration, Task, and Workspace reads."""
+    """Scripted recovery enumeration pages, Task, and Workspace reads."""
 
     def __init__(self) -> None:
-        self.candidates: list[Any] = []
+        self.pages: list[list[Any]] = []
         self.tasks: dict[UUID, Any] = {}
         self.workspaces: dict[UUID, Any] = {}
-        self.enumeration_limits: list[int] = []
+        self.calls: list[tuple[int, UUID | None]] = []
 
-    def enumerate(self, pool: Any, *, limit: int) -> list[Any]:
-        self.enumeration_limits.append(limit)
-        return self.candidates[:limit]
+    def enumerate(
+        self, pool: Any, *, limit: int, after_episode_id: UUID | None = None
+    ) -> list[Any]:
+        self.calls.append((limit, after_episode_id))
+        if not self.pages:
+            return []
+        return self.pages.pop(0)[:limit]
 
     def task(self, pool: Any, *, task_id: UUID) -> Any:
         return self.tasks.get(task_id)
 
     def workspace(self, pool: Any, *, workspace_id: UUID) -> Any:
         return self.workspaces.get(workspace_id)
+
+    def stale_page(self) -> list[Any]:
+        """One full page of candidates whose Tasks are no longer executable.
+
+        None of these candidates' Tasks are scripted, so every arrangement
+        re-proves them as moved-on and submits nothing — exactly the
+        historical batch shape that must never permanently starve a later
+        eligible attempt.
+        """
+        return [
+            _candidate(episode_id=uuid4())
+            for _ in range(task_retry_recovery._RECOVERY_SUBJECT_BUDGET)
+        ]
 
 
 def _candidate(**overrides: Any) -> Any:
@@ -131,7 +148,7 @@ def test_recovery_submits_the_same_typed_retry_invocation_for_each_family(
     presentation = _candidate(
         operation_family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION
     )
-    recovery_harness.candidates = [implementation, merge, presentation]
+    recovery_harness.pages = [[implementation, merge, presentation]]
     recovery_harness.tasks[implementation.task_id] = _task()
     recovery_harness.tasks[merge.task_id] = _task(status=TaskStatus.WAITING_FOR_OWNER)
     recovery_harness.tasks[presentation.task_id] = _task()
@@ -181,7 +198,7 @@ def test_recovery_skips_a_candidate_whose_durable_facts_moved_on(
     trigger."""
     still_current = _candidate()
     moved_on = _candidate(operation_family=GitHubMergeOperation.EXACT_HEAD_MERGE)
-    recovery_harness.candidates = [still_current, moved_on]
+    recovery_harness.pages = [[still_current, moved_on]]
     recovery_harness.tasks[still_current.task_id] = _task()
     # The merge family expects waiting_for_owner; the Task is still
     # implementing, so the recovery submits nothing for it.
@@ -204,7 +221,7 @@ def test_a_missing_task_or_workspace_submits_nothing(
     """A gone or foreign Task, or a missing Workspace, submits nothing and
     never fails the pass."""
     candidate = _candidate()
-    recovery_harness.candidates = [candidate]
+    recovery_harness.pages = [[candidate]]
     recovery_harness.tasks[candidate.task_id] = _task(workspace_id=uuid4())  # foreign
     recovery_harness.workspaces[_WORKSPACE_ID] = _workspace()
     submitter = _RecordingSubmitter()
@@ -229,7 +246,7 @@ def test_a_refused_recovery_arrangement_is_contained(
     """A refused or uncertain recovery arrangement never fails the pass and
     never replays; the next supported trigger revisits the rest."""
     candidate = _candidate()
-    recovery_harness.candidates = [candidate]
+    recovery_harness.pages = [[candidate]]
     recovery_harness.tasks[candidate.task_id] = _task()
     recovery_harness.workspaces[_WORKSPACE_ID] = _workspace()
     submitter = _RecordingSubmitter(
@@ -252,7 +269,7 @@ def test_the_recovery_pass_is_bounded_by_its_subject_budget(
     """The enumeration is a bounded paging read; the next supported trigger
     revisits the rest."""
     candidate = _candidate()
-    recovery_harness.candidates = [candidate]
+    recovery_harness.pages = [[candidate]]
     recovery_harness.tasks[candidate.task_id] = _task()
     recovery_harness.workspaces[_WORKSPACE_ID] = _workspace()
     submitter = _RecordingSubmitter()
@@ -261,10 +278,71 @@ def test_the_recovery_pass_is_bounded_by_its_subject_budget(
         object(), submitter  # type: ignore[arg-type]
     )
 
-    assert recovery_harness.enumeration_limits == [task_retry_recovery._RECOVERY_SUBJECT_BUDGET]
+    assert recovery_harness.calls == [(task_retry_recovery._RECOVERY_SUBJECT_BUDGET, None)]
 
     task_retry_recovery.arrange_task_retry_recovery(
         object(), submitter, subject_budget=7  # type: ignore[arg-type]
     )
 
-    assert recovery_harness.enumeration_limits[-1] == 7
+    assert recovery_harness.calls[-1] == (7, None)
+
+
+def test_recovery_pages_past_a_stale_batch_to_reach_a_later_attempt(
+    recovery_harness: _RecoveryHarness,
+) -> None:
+    """The regression guard against permanent starvation: a full initial page
+    of historical, no-longer-executable candidates advances the keyset cursor
+    within the same bounded pass, so the valid outstanding attempt behind it
+    is reached and resubmitted — at this startup, not only after the ledger
+    happens to shrink."""
+    stale = recovery_harness.stale_page()
+    valid = _candidate()
+    recovery_harness.pages = [stale, [valid]]
+    recovery_harness.tasks[valid.task_id] = _task()
+    recovery_harness.workspaces[_WORKSPACE_ID] = _workspace()
+    submitter = _RecordingSubmitter()
+
+    task_retry_recovery.arrange_task_retry_recovery(
+        object(), submitter  # type: ignore[arg-type]
+    )
+
+    # The valid attempt behind the stale batch was arranged.
+    assert [entry.kind for entry in submitter.submissions] == [
+        OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY
+    ]
+    assert isinstance(submitter.submissions[0].payload, _RETRY_PAYLOAD_TYPES)
+    assert submitter.submissions[0].payload.retry_attempt_id == str(valid.attempt_id)
+    # The pass advanced its keyset cursor past the stale batch instead of
+    # repeatedly examining the same prefix on every subsequent startup.
+    assert recovery_harness.calls == [
+        (task_retry_recovery._RECOVERY_SUBJECT_BUDGET, None),
+        (task_retry_recovery._RECOVERY_SUBJECT_BUDGET, stale[-1].episode_id),
+    ]
+
+
+def test_the_recovery_pass_is_bounded_by_its_page_budget(
+    recovery_harness: _RecoveryHarness,
+) -> None:
+    """The pass examines at most its bounded page count — a paging bound,
+    never a scheduler; the next supported trigger revisits the rest."""
+    stale_pages = [
+        recovery_harness.stale_page()
+        for _ in range(task_retry_recovery._RECOVERY_PAGE_BUDGET + 2)
+    ]
+    recovery_harness.pages = list(stale_pages)
+    submitter = _RecordingSubmitter()
+
+    task_retry_recovery.arrange_task_retry_recovery(
+        object(), submitter  # type: ignore[arg-type]
+    )
+
+    assert len(recovery_harness.calls) == task_retry_recovery._RECOVERY_PAGE_BUDGET
+    assert submitter.submissions == []
+    # Every page advanced the cursor past the examined prefix.
+    cursors = [call[1] for call in recovery_harness.calls]
+    assert cursors[0] is None
+    assert cursors[1:] == [
+        stale_pages[0][-1].episode_id,
+        stale_pages[1][-1].episode_id,
+        stale_pages[2][-1].episode_id,
+    ]
