@@ -87,6 +87,7 @@ __all__ = [
     "OperationalFailureFamily",
     "OperationalFailureSourceKind",
     "OriginalAttemptKind",
+    "OutstandingAuthorizedRetryAttempt",
     "ImplementationAuthorizationPresentationOperation",
     "PRAuthorizationPresentationOperation",
     "canonical_bounded_failure_context",
@@ -523,3 +524,53 @@ def operational_failure_episode_field_names() -> frozenset[str]:
 def operational_failure_attempt_field_names() -> frozenset[str]:
     """Return the exact field set an OperationalFailureAttempt exposes."""
     return frozenset(field.name for field in fields(OperationalFailureAttempt))
+
+
+@dataclass(frozen=True, slots=True)
+class OutstandingAuthorizedRetryAttempt:
+    """One still-outstanding authorized retry attempt candidate (F12, #316).
+
+    The narrow startup-recovery read model: the latest authorized attempt of
+    one non-escalated episode in a supported retry family, together with the
+    family that selects its executing operation kind. It carries no workflow
+    authority and no subject copy of its own — the executing service re-derives
+    every subject and re-proves due time, currentness, and effect safety from
+    committed state. Enumeration is an invitation to revalidate, never an
+    authorization to replay.
+    """
+
+    attempt_id: UUID
+    workspace_id: UUID
+    task_id: UUID
+    episode_id: UUID
+    ordinal: int
+    operation_family: OperationalFailureFamily
+    not_before: datetime
+
+    def __post_init__(self) -> None:
+        for name in ("attempt_id", "workspace_id", "task_id", "episode_id"):
+            _require_uuid(getattr(self, name), name)
+        if (
+            isinstance(self.ordinal, bool)
+            or not isinstance(self.ordinal, int)
+            or not (1 <= self.ordinal <= 3)
+        ):
+            raise OperationalFailureDomainError(
+                "OutstandingAuthorizedRetryAttempt.ordinal must be an integer between 1 and 3"
+            )
+        if not isinstance(
+            self.operation_family,
+            (
+                PendingTaskRuntimeInteractionOperation,
+                GitHubMergeOperation,
+                PRAuthorizationPresentationOperation,
+                ImplementationAuthorizationPresentationOperation,
+            ),
+        ):
+            raise OperationalFailureDomainError(
+                "OutstandingAuthorizedRetryAttempt.operation_family must be a "
+                "PendingTaskRuntimeInteractionOperation, a GitHubMergeOperation, "
+                "a PRAuthorizationPresentationOperation, or an "
+                "ImplementationAuthorizationPresentationOperation"
+            )
+        _require_instant(self.not_before, "not_before")

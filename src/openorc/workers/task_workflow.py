@@ -41,8 +41,10 @@ Composition rules enforced by this module:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -50,6 +52,11 @@ from openorc.adapters.agent_runtime.contract import AgentRuntimeAdapter
 from openorc.adapters.github import HttpGitHubUserTokenClient
 from openorc.config import ConfigurationError, Settings
 from openorc.domain.connections import WorkflowRole
+from openorc.domain.operational_failures import (
+    GitHubMergeOperation,
+    OperationalFailureFamily,
+    PRAuthorizationPresentationOperation,
+)
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.domain.send_claims import (
@@ -59,6 +66,7 @@ from openorc.domain.send_claims import (
 from openorc.domain.sessions import TaskAgentSession
 from openorc.domain.tasks import TaskPlanningBootstrapStage, TaskStatus
 from openorc.persistence import executions as execution_records
+from openorc.persistence import operational_failures as operational_failure_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import tasks as task_records
@@ -90,6 +98,9 @@ from openorc.services.task_authorized_merge_retry import (
 )
 from openorc.services.task_authorized_pr_authorization_retry import (
     execute_authorized_pr_authorization_retry,
+)
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmissionOutcome,
 )
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_implementation_authorization import (
@@ -151,6 +162,7 @@ from openorc.workers.invocation import (
     OperationHandler,
     OperationInvocation,
     OperationKind,
+    OperationSubmitter,
     SubmissionOutcome,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
@@ -173,6 +185,7 @@ from openorc.workers.task_cleanup_operations import (
 from openorc.workers.task_queue_operations import F1TaskQueueWakeSubmission
 
 __all__ = [
+    "F1AuthorizedRetrySubmission",
     "build_task_workflow_handlers",
     "execute_task_workflow_operation",
     "submit_authorized_implementation_after_approval",
@@ -388,6 +401,173 @@ def _submit_continuation(
             result.refusal_reason.value if result.refusal_reason is not None else "none",
         )
     return result
+
+
+# The F12 family -> existing F1 retry operation kinds (issue #316): exactly
+# the three families F4's eligibility matrix can authorize. The adapter below
+# is the ONE family-to-kind mapping at the worker composition boundary.
+_RETRY_FAMILY_OPERATION_KINDS: Mapping[OperationalFailureFamily, OperationKind] = {
+    PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION: (
+        OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY
+    ),
+    GitHubMergeOperation.EXACT_HEAD_MERGE: OperationKind.TASK_AUTHORIZED_MERGE_RETRY,
+    PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION: (
+        OperationKind.TASK_PR_AUTHORIZATION_RETRY
+    ),
+}
+
+# The worker-local due wait's hard bound (F12, issue #316): the largest
+# persisted backoff budget. F4 computes ``not_before`` as now + {2, 4, 8}s at
+# authorization, so the remaining delay is bounded by this under ordinary
+# clocks; the executing F5 service re-proves the persisted due instant
+# authoritatively either way, and a clamped wait can never hold an F1 job
+# hostage to clock skew.
+_MAX_DUE_WAIT_SECONDS = 8.0
+
+
+def _default_retry_clock() -> datetime:
+    """The process clock the due wait compares the persisted due instant against."""
+    return datetime.now(UTC)
+
+
+def _default_due_wait(seconds: float) -> None:
+    """The bounded, cancellation-safe default wait: one plain bounded sleep."""
+    time.sleep(seconds)
+
+
+def _wait_until_retry_due(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    retry_attempt_id: UUID,
+    clock: Callable[[], datetime] | None = None,
+    due_wait: Callable[[float], None] | None = None,
+) -> None:
+    """Wait, bounded and cancellation-safe, until the persisted authorization is due.
+
+    The F12 worker-local backoff (issue #316): on invocation, load the exact
+    persisted authorized attempt and, only while it is still early, perform
+    one bounded wait of at most its remaining 2/4/8-second backoff — outside
+    any database transaction, without holding an HTTP request or a detached
+    observer, and with no timer, scheduler, or polling loop of its own. The
+    read is contained: a missing, moved, or unreadable attempt waits nothing,
+    and the executing F5 service re-proves due time, currentness, and effect
+    safety authoritatively before any effect.
+    """
+    try:
+        attempt = operational_failure_records.get_operational_failure_attempt(
+            pool, attempt_id=retry_attempt_id
+        )
+    except Exception as error:  # noqa: BLE001 - contained pre-service read
+        logger.warning(
+            "the retry due-time read did not complete (error type %s) for attempt %s; "
+            "the executing service re-proves the authorization",
+            type(error).__name__,
+            retry_attempt_id,
+        )
+        return
+    if attempt is None or attempt.workspace_id != workspace_id or attempt.task_id != task_id:
+        return
+    now = (clock if clock is not None else _default_retry_clock)()
+    remaining = (attempt.not_before - now).total_seconds()
+    if remaining <= 0:
+        return
+    wait = due_wait if due_wait is not None else _default_due_wait
+    wait(min(remaining, _MAX_DUE_WAIT_SECONDS))
+
+
+class F1AuthorizedRetrySubmission:
+    """The F1-backed authorized-retry submission bridge (F12, issue #316).
+
+    Implements the shared
+    :class:`~openorc.services.task_authorized_retry_submission.AuthorizedRetrySubmission`
+    seam over a supplied process-local F1 submitter provider: each post-commit
+    arrangement resolves the executing process's
+    :class:`~openorc.workers.invocation.OperationSubmitter` at submit time
+    (the bounded local executor in regular mode, the canonical queue
+    submission in queue mode) and becomes exactly one typed retry invocation
+    of the family's existing registered operation kind, carrying only the
+    scoped Task identifiers, the accountable Owner Profile, the exact
+    authorized attempt UUID, and the currentness seed. The F1 submission
+    outcome maps 1:1 onto the shared retry outcome vocabulary. A submission
+    error is an unknown outcome — never a known non-delivery, never a replay
+    — and acceptance is never execution, admission, or completion: the
+    executing F1 worker/job performs the bounded due wait and the existing
+    F5 service owns admission. The arranging service owns the containment.
+    """
+
+    def __init__(self, submitter_provider: Callable[[], OperationSubmitter]) -> None:
+        self._submitter_provider = submitter_provider
+
+    def submit(
+        self,
+        *,
+        workspace_id: UUID,
+        task_id: UUID,
+        profile_id: UUID,
+        retry_attempt_id: UUID,
+        expected_state_token: UUID,
+        family: OperationalFailureFamily,
+    ) -> AuthorizedRetrySubmissionOutcome:
+        """Submit one authorized retry through the resolved F1 submitter."""
+        submitter = self._submitter_provider()
+        kind = _RETRY_FAMILY_OPERATION_KINDS.get(family)
+        if kind is None:
+            # The arranging service only ever hands a supported family;
+            # anything else fails closed before any submission.
+            raise InvalidInvocationError(
+                "no authorized-retry operation kind is registered for family "
+                f"{str(family)!r}"
+            )
+        if kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY:
+            payload: (
+                TaskAuthorizedImplementationRetryPayload
+                | TaskAuthorizedMergeRetryPayload
+                | TaskPrAuthorizationRetryPayload
+            ) = TaskAuthorizedImplementationRetryPayload(
+                task=TaskScope(
+                    workspace_id=str(workspace_id),
+                    task_id=str(task_id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(profile_id),
+                retry_attempt_id=str(retry_attempt_id),
+                expected_state_token=str(expected_state_token),
+            )
+        elif kind is OperationKind.TASK_AUTHORIZED_MERGE_RETRY:
+            # The merge retry consumes no role session: the Owner-accountable
+            # command's REVIEWER envelope is identity only, and the executing
+            # service re-derives every subject from committed state.
+            payload = TaskAuthorizedMergeRetryPayload(
+                task=TaskScope(
+                    workspace_id=str(workspace_id),
+                    task_id=str(task_id),
+                    role=WorkflowRoleRef.REVIEWER,
+                ),
+                profile_id=str(profile_id),
+                retry_attempt_id=str(retry_attempt_id),
+                expected_state_token=str(expected_state_token),
+            )
+        else:
+            # The presentation retry consumes no role session: the
+            # implementation phase's PRODUCER envelope is identity only.
+            payload = TaskPrAuthorizationRetryPayload(
+                task=TaskScope(
+                    workspace_id=str(workspace_id),
+                    task_id=str(task_id),
+                    role=WorkflowRoleRef.PRODUCER,
+                ),
+                profile_id=str(profile_id),
+                retry_attempt_id=str(retry_attempt_id),
+                expected_state_token=str(expected_state_token),
+            )
+        result = submitter.submit(OperationInvocation(kind=kind, payload=payload))
+        if result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY:
+            return AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+        if result.outcome is SubmissionOutcome.KNOWN_REFUSED:
+            return AuthorizedRetrySubmissionOutcome.KNOWN_REFUSED
+        return AuthorizedRetrySubmissionOutcome.UNCERTAIN
 
 
 # --- explicit workflow entry continuations -----------------------------------
@@ -780,6 +960,13 @@ def _handoff_implementation_completion(
         profile_id=owner_profile_id,
         expected_state_token=expected_state_token,
         invoke_level_one=invoke_level_one,
+        # F12 (issue #316): a failing presentation's durably authorized retry
+        # arranges its one post-commit F1 handoff through the executing
+        # process's own submission seam, resolved at submit time — never
+        # sleeping on this handoff.
+        retry_submission=F1AuthorizedRetrySubmission(
+            dependencies.continuation_submitter
+        ),
     )
 
 
@@ -1547,6 +1734,8 @@ def _compose_task_authorized_implementation_retry(
     *,
     dependencies: OperationDependencies,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    clock: Callable[[], datetime] | None = None,
+    due_wait: Callable[[float], None] | None = None,
 ) -> None:
     """Execute the one F4-authorized implementation retry and present the PR gate.
 
@@ -1560,7 +1749,9 @@ def _compose_task_authorized_implementation_retry(
     NEW retry Execution and the completion handoff owns the exact-head
     PR_AUTHORIZATION presentation. F12 (issue #316) owns submitting due
     authorized retries through this registered operation in either mode
-    (issue #347: both execution modes run this same detached composition).
+    (issue #347: both execution modes run this same detached composition),
+    and this composition performs the worker-local bounded due wait before
+    the service — the persisted ``not_before`` stays authoritative.
 
     On the successful finalized execution, the ordinary authorized
     continuation presents the exact-head PR_AUTHORIZATION gate with the
@@ -1574,6 +1765,17 @@ def _compose_task_authorized_implementation_retry(
     task_id = UUID(payload.task.task_id)
     profile_id = UUID(payload.profile_id)
     expected_state_token = UUID(payload.expected_state_token)
+    # F12 (issue #316): the worker-local bounded backoff — wait only until
+    # the persisted ``not_before``, outside any transaction, before the
+    # service re-proves everything authoritatively.
+    _wait_until_retry_due(
+        pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        clock=clock,
+        due_wait=due_wait,
+    )
     # The detached retry dispatch needs the executing process's detached-turn
     # observation seam and the ONE post-commit completion handoff — process
     # dependencies in both execution modes (issues #323/#333/#340/#346).
@@ -1602,6 +1804,8 @@ def _compose_task_authorized_merge_retry(
     *,
     dependencies: OperationDependencies,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    clock: Callable[[], datetime] | None = None,
+    due_wait: Callable[[float], None] | None = None,
 ) -> None:
     """Execute the one F4-authorized exact-head merge retry (F5d).
 
@@ -1612,8 +1816,22 @@ def _compose_task_authorized_merge_retry(
     propagate for the F5b coordinator's typed Level 2 handoff. A successful
     merge completes the Task through the shared completion seam; no Owner
     approval, gate presentation, or wakeup scheduling exists here (F12 #316
-    owns the due-time wakeups).
+    owns the due-time wakeups, and this composition performs the
+    worker-local bounded due wait before the service — the persisted
+    ``not_before`` stays authoritative).
     """
+    pool = dependencies.database_pool()
+    # F12 (issue #316): the worker-local bounded backoff — wait only until
+    # the persisted ``not_before``, outside any transaction, before the
+    # service re-proves everything authoritatively.
+    _wait_until_retry_due(
+        pool,
+        workspace_id=UUID(payload.task.workspace_id),
+        task_id=UUID(payload.task.task_id),
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        clock=clock,
+        due_wait=due_wait,
+    )
     execute_authorized_merge_retry(
         dependencies.database_pool(),
         dependencies.github_client(),
@@ -1635,6 +1853,8 @@ def _compose_task_pr_authorization_retry(
     *,
     dependencies: OperationDependencies,
     attempt_evidence: InvocationAttemptEvidence | None = None,
+    clock: Callable[[], datetime] | None = None,
+    due_wait: Callable[[float], None] | None = None,
 ) -> None:
     """Execute the one F4-authorized presentation retry (F5f, issue #269).
 
@@ -1645,8 +1865,22 @@ def _compose_task_pr_authorization_retry(
     re-presentation's operational error propagates for the F5b coordinator's
     typed Level 2 handoff with the consumed attempt as the PRIOR_AUTHORIZED
     reporting source; its workflow-semantic refusals are Level 1 outcomes.
-    No wakeup scheduling exists here (F12 #316 owns the due-time wakeups).
+    No wakeup scheduling exists here (F12 #316 owns the due-time wakeups,
+    and this composition performs the worker-local bounded due wait before
+    the service — the persisted ``not_before`` stays authoritative).
     """
+    pool = dependencies.database_pool()
+    # F12 (issue #316): the worker-local bounded backoff — wait only until
+    # the persisted ``not_before``, outside any transaction, before the
+    # service re-proves everything authoritatively.
+    _wait_until_retry_due(
+        pool,
+        workspace_id=UUID(payload.task.workspace_id),
+        task_id=UUID(payload.task.task_id),
+        retry_attempt_id=UUID(payload.retry_attempt_id),
+        clock=clock,
+        due_wait=due_wait,
+    )
     execute_authorized_pr_authorization_retry(
         dependencies.database_pool(),
         dependencies.github_client(),
@@ -1942,6 +2176,12 @@ def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
                 OperationInvocation(kind=kind, payload=payload),
                 dependencies=dependencies,
                 attempt_evidence=evidence,
+            ),
+            # F12 (issue #316): the committed RETRY_AUTHORIZED disposition's
+            # one post-commit F1 retry handoff goes through the executing
+            # process's own submission seam, resolved at submit time.
+            retry_submission=F1AuthorizedRetrySubmission(
+                dependencies.continuation_submitter
             ),
         )
 

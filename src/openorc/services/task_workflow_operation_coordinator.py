@@ -8,8 +8,9 @@ operational failure supplies F4's disposition service
 triage_operational_failure`) with stable typed classification and independently
 verified durable attempt/effect evidence. It implements no recovery policy of
 its own: F4's dispositions are authoritative, the durably authorized retry is
-never consumed here (F5c owns that consumption, F12 #316 the wakeups), and the
-original exception always propagates unchanged so the F1 sanitized unchained
+never consumed here (F5c owns that consumption), F12 (#316) arranges the
+retry's one post-commit F1 handoff through the optional submission seam, and
+the original exception always propagates unchanged so the F1 sanitized unchained
 worker-error report is preserved.
 
 Applicability and classification are strictly type-based:
@@ -159,7 +160,12 @@ from openorc.services.operation_attempt_evidence import (
     ProducedAttemptIdentity,
 )
 from openorc.services.pull_request_merge import MergeRequestSendUncertainError
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmission,
+    arrange_authorized_retry,
+)
 from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
     OperationalFailureDisposition,
     OperationalFailureOperation,
     OperationalFailureReport,
@@ -1030,6 +1036,7 @@ def coordinate_task_workflow_operation(
     expected_state_token: UUID,
     invoke_level_one: Callable[[InvocationAttemptEvidence], None],
     triage: Callable[..., OperationalFailureDisposition] | None = None,
+    retry_submission: AuthorizedRetrySubmission | None = None,
 ) -> None:
     """Run one Level 1 Task-workflow operation with the typed failure handoff.
 
@@ -1041,11 +1048,23 @@ def coordinate_task_workflow_operation(
     identity, an incoherent one, or a workflow-semantic error type fails
     closed with no triage call.
 
+    When F4's committed disposition authorizes the bounded Level 2 retry, the
+    coordinator arranges exactly one typed F1 retry invocation for the exact
+    authorized attempt — strictly after F4's transaction committed, never
+    sleeping, never submitting inside a transaction, and never failing the
+    already-committed authorization (F12, issue #316). The executing F1
+    worker/job owns the remaining ``not_before`` wait and the existing F5
+    service owns admission; the original exception still propagates unchanged
+    below.
+
     ``expected_status`` is the coarse Task status the operation addressed;
     ``expected_state_token`` is the invocation payload's currentness seed,
     which Level 1's own authoritative rotations (recorded at their commit
     points) supersede in the collector. ``triage`` is injectable for
     fake-backed tests and defaults to the real F4 disposition service.
+    ``retry_submission`` is the optional post-commit F1 submission seam; an
+    unwired seam arranges nothing and the committed authorization row owns
+    recovery.
     """
     evidence = InvocationAttemptEvidence()
     evidence.record_task_token(expected_state_token)
@@ -1135,11 +1154,35 @@ def coordinate_task_workflow_operation(
                     type(triage_error).__name__,
                 )
             if disposition is not None:
+                retry_attempt = getattr(disposition, "retry_attempt", None)
+                if (
+                    disposition.kind is DispositionKind.RETRY_AUTHORIZED
+                    and retry_attempt is not None
+                ):
+                    # F12 (issue #316): the durably authorized bounded retry's
+                    # ONE post-commit F1 handoff — arranged strictly after
+                    # F4's transaction committed, contained so it can never
+                    # mask or replace the original Level 1 failure that is
+                    # still about to propagate. A refused or uncertain
+                    # submission never consumes, undoes, or replays the
+                    # authorization: the committed row stays outstanding for
+                    # the bounded startup recovery.
+                    arrange_authorized_retry(
+                        retry_submission,
+                        workspace_id=workspace_id,
+                        task_id=task_id,
+                        profile_id=profile_id,
+                        retry_attempt_id=retry_attempt.id,
+                        expected_state_token=current_token,
+                        family=resolved.operation.family,
+                        origin="task_workflow_operation_coordinator",
+                    )
                 # Every disposition is authoritative and final here. The
                 # authorized retry is recorded but never consumed, replayed,
-                # or scheduled: F5c owns the execution attempt and F12 #316
-                # the due wakeups. BLOCKED and every no-op already applied their
-                # (or no) durable effect inside F4's own composition.
+                # or scheduled here: F5c owns the execution attempt and the
+                # executing F1 worker/job owns the due wait. BLOCKED and
+                # every no-op already applied their (or no) durable effect
+                # inside F4's own composition.
                 logger.debug(
                     "operational-failure disposition applied (kind=%s)",
                     disposition.kind.value,
