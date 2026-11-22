@@ -151,29 +151,32 @@ def _serving_lifespan(
             observer = _build_detached_turn_observer(dependencies)
             observer.start()
             await asyncio.to_thread(observer.reconcile_durable_outstanding_sessions)
-            # The F11 bounded post-restart Task-queue recovery (issue #257),
-            # beside the reconciliation above: re-arrange lost capacity wakes
-            # for the persisted queued Tasks and recover a lost F1
-            # planning-bootstrap handoff only where the durable state
-            # positively proves the bootstrap was never consumed. Scheduling
-            # only — a failed pass is contained and the next supported
-            # trigger revisits the rest; the durable queued facts own
-            # recovery.
-            try:
-                await asyncio.to_thread(
-                    arrange_task_queue_recovery,
-                    dependencies.database_pool(),
-                    build_operation_submitter(settings, local_executor=None),
-                )
-            except Exception as error:  # noqa: BLE001 - contained recovery pass
-                logger.warning(
-                    "the bounded task-queue recovery pass failed (error type %s); "
-                    "the durable queued facts own recovery until the next trigger",
-                    type(error).__name__,
-                )
+        submitter = build_operation_submitter(settings, local_executor=executor)
+        # The F11 bounded post-restart Task-queue recovery (issue #257), off
+        # the event loop in BOTH execution modes: re-arrange lost capacity
+        # wakes for the persisted queued Tasks and recover a lost F1
+        # planning-bootstrap handoff only where the durable state positively
+        # proves the bootstrap was never consumed. Regular mode delivers the
+        # recovered arrangements through its own bounded local executor;
+        # queue mode submits them to the canonical queue beside the
+        # reconciliation above. Scheduling only — a failed pass is contained
+        # and the next supported trigger revisits the rest; the durable
+        # queued facts own recovery.
+        try:
+            await asyncio.to_thread(
+                arrange_task_queue_recovery,
+                dependencies.database_pool(),
+                submitter,
+            )
+        except Exception as error:  # noqa: BLE001 - contained recovery pass
+            logger.warning(
+                "the bounded task-queue recovery pass failed (error type %s); "
+                "the durable queued facts own recovery until the next trigger",
+                type(error).__name__,
+            )
         app.state.operation_executor = executor
         app.state.detached_turn_observer = observer
-        app.state.operation_submitter = build_operation_submitter(settings, local_executor=executor)
+        app.state.operation_submitter = submitter
         try:
             yield
         finally:

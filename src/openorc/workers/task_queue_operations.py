@@ -38,7 +38,7 @@ Composition rules enforced by this module:
   uncertain submission is returned as such — the arranging service treats
   the committed state as authoritative and never replays.
 - Recovery (bounded, scheduling-only): :func:`arrange_task_queue_recovery`
-  — wired beside the queue-mode hosting process's startup reconciliation —
+  — wired into the serving process's startup in both execution modes —
   derives restart candidates from the persisted ``queued`` Tasks and the
   unclaimed ``planning`` bootstrap facts alone. Lost wakes are re-arranged
   per Workspace; a lost F1 bootstrap handoff is submitted only where the
@@ -273,16 +273,18 @@ def arrange_task_queue_recovery(
 ) -> None:
     """One bounded post-restart Task-queue recovery pass (issue #257).
 
-    The supported recovery trigger beside the queue-mode hosting process's
-    existing startup reconciliation: derive the candidates from the
-    persisted ``queued`` Tasks and the unclaimed ``planning`` bootstrap facts
-    alone, and arrange the corresponding bounded wakes and bootstrap handoffs
-    through the executing process's submitter. Every candidate is re-proven
-    from committed state at arrangement time; a candidate whose durable facts
-    moved on submits nothing. Wake and bootstrap submissions are contained —
-    a refused, uncertain, or lost arrangement never fails the recovery pass,
-    never replays a claimed or uncertain runtime turn, and the next
-    supported trigger revisits the rest.
+    The supported recovery trigger wired into the serving process's startup
+    in both execution modes — beside the queue-mode hosting process's
+    durable restart reconciliation, and beside the regular-mode serving
+    process's local-executor ownership: derive the candidates from the
+    persisted ``queued`` Tasks and the unclaimed ``planning`` bootstrap
+    facts alone, and arrange the corresponding bounded wakes and bootstrap
+    handoffs through the executing process's submitter. Every candidate is
+    re-proven from committed state at arrangement time; a candidate whose
+    durable facts moved on submits nothing. Wake and bootstrap submissions
+    are contained — a refused, uncertain, or lost arrangement never fails
+    the recovery pass, never replays a claimed or uncertain runtime turn,
+    and the next supported trigger revisits the rest.
     """
     bridge = F1TaskQueueWakeSubmission(submitter)
     for workspace_id in list_task_queue_recovery_workspaces(pool, limit=subject_budget):
