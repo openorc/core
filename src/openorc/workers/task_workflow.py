@@ -517,8 +517,7 @@ class F1AuthorizedRetrySubmission:
             # The arranging service only ever hands a supported family;
             # anything else fails closed before any submission.
             raise InvalidInvocationError(
-                "no authorized-retry operation kind is registered for family "
-                f"{str(family)!r}"
+                f"no authorized-retry operation kind is registered for family {str(family)!r}"
             )
         if kind is OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY:
             payload: (
@@ -964,9 +963,7 @@ def _handoff_implementation_completion(
         # arranges its one post-commit F1 handoff through the executing
         # process's own submission seam, resolved at submit time — never
         # sleeping on this handoff.
-        retry_submission=F1AuthorizedRetrySubmission(
-            dependencies.continuation_submitter
-        ),
+        retry_submission=F1AuthorizedRetrySubmission(dependencies.continuation_submitter),
     )
 
 
@@ -2180,9 +2177,7 @@ def _task_workflow_handler(kind: OperationKind) -> OperationHandler:
             # F12 (issue #316): the committed RETRY_AUTHORIZED disposition's
             # one post-commit F1 retry handoff goes through the executing
             # process's own submission seam, resolved at submit time.
-            retry_submission=F1AuthorizedRetrySubmission(
-                dependencies.continuation_submitter
-            ),
+            retry_submission=F1AuthorizedRetrySubmission(dependencies.continuation_submitter),
         )
 
     return handler

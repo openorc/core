@@ -1216,9 +1216,7 @@ def test_a_settled_retry_authorization_arranges_the_f1_handoff_after_the_commit(
     assert arranged["profile_id"] == owner_profile_id
     assert arranged["retry_attempt_id"] == arrangement_attempt_id
     assert arranged["expected_state_token"] == _STATE_TOKEN
-    assert (
-        arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
-    )
+    assert arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
 
 
 # --- the settlement entry ------------------------------------------------------------

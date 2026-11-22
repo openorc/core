@@ -3231,9 +3231,7 @@ def test_the_f1_authorized_retry_submission_maps_each_supported_family(
     merge_payload = cast(TaskAuthorizedMergeRetryPayload, submitter.submissions[1].payload)
     assert merge_payload.task == _TASK_SCOPE_REVIEWER
     assert merge_payload.retry_attempt_id == str(_OWNER_GATE_ID)
-    presentation_payload = cast(
-        TaskPrAuthorizationRetryPayload, submitter.submissions[2].payload
-    )
+    presentation_payload = cast(TaskPrAuthorizationRetryPayload, submitter.submissions[2].payload)
     assert presentation_payload.task == _TASK_SCOPE_PRODUCER
     assert presentation_payload.retry_attempt_id == str(_OWNER_GATE_ID)
 

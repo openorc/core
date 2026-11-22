@@ -82,9 +82,7 @@ def test_the_lookup_enumerates_the_latest_outstanding_attempt_per_episode() -> N
         ],
     )
 
-    candidates = list_outstanding_authorized_retry_attempts(
-        _pool(conn), limit=50
-    )
+    candidates = list_outstanding_authorized_retry_attempts(_pool(conn), limit=50)
 
     assert len(candidates) == 2
     first = candidates[0]
@@ -93,10 +91,7 @@ def test_the_lookup_enumerates_the_latest_outstanding_attempt_per_episode() -> N
     assert first.task_id == _TASK_ID
     assert first.episode_id == _EPISODE_ID
     assert first.ordinal == 2
-    assert (
-        first.operation_family
-        is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
-    )
+    assert first.operation_family is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
     assert first.not_before == _UTC_OBSERVED  # normalized to timezone-aware UTC
     assert candidates[1].operation_family is GitHubMergeOperation.EXACT_HEAD_MERGE
 

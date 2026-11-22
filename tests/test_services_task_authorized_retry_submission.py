@@ -80,9 +80,7 @@ def test_an_accepted_arrangement_carries_the_exact_facts() -> None:
 
 def test_a_refused_arrangement_is_reported_not_replayed() -> None:
     """A known refusal is returned as transport information only."""
-    submission = _RecordingSubmission(
-        outcome=AuthorizedRetrySubmissionOutcome.KNOWN_REFUSED
-    )
+    submission = _RecordingSubmission(outcome=AuthorizedRetrySubmissionOutcome.KNOWN_REFUSED)
     outcome = arrange_authorized_retry(submission, origin="test", **_submit())
 
     assert outcome is AuthorizedRetrySubmissionOutcome.KNOWN_REFUSED

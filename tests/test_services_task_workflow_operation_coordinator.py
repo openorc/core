@@ -765,9 +765,7 @@ def test_a_retry_authorized_disposition_arranges_one_f1_retry_after_the_commit(
     assert arranged["profile_id"] == _PROFILE_ID
     assert arranged["retry_attempt_id"] == _ATTEMPT_ID
     assert arranged["expected_state_token"] == _PAYLOAD_TOKEN
-    assert (
-        arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
-    )
+    assert arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
     # The arrangement never replays Level 1, never consumes the
     # authorization, and never masks the original failure.
     assert triage.call_count == 1

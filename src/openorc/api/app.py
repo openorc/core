@@ -90,9 +90,7 @@ def _build_detached_turn_observer(
         # after the settlement committed, through this process's own
         # submission seam resolved at submit time. Never sleeping on the
         # settlement path — the executing F1 worker/job owns the due wait.
-        retry_submission=F1AuthorizedRetrySubmission(
-            dependencies.continuation_submitter
-        ),
+        retry_submission=F1AuthorizedRetrySubmission(dependencies.continuation_submitter),
     )
 
 

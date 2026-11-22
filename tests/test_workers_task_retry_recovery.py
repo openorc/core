@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,6 +22,7 @@ from openorc.domain.operational_failures import (
 )
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.tasks import TaskStatus
+from openorc.persistence.pool import DatabasePool
 from openorc.workers import task_retry_recovery
 from openorc.workers.invocation import (
     OperationInvocation,
@@ -46,6 +47,10 @@ _ATTEMPT_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000004")
 _EPISODE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000005")
 _STATE_TOKEN = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000006")
 _NOT_BEFORE = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+
+# The recovery pass's pool is never touched under these fakes — every
+# persistence seam is patched — so one inert stand-in satisfies the signature.
+_UNUSED_POOL = cast(DatabasePool, object())
 
 
 class _RecordingSubmitter:
@@ -156,7 +161,8 @@ def test_recovery_submits_the_same_typed_retry_invocation_for_each_family(
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     assert [entry.kind for entry in submitter.submissions] == [
@@ -207,7 +213,8 @@ def test_recovery_skips_a_candidate_whose_durable_facts_moved_on(
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     assert [entry.kind for entry in submitter.submissions] == [
@@ -227,7 +234,8 @@ def test_a_missing_task_or_workspace_submits_nothing(
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
     assert submitter.submissions == []
 
@@ -235,7 +243,8 @@ def test_a_missing_task_or_workspace_submits_nothing(
     recovery_harness.workspaces.clear()
     submitter = _RecordingSubmitter()
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
     assert submitter.submissions == []
 
@@ -257,7 +266,8 @@ def test_a_refused_recovery_arrangement_is_contained(
     )
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     assert len(submitter.submissions) == 1  # attempted exactly once
@@ -275,13 +285,16 @@ def test_the_recovery_pass_is_bounded_by_its_subject_budget(
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     assert recovery_harness.calls == [(task_retry_recovery._RECOVERY_SUBJECT_BUDGET, None)]
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter, subject_budget=7  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
+        subject_budget=7,
     )
 
     assert recovery_harness.calls[-1] == (7, None)
@@ -303,7 +316,8 @@ def test_recovery_pages_past_a_stale_batch_to_reach_a_later_attempt(
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     # The valid attempt behind the stale batch was arranged.
@@ -326,14 +340,14 @@ def test_the_recovery_pass_is_bounded_by_its_page_budget(
     """The pass examines at most its bounded page count — a paging bound,
     never a scheduler; the next supported trigger revisits the rest."""
     stale_pages = [
-        recovery_harness.stale_page()
-        for _ in range(task_retry_recovery._RECOVERY_PAGE_BUDGET + 2)
+        recovery_harness.stale_page() for _ in range(task_retry_recovery._RECOVERY_PAGE_BUDGET + 2)
     ]
     recovery_harness.pages = list(stale_pages)
     submitter = _RecordingSubmitter()
 
     task_retry_recovery.arrange_task_retry_recovery(
-        object(), submitter  # type: ignore[arg-type]
+        _UNUSED_POOL,
+        submitter,
     )
 
     assert len(recovery_harness.calls) == task_retry_recovery._RECOVERY_PAGE_BUDGET
