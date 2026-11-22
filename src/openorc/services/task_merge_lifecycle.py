@@ -125,6 +125,10 @@ from openorc.services.github_owner_write_authorization import (
 )
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmission,
+    arrange_authorized_retry,
+)
 from openorc.services.task_exceptional_blocking import install_exceptional_block_gate
 from openorc.services.task_level3_blocking_catalog import classify_blocking_case
 from openorc.services.task_operational_failure_triage import (
@@ -695,6 +699,7 @@ def request_task_merge(
     owner_gate_id: UUID,
     expected_state_token: UUID,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+    retry_submission: AuthorizedRetrySubmission | None = None,
 ) -> TaskMergeOutcome:
     """Command the gate's exact GitHub merge as the current Owner merge decision.
 
@@ -711,7 +716,11 @@ def request_task_merge(
     by which external effect actually occurred; see
     :class:`TaskMergeOutcomeKind`. A newly applied completion forwards the
     optionally supplied F10 cleanup submission seam (issue #256) to the
-    shared completion seam's post-commit arrangement.
+    shared completion seam's post-commit arrangement, and a durably
+    authorized merge retry (F4, #251) arranges its one typed F1 wake through
+    the optionally supplied F12 retry submission seam (issue #316) strictly
+    after the authorization committed — an unwired seam arranges nothing and
+    the committed authorization row owns recovery.
     """
     _require_uuid_command(profile_id, "profile_id")
     _require_uuid_command(workspace_id, "workspace_id")
@@ -915,6 +924,7 @@ def request_task_merge(
                 expected_head_sha=reconciled.head_sha,
                 adapter_cause=error.__cause__,
                 terminal_finalization_submission=terminal_finalization_submission,
+                retry_submission=retry_submission,
             )
 
         except ExternalOperationUncertainError:
@@ -1081,6 +1091,7 @@ def _classify_after_uncertain_merge_send(
     expected_head_sha: str,
     adapter_cause: BaseException | None,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+    retry_submission: AuthorizedRetrySubmission | None = None,
 ) -> TaskMergeOutcome:
     """Classify the merge mutation send's own unknown outcome (F5d, issue #267).
 
@@ -1214,6 +1225,24 @@ def _classify_after_uncertain_merge_send(
             workspace_id=workspace_id,
             task_id=task_id,
             expected_state_token=expected_state_token,
+        )
+        # F12 (issue #316): the authorized merge retry's ONE post-commit F1
+        # handoff — arranged strictly after F4's authorization committed,
+        # with the freshly re-proved current token, and contained so a
+        # refused or uncertain submission never changes the truthful Owner
+        # merge outcome below. The executing F1 worker/job owns the
+        # remaining ``not_before`` wait and the existing F5d service owns
+        # admission; the committed row stays outstanding for the bounded
+        # startup recovery either way.
+        arrange_authorized_retry(
+            retry_submission,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            profile_id=profile_id,
+            retry_attempt_id=retry_attempt.id,
+            expected_state_token=current.state_token,
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+            origin="task_merge_lifecycle.request_task_merge",
         )
         return TaskMergeOutcome(
             kind=TaskMergeOutcomeKind.RETRY_AUTHORIZED,

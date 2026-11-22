@@ -131,6 +131,7 @@ from openorc.services.errors import (
     NotFoundError,
     ObservationRegistrationRefusedError,
 )
+from openorc.services.task_authorized_retry_submission import AuthorizedRetrySubmission
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
 from openorc.services.task_detached_turn_correlation import (
     TurnEvidenceClassifier,
@@ -449,12 +450,21 @@ class DetachedTurnObservationHost:
         control_endpoint_resolver: EndpointResolver,
         completion_handoff: DetachedTurnCompletionHandoff | None = None,
         cost_limit_interrupt_dispatch: InterruptDispatch | None = None,
+        retry_submission: AuthorizedRetrySubmission | None = None,
     ) -> None:
         self._pool_provider = database_pool_provider
         self._source = observation_source
         self._credential_resolver = runtime_credential_resolver
         self._endpoint_resolver = control_endpoint_resolver
         self._completion_handoff = completion_handoff
+        # The F12 (issue #316) post-settlement authorized-retry submission
+        # seam: the composition root supplies it so a settled observed
+        # failure's committed RETRY_AUTHORIZED disposition arranges its one
+        # typed F1 retry invocation strictly after the settlement committed.
+        # An unwired seam arranges nothing; the committed authorization row
+        # owns recovery. The seam never sleeps on this settlement path — the
+        # executing F1 worker/job owns the due wait.
+        self._retry_submission = retry_submission
         # The composition-rooted post-commit Interrupt dispatcher (issue
         # #341): the host drives the shared cost-evaluation engine with it
         # only when BOTH trusted seams exist — the source's neutral usage
@@ -1290,6 +1300,10 @@ class DetachedTurnObservationHost:
                     workspace_id=entry.workspace_id,
                     connection_id=entry.connection_id,
                     evidence=evidence,
+                    # The F12 (issue #316) post-settlement authorized-retry
+                    # seam: an unwired host arranges nothing and the
+                    # committed authorization row owns recovery either way.
+                    retry_submission=self._retry_submission,
                 )
             except Exception as error:  # noqa: BLE001 - best-effort ingestion
                 logger.warning(

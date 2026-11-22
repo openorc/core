@@ -48,6 +48,7 @@ from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
 from openorc.domain.operational_failures import (
     FailureEffectEvidence,
+    OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
@@ -59,6 +60,9 @@ from openorc.persistence.pool import DatabasePool
 from openorc.protocol.models import ImplementationResult, PrResult, WorkspaceResult
 from openorc.services import task_detached_turn_correlation as correlation_module
 from openorc.services.errors import ConflictError, InvalidCommandError, StaleOperationError
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmissionOutcome,
+)
 from openorc.services.task_detached_turn_correlation import (
     TurnSettlementKind,
     TurnSettlementOutcome,
@@ -69,6 +73,10 @@ from openorc.services.task_detached_turn_correlation import (
     classify_acknowledged_turn_status,
     record_task_detached_turn_receipt,
     settle_observed_turn_completion,
+)
+from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
+    OperationalFailureDisposition,
 )
 from tests.fakes.agent_runtime import implementation_result_candidate, pr_result_candidate
 from tests.fakes.task_rows import task_row
@@ -1107,6 +1115,108 @@ def test_the_observed_failure_of_a_detached_authorized_retry_reports_prior_autho
     assert report.reporting_attempt_id == _F4_ATTEMPT_ID
     assert report.effect_attempt_id == _RETRY_EXECUTION_ID
     assert report.effect_evidence is FailureEffectEvidence.KNOWN_FAILED
+
+
+def test_a_settled_retry_authorization_arranges_the_f1_handoff_after_the_commit(
+    triage: _RecordingTriage,
+) -> None:
+    """F12 (issue #316): a settled observed failure whose committed Level 2
+    disposition durably authorized the bounded retry arranges exactly one
+    typed F1 retry invocation for the exact authorized attempt — strictly
+    after the settlement transaction committed, never sleeping on this
+    settlement path, and with the re-proved current Task facts."""
+    arrangement_attempt_id = uuid4()
+    owner_profile_id = uuid4()
+    attempt = OperationalFailureAttempt(
+        id=arrangement_attempt_id,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        episode_id=_EPISODE_ID,
+        ordinal=2,
+        source_kind=OperationalFailureSourceKind.PRIOR_AUTHORIZED,
+        source_attempt_id=_F4_ATTEMPT_ID,
+        error_code=OperationalFailureCode.RUNTIME_UNAVAILABLE,
+        not_before=_OBSERVED,
+        resulting_execution_id=None,
+        consumed_at=None,
+        created_at=_OBSERVED,
+    )
+    triage.disposition = OperationalFailureDisposition(
+        kind=DispositionKind.RETRY_AUTHORIZED, retry_attempt=attempt
+    )
+    submission_calls: list[dict[str, Any]] = []
+
+    class _ArrangedSeam:
+        def submit(self, **kwargs: Any) -> Any:
+            submission_calls.append(kwargs)
+            return AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+    conn = ScriptedConnection()
+    _script_binding_lookup(conn)
+    _script_outstanding_receipt(
+        conn,
+        _receipt_row(
+            status="admitted",
+            admitted_turn_reference=_TURN_REFERENCE,
+            original_attempt_id=_RETRY_EXECUTION_ID,
+        ),
+    )
+    _script_last_consumed_sequence(conn, None)
+    _script_execution_read(conn, _execution_row(execution_id=_RETRY_EXECUTION_ID))
+    _script_task_lock(conn)
+    _script_implementation_subject(conn)
+    _script_execution_lock(conn, _execution_row(execution_id=_RETRY_EXECUTION_ID))
+    _script_fail_execution(conn, execution_id=_RETRY_EXECUTION_ID)
+    _script_event_insert(
+        conn,
+        event_type=WorkflowEventType.EXECUTION_FAILED,
+        failure_kind="observed_run_failure",
+        execution_id=_RETRY_EXECUTION_ID,
+    )
+    _script_settle(
+        conn, _settled_row("observed_failure", marker=None, original_attempt_id=_RETRY_EXECUTION_ID)
+    )
+    # The post-commit arrangement re-derives the Task and the Workspace from
+    # committed state with repeatable reads.
+    conn.on_repeat(
+        _sql_has_not("from openorc.tasks where id = %s", absent="for update"),
+        task_row(
+            id=_TASK_ID,
+            workspace_id=_WORKSPACE_ID,
+            status="implementing",
+            state_token=_STATE_TOKEN,
+            source_requirements_fingerprint="a" * 64,
+            current_plan_revision_id=uuid4(),
+        ),
+    )
+    _script_failure_binding_lookup(conn, _retry_bound_attempt_row())
+    conn.on(
+        _sql_has("from openorc.operational_failure_episodes", "where id = %s"),
+        _retry_episode_row(),
+    )
+    conn.on_repeat(
+        _sql_has("from openorc.workspaces", "where id = %s"),
+        (_WORKSPACE_ID, owner_profile_id, "platform", _OBSERVED, _OBSERVED, 5, "", None),
+    )
+
+    outcome = settle_observed_turn_completion(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        connection_id=_CONNECTION_ID,
+        classifier=_CLASSIFIER,
+        evidence=_terminal_evidence(marker=None, candidate=None),
+        retry_submission=_ArrangedSeam(),
+    )
+
+    assert outcome.kind is TurnSettlementKind.SETTLED_OBSERVED_FAILURE
+    assert len(submission_calls) == 1
+    arranged = submission_calls[0]
+    assert arranged["workspace_id"] == _WORKSPACE_ID
+    assert arranged["task_id"] == _TASK_ID
+    assert arranged["profile_id"] == owner_profile_id
+    assert arranged["retry_attempt_id"] == arrangement_attempt_id
+    assert arranged["expected_state_token"] == _STATE_TOKEN
+    assert arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
 
 
 # --- the settlement entry ------------------------------------------------------------

@@ -54,6 +54,7 @@ from openorc.workers.invocation import (
     QueueWakePayload,
     RQQueueOperationSubmission,
     SubmissionOutcome,
+    SubmissionRefusalReason,
     SubmissionResult,
     TaskAuthorizedImplementationPayload,
     TaskAuthorizedImplementationRetryPayload,
@@ -3078,3 +3079,291 @@ def test_the_completion_handoff_terminal_cleanup_route_propagates_failure(
             operation=PendingTaskRuntimeInteractionOperation.TERMINAL_CLEANUP,
         )
     assert submitter.submissions == []
+
+
+# --- F12 (issue #316): worker-local due wait and the F1 retry bridge ---------
+
+
+def _retry_attempt(**overrides: Any) -> Any:
+    """One fake durably authorized attempt for the due-wait reads."""
+    facts: dict[str, Any] = {
+        "workspace_id": _WORKSPACE_ID,
+        "task_id": _TASK_ID,
+        "not_before": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    facts.update(overrides)
+    return SimpleNamespace(**facts)
+
+
+def _merge_retry_payload() -> TaskAuthorizedMergeRetryPayload:
+    return TaskAuthorizedMergeRetryPayload(
+        task=_TASK_SCOPE_REVIEWER,
+        profile_id=str(_PROFILE_ID),
+        retry_attempt_id=str(_OWNER_GATE_ID),
+        expected_state_token=str(_STATE_TOKEN),
+    )
+
+
+def test_a_future_due_retry_waits_only_its_remaining_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The F12 worker-local due wait requests exactly the remaining delay.
+
+    The fixed clock and the injected recording wait prove the composition
+    waits only until the persisted ``not_before`` — never wall-clock, never a
+    scheduler — and then invokes the existing F5d service.
+    """
+    fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+    reads: list[UUID] = []
+
+    def fake_attempt_read(_pool: Any, *, attempt_id: UUID) -> Any:
+        reads.append(attempt_id)
+        return _retry_attempt(not_before=datetime(2026, 1, 1, 0, 0, 3, tzinfo=UTC))
+
+    monkeypatch.setattr(
+        task_workflow.operational_failure_records,
+        "get_operational_failure_attempt",
+        fake_attempt_read,
+    )
+    waits: list[float] = []
+    merge_retry = RecordingService(result=None)
+    dependencies, _submitter = make_dependencies()
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow._compose_task_authorized_merge_retry(
+            _merge_retry_payload(),
+            dependencies=dependencies,
+            clock=lambda: fixed_now,
+            due_wait=waits.append,
+        )
+
+    assert reads == [_OWNER_GATE_ID]
+    assert waits == [3.0]
+    assert merge_retry.call_count == 1
+
+
+def test_an_already_due_retry_invokes_the_service_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-due authorization invokes the F5d service with no wait."""
+    fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(
+        task_workflow.operational_failure_records,
+        "get_operational_failure_attempt",
+        lambda _pool, *, attempt_id: _retry_attempt(not_before=fixed_now),
+    )
+    waits: list[float] = []
+    merge_retry = RecordingService(result=None)
+    dependencies, _submitter = make_dependencies()
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow._compose_task_authorized_merge_retry(
+            _merge_retry_payload(),
+            dependencies=dependencies,
+            clock=lambda: fixed_now,
+            due_wait=waits.append,
+        )
+
+    assert waits == []
+    assert merge_retry.call_count == 1
+
+
+def test_the_f1_authorized_retry_submission_maps_each_supported_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each supported F4 family maps to its existing F1 retry kind, role, and
+    exact payload facts through the one worker-layer bridge."""
+    from openorc.domain.operational_failures import (
+        GitHubMergeOperation,
+        PRAuthorizationPresentationOperation,
+    )
+    from openorc.services.task_authorized_retry_submission import (
+        AuthorizedRetrySubmissionOutcome,
+    )
+
+    submitter = FakeSubmitter()
+    bridge = task_workflow.F1AuthorizedRetrySubmission(lambda: submitter)
+
+    assert (
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+        )
+        is AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    )
+    assert (
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        )
+        is AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    )
+    assert (
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION,
+        )
+        is AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+    )
+
+    assert [entry.kind for entry in submitter.submissions] == [
+        OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY,
+        OperationKind.TASK_AUTHORIZED_MERGE_RETRY,
+        OperationKind.TASK_PR_AUTHORIZATION_RETRY,
+    ]
+    implementation_payload = cast(
+        TaskAuthorizedImplementationRetryPayload, submitter.submissions[0].payload
+    )
+    assert implementation_payload.task == _TASK_SCOPE_PRODUCER
+    assert implementation_payload.profile_id == str(_PROFILE_ID)
+    assert implementation_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+    assert implementation_payload.expected_state_token == str(_STATE_TOKEN)
+    merge_payload = cast(TaskAuthorizedMergeRetryPayload, submitter.submissions[1].payload)
+    assert merge_payload.task == _TASK_SCOPE_REVIEWER
+    assert merge_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+    presentation_payload = cast(TaskPrAuthorizationRetryPayload, submitter.submissions[2].payload)
+    assert presentation_payload.task == _TASK_SCOPE_PRODUCER
+    assert presentation_payload.retry_attempt_id == str(_OWNER_GATE_ID)
+
+
+def test_the_f1_authorized_retry_submission_maps_refusals_and_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known refusals and uncertain submissions map 1:1; an unsupported
+    family fails closed before any submission."""
+    from openorc.domain.operational_failures import (
+        GitHubMergeOperation,
+        ImplementationAuthorizationPresentationOperation,
+    )
+    from openorc.services.task_authorized_retry_submission import (
+        AuthorizedRetrySubmissionOutcome,
+    )
+
+    # A known refusal maps onto the shared vocabulary.
+    refused = FakeSubmitter(
+        outcomes=[
+            SubmissionResult(
+                outcome=SubmissionOutcome.KNOWN_REFUSED,
+                refusal_reason=SubmissionRefusalReason.QUEUE_UNAVAILABLE,
+            )
+        ]
+    )
+    bridge = task_workflow.F1AuthorizedRetrySubmission(lambda: refused)
+    assert (
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        )
+        is AuthorizedRetrySubmissionOutcome.KNOWN_REFUSED
+    )
+
+    # An uncertain submission stays uncertain — never a known non-delivery.
+    uncertain = FakeSubmitter(outcomes=[SubmissionResult.uncertain()])
+    bridge = task_workflow.F1AuthorizedRetrySubmission(lambda: uncertain)
+    assert (
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=GitHubMergeOperation.EXACT_HEAD_MERGE,
+        )
+        is AuthorizedRetrySubmissionOutcome.UNCERTAIN
+    )
+
+    # A family with no supported retry operation fails closed before any
+    # submission: the arranging service only ever hands a supported family.
+    unsupported = FakeSubmitter()
+    bridge = task_workflow.F1AuthorizedRetrySubmission(lambda: unsupported)
+    with pytest.raises(InvalidInvocationError, match="no authorized-retry operation kind"):
+        bridge.submit(
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            profile_id=_PROFILE_ID,
+            retry_attempt_id=_OWNER_GATE_ID,
+            expected_state_token=_STATE_TOKEN,
+            family=(
+                ImplementationAuthorizationPresentationOperation.EXACT_PLAN_IMPLEMENTATION_AUTHORIZATION_PRESENTATION
+            ),
+        )
+    assert unsupported.submissions == []
+
+
+def test_an_unreadable_or_moved_due_time_waits_nothing_and_still_invokes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing, foreign, or unreadable attempt waits nothing: the F5d
+    service re-proves the authorization authoritatively either way."""
+    fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+    waits: list[float] = []
+    dependencies, _submitter = make_dependencies()
+
+    # A missing attempt row.
+    merge_retry = RecordingService(result=None)
+    monkeypatch.setattr(
+        task_workflow.operational_failure_records,
+        "get_operational_failure_attempt",
+        lambda _pool, *, attempt_id: None,
+    )
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow._compose_task_authorized_merge_retry(
+            _merge_retry_payload(),
+            dependencies=dependencies,
+            clock=lambda: fixed_now,
+            due_wait=waits.append,
+        )
+    assert waits == []
+    assert merge_retry.call_count == 1
+
+    # A foreign-scope attempt.
+    merge_retry = RecordingService(result=None)
+    monkeypatch.setattr(
+        task_workflow.operational_failure_records,
+        "get_operational_failure_attempt",
+        lambda _pool, *, attempt_id: _retry_attempt(workspace_id=uuid4()),
+    )
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow._compose_task_authorized_merge_retry(
+            _merge_retry_payload(),
+            dependencies=dependencies,
+            clock=lambda: fixed_now,
+            due_wait=waits.append,
+        )
+    assert waits == []
+    assert merge_retry.call_count == 1
+
+    # An unreadable attempt (the read itself failed).
+    merge_retry = RecordingService(result=None)
+
+    def failing_read(_pool: Any, *, attempt_id: UUID) -> Any:
+        raise ConflictError("the due-time read failed")
+
+    monkeypatch.setattr(
+        task_workflow.operational_failure_records,
+        "get_operational_failure_attempt",
+        failing_read,
+    )
+    with patched_workflow_environment(monkeypatch, execute_merge_retry=merge_retry):
+        task_workflow._compose_task_authorized_merge_retry(
+            _merge_retry_payload(),
+            dependencies=dependencies,
+            clock=lambda: fixed_now,
+            due_wait=waits.append,
+        )
+    assert waits == []
+    assert merge_retry.call_count == 1

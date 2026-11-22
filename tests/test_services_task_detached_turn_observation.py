@@ -287,6 +287,7 @@ class _SettleRecorder:
     receipt: Any = None
     handoff_operation: Any = None
     calls: list[tuple[UUID, UUID, ObservedTurnEvidence]] = field(default_factory=list)
+    retry_submissions: list[Any] = field(default_factory=list)
 
     def __call__(
         self,
@@ -296,8 +297,10 @@ class _SettleRecorder:
         workspace_id: UUID,
         connection_id: UUID,
         evidence: ObservedTurnEvidence,
+        retry_submission: Any = None,
     ) -> TurnSettlementOutcome:
         self.calls.append((workspace_id, connection_id, evidence))
+        self.retry_submissions.append(retry_submission)
         return TurnSettlementOutcome(
             kind=self.outcome_kind,
             receipt=self.receipt,
@@ -945,6 +948,7 @@ def test_a_successor_registration_between_settlement_and_cleanup_keeps_the_obser
         workspace_id: UUID,
         connection_id: UUID,
         evidence: ObservedTurnEvidence,
+        retry_submission: Any = None,
     ) -> TurnSettlementOutcome:
         # Run A's atomic settlement released the outstanding-run constraint;
         # Run B legitimately registers during the settlement, before Run A's
@@ -1638,6 +1642,7 @@ def test_a_successor_registration_resets_the_attestation_epoch(
         workspace_id: UUID,
         connection_id: UUID,
         evidence: ObservedTurnEvidence,
+        retry_submission: Any = None,
     ) -> Any:
         # Run A's settlement: turn B registers FIRST — renewing the live
         # subscription and advancing to receipt B — and B's own attributed

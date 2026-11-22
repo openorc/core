@@ -42,15 +42,19 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 
 from openorc.domain.operational_failures import (
+    GitHubMergeOperation,
     OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureEpisode,
     OperationalFailureFamily,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
+    OutstandingAuthorizedRetryAttempt,
+    PRAuthorizationPresentationOperation,
     canonical_failure_subject,
     operational_failure_family_from_value,
 )
+from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
@@ -66,6 +70,7 @@ __all__ = [
     "get_operational_failure_episode",
     "get_operational_failure_episode_by_original_attempt",
     "list_operational_failure_attempts",
+    "list_outstanding_authorized_retry_attempts",
     "mark_episode_escalated",
 ]
 
@@ -78,6 +83,16 @@ _ATTEMPT_COLUMNS = (
     "id, workspace_id, task_id, episode_id, ordinal, source_kind, "
     "source_attempt_id, error_code, not_before, resulting_execution_id, "
     "consumed_at, created_at"
+)
+
+# The F12 startup-recovery enumeration's supported retry families (issue
+# #316): exactly the three families F4's eligibility matrix can authorize.
+# The per-family outstanding predicate is expressed beside them in the
+# lookup below; no other family ever yields a recovery candidate.
+_OUTSTANDING_RETRY_FAMILY_VALUES = (
+    PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
+    GitHubMergeOperation.EXACT_HEAD_MERGE.value,
+    PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION.value,
 )
 
 
@@ -114,6 +129,18 @@ def _attempt_from_row(row: Sequence[Any]) -> OperationalFailureAttempt:
         resulting_execution_id=row[9],
         consumed_at=None if row[10] is None else normalize_utc(row[10]),
         created_at=normalize_utc(row[11]),
+    )
+
+
+def _outstanding_from_row(row: Sequence[Any]) -> OutstandingAuthorizedRetryAttempt:
+    return OutstandingAuthorizedRetryAttempt(
+        attempt_id=row[0],
+        workspace_id=row[1],
+        task_id=row[2],
+        episode_id=row[3],
+        ordinal=row[4],
+        operation_family=operational_failure_family_from_value(row[5]),
+        not_before=normalize_utc(row[6]),
     )
 
 
@@ -415,3 +442,73 @@ def mark_episode_escalated(
             (escalated_task_block_id, episode_id, task_id, workspace_id),
         ).fetchone()
     return None if row is None else _episode_from_row(row)
+
+
+def list_outstanding_authorized_retry_attempts(
+    pool: DatabasePool,
+    *,
+    limit: int,
+    after_episode_id: UUID | None = None,
+) -> list[OutstandingAuthorizedRetryAttempt]:
+    """List the bounded startup-recovery retry candidates (F12, issue #316).
+
+    Exactly the latest authorized attempt of each non-escalated episode in a
+    supported retry family whose one-shot evidence still proves the
+    authorization unexecuted: an implementation-execution attempt without its
+    bound resulting Execution, or a merge/presentation attempt without its
+    consumption stamp. A predecessor attempt is always durably consumed by
+    the time a successor is authorized, so the per-episode maximum ordinal is
+    the only candidate.
+
+    The enumeration is additionally scoped to the coarse Task status each
+    supported family's executing service expects (the SQL expression of the
+    recovery's family→status expectations): a candidate whose Task has since
+    moved on is never enumerated at all, so historical candidates cannot
+    occupy — or permanently starve — the recovery pass's bounded budget. The
+    arranging worker still re-derives the exact current Task facts from
+    committed state at arrangement time.
+
+    Keyset paging orders by episode id — ``after_episode_id`` is a paging
+    hint, never authority — and ``limit`` bounds one page; the caller's next
+    page revisits the rest. The read never mutates the ledger, never clears
+    or rewrites history, and yields no workflow authority: the executing
+    service re-proves everything.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("the outstanding-retry lookup requires a positive limit")
+    if after_episode_id is not None:
+        _require_uuid(after_episode_id, "after_episode_id")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select a.id, a.workspace_id, a.task_id, a.episode_id, a.ordinal, "
+            "e.operation_family, a.not_before "
+            "from openorc.operational_failure_attempts a "
+            "join openorc.operational_failure_episodes e on e.id = a.episode_id "
+            "join openorc.tasks t on t.id = a.task_id "
+            "where e.escalated_task_block_id is null "
+            "and e.operation_family = any(%s) "
+            "and a.ordinal = (select max(a2.ordinal) "
+            "from openorc.operational_failure_attempts a2 "
+            "where a2.episode_id = a.episode_id) "
+            "and ((e.operation_family = %s and a.resulting_execution_id is null) "
+            "or (e.operation_family in (%s, %s) and a.consumed_at is null)) "
+            "and ((e.operation_family = %s and t.status = 'implementing') "
+            "or (e.operation_family = %s and t.status = 'waiting_for_owner') "
+            "or (e.operation_family = %s and t.status = 'implementing')) "
+            "and (%s::uuid is null or a.episode_id > %s::uuid) "
+            "order by a.episode_id "
+            "limit %s",
+            (
+                list(_OUTSTANDING_RETRY_FAMILY_VALUES),
+                PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
+                GitHubMergeOperation.EXACT_HEAD_MERGE.value,
+                PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION.value,
+                PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION.value,
+                GitHubMergeOperation.EXACT_HEAD_MERGE.value,
+                PRAuthorizationPresentationOperation.EXACT_HEAD_PR_AUTHORIZATION_PRESENTATION.value,
+                after_episode_id,
+                after_episode_id,
+                limit,
+            ),
+        ).fetchall()
+    return [_outstanding_from_row(row) for row in rows]

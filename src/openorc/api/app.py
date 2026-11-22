@@ -41,7 +41,11 @@ from openorc.workers.invocation import (
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
 from openorc.workers.task_queue_operations import arrange_task_queue_recovery
-from openorc.workers.task_workflow import build_detached_completion_handoff
+from openorc.workers.task_retry_recovery import arrange_task_retry_recovery
+from openorc.workers.task_workflow import (
+    F1AuthorizedRetrySubmission,
+    build_detached_completion_handoff,
+)
 
 API_TITLE = "OpenOrc API"
 
@@ -80,6 +84,13 @@ def _build_detached_turn_observer(
                 external_session_id=external_session_id,
             )
         ),
+        # The F12 (issue #316) post-settlement authorized-retry submission
+        # seam: a settled observed failure's committed RETRY_AUTHORIZED
+        # disposition arranges its one typed F1 retry invocation strictly
+        # after the settlement committed, through this process's own
+        # submission seam resolved at submit time. Never sleeping on the
+        # settlement path — the executing F1 worker/job owns the due wait.
+        retry_submission=F1AuthorizedRetrySubmission(dependencies.continuation_submitter),
     )
 
 
@@ -172,6 +183,28 @@ def _serving_lifespan(
             logger.warning(
                 "the bounded task-queue recovery pass failed (error type %s); "
                 "the durable queued facts own recovery until the next trigger",
+                type(error).__name__,
+            )
+        # The F12 bounded post-restart authorized-retry recovery (issue
+        # #316), off the event loop in BOTH execution modes: resubmit the
+        # same typed F1 retry invocation for each still-outstanding durably
+        # authorized Level 2 retry — never into the F11 Task FIFO or its
+        # capacity processor (these Tasks own their reserved sessions), and
+        # never clearing, resetting, or rewriting the retry ledger. The
+        # executing F1 worker/job performs any remaining ``not_before``
+        # wait; duplicate deliveries are rejected by the F5 one-shot
+        # consumption. Scheduling only — a failed pass is contained and the
+        # next supported trigger revisits the rest.
+        try:
+            await asyncio.to_thread(
+                arrange_task_retry_recovery,
+                dependencies.database_pool(),
+                submitter,
+            )
+        except Exception as error:  # noqa: BLE001 - contained recovery pass
+            logger.warning(
+                "the bounded authorized-retry recovery pass failed (error type %s); "
+                "the committed authorization rows own recovery until the next trigger",
                 type(error).__name__,
             )
         app.state.operation_executor = executor

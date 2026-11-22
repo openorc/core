@@ -74,6 +74,9 @@ from openorc.services.errors import (
     StaleOperationError,
 )
 from openorc.services.pull_request_merge import MergeRequestSendUncertainError
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmissionOutcome,
+)
 from openorc.services.task_exceptional_blocking import ExceptionalBlockInstallation
 from openorc.services.task_merge_lifecycle import (
     TaskMergeCompletionKind,
@@ -211,6 +214,17 @@ class _AcceptedFinalization:
     def submit(self, *, workspace_id: Any, task_id: Any) -> Any:
         self.calls.append((workspace_id, task_id))
         return TerminalFinalizationSubmissionOutcome.ACCEPTED_FOR_DELIVERY
+
+
+class _RecordingRetrySubmission:
+    """The wired F12 retry seam: recording the exact arrangement facts."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def submit(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
 
 def _archived_completed_row(*, state_token: Any) -> tuple[Any, ...]:
@@ -1094,6 +1108,7 @@ def test_uncertain_outcome_blocks_and_is_never_repeated(
     )
     merge = _MergePrimitiveStub(ExternalOperationUncertainError("unknown outcome"))
     _wire(monkeypatch, reconcile=reconcile, merge=merge)
+    submission = _RecordingRetrySubmission()
 
     outcome = request_task_merge(
         pool,
@@ -1105,12 +1120,16 @@ def test_uncertain_outcome_blocks_and_is_never_repeated(
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
         terminal_finalization_submission=_AcceptedFinalization(),
+        retry_submission=submission,
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.BLOCKED_UNCERTAIN
     assert outcome.task.status is TaskStatus.BLOCKED
     assert outcome.task_block is not None
     assert outcome.task_block.reason.value == "external_operation_uncertain"
+    # F12 (issue #316): only a committed RETRY_AUTHORIZED disposition
+    # arranges the F1 retry handoff; a blocked outcome arranges nothing.
+    assert submission.calls == []
     # An uncertain request is never repeated; the F7a composition installs
     # its one BLOCK_RESOLUTION gate (never a retry gate, never a merge
     # request) with the two truthful audits.
@@ -1636,6 +1655,7 @@ def test_send_transport_uncertainty_receives_one_level_2_retry_authorization(
     _wire(monkeypatch, reconcile=reconcile, merge=merge)
     disposition, attempt = _authorized_disposition()
     triaged: list[tuple[Any, Any]] = []
+    submission = _RecordingRetrySubmission()
 
     def fake_triage(pool: Any, **kwargs: Any) -> OperationalFailureDisposition:
         triaged.append((pool, kwargs))
@@ -1653,11 +1673,24 @@ def test_send_transport_uncertainty_receives_one_level_2_retry_authorization(
         owner_gate_id=_RETRY_GATE_ID,
         expected_state_token=_STATE_TOKEN,
         terminal_finalization_submission=_AcceptedFinalization(),
+        retry_submission=submission,
     )
 
     assert outcome.kind is TaskMergeOutcomeKind.RETRY_AUTHORIZED
     assert outcome.retry_attempt is attempt
     assert outcome.task.status is TaskStatus.WAITING_FOR_OWNER
+    # F12 (issue #316): the committed authorization's ONE post-commit F1
+    # handoff carries the exact attempt, the re-proved current token, and
+    # the accountable Owner identity — arranged after the authorization
+    # committed, never changing the truthful Owner merge outcome.
+    assert len(submission.calls) == 1
+    arranged = submission.calls[0]
+    assert arranged["workspace_id"] == _WORKSPACE_ID
+    assert arranged["task_id"] == _TASK_ID
+    assert arranged["profile_id"] == _OWNER_PROFILE_ID
+    assert arranged["retry_attempt_id"] == attempt.id
+    assert arranged["expected_state_token"] == _POST_APPROVAL_TOKEN
+    assert arranged["family"] is GitHubMergeOperation.EXACT_HEAD_MERGE
     # ONE typed ORIGINAL report rooted at the approved gate UUID, classified
     # from the send's chained transport subtype.
     assert len(triaged) == 1

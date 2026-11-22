@@ -140,6 +140,7 @@ from openorc.persistence import reviews as review_iteration_records
 from openorc.persistence import send_claims as send_claim_records
 from openorc.persistence import sessions as session_records
 from openorc.persistence import tasks as task_records
+from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.protocol.errors import ProtocolError
@@ -173,7 +174,14 @@ from openorc.services.task_authorized_implementation_execution import (
     finalize_observed_implementation_failure,
     settle_observed_implementation_result,
 )
+from openorc.services.task_authorized_retry_submission import (
+    AUTHORIZED_RETRY_FAMILY_STATUSES,
+    AuthorizedRetrySubmission,
+    arrange_authorized_retry,
+)
 from openorc.services.task_operational_failure_triage import (
+    DispositionKind,
+    OperationalFailureDisposition,
     OperationalFailureOperation,
     OperationalFailureReport,
     triage_operational_failure,
@@ -2841,6 +2849,7 @@ def settle_observed_turn_completion(
     workspace_id: UUID,
     connection_id: UUID,
     evidence: ObservedTurnEvidence,
+    retry_submission: AuthorizedRetrySubmission | None = None,
 ) -> TurnSettlementOutcome:
     """Settle one independently observed terminal turn observation.
 
@@ -2858,6 +2867,13 @@ def settle_observed_turn_completion(
     second early delivery for the same receipt is a rejected duplicate.
     Nothing here ever invents a match or treats an unattributable
     observation as a workflow fact.
+
+    When a settled observed failure's committed Level 2 disposition durably
+    authorized the bounded retry, this seam arranges its one typed F1
+    invocation strictly after the settlement transaction committed through
+    the optionally supplied F12 retry submission seam (issue #316) — never
+    sleeping on this settlement path; an unwired seam arranges nothing and
+    the committed authorization row owns recovery.
     """
     _require_uuid_command(workspace_id, "workspace_id")
     _require_uuid_command(connection_id, "connection_id")
@@ -2920,7 +2936,7 @@ def settle_observed_turn_completion(
                     return TurnSettlementOutcome(
                         kind=TurnSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                     )
-                return _settle_locked_receipt(
+                outcome = _settle_locked_receipt(
                     transaction_pool,
                     classifier=classifier,
                     workspace_id=workspace_id,
@@ -2929,6 +2945,8 @@ def settle_observed_turn_completion(
                     receipt=locked,
                     evidence=evidence,
                 )
+            _arrange_authorized_retry_after_settlement(pool, retry_submission, outcome)
+            return outcome
         with composed_transaction(pool) as transaction_pool:
             receipt = turn_records.get_outstanding_task_detached_turn_receipt_for_update(
                 transaction_pool, task_agent_session_id=binding.id
@@ -2941,7 +2959,7 @@ def settle_observed_turn_completion(
                 return TurnSettlementOutcome(
                     kind=TurnSettlementKind.NO_OUTSTANDING_RUN, receipt=None
                 )
-            return _settle_locked_receipt(
+            outcome = _settle_locked_receipt(
                 transaction_pool,
                 classifier=classifier,
                 workspace_id=workspace_id,
@@ -2950,6 +2968,68 @@ def settle_observed_turn_completion(
                 receipt=receipt,
                 evidence=evidence,
             )
+        _arrange_authorized_retry_after_settlement(pool, retry_submission, outcome)
+        return outcome
+
+
+def _arrange_authorized_retry_after_settlement(
+    pool: DatabasePool,
+    retry_submission: AuthorizedRetrySubmission | None,
+    outcome: TurnSettlementOutcome,
+) -> None:
+    """Arrange the authorized retry's F1 handoff after the settlement commits.
+
+    The F12 (issue #316) observer/settlement arrangement: a settled observed
+    failure whose committed Level 2 disposition durably authorized the
+    bounded retry arranges exactly one typed F1 retry invocation for the
+    exact authorized attempt — strictly after the settlement transaction
+    committed, never sleeping on this settlement path, and contained so a
+    refused, failed, or uncertain submission never disturbs the settled
+    receipt. The executing F1 worker/job owns the remaining ``not_before``
+    wait; the committed authorization row stays outstanding for the bounded
+    startup recovery either way. A candidate whose durable facts moved on
+    between the committed disposition and this arrangement submits nothing.
+    """
+    disposition = outcome.disposition
+    receipt = outcome.receipt
+    if (
+        retry_submission is None
+        or not isinstance(disposition, OperationalFailureDisposition)
+        or disposition.kind is not DispositionKind.RETRY_AUTHORIZED
+        or disposition.retry_attempt is None
+        or receipt is None
+    ):
+        return
+    family = receipt.operation
+    if family not in AUTHORIZED_RETRY_FAMILY_STATUSES:
+        return
+    attempt = disposition.retry_attempt
+    try:
+        task = task_records.get_task(pool, task_id=attempt.task_id)
+        if task is None or task.workspace_id != attempt.workspace_id:
+            return
+        if task.status is not AUTHORIZED_RETRY_FAMILY_STATUSES[family]:
+            return
+        workspace = get_workspace(pool, workspace_id=attempt.workspace_id)
+    except Exception as error:  # noqa: BLE001 - contained post-commit arrangement
+        logger.warning(
+            "the post-settlement authorized-retry arrangement did not complete "
+            "(error type %s); the committed authorization row owns recovery",
+            type(error).__name__,
+        )
+        return
+    if workspace is None:  # pragma: no cover - the attempt's scope proved it
+        return
+    arrange_authorized_retry(
+        retry_submission,
+        workspace_id=attempt.workspace_id,
+        task_id=attempt.task_id,
+        profile_id=workspace.owner_profile_id,
+        retry_attempt_id=attempt.id,
+        expected_state_token=task.state_token,
+        family=family,
+        origin="detached_turn_observed_failure_settlement",
+    )
 
 
 def _settle_locked_receipt(
