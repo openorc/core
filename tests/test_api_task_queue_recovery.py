@@ -233,8 +233,91 @@ def test_regular_mode_startup_recovery_failure_is_contained(
     with TestClient(app) as client:
         assert app.state.operation_executor is not None
         response = client.get("/healthz")
-
     # The serving process stays healthy and the recovery submitted nothing.
     assert response.status_code == 200
     assert wake_handler.calls == []
+    shutdown_observability()
+
+
+_ATTEMPT_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000108")
+_EPISODE_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-000000000109")
+_TASK_ID = UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000010a")
+_STATE_TOKEN = UUID("0f1c2d3e-4a5b-6c7d-8e9f-00000000010b")
+
+
+def _attempt_row() -> tuple[Any, ...]:
+    """One outstanding authorized implementation-retry attempt candidate."""
+    return (
+        _ATTEMPT_ID,
+        _WORKSPACE_ID,
+        _TASK_ID,
+        _EPISODE_ID,
+        1,
+        "implementation_execution",
+        _NOW,
+    )
+
+
+def _implementing_row() -> tuple[Any, ...]:
+    return task_row(
+        id=_TASK_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=503,
+        github_issue_number=42,
+        status=TaskStatus.IMPLEMENTING,
+        state_token=_STATE_TOKEN,
+        source_requirements_fingerprint="b" * 64,
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+
+
+def test_regular_mode_startup_recovers_an_outstanding_authorized_retry(
+    settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The F12 bounded startup pass (issue #316) resubmits the same typed F1
+    retry invocation for a still-outstanding authorized attempt through the
+    serving process's own bounded local executor — the exact original attempt
+    identity, the re-proved current token, and the accountable Owner identity,
+    delivered off the lifespan's event loop."""
+    conn = ScriptedConnection()
+    conn.on_repeat(
+        _sql_has("from openorc.operational_failure_attempts"),
+        [_attempt_row()],
+    )
+    conn.on_repeat(_task_read(), _implementing_row())
+    conn.on_repeat(_sql_has("from openorc.workspaces"), _ws_row())
+    retry_handler = _RecordingHandler(OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY)
+
+    def patched_handlers() -> dict[OperationKind, Any]:
+        table = dict(invocation.build_production_handlers())
+        table[OperationKind.TASK_AUTHORIZED_IMPLEMENTATION_RETRY] = retry_handler
+        return table
+
+    settings = settings_factory()
+    app = create_app(settings)
+    monkeypatch.setattr(
+        app_module,
+        "build_default_operation_dependencies",
+        lambda settings: _regular_dependencies(settings, conn),
+        raising=True,
+    )
+    monkeypatch.setattr(app_module, "build_production_handlers", patched_handlers, raising=True)
+
+    with TestClient(app):
+        # The lifespan owns the executor and delivers through it.
+        assert app.state.operation_executor is not None
+
+    # After the lifespan exits the executor has drained: the recovered retry
+    # delivery executed on an executor worker thread.
+    assert len(retry_handler.calls) == 1
+    payload = retry_handler.calls[0]["payload"]
+    assert isinstance(payload, invocation.TaskAuthorizedImplementationRetryPayload)
+    assert payload.task.workspace_id == str(_WORKSPACE_ID)
+    assert payload.task.task_id == str(_TASK_ID)
+    assert payload.profile_id == str(_OWNER_PROFILE_ID)
+    assert payload.retry_attempt_id == str(_ATTEMPT_ID)
+    assert payload.expected_state_token == str(_STATE_TOKEN)
+    assert retry_handler.calls[0]["thread"] is not threading.main_thread()
     shutdown_observability()

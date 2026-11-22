@@ -36,6 +36,7 @@ from openorc.domain.operational_failures import (
     FailureEffectEvidence,
     GitHubMergeOperation,
     ImplementationAuthorizationPresentationOperation,
+    OperationalFailureAttempt,
     OperationalFailureCode,
     OperationalFailureSourceKind,
     OriginalAttemptKind,
@@ -56,6 +57,9 @@ from openorc.services.errors import (
 )
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.pull_request_merge import MergeRequestSendUncertainError
+from openorc.services.task_authorized_retry_submission import (
+    AuthorizedRetrySubmissionOutcome,
+)
 from openorc.services.task_operational_failure_triage import (
     DispositionKind,
     NoOpReason,
@@ -200,6 +204,7 @@ def _coordinate(
     level_one: Any,
     triage: RecordingTriage,
     expected_status: TaskStatus = TaskStatus.IMPLEMENTING,
+    retry_submission: Any = None,
 ) -> None:
     coordinate_task_workflow_operation(
         object(),  # type: ignore[arg-type]
@@ -210,6 +215,7 @@ def _coordinate(
         expected_state_token=_PAYLOAD_TOKEN,
         invoke_level_one=level_one,
         triage=triage,
+        retry_submission=retry_submission,
     )
 
 
@@ -680,6 +686,145 @@ def test_an_authorized_retry_is_recorded_but_never_consumed(
     # the disposition and never consumes the authorization or replays Level 1.
     assert triage.call_count == 1
     assert len(invocations) == 1
+    assert excinfo.value is error
+
+
+def _authorized_retry_attempt() -> OperationalFailureAttempt:
+    return OperationalFailureAttempt(
+        id=_ATTEMPT_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        episode_id=_EPISODE_ID,
+        ordinal=1,
+        source_kind=OperationalFailureSourceKind.ORIGINAL,
+        source_attempt_id=_EXECUTION_ID,
+        error_code=OperationalFailureCode.RUNTIME_UNAVAILABLE,
+        not_before=_NOW,
+        resulting_execution_id=None,
+        consumed_at=None,
+        created_at=_NOW,
+    )
+
+
+class RecordingRetrySubmission:
+    """Recording AuthorizedRetrySubmission double with scripted outcomes."""
+
+    def __init__(
+        self,
+        outcome: AuthorizedRetrySubmissionOutcome = (
+            AuthorizedRetrySubmissionOutcome.ACCEPTED_FOR_DELIVERY
+        ),
+        error: Exception | None = None,
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._outcome = outcome
+        self._error = error
+
+    def submit(self, **kwargs: Any) -> AuthorizedRetrySubmissionOutcome:
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        return self._outcome
+
+
+def test_a_retry_authorized_disposition_arranges_one_f1_retry_after_the_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F12: the committed RETRY_AUTHORIZED disposition's one post-commit F1
+    handoff carries the exact authorized attempt, the Level 1-established
+    currentness seed, and the reporting family — and the original error still
+    propagates unchanged."""
+    attempt = _authorized_retry_attempt()
+    triage = RecordingTriage(
+        result=OperationalFailureDisposition(
+            kind=DispositionKind.RETRY_AUTHORIZED, retry_attempt=attempt
+        )
+    )
+    _patch_persistence(monkeypatch, execution=_fake_execution(), with_execution=True)
+    submission = RecordingRetrySubmission()
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage, retry_submission=submission)
+
+    # Exactly one arrangement with the exact authorized attempt identity, the
+    # accountable Profile, and the currentness seed Level 1 established.
+    assert len(submission.calls) == 1
+    arranged = submission.calls[0]
+    assert arranged["workspace_id"] == _WORKSPACE_ID
+    assert arranged["task_id"] == _TASK_ID
+    assert arranged["profile_id"] == _PROFILE_ID
+    assert arranged["retry_attempt_id"] == _ATTEMPT_ID
+    assert arranged["expected_state_token"] == _PAYLOAD_TOKEN
+    assert (
+        arranged["family"] is PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION
+    )
+    # The arrangement never replays Level 1, never consumes the
+    # authorization, and never masks the original failure.
+    assert triage.call_count == 1
+    assert excinfo.value is error
+
+
+def test_a_failed_retry_arrangement_never_masks_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused, failed, or uncertain F12 submission is contained: the
+    original Level 1 failure still propagates and nothing is replayed."""
+    attempt = _authorized_retry_attempt()
+    triage = RecordingTriage(
+        result=OperationalFailureDisposition(
+            kind=DispositionKind.RETRY_AUTHORIZED, retry_attempt=attempt
+        )
+    )
+    _patch_persistence(monkeypatch, execution=_fake_execution(), with_execution=True)
+    submission = RecordingRetrySubmission(error=RuntimeError("the seam exploded"))
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage, retry_submission=submission)
+
+    assert len(submission.calls) == 1  # attempted exactly once, never replayed
+    assert excinfo.value is error
+
+
+def test_a_blocked_disposition_arranges_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a committed RETRY_AUTHORIZED disposition arranges the F12 handoff."""
+    triage = RecordingTriage(result=_blocked_disposition())
+    _patch_persistence(monkeypatch, execution=_fake_execution(), with_execution=True)
+    submission = RecordingRetrySubmission()
+    error = _unavailable_failure()
+
+    def level_one(evidence: InvocationAttemptEvidence) -> None:
+        evidence.record_attempt(
+            family=PendingTaskRuntimeInteractionOperation.IMPLEMENTATION_EXECUTION,
+            original_attempt_kind=OriginalAttemptKind.EXECUTION,
+            original_attempt_id=_EXECUTION_ID,
+            phase="authorized_implementation_execution",
+        )
+        raise error
+
+    with pytest.raises(ExternalOperationFailedError) as excinfo:
+        _coordinate(level_one=level_one, triage=triage, retry_submission=submission)
+
+    assert submission.calls == []
     assert excinfo.value is error
 
 
