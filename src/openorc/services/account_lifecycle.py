@@ -95,12 +95,16 @@ from openorc.adapters.supabase import (
 from openorc.domain.github_user_authorization import GitHubUserAuthorizationStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import (
+    github_user_authorization_flows,
     github_user_authorizations,
     github_user_refresh_secrets,
     runtime_control_secrets,
 )
 from openorc.persistence.connections import list_profile_connections_for_update
 from openorc.persistence.deletion import disconnect_connection
+from openorc.persistence.github_user_authorization_flows import (
+    GitHubUserFlowVerifierReferenceError,
+)
 from openorc.persistence.github_user_refresh_secrets import (
     GitHubUserRefreshSecretReferenceError,
 )
@@ -226,12 +230,27 @@ def _revoke_profile_github_user_authorization(transaction_pool, *, profile_id: U
     the same short credential-revocation transaction that establishes the
     deletion-attempt barrier — before the external Supabase Auth delete — so
     a definitively-rejected Auth deletion never strands a later deletion
-    retry on a dangling secret reference. Idempotent on retry: an absent
-    authorization and an already-revoked one (with no reference) have
-    nothing to revoke. A malformed or dangling reference fails closed
-    before any destructive external Auth call. Account deletion never
-    uninstalls the GitHub App or mutates GitHub engineering artifacts.
+    retry on a dangling secret reference. The Profile's pending OAuth flow
+    correlation is invalidated in the same transaction first (issue #373:
+    the pending flow row and its Vault verifier secret are deleted, so
+    account deletion never strands a pending flow's verifier secret).
+    Idempotent on retry: an absent authorization and an already-revoked one
+    (with no reference) have nothing to revoke. A malformed or dangling
+    reference fails closed before any destructive external Auth call.
+    Account deletion never uninstalls the GitHub App or mutates GitHub
+    engineering artifacts.
     """
+    try:
+        github_user_authorization_flows.delete_pending_flow_with_verifier_secret(
+            transaction_pool, profile_id=profile_id
+        )
+    except GitHubUserFlowVerifierReferenceError as exc:
+        logger.warning(
+            "account deletion revocation rejected an unrecognized pending-flow verifier reference"
+        )
+        raise ConflictError(
+            "the account's credential references could not be reconciled; nothing was revoked"
+        ) from exc
     authorization = github_user_authorizations.get_github_user_authorization_for_update(
         transaction_pool, profile_id=profile_id
     )

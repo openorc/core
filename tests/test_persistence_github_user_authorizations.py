@@ -20,6 +20,7 @@ from typing import Any, cast
 
 from openorc.domain.github_user_authorization import GitHubUserAuthorizationStatus
 from openorc.persistence.github_user_authorizations import (
+    advance_revocation_fence_of_revoked_row,
     get_github_user_authorization,
     get_github_user_authorization_for_update,
     insert_active_github_user_authorization,
@@ -71,7 +72,9 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
     return cast(DatabasePool, FakePool(conn))
 
 
-def _active_row(profile_id: Any, *, generation: int = 1) -> tuple[Any, ...]:
+def _active_row(
+    profile_id: Any, *, generation: int = 1, revocation_count: int = 0
+) -> tuple[Any, ...]:
     return (
         profile_id,
         5432,
@@ -80,6 +83,7 @@ def _active_row(profile_id: Any, *, generation: int = 1) -> tuple[Any, ...]:
         "openorc:github-user-refresh:v1:vault:" + str(uuid.uuid4()),
         _OBSERVED,
         generation,
+        revocation_count,
         _OBSERVED,
         None,
         _OBSERVED,
@@ -216,6 +220,7 @@ def test_revoke_statement_removes_the_usable_credential_and_advances_the_generat
         None,
         None,
         8,
+        3,
         _OBSERVED,
         _OBSERVED,
         _OBSERVED,
@@ -230,11 +235,14 @@ def test_revoke_statement_removes_the_usable_credential_and_advances_the_generat
     assert revoked.refresh_secret_reference is None
     assert revoked.refresh_expires_at is None
     assert revoked.revoked_at is not None
+    assert revoked.revocation_count == 3
     sql, params = conn.executed[0]
     assert "update openorc.github_user_authorizations" in sql
     assert "status = 'revoked'" in sql
     assert "refresh_secret_reference = null" in sql
     assert "refresh_generation = refresh_generation + 1" in sql
+    # The revocation-epoch fence advances in the same statement (issue #373).
+    assert "revocation_count = revocation_count + 1" in sql
     assert params == (profile_id,)
 
 
@@ -243,3 +251,47 @@ def test_revoke_statement_reports_an_absent_row_as_none() -> None:
 
     assert revoke_github_user_authorization_row(_pool(conn), profile_id=uuid.uuid4()) is None
     assert "update openorc.github_user_authorizations" in conn.executed[0][0]
+
+
+def test_fence_advance_targets_only_the_revoked_row_and_preserves_everything_else() -> None:
+    # The externally idempotent revoke of an already-revoked row (issue #373):
+    # the durable fence advances while the status, revocation instant,
+    # refresh reference, and generation stay untouched.
+    profile_id = uuid.uuid4()
+    advanced_row = (
+        profile_id,
+        5432,
+        "octocat",
+        "revoked",
+        None,
+        None,
+        8,
+        4,
+        _OBSERVED,
+        _OBSERVED,
+        _OBSERVED,
+        _OBSERVED,
+    )
+    conn = ScriptedConnection([advanced_row])
+
+    advanced = advance_revocation_fence_of_revoked_row(_pool(conn), profile_id=profile_id)
+
+    assert advanced is not None
+    assert advanced.status is GitHubUserAuthorizationStatus.REVOKED
+    assert advanced.refresh_generation == 8
+    assert advanced.revocation_count == 4
+    sql, params = conn.executed[0]
+    assert "update openorc.github_user_authorizations" in sql
+    assert "revocation_count = revocation_count + 1" in sql
+    assert "status = 'revoked'" in sql  # the conditional match
+    assert "refresh_generation = refresh_generation + 1" not in sql
+    assert "refresh_secret_reference = null" not in sql
+    assert params == (profile_id,)
+
+
+def test_fence_advance_reports_an_absent_or_active_row_as_none() -> None:
+    conn = ScriptedConnection([None])
+
+    assert advance_revocation_fence_of_revoked_row(_pool(conn), profile_id=uuid.uuid4()) is None
+    sql = conn.executed[0][0]
+    assert "where profile_id = %s and status = 'revoked'" in sql

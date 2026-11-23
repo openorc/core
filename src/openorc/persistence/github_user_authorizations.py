@@ -23,9 +23,18 @@ Durable lifecycle expressed here (the issue #142 stale-write contract):
   durable state, never overwrites.
 - ``revoke_github_user_authorization_row`` marks the row revoked, removes
   the usable refresh reference and its expiry, and advances the generation
-  in the same statement, so no (Profile, generation) cache key outlives a
-  revocation. Idempotency for account-deletion retries is the caller's
-  composition (a revoked row with no reference has nothing to revoke).
+  and the ``revocation_count`` fence in the same statement, so no
+  (Profile, generation) cache key outlives a revocation and no flow that
+  captured an earlier fence value can install across it. Idempotency for
+  account-deletion retries is the caller's composition (a revoked row with
+  no reference has nothing to revoke); the externally idempotent revoke of
+  an already-revoked row advances only the fence through
+  ``advance_revocation_fence_of_revoked_row`` (issue #373).
+- ``revocation_count`` is the durable monotonic revocation-epoch fence
+  (issue #373): advanced by every Owner revocation of the row, preserved by
+  reauthorization and rotation, and never reset — so the OAuth flow
+  correlation's captured count is authoritative revocation evidence at the
+  final credential installation.
 
 Raw credential material has no column here and no path through this module:
 only the opaque ``refresh_secret_reference`` pointer is persisted. Violated
@@ -49,6 +58,7 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "advance_revocation_fence_of_revoked_row",
     "get_github_user_authorization",
     "get_github_user_authorization_for_update",
     "insert_active_github_user_authorization",
@@ -61,8 +71,8 @@ __all__ = [
 # _authorization_from_row.
 _AUTHORIZATION_COLUMNS = (
     "profile_id, github_user_id, github_login, status, refresh_secret_reference, "
-    "refresh_expires_at, refresh_generation, authorized_at, revoked_at, "
-    "created_at, updated_at"
+    "refresh_expires_at, refresh_generation, revocation_count, authorized_at, "
+    "revoked_at, created_at, updated_at"
 )
 
 
@@ -75,10 +85,11 @@ def _authorization_from_row(row: Sequence[Any]) -> GitHubUserAuthorization:
         refresh_secret_reference=row[4],
         refresh_expires_at=None if row[5] is None else normalize_utc(row[5]),
         refresh_generation=row[6],
-        authorized_at=normalize_utc(row[7]),
-        revoked_at=None if row[8] is None else normalize_utc(row[8]),
-        created_at=normalize_utc(row[9]),
-        updated_at=normalize_utc(row[10]),
+        revocation_count=row[7],
+        authorized_at=normalize_utc(row[8]),
+        revoked_at=None if row[9] is None else normalize_utc(row[9]),
+        created_at=normalize_utc(row[10]),
+        updated_at=normalize_utc(row[11]),
     )
 
 
@@ -134,8 +145,8 @@ def insert_active_github_user_authorization(
             "insert into openorc.github_user_authorizations "
             "(profile_id, github_user_id, github_login, status, "
             "refresh_secret_reference, refresh_expires_at, refresh_generation, "
-            "authorized_at, revoked_at, created_at, updated_at) "
-            "values (%s, %s, %s, 'active', %s, %s, 1, now(), null, now(), now()) "
+            "revocation_count, authorized_at, revoked_at, created_at, updated_at) "
+            "values (%s, %s, %s, 'active', %s, %s, 1, 0, now(), null, now(), now()) "
             f"returning {_AUTHORIZATION_COLUMNS}",
             (
                 profile_id,
@@ -163,8 +174,10 @@ def reauthorize_github_user_authorization(
     The row is never delete-and-reinserted: the same durable row stays, its
     generation advances monotonically (so no earlier in-memory cache key can
     resurface), and the new refresh credential facts install atomically with
-    the currentness reset to active. The caller holds the row lock (the
-    for-update read) and has already deleted the superseded Vault secret.
+    the currentness reset to active. The durable ``revocation_count`` fence
+    is deliberately preserved (never reset by reactivation). The caller holds
+    the row lock (the for-update read) and has already deleted the superseded
+    Vault secret.
     Returns None only when the row vanished (the caller inserts instead).
     """
     with transaction(pool) as conn:
@@ -224,20 +237,47 @@ def revoke_github_user_authorization_row(
     """Mark the Profile's authorization revoked, advancing its generation.
 
     One statement removes the usable refresh reference and expiry and
-    advances the generation atomically, so no (Profile, generation) cache
-    key survives the revocation. The caller holds the row lock, has already
-    deleted the referenced Vault secret (or the row was found revoked), and
-    treats a zero-row return as the row being absent. The row persists —
-    revocation is durable currentness state, deliberately distinct from
-    never-authorized — until the sanctioned account-root cascade removes it.
+    advances the generation and the ``revocation_count`` fence atomically,
+    so no (Profile, generation) cache key survives the revocation and no
+    flow that captured an earlier fence value can install across it. The
+    caller holds the row lock, has already deleted the referenced Vault
+    secret (or the row was found revoked), and treats a zero-row return as
+    the row being absent. The row persists — revocation is durable
+    currentness state, deliberately distinct from never-authorized — until
+    the sanctioned account-root cascade removes it.
     """
     with transaction(pool) as conn:
         row = conn.execute(
             "update openorc.github_user_authorizations set "
             "status = 'revoked', refresh_secret_reference = null, "
             "refresh_expires_at = null, revoked_at = now(), "
-            "refresh_generation = refresh_generation + 1, updated_at = now() "
+            "refresh_generation = refresh_generation + 1, "
+            "revocation_count = revocation_count + 1, updated_at = now() "
             "where profile_id = %s "
+            f"returning {_AUTHORIZATION_COLUMNS}",
+            (profile_id,),
+        ).fetchone()
+    return None if row is None else _authorization_from_row(row)
+
+
+def advance_revocation_fence_of_revoked_row(
+    pool: DatabasePool, *, profile_id: UUID
+) -> GitHubUserAuthorization | None:
+    """Advance the revocation fence of an already-revoked authorization.
+
+    The externally idempotent Owner revoke of an already-REVOKED row must
+    still advance the durable ``revocation_count`` fence (issue #373): every
+    successful Owner revocation command invalidates reauthorization flows
+    that began before it, even though the row's status, revocation instant,
+    refresh reference (already absent), and generation are unchanged. The
+    caller holds the row lock and has already proved the row exists and is
+    revoked; a zero-row return means the row vanished under the caller.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.github_user_authorizations set "
+            "revocation_count = revocation_count + 1, updated_at = now() "
+            "where profile_id = %s and status = 'revoked' "
             f"returning {_AUTHORIZATION_COLUMNS}",
             (profile_id,),
         ).fetchone()

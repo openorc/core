@@ -75,6 +75,12 @@ class GitHubUserAuthorization:
       refresh credential; non-null exactly when active.
     - ``refresh_generation`` is strictly monotonic per Profile; every
       credential lifecycle transition advances it.
+    - ``revocation_count`` is the durable monotonic revocation-epoch fence
+      (issue #373): advanced by every Owner revocation of the row — including
+      an externally idempotent revoke of an already-revoked row — and never
+      reset. Reactivation preserves it, so an OAuth flow (or any operation)
+      that captured an earlier count can never install credentials across a
+      later revocation, even after a newer authorization became active.
     - ``revoked_at`` is non-null exactly when the status is revoked.
     """
 
@@ -85,6 +91,7 @@ class GitHubUserAuthorization:
     refresh_secret_reference: str | None
     refresh_expires_at: datetime | None
     refresh_generation: int
+    revocation_count: int
     authorized_at: datetime
     revoked_at: datetime | None
     created_at: datetime
@@ -106,6 +113,14 @@ class GitHubUserAuthorization:
         ):
             raise GitHubUserAuthorizationDomainError(
                 f"refresh_generation must be a positive integer, got {self.refresh_generation!r}"
+            )
+        if (
+            isinstance(self.revocation_count, bool)
+            or not isinstance(self.revocation_count, int)
+            or self.revocation_count < 0
+        ):
+            raise GitHubUserAuthorizationDomainError(
+                f"revocation_count must be a non-negative integer, got {self.revocation_count!r}"
             )
         if not isinstance(self.status, GitHubUserAuthorizationStatus):
             raise GitHubUserAuthorizationDomainError(

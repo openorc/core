@@ -40,6 +40,19 @@ first so an already-committed concurrent rotation is observed); an
 uncertain outcome is never replayed and never mutates durable state. There
 is no installation-token fallback.
 
+Revocation fencing (issue #373): the durable ``revocation_count`` is the
+monotonic revocation-epoch fence — advanced by every Owner revocation of the
+row (including an externally idempotent revoke of an already-revoked row)
+and never reset by reactivation. The OAuth flow completion path passes the
+count its pending correlation captured at authenticated start as
+``expected_revocation_count``; the final installation proceeds only when the
+durable count still equals it under the row lock, so any revocation
+committed after the flow started permanently defeats that flow — even if a
+newer authorization has since become active — while a genuinely new
+post-revocation flow remains eligible. Owner revocation also invalidates the
+Profile's pending OAuth flow correlation (row + Vault verifier secret) in
+the same short transaction.
+
 Every authorization mutation composes the account-wide Owner-mutation
 barrier (``require_account_operational``) FIRST, before the authorization
 row lock, so once account deletion claims the Profile no authorization
@@ -81,7 +94,14 @@ from openorc.domain.github_user_authorization import (
     GitHubUserAuthorizationStatus,
 )
 from openorc.observability import annotate_span, application_span
-from openorc.persistence import github_user_authorizations, github_user_refresh_secrets
+from openorc.persistence import (
+    github_user_authorization_flows,
+    github_user_authorizations,
+    github_user_refresh_secrets,
+)
+from openorc.persistence.github_user_authorization_flows import (
+    GitHubUserFlowVerifierReferenceError,
+)
 from openorc.persistence.github_user_refresh_secrets import (
     GitHubUserRefreshSecretReferenceError,
 )
@@ -348,6 +368,7 @@ def establish_github_user_authorization(
     token_client: GitHubUserTokenClient,
     redirect_uri: str | None = None,
     code_verifier: str | None = None,
+    expected_revocation_count: int | None = None,
 ) -> GitHubUserAuthorization:
     """Establish (or re-establish) the Profile's GitHub user authorization.
 
@@ -373,6 +394,16 @@ def establish_github_user_authorization(
        access-token cache key can resurface. Reauthorization is the
        recovery path after revocation, including after an account-deletion
        attempt whose external Auth deletion was definitively rejected.
+
+    Revocation fencing (issue #373): when ``expected_revocation_count`` is
+    supplied — the OAuth flow completion path always supplies it — the final
+    installation additionally requires the durable ``revocation_count``
+    fence to still equal the captured value under the row lock. Any Owner
+    revocation committed after the flow started (including an idempotent
+    revoke of an already-revoked row) defeats the install with nothing
+    stored, permanently — even if a newer authorization has since reactivated
+    the row — while a genuinely new post-revocation flow remains eligible.
+    ``None`` (default) preserves the unfenced contract for direct callers.
 
     External calls run with no database transaction open. The caller
     validates OAuth ``state``/session correlation before invoking this
@@ -407,6 +438,7 @@ def establish_github_user_authorization(
             proven_github_user_id=proven_github_user_id,
             github_login=current_user.login,
             refresh_secret=grant.refresh_token,
+            expected_revocation_count=expected_revocation_count,
         )
 
 
@@ -438,6 +470,7 @@ def _install_established_authorization(
     proven_github_user_id: int,
     github_login: str | None,
     refresh_secret: GitHubUserRefreshSecret,
+    expected_revocation_count: int | None = None,
 ) -> GitHubUserAuthorization:
     """Durably install one proven authorization (insert or in-place replace)."""
     with composed_transaction(pool) as transaction_pool:
@@ -446,6 +479,25 @@ def _install_established_authorization(
         existing = github_user_authorizations.get_github_user_authorization_for_update(
             transaction_pool, profile_id=profile_id
         )
+        # The revocation fence (issue #373): under the row lock, a flow whose
+        # captured count no longer matches the durable count was overtaken by
+        # an Owner revocation and must not install — permanently, even if a
+        # newer authorization has since reactivated the row (the count is
+        # never reset). A row that is absent while the flow completes counts
+        # as never-revoked (0), consistent with fresh inserts.
+        observed_revocation_count = 0 if existing is None else existing.revocation_count
+        if (
+            expected_revocation_count is not None
+            and observed_revocation_count != expected_revocation_count
+        ):
+            logger.warning(
+                "github user authorization install was fenced: the durable "
+                "authorization was revoked after the flow captured its "
+                "revocation evidence"
+            )
+            raise ConflictError(
+                "the authorization was revoked while the authorization flow was completing"
+            )
         if existing is not None:
             if existing.github_user_id != proven_github_user_id:
                 # Durable-state inconsistency: every write path proves the
@@ -517,22 +569,58 @@ def _delete_superseded_refresh_secret(
         )
 
 
+def _delete_pending_authorization_flow(transaction_pool: DatabasePool, *, profile_id: UUID) -> None:
+    """Invalidate the Profile's pending OAuth flow correlation (issue #373).
+
+    Composed inside the caller's one short transaction: the pending flow row
+    and its Vault PKCE verifier secret are deleted together, so no pending
+    flow outlives the Owner revocation command that invalidates it. A
+    malformed or dangling verifier reference fails closed — nothing is
+    revoked, and the transaction rolls back — consistent with every other
+    credential-reference cleanup in this module.
+    """
+    try:
+        github_user_authorization_flows.delete_pending_flow_with_verifier_secret(
+            transaction_pool, profile_id=profile_id
+        )
+    except GitHubUserFlowVerifierReferenceError as exc:
+        logger.warning(
+            "github authorization revocation rejected an unrecognized "
+            "pending-flow verifier reference"
+        )
+        raise ConflictError(
+            "the pending authorization flow's credential reference could not be reconciled"
+        ) from exc
+
+
 def revoke_github_user_authorization(
     pool: DatabasePool, *, profile_id: UUID
 ) -> GitHubUserAuthorization:
     """Explicitly revoke the Profile's GitHub user authorization (Owner action).
 
-    In one short transaction: compose the account-operational barrier, lock
-    the authorization row, delete the referenced Vault refresh secret
-    (fail closed on malformed/dangling references), and mark the row revoked
-    with its generation advanced. Revoking an already-revoked authorization
-    is an idempotent no-op returning its durable row; a missing
-    authorization is the typed MISSING condition, never a fallback.
+    In one short transaction: compose the account-operational barrier,
+    invalidate the Profile's pending OAuth flow correlation (issue #373 —
+    the pending flow row and its Vault verifier secret are deleted here, so
+    no pending flow outlives this command), lock the authorization row, and
+    either:
+
+    - an ACTIVE row: delete the referenced Vault refresh secret (fail closed
+      on malformed/dangling references) and mark the row revoked with its
+      generation and revocation fence advanced; or
+    - an already-REVOKED row: an externally idempotent outcome returning the
+      durable row with ONLY the durable revocation fence advanced — every
+      successful Owner revocation command invalidates reauthorization flows
+      that began before it, so an in-flight flow started before this command
+      can never reactivate credentials afterwards (issue #373). Status,
+      revocation instant, refresh reference, and generation are unchanged.
+
+    A missing authorization is the typed MISSING condition, never a fallback.
     """
     with application_span(_TRACER_SCOPE, _REVOKE_SPAN_NAME) as span:
         annotate_span(span, operation=_REVOKE_SPAN_NAME)
         with composed_transaction(pool) as transaction_pool:
             require_account_operational(transaction_pool, profile_id=profile_id)
+            _delete_pending_authorization_flow(transaction_pool, profile_id=profile_id)
             existing = github_user_authorizations.get_github_user_authorization_for_update(
                 transaction_pool, profile_id=profile_id
             )
@@ -542,7 +630,19 @@ def revoke_github_user_authorization(
                     message="this Profile has no GitHub authorization to revoke",
                 )
             if existing.status is GitHubUserAuthorizationStatus.REVOKED:
-                return existing
+                # Externally idempotent — but the durable fence advances
+                # (issue #373): a revoke command issued while a flow that
+                # started earlier is completing must defeat that flow's
+                # later install even though the row is already revoked.
+                fenced = github_user_authorizations.advance_revocation_fence_of_revoked_row(
+                    transaction_pool, profile_id=profile_id
+                )
+                if fenced is None:  # pragma: no cover - guarded by the locked read
+                    raise ConflictError(
+                        "the durable GitHub authorization vanished while its "
+                        "revocation fence was being advanced"
+                    )
+                return fenced
             if existing.refresh_secret_reference is None:
                 # Unreachable for an active row (CHECK-consistent); fail closed.
                 raise ConflictError("the authorization carries no credential reference")

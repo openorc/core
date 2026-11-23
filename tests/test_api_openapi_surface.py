@@ -44,6 +44,9 @@ _DISCUSSION_STATUS_PATH = (
     "/owner-gates/{owner_gate_id}/discussion-status"
 )
 _CONVERSATION_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/reviewer-conversation"
+_USER_AUTH_STATUS_PATH = "/api/v1/profile/github-user-authorization"
+_USER_AUTH_FLOWS_PATH = "/api/v1/profile/github-user-authorization/flows"
+_USER_AUTH_REAUTH_PATH = "/api/v1/profile/github-user-authorization/reauthorization"
 
 _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_PROFILE_WORKSPACES_PATH, "get"): "list_profile_workspaces",
@@ -73,6 +76,10 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_DISCUSSION_POST_PATH, "post"): "send_owner_gate_discussion_message",
     (_DISCUSSION_STATUS_PATH, "get"): "get_owner_gate_discussion_status",
     (_CONVERSATION_PATH, "get"): "get_task_reviewer_conversation",
+    (_USER_AUTH_STATUS_PATH, "get"): "read_profile_github_user_authorization",
+    (_USER_AUTH_FLOWS_PATH, "post"): "start_github_user_authorization_flow",
+    (_USER_AUTH_REAUTH_PATH, "post"): "start_github_user_reauthorization_flow",
+    (_USER_AUTH_STATUS_PATH, "delete"): "revoke_profile_github_user_authorization",
 }
 
 _OPERATION_TAGS: dict[tuple[str, str], str] = {
@@ -103,6 +110,10 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_DISCUSSION_POST_PATH, "post"): "tasks",
     (_DISCUSSION_STATUS_PATH, "get"): "tasks",
     (_CONVERSATION_PATH, "get"): "tasks",
+    (_USER_AUTH_STATUS_PATH, "get"): "github-user-authorization",
+    (_USER_AUTH_FLOWS_PATH, "post"): "github-user-authorization",
+    (_USER_AUTH_REAUTH_PATH, "post"): "github-user-authorization",
+    (_USER_AUTH_STATUS_PATH, "delete"): "github-user-authorization",
 }
 
 _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
@@ -133,6 +144,10 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_DISCUSSION_POST_PATH, "post"): {"401", "404", "409", "503"},
     (_DISCUSSION_STATUS_PATH, "get"): {"401", "404", "503"},
     (_CONVERSATION_PATH, "get"): {"401", "404", "503"},
+    (_USER_AUTH_STATUS_PATH, "get"): {"401", "503"},
+    (_USER_AUTH_FLOWS_PATH, "post"): {"401", "409", "503"},
+    (_USER_AUTH_REAUTH_PATH, "post"): {"401", "409", "503"},
+    (_USER_AUTH_STATUS_PATH, "delete"): {"401", "404", "409", "503"},
 }
 
 
@@ -155,6 +170,11 @@ def test_the_route_inventory_matches_the_public_v1_contract(settings_factory) ->
         "/api/github/webhooks",
     }
     assert "/internal/observer/registrations" not in paths
+    # The GitHub user-authorization OAuth provider callback ingress (issue
+    # #373) is provider/browser transport outside the versioned public
+    # namespace: like the private handshake, it is never advertised in the
+    # published schema.
+    assert "/api/github/user-authorization/callback" not in paths
 
 
 def test_the_bearer_scheme_is_declared_and_enforced_in_openapi(settings_factory) -> None:
@@ -197,6 +217,7 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
         "workspaces",
         "connections",
         "github-installations",
+        "github-user-authorization",
         "projects",
         "repositories",
         "role-bindings",
@@ -205,8 +226,10 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
         "github-webhooks",
     } <= (tag_names)
     # The private handshake route is excluded from the schema, so its tag is
-    # never published either.
+    # never published either; the same holds for the user-authorization
+    # callback ingress (issue #373).
     assert "internal-queue-observer" not in tag_names
+    assert "github-user-authorization-callback" not in tag_names
 
 
 def test_representative_error_responses_are_documented(settings_factory) -> None:
