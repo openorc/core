@@ -11,7 +11,9 @@ The claim command carries the stable external repository identity and its
 owning Project alone: a repository claim is unverified Owner configuration,
 never a GitHub observation, and no observation fact is accepted or echoed by
 any operation here. Route binding/unbinding delegate to the existing issue
-#57 route services unchanged. Blocking database work runs off the event loop
+#57 route services unchanged. The issue #374 Repository-mapping deletion
+delegates to the issue #97 administrative-deletion service unchanged.
+Blocking database work runs off the event loop
 (sync route handlers; the v1 persistence surface is synchronous). The
 addressed errors are the typed application vocabulary, mapped to HTTP by the
 application-level application-error handler.
@@ -40,9 +42,9 @@ from openorc.api.schemas.repositories import (
     RepositoryRead,
 )
 from openorc.config import Settings
-from openorc.domain.ownership import Profile
+from openorc.domain.ownership import Profile, Repository
 from openorc.persistence.pool import get_database_pool
-from openorc.services import github_installations, repository_onboarding
+from openorc.services import administrative_deletion, github_installations, repository_onboarding
 from openorc.services.repository_onboarding import WorkspaceRepositoryStatus
 
 router = APIRouter(tags=["repositories"])
@@ -72,6 +74,8 @@ _UNBIND_RESPONSES: dict[int | str, dict[str, Any]] = {
     409: DOCUMENTED_CONFLICT_409,
     503: DOCUMENTED_UNAVAILABLE_503,
 }
+# The documented responses of the issue #374 mapping deletion (same vocabulary).
+_DELETE_REPOSITORY_RESPONSES = _UNBIND_RESPONSES
 
 
 @router.post(
@@ -238,6 +242,67 @@ def unbind_installation_route(
             workspace_id=workspace_id,
             repository_id=repository_id,
         )
+    )
+
+
+@router.delete(
+    _REPOSITORY_PATH,
+    response_model=RepositoryRead,
+    operation_id="delete_workspace_repository",
+    responses=_DELETE_REPOSITORY_RESPONSES,
+)
+def delete_repository(
+    workspace_id: UUID,
+    repository_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> RepositoryRead:
+    """Delete the Workspace's OpenOrc Repository mapping (issue #374).
+
+    Removes OpenOrc's own persisted mapping for the external GitHub
+    repository — never the GitHub repository, its issues, branches,
+    commits, pull requests, or checks, and never the installation. The
+    response is the deleted mapping's last recorded claim/observation
+    state; no installation route reference survives the deleted mapping.
+    """
+    settings: Settings = request.app.state.settings
+    deleted = administrative_deletion.delete_repository_record(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+    )
+    return _deleted_to_wire(deleted)
+
+
+def _deleted_to_wire(repository: Repository) -> RepositoryRead:
+    """Map the deleted Repository aggregate onto the wire DTO.
+
+    The mapping record is gone: the claim's stable external identity and any
+    recorded observation are the surviving facts worth reporting, and no
+    installation route reference survives the deleted mapping. No credential
+    material and no GitHub-side effect is implied — the external repository
+    is untouched.
+    """
+    return RepositoryRead(
+        id=repository.id,
+        project_id=repository.project_id,
+        workspace_id=repository.workspace_id,
+        github_repository_id=repository.identity.github_repository_id,
+        observed=(
+            None
+            if repository.metadata is None
+            else RepositoryObservationRead(
+                owner_login=repository.metadata.owner_login,
+                name=repository.metadata.name,
+                html_url=repository.metadata.html_url,
+                is_private=repository.metadata.is_private,
+                default_branch=repository.metadata.default_branch,
+            )
+        ),
+        installation_route=None,
+        created_at=repository.created_at,
+        updated_at=repository.updated_at,
     )
 
 

@@ -22,6 +22,7 @@ from openorc.api.request_correlation import (
     RequestCorrelationMiddleware,
     server_error_response,
 )
+from openorc.api.routers.account import router as account_router
 from openorc.api.routers.connections import router as connections_router
 from openorc.api.routers.github_installations import router as github_installations_router
 from openorc.api.routers.github_user_authorization import (
@@ -74,8 +75,9 @@ API_DESCRIPTION = (
     "administration and control-credential routes (issue #371), the "
     "Workspace GitHub installation and Repository mapping routes (issue "
     "#372), the Profile's GitHub user-authorization status/start/"
-    "reauthorization/revocation routes (issue #373), the role-binding "
-    "configuration routes (issue #162), and the Task "
+    "reauthorization/revocation routes (issue #373), the safe administrative "
+    "disconnect/deletion and permanent account-deletion routes (issue #374), "
+    "the role-binding configuration routes (issue #162), and the Task "
     "discussion/conversation routes (issue #339), authenticated by a "
     "Supabase Auth session JWT (GitHub-only sign-in) supplied as an HTTP "
     "Bearer credential — publishable and secret Supabase keys are not user "
@@ -98,32 +100,35 @@ OPENAPI_TAG_METADATA = [
     {
         "name": "tasks",
         "description": (
-            "Task-scoped discussion and conversation transport (issue #339): "
-            "the asynchronous Owner ↔ Reviewer discussion admission, its "
-            "durable receipt-status projection, and the transient "
-            "Reviewer-conversation read."
+            "Task-scoped discussion, conversation, and archival transport "
+            "(issues #339, #374): the asynchronous Owner ↔ Reviewer "
+            "discussion admission, its durable receipt-status projection, "
+            "the transient Reviewer-conversation read, and the "
+            "administrative purge of an archived Task attempt."
         ),
     },
     {
         "name": "workspaces",
         "description": (
             "Profile/Workspace discovery, creation and configuration "
-            "(issue #370): the authenticated Profile's owned-Workspace list "
-            "and creation, the ownership-gated Workspace read model with its "
-            "first-class settings, and the three Owner-authorized setting "
+            "(issues #370, #374): the authenticated Profile's owned-Workspace "
+            "list and creation, the ownership-gated Workspace read model with "
+            "its first-class settings, the three Owner-authorized setting "
             "updates (review-iteration limit, guidance prose, default Task "
-            "USD budget)."
+            "USD budget), and the issue #97 administrative Workspace deletion."
         ),
     },
     {
         "name": "connections",
         "description": (
-            "Workspace Agent Runtime Connection administration (issue #371): "
-            "the Owner-authorized configured-inventory list/create/read/"
-            "update with #188 safe-config validation, and the trusted "
-            "control-credential setup/rotation over the issue #55 service. "
-            "Exposed state is configured inventory only — never runtime Hub "
-            "health, session READY, or active-run state."
+            "Workspace Agent Runtime Connection administration (issues #371, "
+            "#374): the Owner-authorized configured-inventory list/create/"
+            "read/update with #188 safe-config validation, the trusted "
+            "control-credential setup/rotation over the issue #55 service, "
+            "and the issue #97 administrative credential disconnect and "
+            "unreferenced-record deletion. Exposed state is configured "
+            "inventory only — never runtime Hub health, session READY, or "
+            "active-run state."
         ),
     },
     {
@@ -141,20 +146,23 @@ OPENAPI_TAG_METADATA = [
     {
         "name": "projects",
         "description": (
-            "Workspace Project onboarding (issue #372): the Owner-authorized "
-            "deterministic list and creation of Projects within an owned "
-            "Workspace. Project names are Owner-authored configuration, "
-            "never GitHub observations."
+            "Workspace Project onboarding and administration (issues #372, "
+            "#374): the Owner-authorized deterministic list and creation of "
+            "Projects within an owned Workspace, and the issue #97 "
+            "administrative Project deletion. Project names are Owner-"
+            "authored configuration, never GitHub observations."
         ),
     },
     {
         "name": "repositories",
         "description": (
-            "Workspace Repository mapping (issue #372): the Owner-authorized "
-            "stable-identity claim, its recorded claim/observation status, "
-            "and the explicit installation route binding. Claims and routes "
-            "are configuration facts — never access or permission, and never "
-            "live GitHub freshness."
+            "Workspace Repository mapping (issues #372, #374): the "
+            "Owner-authorized stable-identity claim, its recorded "
+            "claim/observation status, the explicit installation route "
+            "binding, and the issue #97 administrative mapping deletion — "
+            "the external GitHub repository itself is never touched. Claims "
+            "and routes are configuration facts — never access or "
+            "permission, and never live GitHub freshness."
         ),
     },
     {
@@ -169,6 +177,18 @@ OPENAPI_TAG_METADATA = [
             "durable revocation fence. The OAuth provider callback ingress "
             "is unauthenticated provider transport outside the versioned "
             "public namespace and is not advertised here."
+        ),
+    },
+    {
+        "name": "account",
+        "description": (
+            "The authenticated Profile's own account lifecycle (issue #374): "
+            "the permanent account deletion composed over the issue #97 "
+            "account-lifecycle service — credential revocation and the "
+            "durable attempt claim in one short transaction, then the "
+            "supported Supabase Auth Admin delete with no transaction open. "
+            "Only the caller's own account is addressable; the truthful end "
+            "states, guarded conflicts, and honest known/unknown failures."
         ),
     },
     {
@@ -398,6 +418,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(connections_router, prefix="/api/v1")
     app.include_router(github_installations_router, prefix="/api/v1")
+    app.include_router(account_router, prefix="/api/v1")
     app.include_router(github_user_authorization_router, prefix="/api/v1")
     # The GitHub user-authorization OAuth provider callback ingress (issue
     # #373): the GitHub App's configured Callback URL target — unauthenticated

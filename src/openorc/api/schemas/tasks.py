@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 
 __all__ = [
+    "ArchivedTaskPurge",
     "DiscussionAdmissionRead",
     "DiscussionMessageCreate",
     "DiscussionStatusRead",
@@ -99,3 +100,17 @@ class ReviewerConversationRead(BaseModel):
     task_id: UUID
     reviewer_session_id: UUID
     messages: list[ReviewerConversationMessageRead]
+
+
+class ArchivedTaskPurge(BaseModel):
+    """The settled result of one archived-Task administrative purge (issue #374).
+
+    Identifies the purged archived attempt within its Workspace. Only
+    archived (terminal) attempts are purgeable — a current Task is a typed
+    conflict, and normal workflow cancellation is the supported route. The
+    purge is internal-state deletion only: the backing GitHub issue,
+    branch, and PR are never touched.
+    """
+
+    workspace_id: UUID
+    task_id: UUID
