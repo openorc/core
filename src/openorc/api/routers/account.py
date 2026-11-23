@@ -23,7 +23,7 @@ never reported as success, never replayed inside the same attempt.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request
 
@@ -45,8 +45,9 @@ router = APIRouter(tags=["account"])
 
 AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
 
-# The typed outcome vocabulary is closed; the wire mapping is a fixed table.
-_WIRE_RESULT_BY_OUTCOME: dict[str, str] = {
+# The typed outcome vocabulary is closed; the wire mapping is a fixed table
+# over the wire result literals.
+_WIRE_RESULT_BY_OUTCOME: dict[str, Literal["deleted", "already_absent"]] = {
     account_lifecycle.RESULT_DELETED: "deleted",
     account_lifecycle.RESULT_ALREADY_ABSENT: "already_absent",
 }

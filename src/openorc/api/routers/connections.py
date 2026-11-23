@@ -21,7 +21,7 @@ application-level application-error handler.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -56,7 +56,7 @@ AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
 
 # The documented responses shared by the administrative disconnect/deletion
 # routes (issue #374): guarded refusals are conflicts, never successes.
-_DELETION_RESPONSES = {
+_DELETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: DOCUMENTED_AUTH_401,
     404: DOCUMENTED_NOT_FOUND_404,
     409: DOCUMENTED_CONFLICT_409,
