@@ -217,7 +217,7 @@ def test_read_absent_pending_flow_is_none() -> None:
 # --- the atomic consume ------------------------------------------------------
 
 
-def test_consume_deletes_the_row_and_decrypts_the_verifier_in_one_transaction() -> None:
+def test_consume_deletes_the_row_and_verifier_secret_in_one_transaction() -> None:
     profile_id = uuid.uuid4()
     secret_id = uuid.uuid4()
     row = _flow_row(profile_id, revocation_count=3)
@@ -226,6 +226,7 @@ def test_consume_deletes_the_row_and_decrypts_the_verifier_in_one_transaction() 
         [
             row,  # the conditional delete returning the matched flow
             (_VERIFIER,),  # the in-transaction Vault decrypt
+            (1,),  # the verifier secret delete
         ]
     )
 
@@ -244,10 +245,12 @@ def test_consume_deletes_the_row_and_decrypts_the_verifier_in_one_transaction() 
     decrypt_sql, decrypt_params = conn.executed[1]
     assert "vault.decrypted_secrets" in decrypt_sql
     assert decrypt_params == (secret_id,)
-    # The consume stays inside one transaction: the delete and the decrypt
-    # run at the same transaction depth.
+    # The consumed flow's verifier secret is deleted in the same transaction
+    # (issue #373 review): no consumed flow ever orphans its secret.
+    cleanup_sql, cleanup_params = conn.executed[2]
+    assert "delete from vault.secrets" in cleanup_sql
+    assert cleanup_params == (secret_id,)
     assert conn.transaction_depth == 0
-    assert conn.executed[0] is not None and conn.executed[1] is not None
 
 
 def test_consume_reports_an_unknown_expired_or_replayed_state_as_none() -> None:
@@ -256,8 +259,7 @@ def test_consume_reports_an_unknown_expired_or_replayed_state_as_none() -> None:
     assert consume_pending_flow(_pool(conn), state="s" * 43) is None
 
 
-@pytest.mark.parametrize("dangling", [True])
-def test_consume_fails_closed_and_rolls_back_on_a_dangling_reference(dangling: bool) -> None:
+def test_consume_fails_closed_and_rolls_back_on_a_dangling_reference() -> None:
     profile_id = uuid.uuid4()
     row = _flow_row(profile_id)
     conn = ScriptedConnection(
@@ -270,9 +272,31 @@ def test_consume_fails_closed_and_rolls_back_on_a_dangling_reference(dangling: b
     with pytest.raises(GitHubUserFlowVerifierReferenceError):
         consume_pending_flow(_pool(conn), state="s" * 43)
 
-    # The reference parse and the decrypt ran; the caller-side translation is
-    # the service's. The rollback semantics are the transaction boundary's.
+    # The reference parse and the decrypt ran; the secret cleanup never did —
+    # and the rollback restores the pending row for the caller's retry.
     assert "vault.decrypted_secrets" in conn.executed[1][0]
+    assert all("delete from vault.secrets" not in sql for sql, _ in conn.executed)
+
+
+def test_consume_fails_closed_and_rolls_back_when_the_secret_cleanup_fails() -> None:
+    profile_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    row = _flow_row(profile_id)
+    row = (row[0], row[1], row[2], _reference(secret_id), *row[4:])
+    conn = ScriptedConnection(
+        [
+            row,  # the delete matched
+            (_VERIFIER,),  # the decrypt succeeded
+            None,  # the secret cleanup reports the secret absent
+        ]
+    )
+
+    with pytest.raises(GitHubUserFlowVerifierReferenceError):
+        consume_pending_flow(_pool(conn), state="s" * 43)
+
+    # Cleanup failure is never silently tolerated: the whole consumption —
+    # including the row delete — rolls back.
+    assert "delete from vault.secrets" in conn.executed[2][0]
 
 
 def test_consume_fails_closed_on_a_malformed_reference() -> None:
@@ -291,24 +315,52 @@ def test_consume_fails_closed_on_a_malformed_reference() -> None:
 # --- the no-decrypt discard and the invalidation delete ----------------------
 
 
-def test_discard_deletes_by_state_without_decrypting() -> None:
-    profile_id = uuid.uuid4()
-    conn = ScriptedConnection([(profile_id,)])
+def test_discard_deletes_the_declined_flow_and_its_verifier_secret() -> None:
+    secret_id = uuid.uuid4()
+    reference = _reference(secret_id)
+    conn = ScriptedConnection([(reference,), (1,)])
 
     discarded = discard_pending_flow(_pool(conn), state="s" * 43)
 
     assert discarded is True
-    sql, params = conn.executed[0]
-    assert "delete from openorc.github_user_authorization_flows" in sql
-    assert "where state = %s" in sql
-    assert "vault" not in sql
-    assert params == ("s" * 43,)
+    row_sql, row_params = conn.executed[0]
+    assert "delete from openorc.github_user_authorization_flows" in row_sql
+    assert "where state = %s" in row_sql
+    assert "returning pkce_verifier_reference" in row_sql
+    assert row_params == ("s" * 43,)
+    # The declined flow's verifier secret is deleted with the row — without
+    # any decryption (issue #373 review).
+    vault_sql, vault_params = conn.executed[1]
+    assert "delete from vault.secrets" in vault_sql
+    assert vault_params == (secret_id,)
+    assert all("vault.decrypted_secrets" not in sql for sql, _ in conn.executed)
 
 
-def test_discard_of_an_absent_flow_is_false() -> None:
+def test_discard_of_an_absent_flow_is_false_and_touches_no_secret() -> None:
     conn = ScriptedConnection([None])
 
     assert discard_pending_flow(_pool(conn), state="s" * 43) is False
+    assert len(conn.executed) == 1
+    assert all("vault" not in sql for sql, _ in conn.executed)
+
+
+def test_discard_fails_closed_on_a_malformed_reference() -> None:
+    conn = ScriptedConnection([("not-a-v1-reference",)])
+
+    with pytest.raises(GitHubUserFlowVerifierReferenceError):
+        discard_pending_flow(_pool(conn), state="s" * 43)
+
+    assert len(conn.executed) == 1
+
+
+def test_discard_fails_closed_when_the_secret_cleanup_fails() -> None:
+    secret_id = uuid.uuid4()
+    conn = ScriptedConnection([(_reference(secret_id),), None])
+
+    with pytest.raises(GitHubUserFlowVerifierReferenceError):
+        discard_pending_flow(_pool(conn), state="s" * 43)
+
+    assert "delete from vault.secrets" in conn.executed[1][0]
 
 
 def test_invalidation_delete_removes_the_row_and_its_verifier_secret_atomically() -> None:

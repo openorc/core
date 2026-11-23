@@ -395,8 +395,9 @@ def complete_github_user_authorization_flow(
 
     Transaction 1: atomically consume the pending flow by its exact state
     (unknown/expired/replayed states are one uniform typed condition with no
-    distinguishing oracle; a successful consume durably deletes the row and
-    decrypts its Vault verifier in the same transaction). Then, with NO
+    distinguishing oracle; a successful consume durably deletes the row,
+    decrypts its Vault verifier, and deletes the verifier secret in the same
+    transaction). Then, with NO
     database transaction open, run the full #142 establishment against the
     bound Profile: the trusted Supabase GitHub-identity lookup, the code
     exchange forwarding the correlation's PKCE verifier, the authoritative
@@ -446,11 +447,12 @@ def abort_pending_github_user_authorization_flow(pool: DatabasePool, *, state: s
     """Consume one pending flow the provider has already terminated.
 
     The callback arrived with a GitHub ``error`` answer (for example, the
-    Owner denied access at the consent step): the correlation is deleted so
-    it can never be completed later. No verifier resolution is needed; an
-    unknown state is already the desired end state. This is a deliberate
-    invalidation, not a completion — the caller reports a uniform failure
-    outcome either way.
+    Owner denied access at the consent step): the correlation is deleted —
+    together with its Vault verifier secret — so it can never be completed
+    later and never orphans credential material. No verifier decryption is
+    needed; an unknown state is already the desired end state. This is a
+    deliberate invalidation, not a completion — the caller reports a uniform
+    failure outcome either way.
     """
     state = _require_callback_state(state)
     github_user_authorization_flows.discard_pending_flow(pool, state=state)

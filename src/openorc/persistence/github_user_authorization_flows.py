@@ -14,9 +14,12 @@ Durable properties expressed here:
   atomic consume (the delete IS the single-use enforcement, conditional on
   the exact state and an unexpired row), the start operation's supersession
   of the Profile's prior pending flow, and Owner-revocation /
-  account-deletion invalidation. An expired pending row is simply never
-  consumable; the accumulation stays bounded by one row per Profile and the
-  sanctioned account-root cascade removes the row with the Profile graph.
+  account-deletion invalidation — and every one of those deletes removes
+  the verifier's Vault secret in the same transaction, so no consumed,
+  declined, superseded, or invalidated flow ever outlives its encrypted
+  verifier material. An expired pending row is simply never consumable;
+  the accumulation stays bounded by one row per Profile and the sanctioned
+  account-root cascade removes the row with the Profile graph.
 - The PKCE verifier is secret-bearing exchange material: it lives
   exclusively in Supabase Vault behind the opaque
   ``pkce_verifier_reference`` (this module's own purpose-specific reference
@@ -213,11 +216,14 @@ def consume_pending_flow(
 
     The conditional delete matches only a still-pending, unexpired row, so a
     replayed, expired, or unknown state returns None without any effect —
-    the delete IS the single-use enforcement. On a match the row is deleted
-    and the Vault verifier is decrypted inside the same transaction: a
-    malformed or dangling verifier reference raises
-    :class:`GitHubUserFlowVerifierReferenceError` and rolls the whole
-    consumption back, leaving the pending flow intact and retryable.
+    the delete IS the single-use enforcement. On a match the correlation row
+    is deleted, the Vault verifier is decrypted, and the verifier secret
+    itself is deleted inside the same transaction: a malformed or dangling
+    verifier reference — including a secret that turns out to be absent at
+    cleanup time — raises :class:`GitHubUserFlowVerifierReferenceError` and
+    rolls the whole consumption back, leaving the pending flow intact and
+    retryable. The row and its secret commit together, so no consumed flow
+    ever orphans its encrypted verifier material.
 
     The returned verifier string is secret-bearing exchange material: the
     completion service must use it immediately in its completion call chain
@@ -240,24 +246,39 @@ def consume_pending_flow(
             raise GitHubUserFlowVerifierReferenceError(
                 "the flow verifier reference does not point at an existing secret"
             )
+        if not delete_vault_secret(pool, secret_id=secret_id):
+            raise GitHubUserFlowVerifierReferenceError(
+                "the flow verifier reference does not point at an existing secret"
+            )
     return flow, verifier
 
 
 def discard_pending_flow(pool: DatabasePool, *, state: str) -> bool:
-    """Delete one pending flow by exact state without decrypting its verifier.
+    """Delete one provider-terminated pending flow and its verifier secret.
 
-    The provider-terminated-flow path (the callback arrived with a GitHub
-    ``error`` answer) consumes the correlation so it can never be completed
-    later; no verifier resolution is needed for that. Returns whether a row
-    was removed.
+    The callback arrived with a GitHub ``error`` answer (for example, the
+    Owner denied access at the consent step): the correlation is deleted so
+    it can never be completed later. No verifier decryption is needed, but
+    the secret itself is deleted inside the same transaction as the row — a
+    malformed or dangling verifier reference raises
+    :class:`GitHubUserFlowVerifierReferenceError` and rolls the whole discard
+    back — so a declined flow never orphans its encrypted verifier material.
+    Returns whether a pending flow was removed.
     """
     with transaction(pool) as conn:
         row = conn.execute(
             "delete from openorc.github_user_authorization_flows "
-            "where state = %s returning profile_id",
+            "where state = %s returning pkce_verifier_reference",
             (state,),
         ).fetchone()
-    return row is not None
+        if row is None:
+            return False
+        secret_id = parse_github_user_flow_verifier_reference(row[0])  # type: ignore[arg-type]
+        if not delete_vault_secret(pool, secret_id=secret_id):
+            raise GitHubUserFlowVerifierReferenceError(
+                "the flow verifier reference does not point at an existing secret"
+            )
+    return True
 
 
 def delete_pending_flow_with_verifier_secret(pool: DatabasePool, *, profile_id: UUID) -> bool:

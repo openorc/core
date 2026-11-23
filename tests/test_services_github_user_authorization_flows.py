@@ -411,6 +411,7 @@ def test_complete_consumes_and_delegates_the_exact_fenced_establishment(
         [
             row,  # the conditional delete matched
             (_VERIFIER,),  # the in-transaction Vault decrypt
+            (1,),  # the verifier secret delete
         ]
     )
 
@@ -428,6 +429,9 @@ def test_complete_consumes_and_delegates_the_exact_fenced_establishment(
     assert "where state = %s and expires_at > now()" in consume_sql
     assert consume_params == (_STATE,)
     assert "vault.decrypted_secrets" in conn.executed[1][0]
+    # The consumed flow's verifier secret is deleted with the row (issue
+    # #373 review): the completion leaves no orphaned secret behind.
+    assert "delete from vault.secrets" in conn.executed[2][0]
     # The exact delegation: the bound Profile, the presented code, the
     # correlation's verifier, and the captured fence evidence.
     assert recorder.calls == [
@@ -482,7 +486,7 @@ def test_complete_propagates_the_establishment_errors_unchanged(establish_record
             "the authorized GitHub account is not the account that signed in to this Profile"
         )
     )
-    conn = ScriptedConnection([row, (_VERIFIER,)])
+    conn = ScriptedConnection([row, (_VERIFIER,), (1,)])
 
     with pytest.raises(GitHubUserIdentityMismatchError):
         github_user_authorization_flows.complete_github_user_authorization_flow(
@@ -522,18 +526,40 @@ def test_complete_fails_closed_on_unusable_callback_inputs(
     assert recorder.calls == []
 
 
-def test_abort_discards_the_provider_terminated_correlation() -> None:
+def test_abort_discards_the_declined_flow_and_its_verifier_secret() -> None:
+    secret_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            (f"openorc:github-user-flow-verifier:v1:vault:{secret_id}",),
+            (1,),  # the verifier secret delete
+        ]
+    )
+
+    github_user_authorization_flows.abort_pending_github_user_authorization_flow(
+        _pool(conn), state=_STATE
+    )
+
+    row_sql, row_params = conn.executed[0]
+    assert "delete from openorc.github_user_authorization_flows" in row_sql
+    assert "where state = %s" in row_sql
+    assert row_params == (_STATE,)
+    # The declined flow's verifier secret is deleted with the row — without
+    # any decryption (issue #373 review).
+    vault_sql, vault_params = conn.executed[1]
+    assert "delete from vault.secrets" in vault_sql
+    assert vault_params == (secret_id,)
+    assert all("vault.decrypted_secrets" not in sql for sql, _ in conn.executed)
+
+
+def test_abort_of_an_unknown_state_is_a_noop_never_a_failure() -> None:
     conn = ScriptedConnection([None])
 
     github_user_authorization_flows.abort_pending_github_user_authorization_flow(
         _pool(conn), state=_STATE
     )
 
-    sql, params = conn.executed[0]
-    assert "delete from openorc.github_user_authorization_flows" in sql
-    assert "where state = %s" in sql
-    assert params == (_STATE,)
-    assert "vault" not in sql
+    assert len(conn.executed) == 1
+    assert all("vault" not in sql for sql, _ in conn.executed)
 
 
 # --- status projection and the revoke seam -----------------------------------
