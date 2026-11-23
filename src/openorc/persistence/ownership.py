@@ -53,6 +53,7 @@ __all__ = [
     "get_workspace",
     "get_workspace_for_update",
     "list_github_routed_repositories",
+    "list_workspaces_for_owner",
     "mark_account_deletion_attempt_uncertain",
     "read_account_deletion_state_for_key_share",
     "reclaim_expired_account_deletion_attempt",
@@ -217,6 +218,22 @@ def get_workspace(pool: DatabasePool, workspace_id: UUID) -> Workspace | None:
             (workspace_id,),
         ).fetchone()
     return None if row is None else _workspace_from_row(row)
+
+
+def list_workspaces_for_owner(pool: DatabasePool, *, owner_profile_id: UUID) -> list[Workspace]:
+    """List every Workspace owned by one Profile, deterministically ordered.
+
+    The Profile-facing Workspace enumeration for the discovery surface
+    (issue #370): the owner-scoped filter is the isolation boundary, and
+    ordering by creation instant then id keeps the listing deterministic.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_WORKSPACE_COLUMNS} from openorc.workspaces "
+            "where owner_profile_id = %s order by created_at, id",
+            (owner_profile_id,),
+        ).fetchall()
+    return [_workspace_from_row(row) for row in rows]
 
 
 def get_project(pool: DatabasePool, project_id: UUID) -> Project | None:
