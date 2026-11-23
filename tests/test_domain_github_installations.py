@@ -136,3 +136,21 @@ def test_repository_route_defaults_to_unconfigured() -> None:
         updated_at=_OBSERVED,
     )
     assert repository.github_installation_id is None
+
+
+def test_the_claim_state_record_carries_no_observation_fact() -> None:
+    # The issue #372 claim state: an Owner-submitted stable installation
+    # identity recorded as unverified configuration — the observed account
+    # block is None and no observation fact exists on the record.
+    installation = GitHubInstallation(
+        id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        identity=GitHubInstallationIdentity(github_installation_id=12345678),
+        account=None,
+        suspended_at=None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+    assert installation.account is None
+    assert installation.suspended_at is None
+    assert installation.identity.github_installation_id == 12345678

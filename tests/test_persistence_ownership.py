@@ -34,6 +34,8 @@ from openorc.persistence.ownership import (
     get_repository,
     get_workspace,
     list_github_routed_repositories,
+    list_workspace_projects,
+    list_workspace_repositories,
     list_workspaces_for_owner,
     set_repository_installation_route,
     update_repository_metadata,
@@ -404,6 +406,7 @@ def test_update_repository_metadata_maps_updated_row_and_handles_missing() -> No
     assert updated is not None
     assert updated.id == row[0]
     assert updated.identity.github_repository_id == 987654321
+    assert updated.metadata is not None
     assert updated.metadata.default_branch is None
     sql, params = conn.executed[0]
     assert "update openorc.repositories" in sql
@@ -621,3 +624,73 @@ def test_routed_repository_listing_with_no_rows_returns_an_empty_list() -> None:
     pool = cast(DatabasePool, FakePool(fake_conn))
 
     assert list_github_routed_repositories(pool) == []
+
+
+def test_create_repository_claim_state_binds_no_observation_fact() -> None:
+    project_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    row = list(_repository_row())
+    for index in range(4, 9):
+        row[index] = None
+    fake_conn = FakeConnection(tuple(row))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    created = create_repository(
+        pool,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        identity=GitHubRepositoryIdentity(github_repository_id=987654321),
+        metadata=None,
+    )
+
+    # The claim-state insert (issue #372) binds the stable identity ALONE:
+    # every observation column parameter is NULL.
+    assert created.metadata is None
+    sql, params = fake_conn.executed[0]
+    assert "insert into openorc.repositories" in sql
+    assert params == (project_id, workspace_id, 987654321, None, None, None, None, None)
+
+
+def test_a_claim_state_repository_row_maps_without_observed_metadata() -> None:
+    row = list(_repository_row())
+    for index in range(4, 9):
+        row[index] = None
+    fake_conn = FakeConnection(tuple(row))
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    repository = get_repository(pool, row[0])
+
+    assert repository is not None
+    assert repository.metadata is None
+    assert repository.identity.github_repository_id == 987654321
+
+
+def test_workspace_project_listing_scopes_deterministically() -> None:
+    workspace_id = uuid.uuid4()
+    rows = [(uuid.uuid4(), workspace_id, "delivery", _observed_at(), _observed_at())]
+    fake_conn = FakeConnection(None, rows)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_workspace_projects(pool, workspace_id=workspace_id)
+
+    assert [project.id for project in listed] == [rows[0][0]]
+    sql, params = fake_conn.executed[0]
+    assert "from openorc.projects where workspace_id = %s order by created_at, id" in sql
+    assert params == (workspace_id,)
+
+
+def test_workspace_repository_listing_scopes_deterministically() -> None:
+    workspace_id = uuid.uuid4()
+    first = list(_repository_row())
+    first[2] = workspace_id
+    second = list(_repository_row())
+    second[2] = workspace_id
+    fake_conn = FakeConnection(None, [tuple(first), tuple(second)])
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    listed = list_workspace_repositories(pool, workspace_id=workspace_id)
+
+    assert [repository.id for repository in listed] == [first[0], second[0]]
+    sql, params = fake_conn.executed[0]
+    assert "where workspace_id = %s order by created_at, id" in sql
+    assert params == (workspace_id,)

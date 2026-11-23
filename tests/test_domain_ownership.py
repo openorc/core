@@ -10,6 +10,7 @@ import pytest
 from openorc.domain.ownership import (
     GitHubRepositoryIdentity,
     OwnershipError,
+    Repository,
     RepositoryMetadata,
     Workspace,
 )
@@ -61,6 +62,24 @@ def test_github_repository_identity_requires_a_positive_id() -> None:
         GitHubRepositoryIdentity(github_repository_id=0)
     with pytest.raises(OwnershipError):
         GitHubRepositoryIdentity(github_repository_id=-1)
+
+
+def test_the_claim_state_repository_record_carries_no_observation_fact() -> None:
+    # The issue #372 claim state: an Owner-submitted stable repository
+    # identity recorded as unverified configuration — the observed metadata
+    # block is None and no observation fact exists on the record.
+    repository = Repository(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        identity=GitHubRepositoryIdentity(github_repository_id=987654321),
+        metadata=None,
+        created_at=datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC),
+        github_installation_id=None,
+    )
+    assert repository.metadata is None
+    assert repository.identity.github_repository_id == 987654321
 
 
 def test_repository_metadata_rejects_blank_observed_fields() -> None:

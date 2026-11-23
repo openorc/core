@@ -118,6 +118,7 @@ def test_installation_record_round_trip_and_reconcile(conn: Connection[Any]) -> 
         suspended_at=None,
     )
     assert created.identity.github_installation_id == 12345678
+    assert created.account is not None
     assert created.account.login == "octocat"
     assert created.suspended_at is None
     assert created.created_at.utcoffset() is not None
@@ -133,6 +134,7 @@ def test_installation_record_round_trip_and_reconcile(conn: Connection[Any]) -> 
     )
     assert reconciled.id == created.id
     assert reconciled.created_at == created.created_at
+    assert reconciled.account is not None
     assert reconciled.account.login == "renamed"
     assert reconciled.account.type == "User"
     assert reconciled.suspended_at == _OBSERVED
@@ -466,6 +468,7 @@ def test_a_changed_stable_account_id_cannot_rewrite_the_record(conn: Connection[
         )
     unchanged = installation_repositories.get_github_installation(_pool(conn), created.id)
     assert unchanged is not None
+    assert unchanged.account is not None
     assert unchanged.account.github_account_id == 501
     assert unchanged.account.login == "octocat"
     assert unchanged.account.type == "Organization"
@@ -484,6 +487,7 @@ def test_a_changed_stable_account_id_cannot_rewrite_the_record(conn: Connection[
         suspended_at=_OBSERVED,
     )
     assert reconciled.id == created.id
+    assert reconciled.account is not None
     assert reconciled.account.github_account_id == 501
     assert reconciled.account.login == "renamed"
     assert reconciled.account.type == "User"

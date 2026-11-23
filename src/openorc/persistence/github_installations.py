@@ -37,9 +37,11 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "claim_github_installation",
     "create_or_reconcile_github_installation",
     "delete_github_installation",
     "get_github_installation",
+    "get_workspace_github_installation",
     "list_workspace_installations",
 ]
 
@@ -65,10 +67,19 @@ def _github_installation_from_row(row: Sequence[Any]) -> GitHubInstallation:
         id=row[0],
         workspace_id=row[1],
         identity=GitHubInstallationIdentity(github_installation_id=row[2]),
-        account=GitHubInstallationAccount(
-            github_account_id=row[3],
-            login=row[4],
-            type=row[5],
+        # ``account`` is the observed account identity block: a NULL account
+        # triple is the issue #372 claim state (the Owner-submitted stable
+        # installation identity recorded before any trusted GitHub
+        # observation exists). The observation columns are written together
+        # or not at all, so the triple is all-NULL or fully populated.
+        account=(
+            None
+            if row[3] is None
+            else GitHubInstallationAccount(
+                github_account_id=row[3],
+                login=row[4],
+                type=row[5],
+            )
         ),
         suspended_at=None if row[6] is None else normalize_utc(row[6]),
         created_at=normalize_utc(row[7]),
@@ -88,13 +99,17 @@ def create_or_reconcile_github_installation(
 
     The durable record identity is the ``(workspace_id, github_installation_id)``
     pair, and both stable external identifiers — the GitHub installation ID and
-    the GitHub account ID — are never rewritten by reconciliation: an existing
-    record keeps its OpenOrc UUID, creation time, and stored account ID, and
-    receives only the mutable reported observations (login/type,
-    ``suspended_at``). A reconcile that reports a different account ID leaves
-    the stored stable identity intact; deciding the conflict belongs to the
-    service boundary, not to persistence. No credential material is accepted
-    or stored.
+    the GitHub account ID — are never rewritten by reconciliation once
+    established: an existing record keeps its OpenOrc UUID, creation time, and
+    stored account ID, and receives only the mutable reported observations
+    (login/type, ``suspended_at``). The one establishment exception is the
+    issue #372 claim state: a claim-state record carries a NULL stable account
+    identity until trusted facts arrive, and the upsert populates it then
+    (coalesce-preserved for already-established rows) atomically with the
+    first observation write. A reconcile that reports a different account ID
+    than an established record leaves the stored stable identity intact;
+    deciding the conflict belongs to the service boundary, not to persistence.
+    No credential material is accepted or stored.
 
     ``suspended_at`` crosses into the TIMESTAMPTZ column only through the
     established UTC-normalization boundary: naive datetimes are rejected
@@ -114,7 +129,10 @@ def create_or_reconcile_github_installation(
             "account_login, account_type, suspended_at) "
             "values (%s, %s, %s, %s, %s, %s) "
             "on conflict (workspace_id, github_installation_id) do update "
-            "set account_login = excluded.account_login, "
+            "set github_account_id = coalesce("
+            "openorc.github_installations.github_account_id, "
+            "excluded.github_account_id), "
+            "account_login = excluded.account_login, "
             "account_type = excluded.account_type, "
             "suspended_at = excluded.suspended_at, "
             "updated_at = now() "
@@ -132,6 +150,47 @@ def create_or_reconcile_github_installation(
     return _github_installation_from_row(row)
 
 
+def claim_github_installation(
+    pool: DatabasePool, *, workspace_id: UUID, identity: GitHubInstallationIdentity
+) -> GitHubInstallation:
+    """Record one Owner installation claim as unverified configuration state.
+
+    The claim command is the Owner-facing configuration entry (issue #372): it
+    carries the stable external installation identity alone and can never
+    carry or write observation facts. The row is created in claim state —
+    every observation column NULL — or, when the ``(workspace_id,
+    github_installation_id)`` record already exists (a re-asserted claim, a
+    committed concurrent claim, or an already-established installation), the
+    durable row is returned unchanged: a claim never updates an existing
+    row's stable identity or observations. Only trusted GitHub reconciliation
+    (:func:`create_or_reconcile_github_installation`) later populates the
+    observation columns, atomically establishing the claim's stable account
+    identity.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "insert into openorc.github_installations "
+            "(workspace_id, github_installation_id, github_account_id, "
+            "account_login, account_type, suspended_at) "
+            "values (%s, %s, null, null, null, null) "
+            "on conflict (workspace_id, github_installation_id) do nothing "
+            f"returning {_GITHUB_INSTALLATION_COLUMNS}",
+            (workspace_id, identity.github_installation_id),
+        ).fetchone()
+        if row is None:
+            # The record already exists: the claim is idempotent, and the
+            # durable row — in whatever state trusted reconciliation has
+            # established — is the returned truth.
+            row = conn.execute(
+                f"select {_GITHUB_INSTALLATION_COLUMNS} "
+                "from openorc.github_installations "
+                "where workspace_id = %s and github_installation_id = %s",
+                (workspace_id, identity.github_installation_id),
+            ).fetchone()
+    assert row is not None
+    return _github_installation_from_row(row)
+
+
 def get_github_installation(pool: DatabasePool, installation_id: UUID) -> GitHubInstallation | None:
     """Return one installation record by OpenOrc UUID, or ``None``."""
     with transaction(pool) as conn:
@@ -139,6 +198,20 @@ def get_github_installation(pool: DatabasePool, installation_id: UUID) -> GitHub
             f"select {_GITHUB_INSTALLATION_COLUMNS} "
             "from openorc.github_installations where id = %s",
             (installation_id,),
+        ).fetchone()
+    return None if row is None else _github_installation_from_row(row)
+
+
+def get_workspace_github_installation(
+    pool: DatabasePool, *, workspace_id: UUID, github_installation_id: int
+) -> GitHubInstallation | None:
+    """Return one Workspace installation record by stable external identity, or ``None``."""
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_GITHUB_INSTALLATION_COLUMNS} "
+            "from openorc.github_installations "
+            "where workspace_id = %s and github_installation_id = %s",
+            (workspace_id, github_installation_id),
         ).fetchone()
     return None if row is None else _github_installation_from_row(row)
 

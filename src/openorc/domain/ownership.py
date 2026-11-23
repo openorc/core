@@ -19,7 +19,11 @@ scopes all later Workspace-owned OpenOrc state (Phase 1).
 - A Repository record's identity is its OpenOrc UUID; the GitHub repository ID
   is the stable external identity used for reconciliation and per-Workspace
   canonicalization. Owner login, name, URL, visibility, and similar fields are
-  mutable observed metadata and never identity.
+  mutable observed metadata and never identity. A record is either in claim
+  state (issue #372: an Owner-submitted stable repository identity recorded as
+  unverified configuration, with ``metadata`` ``None``) or observation state
+  (trusted GitHub reconciliation has recorded the presentation metadata);
+  claim data never masquerades as a GitHub observation.
 - A Repository may carry an explicit route (issue #57) to one Workspace-scoped
   GitHubInstallation record (:mod:`openorc.domain.github_installations`): the
   route is a durable configuration fact establishing which installation later
@@ -213,6 +217,12 @@ class Repository:
     stable external GitHub repository identity used for reconciliation and
     per-Workspace canonicalization. ``workspace_id`` carries the direct
     Workspace scope and must agree with the owning Project's Workspace.
+    ``metadata`` is the observed GitHub presentation block, carried verbatim:
+    ``None`` is the claim state of the issue #372 Owner onboarding surface —
+    an Owner-submitted stable repository identity recorded as unverified
+    configuration before any trusted GitHub observation exists — and only
+    trusted GitHub reconciliation ever populates the observation facts; claim
+    data never masquerades as a GitHub observation.
     ``github_installation_id`` is the explicit route (issue #57) to the one
     Workspace-scoped GitHubInstallation record that later GitHub operations
     must use: ``None`` means no route is configured, so the Repository is a
@@ -227,7 +237,7 @@ class Repository:
     project_id: UUID
     workspace_id: UUID
     identity: GitHubRepositoryIdentity
-    metadata: RepositoryMetadata
+    metadata: RepositoryMetadata | None
     created_at: datetime
     updated_at: datetime
     github_installation_id: UUID | None = None
