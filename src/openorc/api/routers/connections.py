@@ -8,10 +8,11 @@ Owner-authorized application services, and the domain-to-wire response
 mapping. It owns no authorization policy, no safe-config semantics, and no
 persistence behavior — those belong to the service layer. Connection
 administration delegates to the issue #371 configuration service; credential
-setup and rotation delegate to the existing issue #55 credential service
-unchanged. Blocking database work runs off the event loop (sync route
-handlers; the v1 persistence surface is synchronous). The addressed errors
-are the typed application vocabulary, mapped to HTTP by the
+setup and rotation delegate through its thin composition of the issue #55
+credential service, so every projected response passes the same
+read-boundary validation. Blocking database work runs off the event loop
+(sync route handlers; the v1 persistence surface is synchronous). The
+addressed errors are the typed application vocabulary, mapped to HTTP by the
 application-level application-error handler.
 """
 
@@ -45,7 +46,7 @@ from openorc.config import Settings
 from openorc.domain.connections import Connection
 from openorc.domain.ownership import Profile
 from openorc.persistence.pool import get_database_pool
-from openorc.services import connection_configuration, connection_credentials
+from openorc.services import connection_configuration
 
 router = APIRouter(tags=["connections"])
 
@@ -194,13 +195,15 @@ def configure_credential(
     request: Request,
     profile: AuthenticatedProfile,
 ) -> ConnectionRead:
-    """Configure the Connection's control credential (issue #55 service).
+    """Configure the Connection's control credential (issue #55 composition).
 
     Configuring over an existing credential is a conflict: rotate instead.
-    The credential value is never echoed back by any response.
+    The credential value is never echoed back by any response, and the
+    response passes the service's read-boundary validation — a legacy or
+    malformed persisted safe config fails closed instead of being projected.
     """
     settings: Settings = request.app.state.settings
-    connection = connection_credentials.configure_connection_credential(
+    connection = connection_configuration.setup_connection_credential(
         get_database_pool(settings),
         profile_id=profile.id,
         workspace_id=workspace_id,
@@ -229,13 +232,16 @@ def rotate_credential(
     request: Request,
     profile: AuthenticatedProfile,
 ) -> ConnectionRead:
-    """Rotate the Connection's control credential in place (issue #55 service).
+    """Rotate the Connection's control credential in place (issue #55 composition).
 
     Rotating without a configured credential is a conflict: set one up
-    first. The credential value is never echoed back by any response.
+    first. The credential value is never echoed back by any response, and
+    the response passes the service's read-boundary validation — a legacy
+    or malformed persisted safe config fails closed instead of being
+    projected.
     """
     settings: Settings = request.app.state.settings
-    connection = connection_credentials.rotate_connection_credential(
+    connection = connection_configuration.rotate_connection_credential(
         get_database_pool(settings),
         profile_id=profile.id,
         workspace_id=workspace_id,

@@ -492,3 +492,34 @@ def test_malformed_bodies_never_reach_the_services(
     assert seam.replaces == []
     assert seam.configures == []
     assert seam.rotates == []
+
+
+def test_credential_response_fails_closed_on_a_malformed_persisted_endpoint(
+    service_seam, settings_factory, owner_profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    stored = "wss://user:pass@hub.example/hub"
+    # The #55 seam returns the post-configure Connection unchanged; the
+    # service composition must fail the projection closed instead of
+    # exposing the unvalidated stored endpoint the reads would reject.
+    leaked = _connection(workspace_id, auth_reference="vault-ref-1", control_endpoint=stored)
+    seam = service_seam(credential_result=leaked)
+    client = _client(settings_factory(), owner_profile)
+
+    response = client.post(
+        f"/api/v1/workspaces/{workspace_id}/connections/{connection_id}/credentials",
+        json={"credential": _CREDENTIAL},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "the connection's stored configuration does not satisfy the established "
+        "safe-configuration contract"
+    )
+    # The prohibited endpoint and its components are never disclosed, even
+    # though the credential composition itself succeeded.
+    assert stored not in response.text
+    assert "user:pass" not in response.text
+    assert _CREDENTIAL not in response.text
+    assert len(seam.configures) == 1

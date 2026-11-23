@@ -31,10 +31,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from openorc.domain.connections import AdapterType
+from openorc.domain.connections import AdapterType, Connection
 from openorc.observability import CONNECTION_ID, OPERATION, WORKSPACE_ID, injected_tracer_source
 from openorc.persistence.pool import DatabasePool
-from openorc.services import connection_configuration
+from openorc.services import connection_configuration, connection_credentials
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 
 _OBSERVED = datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC)
@@ -695,3 +695,144 @@ def test_get_opens_its_service_span_with_safe_attributes_only() -> None:
     attributes = exported.attributes
     assert attributes is not None
     assert set(attributes) == {OPERATION, WORKSPACE_ID, CONNECTION_ID}
+
+
+def _domain_connection(
+    workspace_id: Any,
+    *,
+    connection_id: Any = None,
+    safe_config: Any = None,
+    auth_reference: str | None = None,
+) -> Connection:
+    """A domain Connection as the #55 credential service would return it."""
+    return Connection(
+        id=connection_id or uuid.uuid4(),
+        workspace_id=workspace_id,
+        adapter=AdapterType.CLINE,
+        name="primary cline hub",
+        safe_config={} if safe_config is None else safe_config,
+        session_capacity=2,
+        enabled=True,
+        auth_reference=auth_reference,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+
+
+def test_credential_setup_delegates_to_the_55_service_and_revalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    configured = _domain_connection(
+        workspace_id,
+        connection_id=connection_id,
+        safe_config=_VALID_SAFE_CONFIG,
+        auth_reference="vault-ref-1",
+    )
+    commands: list[dict[str, Any]] = []
+
+    def _fake_configure(pool: Any, **command: Any) -> Any:
+        commands.append(command)
+        return configured
+
+    monkeypatch.setattr(connection_credentials, "configure_connection_credential", _fake_configure)
+    conn = ScriptedConnection([])
+
+    connection = connection_configuration.setup_connection_credential(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        credential="s3cr3t",
+    )
+
+    # The #55 composition delegates the exact command and is the only
+    # database consumer: the wrapper itself executes no SQL.
+    assert connection is configured
+    assert commands == [
+        {
+            "profile_id": profile_id,
+            "workspace_id": workspace_id,
+            "connection_id": connection_id,
+            "credential": "s3cr3t",
+        }
+    ]
+    assert conn.executed == []
+
+
+def test_credential_setup_fails_closed_on_a_malformed_persisted_endpoint(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stored = "wss://user:pass@hub.example/hub"
+    leaked = _domain_connection(
+        uuid.uuid4(), safe_config={"control_endpoint": stored}, auth_reference="vault-ref-1"
+    )
+    monkeypatch.setattr(
+        connection_credentials,
+        "configure_connection_credential",
+        lambda pool, **command: leaked,
+    )
+    conn = ScriptedConnection([])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_configuration"),
+        pytest.raises(ConflictError) as exc_info,
+    ):
+        connection_configuration.setup_connection_credential(
+            _pool(conn),
+            profile_id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            connection_id=uuid.uuid4(),
+            credential="s3cr3t",
+        )
+
+    # The credential composition must not project the unvalidated stored
+    # endpoint: the fixed safe message never carries any stored value.
+    assert str(exc_info.value) == (
+        "the connection's stored configuration does not satisfy the established "
+        "safe-configuration contract"
+    )
+    assert stored not in str(exc_info.value)
+    assert "user:pass" not in str(exc_info.value)
+    assert any(
+        record.name == "openorc.services.connection_configuration"
+        and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+
+
+def test_credential_rotation_fails_closed_on_a_malformed_persisted_endpoint(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stored = "ws://hub.example/hub?token=x"
+    leaked = _domain_connection(
+        uuid.uuid4(), safe_config={"control_endpoint": stored}, auth_reference="vault-ref-1"
+    )
+    monkeypatch.setattr(
+        connection_credentials,
+        "rotate_connection_credential",
+        lambda pool, **command: leaked,
+    )
+    conn = ScriptedConnection([])
+
+    with (
+        caplog.at_level(logging.WARNING, logger="openorc.services.connection_configuration"),
+        pytest.raises(ConflictError) as exc_info,
+    ):
+        connection_configuration.rotate_connection_credential(
+            _pool(conn),
+            profile_id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            connection_id=uuid.uuid4(),
+            credential="s3cr3t",
+        )
+
+    assert str(exc_info.value).startswith("the connection's stored configuration does not satisfy")
+    assert stored not in str(exc_info.value)
+    assert any(
+        record.name == "openorc.services.connection_configuration"
+        and record.levelno == logging.WARNING
+        for record in caplog.records
+    )

@@ -5,8 +5,10 @@ Connection persistence (:mod:`openorc.persistence.connections`): the
 authenticated Owner lists, reads, creates, and reconfigures the Workspace
 Agent Runtime Connections. This module is deliberately narrow — the
 configuration boundary only. The trusted control-credential lifecycle stays
-in :mod:`openorc.services.connection_credentials` (issue #55), the role
-bindings stay in :mod:`openorc.services.role_binding_configuration`
+in :mod:`openorc.services.connection_credentials` (issue #55) — the G1b
+credential transport composes it through the thin setup/rotation wrappers in
+this module so a credential response passes the same read boundary — the
+role bindings stay in :mod:`openorc.services.role_binding_configuration`
 (issue #162), and disconnect/deletion stays with the administrative deletion
 services. Nothing here touches ``task_agent_sessions`` or
 ``workflow_role_bindings``: existing Task/session bindings never migrate
@@ -73,7 +75,7 @@ from openorc.domain.connections import AdapterType, Connection
 from openorc.observability import annotate_span, application_span
 from openorc.persistence import connections as connection_records
 from openorc.persistence.pool import DatabasePool
-from openorc.services import event_coordination
+from openorc.services import connection_credentials, event_coordination
 from openorc.services.errors import ConflictError, InvalidCommandError, NotFoundError
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
@@ -84,6 +86,8 @@ __all__ = [
     "get_workspace_connection",
     "list_workspace_connections",
     "replace_workspace_connection",
+    "rotate_connection_credential",
+    "setup_connection_credential",
 ]
 
 # Application-service span boundaries (issues #108/#109): every public
@@ -95,6 +99,8 @@ _LIST_SPAN_NAME = "connection_configuration.list_workspace_connections"
 _GET_SPAN_NAME = "connection_configuration.get_workspace_connection"
 _CREATE_SPAN_NAME = "connection_configuration.create_workspace_connection"
 _REPLACE_SPAN_NAME = "connection_configuration.replace_workspace_connection"
+_SETUP_CREDENTIAL_SPAN_NAME = "connection_configuration.setup_connection_credential"
+_ROTATE_CREDENTIAL_SPAN_NAME = "connection_configuration.rotate_connection_credential"
 
 # The durable default (issue #200): one shared Connection serves both Task
 # roles, whose two session reservations consume two slots. An unprovided
@@ -440,3 +446,76 @@ def replace_workspace_connection(
             )
             return updated
     raise AssertionError("unreachable: the replacement flow returns inside its transaction")
+
+
+def setup_connection_credential(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    connection_id: UUID,
+    credential: str,
+) -> Connection:
+    """Configure one Connection's control credential through the #55 service.
+
+    Thin composition for the G1b credential transport: the issue #55
+    Owner-authorized configure semantics, atomicity, and authorization are
+    unchanged, and the returned post-configure Connection re-passes the
+    read-boundary safe-config validation before it can be projected, so a
+    legacy or malformed persisted endpoint can never be disclosed through a
+    credential response while the same Connection's reads fail closed. A
+    stored config that violates the contracts fails the response closed
+    after the credential composition commits — the durable state stays
+    consistent, and every read of the same Connection fails closed
+    identically until the Owner repairs the configuration.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _SETUP_CREDENTIAL_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_SETUP_CREDENTIAL_SPAN_NAME,
+            workspace_id=str(workspace_id),
+        )
+        connection = connection_credentials.configure_connection_credential(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            credential=credential,
+        )
+        annotate_span(span, connection_id=str(connection.id))
+        _validate_persisted_safe_config(connection)
+        return connection
+
+
+def rotate_connection_credential(
+    pool: DatabasePool,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    connection_id: UUID,
+    credential: str,
+) -> Connection:
+    """Rotate one Connection's control credential through the #55 service.
+
+    Thin composition for the G1b credential transport: the issue #55
+    Owner-authorized rotate semantics, atomicity, and authorization are
+    unchanged, and the returned post-rotation Connection re-passes the
+    read-boundary safe-config validation before it can be projected — the
+    same disclosure guarantee as the credential setup composition.
+    """
+    with application_span(_SERVICE_TRACER_SCOPE, _ROTATE_CREDENTIAL_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_ROTATE_CREDENTIAL_SPAN_NAME,
+            workspace_id=str(workspace_id),
+        )
+        connection = connection_credentials.rotate_connection_credential(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            credential=credential,
+        )
+        annotate_span(span, connection_id=str(connection.id))
+        _validate_persisted_safe_config(connection)
+        return connection
