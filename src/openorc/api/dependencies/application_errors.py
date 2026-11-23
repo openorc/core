@@ -8,7 +8,10 @@ service-layer obligation ("service errors must carry only safe fields"), so
 the response carries the typed message as the ``detail`` value; an unmapped
 vocabulary member keeps the generic framework server-error response and
 never leaks its text. Every mapped response carries the correlation
-middleware's request ID header, like every other API response.
+middleware's request ID header, like every other API response. The module
+also publishes the representative OpenAPI response declarations of the same
+fixed mapping for the public /api/v1 operations (issue #369): routers attach
+them to document the existing status vocabulary without duplicating it.
 """
 
 from __future__ import annotations
@@ -65,3 +68,70 @@ def _json_response(request: Request, status: int, detail: str) -> JSONResponse:
     request_id = request.scope.get("state", {}).get(REQUEST_ID_SCOPE_KEY)
     headers = {REQUEST_ID_HEADER: request_id} if isinstance(request_id, str) else None
     return JSONResponse(status_code=status, content={"detail": detail}, headers=headers)
+
+
+# --- OpenAPI declarations of the same fixed mapping (issue #369) ----------------
+#
+# Representative documented responses for the public /api/v1 operations. Each
+# documented body is the fixed {"detail": ...} envelope carrying the typed,
+# safe, service-authored message; the examples below are representative of the
+# mapping, not a per-route exhaustive matrix (the owning route tests prove the
+# actual outcomes).
+
+DOCUMENTED_AUTH_401 = {
+    "description": (
+        "Authentication failed: the Supabase session JWT bearer credential is "
+        "missing, malformed, or invalid (uniform, detail-free)."
+    ),
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": "authentication failed: the access token is missing or malformed",
+            }
+        }
+    },
+}
+
+DOCUMENTED_NOT_FOUND_404 = {
+    "description": (
+        "The addressed subject does not exist for the authenticated Profile: "
+        "missing, foreign-Workspace, and non-owner subjects are uniformly "
+        "this outcome, never a probing oracle."
+    ),
+    "content": {
+        "application/json": {
+            "example": {"detail": "the addressed subject does not exist in this workspace"}
+        }
+    },
+}
+
+DOCUMENTED_CONFLICT_409 = {
+    "description": (
+        "The operation conflicts with current durable state, or addresses a "
+        "subject that has since moved on (a stale operation)."
+    ),
+    "content": {
+        "application/json": {
+            "example": {"detail": "the operation conflicts with current durable state"}
+        }
+    },
+}
+
+DOCUMENTED_UNAVAILABLE_503 = {
+    "description": (
+        "A required integration is not configured for this process (fail "
+        "closed), or the outcome of an external operation is unknown or was "
+        "refused before delivery — never reported as invalid caller "
+        "credentials."
+    ),
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": (
+                    "the outcome of the external operation is unknown; the "
+                    "durable projection remains the caller-visible truth"
+                )
+            }
+        }
+    },
+}

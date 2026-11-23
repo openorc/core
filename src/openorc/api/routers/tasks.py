@@ -1,5 +1,7 @@
 """Thin Task discussion and conversation transport (issue #339).
 
+Public paths compose under the versioned ``/api/v1`` namespace (issue #369).
+
 This router owns HTTP concerns only: authenticated Profile extraction (the
 #52 dependency), request path/body parsing, delegation to the shared
 Owner-authorized application services, and the domain-to-wire response
@@ -22,6 +24,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 
+from openorc.api.dependencies.application_errors import (
+    DOCUMENTED_AUTH_401,
+    DOCUMENTED_CONFLICT_409,
+    DOCUMENTED_NOT_FOUND_404,
+    DOCUMENTED_UNAVAILABLE_503,
+)
 from openorc.api.dependencies.authentication import authenticated_profile
 from openorc.api.schemas.tasks import (
     DiscussionAdmissionRead,
@@ -64,9 +72,16 @@ AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
 
 
 @router.post(
-    "/api/workspaces/{workspace_id}/tasks/{task_id}/owner-gates/{owner_gate_id}/discussion-message",
+    "/workspaces/{workspace_id}/tasks/{task_id}/owner-gates/{owner_gate_id}/discussion-message",
     status_code=202,
     response_model=DiscussionAdmissionRead,
+    operation_id="send_owner_gate_discussion_message",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        409: DOCUMENTED_CONFLICT_409,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
 )
 def send_discussion_message(
     workspace_id: UUID,
@@ -148,8 +163,14 @@ def send_discussion_message(
 
 
 @router.get(
-    "/api/workspaces/{workspace_id}/tasks/{task_id}/owner-gates/{owner_gate_id}/discussion-status",
+    "/workspaces/{workspace_id}/tasks/{task_id}/owner-gates/{owner_gate_id}/discussion-status",
     response_model=DiscussionStatusRead,
+    operation_id="get_owner_gate_discussion_status",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
 )
 def read_discussion_status(
     workspace_id: UUID,
@@ -181,8 +202,14 @@ def read_discussion_status(
 
 
 @router.get(
-    "/api/workspaces/{workspace_id}/tasks/{task_id}/reviewer-conversation",
+    "/workspaces/{workspace_id}/tasks/{task_id}/reviewer-conversation",
     response_model=ReviewerConversationRead,
+    operation_id="get_task_reviewer_conversation",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
 )
 def read_reviewer_conversation(
     workspace_id: UUID,
