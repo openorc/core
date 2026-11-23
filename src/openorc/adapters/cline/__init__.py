@@ -36,6 +36,7 @@ from openorc.adapters.cline.bridge_process import ClineBridgeProcessBackend
 from openorc.adapters.cline.classification import classify_backend_failure
 from openorc.adapters.cline.connection_endpoint import (
     CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY,
+    CONNECTION_REPOSITORY_BASE_CONFIG_KEY,
     ConnectionControlEndpointError,
     parse_control_endpoint_url,
     resolve_connection_control_endpoint,
@@ -87,6 +88,7 @@ from openorc.adapters.cline.values import (
 
 __all__ = [
     "CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY",
+    "CONNECTION_REPOSITORY_BASE_CONFIG_KEY",
     "aggregate_usage_cost_usd",
     "ClineAccumulatedUsage",
     "ClineAdapter",

@@ -70,6 +70,7 @@ __all__ = [
     "WorkflowActorContext",
     "owner_actor",
     "producer_actor",
+    "record_connection_configuration_changed_event",
     "record_execution_cancelled_event",
     "record_execution_completed_event",
     "record_execution_failed_event",
@@ -328,6 +329,35 @@ def record_role_binding_configuration_changed_event(
         subject_type=_SUBJECT_TYPE_WORKSPACE,
         subject_id=workspace_id,
         context={"setting": "workflow_role_binding", "role": role.value},
+    )
+
+
+def record_connection_configuration_changed_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    actor: WorkflowActorContext,
+    connection_id: UUID,
+) -> None:
+    """Record one Workspace Connection configuration change (issue #371).
+
+    Workspace-scoped (no Task), subject the Workspace, context identifies
+    only the ``connection`` setting and the affected Connection ID. The
+    Owner's safe-config values (repository base, control endpoint) have no
+    parameter in this helper at all, so they can never be copied into the
+    event.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(connection_id, "connection_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+        subject_type=_SUBJECT_TYPE_WORKSPACE,
+        subject_id=workspace_id,
+        context={"setting": "connection", "connection_id": str(connection_id)},
     )
 
 
