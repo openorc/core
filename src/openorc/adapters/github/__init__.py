@@ -121,6 +121,7 @@ from openorc.adapters.github.transport import (
     http_fetch,
 )
 from openorc.adapters.github.user_tokens import (
+    GITHUB_AUTHORIZE_ENDPOINT_URL,
     GITHUB_TOKEN_ENDPOINT_URL,
     GitHubCurrentUser,
     GitHubProfileUserAccessToken,
@@ -129,6 +130,7 @@ from openorc.adapters.github.user_tokens import (
     GitHubUserTokenClient,
     GitHubUserTokenGrant,
     HttpGitHubUserTokenClient,
+    compose_user_authorization_url,
 )
 
 __all__ = [
@@ -148,6 +150,7 @@ __all__ = [
     "GITHUB_REPOSITORY_ISSUE_PATH",
     "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
     "GITHUB_TOKEN_ENDPOINT_URL",
+    "GITHUB_AUTHORIZE_ENDPOINT_URL",
     "GITHUB_USER_INSTALLATIONS_PATH",
     "GITHUB_USER_INSTALLATION_REPOSITORIES_PATH",
     "INSTALLATION_TOKEN_CACHE_MAX_ENTRIES",
@@ -190,6 +193,7 @@ __all__ = [
     "HttpGitHubRestClient",
     "HttpGitHubUserTokenClient",
     "InstallationAccessToken",
+    "compose_user_authorization_url",
     "GitHubAuthenticationRejectedError",
     "GitHubAuthorizationRejectedError",
     "GitHubOutcomeUncertainError",

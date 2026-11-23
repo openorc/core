@@ -11,19 +11,22 @@ Scope and safety:
 
 - The exchange API accepts only post-correlation callback inputs. OAuth
   ``state`` correlation and session lifecycle against the authenticated
-  Profile are the browser/API callback layer's responsibility (outside this
-  leaf); an authorization code is never treated here as proof of Profile
-  identity. The GitHub App web application flow supports PKCE: where the
-  correlated authorization request carried ``code_challenge``/
-  ``code_challenge_method=S256``, the exchange forwards the original
-  ``code_verifier`` (GitHub's documented ``missing or incorrect
-  code_verifier`` rejection classifies as a known rejection); challenge
-  generation and verifier lifecycle remain callback-layer concerns.
+  Profile are the flow boundary's responsibility (the issue #373 pending
+  OAuth start-to-callback correlation service); an authorization code is
+  never treated here as proof of Profile identity. The GitHub App web
+  application flow supports PKCE: where the correlated authorization request
+  carried ``code_challenge``/``code_challenge_method=S256``, the exchange
+  forwards the original ``code_verifier`` (GitHub's documented ``missing or
+  incorrect code_verifier`` rejection classifies as a known rejection);
+  challenge generation, verifier lifecycle, and the durable correlation
+  belong to the flow service, while the documented authorize-URL composition
+  lives here as a pure provider mechanic.
 - The deployment's GitHub App user-flow client ID and client secret are
   deployment/bootstrap secret material: supplied at construction, validated
   once (fail fast on missing/blank values), held in private fields with
   redacted ordinary representations, and never exposed through errors,
-  logs, span attributes, or returned objects.
+  logs, span attributes, or returned objects. The client ID is public
+  identity material in the authorize URL; the client secret never is.
 - The token endpoint is fixed to the documented HTTPS
   ``https://github.com/login/oauth/access_token`` URL; credentials travel in
   the form-encoded request body, never in a URL or query string, and the
@@ -70,6 +73,7 @@ from openorc.config import ConfigurationError
 from openorc.observability import annotate_span, application_span
 
 __all__ = [
+    "GITHUB_AUTHORIZE_ENDPOINT_URL",
     "GITHUB_TOKEN_ENDPOINT_URL",
     "GitHubCurrentUser",
     "GitHubProfileUserAccessToken",
@@ -78,12 +82,48 @@ __all__ = [
     "GitHubUserTokenClient",
     "GitHubUserTokenGrant",
     "HttpGitHubUserTokenClient",
+    "compose_user_authorization_url",
 ]
 
 # The documented GitHub App web-flow token endpoint (authorization-code
 # exchange and refresh exchange). Credentials travel only in the request
 # body; the URL is a fixed HTTPS constant, never caller-supplied.
 GITHUB_TOKEN_ENDPOINT_URL = "https://github.com/login/oauth/access_token"
+
+# The documented GitHub App user-authorization endpoint the flow service
+# redirects the Owner's browser to (issue #373). A fixed HTTPS constant,
+# never caller-supplied.
+GITHUB_AUTHORIZE_ENDPOINT_URL = "https://github.com/login/oauth/authorize"
+
+
+def compose_user_authorization_url(*, client_id: str, state: str, code_challenge: str) -> str:
+    """Compose the documented GitHub App user-authorization URL (issue #373).
+
+    Pure provider mechanics over the fixed HTTPS endpoint. The query carries
+    only public identity and correlation material: the user-flow client ID
+    (public in the authorize URL by GitHub's documented web-application
+    flow), the unpredictable correlation ``state``, and the S256 PKCE code
+    challenge. The PKCE code verifier, the client secret, and every other
+    credential have no path into this URL; no ``redirect_uri`` is sent, so
+    GitHub redirects to the deployment's configured GitHub App Callback URL
+    (the deployment points it at OpenOrc's provider ingress route).
+    """
+    if not isinstance(client_id, str) or not client_id:
+        raise ConfigurationError("the GitHub App user-flow client ID must be configured")
+    for value, description in ((state, "state"), (code_challenge, "code challenge")):
+        if not isinstance(value, str) or not value:
+            raise ConfigurationError(
+                f"the GitHub user-authorization {description} must be a non-empty string"
+            )
+    query = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+    )
+    return f"{GITHUB_AUTHORIZE_ENDPOINT_URL}?{query}"
 
 
 class GitHubUserAccessToken:
