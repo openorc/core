@@ -1,5 +1,7 @@
 """Thin role-binding configuration transport (issue #162).
 
+Public paths compose under the versioned ``/api/v1`` namespace (issue #369).
+
 This router owns HTTP concerns only: authenticated Profile extraction (the
 #52 dependency), request path/body parsing, delegation to the shared
 Owner-authorized application service, and the domain-to-wire response
@@ -18,6 +20,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 
+from openorc.api.dependencies.application_errors import (
+    DOCUMENTED_AUTH_401,
+    DOCUMENTED_NOT_FOUND_404,
+    DOCUMENTED_UNAVAILABLE_503,
+)
 from openorc.api.dependencies.authentication import authenticated_profile
 from openorc.api.schemas.role_bindings import (
     RoleBindingConfigurationRead,
@@ -38,8 +45,14 @@ AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
 
 
 @router.get(
-    "/api/workspaces/{workspace_id}/role-bindings/{role}",
+    "/workspaces/{workspace_id}/role-bindings/{role}",
     response_model=RoleBindingConfigurationRead,
+    operation_id="get_workspace_role_binding",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
 )
 def read_role_binding_configuration(
     workspace_id: UUID,
@@ -59,8 +72,14 @@ def read_role_binding_configuration(
 
 
 @router.put(
-    "/api/workspaces/{workspace_id}/role-bindings/{role}",
+    "/workspaces/{workspace_id}/role-bindings/{role}",
     response_model=RoleBindingConfigurationRead,
+    operation_id="replace_workspace_role_binding",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
 )
 def update_role_binding_configuration(
     workspace_id: UUID,

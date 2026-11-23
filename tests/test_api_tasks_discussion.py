@@ -140,15 +140,15 @@ def discussion_seam(monkeypatch: pytest.MonkeyPatch):
 
 def _post_url() -> str:
     return (
-        f"/api/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}"
+        f"/api/v1/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}"
         f"/owner-gates/{_GATE_ID}/discussion-message"
     )
 
 
 _STATUS_URL = (
-    f"/api/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}/owner-gates/{_GATE_ID}/discussion-status"
+    f"/api/v1/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}/owner-gates/{_GATE_ID}/discussion-status"
 )
-_CONVERSATION_URL = f"/api/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}/reviewer-conversation"
+_CONVERSATION_URL = f"/api/v1/workspaces/{_WORKSPACE_ID}/tasks/{_TASK_ID}/reviewer-conversation"
 _MESSAGE = {"message": "Owner question: is the retry backoff sufficient?"}
 
 

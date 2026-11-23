@@ -116,6 +116,15 @@ QUEUE_OBSERVER_REGISTRATION_PATH: Final[str] = "/internal/observer/registrations
 LOCAL_EXECUTOR_WORKERS_VAR = "OPENORC_LOCAL_EXECUTOR_WORKERS"
 LOCAL_EXECUTOR_PENDING_VAR = "OPENORC_LOCAL_EXECUTOR_PENDING"
 REVIEWER_NEUTRAL_DIRECTORY_VAR = "OPENORC_REVIEWER_NEUTRAL_DIRECTORY"
+# Optional deployment-configured browser-CORS origin allow-list (issue #369).
+# HTTP mechanism only — never application authorization policy. Unset or blank
+# means CORS is disabled (the default in every environment, production
+# included): there is no hardcoded Cloud/frontend origin and no permissive
+# default. When supplied, it is an explicit, closed list of absolute http(s)
+# origins (no wildcard, no path-bearing values); malformed entries fail
+# configuration so misconfiguration never surfaces at runtime. A deployment
+# whose edge proxy already owns CORS simply leaves this unset.
+CORS_ALLOWED_ORIGINS_VAR = "OPENORC_CORS_ALLOWED_ORIGINS"
 
 DEFAULT_ENVIRONMENT = "development"
 PRODUCTION_ENVIRONMENT = "production"
@@ -187,6 +196,10 @@ _SUPABASE_URL_SCHEMES = frozenset({"http", "https"})
 # Schemes accepted for the OTLP collector base URL (issue #108). Telemetry
 # export is deployment configuration; unconfigured telemetry stays a no-op.
 _OTLP_URL_SCHEMES = frozenset({"http", "https"})
+
+# Schemes accepted for each browser-CORS origin entry (issue #369): absolute
+# http(s) origins only.
+_CORS_ORIGIN_SCHEMES = frozenset({"http", "https"})
 
 
 class ConfigurationError(Exception):
@@ -291,6 +304,50 @@ def _read_optional_int(env: Mapping[str, str], name: str, *, minimum: int) -> in
     return value
 
 
+def _parse_cors_allowed_origins(raw: str | None) -> tuple[str, ...]:
+    """Parse the optional browser-CORS origin allow-list (issue #369).
+
+    Unset/blank means CORS is disabled. Supplied values are comma-separated
+    absolute http(s) origins: trimmed, scheme/host-normalized to lowercase,
+    deduplicated preserving first-seen order, and rejected (fail fast) when a
+    wildcard, a path/query/fragment/userinfo component, or a malformed
+    non-http(s) origin appears. The CORS middleware compares origins exactly,
+    so the normalization here keeps configured and browser-sent origins
+    comparable.
+    """
+    if raw is None:
+        return ()
+    origins: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.split(","):
+        origin = chunk.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            raise ConfigurationError(
+                f"{CORS_ALLOWED_ORIGINS_VAR} does not accept wildcard origins: "
+                "list each allowed origin explicitly"
+            )
+        parsed = urlparse(origin)
+        if (
+            parsed.scheme.lower() not in _CORS_ORIGIN_SCHEMES
+            or not parsed.netloc
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or "@" in parsed.netloc
+        ):
+            raise ConfigurationError(
+                f"{CORS_ALLOWED_ORIGINS_VAR} entries must be absolute http(s) "
+                f"origins without paths, got {origin!r}"
+            )
+        normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+        if normalized not in seen:
+            seen.add(normalized)
+            origins.append(normalized)
+    return tuple(origins)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Process configuration resolved from the environment boundary."""
@@ -363,6 +420,10 @@ class Settings:
     # executes without it.
     reviewer_neutral_directory: str | None = None
     otlp_endpoint: str | None = None
+    # Optional browser-CORS origin allow-list (issue #369): HTTP mechanism
+    # only. Empty means CORS is disabled (the default); parsed and validated
+    # in from_env, never at request time.
+    cors_allowed_origins: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -616,6 +677,11 @@ class Settings:
                     f"base URL, got {otlp_endpoint!r}"
                 )
 
+        # Optional browser-CORS origin allow-list (issue #369). Parsed and
+        # validated here so misconfiguration fails startup like every other
+        # configuration error; an unset/blank value keeps CORS disabled.
+        cors_allowed_origins = _parse_cors_allowed_origins(_read(source, CORS_ALLOWED_ORIGINS_VAR))
+
         return cls(
             environment=environment,
             api_host=_read(source, API_HOST_VAR) or DEFAULT_API_HOST,
@@ -642,4 +708,5 @@ class Settings:
             local_executor_pending=local_executor_pending,
             reviewer_neutral_directory=reviewer_neutral_directory,
             otlp_endpoint=otlp_endpoint,
+            cors_allowed_origins=cors_allowed_origins,
         )

@@ -138,7 +138,10 @@ def _register_observation(
         registrar.register_establishment_session(**kwargs)
 
 
-@router.post(_REGISTRATION_PATH)
+# Private infrastructure is not advertised as public API (issue #369): the
+# handshake stays fully operational for the queue dispatch worker while being
+# excluded from the generated OpenAPI schema.
+@router.post(_REGISTRATION_PATH, include_in_schema=False)
 async def register_detached_turn_observation(
     request: Request,
     registration: DetachedTurnObservationRegistrationRequest,

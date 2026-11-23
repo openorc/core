@@ -1,14 +1,19 @@
 """Authenticated-Profile request dependency (the #52 boundary at the #162 transport).
 
-The first authenticated API dependency: extracts the bearer token from the
-``Authorization`` header, verifies it through the #52 authentication
-application service (Supabase Auth token verification plus canonical Profile
-resolution), and hands the resolved Profile to authorized routes.
+The first authenticated API dependency: extracts the bearer credential from
+the ``Authorization`` header through the declared ``SupabaseSessionJwtBearer``
+security scheme, verifies it through the #52 authentication application
+service (Supabase Auth token verification plus canonical Profile resolution),
+and hands the resolved Profile to authorized routes.
 
 - The dependency is synchronous: FastAPI runs sync dependencies off the
   event loop, so the blocking token verification (JWKS retrieval, an
   external call) and the Profile-resolution database work never run on the
-  event loop.
+  event loop. The security-scheme sub-dependency only reads the header.
+- The declared scheme is what the generated OpenAPI advertises (issue #369):
+  the Supabase Auth session JWT obtained through GitHub-only sign-in,
+  supplied as an HTTP Bearer credential. Publishable and secret Supabase
+  keys are not user JWTs, and no new login/token system is introduced.
 - Failures surface as the typed application vocabulary and are mapped to
   HTTP by the application-level application-error handler: invalid/missing
   credentials to a uniform 401, JWKS retrieval failures to 503, and an
@@ -24,7 +29,8 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Header, Request
+from fastapi import Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from openorc.adapters.supabase import SupabaseAccessTokenVerifier
 from openorc.config import Settings
@@ -33,14 +39,31 @@ from openorc.persistence.pool import get_database_pool
 from openorc.services.authentication import authenticate
 from openorc.services.errors import AuthenticationError, IntegrationNotConfiguredError
 
-__all__ = ["authenticated_profile"]
+__all__ = ["authenticated_profile", "supabase_session_jwt_bearer"]
 
-_BEARER_SCHEME = "Bearer "
+_UNAUTHENTICATED_MESSAGE = "authentication failed: the access token is missing or malformed"
+
+# The declared security scheme (issue #369): the Supabase Auth session JWT
+# obtained through GitHub-only sign-in, supplied as an HTTP Bearer credential.
+# ``auto_error=False`` keeps every credential failure inside this module's
+# typed uniform-401 contract — the scheme never produces its own HTTP
+# exception, and no credential material is ever stored or reflected back.
+supabase_session_jwt_bearer = HTTPBearer(
+    scheme_name="SupabaseSessionJwtBearer",
+    bearerFormat="JWT",
+    description=(
+        "Supabase Auth session JWT obtained through GitHub sign-in. "
+        "Publishable and secret Supabase API keys are not user JWTs."
+    ),
+    auto_error=False,
+)
 
 
 def authenticated_profile(
     request: Request,
-    authorization: Annotated[str | None, Header()] = None,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Security(supabase_session_jwt_bearer)
+    ] = None,
 ) -> Profile:
     """Resolve the authenticated Profile for one request (#52 boundary).
 
@@ -52,21 +75,22 @@ def authenticated_profile(
     return authenticate(
         get_database_pool(settings),
         _verifier_for(settings),
-        token=_extract_bearer_token(authorization),
+        token=_extract_bearer_token(credentials),
     ).profile
 
 
-def _extract_bearer_token(authorization: str | None) -> str:
-    """Extract the bearer-token value from the Authorization header value.
+def _extract_bearer_token(credentials: HTTPAuthorizationCredentials | None) -> str:
+    """Extract the bearer-token value under the uniform failure contract.
 
-    Missing, non-bearer, and empty-token headers are the same uniform
+    A missing header, a non-bearer scheme (the ``Bearer`` capitalization is
+    required, as before), and an empty token are the same uniform
     authentication failure: no header content is ever reflected back.
     """
-    if authorization is None or not authorization.startswith(_BEARER_SCHEME):
-        raise AuthenticationError("authentication failed: the access token is missing or malformed")
-    token = authorization[len(_BEARER_SCHEME) :].strip()
+    if credentials is None or credentials.scheme != "Bearer":
+        raise AuthenticationError(_UNAUTHENTICATED_MESSAGE)
+    token = credentials.credentials.strip()
     if not token:
-        raise AuthenticationError("authentication failed: the access token is missing or malformed")
+        raise AuthenticationError(_UNAUTHENTICATED_MESSAGE)
     return token
 
 

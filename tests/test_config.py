@@ -8,6 +8,7 @@ from openorc.config import (
     API_HOST_VAR,
     API_PORT_VAR,
     API_RELOAD_VAR,
+    CORS_ALLOWED_ORIGINS_VAR,
     DATABASE_URL_VAR,
     DB_POOL_MAX_VAR,
     DB_POOL_MIN_VAR,
@@ -732,3 +733,51 @@ def test_the_observer_registration_secret_never_appears_in_settings_representati
     assert raw_secret not in str(settings)
     # The representation stays useful for the non-secret transport field.
     assert "http://control-plane.internal:3000" in repr(settings)
+
+
+# --- optional browser-CORS origin allow-list (issue #369) ------------------------
+
+
+def test_cors_origins_default_to_disabled() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.cors_allowed_origins == ()
+
+
+def test_blank_cors_origins_fall_back_to_disabled() -> None:
+    settings = Settings.from_env({CORS_ALLOWED_ORIGINS_VAR: ""})
+
+    assert settings.cors_allowed_origins == ()
+
+
+def test_cors_origins_are_parsed_trimmed_normalized_and_deduplicated() -> None:
+    settings = Settings.from_env(
+        {
+            CORS_ALLOWED_ORIGINS_VAR: (
+                " https://app.example.com , https://app.example.com/ ,"
+                " HTTPS://Admin.Example.ORG:8443,"
+            )
+        }
+    )
+
+    assert settings.cors_allowed_origins == (
+        "https://app.example.com",
+        "https://admin.example.org:8443",
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "*",
+        "ftp://app.example.com",
+        "https://",
+        "https://app.example.com/console",
+        "https://app.example.com/?next=/x",
+        "https://user@app.example.com",
+        "not-an-origin",
+    ],
+)
+def test_malformed_cors_origin_values_are_rejected(raw: str) -> None:
+    with pytest.raises(ConfigurationError, match="OPENORC_CORS_ALLOWED_ORIGINS"):
+        Settings.from_env({CORS_ALLOWED_ORIGINS_VAR: raw})

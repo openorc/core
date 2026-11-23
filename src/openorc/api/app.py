@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from openorc import __version__
 from openorc.adapters.cline import (
@@ -17,6 +18,7 @@ from openorc.adapters.cline import (
 from openorc.adapters.cline.hub_observation import ClineHubTurnObservationSource
 from openorc.api.dependencies.application_errors import application_error_response
 from openorc.api.request_correlation import (
+    REQUEST_ID_HEADER,
     RequestCorrelationMiddleware,
     server_error_response,
 )
@@ -48,6 +50,59 @@ from openorc.workers.task_workflow import (
 )
 
 API_TITLE = "OpenOrc API"
+
+# The v1 reference is the FastAPI-generated documentation (issue #369): the
+# public client contract lives under the URL-major ``/api/v1`` namespace while
+# the API package ``version`` stays the package release version — the two are
+# deliberately distinct. Health, provider webhook ingress, and private
+# deployment infrastructure stay outside the versioned public namespace.
+API_DESCRIPTION = (
+    "OpenOrc control-plane HTTP transport. The public client contract is the "
+    "versioned /api/v1 namespace: currently the role-binding configuration "
+    "routes (issue #162) and the Task discussion/conversation routes "
+    "(issue #339), authenticated by a Supabase Auth session JWT (GitHub-only "
+    "sign-in) supplied as an HTTP Bearer credential — publishable and secret "
+    "Supabase keys are not user JWTs. Deterministic health (/healthz), "
+    "provider webhook ingress (/api/github/webhooks), and private deployment "
+    "infrastructure are outside the versioned public namespace."
+)
+
+# OpenAPI tag metadata (issue #369): meaningful grouping/descriptions for the
+# operations the published schema carries.
+OPENAPI_TAG_METADATA = [
+    {
+        "name": "role-bindings",
+        "description": (
+            "Per-role runtime-session configuration of a Workspace "
+            "(issue #162): the Owner-authorized read and full-record "
+            "replacement."
+        ),
+    },
+    {
+        "name": "tasks",
+        "description": (
+            "Task-scoped discussion and conversation transport (issue #339): "
+            "the asynchronous Owner ↔ Reviewer discussion admission, its "
+            "durable receipt-status projection, and the transient "
+            "Reviewer-conversation read."
+        ),
+    },
+    {
+        "name": "health",
+        "description": (
+            "Deterministic process health/readiness; an infrastructure "
+            "endpoint outside the versioned public namespace."
+        ),
+    },
+    {
+        "name": "github-webhooks",
+        "description": (
+            "GitHub App webhook ingress authenticated by the provider's own "
+            "signature material; provider-facing, outside the versioned "
+            "public namespace."
+        ),
+    },
+]
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +292,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings if settings is not None else Settings.from_env()
     app = FastAPI(
         title=API_TITLE,
+        description=API_DESCRIPTION,
         version=__version__,
+        openapi_tags=OPENAPI_TAG_METADATA,
         lifespan=_serving_lifespan(resolved),
         # The correlation module owns the application's registered Exception
         # handler so the framework's outermost server-error layer keeps its
@@ -249,15 +306,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         },
     )
     app.add_middleware(RequestCorrelationMiddleware)
+    # The public client contract is versioned (issue #369): the two public
+    # application routers mount under /api/v1 while health, provider webhook
+    # ingress, and the private registration transport stay outside it.
     app.include_router(health_router)
     app.include_router(github_webhooks_router)
-    app.include_router(role_bindings_router)
-    app.include_router(tasks_router)
+    app.include_router(role_bindings_router, prefix="/api/v1")
+    app.include_router(tasks_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport
     # (issue #346): deployment-only, authenticated, and nonpublic; it serves
     # the serving process's own observation host and is never an application
-    # command or Owner-authority surface.
+    # command or Owner-authority surface. Private infrastructure is also
+    # excluded from the published OpenAPI schema (issue #369).
     app.include_router(internal_queue_observer_router)
+    # Optional deployment-configured browser-CORS support (issue #369): HTTP
+    # mechanism only, enabled solely by an explicit configured origin
+    # allow-list — never a hardcoded Cloud/frontend origin, never a permissive
+    # default, and simply left unset when an edge proxy already owns CORS.
+    # Added after the correlation middleware so it is the outermost layer: a
+    # CORS preflight short-circuits as browser mechanics before any
+    # application request span exists, while every application request still
+    # owns exactly one canonical correlation span, and the correlation
+    # request-ID response header is exposed to allowed browser clients.
+    if resolved.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(resolved.cors_allowed_origins),
+            allow_methods=["GET", "POST", "PUT"],
+            allow_headers=["Authorization", "Content-Type"],
+            expose_headers=[REQUEST_ID_HEADER],
+        )
     app.state.settings = resolved
     return app
 

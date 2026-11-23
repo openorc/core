@@ -135,7 +135,7 @@ def test_get_returns_the_durable_configuration(
     seam = service_seam(read_result=binding)
     client = _client(settings_factory(), owner_profile)
 
-    response = client.get(f"/api/workspaces/{binding.workspace_id}/role-bindings/producer")
+    response = client.get(f"/api/v1/workspaces/{binding.workspace_id}/role-bindings/producer")
 
     assert response.status_code == 200
     body = response.json()
@@ -176,7 +176,7 @@ def test_put_delegates_the_full_record(service_seam, settings_factory, owner_pro
     client = _client(settings_factory(), owner_profile)
 
     response = client.put(
-        f"/api/workspaces/{binding.workspace_id}/role-bindings/reviewer",
+        f"/api/v1/workspaces/{binding.workspace_id}/role-bindings/reviewer",
         json={
             "connection_id": str(binding.connection_id),
             "configured_provider": "provider-id-2",
@@ -217,7 +217,7 @@ def test_put_passes_an_empty_override_verbatim(
     client = _client(settings_factory(), owner_profile)
 
     response = client.put(
-        f"/api/workspaces/{binding.workspace_id}/role-bindings/producer",
+        f"/api/v1/workspaces/{binding.workspace_id}/role-bindings/producer",
         json={
             "connection_id": str(binding.connection_id),
             "configured_provider": None,
@@ -248,7 +248,7 @@ def test_application_errors_map_to_their_http_statuses(
     client = _client(settings_factory(), owner_profile)
 
     response = client.put(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         json={
             "connection_id": str(uuid.uuid4()),
             "configured_provider": None,
@@ -267,7 +267,7 @@ def test_a_read_error_maps_to_not_found(service_seam, settings_factory, owner_pr
     service_seam(read_error=NotFoundError("binding not available"))
     client = _client(settings_factory(), owner_profile)
 
-    response = client.get(f"/api/workspaces/{uuid.uuid4()}/role-bindings/reviewer")
+    response = client.get(f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/reviewer")
 
     assert response.status_code == 404
 
@@ -278,7 +278,7 @@ def test_an_unknown_role_path_is_a_wire_validation_error(
     seam = service_seam()
     client = _client(settings_factory(), owner_profile)
 
-    response = client.get(f"/api/workspaces/{uuid.uuid4()}/role-bindings/navigator")
+    response = client.get(f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/navigator")
 
     assert response.status_code == 422
     assert seam.reads == []
@@ -291,7 +291,7 @@ def test_a_malformed_put_body_is_a_wire_validation_error(
     client = _client(settings_factory(), owner_profile)
 
     response = client.put(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         json={"configured_provider": "p"},
     )
 
@@ -305,7 +305,7 @@ def test_a_malformed_workspace_path_is_a_wire_validation_error(
     seam = service_seam()
     client = _client(settings_factory(), owner_profile)
 
-    response = client.get("/api/workspaces/not-a-uuid/role-bindings/producer")
+    response = client.get("/api/v1/workspaces/not-a-uuid/role-bindings/producer")
 
     assert response.status_code == 422
     assert seam.reads == []
@@ -368,7 +368,9 @@ def test_missing_or_malformed_credentials_are_a_uniform_401(
     app = create_app(_settings_for_auth(settings_factory))
     client = TestClient(app)
 
-    response = client.get(f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer", headers=headers)
+    response = client.get(
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer", headers=headers
+    )
 
     # Uniform, detail-free rejection class: the typed authentication failure
     # maps to 401 before any Profile or Workspace work.
@@ -382,7 +384,7 @@ def test_an_invalid_token_is_a_uniform_401(auth_seam, settings_factory) -> None:
     client = TestClient(app)
 
     response = client.get(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         headers={"Authorization": "Bearer rejected-token"},
     )
 
@@ -402,7 +404,7 @@ def test_jwks_unavailability_is_a_fail_closed_503(auth_seam, settings_factory) -
     client = TestClient(app)
 
     response = client.get(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         headers={"Authorization": "Bearer some-token"},
     )
 
@@ -417,7 +419,7 @@ def test_an_unconfigured_project_url_fails_closed_503(auth_seam, settings_factor
     client = TestClient(app)
 
     response = client.get(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         headers={"Authorization": "Bearer some-token"},
     )
 
@@ -436,7 +438,7 @@ def test_a_verified_identity_reaches_the_authorized_route(
     client = TestClient(app)
 
     response = client.get(
-        f"/api/workspaces/{binding.workspace_id}/role-bindings/producer",
+        f"/api/v1/workspaces/{binding.workspace_id}/role-bindings/producer",
         headers={"Authorization": "Bearer verified-token"},
     )
 
@@ -459,7 +461,7 @@ def test_omitted_configuration_fields_cannot_silently_clear(
     client = _client(settings_factory(), owner_profile)
 
     response = client.put(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         json={"connection_id": str(uuid.uuid4())},
     )
 
@@ -475,7 +477,7 @@ def test_omitted_configuration_fields_cannot_silently_clear(
         )
     )
     response = client.put(
-        f"/api/workspaces/{uuid.uuid4()}/role-bindings/producer",
+        f"/api/v1/workspaces/{uuid.uuid4()}/role-bindings/producer",
         json={
             "connection_id": str(uuid.uuid4()),
             "configured_provider": None,
