@@ -9,6 +9,7 @@ allow-credentials (Bearer-token authentication is not CORS-credentialed).
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -68,9 +69,29 @@ def test_a_preflight_from_a_configured_origin_is_short_circuited(settings_factor
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == _ALLOWED_ORIGIN
     allowed_methods = preflight.headers["access-control-allow-methods"].replace(" ", "")
-    assert {"GET", "POST", "PUT"} <= set(allowed_methods.split(","))
+    assert {"GET", "POST", "PUT", "DELETE"} <= set(allowed_methods.split(","))
     assert "authorization" in preflight.headers["access-control-allow-headers"].lower()
     # The preflight is browser mechanics, not an application request: it
     # short-circuits before the correlation middleware, so no application
     # request ID is minted for it.
     assert "x-openorc-request-id" not in preflight.headers
+
+
+def test_a_delete_preflight_for_the_route_unbinding_is_allowed(settings_factory) -> None:
+    """The issue #372 route-unbinding operation is reachable from a configured
+    browser client: the DELETE preflight against the exact route path succeeds
+    and advertises DELETE among the allowed methods."""
+    client = _client(settings_factory(cors_allowed_origins=(_ALLOWED_ORIGIN,)))
+
+    preflight = client.options(
+        f"/api/v1/workspaces/{uuid.uuid4()}/repositories/{uuid.uuid4()}/installation-route",
+        headers={
+            "Origin": _ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "DELETE",
+        },
+    )
+
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == _ALLOWED_ORIGIN
+    allowed_methods = preflight.headers["access-control-allow-methods"].replace(" ", "")
+    assert "DELETE" in allowed_methods.split(",")
