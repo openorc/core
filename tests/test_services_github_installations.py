@@ -22,6 +22,11 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from psycopg.errors import ForeignKeyViolation
 
+from openorc.domain.ownership import (
+    GitHubRepositoryIdentity,
+    Repository,
+    RepositoryMetadata,
+)
 from openorc.observability import injected_tracer_source
 from openorc.persistence.pool import DatabasePool
 from openorc.services import github_installations
@@ -196,6 +201,7 @@ def test_record_workspace_installation_reconciles_through_the_guarded_compositio
 
     assert installation.id == installation_id
     assert installation.identity.github_installation_id == 12345678
+    assert installation.account is not None
     assert installation.account.login == "octocat"
     assert len(conn.executed) == 3
     guard_sql, guard_params = conn.executed[0]
@@ -593,3 +599,112 @@ def test_malformed_command_is_classified_without_exporting_its_values() -> None:
     # The malformed identifier never reaches exported telemetry: annotation
     # happens only after the caller-supplied identifiers proved valid.
     assert malformed not in str(exported.attributes)
+
+
+def _claim_state_installation_row(installation_id: Any, workspace_id: Any) -> tuple[Any, ...]:
+    return (
+        installation_id,
+        workspace_id,
+        12345678,
+        None,
+        None,
+        None,
+        None,
+        _OBSERVED,
+        _OBSERVED,
+    )
+
+
+def test_record_workspace_installation_establishes_a_claim_state_record() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    installation_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(workspace_id, profile_id),
+            _claim_state_installation_row(installation_id, workspace_id),
+        ]
+    )
+
+    installation = github_installations.record_workspace_installation(
+        _pool(conn),
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        github_installation_id=12345678,
+        github_account_id=501,
+        account_login="octocat",
+        account_type="Organization",
+        suspended_at=None,
+    )
+
+    # A claim-state record (observed account identity NULL, issue #372) is
+    # established by these trusted facts: no conflict is raised, and the
+    # trusted upsert populates the stable account identity atomically with
+    # the observations (the coalesce shape is proven by the persistence
+    # tests and the migration convention tests).
+    assert installation.account is None
+    assert len(conn.executed) == 3
+    upsert_sql, upsert_params = conn.executed[2]
+    assert "insert into openorc.github_installations" in upsert_sql
+    assert upsert_params == (workspace_id, 12345678, 501, "octocat", "Organization", None)
+
+
+def test_record_workspace_installation_still_conflicts_on_a_different_established_account() -> None:
+    profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _ws_row(workspace_id, profile_id),
+            _installation_row(uuid.uuid4(), workspace_id, github_account_id=502),
+        ]
+    )
+
+    with pytest.raises(ConflictError):
+        github_installations.record_workspace_installation(
+            _pool(conn),
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            github_installation_id=12345678,
+            github_account_id=501,
+            account_login="octocat",
+            account_type="Organization",
+            suspended_at=None,
+        )
+
+
+def test_require_observed_repository_metadata_returns_the_observed_block() -> None:
+    metadata = RepositoryMetadata(
+        owner_login="octocat",
+        name="hello-world",
+        html_url="https://github.com/octocat/hello-world",
+        is_private=False,
+        default_branch="main",
+    )
+    repository = Repository(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        identity=GitHubRepositoryIdentity(github_repository_id=987654321),
+        metadata=metadata,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+
+    assert github_installations.require_observed_repository_metadata(repository) is metadata
+
+
+def test_require_observed_repository_metadata_fails_closed_for_claim_state() -> None:
+    repository = Repository(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        identity=GitHubRepositoryIdentity(github_repository_id=987654321),
+        metadata=None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+
+    with pytest.raises(ConflictError):
+        github_installations.require_observed_repository_metadata(repository)

@@ -147,6 +147,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.github_installations import require_observed_repository_metadata
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
@@ -637,7 +638,8 @@ def _require_review_eligible_pull_request(
             "feature branch; the review subject is invalidated and the dispatch "
             "applies nothing"
         )
-    default_branch = repository.metadata.default_branch
+    metadata = require_observed_repository_metadata(repository)
+    default_branch = metadata.default_branch
     if default_branch is None or not default_branch.strip():
         raise ConflictError(
             "the routed repository carries no default branch; the base routing cannot be verified"
@@ -814,6 +816,10 @@ def _reserve_pr_review_attempt(
     repository = get_repository(pool, task.repository_id)
     if repository is None or repository.workspace_id != workspace_id:
         raise NotFoundError("the requested repository is not available in this workspace")
+    # OBSERVED presentation facts only: a claim-state repository (issue #372
+    # Owner onboarding) carries no trusted GitHub observation yet and fails
+    # closed instead of misusing claim data.
+    metadata = require_observed_repository_metadata(repository)
     _require_review_eligible_pull_request(pull_request=reconciled, task=task, repository=repository)
     head_sha = reconciled.head_sha
 
@@ -902,7 +908,7 @@ def _reserve_pr_review_attempt(
         task=task,
         pull_request=pull_request,
         reviewer=reviewer,
-        repository_full_name=f"{repository.metadata.owner_login}/{repository.metadata.name}",
+        repository_full_name=f"{metadata.owner_login}/{metadata.name}",
         loop=locked_loop,
         iteration=reserved,
         head_sha=head_sha,

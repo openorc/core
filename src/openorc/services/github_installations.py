@@ -46,7 +46,7 @@ from openorc.domain.github_installations import (
     GitHubInstallationDomainError,
     GitHubInstallationIdentity,
 )
-from openorc.domain.ownership import Repository
+from openorc.domain.ownership import Repository, RepositoryMetadata
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.github_installations import (
     create_or_reconcile_github_installation,
@@ -67,6 +67,7 @@ __all__ = [
     "bind_repository_installation",
     "record_workspace_installation",
     "require_configured_repository_installation_route",
+    "require_observed_repository_metadata",
     "unbind_repository_installation",
 ]
 
@@ -85,6 +86,25 @@ def _require_uuid_command(value: object, name: str) -> None:
     """Reject a malformed UUID command argument before any state is touched."""
     if not isinstance(value, UUID):
         raise InvalidCommandError(f"{name} must be a UUID")
+
+
+def require_observed_repository_metadata(repository: Repository) -> RepositoryMetadata:
+    """Fail closed unless the Repository carries trusted GitHub observations.
+
+    A claim-state Repository (the issue #372 Owner onboarding) is valid durable
+    configuration but has never been observed through trusted GitHub
+    reconciliation: its presentation facts would be Owner-supplied claim data,
+    never GitHub-reported observations. GitHub-operational flows that compose
+    presentation facts (repository full name, workflow base branch) call this
+    guard first, so an unobserved record fails closed instead of fabricating
+    or misusing unverified claim data as provider observations.
+    """
+    if repository.metadata is None:
+        raise ConflictError(
+            "the repository has no recorded GitHub observation yet; establish "
+            "it through trusted GitHub reconciliation before this operation"
+        )
+    return repository.metadata
 
 
 def record_workspace_installation(
@@ -107,12 +127,15 @@ def record_workspace_installation(
     Reconciliation persists the reported facts as the current observations —
     login/type and ``suspended_at`` — and never replaces the durable record
     identity: the OpenOrc UUID, the Workspace, the external installation ID,
-    and the stable GitHub account ID. Trusted facts reporting a different
-    account ID for a known installation fail closed as a conflict instead of
-    rewriting stable identity. ``suspended_at`` must be timezone-aware (it is
-    normalized to UTC before persistence; naive values are rejected). No
-    credential material is accepted or stored, and the operation requires no
-    GitHub call.
+    and the established stable GitHub account ID. Trusted facts reporting a
+    different account ID than an established record fail closed as a conflict
+    instead of rewriting stable identity; the one establishment exception is
+    the issue #372 claim state — a claim-state record (observed account
+    identity ``None``) is established by the first trusted facts, which
+    populate the stable account identity atomically with the observations.
+    ``suspended_at`` must be timezone-aware (it is normalized to UTC before
+    persistence; naive values are rejected). No credential material is
+    accepted or stored, and the operation requires no GitHub call.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _RECORD_SPAN_NAME) as span:
         _require_uuid_command(profile_id, "profile_id")
@@ -151,11 +174,16 @@ def record_workspace_installation(
                 account=account,
                 suspended_at=suspended_at,
             )
-            if reconciled.account.github_account_id != account.github_account_id:
+            if (
+                reconciled.account is not None
+                and reconciled.account.github_account_id != account.github_account_id
+            ):
                 # The stored stable account identity cannot be rewritten by
                 # reconciliation; trusted facts reporting a different account
-                # for a known installation fail closed and the whole
+                # than an established record fail closed and the whole
                 # composition (including any observation updates) rolls back.
+                # A claim-state record (issue #372, observed account identity
+                # ``None``) is instead established by these trusted facts.
                 raise ConflictError(
                     "the trusted installation facts report a different GitHub "
                     "account than the reconciled installation record"

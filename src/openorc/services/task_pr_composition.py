@@ -132,6 +132,7 @@ from openorc.services.errors import (
 from openorc.services.github_installation_route import (
     resolve_system_repository_installation_route,
 )
+from openorc.services.github_installations import require_observed_repository_metadata
 from openorc.services.github_user_authorization import ProfileUserAccessTokenResolver
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
@@ -523,10 +524,12 @@ def _resolve_publication_route_subjects(
         workspace_id=workspace_id,
         repository_id=task.repository_id,
     )
-    repository_full_name = (
-        f"{route.repository.metadata.owner_login}/{route.repository.metadata.name}"
-    )
-    base_ref = route.repository.metadata.default_branch
+    # The routed record's OBSERVED presentation facts only: a claim-state
+    # repository (issue #372 Owner onboarding) carries no trusted GitHub
+    # observation yet and fails closed instead of misusing claim data.
+    metadata = require_observed_repository_metadata(route.repository)
+    repository_full_name = f"{metadata.owner_login}/{metadata.name}"
+    base_ref = metadata.default_branch
     if base_ref is None or not base_ref.strip():
         raise ConflictError(
             "the routed repository carries no usable workflow base branch; "

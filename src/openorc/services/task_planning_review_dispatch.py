@@ -161,6 +161,7 @@ from openorc.services.errors import (
     NotFoundError,
     StaleOperationError,
 )
+from openorc.services.github_installations import require_observed_repository_metadata
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_completion_handoff import DetachedTurnCompletionHandoff
@@ -328,11 +329,14 @@ def _require_task_repository(
     The durable reconciled record supplies the authoritative stable
     repository/issue identity for the REVIEW subject; mutable presentation
     metadata is never sole identity, and a missing or cross-Workspace
-    repository is the uniform not-found outcome.
+    repository is the uniform not-found outcome. A claim-state repository
+    (issue #372 Owner onboarding, no trusted GitHub observation yet) fails
+    closed as a conflict instead of supplying unverified claim data.
     """
     repository = get_repository(pool, repository_id)
     if repository is None or repository.workspace_id != workspace_id:
         raise NotFoundError("the requested repository is not available in this workspace")
+    require_observed_repository_metadata(repository)
     return repository
 
 
@@ -645,6 +649,11 @@ def _reserve_review_attempt(
             workspace_id=workspace_id,
             repository_id=task.repository_id,
         )
+        # The REVIEW dispatch composes OBSERVED presentation facts only: a
+        # claim-state repository (issue #372 Owner onboarding) carries no
+        # trusted GitHub observation yet and fails closed instead of misusing
+        # claim data.
+        metadata = require_observed_repository_metadata(repository)
         loop = _require_or_establish_planning_loop(
             transaction_pool,
             workspace_id=workspace_id,
@@ -675,7 +684,7 @@ def _reserve_review_attempt(
         task=task,
         revision=persisted_revision,
         reviewer=reviewer,
-        repository_full_name=f"{repository.metadata.owner_login}/{repository.metadata.name}",
+        repository_full_name=f"{metadata.owner_login}/{metadata.name}",
         loop=locked_loop,
         iteration=reserved,
     )

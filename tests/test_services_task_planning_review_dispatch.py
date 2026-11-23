@@ -57,6 +57,7 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.protocol.interaction import ReviewInteraction
 from openorc.services.errors import (
+    ConflictError,
     ExternalOperationFailedError,
     ExternalOperationRejectedError,
     ExternalOperationUncertainError,
@@ -70,6 +71,7 @@ from openorc.services.task_plan_production import (
 )
 from openorc.services.task_planning_review_dispatch import (
     DispatchedPlanningReview,
+    _require_task_repository,
     dispatch_planning_review_detached,
 )
 from tests.fakes.agent_runtime import (
@@ -291,6 +293,36 @@ def _repository_row() -> tuple[Any, ...]:
         _OBSERVED,
         None,
     )
+
+
+def test_the_review_subject_repository_fails_closed_for_a_claim_state_record() -> None:
+    # The issue #372 claim state: the durable record exists with its stable
+    # identity but carries no trusted GitHub observation yet. The REVIEW
+    # subject resolver composes OBSERVED presentation facts only, so it fails
+    # closed instead of misusing unverified claim data as provider fact.
+    claim_row = list(_repository_row())
+    for index in range(4, 9):
+        claim_row[index] = None
+    conn = ScriptedConnection()
+    conn.on(_REPO_READ, tuple(claim_row))
+
+    with pytest.raises(ConflictError):
+        _require_task_repository(
+            _pool(conn), workspace_id=_WORKSPACE_ID, repository_id=_REPOSITORY_ID
+        )
+
+
+def test_the_review_subject_repository_resolves_an_observed_record() -> None:
+    conn = ScriptedConnection()
+    conn.on(_REPO_READ, _repository_row())
+
+    repository = _require_task_repository(
+        _pool(conn), workspace_id=_WORKSPACE_ID, repository_id=_REPOSITORY_ID
+    )
+
+    assert repository.id == _REPOSITORY_ID
+    assert repository.metadata is not None
+    assert repository.metadata.owner_login == "octocat"
 
 
 def _loop_row(
