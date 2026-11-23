@@ -823,6 +823,7 @@ def test_a_rename_or_transfer_refreshes_metadata_without_rebinding_identity() ->
     # The stable external identity is preserved on the returned record; the
     # mutable presentation metadata is refreshed.
     assert result.repository.identity.github_repository_id == _GITHUB_REPOSITORY_ID
+    assert result.repository.metadata is not None
     assert result.repository.metadata.owner_login == "renamed-org"
     update_sql, _ = next(
         (sql, p) for sql, p in conn.executed if sql.lstrip().lower().startswith("update")

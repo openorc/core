@@ -253,6 +253,7 @@ def test_authorization_never_consults_github_identity_or_repository_metadata() -
     )
 
     assert repository.id == repository_id
+    assert repository.metadata is not None
     assert repository.metadata.owner_login == "totally-unrelated-github-owner"
     for sql, _ in conn.executed:
         where_clause = sql.split("where")[-1]

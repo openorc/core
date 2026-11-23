@@ -23,11 +23,14 @@ from openorc.api.request_correlation import (
     server_error_response,
 )
 from openorc.api.routers.connections import router as connections_router
+from openorc.api.routers.github_installations import router as github_installations_router
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
 from openorc.api.routers.internal_queue_observer import (
     router as internal_queue_observer_router,
 )
+from openorc.api.routers.projects import router as projects_router
+from openorc.api.routers.repositories import router as repositories_router
 from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
 from openorc.api.routers.workspaces import router as workspaces_router
@@ -63,7 +66,8 @@ API_DESCRIPTION = (
     "versioned /api/v1 namespace: the Profile/Workspace discovery, creation "
     "and configuration routes (issue #370), the Workspace Connection "
     "administration and control-credential routes (issue #371), the "
-    "role-binding configuration routes (issue #162), and the Task "
+    "Workspace GitHub installation and Repository mapping routes (issue "
+    "#372), the role-binding configuration routes (issue #162), and the Task "
     "discussion/conversation routes (issue #339), authenticated by a "
     "Supabase Auth session JWT (GitHub-only sign-in) supplied as an HTTP "
     "Bearer credential — publishable and secret Supabase keys are not user "
@@ -112,6 +116,37 @@ OPENAPI_TAG_METADATA = [
             "control-credential setup/rotation over the issue #55 service. "
             "Exposed state is configured inventory only — never runtime Hub "
             "health, session READY, or active-run state."
+        ),
+    },
+    {
+        "name": "github-installations",
+        "description": (
+            "Workspace GitHub App installation mapping (issue #372): the "
+            "Owner-authorized installation claim and its recorded status. A "
+            "claim is unverified Owner configuration persisted in claim "
+            "state; the observed block appears only once trusted GitHub "
+            "reconciliation has recorded facts. Recorded status is durable "
+            "evidence, never live GitHub freshness, and never implies access "
+            "or permission."
+        ),
+    },
+    {
+        "name": "projects",
+        "description": (
+            "Workspace Project onboarding (issue #372): the Owner-authorized "
+            "deterministic list and creation of Projects within an owned "
+            "Workspace. Project names are Owner-authored configuration, "
+            "never GitHub observations."
+        ),
+    },
+    {
+        "name": "repositories",
+        "description": (
+            "Workspace Repository mapping (issue #372): the Owner-authorized "
+            "stable-identity claim, its recorded claim/observation status, "
+            "and the explicit installation route binding. Claims and routes "
+            "are configuration facts — never access or permission, and never "
+            "live GitHub freshness."
         ),
     },
     {
@@ -340,6 +375,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(github_webhooks_router)
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(connections_router, prefix="/api/v1")
+    app.include_router(github_installations_router, prefix="/api/v1")
+    app.include_router(projects_router, prefix="/api/v1")
+    app.include_router(repositories_router, prefix="/api/v1")
     app.include_router(role_bindings_router, prefix="/api/v1")
     app.include_router(tasks_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport
