@@ -3,8 +3,9 @@
 The ordinary suite cannot execute Postgres: these tests prove the non-secret
 domain invariants — the active/revoked currentness vocabulary, the
 CHECK-mirroring lifecycle consistency rules, the strictly positive stable
-GitHub identity and generation, and that no credential-bearing field exists
-on the durable record.
+GitHub identity and generation, the non-negative monotonic revocation-epoch
+fence (issue #373), and that no credential-bearing field exists on the
+durable record.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ def _authorization(**overrides: object) -> GitHubUserAuthorization:
         "refresh_secret_reference": "openorc:github-user-refresh:v1:vault:" + str(uuid.uuid4()),
         "refresh_expires_at": _OBSERVED,
         "refresh_generation": 1,
+        "revocation_count": 0,
         "authorized_at": _OBSERVED,
         "revoked_at": None,
         "created_at": _OBSERVED,
@@ -47,6 +49,7 @@ def _authorization(**overrides: object) -> GitHubUserAuthorization:
         refresh_secret_reference=values["refresh_secret_reference"],  # type: ignore[arg-type]
         refresh_expires_at=values["refresh_expires_at"],  # type: ignore[arg-type]
         refresh_generation=values["refresh_generation"],  # type: ignore[arg-type]
+        revocation_count=values["revocation_count"],  # type: ignore[arg-type]
         authorized_at=values["authorized_at"],  # type: ignore[arg-type]
         revoked_at=values["revoked_at"],  # type: ignore[arg-type]
         created_at=values["created_at"],  # type: ignore[arg-type]
@@ -60,6 +63,7 @@ def test_active_authorization_represents_the_durable_lifecycle_facts() -> None:
     assert authorization.status is GitHubUserAuthorizationStatus.ACTIVE
     assert authorization.github_user_id == 5432
     assert authorization.refresh_generation == 1
+    assert authorization.revocation_count == 0
     assert authorization.revoked_at is None
 
 
@@ -85,6 +89,33 @@ def test_revoked_authorization_is_representable_and_distinct_from_absence() -> N
     # The row persists with its generation: revoked is durable currentness
     # state, never a delete-and-reinsert hole.
     assert authorization.refresh_generation == 1
+
+
+def test_revocation_count_is_the_monotonic_revocation_epoch_fence() -> None:
+    # The fence (issue #373): a revoked row persists with its advanced count,
+    # and reactivation preserves it — so a flow that captured an earlier
+    # count can never install across a later revocation, even after a newer
+    # authorization became active.
+    authorization = _authorization(
+        status=GitHubUserAuthorizationStatus.REVOKED,
+        refresh_secret_reference=None,
+        refresh_expires_at=None,
+        revoked_at=_OBSERVED,
+        revocation_count=3,
+    )
+    assert authorization.revocation_count == 3
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"revocation_count": -1},
+        {"revocation_count": True},
+    ],
+)
+def test_invalid_revocation_count_fails_closed(overrides: dict[str, object]) -> None:
+    with pytest.raises(GitHubUserAuthorizationDomainError):
+        _authorization(**overrides)
 
 
 @pytest.mark.parametrize(

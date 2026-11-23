@@ -144,6 +144,7 @@ def _row(
     reference: Any = None,
     expires: Any = None,
     github_user_id: int = 5432,
+    revocation_count: int = 0,
 ) -> tuple[Any, ...]:
     if status == "active":
         reference = reference if reference is not None else _reference(uuid.uuid4())
@@ -159,6 +160,7 @@ def _row(
         reference,
         expires,
         generation,
+        revocation_count,
         _OBSERVED,
         None if status == "active" else _OBSERVED,
         _OBSERVED,
@@ -722,6 +724,7 @@ def test_revoke_deletes_the_secret_and_marks_the_authorization_revoked() -> None
     conn = ScriptedConnection(
         [
             _GUARD_OPERATIONAL_ROW,  # barrier
+            None,  # pending-flow correlation cleanup: none pending
             _row(profile_id, generation=6, reference=_reference(secret_id)),  # locked read
             (1,),  # Vault secret delete
             _row(profile_id, status="revoked", generation=7),  # the revocation update
@@ -734,21 +737,31 @@ def test_revoke_deletes_the_secret_and_marks_the_authorization_revoked() -> None
 
     assert revoked.status.value == "revoked"
     assert revoked.refresh_generation == 7
-    delete_sql, delete_params = conn.executed[2]
+    # The pending-flow correlation is invalidated inside the same transaction,
+    # before the authorization row lock (issue #373).
+    flows_sql, flows_params = conn.executed[1]
+    assert "delete from openorc.github_user_authorization_flows" in flows_sql
+    assert flows_params == (profile_id,)
+    delete_sql, delete_params = conn.executed[3]
     assert "delete from vault.secrets" in delete_sql
     assert delete_params == (secret_id,)
-    revoke_sql = conn.executed[3][0]
+    revoke_sql = conn.executed[4][0]
     assert "status = 'revoked'" in revoke_sql
     assert "refresh_secret_reference = null" in revoke_sql
     assert "refresh_generation = refresh_generation + 1" in revoke_sql
+    assert "revocation_count = revocation_count + 1" in revoke_sql
 
 
-def test_revoke_of_an_already_revoked_authorization_is_idempotent() -> None:
+def test_revoke_of_an_already_revoked_authorization_is_idempotent_and_advances_the_fence() -> None:
     profile_id = uuid.uuid4()
     conn = ScriptedConnection(
         [
             _GUARD_OPERATIONAL_ROW,
-            _row(profile_id, status="revoked", generation=7),  # locked read
+            None,  # pending-flow correlation cleanup: none pending
+            _row(profile_id, status="revoked", generation=7, revocation_count=3),  # locked read
+            _row(  # the fence advance (status/generation/reference untouched)
+                profile_id, status="revoked", generation=7, revocation_count=4
+            ),
         ]
     )
 
@@ -756,16 +769,30 @@ def test_revoke_of_an_already_revoked_authorization_is_idempotent() -> None:
         _pool(conn), profile_id=profile_id
     )
 
+    # Externally idempotent: the status stays revoked, the generation and the
+    # reference are untouched.
+    assert revoked.status.value == "revoked"
     assert revoked.refresh_generation == 7
-    # Idempotent: no Vault call, no further durable write.
-    assert len(conn.executed) == 2
+    # But every successful Owner revocation command advances the durable
+    # revocation fence (issue #373): an in-flight reauthorization flow that
+    # began before this command can never reactivate credentials afterwards.
+    assert revoked.revocation_count == 4
+    fence_sql = conn.executed[3][0]
+    assert "update openorc.github_user_authorizations" in fence_sql
+    assert "revocation_count = revocation_count + 1" in fence_sql
+    assert "status = 'revoked'" in fence_sql  # the conditional match, not a write
+    assert "refresh_generation = refresh_generation + 1" not in fence_sql
+    assert "refresh_secret_reference = null" not in fence_sql
+    # No Vault call at all: an already-revoked row carries no credential.
     assert all("vault" not in sql for sql, _ in conn.executed)
+    assert len(conn.executed) == 4
 
 
 def test_revoke_of_a_missing_authorization_is_the_typed_missing_condition() -> None:
     conn = ScriptedConnection(
         [
             _GUARD_OPERATIONAL_ROW,
+            None,  # pending-flow correlation cleanup: none pending
             None,  # no durable authorization
         ]
     )
@@ -783,6 +810,7 @@ def test_revoke_fails_closed_on_malformed_or_dangling_references(dangling: bool)
     profile_id = uuid.uuid4()
     results: list[object] = [
         _GUARD_OPERATIONAL_ROW,
+        None,  # pending-flow correlation cleanup: none pending
         _row(profile_id, generation=6, reference="not-a-v1-reference")
         if not dangling
         else _row(profile_id, generation=6, reference=_reference(uuid.uuid4())),
@@ -797,8 +825,78 @@ def test_revoke_fails_closed_on_malformed_or_dangling_references(dangling: bool)
         )
 
     if dangling:
-        assert "delete from vault.secrets" in conn.executed[2][0]
+        assert "delete from vault.secrets" in conn.executed[3][0]
     assert all("update openorc.github_user_authorizations" not in sql for sql, _ in conn.executed)
+
+
+def test_establish_is_fenced_when_the_durable_count_moved() -> None:
+    # The revocation fence (issue #373): a flow that captured count C cannot
+    # install when the durable count has advanced under the row lock (an
+    # Owner revocation committed after the flow started) — permanently,
+    # nothing stored, even though the row may have been reactivated since.
+    profile_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _row(profile_id, generation=9, revocation_count=3),  # locked read
+        ]
+    )
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+
+    with pytest.raises(ConflictError):
+        github_user_authorization.establish_github_user_authorization(
+            _pool(conn),
+            profile_id=profile_id,
+            code="the-code",
+            admin_client=admin,
+            token_client=token_client,
+            expected_revocation_count=2,
+        )
+
+    # Nothing stored: no Vault write and no authorization write followed the
+    # fenced locked read.
+    assert all("vault.create_secret" not in sql for sql, _ in conn.executed)
+    assert all(
+        "insert into openorc.github_user_authorizations" not in sql for sql, _ in conn.executed
+    )
+    assert all("refresh_generation = refresh_generation + 1" not in sql for sql, _ in conn.executed)
+
+
+def test_establish_proceeds_when_the_fenced_count_still_matches() -> None:
+    # A genuinely new post-revocation flow (issue #373): the captured count
+    # equals the durable count under the row lock, so the reactivation
+    # installs through the documented recovery path.
+    profile_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    conn = ScriptedConnection(
+        [
+            _GUARD_OPERATIONAL_ROW,
+            _row(  # locked read: revoked at the captured count
+                profile_id, status="revoked", generation=4, revocation_count=2
+            ),
+            (secret_id,),  # new Vault secret create (no superseded credential)
+            _row(  # the reactivation update (count deliberately preserved)
+                profile_id, status="revoked", generation=5, revocation_count=2
+            ),
+        ]
+    )
+    admin, token_client = _establish_clients(conn, provider_ids=("5432",), current_user_id=5432)
+
+    established = github_user_authorization.establish_github_user_authorization(
+        _pool(conn),
+        profile_id=profile_id,
+        code="the-code",
+        admin_client=admin,
+        token_client=token_client,
+        expected_revocation_count=2,
+    )
+
+    assert established.refresh_generation == 5
+    # The fence survives reactivation: the reauthorize SET never touches the
+    # revocation count (the RETURNING list names the column, the SET does
+    # not assign it).
+    reauth_sql = conn.executed[3][0]
+    assert "revocation_count = " not in reauth_sql
 
 
 def test_reauthorization_over_a_revoked_row_reactivates_it_in_place() -> None:
