@@ -1,0 +1,34 @@
+-- Durable revocation-epoch fence for the Profile-scoped GitHub user
+-- authorization (Phase 2G, issue #373).
+--
+-- ``revocation_count`` is the durable, monotonic revocation evidence the
+-- OAuth start-to-callback correlation (the pending-flow table added by the
+-- following migration) captures when an authenticated Owner starts an
+-- authorization flow, and the final credential installation checks under the
+-- authorization row lock. Its contract:
+--
+-- - advanced by EVERY successful Owner revocation command against an
+--   existing authorization — both the ACTIVE -> REVOKED transition and the
+--   externally idempotent revoke of an already-REVOKED row;
+-- - NEVER reset: reauthorization (reactivation in place) preserves it, so a
+--   flow that began before a revocation can never install credentials after
+--   a newer authorization became active;
+-- - fresh inserts always start at 0 (a row that does not exist has, by
+--   definition, never been revoked);
+-- - refresh rotation and the generation compare-and-swap leave it untouched
+--   (the fence is revocation-specific, never a global credential-version
+--   guard — that remains ``refresh_generation``).
+--
+-- The counter is monotonic across the row's whole Profile lifetime (revoked
+-- rows persist; only the sanctioned account-root cascade removes the row).
+-- Historical revocations committed before this migration are not
+-- reconstructed: existing rows start at 0. No exploit window exists because
+-- the pending-flow correlation this fence protects arrives only with this
+-- change.
+--
+-- No privileges are granted here: the openorc schema lockout established by
+-- create_openorc_schema carries isolation, and runtime access is
+-- backend-only.
+
+alter table openorc.github_user_authorizations
+    add column revocation_count integer not null default 0 check (revocation_count >= 0);
