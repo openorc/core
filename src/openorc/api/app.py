@@ -24,6 +24,12 @@ from openorc.api.request_correlation import (
 )
 from openorc.api.routers.connections import router as connections_router
 from openorc.api.routers.github_installations import router as github_installations_router
+from openorc.api.routers.github_user_authorization import (
+    router as github_user_authorization_router,
+)
+from openorc.api.routers.github_user_authorization_callback import (
+    router as github_user_authorization_callback_router,
+)
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
 from openorc.api.routers.internal_queue_observer import (
@@ -67,7 +73,9 @@ API_DESCRIPTION = (
     "and configuration routes (issue #370), the Workspace Connection "
     "administration and control-credential routes (issue #371), the "
     "Workspace GitHub installation and Repository mapping routes (issue "
-    "#372), the role-binding configuration routes (issue #162), and the Task "
+    "#372), the Profile's GitHub user-authorization status/start/"
+    "reauthorization/revocation routes (issue #373), the role-binding "
+    "configuration routes (issue #162), and the Task "
     "discussion/conversation routes (issue #339), authenticated by a "
     "Supabase Auth session JWT (GitHub-only sign-in) supplied as an HTTP "
     "Bearer credential — publishable and secret Supabase keys are not user "
@@ -147,6 +155,20 @@ OPENAPI_TAG_METADATA = [
             "and the explicit installation route binding. Claims and routes "
             "are configuration facts — never access or permission, and never "
             "live GitHub freshness."
+        ),
+    },
+    {
+        "name": "github-user-authorization",
+        "description": (
+            "The Profile's GitHub App user-to-server authorization (issue "
+            "#373): the Owner-authorized durable status read, the pending "
+            "OAuth flow start for authorization and reauthorization (the "
+            "response carries the documented GitHub authorize URL — the only "
+            "place correlation material is projected), and the Owner "
+            "revocation that invalidates pending flows and advances the "
+            "durable revocation fence. The OAuth provider callback ingress "
+            "is unauthenticated provider transport outside the versioned "
+            "public namespace and is not advertised here."
         ),
     },
     {
@@ -376,6 +398,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(connections_router, prefix="/api/v1")
     app.include_router(github_installations_router, prefix="/api/v1")
+    app.include_router(github_user_authorization_router, prefix="/api/v1")
+    # The GitHub user-authorization OAuth provider callback ingress (issue
+    # #373): the GitHub App's configured Callback URL target — unauthenticated
+    # provider/browser transport outside the versioned public namespace (the
+    # route is excluded from the published OpenAPI schema), exactly like the
+    # webhook ingress. Its serving-boundary access logging redacts the
+    # credential-bearing request target (issue #373).
+    app.include_router(github_user_authorization_callback_router)
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(repositories_router, prefix="/api/v1")
     app.include_router(role_bindings_router, prefix="/api/v1")
