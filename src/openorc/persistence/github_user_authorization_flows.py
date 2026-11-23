@@ -31,7 +31,11 @@ Durable properties expressed here:
   structures, DTOs, logs, or persistence.
 - Malformed or dangling verifier references fail closed and roll the whole
   operation back (the caller translates the module error into its typed
-  conflict vocabulary).
+  conflict vocabulary). The consume and discard operations join the
+  caller's composed transaction through the transaction-scoped pool, so
+  their row delete and Vault-secret cleanup share one connection and one
+  rollback boundary — never two independent transactions on separate pool
+  connections.
 - ``observed_revocation_count`` is the fence evidence captured at start;
   the completion service compares it against the durable authorization
   count under the authorization row lock. No fence semantics live here.
@@ -214,21 +218,21 @@ def consume_pending_flow(
 ) -> tuple[GitHubUserAuthorizationFlow, str] | None:
     """Atomically consume one pending flow by its exact state (single use).
 
+    The caller composes this operation inside ONE outer composed transaction
+    and passes its transaction-scoped pool (as the completion service does),
+    so the correlation-row delete, the Vault decrypt, and the verifier-secret
+    delete all join the same connection and rollback boundary: a failure
+    anywhere — including a malformed or dangling verifier reference, or a
+    secret absent at cleanup time — rolls the row delete back with the
+    cleanup, and a consumed flow can never survive with a dangling verifier
+    reference or orphan its encrypted verifier material.
+
     The conditional delete matches only a still-pending, unexpired row, so a
     replayed, expired, or unknown state returns None without any effect —
-    the delete IS the single-use enforcement. On a match the correlation row
-    is deleted, the Vault verifier is decrypted, and the verifier secret
-    itself is deleted inside the same transaction: a malformed or dangling
-    verifier reference — including a secret that turns out to be absent at
-    cleanup time — raises :class:`GitHubUserFlowVerifierReferenceError` and
-    rolls the whole consumption back, leaving the pending flow intact and
-    retryable. The row and its secret commit together, so no consumed flow
-    ever orphans its encrypted verifier material.
-
-    The returned verifier string is secret-bearing exchange material: the
-    completion service must use it immediately in its completion call chain
-    and must never copy it into ordinary structures, DTOs, logs, or
-    persistence.
+    the delete IS the single-use enforcement. The returned verifier string
+    is secret-bearing exchange material: the completion service must use it
+    immediately in its completion call chain and must never copy it into
+    ordinary structures, DTOs, logs, or persistence.
     """
     with transaction(pool) as conn:
         row = conn.execute(
@@ -256,13 +260,17 @@ def consume_pending_flow(
 def discard_pending_flow(pool: DatabasePool, *, state: str) -> bool:
     """Delete one provider-terminated pending flow and its verifier secret.
 
+    The caller composes this operation inside ONE outer composed transaction
+    and passes its transaction-scoped pool (as the abort path does), so the
+    correlation-row delete and the Vault-secret delete join the same
+    connection and rollback boundary: a malformed or dangling verifier
+    reference — or a secret absent at cleanup time — rolls the row delete
+    back with the cleanup, and a declined flow can never survive with a
+    dangling verifier reference or orphan its encrypted verifier material.
+
     The callback arrived with a GitHub ``error`` answer (for example, the
     Owner denied access at the consent step): the correlation is deleted so
-    it can never be completed later. No verifier decryption is needed, but
-    the secret itself is deleted inside the same transaction as the row — a
-    malformed or dangling verifier reference raises
-    :class:`GitHubUserFlowVerifierReferenceError` and rolls the whole discard
-    back — so a declined flow never orphans its encrypted verifier material.
+    it can never be completed later. No verifier decryption is needed.
     Returns whether a pending flow was removed.
     """
     with transaction(pool) as conn:

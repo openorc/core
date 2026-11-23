@@ -35,6 +35,7 @@ from openorc.persistence.github_user_authorization_flows import (
     parse_github_user_flow_verifier_reference,
 )
 from openorc.persistence.pool import DatabasePool
+from openorc.services.transaction_composition import composed_transaction
 
 _OBSERVED = datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC)
 _EXPIRES = _OBSERVED + timedelta(seconds=600)
@@ -50,15 +51,23 @@ class FakeCursor:
 
 
 class ScriptedConnection:
-    """Plays back canned statement results in order, recording executed SQL."""
+    """Plays back canned statement results in order, recording executed SQL.
+
+    Every executed statement also records the connection's transaction depth
+    at the moment it ran, and the transaction boundary records whether it
+    ever rolled back — the atomicity proofs need both.
+    """
 
     def __init__(self, results: list[object]) -> None:
         self.results = list(results)
         self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
+        self.executed_depths: list[int] = []
+        self.rolled_back = False
         self.transaction_depth = 0
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
         self.executed.append((sql, params))
+        self.executed_depths.append(self.transaction_depth)
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -69,15 +78,31 @@ class ScriptedConnection:
         self.transaction_depth += 1
         try:
             yield self
+        except BaseException:
+            self.rolled_back = True
+            raise
         finally:
             self.transaction_depth -= 1
 
 
 class FakePool:
+    """Counts every connection checkout out of the pool.
+
+    The production defect this suite guards against (issue #373 review) is
+    an operation whose row effects and Vault effects check out SEPARATE
+    pool connections — on the real psycopg pool those are independent
+    transactions. The scripted connection collapses every checkout onto one
+    connection, so the checkout count is what proves the operations ran on
+    one.
+    """
+
     def __init__(self, conn: ScriptedConnection) -> None:
         self._conn = conn
+        self.checkouts = 0
 
     def connection(self) -> Any:
+        self.checkouts += 1
+
         @contextmanager
         def managed() -> Iterator[ScriptedConnection]:
             yield self._conn
@@ -217,7 +242,7 @@ def test_read_absent_pending_flow_is_none() -> None:
 # --- the atomic consume ------------------------------------------------------
 
 
-def test_consume_deletes_the_row_and_verifier_secret_in_one_transaction() -> None:
+def test_consume_runs_row_delete_decrypt_and_cleanup_on_one_connection() -> None:
     profile_id = uuid.uuid4()
     secret_id = uuid.uuid4()
     row = _flow_row(profile_id, revocation_count=3)
@@ -229,8 +254,10 @@ def test_consume_deletes_the_row_and_verifier_secret_in_one_transaction() -> Non
             (1,),  # the verifier secret delete
         ]
     )
+    fake_pool = FakePool(conn)
 
-    consumed = consume_pending_flow(_pool(conn), state="s" * 43)
+    with composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool:
+        consumed = consume_pending_flow(transaction_pool, state="s" * 43)
 
     assert consumed is not None
     flow, verifier = consumed
@@ -242,21 +269,32 @@ def test_consume_deletes_the_row_and_verifier_secret_in_one_transaction() -> Non
     assert "delete from openorc.github_user_authorization_flows" in delete_sql
     assert "where state = %s and expires_at > now()" in delete_sql
     assert delete_params == ("s" * 43,)
-    decrypt_sql, decrypt_params = conn.executed[1]
-    assert "vault.decrypted_secrets" in decrypt_sql
-    assert decrypt_params == (secret_id,)
-    # The consumed flow's verifier secret is deleted in the same transaction
-    # (issue #373 review): no consumed flow ever orphans its secret.
+    assert "vault.decrypted_secrets" in conn.executed[1][0]
     cleanup_sql, cleanup_params = conn.executed[2]
     assert "delete from vault.secrets" in cleanup_sql
     assert cleanup_params == (secret_id,)
-    assert conn.transaction_depth == 0
+    # Atomicity (issue #373 review): exactly ONE pool checkout — the row
+    # delete, the decrypt, and the secret cleanup share ONE connection, so
+    # they cannot be independent transactions on the real pool — and every
+    # statement ran inside the ONE outer transaction (depth 1 is the
+    # composed transaction block; the row delete and the Vault operations
+    # run in its nested savepoints).
+    assert fake_pool.checkouts == 1
+    assert conn.executed_depths == [2, 3, 3]
 
 
 def test_consume_reports_an_unknown_expired_or_replayed_state_as_none() -> None:
     conn = ScriptedConnection([None])
+    fake_pool = FakePool(conn)
 
-    assert consume_pending_flow(_pool(conn), state="s" * 43) is None
+    with composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool:
+        consumed = consume_pending_flow(transaction_pool, state="s" * 43)
+
+    assert consumed is None
+    # Nothing matched: one checkout, no Vault touch, nothing rolled back.
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is False
+    assert all("vault" not in sql for sql, _ in conn.executed)
 
 
 def test_consume_fails_closed_and_rolls_back_on_a_dangling_reference() -> None:
@@ -268,14 +306,22 @@ def test_consume_fails_closed_and_rolls_back_on_a_dangling_reference() -> None:
             None,  # the Vault decrypt reports the secret absent
         ]
     )
+    fake_pool = FakePool(conn)
 
-    with pytest.raises(GitHubUserFlowVerifierReferenceError):
-        consume_pending_flow(_pool(conn), state="s" * 43)
+    with (
+        pytest.raises(GitHubUserFlowVerifierReferenceError),
+        composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool,
+    ):
+        consume_pending_flow(transaction_pool, state="s" * 43)
 
-    # The reference parse and the decrypt ran; the secret cleanup never did —
-    # and the rollback restores the pending row for the caller's retry.
+    # The reference parse and the decrypt ran; the secret cleanup never did.
     assert "vault.decrypted_secrets" in conn.executed[1][0]
     assert all("delete from vault.secrets" not in sql for sql, _ in conn.executed)
+    # The ONE outer transaction rolled back: the row delete cannot have
+    # committed without the cleanup, and the pending row is restored for the
+    # caller's retry.
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is True
 
 
 def test_consume_fails_closed_and_rolls_back_when_the_secret_cleanup_fails() -> None:
@@ -290,13 +336,20 @@ def test_consume_fails_closed_and_rolls_back_when_the_secret_cleanup_fails() -> 
             None,  # the secret cleanup reports the secret absent
         ]
     )
+    fake_pool = FakePool(conn)
 
-    with pytest.raises(GitHubUserFlowVerifierReferenceError):
-        consume_pending_flow(_pool(conn), state="s" * 43)
+    with (
+        pytest.raises(GitHubUserFlowVerifierReferenceError),
+        composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool,
+    ):
+        consume_pending_flow(transaction_pool, state="s" * 43)
 
-    # Cleanup failure is never silently tolerated: the whole consumption —
-    # including the row delete — rolls back.
+    # Cleanup failure is never silently tolerated: the secret delete was
+    # attempted inside the ONE outer transaction, and the whole composition —
+    # row delete included — rolled back with it.
     assert "delete from vault.secrets" in conn.executed[2][0]
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is True
 
 
 def test_consume_fails_closed_on_a_malformed_reference() -> None:
@@ -304,23 +357,32 @@ def test_consume_fails_closed_on_a_malformed_reference() -> None:
     row = _flow_row(profile_id)
     row = (row[0], row[1], row[2], "not-a-v1-reference", *row[4:])
     conn = ScriptedConnection([row])
+    fake_pool = FakePool(conn)
 
-    with pytest.raises(GitHubUserFlowVerifierReferenceError):
-        consume_pending_flow(_pool(conn), state="s" * 43)
+    with (
+        pytest.raises(GitHubUserFlowVerifierReferenceError),
+        composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool,
+    ):
+        consume_pending_flow(transaction_pool, state="s" * 43)
 
-    # The malformed reference is detected before any Vault decrypt.
+    # The malformed reference is detected before any Vault decrypt, and the
+    # outer transaction rolls the row delete back.
     assert len(conn.executed) == 1
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is True
 
 
 # --- the no-decrypt discard and the invalidation delete ----------------------
 
 
-def test_discard_deletes_the_declined_flow_and_its_verifier_secret() -> None:
+def test_discard_runs_row_delete_and_cleanup_on_one_connection() -> None:
     secret_id = uuid.uuid4()
     reference = _reference(secret_id)
     conn = ScriptedConnection([(reference,), (1,)])
+    fake_pool = FakePool(conn)
 
-    discarded = discard_pending_flow(_pool(conn), state="s" * 43)
+    with composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool:
+        discarded = discard_pending_flow(transaction_pool, state="s" * 43)
 
     assert discarded is True
     row_sql, row_params = conn.executed[0]
@@ -334,33 +396,58 @@ def test_discard_deletes_the_declined_flow_and_its_verifier_secret() -> None:
     assert "delete from vault.secrets" in vault_sql
     assert vault_params == (secret_id,)
     assert all("vault.decrypted_secrets" not in sql for sql, _ in conn.executed)
+    # Atomicity (issue #373 review): ONE pool checkout, both statements
+    # inside the ONE outer transaction (depth 1 is the composed transaction
+    # block; the row delete and the Vault cleanup run in its nested
+    # savepoints).
+    assert fake_pool.checkouts == 1
+    assert conn.executed_depths == [2, 3]
 
 
 def test_discard_of_an_absent_flow_is_false_and_touches_no_secret() -> None:
     conn = ScriptedConnection([None])
+    fake_pool = FakePool(conn)
 
-    assert discard_pending_flow(_pool(conn), state="s" * 43) is False
+    with composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool:
+        discarded = discard_pending_flow(transaction_pool, state="s" * 43)
+
+    assert discarded is False
     assert len(conn.executed) == 1
+    assert fake_pool.checkouts == 1
     assert all("vault" not in sql for sql, _ in conn.executed)
 
 
 def test_discard_fails_closed_on_a_malformed_reference() -> None:
     conn = ScriptedConnection([("not-a-v1-reference",)])
+    fake_pool = FakePool(conn)
 
-    with pytest.raises(GitHubUserFlowVerifierReferenceError):
-        discard_pending_flow(_pool(conn), state="s" * 43)
+    with (
+        pytest.raises(GitHubUserFlowVerifierReferenceError),
+        composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool,
+    ):
+        discard_pending_flow(transaction_pool, state="s" * 43)
 
     assert len(conn.executed) == 1
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is True
 
 
 def test_discard_fails_closed_when_the_secret_cleanup_fails() -> None:
     secret_id = uuid.uuid4()
     conn = ScriptedConnection([(_reference(secret_id),), None])
+    fake_pool = FakePool(conn)
 
-    with pytest.raises(GitHubUserFlowVerifierReferenceError):
-        discard_pending_flow(_pool(conn), state="s" * 43)
+    with (
+        pytest.raises(GitHubUserFlowVerifierReferenceError),
+        composed_transaction(cast(DatabasePool, fake_pool)) as transaction_pool,
+    ):
+        discard_pending_flow(transaction_pool, state="s" * 43)
 
+    # The secret delete was attempted inside the ONE outer transaction, and
+    # the whole composition — row delete included — rolled back with it.
     assert "delete from vault.secrets" in conn.executed[1][0]
+    assert fake_pool.checkouts == 1
+    assert conn.rolled_back is True
 
 
 def test_invalidation_delete_removes_the_row_and_its_verifier_secret_atomically() -> None:

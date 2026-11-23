@@ -38,10 +38,13 @@ references — ever enters the authorize URL beyond the documented public
 query parameters (client ID, state, S256 code challenge), the callback
 response, logs, or telemetry.
 
-Transaction discipline: the start composition (barrier, supersession, guard,
-flow + verifier insert) and the consume are each ONE short transaction; the
-completion's external GitHub/Auth calls run with NO database transaction
-open; the final installation composes its own short transaction inside #142.
+Transaction discipline: the start composition, the consume, and the
+provider-terminated abort are each ONE composed transaction on one
+connection — every row and Vault operation inside them joins the same
+outer transaction and rollback boundary through the transaction-scoped
+pool; the completion's external GitHub/Auth calls run with NO database
+transaction open; the final installation composes its own short
+transaction inside #142.
 """
 
 from __future__ import annotations
@@ -393,11 +396,14 @@ def complete_github_user_authorization_flow(
 ) -> GitHubUserAuthorization:
     """Complete one pending flow through the #142 establishment proof.
 
-    Transaction 1: atomically consume the pending flow by its exact state
-    (unknown/expired/replayed states are one uniform typed condition with no
-    distinguishing oracle; a successful consume durably deletes the row,
-    decrypts its Vault verifier, and deletes the verifier secret in the same
-    transaction). Then, with NO
+    Transaction 1: ONE composed transaction on one connection — the
+    correlation-row delete, the Vault decrypt, and the verifier-secret
+    delete all join the same outer transaction and rollback boundary
+    through the transaction-scoped pool (issue #373 review), so a failure
+    anywhere rolls the row delete back with the cleanup and a consumed flow
+    can never survive with a dangling verifier reference. Unknown/expired/
+    replayed states are one uniform typed condition with no distinguishing
+    oracle. Then, with NO
     database transaction open, run the full #142 establishment against the
     bound Profile: the trusted Supabase GitHub-identity lookup, the code
     exchange forwarding the correlation's PKCE verifier, the authoritative
@@ -418,7 +424,14 @@ def complete_github_user_authorization_flow(
         annotate_span(span, operation=_COMPLETE_SPAN_NAME)
         state = _require_callback_state(state)
         code = _require_callback_code(code)
-        consumed = github_user_authorization_flows.consume_pending_flow(pool, state=state)
+        # ONE composed transaction on one connection: the correlation-row
+        # delete, the Vault decrypt, and the verifier-secret delete all join
+        # the same outer transaction and rollback boundary through the
+        # transaction-scoped pool (issue #373 review).
+        with composed_transaction(pool) as transaction_pool:
+            consumed = github_user_authorization_flows.consume_pending_flow(
+                transaction_pool, state=state
+            )
         if consumed is None:
             logger.warning(
                 "a github user authorization flow completion was refused: the "
@@ -448,14 +461,16 @@ def abort_pending_github_user_authorization_flow(pool: DatabasePool, *, state: s
 
     The callback arrived with a GitHub ``error`` answer (for example, the
     Owner denied access at the consent step): the correlation is deleted —
-    together with its Vault verifier secret — so it can never be completed
+    together with its Vault verifier secret, inside ONE composed transaction
+    on one connection (issue #373 review) — so it can never be completed
     later and never orphans credential material. No verifier decryption is
     needed; an unknown state is already the desired end state. This is a
     deliberate invalidation, not a completion — the caller reports a uniform
     failure outcome either way.
     """
     state = _require_callback_state(state)
-    github_user_authorization_flows.discard_pending_flow(pool, state=state)
+    with composed_transaction(pool) as transaction_pool:
+        github_user_authorization_flows.discard_pending_flow(transaction_pool, state=state)
 
 
 # --- status and revoke seams -------------------------------------------------
