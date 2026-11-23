@@ -10,7 +10,9 @@ persistence behavior — those belong to the service layer. Connection
 administration delegates to the issue #371 configuration service; credential
 setup and rotation delegate through its thin composition of the issue #55
 credential service, so every projected response passes the same
-read-boundary validation. Blocking database work runs off the event loop
+read-boundary validation. The issue #374 administrative disconnect and
+deletion routes delegate to the issue #97 administrative-deletion service
+unchanged. Blocking database work runs off the event loop
 (sync route handlers; the v1 persistence surface is synchronous). The
 addressed errors are the typed application vocabulary, mapped to HTTP by the
 application-level application-error handler.
@@ -46,11 +48,20 @@ from openorc.config import Settings
 from openorc.domain.connections import Connection
 from openorc.domain.ownership import Profile
 from openorc.persistence.pool import get_database_pool
-from openorc.services import connection_configuration
+from openorc.services import administrative_deletion, connection_configuration
 
 router = APIRouter(tags=["connections"])
 
 AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
+
+# The documented responses shared by the administrative disconnect/deletion
+# routes (issue #374): guarded refusals are conflicts, never successes.
+_DELETION_RESPONSES = {
+    401: DOCUMENTED_AUTH_401,
+    404: DOCUMENTED_NOT_FOUND_404,
+    409: DOCUMENTED_CONFLICT_409,
+    503: DOCUMENTED_UNAVAILABLE_503,
+}
 
 
 @router.get(
@@ -249,6 +260,73 @@ def rotate_credential(
         credential=payload.credential,
     )
     return _to_wire(connection)
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/connections/{connection_id}/credentials",
+    response_model=ConnectionRead,
+    operation_id="disconnect_connection_credential",
+    responses=_DELETION_RESPONSES,
+)
+def disconnect_credential(
+    workspace_id: UUID,
+    connection_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> ConnectionRead:
+    """Disconnect the Connection's control credential (issue #374).
+
+    One atomic administrative composition: the account-wide Owner-mutation
+    barrier, the Workspace ownership gate, the row-locked Connection read,
+    the referenced OpenOrc-owned Vault secret's deletion, and the
+    disconnect semantics (``enabled = false`` with ``auth_reference =
+    null``). Distinct from disabling the Connection (the replace operation
+    with ``enabled = false`` keeps its credential) and from deleting the
+    Connection's record (the DELETE on the Connection itself). A malformed
+    or dangling credential reference is a conflict — never a reported
+    success — and runtime-owned credentials and provider state are never
+    touched.
+    """
+    settings: Settings = request.app.state.settings
+    disconnected = administrative_deletion.disconnect_connection_credential(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+    )
+    return _to_wire(disconnected)
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/connections/{connection_id}",
+    response_model=ConnectionRead,
+    operation_id="delete_workspace_connection",
+    responses=_DELETION_RESPONSES,
+)
+def delete_connection(
+    workspace_id: UUID,
+    connection_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> ConnectionRead:
+    """Hard-delete an unreferenced Connection with its credential cleanup.
+
+    The OpenOrc-owned Vault secret cleanup runs first; the Phase 1 delete
+    primitive then forces its historical-reference constraints immediate —
+    a Connection still referenced by historical TaskAgentSessions or
+    workflow role bindings is a typed conflict (history is never cascaded
+    away to make the delete succeed). The response is the deleted
+    Connection's final configured-inventory state; no runtime Hub or
+    filesystem state is ever touched.
+    """
+    settings: Settings = request.app.state.settings
+    deleted = administrative_deletion.delete_connection_record(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+    )
+    return _to_wire(deleted)
 
 
 def _permitted_value(safe_config: Mapping[str, object], key: str) -> str | None:

@@ -6,6 +6,8 @@ This router owns HTTP concerns only: authenticated Profile extraction (the
 #52 dependency), request path/body parsing, delegation to the shared
 application services, and the domain-to-wire response mapping. A Project
 name is genuine Owner-authored configuration, never a GitHub observation.
+The issue #374 Project deletion delegates to the issue #97
+administrative-deletion service unchanged.
 Blocking database work runs off the event loop (sync route handlers; the v1
 persistence surface is synchronous). The addressed errors are the typed
 application vocabulary, mapped to HTTP by the application-level
@@ -31,7 +33,7 @@ from openorc.api.schemas.projects import ProjectCreate, ProjectRead
 from openorc.config import Settings
 from openorc.domain.ownership import Profile, Project
 from openorc.persistence.pool import get_database_pool
-from openorc.services import repository_onboarding
+from openorc.services import administrative_deletion, repository_onboarding
 
 router = APIRouter(tags=["projects"])
 
@@ -93,6 +95,40 @@ def create_project(
         name=payload.name,
     )
     return _to_wire(project)
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/projects/{project_id}",
+    response_model=ProjectRead,
+    operation_id="delete_workspace_project",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        409: DOCUMENTED_CONFLICT_409,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
+)
+def delete_project(
+    workspace_id: UUID,
+    project_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> ProjectRead:
+    """Delete one Project with its Task subtrees within the authorized Workspace.
+
+    The Project's Repositories and their Task subtrees go with it; the
+    Workspace, sibling Projects, and Workspace-level Connections and their
+    credentials are untouched. This deletes OpenOrc's control aggregate
+    only — the external GitHub repositories are never touched.
+    """
+    settings: Settings = request.app.state.settings
+    deleted = administrative_deletion.delete_project_record(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        project_id=project_id,
+    )
+    return _to_wire(deleted)
 
 
 def _to_wire(project: Project) -> ProjectRead:

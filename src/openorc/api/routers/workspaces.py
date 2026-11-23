@@ -8,9 +8,11 @@ application services, and the domain-to-wire response mapping. It owns no
 authorization policy, no Workspace-configuration semantics, and no
 persistence behavior — those belong to the service layer. Discovery/creation
 compose the narrowly-scoped lifecycle service; the settings updates delegate
-to the existing issue #53/#240 configuration service unchanged. Blocking
-database work runs off the event loop (sync route handlers; the v1
-persistence surface is synchronous). The addressed errors are the typed
+to the existing issue #53/#240 configuration service unchanged. The issue
+#374 Workspace deletion delegates to the issue #97 administrative-deletion
+service unchanged. Blocking database work runs off the event loop (sync
+route handlers; the v1 persistence surface is synchronous). The addressed
+errors are the typed
 application vocabulary, mapped to HTTP by the application-level
 application-error handler.
 """
@@ -43,7 +45,7 @@ from openorc.api.schemas.workspaces import (
 from openorc.config import Settings
 from openorc.domain.ownership import Profile, Workspace
 from openorc.persistence.pool import get_database_pool
-from openorc.services import workspace_configuration
+from openorc.services import administrative_deletion, workspace_configuration
 from openorc.services.workspace_lifecycle import (
     create_workspace_for_profile,
     list_owned_workspaces,
@@ -225,6 +227,41 @@ def replace_default_task_budget(
         previous_default_task_budget_usd=result.previous_default_task_budget_usd,
         new_default_task_budget_usd=result.new_default_task_budget_usd,
     )
+
+
+@router.delete(
+    "/workspaces/{workspace_id}",
+    response_model=WorkspaceRead,
+    operation_id="delete_workspace",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        409: DOCUMENTED_CONFLICT_409,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
+)
+def delete_workspace(
+    workspace_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> WorkspaceRead:
+    """Delete the Workspace with every OpenOrc-owned Vault secret it references.
+
+    The Workspace-root lock is held across the whole composition, so no
+    Connection can enter the aggregate after the cleanup set is
+    established, and every enumerated Connection's referenced OpenOrc-owned
+    credential is deleted in the same transaction. This deletes OpenOrc's
+    control state only — never GitHub or runtime-owned artifacts. The
+    narrower Connection/Project/Repository deletions are the smaller
+    alternatives; this is the Workspace-wide irreversible operation.
+    """
+    settings: Settings = request.app.state.settings
+    deleted = administrative_deletion.delete_workspace_record(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+    )
+    return _to_wire(deleted)
 
 
 def _to_wire(workspace: Workspace) -> WorkspaceRead:

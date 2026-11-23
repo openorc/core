@@ -1,4 +1,4 @@
-"""Thin Task discussion and conversation transport (issue #339).
+"""Thin Task discussion, conversation, and archived-purge transport (issues #339, #374).
 
 Public paths compose under the versioned ``/api/v1`` namespace (issue #369).
 
@@ -7,8 +7,10 @@ This router owns HTTP concerns only: authenticated Profile extraction (the
 Owner-authorized application services, and the domain-to-wire response
 mapping. It owns no authorization policy, no discussion admission semantics,
 no receipt lifecycle, and no persistence behavior — those belong to the
-service layer. Blocking database and submission work runs off the event
-loop (sync route handlers; the v1 persistence surface is synchronous). The
+service layer. The issue #374 archived-Task purge delegates to the issue #97
+administrative-deletion service unchanged. Blocking database and submission
+work runs off the event loop (sync route handlers; the v1 persistence
+surface is synchronous). The
 addressed errors are the typed application vocabulary, mapped to HTTP by
 the application-level application-error handler.
 
@@ -32,6 +34,7 @@ from openorc.api.dependencies.application_errors import (
 )
 from openorc.api.dependencies.authentication import authenticated_profile
 from openorc.api.schemas.tasks import (
+    ArchivedTaskPurge,
     DiscussionAdmissionRead,
     DiscussionMessageCreate,
     DiscussionStatusRead,
@@ -41,6 +44,7 @@ from openorc.api.schemas.tasks import (
 from openorc.config import Settings
 from openorc.domain.ownership import Profile
 from openorc.persistence.pool import get_database_pool
+from openorc.services import administrative_deletion
 from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
@@ -249,3 +253,38 @@ def read_reviewer_conversation(
             for message in projection.messages
         ],
     )
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/tasks/{task_id}",
+    response_model=ArchivedTaskPurge,
+    operation_id="purge_archived_task",
+    responses={
+        401: DOCUMENTED_AUTH_401,
+        404: DOCUMENTED_NOT_FOUND_404,
+        409: DOCUMENTED_CONFLICT_409,
+        503: DOCUMENTED_UNAVAILABLE_503,
+    },
+)
+def purge_archived_task(
+    workspace_id: UUID,
+    task_id: UUID,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> ArchivedTaskPurge:
+    """Purge one archived Task attempt with its complete OpenOrc aggregate.
+
+    Only archived (terminal) attempts are purgeable: a current Task is a
+    typed conflict, and normal workflow cancellation is the supported
+    route — this is never a cancellation substitute. The purge deletes
+    OpenOrc's internal aggregate only; the backing GitHub issue, branch,
+    and PR are never touched.
+    """
+    settings: Settings = request.app.state.settings
+    purged = administrative_deletion.purge_archived_task_record(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+    )
+    return ArchivedTaskPurge(workspace_id=purged.workspace_id, task_id=purged.id)
