@@ -25,9 +25,11 @@ from openorc.domain.github_installations import (
     GitHubInstallationIdentity,
 )
 from openorc.persistence.github_installations import (
+    claim_github_installation,
     create_or_reconcile_github_installation,
     delete_github_installation,
     get_github_installation,
+    get_workspace_github_installation,
     list_workspace_installations,
 )
 from openorc.persistence.pool import DatabasePool
@@ -154,8 +156,13 @@ def test_create_or_reconcile_maps_the_upsert_and_parameters() -> None:
     assert not re.search(r"\bworkspace_id = excluded\b", sql)
     assert not re.search(r"\bgithub_installation_id = excluded\b", sql)
     # The GitHub account ID is a stable external identifier, not an
-    # observation: reconciliation preserves the stored value.
+    # observation: reconciliation preserves an established stored value and
+    # populates the claim-state NULL exactly once (issue #372 establishment).
     assert not re.search(r"\bgithub_account_id = excluded\b", sql)
+    assert (
+        "github_account_id = coalesce(openorc.github_installations.github_account_id, "
+        "excluded.github_account_id)" in sql
+    )
     assert "updated_at = now()" in sql
     assert params == (workspace_id, 12345678, 501, "octocat", "Organization", _UTC_OBSERVED)
 
@@ -226,3 +233,113 @@ def test_reconcile_rejects_a_naive_suspended_instant_at_the_boundary() -> None:
             account=_account(),
             suspended_at=naive,
         )
+
+
+def _claim_state_row(workspace_id: uuid.UUID) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        12345678,
+        None,
+        None,
+        None,
+        None,
+        _OBSERVED_AT,
+        _OBSERVED_AT,
+    )
+
+
+def _established_row(workspace_id: uuid.UUID) -> tuple[Any, ...]:
+    return (
+        uuid.uuid4(),
+        workspace_id,
+        12345678,
+        501,
+        "octocat",
+        "Organization",
+        None,
+        _OBSERVED_AT,
+        _OBSERVED_AT,
+    )
+
+
+class ScriptedConnection(FakeConnection):
+    """Plays back canned statement results in order, recording executed SQL."""
+
+    def __init__(self, results: list[Any]) -> None:
+        super().__init__(row=None)
+        self.results = list(results)
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
+        self.executed.append((sql, params))
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeCursor(result)
+
+
+def test_claim_github_installation_inserts_the_identity_alone_in_claim_state() -> None:
+    workspace_id = uuid.uuid4()
+    conn = FakeConnection(row=_claim_state_row(workspace_id))
+
+    installation = claim_github_installation(
+        _pool(conn), workspace_id=workspace_id, identity=_identity()
+    )
+
+    # The claim row carries the stable external installation identity ALONE:
+    # every observation column is NULL in the executed command.
+    assert installation.account is None
+    assert installation.suspended_at is None
+    sql, params = conn.executed[0]
+    assert "insert into openorc.github_installations" in sql
+    assert "on conflict (workspace_id, github_installation_id) do nothing" in sql
+    assert "values (%s, %s, null, null, null, null)" in sql
+    assert params == (workspace_id, 12345678)
+    assert len(conn.executed) == 1
+
+
+def test_claim_github_installation_returns_the_existing_record_unchanged() -> None:
+    workspace_id = uuid.uuid4()
+    conn = ScriptedConnection([None, _established_row(workspace_id)])
+
+    installation = claim_github_installation(
+        _pool(conn), workspace_id=workspace_id, identity=_identity()
+    )
+
+    # The insert-if-absent lost to an existing record: the fallback read
+    # returns the durable row — in whatever state trusted reconciliation has
+    # established — and no update statement ever ran.
+    assert installation.account is not None
+    assert installation.account.github_account_id == 501
+    assert len(conn.executed) == 2
+    fallback_sql, fallback_params = conn.executed[1]
+    assert "where workspace_id = %s and github_installation_id = %s" in fallback_sql
+    assert fallback_params == (workspace_id, 12345678)
+
+
+def test_a_claim_state_row_maps_without_an_observed_account() -> None:
+    workspace_id = uuid.uuid4()
+    conn = FakeConnection(row=_claim_state_row(workspace_id))
+
+    installation = get_github_installation(_pool(conn), installation_id=uuid.uuid4())
+
+    assert installation is not None
+    assert installation.account is None
+    assert installation.suspended_at is None
+    assert installation.identity.github_installation_id == 12345678
+
+
+def test_get_workspace_github_installation_scopes_by_the_external_identity() -> None:
+    workspace_id = uuid.uuid4()
+    conn = FakeConnection(row=_established_row(workspace_id))
+
+    installation = get_workspace_github_installation(
+        _pool(conn), workspace_id=workspace_id, github_installation_id=12345678
+    )
+
+    assert installation is not None
+    assert installation.account is not None
+    assert installation.account.github_account_id == 501
+    sql, params = conn.executed[0]
+    assert "where workspace_id = %s and github_installation_id = %s" in sql
+    assert params == (workspace_id, 12345678)

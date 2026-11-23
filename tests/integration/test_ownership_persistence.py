@@ -312,6 +312,7 @@ def test_repository_round_trip_through_persistence_layer(conn: Connection[Any]) 
     assert updated is not None
     assert updated.id == created.id
     assert updated.identity == identity
+    assert updated.metadata is not None
     assert updated.metadata.owner_login == "new-owner"
 
     # Instants crossing the boundary are timezone-aware and UTC-normalized.

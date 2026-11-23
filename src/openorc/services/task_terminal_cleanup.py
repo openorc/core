@@ -357,6 +357,18 @@ def establish_terminal_checkout_cleanup(
         return TerminalCheckoutCleanupEstablishment(
             kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_APPLICABLE_CHECKOUT
         )
+    if repository.metadata is None:
+        # A claim-state repository (issue #372 Owner onboarding) carries no
+        # trusted GitHub observation yet: the interaction's presentation
+        # facts cannot be composed truthfully, so cleanup is contained as a
+        # skip with a sanitized log and never applies partially.
+        logger.warning(
+            "terminal checkout cleanup skipped: the task's repository record "
+            "carries no recorded GitHub observation"
+        )
+        return TerminalCheckoutCleanupEstablishment(
+            kind=TerminalCleanupEstablishmentKind.SKIPPED_NO_APPLICABLE_CHECKOUT
+        )
     interaction = CleanupWorkspaceInteraction(
         repository_full_name=(f"{repository.metadata.owner_login}/{repository.metadata.name}"),
         issue_number=task.github_issue_number,

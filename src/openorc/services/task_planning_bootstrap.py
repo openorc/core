@@ -150,6 +150,7 @@ from openorc.services.errors import (
     ObservationRegistrationRefusedError,
     StaleOperationError,
 )
+from openorc.services.github_installations import require_observed_repository_metadata
 from openorc.services.operation_attempt_evidence import InvocationAttemptEvidence
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.session_runtime import (
@@ -1134,7 +1135,11 @@ def prepare_task_for_planning(
         # a possibly-delivered control, and the send's outcome — whatever it
         # is — leaves the honest ``prepare_dispatched`` stage evidence for
         # the existing fail-closed recovery semantics. ---
-        repository_full_name = f"{repository.metadata.owner_login}/{repository.metadata.name}"
+        # The OBSERVED presentation facts only: a claim-state repository
+        # (issue #372 Owner onboarding) carries no trusted GitHub observation
+        # yet and fails closed instead of misusing claim data.
+        metadata = require_observed_repository_metadata(repository)
+        repository_full_name = f"{metadata.owner_login}/{metadata.name}"
         if observation_registrar is not None:
             # The detached workspace-preparation dispatch (issue #334): the
             # regular-mode path records the dispatch marker and the

@@ -359,6 +359,7 @@ def test_service_authorization_enforces_workspace_isolation_on_real_data(
         workspace_id=owner_workspace.id,
         repository_id=repository_id,
     )
+    assert repository.metadata is not None
     assert repository.metadata.owner_login == "octocat"
     assert repository.identity == GitHubRepositoryIdentity(github_repository_id=4000)
 

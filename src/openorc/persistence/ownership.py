@@ -53,6 +53,8 @@ __all__ = [
     "get_workspace",
     "get_workspace_for_update",
     "list_github_routed_repositories",
+    "list_workspace_projects",
+    "list_workspace_repositories",
     "list_workspaces_for_owner",
     "mark_account_deletion_attempt_uncertain",
     "read_account_deletion_state_for_key_share",
@@ -115,12 +117,21 @@ def _repository_from_row(row: Sequence[Any]) -> Repository:
         project_id=row[1],
         workspace_id=row[2],
         identity=GitHubRepositoryIdentity(github_repository_id=row[3]),
-        metadata=RepositoryMetadata(
-            owner_login=row[4],
-            name=row[5],
-            html_url=row[6],
-            is_private=row[7],
-            default_branch=row[8],
+        # ``metadata`` is the observed GitHub presentation block: a NULL
+        # metadata block is the issue #372 claim state (the Owner-submitted
+        # stable repository identity recorded before any trusted GitHub
+        # observation exists). The observation columns are written together
+        # or not at all, so the block is all-NULL or fully populated.
+        metadata=(
+            None
+            if row[4] is None
+            else RepositoryMetadata(
+                owner_login=row[4],
+                name=row[5],
+                html_url=row[6],
+                is_private=row[7],
+                default_branch=row[8],
+            )
         ),
         created_at=normalize_utc(row[9]),
         updated_at=normalize_utc(row[10]),
@@ -395,7 +406,7 @@ def create_repository(
     project_id: UUID,
     workspace_id: UUID,
     identity: GitHubRepositoryIdentity,
-    metadata: RepositoryMetadata,
+    metadata: RepositoryMetadata | None,
 ) -> Repository:
     """Insert one canonical Repository record for a GitHub repository identity.
 
@@ -403,6 +414,12 @@ def create_repository(
     Workspace violates the ``(workspace_id, github_repository_id)`` unique
     constraint; the same identity in a different Workspace is a distinct,
     independent record.
+
+    ``metadata`` is the trusted GitHub observation block (issue #372): a
+    claim-state record — the Owner-facing onboarding entry — is created with
+    ``None`` and carries no observed presentation facts until trusted GitHub
+    reconciliation records them. Callers holding trusted GitHub facts pass
+    them here; the Owner claim path never does.
     """
     with transaction(pool) as conn:
         row = conn.execute(
@@ -415,11 +432,11 @@ def create_repository(
                 project_id,
                 workspace_id,
                 identity.github_repository_id,
-                metadata.owner_login,
-                metadata.name,
-                metadata.html_url,
-                metadata.is_private,
-                metadata.default_branch,
+                None if metadata is None else metadata.owner_login,
+                None if metadata is None else metadata.name,
+                None if metadata is None else metadata.html_url,
+                None if metadata is None else metadata.is_private,
+                None if metadata is None else metadata.default_branch,
             ),
         ).fetchone()
     assert row is not None
@@ -478,6 +495,38 @@ def list_github_routed_repositories(pool: DatabasePool) -> list[Repository]:
         rows = conn.execute(
             f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
             "where github_installation_id is not null order by workspace_id, id",
+        ).fetchall()
+    return [_repository_from_row(row) for row in rows]
+
+
+def list_workspace_projects(pool: DatabasePool, *, workspace_id: UUID) -> list[Project]:
+    """List one Workspace's Projects, deterministically ordered.
+
+    The Workspace-scoped Project enumeration for the issue #372 onboarding
+    surface: the direct ``workspace_id`` filter is the durable scope, and
+    ordering by creation instant then id keeps the listing deterministic.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select id, workspace_id, name, created_at, updated_at "
+            "from openorc.projects where workspace_id = %s order by created_at, id",
+            (workspace_id,),
+        ).fetchall()
+    return [_project_from_row(row) for row in rows]
+
+
+def list_workspace_repositories(pool: DatabasePool, *, workspace_id: UUID) -> list[Repository]:
+    """List one Workspace's Repository records, deterministically ordered.
+
+    The Workspace-scoped Repository enumeration for the issue #372 mapping
+    surface: the direct ``workspace_id`` filter is the durable scope, and
+    ordering by creation instant then id keeps the listing deterministic.
+    """
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
+            "where workspace_id = %s order by created_at, id",
+            (workspace_id,),
         ).fetchall()
     return [_repository_from_row(row) for row in rows]
 

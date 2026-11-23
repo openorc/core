@@ -12,6 +12,12 @@ agent-runtime work, an installation routes GitHub operations.
   (its repositories may span multiple GitHub accounts), and the same external
   installation may be represented independently in several Workspaces —
   Workspace isolation stays explicit.
+- A record is either in claim state (issue #372: an Owner-submitted stable
+  installation identity recorded as unverified configuration, with every
+  observation fact ``None``) or observation state (trusted GitHub
+  reconciliation has recorded the account identity and observations). Claim
+  data never masquerades as a GitHub observation, and a claim never
+  overwrites established facts.
 - Raw GitHub App private-key material, installation access tokens, human OAuth
   tokens, PATs, and any other credential material never appear in these
   models. GitHub App credentials are not OpenOrc application-table state at
@@ -104,17 +110,22 @@ class GitHubInstallationAccount:
 class GitHubInstallation:
     """One GitHub App installation record within one Workspace.
 
-    Durable routing and observation facts only. ``suspended_at`` is the
-    observed installation state carried verbatim (``None`` means no
-    suspension is observed); deciding whether the installation currently
-    grants the required repository access or permissions is later GitHub
-    reconciliation work, never a property of this record.
+    Durable routing and observation facts only. ``account`` is the observed
+    account identity block, ``suspended_at`` the observed suspension state —
+    both carried verbatim. ``account is None`` is the claim state of the
+    issue #372 Owner mapping surface: an Owner-submitted stable installation
+    identity recorded as unverified configuration before any trusted GitHub
+    observation exists, and only trusted GitHub reconciliation ever populates
+    the observation facts. Neither the claim nor any observation derives an
+    access or permission assertion; deciding whether the installation
+    currently grants the required repository access or permissions is later
+    GitHub reconciliation work, never a property of this record.
     """
 
     id: UUID
     workspace_id: UUID
     identity: GitHubInstallationIdentity
-    account: GitHubInstallationAccount
+    account: GitHubInstallationAccount | None
     suspended_at: datetime | None
     created_at: datetime
     updated_at: datetime

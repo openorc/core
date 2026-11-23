@@ -29,6 +29,12 @@ _CONNECTION_PATH = "/api/v1/workspaces/{workspace_id}/connections/{connection_id
 _CONNECTION_CREDENTIALS_PATH = (
     "/api/v1/workspaces/{workspace_id}/connections/{connection_id}/credentials"
 )
+_INSTALLATIONS_PATH = "/api/v1/workspaces/{workspace_id}/github/installations"
+_INSTALLATION_PATH = "/api/v1/workspaces/{workspace_id}/github/installations/{installation_id}"
+_PROJECTS_PATH = "/api/v1/workspaces/{workspace_id}/projects"
+_REPOSITORIES_PATH = "/api/v1/workspaces/{workspace_id}/repositories"
+_REPOSITORY_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}"
+_ROUTE_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/installation-route"
 _DISCUSSION_POST_PATH = (
     "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
     "/owner-gates/{owner_gate_id}/discussion-message"
@@ -52,6 +58,16 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_CONNECTION_PATH, "put"): "replace_workspace_connection",
     (_CONNECTION_CREDENTIALS_PATH, "post"): "configure_connection_credential",
     (_CONNECTION_CREDENTIALS_PATH, "put"): "rotate_connection_credential",
+    (_INSTALLATIONS_PATH, "get"): "list_workspace_installation_claims",
+    (_INSTALLATIONS_PATH, "post"): "record_workspace_installation_claim",
+    (_INSTALLATION_PATH, "get"): "read_workspace_installation_claim",
+    (_PROJECTS_PATH, "get"): "list_workspace_projects",
+    (_PROJECTS_PATH, "post"): "create_workspace_project",
+    (_REPOSITORIES_PATH, "get"): "list_workspace_repositories",
+    (_REPOSITORIES_PATH, "post"): "claim_workspace_repository",
+    (_REPOSITORY_PATH, "get"): "read_workspace_repository",
+    (_ROUTE_PATH, "put"): "bind_repository_installation_route",
+    (_ROUTE_PATH, "delete"): "unbind_repository_installation_route",
     (_ROLE_BINDING_PATH, "get"): "get_workspace_role_binding",
     (_ROLE_BINDING_PATH, "put"): "replace_workspace_role_binding",
     (_DISCUSSION_POST_PATH, "post"): "send_owner_gate_discussion_message",
@@ -72,6 +88,16 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_CONNECTION_PATH, "put"): "connections",
     (_CONNECTION_CREDENTIALS_PATH, "post"): "connections",
     (_CONNECTION_CREDENTIALS_PATH, "put"): "connections",
+    (_INSTALLATIONS_PATH, "get"): "github-installations",
+    (_INSTALLATIONS_PATH, "post"): "github-installations",
+    (_INSTALLATION_PATH, "get"): "github-installations",
+    (_PROJECTS_PATH, "get"): "projects",
+    (_PROJECTS_PATH, "post"): "projects",
+    (_REPOSITORIES_PATH, "get"): "repositories",
+    (_REPOSITORIES_PATH, "post"): "repositories",
+    (_REPOSITORY_PATH, "get"): "repositories",
+    (_ROUTE_PATH, "put"): "repositories",
+    (_ROUTE_PATH, "delete"): "repositories",
     (_ROLE_BINDING_PATH, "get"): "role-bindings",
     (_ROLE_BINDING_PATH, "put"): "role-bindings",
     (_DISCUSSION_POST_PATH, "post"): "tasks",
@@ -92,6 +118,16 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_CONNECTION_PATH, "put"): {"401", "404", "409", "422", "503"},
     (_CONNECTION_CREDENTIALS_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_CONNECTION_CREDENTIALS_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_INSTALLATIONS_PATH, "get"): {"401", "404", "503"},
+    (_INSTALLATIONS_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_INSTALLATION_PATH, "get"): {"401", "404", "503"},
+    (_PROJECTS_PATH, "get"): {"401", "404", "503"},
+    (_PROJECTS_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_REPOSITORIES_PATH, "get"): {"401", "404", "503"},
+    (_REPOSITORIES_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_REPOSITORY_PATH, "get"): {"401", "404", "503"},
+    (_ROUTE_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_ROUTE_PATH, "delete"): {"401", "404", "409", "503"},
     (_ROLE_BINDING_PATH, "get"): {"401", "404", "503"},
     (_ROLE_BINDING_PATH, "put"): {"401", "404", "503"},
     (_DISCUSSION_POST_PATH, "post"): {"401", "404", "409", "503"},
@@ -157,9 +193,17 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
     assert paths["/api/github/webhooks"]["post"]["tags"] == ["github-webhooks"]
 
     tag_names = {tag["name"] for tag in schema["tags"]}
-    assert {"workspaces", "connections", "role-bindings", "tasks", "health", "github-webhooks"} <= (
-        tag_names
-    )
+    assert {
+        "workspaces",
+        "connections",
+        "github-installations",
+        "projects",
+        "repositories",
+        "role-bindings",
+        "tasks",
+        "health",
+        "github-webhooks",
+    } <= (tag_names)
     # The private handshake route is excluded from the schema, so its tag is
     # never published either.
     assert "internal-queue-observer" not in tag_names
