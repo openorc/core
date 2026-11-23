@@ -47,6 +47,9 @@ _CONVERSATION_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/reviewer
 _USER_AUTH_STATUS_PATH = "/api/v1/profile/github-user-authorization"
 _USER_AUTH_FLOWS_PATH = "/api/v1/profile/github-user-authorization/flows"
 _USER_AUTH_REAUTH_PATH = "/api/v1/profile/github-user-authorization/reauthorization"
+_ACCOUNT_DELETION_PATH = "/api/v1/profile/account"
+_TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
+_PROJECT_PATH = "/api/v1/workspaces/{workspace_id}/projects/{project_id}"
 
 _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_PROFILE_WORKSPACES_PATH, "get"): "list_profile_workspaces",
@@ -80,6 +83,13 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_USER_AUTH_FLOWS_PATH, "post"): "start_github_user_authorization_flow",
     (_USER_AUTH_REAUTH_PATH, "post"): "start_github_user_reauthorization_flow",
     (_USER_AUTH_STATUS_PATH, "delete"): "revoke_profile_github_user_authorization",
+    (_WORKSPACE_PATH, "delete"): "delete_workspace",
+    (_CONNECTION_PATH, "delete"): "delete_workspace_connection",
+    (_CONNECTION_CREDENTIALS_PATH, "delete"): "disconnect_connection_credential",
+    (_PROJECT_PATH, "delete"): "delete_workspace_project",
+    (_REPOSITORY_PATH, "delete"): "delete_workspace_repository",
+    (_TASK_PATH, "delete"): "purge_archived_task",
+    (_ACCOUNT_DELETION_PATH, "delete"): "delete_account",
 }
 
 _OPERATION_TAGS: dict[tuple[str, str], str] = {
@@ -114,6 +124,13 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_USER_AUTH_FLOWS_PATH, "post"): "github-user-authorization",
     (_USER_AUTH_REAUTH_PATH, "post"): "github-user-authorization",
     (_USER_AUTH_STATUS_PATH, "delete"): "github-user-authorization",
+    (_WORKSPACE_PATH, "delete"): "workspaces",
+    (_CONNECTION_PATH, "delete"): "connections",
+    (_CONNECTION_CREDENTIALS_PATH, "delete"): "connections",
+    (_PROJECT_PATH, "delete"): "projects",
+    (_REPOSITORY_PATH, "delete"): "repositories",
+    (_TASK_PATH, "delete"): "tasks",
+    (_ACCOUNT_DELETION_PATH, "delete"): "account",
 }
 
 _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
@@ -148,6 +165,13 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_USER_AUTH_FLOWS_PATH, "post"): {"401", "409", "503"},
     (_USER_AUTH_REAUTH_PATH, "post"): {"401", "409", "503"},
     (_USER_AUTH_STATUS_PATH, "delete"): {"401", "404", "409", "503"},
+    (_WORKSPACE_PATH, "delete"): {"401", "404", "409", "503"},
+    (_CONNECTION_PATH, "delete"): {"401", "404", "409", "503"},
+    (_CONNECTION_CREDENTIALS_PATH, "delete"): {"401", "404", "409", "503"},
+    (_PROJECT_PATH, "delete"): {"401", "404", "409", "503"},
+    (_REPOSITORY_PATH, "delete"): {"401", "404", "409", "503"},
+    (_TASK_PATH, "delete"): {"401", "404", "409", "503"},
+    (_ACCOUNT_DELETION_PATH, "delete"): {"401", "409", "503"},
 }
 
 
@@ -222,6 +246,7 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
         "repositories",
         "role-bindings",
         "tasks",
+        "account",
         "health",
         "github-webhooks",
     } <= (tag_names)
