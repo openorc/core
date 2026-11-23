@@ -22,6 +22,7 @@ from openorc.api.request_correlation import (
     RequestCorrelationMiddleware,
     server_error_response,
 )
+from openorc.api.routers.connections import router as connections_router
 from openorc.api.routers.github_webhooks import router as github_webhooks_router
 from openorc.api.routers.health import router as health_router
 from openorc.api.routers.internal_queue_observer import (
@@ -60,13 +61,15 @@ API_TITLE = "OpenOrc API"
 API_DESCRIPTION = (
     "OpenOrc control-plane HTTP transport. The public client contract is the "
     "versioned /api/v1 namespace: the Profile/Workspace discovery, creation "
-    "and configuration routes (issue #370), the role-binding configuration "
-    "routes (issue #162), and the Task discussion/conversation routes "
-    "(issue #339), authenticated by a Supabase Auth session JWT (GitHub-only "
-    "sign-in) supplied as an HTTP Bearer credential — publishable and secret "
-    "Supabase keys are not user JWTs. Deterministic health (/healthz), "
-    "provider webhook ingress (/api/github/webhooks), and private deployment "
-    "infrastructure are outside the versioned public namespace."
+    "and configuration routes (issue #370), the Workspace Connection "
+    "administration and control-credential routes (issue #371), the "
+    "role-binding configuration routes (issue #162), and the Task "
+    "discussion/conversation routes (issue #339), authenticated by a "
+    "Supabase Auth session JWT (GitHub-only sign-in) supplied as an HTTP "
+    "Bearer credential — publishable and secret Supabase keys are not user "
+    "JWTs. Deterministic health (/healthz), provider webhook ingress "
+    "(/api/github/webhooks), and private deployment infrastructure are "
+    "outside the versioned public namespace."
 )
 
 # OpenAPI tag metadata (issue #369): meaningful grouping/descriptions for the
@@ -98,6 +101,17 @@ OPENAPI_TAG_METADATA = [
             "first-class settings, and the three Owner-authorized setting "
             "updates (review-iteration limit, guidance prose, default Task "
             "USD budget)."
+        ),
+    },
+    {
+        "name": "connections",
+        "description": (
+            "Workspace Agent Runtime Connection administration (issue #371): "
+            "the Owner-authorized configured-inventory list/create/read/"
+            "update with #188 safe-config validation, and the trusted "
+            "control-credential setup/rotation over the issue #55 service. "
+            "Exposed state is configured inventory only — never runtime Hub "
+            "health, session READY, or active-run state."
         ),
     },
     {
@@ -325,6 +339,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(github_webhooks_router)
     app.include_router(workspaces_router, prefix="/api/v1")
+    app.include_router(connections_router, prefix="/api/v1")
     app.include_router(role_bindings_router, prefix="/api/v1")
     app.include_router(tasks_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport

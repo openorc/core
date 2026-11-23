@@ -24,6 +24,11 @@ _WORKSPACE_PATH = "/api/v1/workspaces/{workspace_id}"
 _REVIEW_LIMIT_PATH = "/api/v1/workspaces/{workspace_id}/configuration/review-iteration-limit"
 _GUIDANCE_PATH = "/api/v1/workspaces/{workspace_id}/configuration/guidance"
 _BUDGET_PATH = "/api/v1/workspaces/{workspace_id}/configuration/default-task-budget"
+_CONNECTIONS_PATH = "/api/v1/workspaces/{workspace_id}/connections"
+_CONNECTION_PATH = "/api/v1/workspaces/{workspace_id}/connections/{connection_id}"
+_CONNECTION_CREDENTIALS_PATH = (
+    "/api/v1/workspaces/{workspace_id}/connections/{connection_id}/credentials"
+)
 _DISCUSSION_POST_PATH = (
     "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
     "/owner-gates/{owner_gate_id}/discussion-message"
@@ -41,6 +46,12 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_REVIEW_LIMIT_PATH, "put"): "set_workspace_review_iteration_limit",
     (_GUIDANCE_PATH, "put"): "set_workspace_guidance",
     (_BUDGET_PATH, "put"): "set_workspace_default_task_budget",
+    (_CONNECTIONS_PATH, "get"): "list_workspace_connections",
+    (_CONNECTIONS_PATH, "post"): "create_workspace_connection",
+    (_CONNECTION_PATH, "get"): "read_workspace_connection",
+    (_CONNECTION_PATH, "put"): "replace_workspace_connection",
+    (_CONNECTION_CREDENTIALS_PATH, "post"): "configure_connection_credential",
+    (_CONNECTION_CREDENTIALS_PATH, "put"): "rotate_connection_credential",
     (_ROLE_BINDING_PATH, "get"): "get_workspace_role_binding",
     (_ROLE_BINDING_PATH, "put"): "replace_workspace_role_binding",
     (_DISCUSSION_POST_PATH, "post"): "send_owner_gate_discussion_message",
@@ -55,6 +66,12 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_REVIEW_LIMIT_PATH, "put"): "workspaces",
     (_GUIDANCE_PATH, "put"): "workspaces",
     (_BUDGET_PATH, "put"): "workspaces",
+    (_CONNECTIONS_PATH, "get"): "connections",
+    (_CONNECTIONS_PATH, "post"): "connections",
+    (_CONNECTION_PATH, "get"): "connections",
+    (_CONNECTION_PATH, "put"): "connections",
+    (_CONNECTION_CREDENTIALS_PATH, "post"): "connections",
+    (_CONNECTION_CREDENTIALS_PATH, "put"): "connections",
     (_ROLE_BINDING_PATH, "get"): "role-bindings",
     (_ROLE_BINDING_PATH, "put"): "role-bindings",
     (_DISCUSSION_POST_PATH, "post"): "tasks",
@@ -69,6 +86,12 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_REVIEW_LIMIT_PATH, "put"): {"401", "404", "409", "422", "503"},
     (_GUIDANCE_PATH, "put"): {"401", "404", "409", "422", "503"},
     (_BUDGET_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_CONNECTIONS_PATH, "get"): {"401", "404", "409", "503"},
+    (_CONNECTIONS_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_CONNECTION_PATH, "get"): {"401", "404", "409", "503"},
+    (_CONNECTION_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_CONNECTION_CREDENTIALS_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_CONNECTION_CREDENTIALS_PATH, "put"): {"401", "404", "409", "422", "503"},
     (_ROLE_BINDING_PATH, "get"): {"401", "404", "503"},
     (_ROLE_BINDING_PATH, "put"): {"401", "404", "503"},
     (_DISCUSSION_POST_PATH, "post"): {"401", "404", "409", "503"},
@@ -134,7 +157,9 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
     assert paths["/api/github/webhooks"]["post"]["tags"] == ["github-webhooks"]
 
     tag_names = {tag["name"] for tag in schema["tags"]}
-    assert {"workspaces", "role-bindings", "tasks", "health", "github-webhooks"} <= tag_names
+    assert {"workspaces", "connections", "role-bindings", "tasks", "health", "github-webhooks"} <= (
+        tag_names
+    )
     # The private handshake route is excluded from the schema, so its tag is
     # never published either.
     assert "internal-queue-observer" not in tag_names

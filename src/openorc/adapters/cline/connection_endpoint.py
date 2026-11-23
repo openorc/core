@@ -51,6 +51,7 @@ from urllib.parse import urlsplit
 
 __all__ = [
     "CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY",
+    "CONNECTION_REPOSITORY_BASE_CONFIG_KEY",
     "ConnectionControlEndpointError",
     "parse_control_endpoint_url",
     "resolve_connection_control_endpoint",
@@ -58,6 +59,13 @@ __all__ = [
 
 #: The one safe_config key carrying the Cline control endpoint (issue #188).
 CONNECTION_CONTROL_ENDPOINT_CONFIG_KEY = "control_endpoint"
+
+#: The safe_config key carrying the runtime-side repository base (issue #188):
+#: the existing Owner field the v1 Cline Connection schema defines beside the
+#: control endpoint. Its canonical-absolute-path shape rule is enforced by the
+#: configuration boundary that composes this module; Core validates shape only
+#: and never probes the runtime-side filesystem.
+CONNECTION_REPOSITORY_BASE_CONFIG_KEY = "repository_base"
 
 _SUPPORTED_SCHEMES = ("ws", "wss")
 
