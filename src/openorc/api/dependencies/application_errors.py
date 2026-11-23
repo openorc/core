@@ -108,11 +108,26 @@ DOCUMENTED_NOT_FOUND_404 = {
 DOCUMENTED_CONFLICT_409 = {
     "description": (
         "The operation conflicts with current durable state, or addresses a "
-        "subject that has since moved on (a stale operation)."
+        "subject that has since moved on (a stale operation). A guarded "
+        "Owner mutation fails closed this way while an account-deletion "
+        "attempt is unresolved."
     ),
     "content": {
         "application/json": {
             "example": {"detail": "the operation conflicts with current durable state"}
+        }
+    },
+}
+
+DOCUMENTED_INVALID_COMMAND_422 = {
+    "description": (
+        "The command is invalid: the submitted value violates a semantic "
+        "rule the application service owns (wire-shape failures are the "
+        "framework's request-validation errors, also 422)."
+    ),
+    "content": {
+        "application/json": {
+            "example": {"detail": "the submitted command is not a valid value for this operation"}
         }
     },
 }

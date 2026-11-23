@@ -19,6 +19,11 @@ from openorc import __version__
 from openorc.api.app import create_app
 
 _ROLE_BINDING_PATH = "/api/v1/workspaces/{workspace_id}/role-bindings/{role}"
+_PROFILE_WORKSPACES_PATH = "/api/v1/profile/workspaces"
+_WORKSPACE_PATH = "/api/v1/workspaces/{workspace_id}"
+_REVIEW_LIMIT_PATH = "/api/v1/workspaces/{workspace_id}/configuration/review-iteration-limit"
+_GUIDANCE_PATH = "/api/v1/workspaces/{workspace_id}/configuration/guidance"
+_BUDGET_PATH = "/api/v1/workspaces/{workspace_id}/configuration/default-task-budget"
 _DISCUSSION_POST_PATH = (
     "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
     "/owner-gates/{owner_gate_id}/discussion-message"
@@ -30,6 +35,12 @@ _DISCUSSION_STATUS_PATH = (
 _CONVERSATION_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/reviewer-conversation"
 
 _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
+    (_PROFILE_WORKSPACES_PATH, "get"): "list_profile_workspaces",
+    (_PROFILE_WORKSPACES_PATH, "post"): "create_profile_workspace",
+    (_WORKSPACE_PATH, "get"): "get_workspace",
+    (_REVIEW_LIMIT_PATH, "put"): "set_workspace_review_iteration_limit",
+    (_GUIDANCE_PATH, "put"): "set_workspace_guidance",
+    (_BUDGET_PATH, "put"): "set_workspace_default_task_budget",
     (_ROLE_BINDING_PATH, "get"): "get_workspace_role_binding",
     (_ROLE_BINDING_PATH, "put"): "replace_workspace_role_binding",
     (_DISCUSSION_POST_PATH, "post"): "send_owner_gate_discussion_message",
@@ -38,6 +49,12 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
 }
 
 _OPERATION_TAGS: dict[tuple[str, str], str] = {
+    (_PROFILE_WORKSPACES_PATH, "get"): "workspaces",
+    (_PROFILE_WORKSPACES_PATH, "post"): "workspaces",
+    (_WORKSPACE_PATH, "get"): "workspaces",
+    (_REVIEW_LIMIT_PATH, "put"): "workspaces",
+    (_GUIDANCE_PATH, "put"): "workspaces",
+    (_BUDGET_PATH, "put"): "workspaces",
     (_ROLE_BINDING_PATH, "get"): "role-bindings",
     (_ROLE_BINDING_PATH, "put"): "role-bindings",
     (_DISCUSSION_POST_PATH, "post"): "tasks",
@@ -46,6 +63,12 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
 }
 
 _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
+    (_PROFILE_WORKSPACES_PATH, "get"): {"401", "503"},
+    (_PROFILE_WORKSPACES_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_WORKSPACE_PATH, "get"): {"401", "404", "503"},
+    (_REVIEW_LIMIT_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_GUIDANCE_PATH, "put"): {"401", "404", "409", "422", "503"},
+    (_BUDGET_PATH, "put"): {"401", "404", "409", "422", "503"},
     (_ROLE_BINDING_PATH, "get"): {"401", "404", "503"},
     (_ROLE_BINDING_PATH, "put"): {"401", "404", "503"},
     (_DISCUSSION_POST_PATH, "post"): {"401", "404", "409", "503"},
@@ -111,7 +134,7 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
     assert paths["/api/github/webhooks"]["post"]["tags"] == ["github-webhooks"]
 
     tag_names = {tag["name"] for tag in schema["tags"]}
-    assert {"role-bindings", "tasks", "health", "github-webhooks"} <= tag_names
+    assert {"workspaces", "role-bindings", "tasks", "health", "github-webhooks"} <= tag_names
     # The private handshake route is excluded from the schema, so its tag is
     # never published either.
     assert "internal-queue-observer" not in tag_names
@@ -128,6 +151,27 @@ def test_representative_error_responses_are_documented(settings_factory) -> None
             assert documented["description"]
             example = documented["content"]["application/json"]["example"]
             assert example["detail"]
+
+
+def test_the_published_budget_schema_is_exact_decimal_text(settings_factory) -> None:
+    # pydantic serializes Decimal as canonical decimal text (the
+    # exactness-preserving form, never a binary float), so the published
+    # schema must declare a string — not the number type a binary float would
+    # imply.
+    schema = _openapi(settings_factory())
+    components = schema["components"]["schemas"]
+    budget_properties = {
+        "DefaultTaskBudgetSetting": ["default_task_budget_usd"],
+        "WorkspaceRead": ["default_task_budget_usd"],
+        "DefaultTaskBudgetChange": [
+            "previous_default_task_budget_usd",
+            "new_default_task_budget_usd",
+        ],
+    }
+    for name, properties in budget_properties.items():
+        for prop in properties:
+            members = components[name]["properties"][prop]["anyOf"]
+            assert {member.get("type") for member in members} == {"string", "null"}
 
 
 def test_the_api_metadata_describes_the_versioned_contract(settings_factory) -> None:

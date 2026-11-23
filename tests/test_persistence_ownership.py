@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, cast
 
 from openorc.domain.ownership import (
@@ -33,6 +34,7 @@ from openorc.persistence.ownership import (
     get_repository,
     get_workspace,
     list_github_routed_repositories,
+    list_workspaces_for_owner,
     set_repository_installation_route,
     update_repository_metadata,
     update_workspace_guidance,
@@ -216,6 +218,68 @@ def test_create_workspace_maps_row_and_parameters() -> None:
     insert_columns = sql.split("(", 1)[1].split(")", 1)[0]
     assert "review_iteration_limit" not in insert_columns
     assert "guidance" not in insert_columns
+
+
+def test_list_workspaces_for_owner_scopes_and_maps_rows() -> None:
+    profile_id = uuid.uuid4()
+    observed = _observed_at()
+    rows = [
+        (uuid.uuid4(), profile_id, "platform", observed, observed, 5, "", None),
+        (
+            uuid.uuid4(),
+            profile_id,
+            "second",
+            observed,
+            observed,
+            7,
+            "prose",
+            Decimal("12.5"),
+        ),
+    ]
+    conn = FakeConnection(rows=rows)
+
+    workspaces = list_workspaces_for_owner(
+        cast(DatabasePool, FakePool(conn)), owner_profile_id=profile_id
+    )
+
+    assert workspaces == [
+        Workspace(
+            id=rows[0][0],
+            owner_profile_id=profile_id,
+            name="platform",
+            created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+            review_iteration_limit=5,
+            guidance="",
+        ),
+        Workspace(
+            id=rows[1][0],
+            owner_profile_id=profile_id,
+            name="second",
+            created_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC),
+            review_iteration_limit=7,
+            guidance="prose",
+            default_task_budget_usd=Decimal("12.5"),
+        ),
+    ]
+    assert workspaces[1].created_at.utcoffset() == timedelta(0)
+    sql, params = conn.executed[0]
+    assert "from openorc.workspaces" in sql
+    assert "where owner_profile_id = %s" in sql
+    # Deterministic ordering: creation instant, then record id.
+    assert "order by created_at, id" in sql
+    assert params == (profile_id,)
+
+
+def test_list_workspaces_for_owner_maps_an_empty_result() -> None:
+    profile_id = uuid.uuid4()
+    conn = FakeConnection(row=None)
+
+    assert (
+        list_workspaces_for_owner(cast(DatabasePool, FakePool(conn)), owner_profile_id=profile_id)
+        == []
+    )
 
 
 def test_create_repository_maps_row_to_domain_object() -> None:

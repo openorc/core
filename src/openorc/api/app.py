@@ -29,6 +29,7 @@ from openorc.api.routers.internal_queue_observer import (
 )
 from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
+from openorc.api.routers.workspaces import router as workspaces_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
 from openorc.services.cline_attachment import dispatch_cost_limit_interrupt
@@ -58,8 +59,9 @@ API_TITLE = "OpenOrc API"
 # deployment infrastructure stay outside the versioned public namespace.
 API_DESCRIPTION = (
     "OpenOrc control-plane HTTP transport. The public client contract is the "
-    "versioned /api/v1 namespace: currently the role-binding configuration "
-    "routes (issue #162) and the Task discussion/conversation routes "
+    "versioned /api/v1 namespace: the Profile/Workspace discovery, creation "
+    "and configuration routes (issue #370), the role-binding configuration "
+    "routes (issue #162), and the Task discussion/conversation routes "
     "(issue #339), authenticated by a Supabase Auth session JWT (GitHub-only "
     "sign-in) supplied as an HTTP Bearer credential — publishable and secret "
     "Supabase keys are not user JWTs. Deterministic health (/healthz), "
@@ -85,6 +87,17 @@ OPENAPI_TAG_METADATA = [
             "the asynchronous Owner ↔ Reviewer discussion admission, its "
             "durable receipt-status projection, and the transient "
             "Reviewer-conversation read."
+        ),
+    },
+    {
+        "name": "workspaces",
+        "description": (
+            "Profile/Workspace discovery, creation and configuration "
+            "(issue #370): the authenticated Profile's owned-Workspace list "
+            "and creation, the ownership-gated Workspace read model with its "
+            "first-class settings, and the three Owner-authorized setting "
+            "updates (review-iteration limit, guidance prose, default Task "
+            "USD budget)."
         ),
     },
     {
@@ -306,11 +319,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         },
     )
     app.add_middleware(RequestCorrelationMiddleware)
-    # The public client contract is versioned (issue #369): the two public
+    # The public client contract is versioned (issue #369): the public
     # application routers mount under /api/v1 while health, provider webhook
     # ingress, and the private registration transport stay outside it.
     app.include_router(health_router)
     app.include_router(github_webhooks_router)
+    app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(role_bindings_router, prefix="/api/v1")
     app.include_router(tasks_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport
