@@ -43,7 +43,11 @@ from openorc.adapters.github import (
 from openorc.domain.blocks import TaskBlockReason
 from openorc.domain.executions import ExecutionStatus
 from openorc.domain.gates import OwnerGateStatus, OwnerGateType
-from openorc.domain.github_issues import GitHubIssueState, github_issue_requirements_fingerprint
+from openorc.domain.github_issues import (
+    GitHubIssueObservedFacts,
+    GitHubIssueState,
+    github_issue_requirements_fingerprint,
+)
 from openorc.domain.reviews import ReviewLoopPurpose, ReviewLoopStatus, ReviewOutcome
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import executions as execution_repositories
@@ -83,6 +87,15 @@ _OBSERVED = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 
 
 class _FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """A local fixed-observation client for the durable-composition checks."""
 
     def __init__(
@@ -124,6 +137,14 @@ class _FakeGitHubAppClient:
             state=self._issue_state,
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         )
 
     def get_repository_branch(
@@ -340,12 +361,14 @@ def _pr_authorization_fixture(conn: Connection[Any]) -> dict[str, Any]:
         workspace_id=workspace_id,
         repository_id=repository_id,
         github_issue_id=_GITHUB_ISSUE_ID,
-        issue_number=_ISSUE_NUMBER,
-        title="Found a bug",
-        body="Requirements body",
-        state=GitHubIssueState.OPEN,
-        requirements_fingerprint=_FINGERPRINT,
-        provider_updated_at=None,
+        facts=GitHubIssueObservedFacts(
+            issue_number=_ISSUE_NUMBER,
+            title="Found a bug",
+            body="Requirements body",
+            state=GitHubIssueState.OPEN,
+            requirements_fingerprint=_FINGERPRINT,
+            provider_updated_at=None,
+        ),
     )
     assert projected.outcome is issue_repositories.GitHubIssueReconcileOutcome.INSERTED
 

@@ -64,6 +64,7 @@ from openorc.persistence.github_issue_relations import (
     replace_github_issue_parent_edge,
     replace_github_issue_sub_issue_edges,
 )
+from openorc.persistence.github_issues import stamp_github_issue_relations_observation
 from openorc.persistence.ownership import (
     get_repository,
     get_repository_for_update,
@@ -370,6 +371,18 @@ def _apply_dependency_mirror(
             github_issue_id=github_issue_id,
             blockers=endpoints,
         )
+        # The minimal observation evidence (issue #375), committed atomically
+        # with the mirror: a successful dependency synchronization proves the
+        # edge set was observed, so an authoritative empty observation stays
+        # distinguishable from "never observed". A failed or unobservable
+        # read never reaches this line — the prior evidence stays untouched.
+        stamp_github_issue_relations_observation(
+            tx_pool,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=github_issue_id,
+            dependencies=True,
+        )
         if outcome is GitHubRelationReplaceOutcome.CHANGED:
             _record_relation_event(
                 tx_pool,
@@ -417,6 +430,17 @@ def _apply_hierarchy_mirror(
             GitHubRelationReplaceOutcome.CHANGED
             if GitHubRelationReplaceOutcome.CHANGED in (parent_outcome, children_outcome)
             else GitHubRelationReplaceOutcome.UNCHANGED
+        )
+        # The minimal observation evidence (issue #375), committed atomically
+        # with the mirrors: a successful hierarchy synchronization proves the
+        # parent/sub-issue facts were observed. A failed or unobservable read
+        # never reaches this line — the prior evidence stays untouched.
+        stamp_github_issue_relations_observation(
+            tx_pool,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=github_issue_id,
+            hierarchy=True,
         )
         if outcome is GitHubRelationReplaceOutcome.CHANGED:
             _record_relation_event(

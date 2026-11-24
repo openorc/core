@@ -50,7 +50,7 @@ from psycopg.errors import UniqueViolation
 
 from openorc.adapters.github import GitHubAppClient
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
-from openorc.domain.github_issues import GitHubIssueState
+from openorc.domain.github_issues import GitHubIssueProjection, GitHubIssueState
 from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.events import record_workflow_event
@@ -66,6 +66,9 @@ from openorc.services.errors import (
     NotFoundError,
 )
 from openorc.services.event_coordination import WorkflowActorContext
+from openorc.services.github_installation_route import (
+    resolve_system_repository_installation_route,
+)
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_repository
@@ -339,3 +342,58 @@ def intake_repository_task_for_owner(
             repository_id=repository_id,
             issue_number=issue_number,
         )
+
+
+def durably_eligible_for_create_task_action(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    projection: GitHubIssueProjection,
+) -> bool:
+    """Assess the backend-generated ``create_task`` action eligibility (issue #375).
+
+    The read-side, DB-only eligibility assessment behind the authorized issue
+    read surface's ``openorc.actions`` — a best-effort hint composed from the
+    existing durable intake prerequisites, never a second policy engine and
+    never persisted. The action is offered only when durable facts POSITIVELY
+    support it:
+
+    - the issue's durably observed state is open;
+    - no current (non-archived) Task exists for the stable issue identity —
+      archived-only history permits a fresh attempt;
+    - the dependency mirror is POSITIVELY observed empty: the observation
+      evidence instant is set AND the durable blocked-by edge set is empty.
+      Unknown/unobserved/incomplete dependency observations never establish
+      eligibility, and presentation truncation (a read-surface concern) is
+      never an input here;
+    - the Repository has an explicit currently usable installation route; and
+    - the owning Workspace's account is operational (the account-deletion
+      barrier).
+
+    Hierarchy is categorically absent from the predicate (non-gating), and
+    the offered action is never fresh eligibility: the existing intake
+    command boundary revalidates everything freshly and authoritatively at
+    invocation. No automatic intake or Start exists anywhere.
+    """
+    if projection.state is not GitHubIssueState.OPEN:
+        return False
+    if projection.dependencies_observed_at is None or list_github_issue_blocked_by_edges(
+        pool, repository_id=repository_id, github_issue_id=projection.identity.github_issue_id
+    ):
+        return False
+    if (
+        find_current_task_for_issue(
+            pool, repository_id=repository_id, github_issue_id=projection.identity.github_issue_id
+        )
+        is not None
+    ):
+        return False
+    workspace = get_workspace(pool, workspace_id)
+    if workspace is None:
+        return False
+    require_account_operational(pool, profile_id=workspace.owner_profile_id)
+    resolve_system_repository_installation_route(
+        pool, workspace_id=workspace_id, repository_id=repository_id
+    )
+    return True

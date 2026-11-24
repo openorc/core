@@ -1,4 +1,4 @@
-"""Repositories for the durable GitHub issue projection (issue #59).
+"""Repositories for the durable GitHub issue projection (issues #59, #375).
 
 Explicit SQL repositories over the ``openorc`` schema for the authoritative
 GitHub Issue observations of one Workspace Repository, independent from the
@@ -16,13 +16,27 @@ Reconciliation semantics implemented here (deterministic, race-safe):
 - :func:`reconcile_github_issue` is the serialized write: it locks the
   existing projection row (``SELECT ... FOR UPDATE``) before computing any
   before/current fact, applies a conditional update only when a mutable
-  observation field actually differs (``IS DISTINCT FROM`` — an unchanged
+  observation fact actually differs (``IS DISTINCT FROM`` — an unchanged
   reconciliation performs no write at all and preserves ``updated_at``), and
   classifies insert races from re-read durable state rather than from which
   unique constraint PostgreSQL reported. A number durably mapped to a
   different stable identity is never rebound: the caller receives the
-  classified outcome and applies the typed application-error semantics.
+  classified outcome and applies the typed application-error semantics. The
+  compared and written fact set is one coherent
+  :class:`GitHubIssueObservedFacts` snapshot: the #59 core facts plus the
+  #375 presentation facts. A presentation-only change persists through this
+  path and never touches the requirements fingerprint; an identical
+  observation remains a true durable no-op.
 - Durable identity and Workspace scope are immutable on every update path.
+
+Read-side support (#375): the authorized issue read surface consumes
+:func:`find_github_issue_by_id` (one projection by its internal UUID, scoped
+to the addressed Workspace Repository) and
+:func:`list_repository_github_issues_page` (the deterministic keyset-paged,
+state-filtered bounded list). :func:`stamp_github_issue_relations_observation`
+records the minimal observation-evidence instants for the successful
+relations synchronizations (#60) so the read surface can distinguish an
+authoritative empty relation observation from "never observed".
 
 Violated database invariants surface as driver exceptions (for example
 ``psycopg.errors.UniqueViolation``); translating the classified outcomes
@@ -32,37 +46,54 @@ one.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
 
 from openorc.domain.github_issues import (
     GitHubIssueIdentity,
+    GitHubIssueObservedFacts,
     GitHubIssueProjection,
     GitHubIssueState,
+    github_issue_assignees_from_json,
+    github_issue_assignees_json,
+    github_issue_labels_from_json,
+    github_issue_labels_json,
+    github_issue_milestone_from_json,
+    github_issue_milestone_json,
+    github_issue_user_from_json,
+    github_issue_user_json,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "GitHubIssuePageState",
     "GitHubIssueReconcileOutcome",
     "GitHubIssueReconcileResult",
     "find_github_issue",
+    "find_github_issue_by_id",
     "find_github_issue_by_number",
     "list_open_repository_github_issues",
     "list_repository_github_issues",
+    "list_repository_github_issues_page",
     "reconcile_github_issue",
+    "stamp_github_issue_relations_observation",
 ]
 
 _GITHUB_ISSUE_COLUMNS = (
     "id, workspace_id, repository_id, github_issue_id, issue_number, title, body, "
-    "state, requirements_fingerprint, provider_updated_at, created_at, updated_at"
+    "state, requirements_fingerprint, provider_updated_at, created_at, updated_at, "
+    "state_reason, html_url, provider_created_at, provider_closed_at, user_json, "
+    "labels_json, assignees_json, milestone_json, hierarchy_observed_at, "
+    "dependencies_observed_at"
 )
 
 # A concurrent first-projection insert is retried a small, bounded number of
@@ -136,6 +167,16 @@ def _github_issue_from_row(row: Sequence[Any]) -> GitHubIssueProjection:
         provider_updated_at=None if row[9] is None else normalize_utc(row[9]),
         created_at=normalize_utc(row[10]),
         updated_at=normalize_utc(row[11]),
+        state_reason=row[12],
+        html_url=row[13],
+        provider_created_at=None if row[14] is None else normalize_utc(row[14]),
+        provider_closed_at=None if row[15] is None else normalize_utc(row[15]),
+        user=github_issue_user_from_json(row[16]),
+        labels=github_issue_labels_from_json(row[17]),
+        assignees=github_issue_assignees_from_json(row[18]),
+        milestone=github_issue_milestone_from_json(row[19]),
+        hierarchy_observed_at=None if row[20] is None else normalize_utc(row[20]),
+        dependencies_observed_at=None if row[21] is None else normalize_utc(row[21]),
     )
 
 
@@ -155,16 +196,60 @@ def _select_for_update_by_number(conn: Any, repository_id: UUID, issue_number: i
     ).fetchone()
 
 
+def _facts_json_wrapped(facts: GitHubIssueObservedFacts) -> tuple[Any, ...]:
+    """Return the snapshot's SQL parameters with nested facts Jsonb-wrapped.
+
+    Nested presentation facts cross as explicit canonical ``Jsonb`` values
+    (or ``NULL`` when unobserved), matching the canonical JSON shapes the
+    domain boundary defines.
+    """
+    return (
+        facts.issue_number,
+        facts.title,
+        facts.body,
+        facts.state.value,
+        facts.requirements_fingerprint,
+        facts.provider_updated_at,
+        facts.state_reason,
+        facts.html_url,
+        facts.provider_created_at,
+        facts.provider_closed_at,
+        Jsonb(github_issue_user_json(facts.user)) if facts.user is not None else None,
+        Jsonb(github_issue_labels_json(facts.labels)) if facts.labels is not None else None,
+        Jsonb(github_issue_assignees_json(facts.assignees))
+        if facts.assignees is not None
+        else None,
+        Jsonb(github_issue_milestone_json(facts.milestone))
+        if facts.milestone is not None
+        else None,
+    )
+
+
+def _facts_match_durable(current: GitHubIssueProjection, facts: GitHubIssueObservedFacts) -> bool:
+    """Whether the durable projection already carries exactly these facts."""
+    return (
+        current.issue_number == facts.issue_number
+        and current.title == facts.title
+        and current.body == facts.body
+        and current.state is facts.state
+        and current.requirements_fingerprint == facts.requirements_fingerprint
+        and current.provider_updated_at == facts.provider_updated_at
+        and current.state_reason == facts.state_reason
+        and current.html_url == facts.html_url
+        and current.provider_created_at == facts.provider_created_at
+        and current.provider_closed_at == facts.provider_closed_at
+        and current.user == facts.user
+        and current.labels == facts.labels
+        and current.assignees == facts.assignees
+        and current.milestone == facts.milestone
+    )
+
+
 def _apply_conditional_update(
     conn: Any,
     current: GitHubIssueProjection,
     *,
-    issue_number: int,
-    title: str,
-    body: str | None,
-    state: GitHubIssueState,
-    requirements_fingerprint: str,
-    provider_updated_at: datetime | None,
+    facts: GitHubIssueObservedFacts,
 ) -> GitHubIssueReconcileResult:
     """Apply the serialized, change-only update against the locked row.
 
@@ -172,45 +257,37 @@ def _apply_conditional_update(
     state. The ``IS DISTINCT FROM`` guard is the durable expression of the
     same-value no-op: an identical observation writes nothing, and
     ``updated_at`` only advances when canonical observed state actually
-    changes. Stable identity and Workspace scope are never rewritten.
+    changes — including the #375 presentation facts, whose change is a real
+    durable observation change that never moves the requirements
+    fingerprint. Stable identity and Workspace scope are never rewritten.
     """
-    if (
-        current.issue_number == issue_number
-        and current.title == title
-        and current.body == body
-        and current.state is state
-        and current.requirements_fingerprint == requirements_fingerprint
-        and current.provider_updated_at == provider_updated_at
-    ):
+    if _facts_match_durable(current, facts):
         return GitHubIssueReconcileResult(
             outcome=GitHubIssueReconcileOutcome.UNCHANGED,
             projection=current,
             previous_fingerprint=current.requirements_fingerprint,
             previous_state=current.state,
         )
+    values = _facts_json_wrapped(facts)
     row = conn.execute(
         f"update openorc.github_issues set "
         "issue_number = %s, title = %s, body = %s, state = %s, "
-        "requirements_fingerprint = %s, provider_updated_at = %s, updated_at = now() "
+        "requirements_fingerprint = %s, provider_updated_at = %s, "
+        "state_reason = %s, html_url = %s, provider_created_at = %s, "
+        "provider_closed_at = %s, user_json = %s, labels_json = %s, "
+        "assignees_json = %s, milestone_json = %s, updated_at = now() "
         "where repository_id = %s and github_issue_id = %s "
         "and (issue_number, title, body, state, requirements_fingerprint, "
-        "provider_updated_at) is distinct from (%s, %s, %s, %s, %s, %s) "
+        "provider_updated_at, state_reason, html_url, provider_created_at, "
+        "provider_closed_at, user_json, labels_json, assignees_json, milestone_json) "
+        "is distinct from "
+        "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         f"returning {_GITHUB_ISSUE_COLUMNS}",
         (
-            issue_number,
-            title,
-            body,
-            state.value,
-            requirements_fingerprint,
-            provider_updated_at,
+            *values,
             current.repository_id,
             current.identity.github_issue_id,
-            issue_number,
-            title,
-            body,
-            state.value,
-            requirements_fingerprint,
-            provider_updated_at,
+            *values,
         ),
     ).fetchone()
     if row is None:  # pragma: no cover - the row lock excludes concurrent change
@@ -233,12 +310,7 @@ def _reconcile_locked_row(
     *,
     repository_id: UUID,
     github_issue_id: int,
-    issue_number: int,
-    title: str,
-    body: str | None,
-    state: GitHubIssueState,
-    requirements_fingerprint: str,
-    provider_updated_at: datetime | None,
+    facts: GitHubIssueObservedFacts,
 ) -> GitHubIssueReconcileResult | None:
     """Reconcile the projection row if it exists, locking it first.
 
@@ -251,23 +323,14 @@ def _reconcile_locked_row(
     if locked is None:
         return None
     current = _github_issue_from_row(locked)
-    if current.issue_number != issue_number:
+    if current.issue_number != facts.issue_number:
         return GitHubIssueReconcileResult(
             outcome=GitHubIssueReconcileOutcome.IDENTITY_NUMBER_MISMATCH,
             projection=current,
             previous_fingerprint=current.requirements_fingerprint,
             previous_state=current.state,
         )
-    return _apply_conditional_update(
-        conn,
-        current,
-        issue_number=issue_number,
-        title=title,
-        body=body,
-        state=state,
-        requirements_fingerprint=requirements_fingerprint,
-        provider_updated_at=provider_updated_at,
-    )
+    return _apply_conditional_update(conn, current, facts=facts)
 
 
 def _classify_insert_race(
@@ -308,18 +371,35 @@ def _classify_insert_race(
     return None
 
 
+def _normalize_facts_instants(facts: GitHubIssueObservedFacts) -> GitHubIssueObservedFacts:
+    """Normalize the snapshot's provider instants to timezone-aware UTC.
+
+    Python datetimes crossing this boundary are timezone-aware and
+    normalized to UTC (the persistence time rule); the domain dataclass
+    rejects naive instants downstream, so this normalization is the
+    boundary's own obligation, applied uniformly to every provider instant.
+    """
+    return dataclasses.replace(
+        facts,
+        provider_updated_at=(
+            None if facts.provider_updated_at is None else normalize_utc(facts.provider_updated_at)
+        ),
+        provider_created_at=(
+            None if facts.provider_created_at is None else normalize_utc(facts.provider_created_at)
+        ),
+        provider_closed_at=(
+            None if facts.provider_closed_at is None else normalize_utc(facts.provider_closed_at)
+        ),
+    )
+
+
 def reconcile_github_issue(
     pool: DatabasePool,
     *,
     workspace_id: UUID,
     repository_id: UUID,
     github_issue_id: int,
-    issue_number: int,
-    title: str,
-    body: str | None,
-    state: GitHubIssueState,
-    requirements_fingerprint: str,
-    provider_updated_at: datetime | None,
+    facts: GitHubIssueObservedFacts,
 ) -> GitHubIssueReconcileResult:
     """Serialize one authoritative issue observation into durable state.
 
@@ -333,7 +413,9 @@ def reconcile_github_issue(
     converges through the locked update/no-op path. A number durably mapped
     to another stable identity, or an unresolvable serialized state, is
     returned as a classified conflict for the service layer to fail closed
-    on; identity is never rebound here.
+    on; identity is never rebound here. The compared and written fact set is
+    the caller's whole :class:`GitHubIssueObservedFacts` snapshot (instants
+    normalized to UTC at this boundary).
     """
     if not isinstance(repository_id, UUID) or not isinstance(workspace_id, UUID):
         raise ValueError("workspace_id and repository_id must be UUIDs")
@@ -343,22 +425,13 @@ def reconcile_github_issue(
         or github_issue_id <= 0
     ):
         raise ValueError("github_issue_id must be a positive integer")
-    if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
-        raise ValueError("issue_number must be a positive integer")
-    if not isinstance(state, GitHubIssueState):
-        raise ValueError("state must be a GitHubIssueState value")
-    if provider_updated_at is not None:
-        provider_updated_at = normalize_utc(provider_updated_at)
+    normalized = _normalize_facts_instants(facts)
+    values = _facts_json_wrapped(normalized)
     insert_params: tuple[Any, ...] = (
         workspace_id,
         repository_id,
         github_issue_id,
-        issue_number,
-        title,
-        body,
-        state.value,
-        requirements_fingerprint,
-        provider_updated_at,
+        *values,
     )
     with transaction(pool) as conn:
         for _attempt in range(_MAX_INSERT_ATTEMPTS):
@@ -366,12 +439,7 @@ def reconcile_github_issue(
                 conn,
                 repository_id=repository_id,
                 github_issue_id=github_issue_id,
-                issue_number=issue_number,
-                title=title,
-                body=body,
-                state=state,
-                requirements_fingerprint=requirements_fingerprint,
-                provider_updated_at=provider_updated_at,
+                facts=normalized,
             )
             if locked_result is not None:
                 return locked_result
@@ -380,8 +448,11 @@ def reconcile_github_issue(
                     inserted = conn.execute(
                         "insert into openorc.github_issues "
                         "(workspace_id, repository_id, github_issue_id, issue_number, "
-                        "title, body, state, requirements_fingerprint, provider_updated_at) "
-                        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                        "title, body, state, requirements_fingerprint, provider_updated_at, "
+                        "state_reason, html_url, provider_created_at, provider_closed_at, "
+                        "user_json, labels_json, assignees_json, milestone_json) "
+                        "values ("
+                        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                         f"returning {_GITHUB_ISSUE_COLUMNS}",
                         insert_params,
                     ).fetchone()
@@ -398,7 +469,7 @@ def reconcile_github_issue(
                 classified = _classify_insert_race(
                     conn,
                     repository_id=repository_id,
-                    issue_number=issue_number,
+                    issue_number=normalized.issue_number,
                     github_issue_id=github_issue_id,
                 )
                 if classified is not None:
@@ -479,3 +550,129 @@ def list_open_repository_github_issues(
             (workspace_id, repository_id, GitHubIssueState.OPEN.value),
         ).fetchall()
     return [_github_issue_from_row(row) for row in rows]
+
+
+class GitHubIssuePageState(StrEnum):
+    """The documented state-filter vocabulary of the authorized issue list.
+
+    Values are the documented API filter tokens (issue #375): the durable
+    ``open``/``closed`` observed states and the explicit ``all`` unfiltered
+    form. The default list state is ``open``.
+    """
+
+    OPEN = "open"
+    CLOSED = "closed"
+    ALL = "all"
+
+
+def find_github_issue_by_id(
+    pool: DatabasePool, *, workspace_id: UUID, repository_id: UUID, issue_id: UUID
+) -> GitHubIssueProjection | None:
+    """Return one projection by its internal record identity, scope-checked.
+
+    The authorized detail read (#375): the internal projection UUID is the
+    only address, and the row must belong to the addressed Workspace
+    Repository — a foreign scope is the uniform not-found outcome, never a
+    cross-Workspace oracle.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
+            "where id = %s and workspace_id = %s and repository_id = %s",
+            (issue_id, workspace_id, repository_id),
+        ).fetchone()
+    return None if row is None else _github_issue_from_row(row)
+
+
+def list_repository_github_issues_page(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    state: GitHubIssuePageState,
+    after_issue_number: int | None,
+    limit: int,
+) -> list[GitHubIssueProjection]:
+    """Return one deterministic keyset page of the repository's projections.
+
+    The authorized bounded list (#375): ordered by the durable address
+    metadata (``issue_number`` ascending, unique per repository), advanced
+    by the previous page's last number (the keyset cursor), and explicitly
+    limited so one page stays bounded. The state filter selects the durable
+    observed state vocabulary; ``all`` carries no state predicate.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    if not isinstance(state, GitHubIssuePageState):
+        raise ValueError("state must be a GitHubIssuePageState value")
+    if after_issue_number is not None and (
+        isinstance(after_issue_number, bool)
+        or not isinstance(after_issue_number, int)
+        or after_issue_number <= 0
+    ):
+        raise ValueError("after_issue_number must be a positive integer or None")
+    state_predicate = "" if state is GitHubIssuePageState.ALL else " and state = %s"
+    state_param: tuple[Any, ...] = () if state is GitHubIssuePageState.ALL else (state.value,)
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
+            "where workspace_id = %s and repository_id = %s"
+            f"{state_predicate} "
+            "and (%s::bigint is null or issue_number > %s::bigint) "
+            "order by issue_number asc limit %s",
+            (
+                workspace_id,
+                repository_id,
+                *state_param,
+                after_issue_number,
+                after_issue_number,
+                limit,
+            ),
+        ).fetchall()
+    return [_github_issue_from_row(row) for row in rows]
+
+
+def stamp_github_issue_relations_observation(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    github_issue_id: int,
+    hierarchy: bool = False,
+    dependencies: bool = False,
+) -> None:
+    """Record the minimal observation-evidence instants of a successful sync.
+
+    Called only by a relations synchronization that completed successfully:
+    the addressed evidence column(s) advance to the observation instant so
+    the read surface can distinguish an authoritative empty relation
+    observation from "never observed". A failed or unobservable relations
+    read never calls this, so the prior evidence stays byte-identical — the
+    mirrors' own no-stamp rule (issue #60) extended to the evidence. The
+    evidence is presentation observation context, never workflow fact.
+    """
+    if not hierarchy and not dependencies:
+        raise ValueError("at least one evidence family must be stamped")
+    # The supported evidence combinations are static SQL: the dynamic-identifier
+    # builder never applies to value-free SET clauses.
+    if hierarchy and dependencies:
+        statement = (
+            "update openorc.github_issues set "
+            "hierarchy_observed_at = now(), dependencies_observed_at = now() "
+            "where workspace_id = %s and repository_id = %s and github_issue_id = %s"
+        )
+    elif hierarchy:
+        statement = (
+            "update openorc.github_issues set hierarchy_observed_at = now() "
+            "where workspace_id = %s and repository_id = %s and github_issue_id = %s"
+        )
+    else:
+        statement = (
+            "update openorc.github_issues set dependencies_observed_at = now() "
+            "where workspace_id = %s and repository_id = %s and github_issue_id = %s"
+        )
+    with transaction(pool) as conn:
+        conn.execute(
+            statement,
+            (workspace_id, repository_id, github_issue_id),
+        )

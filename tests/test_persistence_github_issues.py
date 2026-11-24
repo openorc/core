@@ -7,8 +7,11 @@ fakes) to prove the serialized reconcile contract:
 - the lock-then-compute-then-write shape (``SELECT ... FOR UPDATE`` before
   any fact is computed);
 - the true durable no-op: an identical authoritative observation executes no
-  UPDATE at all, preserving ``updated_at``;
-- change-only writes through the conditional ``IS DISTINCT FROM`` update;
+  UPDATE at all, preserving ``updated_at`` — including identical #375
+  presentation facts;
+- change-only writes through the conditional ``IS DISTINCT FROM`` update,
+  including the #375 presentation facts, whose change never moves the
+  requirements fingerprint;
 - insert-race classification from re-read durable mappings — including the
   interleaving where the tuple-identical concurrent insert is surfaced
   through the number-unique violation and still converges idempotently —
@@ -16,7 +19,10 @@ fakes) to prove the serialized reconcile contract:
 - number reuse against a different stable identity as a durable conflict
   with no identity rebind;
 - row mapping, UTC normalization, and naive-instant rejection at the
-  boundary.
+  boundary;
+- the #375 authorized read surface: the keyset-paged state-filtered list,
+  the scope-checked by-UUID detail lookup, and the relations
+  observation-evidence stamps.
 
 Database constraint behavior is proven against a real database by the
 integration-marked suite.
@@ -34,16 +40,25 @@ import pytest
 from psycopg.errors import UniqueViolation
 
 from openorc.domain.github_issues import (
+    GitHubIssueDomainError,
+    GitHubIssueLabel,
+    GitHubIssueMilestone,
+    GitHubIssueObservedFacts,
     GitHubIssueProjection,
     GitHubIssueState,
+    GitHubIssueUserRef,
     github_issue_requirements_fingerprint,
 )
 from openorc.persistence.github_issues import (
+    GitHubIssuePageState,
     GitHubIssueReconcileOutcome,
     find_github_issue,
+    find_github_issue_by_id,
     find_github_issue_by_number,
     list_open_repository_github_issues,
+    list_repository_github_issues_page,
     reconcile_github_issue,
+    stamp_github_issue_relations_observation,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.time import NaiveDatetimeError
@@ -136,6 +151,16 @@ def _issue_row(
     fingerprint: str = _FINGERPRINT,
     provider_updated_at: datetime | None = _UTC_OBSERVED,
     updated_at: datetime | None = None,
+    state_reason: str | None = None,
+    html_url: str | None = None,
+    provider_created_at: datetime | None = None,
+    provider_closed_at: datetime | None = None,
+    user_json: Any = None,
+    labels_json: Any = None,
+    assignees_json: Any = None,
+    milestone_json: Any = None,
+    hierarchy_observed_at: datetime | None = None,
+    dependencies_observed_at: datetime | None = None,
 ) -> tuple[Any, ...]:
     return (
         uuid.uuid4(),
@@ -150,6 +175,16 @@ def _issue_row(
         provider_updated_at,
         _UTC_OBSERVED,
         updated_at or _UTC_OBSERVED,
+        state_reason,
+        html_url,
+        provider_created_at,
+        provider_closed_at,
+        user_json,
+        labels_json,
+        assignees_json,
+        milestone_json,
+        hierarchy_observed_at,
+        dependencies_observed_at,
     )
 
 
@@ -159,10 +194,7 @@ def _projection(row: GitHubIssueProjection | None) -> GitHubIssueProjection:
 
 
 def _incoming_kwargs(**overrides: Any) -> dict[str, Any]:
-    values: dict[str, Any] = {
-        "workspace_id": _WORKSPACE_ID,
-        "repository_id": _REPOSITORY_ID,
-        "github_issue_id": _GITHUB_ISSUE_ID,
+    fact_values: dict[str, Any] = {
         "issue_number": _ISSUE_NUMBER,
         "title": "Found a bug",
         "body": "Steps to reproduce",
@@ -170,8 +202,17 @@ def _incoming_kwargs(**overrides: Any) -> dict[str, Any]:
         "requirements_fingerprint": _FINGERPRINT,
         "provider_updated_at": _UTC_OBSERVED,
     }
-    values.update(overrides)
-    return values
+    outer: dict[str, Any] = {
+        "workspace_id": _WORKSPACE_ID,
+        "repository_id": _REPOSITORY_ID,
+        "github_issue_id": _GITHUB_ISSUE_ID,
+    }
+    for key, value in overrides.items():
+        if key in outer:
+            outer[key] = value
+        else:
+            fact_values[key] = value
+    return {**outer, "facts": GitHubIssueObservedFacts(**fact_values)}
 
 
 def test_row_mapping_normalizes_provider_instants_to_utc() -> None:
@@ -236,6 +277,14 @@ def test_a_first_projection_inserts_and_reports_creation() -> None:
         "open",
         _FINGERPRINT,
         _UTC_OBSERVED,
+        None,  # state_reason: unobserved presentation fact stays honest
+        None,  # html_url
+        None,  # provider_created_at
+        None,  # provider_closed_at
+        None,  # user_json
+        None,  # labels_json
+        None,  # assignees_json
+        None,  # milestone_json
     )
     assert len(conn.executed) == 2
 
@@ -387,10 +436,13 @@ def test_malformed_command_arguments_are_rejected_before_any_sql() -> None:
 
     with pytest.raises(ValueError):
         reconcile_github_issue(_pool(conn), **_incoming_kwargs(github_issue_id=0))
-    with pytest.raises(ValueError):
+    with pytest.raises(GitHubIssueDomainError):
         reconcile_github_issue(_pool(conn), **_incoming_kwargs(issue_number=True))
-    with pytest.raises(ValueError):
-        reconcile_github_issue(_pool(conn), **_incoming_kwargs(state="open"))  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        reconcile_github_issue(
+            _pool(conn),
+            **_incoming_kwargs(state="open"),  # type: ignore[arg-type]
+        )
     with pytest.raises(ValueError):
         reconcile_github_issue(
             _pool(conn),
@@ -433,3 +485,217 @@ def test_open_issue_listing_with_no_rows_returns_an_empty_list() -> None:
         )
         == []
     )
+
+
+_PRESENTATION_USER_JSON = {"id": 77, "login": "octocat"}
+_PRESENTATION_LABELS_JSON = [{"id": 11, "name": "bug", "color": "d73a4a", "description": None}]
+
+
+def test_row_mapping_restores_the_presentation_facts() -> None:
+    conn = ScriptedConnection()
+    row = _issue_row(
+        state_reason="reopened",
+        html_url="https://github.com/octocat/hello-world/issues/42",
+        provider_created_at=_UTC_OBSERVED,
+        provider_closed_at=None,
+        user_json=_PRESENTATION_USER_JSON,
+        labels_json=_PRESENTATION_LABELS_JSON,
+        assignees_json=[{"id": 88, "login": "hubot"}],
+        milestone_json={
+            "id": 13,
+            "number": 7,
+            "title": "v1",
+            "description": None,
+            "state": "open",
+            "html_url": "https://github.com/octocat/hello-world/milestone/7",
+            "due_on": "2026-12-01T00:00:00+00:00",
+        },
+        hierarchy_observed_at=_UTC_OBSERVED,
+        dependencies_observed_at=_UTC_OBSERVED,
+    )
+    conn.on("select", row)
+
+    projection = find_github_issue(
+        _pool(conn), repository_id=_REPOSITORY_ID, github_issue_id=_GITHUB_ISSUE_ID
+    )
+
+    restored = _projection(projection)
+    assert restored.state_reason == "reopened"
+    assert restored.html_url == "https://github.com/octocat/hello-world/issues/42"
+    assert restored.provider_created_at == _UTC_OBSERVED
+    assert restored.provider_closed_at is None
+    assert restored.user is not None
+    assert restored.user.login == "octocat"
+    assert restored.labels is not None
+    assert restored.labels[0].name == "bug"
+    assert restored.assignees is not None
+    assert restored.assignees[0].login == "hubot"
+    assert restored.milestone is not None
+    assert restored.milestone.due_on == datetime(2026, 12, 1, tzinfo=UTC)
+    assert restored.hierarchy_observed_at == _UTC_OBSERVED
+    assert restored.dependencies_observed_at == _UTC_OBSERVED
+
+
+def test_an_identical_observation_including_presentation_facts_is_a_true_no_op() -> None:
+    previous = _issue_row(
+        state_reason="reopened",
+        html_url="https://github.com/octocat/hello-world/issues/42",
+        user_json=_PRESENTATION_USER_JSON,
+        labels_json=_PRESENTATION_LABELS_JSON,
+        assignees_json=[{"id": 88, "login": "hubot"}],
+        milestone_json={
+            "id": 13,
+            "number": 7,
+            "title": "v1",
+            "description": None,
+            "state": "open",
+            "html_url": "https://github.com/octocat/hello-world/milestone/7",
+            "due_on": None,
+        },
+    )
+    conn = ScriptedConnection()
+    conn.on("select", previous)
+
+    result = reconcile_github_issue(
+        _pool(conn),
+        **_incoming_kwargs(
+            state_reason="reopened",
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            user=GitHubIssueUserRef(id=77, login="octocat"),
+            labels=(GitHubIssueLabel(id=11, name="bug", color="d73a4a", description=None),),
+            assignees=(GitHubIssueUserRef(id=88, login="hubot"),),
+            milestone=GitHubIssueMilestone(
+                id=13,
+                number=7,
+                title="v1",
+                description=None,
+                state="open",
+                html_url="https://github.com/octocat/hello-world/milestone/7",
+                due_on=None,
+            ),
+        ),
+    )
+
+    assert result.outcome is GitHubIssueReconcileOutcome.UNCHANGED
+    assert len(conn.executed) == 1  # no write at all; updated_at preserved
+
+
+def test_a_presentation_only_change_writes_but_never_moves_the_fingerprint() -> None:
+    previous = _issue_row()  # no presentation facts observed yet
+    conn = ScriptedConnection()
+    conn.on("select", previous)
+    conn.on(
+        "update openorc.github_issues",
+        _issue_row(
+            state_reason="reopened",
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            user_json=_PRESENTATION_USER_JSON,
+        ),
+    )
+
+    result = reconcile_github_issue(
+        _pool(conn),
+        **_incoming_kwargs(
+            state_reason="reopened",
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            user=GitHubIssueUserRef(id=77, login="octocat"),
+        ),
+    )
+
+    assert result.outcome is GitHubIssueReconcileOutcome.UPDATED
+    assert result.previous_fingerprint == _FINGERPRINT
+    assert result.previous_state is GitHubIssueState.OPEN
+    update_sql, update_params = conn.executed[1]
+    assert "requirements_fingerprint = %s" in update_sql
+    assert update_params is not None
+    # The written fingerprint equals the unchanged requirements digest: the
+    # presentation change never moved it.
+    assert update_params[4] == _FINGERPRINT
+    assert "labels_json = %s" in update_sql
+    assert "milestone_json = %s" in update_sql
+
+
+def test_the_keyset_page_query_filters_states_and_bounds_the_page() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.github_issues", [_issue_row()])
+
+    listed = list_repository_github_issues_page(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        state=GitHubIssuePageState.CLOSED,
+        after_issue_number=41,
+        limit=25,
+    )
+
+    assert len(listed) == 1
+    sql, params = conn.executed[0]
+    assert "order by issue_number asc limit %s" in sql
+    assert "state = %s" in sql
+    assert "issue_number > " in sql
+    assert params == (_WORKSPACE_ID, _REPOSITORY_ID, "closed", 41, 41, 25)
+
+
+def test_the_all_page_query_carries_no_state_predicate() -> None:
+    conn = ScriptedConnection()
+    conn.on("from openorc.github_issues", [])
+
+    list_repository_github_issues_page(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        state=GitHubIssuePageState.ALL,
+        after_issue_number=None,
+        limit=50,
+    )
+
+    sql, params = conn.executed[0]
+    assert "state = %s" not in sql
+    assert params == (_WORKSPACE_ID, _REPOSITORY_ID, None, None, 50)
+
+
+def test_the_detail_lookup_is_scoped_to_the_addressed_repository() -> None:
+    conn = ScriptedConnection()
+    issue_id = uuid.uuid4()
+    conn.on("select", _issue_row())
+
+    projection = find_github_issue_by_id(
+        _pool(conn), workspace_id=_WORKSPACE_ID, repository_id=_REPOSITORY_ID, issue_id=issue_id
+    )
+
+    assert _projection(projection).id is not None
+    sql, params = conn.executed[0]
+    assert "where id = %s and workspace_id = %s and repository_id = %s" in sql
+    assert params == (issue_id, _WORKSPACE_ID, _REPOSITORY_ID)
+
+
+def test_relations_observation_evidence_stamps_the_requested_families() -> None:
+    conn = ScriptedConnection()
+    conn.on("update openorc.github_issues", None)
+
+    stamp_github_issue_relations_observation(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        github_issue_id=_GITHUB_ISSUE_ID,
+        dependencies=True,
+    )
+
+    sql, params = conn.executed[0]
+    assert "dependencies_observed_at = now()" in sql
+    assert "hierarchy_observed_at" not in sql
+    assert params == (_WORKSPACE_ID, _REPOSITORY_ID, _GITHUB_ISSUE_ID)
+
+
+def test_relations_observation_evidence_requires_a_family() -> None:
+    conn = ScriptedConnection()
+
+    with pytest.raises(ValueError):
+        stamp_github_issue_relations_observation(
+            _pool(conn),
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            github_issue_id=_GITHUB_ISSUE_ID,
+        )
+
+    assert conn.executed == []

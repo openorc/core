@@ -68,6 +68,7 @@ from openorc.adapters.github.capabilities import (
     GITHUB_PULL_REQUEST_MERGE_PATH,
     GITHUB_REPOSITORY_BRANCH_PATH,
     GITHUB_REPOSITORY_ISSUE_PATH,
+    GITHUB_REPOSITORY_ISSUES_COLLECTION_PATH,
     GITHUB_REPOSITORY_PULL_REQUEST_PATH,
     GITHUB_REPOSITORY_PULL_REQUESTS_COLLECTION_PATH,
     GITHUB_USER_INSTALLATION_REPOSITORIES_PATH,
@@ -92,9 +93,11 @@ from openorc.adapters.github.errors import (
 )
 from openorc.adapters.github.observations import (
     GitHubIssueObservation,
+    GitHubRepositoryIssueListing,
     GitHubRepositoryObservation,
     parse_installation_repository_entry,
     parse_issue_payload,
+    parse_repository_issue_list_entry,
 )
 from openorc.adapters.github.observations_branch import (
     GitHubBranchObservation,
@@ -160,6 +163,7 @@ _TRACER_SCOPE = "openorc.adapters.github.client"
 _INSTALLATION_LOOKUP_SPAN_NAME = "github.get_installation_capabilities"
 _LISTING_SPAN_NAME = "github.list_installation_repositories"
 _ISSUE_SPAN_NAME = "github.get_repository_issue"
+_ISSUE_LISTING_SPAN_NAME = "github.list_repository_open_issues"
 _BLOCKED_BY_SPAN_NAME = "github.get_issue_blocked_by"
 _SUB_ISSUES_SPAN_NAME = "github.get_issue_sub_issues"
 _PARENT_SPAN_NAME = "github.get_issue_parent"
@@ -177,6 +181,14 @@ _USER_ACCESS_SPAN_NAME = "github.validate_user_installation_repository_access"
 # size (100) and is bounded so a broken pagination chain cannot loop.
 _LISTING_PAGE_SIZE = 100
 _MAX_LISTING_PAGES = 100
+
+# The repository open-issue listing (issue #375) requests the maximum
+# documented page size and is bounded so one synchronization observation's
+# provider work stays bounded regardless of repository history: exhausting
+# the page bound reports a deliberately partial listing (``complete=False``)
+# instead of looping or silently pretending completeness.
+_ISSUE_LISTING_PAGE_SIZE = 100
+_MAX_ISSUE_LISTING_PAGES = 10
 
 # The minimal documented GraphQL query for the one parent fact REST cannot
 # authoritatively express: the nullable ``Issue.parent`` field plus the
@@ -256,6 +268,16 @@ class GitHubAppClient(Protocol):
         issue_number: int,
     ) -> GitHubIssueObservation:
         """Return the normalized current observation of one repository issue."""
+        ...
+
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> GitHubRepositoryIssueListing:
+        """Return the bounded open-issue listing observation of one repository."""
         ...
 
     def get_repository_branch(
@@ -638,6 +660,81 @@ class HttpGitHubAppClient:
                 owner_login=owner_login,
                 repository_name=repository_name,
                 issue_number=issue_number,
+            )
+
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> GitHubRepositoryIssueListing:
+        """Return the bounded open-issue listing observation (issue #375).
+
+        The documented ``GET /repos/{owner}/{repo}/issues`` operation under
+        the installation access token, requested with ``state=open`` and
+        walked through GitHub's documented ``Link`` pagination within a
+        bounded page count. Every entry binds to the addressed repository
+        through its own documented ``repository_url`` (the shared
+        issue-object parser) and carries the full documented fact set. A
+        documented ``pull_request`` entry is GitHub's own discriminator that
+        the number is a pull request viewed through the issues endpoint: it
+        is counted and skipped, never projected as a pseudo-issue.
+
+        ``complete`` is ``True`` only when the walk observed the provider
+        report the end of its pagination chain; exhausting the bounded page
+        count returns the successfully observed entries with
+        ``complete=False`` — a deliberately partial observation the caller
+        must never present as complete discovery, and from which closure or
+        deletion of unlisted issues is never inferred. Transport and
+        pagination failures raise the adapter's classified errors.
+        """
+        require_positive_int(github_installation_id, "github_installation_id")
+        _require_non_empty_command_str(owner_login, "owner_login")
+        _require_non_empty_command_str(repository_name, "repository_name")
+        with application_span(_TRACER_SCOPE, _ISSUE_LISTING_SPAN_NAME) as span:
+            annotate_span(
+                span,
+                operation=_ISSUE_LISTING_SPAN_NAME,
+                github_installation_id=str(github_installation_id),
+            )
+            path = (
+                GITHUB_REPOSITORY_ISSUES_COLLECTION_PATH.format(
+                    owner=owner_login, repo=repository_name
+                )
+                + f"?state=open&per_page={_ISSUE_LISTING_PAGE_SIZE}"
+            )
+            issues: list[GitHubIssueObservation] = []
+            pull_request_entries_skipped = 0
+            complete = False
+            page_count = 0
+            while page_count < _MAX_ISSUE_LISTING_PAGES:
+                response = self._request_with_installation_token(github_installation_id, path)
+                entries = _json_array_body(response)
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        raise GitHubOutcomeUncertainError(
+                            "the GitHub issue listing is not interpretable: "
+                            "a listing entry is malformed"
+                        )
+                    if entry.get("pull_request") is not None:
+                        pull_request_entries_skipped += 1
+                        continue
+                    issues.append(
+                        parse_repository_issue_list_entry(
+                            entry, owner_login=owner_login, repository_name=repository_name
+                        )
+                    )
+                next_url = self._next_page_url(response)
+                if next_url is None:
+                    complete = True
+                    break
+                path = next_url
+                page_count += 1
+            return GitHubRepositoryIssueListing(
+                issues=tuple(issues),
+                pull_request_entries_skipped=pull_request_entries_skipped,
+                complete=complete,
             )
 
     def get_repository_branch(

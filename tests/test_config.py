@@ -26,7 +26,6 @@ from openorc.config import (
     EXECUTION_MODE_VAR,
     GITHUB_APP_USER_FLOW_CLIENT_ID_VAR,
     GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR,
-    GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
     GITHUB_WEBHOOK_SECRET_VAR,
     LOCAL_EXECUTOR_PENDING_VAR,
     LOCAL_EXECUTOR_WORKERS_VAR,
@@ -628,24 +627,6 @@ def test_github_app_user_flow_credentials_are_optional_in_production() -> None:
 
     assert settings.github_app_user_flow_client_id is None
     assert settings.github_app_user_flow_client_secret is None
-
-
-def test_sweep_partitions_default_to_the_documented_rotation() -> None:
-    settings = Settings.from_env({})
-
-    assert settings.github_reconciliation_sweep_partitions == 16
-
-
-def test_sweep_partitions_override_from_the_environment() -> None:
-    settings = Settings.from_env({GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR: "8"})
-
-    assert settings.github_reconciliation_sweep_partitions == 8
-
-
-@pytest.mark.parametrize("raw", ["0", "-1", "abc", "1.5"])
-def test_malformed_sweep_partitions_are_rejected(raw: str) -> None:
-    with pytest.raises(ConfigurationError, match="OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"):
-        Settings.from_env({GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR: raw})
 
 
 _QUEUE_REGISTRATION_ENV = {

@@ -86,6 +86,15 @@ class _SingleConnectionPool:
 
 
 class _ScriptedGitHub:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """Minimal canned adapter for the start path's fresh B3/B4 revalidation."""
 
     def get_installation_repository(
@@ -116,6 +125,14 @@ class _ScriptedGitHub:
             state="open",
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         )
 
     def get_issue_blocked_by(

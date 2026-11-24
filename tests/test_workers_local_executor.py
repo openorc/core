@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +27,8 @@ from openorc.workers.invocation import (
     WebhookDeliveryDispatchPayload,
 )
 from openorc.workers.local_executor import BoundedLocalExecutor
+
+_SWEEP_REFRESH_ID = uuid.uuid4()
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
@@ -284,7 +287,7 @@ def test_sweep_invocations_round_trip_through_the_executor(
     )
     wire = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=4),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
     try:
         accepted = executor.submit(wire)
@@ -292,6 +295,6 @@ def test_sweep_invocations_round_trip_through_the_executor(
         wait_for(lambda: len(handler.calls) == 1)
 
         payload, _resolved = handler.calls[0]
-        assert payload == ReconciliationSweepPayload(sweep_tick=4)
+        assert payload == ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID))
     finally:
         executor.shutdown()

@@ -16,6 +16,7 @@ live Postgres, Valkey, GitHub, or Cline is touched.
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any
 
 import pytest
@@ -102,17 +103,15 @@ class _GitHubServiceHarness:
         self,
         pool: Any,
         github: Any,
-        settings: Settings,
         *,
-        sweep_tick: int | None,
+        refresh_id: Any,
         terminal_finalization_submission: Any = None,
     ) -> None:
         self.sweep_calls.append(
             {
                 "pool": pool,
                 "github": github,
-                "settings": settings,
-                "sweep_tick": sweep_tick,
+                "refresh_id": refresh_id,
                 "terminal_finalization_submission": terminal_finalization_submission,
             }
         )
@@ -253,31 +252,24 @@ def test_the_dispatch_handler_invokes_the_existing_service_with_only_the_guid(
     assert github_service_harness.sweep_calls == []
 
 
-def test_the_sweep_handler_invokes_the_existing_service_with_the_settings_and_tick(
+def test_the_refresh_handler_invokes_the_existing_service_with_the_durable_identity(
     github_service_harness: _GitHubServiceHarness,
 ) -> None:
     settings = _settings()
     dependencies = _dependencies(settings, github_service_harness)
     handler = build_github_operation_handlers()[OperationKind.GITHUB_RECONCILIATION_SWEEP]
+    refresh_id = uuid.uuid4()
 
-    handler(ReconciliationSweepPayload(sweep_tick=7), dependencies=dependencies)
-    handler(ReconciliationSweepPayload(sweep_tick=None), dependencies=dependencies)
+    handler(ReconciliationSweepPayload(refresh_id=str(refresh_id)), dependencies=dependencies)
 
-    assert len(github_service_harness.sweep_calls) == 2
+    assert len(github_service_harness.sweep_calls) == 1
     for call in github_service_harness.sweep_calls:
         _assert_forwarded_cleanup_submission(call, github_service_harness)
     assert github_service_harness.sweep_calls == [
         {
             "pool": github_service_harness.pool,
             "github": github_service_harness.github,
-            "settings": settings,
-            "sweep_tick": 7,
-        },
-        {
-            "pool": github_service_harness.pool,
-            "github": github_service_harness.github,
-            "settings": settings,
-            "sweep_tick": None,
+            "refresh_id": refresh_id,
         },
     ]
     assert github_service_harness.dispatch_calls == []
@@ -327,18 +319,17 @@ def test_the_explicit_sweep_seam_flows_through_the_regular_mode_executor(
     settings = _settings()
     executor = _drained_executor(settings, github_service_harness)
     try:
-        full = submit_github_reconciliation_sweep(executor, sweep_tick=None)
-        assert full.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
+        refresh_id = uuid.uuid4()
+        submitted = submit_github_reconciliation_sweep(executor, refresh_id=refresh_id)
+        assert submitted.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
         assert github_service_harness.sweep_started.wait(timeout=5.0)
-        partitioned = submit_github_reconciliation_sweep(executor, sweep_tick=3)
-        assert partitioned.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
     finally:
         drain = executor.shutdown()
 
     assert drain.drained
-    # The explicit full sweep and the partition tick pass through unchanged;
-    # the tick is a scheduling position, never authority.
-    assert [call["sweep_tick"] for call in github_service_harness.sweep_calls] == [None, 3]
+    # The durable refresh identity passes through unchanged; the queued scope
+    # is never authority — the executor re-derives it from durable state.
+    assert [call["refresh_id"] for call in github_service_harness.sweep_calls] == [refresh_id]
     assert github_service_harness.dispatch_calls == []
     assert queue_wire["client_settings"] == []
 
@@ -423,12 +414,13 @@ def test_the_explicit_sweep_seam_flows_through_the_queue_wire_form(
     submitter = invocation.RQQueueOperationSubmission(settings)
     dependencies = _dependencies(settings, github_service_harness)
 
-    result = submit_github_reconciliation_sweep(submitter, sweep_tick=None)
+    refresh_id = uuid.uuid4()
+    result = submit_github_reconciliation_sweep(submitter, refresh_id=refresh_id)
 
     assert result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY
     wire_invocation = _recorded_queue_invocation(queue_wire)
     assert wire_invocation.kind is OperationKind.GITHUB_RECONCILIATION_SWEEP
-    assert wire_invocation.payload == ReconciliationSweepPayload(sweep_tick=None)
+    assert wire_invocation.payload == ReconciliationSweepPayload(refresh_id=str(refresh_id))
     invoke_operation(
         wire_invocation,
         handlers=invocation.build_production_handlers(),
@@ -442,8 +434,7 @@ def test_the_explicit_sweep_seam_flows_through_the_queue_wire_form(
         {
             "pool": github_service_harness.pool,
             "github": github_service_harness.github,
-            "settings": settings,
-            "sweep_tick": None,
+            "refresh_id": refresh_id,
         }
     ]
 
@@ -489,29 +480,35 @@ def test_the_bridge_maps_f1_outcomes_onto_the_dispatch_submission_outcomes(
 # --- the explicit sweep submission seam: truthful results ----------------------
 
 
-def test_the_sweep_seam_preserves_the_actual_f1_submission_result() -> None:
+def test_the_refresh_seam_preserves_the_actual_f1_submission_result() -> None:
     refused = SubmissionResult.refused(SubmissionRefusalReason.QUEUE_UNAVAILABLE)
     submitter = _RecordingSubmitter(refused)
+    refresh_id = uuid.uuid4()
 
-    result = submit_github_reconciliation_sweep(submitter, sweep_tick=None)
+    result = submit_github_reconciliation_sweep(submitter, refresh_id=refresh_id)
 
     # The actual F1 result — a known refusal is never fabricated completion,
-    # and the durable recovery path stays the only recovery path.
+    # and the durable record's bounded lease stays the only recovery path.
     assert result is refused
     assert submitter.submissions == [
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(refresh_id)),
         )
     ]
 
 
-@pytest.mark.parametrize("bad_tick", [-1, True, "0", 1.5])
-def test_a_malformed_tick_is_refused_before_any_submission(bad_tick: Any) -> None:
+@pytest.mark.parametrize("bad_refresh_id", ["not-a-uuid", "", 42, None])
+def test_a_malformed_refresh_identity_is_refused_before_any_submission(
+    bad_refresh_id: Any,
+) -> None:
     submitter = _RecordingSubmitter()
 
     with pytest.raises(InvalidInvocationError):
-        submit_github_reconciliation_sweep(submitter, sweep_tick=bad_tick)  # type: ignore[arg-type]
+        submit_github_reconciliation_sweep(
+            submitter,
+            refresh_id=bad_refresh_id,  # type: ignore[arg-type]
+        )
 
-    # The malformed scheduling position never became a submission.
+    # The malformed identity never became a submission.
     assert submitter.submissions == []

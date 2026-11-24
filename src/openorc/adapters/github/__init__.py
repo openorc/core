@@ -75,6 +75,7 @@ from openorc.adapters.github.errors import (
 )
 from openorc.adapters.github.observations import (
     GitHubIssueObservation,
+    GitHubRepositoryIssueListing,
     GitHubRepositoryObservation,
     parse_installation_repository_entry,
     parse_issue_payload,
@@ -181,6 +182,7 @@ __all__ = [
     "body_reports_pull_request_already_exists",
     "GitHubRelatedIssueEndpoint",
     "GitHubRelatedIssueObservation",
+    "GitHubRepositoryIssueListing",
     "GitHubRepositoryObservation",
     "GitHubStatusContextObservation",
     "GitHubUserAccessToken",

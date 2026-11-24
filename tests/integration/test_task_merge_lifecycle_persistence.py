@@ -377,6 +377,14 @@ def test_the_owner_approval_claim_survives_a_post_claim_failure_and_is_one_shot(
                 state="open",
                 provider_updated_at=_OBSERVED,
                 is_pull_request=False,
+                state_reason=None,
+                html_url="https://github.com/octocat/hello-world/issues/42",
+                provider_created_at=_OBSERVED,
+                provider_closed_at=None,
+                user=None,
+                labels=(),
+                assignees=(),
+                milestone=None,
             )
 
     merge_calls: list[dict[str, Any]] = []

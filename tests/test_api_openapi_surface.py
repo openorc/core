@@ -50,6 +50,11 @@ _USER_AUTH_REAUTH_PATH = "/api/v1/profile/github-user-authorization/reauthorizat
 _ACCOUNT_DELETION_PATH = "/api/v1/profile/account"
 _TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
 _PROJECT_PATH = "/api/v1/workspaces/{workspace_id}/projects/{project_id}"
+_ISSUES_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/issues"
+_ISSUE_PATH = _ISSUES_PATH + "/{issue_id}"
+_WORKSPACE_REFRESH_PATH = "/api/v1/workspaces/{workspace_id}/refresh"
+_REPOSITORY_REFRESH_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/refresh"
+_REFRESH_STATUS_PATH = _WORKSPACE_REFRESH_PATH + "/{refresh_id}"
 
 _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_PROFILE_WORKSPACES_PATH, "get"): "list_profile_workspaces",
@@ -90,6 +95,11 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_REPOSITORY_PATH, "delete"): "delete_workspace_repository",
     (_TASK_PATH, "delete"): "purge_archived_task",
     (_ACCOUNT_DELETION_PATH, "delete"): "delete_account",
+    (_ISSUES_PATH, "get"): "list_repository_github_issues",
+    (_ISSUE_PATH, "get"): "get_repository_github_issue",
+    (_WORKSPACE_REFRESH_PATH, "post"): "request_workspace_github_refresh",
+    (_REPOSITORY_REFRESH_PATH, "post"): "request_repository_github_refresh",
+    (_REFRESH_STATUS_PATH, "get"): "get_workspace_github_refresh",
 }
 
 _OPERATION_TAGS: dict[tuple[str, str], str] = {
@@ -131,6 +141,11 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_REPOSITORY_PATH, "delete"): "repositories",
     (_TASK_PATH, "delete"): "tasks",
     (_ACCOUNT_DELETION_PATH, "delete"): "account",
+    (_ISSUES_PATH, "get"): "github-issues",
+    (_ISSUE_PATH, "get"): "github-issues",
+    (_WORKSPACE_REFRESH_PATH, "post"): "github-refresh",
+    (_REPOSITORY_REFRESH_PATH, "post"): "github-refresh",
+    (_REFRESH_STATUS_PATH, "get"): "github-refresh",
 }
 
 _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
@@ -172,6 +187,11 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_REPOSITORY_PATH, "delete"): {"401", "404", "409", "503"},
     (_TASK_PATH, "delete"): {"401", "404", "409", "503"},
     (_ACCOUNT_DELETION_PATH, "delete"): {"401", "409", "503"},
+    (_ISSUES_PATH, "get"): {"401", "404", "422", "503"},
+    (_ISSUE_PATH, "get"): {"401", "404", "422", "503"},
+    (_WORKSPACE_REFRESH_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_REPOSITORY_REFRESH_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_REFRESH_STATUS_PATH, "get"): {"401", "404", "422", "503"},
 }
 
 

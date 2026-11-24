@@ -39,6 +39,7 @@ from openorc.adapters.github.errors import (
 from openorc.adapters.github.observations_relations import GitHubRelatedIssueObservation
 from openorc.adapters.github.transport import GITHUB_API_BASE_URL, HttpGitHubRestClient
 from openorc.domain.github_issue_relations import RelatedIssueEndpoint
+from openorc.domain.github_issues import GitHubIssueUserRef
 
 _NOW = 1_790_000_000.0
 _REPOSITORY_ID = 987654321
@@ -161,8 +162,14 @@ def _issue_payload(
         "state": state,
         "updated_at": updated_at,
         "repository_url": repository_url or f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world",
+        "html_url": f"https://github.com/octocat/hello-world/issues/{number}",
+        "created_at": "2026-09-24T01:00:00Z",
+        "closed_at": None,
+        "state_reason": None,
+        "user": {"id": 77, "login": "octocat"},
         "labels": [],
         "assignees": [],
+        "milestone": None,
     }
     if is_pull_request:
         payload["pull_request"] = {"merged_at": None}
@@ -596,4 +603,207 @@ def test_a_malformed_returned_repository_object_classifies_uncertain() -> None:
                     repository_url=f"{GITHUB_API_BASE_URL}/repos/other/repo",
                 )
             ],
+        )
+
+
+def _full_issue_payload(**overrides: Any) -> dict[str, Any]:
+    payload = _issue_payload()
+    payload.update(
+        {
+            "html_url": "https://github.com/octocat/hello-world/issues/42",
+            "created_at": "2026-09-24T01:00:00Z",
+            "closed_at": None,
+            "state_reason": None,
+            "user": {"id": 77, "login": "octocat"},
+            "labels": [
+                {"id": 11, "name": "bug", "color": "d73a4a", "description": None},
+                {"id": 12, "name": "ui", "color": None, "description": "interface"},
+            ],
+            "assignees": [{"id": 88, "login": "hubot"}],
+            "milestone": {
+                "id": 13,
+                "number": 7,
+                "title": "v1",
+                "description": "first release",
+                "state": "open",
+                "html_url": "https://github.com/octocat/hello-world/milestone/7",
+                "due_on": "2026-12-01T00:00:00Z",
+            },
+        }
+    )
+    payload.update(overrides)
+    return payload
+
+
+def _issue_fetch(payload: Any) -> FakeFetcher:
+    return FakeFetcher([_mint_response(), _json(200, {}, payload)])
+
+
+def test_the_issue_observation_carries_the_agreed_presentation_facts() -> None:
+    observation = _client(_issue_fetch(_full_issue_payload())).get_repository_issue(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        issue_number=_ISSUE_NUMBER,
+    )
+
+    assert observation.html_url == "https://github.com/octocat/hello-world/issues/42"
+    assert observation.provider_created_at == datetime(2026, 9, 24, 1, 0, 0, tzinfo=UTC)
+    assert observation.provider_closed_at is None
+    assert observation.state_reason is None
+    assert observation.user is not None and observation.user.id == 77
+    assert observation.user.login == "octocat"
+    assert [label.name for label in observation.labels] == ["bug", "ui"]
+    assert observation.labels[0].color == "d73a4a"
+    assert observation.labels[1].description == "interface"
+    assert observation.assignees == (GitHubIssueUserRef(id=88, login="hubot"),)
+    assert observation.milestone is not None
+    assert observation.milestone.id == 13
+    assert observation.milestone.due_on == datetime(2026, 12, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def test_nullable_presentation_facts_preserve_github_nulls() -> None:
+    payload = _full_issue_payload(
+        closed_at="2026-09-25T10:00:00Z",
+        state="closed",
+        state_reason="completed",
+        user=None,
+        milestone=None,
+        labels=[{"id": 11, "name": "bug", "color": None, "description": None}],
+        assignees=[],
+    )
+
+    observation = _client(_issue_fetch(payload)).get_repository_issue(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+        issue_number=_ISSUE_NUMBER,
+    )
+
+    assert observation.provider_closed_at == datetime(2026, 9, 25, 10, 0, 0, tzinfo=UTC)
+    assert observation.state_reason == "completed"
+    assert observation.user is None
+    assert observation.milestone is None
+    assert observation.labels[0].color is None
+    assert observation.assignees == ()
+
+
+def test_a_malformed_presentation_shape_classifies_the_whole_answer_uncertain() -> None:
+    for payload in (
+        _full_issue_payload(user={"login": "no-id"}),
+        _full_issue_payload(labels="not-a-list"),
+        _full_issue_payload(labels=[{"id": "x", "name": "bug"}]),
+        _full_issue_payload(milestone={"id": 1, "number": 1, "title": "v1"}),
+        _full_issue_payload(state_reason=42),
+        _full_issue_payload(closed_at="not-an-instant"),
+        _full_issue_payload(html_url=""),
+        _full_issue_payload(assignees=[{"id": 1}]),
+        _full_issue_payload(created_at=None),
+    ):
+        with pytest.raises(GitHubOutcomeUncertainError):
+            _client(_issue_fetch(payload)).get_repository_issue(
+                github_installation_id=4242,
+                owner_login="octocat",
+                repository_name="hello-world",
+                issue_number=_ISSUE_NUMBER,
+            )
+
+
+def test_the_open_issue_listing_walks_the_documented_path_and_binds_entries() -> None:
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(200, {}, [_full_issue_payload(), _issue_payload(issue_id=504, number=43)]),
+        ]
+    )
+
+    listing = _client(fetch).list_repository_open_issues(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+    )
+
+    assert listing.complete is True
+    assert listing.pull_request_entries_skipped == 0
+    assert [observation.issue_number for observation in listing.issues] == [42, 43]
+    assert fetch.calls[1][0] == (
+        f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/issues?state=open&per_page=100"
+    )
+    assert fetch.calls[1][2]["Authorization"].startswith("Bearer ghs_")
+
+
+def test_the_open_issue_listing_skips_documented_pull_request_entries() -> None:
+    pseudo_issue = _issue_payload(issue_id=999, number=77, is_pull_request=True)
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(200, {}, [_full_issue_payload(), pseudo_issue]),
+        ]
+    )
+
+    listing = _client(fetch).list_repository_open_issues(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+    )
+
+    assert listing.complete is True
+    assert listing.pull_request_entries_skipped == 1
+    assert [observation.issue_number for observation in listing.issues] == [42]
+
+
+def test_the_open_issue_listing_is_deliberately_partial_at_the_page_bound() -> None:
+    next_page_link = f'<{GITHUB_API_BASE_URL}/repos/octocat/hello-world/issues?page=2>; rel="next"'
+    # Every page reports a further page, so the bounded walk exhausts its page
+    # cap while the provider chain continues: the observation stays partial.
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            *[_json(200, {"Link": next_page_link}, [_full_issue_payload()]) for _ in range(10)],
+        ]
+    )
+
+    listing = _client(fetch).list_repository_open_issues(
+        github_installation_id=4242,
+        owner_login="octocat",
+        repository_name="hello-world",
+    )
+
+    assert listing.complete is False
+    assert len(listing.issues) == 10
+
+
+def test_a_malformed_listing_entry_classifies_the_page_uncertain() -> None:
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(200, {}, ["not-an-object"]),
+        ]
+    )
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).list_repository_open_issues(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
+        )
+
+
+def test_a_listing_entry_for_another_repository_does_not_bind() -> None:
+    fetch = FakeFetcher(
+        [
+            _mint_response(),
+            _json(
+                200,
+                {},
+                [_full_issue_payload(repository_url=f"{GITHUB_API_BASE_URL}/repos/other/repo")],
+            ),
+        ]
+    )
+
+    with pytest.raises(GitHubOutcomeUncertainError):
+        _client(fetch).list_repository_open_issues(
+            github_installation_id=4242,
+            owner_login="octocat",
+            repository_name="hello-world",
         )

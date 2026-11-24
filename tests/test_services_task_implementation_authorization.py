@@ -386,6 +386,16 @@ def _issue_row(
         _OBSERVED,
         _OBSERVED,
         _OBSERVED,
+        None,
+        "https://github.com/octocat/hello-world/issues/42",
+        _OBSERVED,
+        None,
+        None,
+        [],
+        [],
+        None,
+        None,
+        None,
     )
 
 
@@ -443,6 +453,14 @@ def _issue_observation(
         state=state,
         provider_updated_at=_OBSERVED,
         is_pull_request=False,
+        state_reason=None,
+        html_url="https://github.com/octocat/hello-world/issues/42",
+        provider_created_at=_OBSERVED,
+        provider_closed_at=None,
+        user=None,
+        labels=(),
+        assignees=(),
+        milestone=None,
     )
 
 

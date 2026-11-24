@@ -134,6 +134,15 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 class FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """Scripted adapter fake recording call order and transaction safety."""
 
     def __init__(
@@ -186,6 +195,14 @@ class FakeGitHubAppClient:
             state="open",
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url=f"https://github.com/octocat/hello-world/issues/{issue_number}",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         )
 
     def get_issue_blocked_by(
@@ -343,6 +360,16 @@ def _issue_projection_row(state: str = "open") -> tuple[Any, ...]:
         _OBSERVED,
         _OBSERVED,
         _OBSERVED,
+        None,
+        "https://github.com/octocat/hello-world/issues/42",
+        _OBSERVED,
+        None,
+        None,
+        [],
+        [],
+        None,
+        None,
+        None,
     )
 
 
@@ -412,10 +439,12 @@ def _script_dependency_mirror(
         durable_blockers,
     )
     # The observation replaces the prior set; the change-only
-    # task_dependency_synced event write follows.
+    # task_dependency_synced event write follows, and the successful sync
+    # commits the minimal observation evidence in the same transaction.
     conn.on("delete from openorc.github_issue_dependencies", [])
     for _ in durable_blockers:
         conn.on("insert into openorc.github_issue_dependencies", [])
+    conn.on("update openorc.github_issues", None)
     conn.on("insert into openorc.workflow_events", _event_row())
 
 
@@ -450,6 +479,7 @@ def _script_hierarchy_after_creation(
     conn.on("select parent_github_repository_id", None)
     conn.on("delete from openorc.github_issue_hierarchy", [])
     conn.on("insert into openorc.github_issue_hierarchy", [])
+    conn.on("update openorc.github_issues", None)
     conn.on(
         "select child_github_repository_id, child_github_issue_id from "
         "openorc.github_issue_sub_issues",

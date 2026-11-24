@@ -33,6 +33,7 @@ from openorc.adapters.github import (
     GitHubRepositoryObservation,
 )
 from openorc.domain.github_issues import (
+    GitHubIssueObservedFacts,
     GitHubIssueState,
     github_issue_requirements_fingerprint,
 )
@@ -137,13 +138,15 @@ def _reconcile_kwargs(
         "workspace_id": workspace_id,
         "repository_id": repository_id,
         "github_issue_id": github_issue_id,
-        "issue_number": issue_number,
-        "title": title,
-        "body": body,
-        "state": state,
-        "requirements_fingerprint": fingerprint
-        or github_issue_requirements_fingerprint(title, body),
-        "provider_updated_at": _OBSERVED,
+        "facts": GitHubIssueObservedFacts(
+            issue_number=issue_number,
+            title=title,
+            body=body,
+            state=state,
+            requirements_fingerprint=fingerprint
+            or github_issue_requirements_fingerprint(title, body),
+            provider_updated_at=_OBSERVED,
+        ),
     }
 
 
@@ -466,6 +469,15 @@ def test_the_service_boundary_fails_closed_on_an_unrouted_or_foreign_repository(
 class _FakeGitHubClient:
     """Minimal GitHubAppClient fake: typed observations, never the network."""
 
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     def __init__(
         self,
         repository_observation: GitHubRepositoryObservation,
@@ -606,6 +618,14 @@ def test_the_service_reconciles_an_issue_end_to_end_against_the_real_schema(
             state="open",
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         ),
     )
 
@@ -659,6 +679,14 @@ def test_the_service_fails_closed_on_number_reuse_without_rebinding_identity(
             state="open",
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         ),
     )
 

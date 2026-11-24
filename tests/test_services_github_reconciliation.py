@@ -154,6 +154,15 @@ def _pool(conn: ScriptedConnection) -> DatabasePool:
 
 
 class FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """The adapter Protocol fake recording the exact routing arguments."""
 
     def __init__(
@@ -332,7 +341,27 @@ def _issue_row(
     issue_number: int = _ISSUE_NUMBER,
     github_issue_id: int = _GITHUB_ISSUE_ID,
     provider_updated_at: datetime | None = _OBSERVED,
+    state_reason: str | None = None,
+    html_url: str | None = None,
+    provider_created_at: datetime | None = None,
+    provider_closed_at: datetime | None = None,
+    user_json: Any = None,
+    labels_json: Any = None,
+    assignees_json: Any = None,
+    milestone_json: Any = None,
+    hierarchy_observed_at: datetime | None = None,
+    dependencies_observed_at: datetime | None = None,
 ) -> tuple[Any, ...]:
+    # Defaults mirror the default `_issue_observation` presentation facts so
+    # the identical-observation no-op comparisons line up exactly.
+    if html_url is None:
+        html_url = f"https://github.com/octocat/hello-world/issues/{issue_number}"
+    if provider_created_at is None:
+        provider_created_at = _OBSERVED
+    if labels_json is None:
+        labels_json = []
+    if assignees_json is None:
+        assignees_json = []
     return (
         uuid.uuid4(),
         workspace_id or uuid.uuid4(),
@@ -346,6 +375,16 @@ def _issue_row(
         provider_updated_at,
         _OBSERVED,
         _OBSERVED,
+        state_reason,
+        html_url,
+        provider_created_at,
+        provider_closed_at,
+        user_json,
+        labels_json,
+        assignees_json,
+        milestone_json,
+        hierarchy_observed_at,
+        dependencies_observed_at,
     )
 
 
@@ -379,6 +418,14 @@ def _issue_observation(
         state=state,
         provider_updated_at=provider_updated_at,
         is_pull_request=is_pull_request,
+        state_reason=None,
+        html_url=f"https://github.com/octocat/hello-world/issues/{_ISSUE_NUMBER}",
+        provider_created_at=_OBSERVED,
+        provider_closed_at=None,
+        user=None,
+        labels=(),
+        assignees=(),
+        milestone=None,
     )
 
 

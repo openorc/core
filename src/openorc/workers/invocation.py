@@ -623,27 +623,20 @@ class WebhookDeliveryDispatchPayload:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationSweepPayload:
-    """The GitHub reconciliation/recovery sweep operation payload (Task-less).
+    """The GitHub scoped-refresh execution payload (Task-less, issue #375).
 
-    At most the scheduling position (``sweep_tick``, a validated
-    non-negative integer, or omitted for the operator's full sweep). The
-    tick is a scheduling position only, never workflow truth: every sweep
-    unit re-derives its subject from durable state.
+    Exactly one safe stable identity — the durable refresh record's UUID —
+    the owning executor reloads and claims through its CAS. The queued scope
+    is never authorization: the execution re-derives the authorized scope
+    from durable state, and a stale or recovered record is never claimable.
     """
 
-    sweep_tick: int | None = None
+    refresh_id: str
 
     def __post_init__(self) -> None:
-        if self.sweep_tick is None:
-            return
-        if isinstance(self.sweep_tick, bool) or not isinstance(self.sweep_tick, int):
-            raise InvalidInvocationError(
-                "the invocation field 'sweep_tick' must be a non-negative integer"
-            )
-        if self.sweep_tick < 0:
-            raise InvalidInvocationError(
-                "the invocation field 'sweep_tick' must be a non-negative integer"
-            )
+        object.__setattr__(
+            self, "refresh_id", _require_canonical_uuid(self.refresh_id, "refresh_id")
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -758,7 +751,7 @@ OperationPayload = (
 
 _ALLOWED_PAYLOAD_FIELDS: Mapping[OperationKind, frozenset[str]] = {
     OperationKind.GITHUB_WEBHOOK_DELIVERY_DISPATCH: frozenset({"delivery_guid"}),
-    OperationKind.GITHUB_RECONCILIATION_SWEEP: frozenset({"sweep_tick"}),
+    OperationKind.GITHUB_RECONCILIATION_SWEEP: frozenset({"refresh_id"}),
     OperationKind.TASK_PLANNING_BOOTSTRAP_AND_INITIAL_PLAN: frozenset(
         {"task", "profile_id", "expected_state_token"}
     ),
@@ -827,14 +820,9 @@ def _decode_reconciliation_sweep_payload(raw: object) -> ReconciliationSweepPayl
     fields = _require_exact_fields(
         raw, _ALLOWED_PAYLOAD_FIELDS[OperationKind.GITHUB_RECONCILIATION_SWEEP]
     )
-    tick = fields["sweep_tick"]
-    if tick is None:
-        return ReconciliationSweepPayload(sweep_tick=None)
-    if isinstance(tick, bool) or not isinstance(tick, int) or tick < 0:
-        raise InvalidInvocationError(
-            "the invocation field 'sweep_tick' must be a non-negative integer"
-        )
-    return ReconciliationSweepPayload(sweep_tick=tick)
+    return ReconciliationSweepPayload(
+        refresh_id=_require_canonical_uuid(fields["refresh_id"], "refresh_id")
+    )
 
 
 def _decode_task_planning_bootstrap_payload(
@@ -1041,7 +1029,7 @@ def _encode_payload(kind: OperationKind, payload: OperationPayload) -> dict[str,
     if isinstance(payload, ReconciliationSweepPayload) and (
         kind is OperationKind.GITHUB_RECONCILIATION_SWEEP
     ):
-        return {"sweep_tick": payload.sweep_tick}
+        return {"refresh_id": payload.refresh_id}
     if isinstance(payload, TerminalFinalizationPayload) and (
         kind is OperationKind.TASK_TERMINAL_FINALIZATION
     ):

@@ -152,7 +152,7 @@ def list_github_webhook_delivery_routes(
     """Return the persisted routing linkages of one delivery, deterministically ordered."""
     with transaction(pool) as conn:
         rows = conn.execute(
-            "select id, delivery_id, workspace_id, repository_id, created_at "
+            "select id, delivery_id, workspace_id, repository_id, created_at, resolved_at "
             "from openorc.github_webhook_delivery_routes "
             "where delivery_id = %s order by workspace_id, repository_id",
             (delivery_id,),
@@ -164,9 +164,48 @@ def list_github_webhook_delivery_routes(
             workspace_id=row[2],
             repository_id=row[3],
             created_at=normalize_utc(row[4]),
+            resolved_at=None if row[5] is None else normalize_utc(row[5]),
         )
         for row in rows
     ]
+
+
+def mark_github_webhook_delivery_route_resolved(pool: DatabasePool, *, route_id: UUID) -> bool:
+    """Record one route's completion evidence (``resolved_at``); idempotent.
+
+    The scoped recovery's minimal per-route completion evidence (issue
+    #375): the route's routed reconciliation completed or typedly declined.
+    The conditional update makes repeated recoveries true no-ops. ``False``
+    means the route row is absent (it cannot be resolved).
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "update openorc.github_webhook_delivery_routes "
+            "set resolved_at = now() "
+            "where id = %s and resolved_at is null "
+            "returning id",
+            (route_id,),
+        ).fetchone()
+    return row is not None
+
+
+def count_unresolved_github_webhook_delivery_routes(
+    pool: DatabasePool, *, delivery_id: UUID
+) -> int:
+    """Return how many of one delivery's routes still lack completion evidence.
+
+    The scoped recovery's processed-marking input: the delivery is marked
+    processed only when nothing remains outstanding — every routed route
+    carries its completion evidence.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select count(*) from openorc.github_webhook_delivery_routes "
+            "where delivery_id = %s and resolved_at is null",
+            (delivery_id,),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def get_github_webhook_delivery(

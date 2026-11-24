@@ -35,6 +35,7 @@ from openorc.domain.github_issues import (
     GitHubIssueProjection,
     GitHubIssueState,
 )
+from openorc.domain.github_refreshes import GitHubRefreshRecord, GitHubRefreshStatus
 from openorc.domain.ownership import GitHubRepositoryIdentity, Repository, RepositoryMetadata
 from openorc.domain.pull_requests import TaskPullRequest, TaskPullRequestState
 from openorc.persistence.pool import DatabasePool
@@ -43,6 +44,7 @@ from openorc.services import (
     commit_checks_projection,
     github_issue_relations,
     github_reconciliation,
+    github_reconciliation_recovery,
     github_webhook_dispatch,
     task_cancellation,
     task_merge_lifecycle,
@@ -59,6 +61,7 @@ from openorc.services.errors import (
 )
 from openorc.services.github_issue_relations import DependencySyncResult, HierarchySyncResult
 from openorc.services.github_reconciliation import (
+    RepositoryIssueListingSynchronization,
     RepositoryIssueReconciliation,
     RepositoryObservationReconciliation,
 )
@@ -87,6 +90,7 @@ _EXTERNAL_INSTALLATION_ID = 123
 _TASK_A = uuid.uuid4()
 _TASK_B = uuid.uuid4()
 _TOKEN_A = uuid.uuid4()
+_REFRESH_ID = uuid.uuid4()
 _FINGERPRINT_BASE = "a" * 64
 _FINGERPRINT_NEW = "b" * 64
 _HEAD_SHA_OLD = "0" * 40
@@ -254,14 +258,15 @@ class Harness:
         self.dispatch = ScriptedCapability(self.pool_fake)
         self.merge_completion = ScriptedCapability(self.pool_fake)
         self.pr_closure_cancellation = ScriptedCapability(self.pool_fake)
-        self.settings = _settings()
+        self.issue_listing = ScriptedCapability(self.pool_fake)
+        self.refresh_claims = ScriptedCapability(self.pool_fake)
+        self.refresh_completions = ScriptedCapability(self.pool_fake)
 
 
 @pytest.fixture
 def harness_factory(monkeypatch: pytest.MonkeyPatch):
-    def _make(partitions: int = 16) -> Harness:
+    def _make() -> Harness:
         harness = Harness(ScriptedConnection())
-        harness.settings = _settings(partitions=partitions)
         # Every sweep invocation reconciles each configured repository's
         # metadata (always for the operator's full sweep; on bucket match
         # otherwise); the single-repository tests seed its benign unchanged
@@ -272,10 +277,39 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
                 repository=_durable_repository(), metadata_changed=False
             )
         ]
+        # The #375 listing synchronization composes once per scope repository
+        # with an empty, complete observation by default: the listing family
+        # contributes its own typed outcome without extra issue entries.
+        harness.issue_listing.results = [
+            RepositoryIssueListingSynchronization(
+                repository=_durable_repository(),
+                listing_complete=True,
+                pull_request_entries_skipped=0,
+                entries=(),
+            )
+        ]
+        # The durable refresh record claim/completion fakes: the execution
+        # claims the record and stamps its terminal outcome through the CAS
+        # fakes, so no refresh SQL ever runs against the scripted connection.
+        harness.refresh_claims.results = [_refresh_record()]
+        harness.refresh_completions.results = [_refresh_record()]
         monkeypatch.setattr(
             github_reconciliation,
             "reconcile_repository_observation",
             harness.repository_observation,
+        )
+        monkeypatch.setattr(
+            github_reconciliation,
+            "synchronize_repository_open_issue_listing",
+            harness.issue_listing,
+        )
+        monkeypatch.setattr(
+            github_reconciliation_recovery, "claim_github_refresh", harness.refresh_claims
+        )
+        monkeypatch.setattr(
+            github_reconciliation_recovery,
+            "complete_github_refresh",
+            harness.refresh_completions,
         )
         monkeypatch.setattr(
             github_reconciliation, "reconcile_repository_issue", harness.issue_reconcile
@@ -328,7 +362,7 @@ def harness_factory(monkeypatch: pytest.MonkeyPatch):
     return _make
 
 
-def _settings(partitions: int = 16) -> Settings:
+def _settings() -> Settings:
     return Settings(
         environment="test",
         api_host="127.0.0.1",
@@ -339,7 +373,6 @@ def _settings(partitions: int = 16) -> Settings:
         db_pool_min=1,
         db_pool_max=5,
         db_pool_timeout=5.0,
-        github_reconciliation_sweep_partitions=partitions,
     )
 
 
@@ -406,6 +439,16 @@ def _open_issue_row(
         None,
         _NOW,
         _NOW,
+        None,
+        f"https://github.com/octocat/hello-world/issues/{issue_number}",
+        _NOW,
+        None,
+        None,
+        [],
+        [],
+        None,
+        None,
+        None,
     )
 
 
@@ -465,6 +508,22 @@ def _durable_repository() -> Repository:
         created_at=_NOW,
         updated_at=_NOW,
         github_installation_id=_INSTALLATION_A,
+    )
+
+
+def _refresh_record() -> Any:
+    """The claimed durable refresh record projection (the execution's scope)."""
+    return GitHubRefreshRecord(
+        id=_REFRESH_ID,
+        workspace_id=_WORKSPACE_A,
+        repository_id=None,
+        status=GitHubRefreshStatus.RUNNING,
+        requested_at=_NOW,
+        started_at=_NOW,
+        lease_expires_at=_NOW,
+        completed_at=None,
+        summary=None,
+        errors=(),
     )
 
 
@@ -667,13 +726,18 @@ def test_the_full_sweep_services_the_bounded_current_work_set(harness_factory) -
         )
     ]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
-    assert result.tick is None
-    assert result.partitions == 16
+    assert result.refresh_id == _REFRESH_ID
+    assert result.workspace_id == _WORKSPACE_A
+    assert result.repository_id is None
     assert [(outcome.family, outcome.status) for outcome in result.outcomes] == [
         (
             GitHubReconciliationSweepFamily.REPOSITORY,
+            GitHubReconciliationSweepUnitStatus.RECONCILED,
+        ),
+        (
+            GitHubReconciliationSweepFamily.ISSUE_LISTING,
             GitHubReconciliationSweepUnitStatus.RECONCILED,
         ),
         (GitHubReconciliationSweepFamily.ISSUE, GitHubReconciliationSweepUnitStatus.RECONCILED),
@@ -696,57 +760,6 @@ def test_the_full_sweep_services_the_bounded_current_work_set(harness_factory) -
     _assert_no_durable_writes(harness)
 
 
-def test_tick_bucketing_is_deterministic_disjoint_and_starvation_free(harness_factory) -> None:
-    def _run(tick: int) -> list[int]:
-        harness = harness_factory(partitions=2)
-        conn = harness.conn
-        conn.on("from openorc.repositories", [_repository_row()])
-        conn.on(
-            "from openorc.github_issues",
-            [
-                _open_issue_row(github_issue_id=issue_id, issue_number=issue_id)
-                for issue_id in (1, 2, 3, 4)
-            ],
-        )
-        conn.on("from openorc.tasks", [])
-        conn.on("from openorc.tasks", [])
-        conn.on("order by received_at, id limit %s", [])
-        harness.issue_reconcile.results = [
-            _issue_reconciliation(
-                fingerprint=_FINGERPRINT_BASE,
-                requirements_changed=False,
-                previous_fingerprint=None,
-            )
-            for _ in range(4)
-        ]
-        harness.dependencies.results = [
-            DependencySyncResult(blocked=False, changed=False) for _ in range(4)
-        ]
-        harness.hierarchy.results = [HierarchySyncResult(changed=False) for _ in range(4)]
-
-        result = run_github_reconciliation_sweep(
-            harness.pool, _github_client(), harness.settings, sweep_tick=tick
-        )
-
-        assert result.tick == tick
-        return [
-            outcome.github_issue_id
-            for outcome in result.outcomes
-            if outcome.family is GitHubReconciliationSweepFamily.ISSUE
-            and outcome.github_issue_id is not None
-        ]
-
-    tick_zero = _run(0)
-    tick_one = _run(1)
-    # Deterministic membership: each tick services exactly its stable-identity
-    # bucket, the buckets are disjoint, and their union covers every eligible
-    # unit — no starvation, no double service per rotation.
-    assert tick_zero == [2, 4]
-    assert tick_one == [1, 3]
-    assert sorted(tick_zero + tick_one) == [1, 2, 3, 4]
-    assert not set(tick_zero) & set(tick_one)
-
-
 def test_no_webhook_requirements_drift_is_detected_without_rewriting_the_baseline(
     harness_factory,
 ) -> None:
@@ -766,7 +779,7 @@ def test_no_webhook_requirements_drift_is_detected_without_rewriting_the_baselin
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -803,7 +816,7 @@ def test_unchanged_requirements_report_no_drift(harness_factory) -> None:
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -833,7 +846,7 @@ def test_a_never_started_task_reports_no_baseline_comparison(harness_factory) ->
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -867,7 +880,7 @@ def test_an_issue_without_a_current_task_reports_no_baseline_comparison(
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -894,7 +907,7 @@ def test_a_no_webhook_hierarchy_change_is_recovered_without_blocking_consequence
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=True)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     relations_outcome = next(
         outcome
@@ -924,7 +937,7 @@ def test_a_no_webhook_dependency_blocking_change_is_discovered(harness_factory) 
     harness.dependencies.results = [DependencySyncResult(blocked=True, changed=True)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     relations_outcome = next(
         outcome
@@ -962,7 +975,7 @@ def test_a_missed_branch_head_change_is_discovered(harness_factory) -> None:
         )
     ]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     branch_outcome = next(
         outcome
@@ -994,11 +1007,15 @@ def test_missed_pr_head_state_and_merge_are_discovered_with_the_exact_head_check
     harness.checks_projection.results = [_checks_projection()]
     conn.on("order by received_at, id limit %s", [])
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     assert [(outcome.family, outcome.status) for outcome in result.outcomes] == [
         (
             GitHubReconciliationSweepFamily.REPOSITORY,
+            GitHubReconciliationSweepUnitStatus.RECONCILED,
+        ),
+        (
+            GitHubReconciliationSweepFamily.ISSUE_LISTING,
             GitHubReconciliationSweepUnitStatus.RECONCILED,
         ),
         (
@@ -1010,7 +1027,7 @@ def test_missed_pr_head_state_and_merge_are_discovered_with_the_exact_head_check
     # The narrow E10a completion consequence fired exactly once for the
     # observed merge and added no extra outcome of its own.
     assert harness.merge_completion.calls == [{"workspace_id": _WORKSPACE_A, "task_id": _TASK_A}]
-    _, pr_outcome, checks_outcome = result.outcomes
+    _, _, pr_outcome, checks_outcome = result.outcomes
     assert pr_outcome.pull_request_updated is True
     assert pr_outcome.pull_request_head_changed is True
     assert pr_outcome.pull_request_state_changed is True
@@ -1045,7 +1062,7 @@ def test_a_missed_closed_unmerged_pr_is_a_normalized_fact(harness_factory) -> No
     harness.checks_projection.results = [_checks_projection()]
     conn.on("order by received_at, id limit %s", [])
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     pr_outcome = next(
         outcome
@@ -1086,7 +1103,7 @@ def test_a_failed_closed_unmerged_consequence_stays_visible_and_rerunnable(
     harness.checks_projection.results = [_checks_projection()]
     conn.on("order by received_at, id limit %s", [])
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     # The contained consequence failure is reported as its own known-failure
     # outcome so the gap stays visible and re-runnable by the next rotation;
@@ -1094,6 +1111,10 @@ def test_a_failed_closed_unmerged_consequence_stays_visible_and_rerunnable(
     assert [(outcome.family, outcome.status) for outcome in result.outcomes] == [
         (
             GitHubReconciliationSweepFamily.REPOSITORY,
+            GitHubReconciliationSweepUnitStatus.RECONCILED,
+        ),
+        (
+            GitHubReconciliationSweepFamily.ISSUE_LISTING,
             GitHubReconciliationSweepUnitStatus.RECONCILED,
         ),
         (
@@ -1144,7 +1165,7 @@ def test_a_failed_pr_reconciliation_never_projects_checks(harness_factory) -> No
     harness.merge_completion.results = [None]
     harness.checks_projection.results = [_checks_projection()]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     pr_outcomes = [
         outcome
@@ -1178,7 +1199,7 @@ def test_an_uncertain_pr_reconciliation_never_yields_current_head_checks_evidenc
     harness.merge_completion.results = [None]
     harness.checks_projection.results = [_checks_projection()]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     pr_outcomes = [
         outcome
@@ -1221,7 +1242,7 @@ def test_duplicate_and_out_of_order_deliveries_converge_oldest_first(harness_fac
     )
     harness.dispatch.results = [_dispatch_result(), _dispatch_result()]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     delivery_outcomes = [
         outcome
@@ -1264,7 +1285,7 @@ def test_a_failed_delivery_dispatch_stays_recoverable_and_uncertainty_has_preced
         ),
     ]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     delivery_outcomes = [
         outcome
@@ -1289,7 +1310,7 @@ def test_the_delivery_recovery_batch_is_bounded(harness_factory) -> None:
     conn.on("from openorc.tasks", [])
     conn.on("order by received_at, id limit %s", [])
 
-    run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     deliveries_sql, deliveries_params = next(
         (sql, params) for sql, params in conn.executed if "limit %s" in sql
@@ -1327,7 +1348,7 @@ def test_one_units_failure_does_not_corrupt_independent_units(harness_factory) -
         HierarchySyncResult(changed=False),
     ]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcomes = [
         outcome
@@ -1367,7 +1388,7 @@ def test_an_uncertain_outcome_is_surfaced_without_destructive_guessing(
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -1394,7 +1415,7 @@ def test_access_loss_is_a_normalized_fact_without_credential_fallback(
     harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
-    result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     issue_outcome = next(
         outcome
@@ -1422,7 +1443,9 @@ def test_an_unexpected_error_is_contained_with_safe_classification(
     harness.hierarchy.results = [HierarchySyncResult(changed=False)]
 
     with caplog.at_level(logging.WARNING, logger="openorc.services.github_reconciliation_recovery"):
-        result = run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+        result = run_github_reconciliation_sweep(
+            harness.pool, _github_client(), refresh_id=_REFRESH_ID
+        )
 
     issue_outcome = next(
         outcome
@@ -1457,7 +1480,9 @@ def test_repeated_unchanged_sweep_is_an_idempotent_noop(harness_factory) -> None
         ]
         harness.dependencies.results = [DependencySyncResult(blocked=False, changed=False)]
         harness.hierarchy.results = [HierarchySyncResult(changed=False)]
-        return run_github_reconciliation_sweep(harness.pool, _github_client(), harness.settings)
+        return run_github_reconciliation_sweep(
+            harness.pool, _github_client(), refresh_id=_REFRESH_ID
+        )
 
     first = _run()
     second = _run()
@@ -1498,7 +1523,7 @@ def test_a_partial_failure_sweep_is_safe_to_rerun(harness_factory) -> None:
     _script(failing)
     failing.issue_reconcile.errors = {0: ExternalOperationFailedError("known provider condition")}
 
-    failed = run_github_reconciliation_sweep(failing.pool, _github_client(), failing.settings)
+    failed = run_github_reconciliation_sweep(failing.pool, _github_client(), refresh_id=_REFRESH_ID)
 
     recovered = harness_factory()
     _script(recovered)
@@ -1506,7 +1531,9 @@ def test_a_partial_failure_sweep_is_safe_to_rerun(harness_factory) -> None:
         _issue_reconciliation(fingerprint=_FINGERPRINT_BASE, requirements_changed=False)
     ]
 
-    rerun = run_github_reconciliation_sweep(recovered.pool, _github_client(), recovered.settings)
+    rerun = run_github_reconciliation_sweep(
+        recovered.pool, _github_client(), refresh_id=_REFRESH_ID
+    )
 
     first_issue = next(
         o for o in failed.outcomes if o.family is GitHubReconciliationSweepFamily.ISSUE
@@ -1521,20 +1548,30 @@ def test_a_partial_failure_sweep_is_safe_to_rerun(harness_factory) -> None:
     _assert_no_durable_writes(recovered)
 
 
-def test_malformed_sweep_arguments_are_rejected_before_any_work(harness_factory) -> None:
+def test_malformed_refresh_arguments_are_rejected_before_any_work(harness_factory) -> None:
     harness = harness_factory()
 
-    for bad_tick in (-1, True, "0", 1.5):
+    for bad_refresh_id in ("not-a-uuid", 42, None):
         with pytest.raises(InvalidCommandError):
             run_github_reconciliation_sweep(
                 harness.pool,
                 _github_client(),
-                harness.settings,
-                sweep_tick=bad_tick,  # type: ignore[arg-type]
+                refresh_id=bad_refresh_id,  # type: ignore[arg-type]
             )
-    for bad_partitions in (0, -3):
-        settings = _settings(partitions=bad_partitions)
-        with pytest.raises(InvalidCommandError):
-            run_github_reconciliation_sweep(harness.pool, _github_client(), settings)
     # Validation happens before any durable read.
     assert harness.conn.executed == []
+
+
+def test_an_unclaimable_refresh_record_is_a_stale_operation(harness_factory) -> None:
+    harness = harness_factory()
+    # The durable record expired and was recovered to ``unknown`` (or moved
+    # on): the stale job never claims it and never fabricates completion.
+    harness.refresh_claims.results = []
+    harness.refresh_claims.errors = {0: StaleOperationError("no longer claimable")}
+
+    with pytest.raises(StaleOperationError):
+        run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
+
+    # Nothing ran: no capability invocation, no completion stamp.
+    assert harness.issue_reconcile.calls == []
+    assert harness.refresh_completions.calls == []

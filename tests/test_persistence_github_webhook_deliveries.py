@@ -199,7 +199,14 @@ def test_route_listing_maps_rows_deterministically() -> None:
     workspace_id = uuid.uuid4()
     repository_id = uuid.uuid4()
     conn = FakeConnection(
-        row=(uuid.uuid4(), delivery_id, workspace_id, repository_id, _OBSERVED_AT)
+        row=(
+            uuid.uuid4(),
+            delivery_id,
+            workspace_id,
+            repository_id,
+            _OBSERVED_AT,
+            None,
+        )
     )
 
     routes = list_github_webhook_delivery_routes(_pool(conn), delivery_id=delivery_id)
@@ -209,6 +216,8 @@ def test_route_listing_maps_rows_deterministically() -> None:
     assert routes[0].workspace_id == workspace_id
     assert routes[0].repository_id == repository_id
     assert routes[0].created_at == _UTC_OBSERVED
+    # The #375 per-route completion evidence starts unobserved.
+    assert routes[0].resolved_at is None
     sql, params = conn.executed[0]
     assert "order by workspace_id, repository_id" in sql
     assert params == (delivery_id,)

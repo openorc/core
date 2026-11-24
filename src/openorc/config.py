@@ -76,12 +76,6 @@ GITHUB_WEBHOOK_SECRET_VAR = "OPENORC_GITHUB_WEBHOOK_SECRET"
 # the value.
 GITHUB_APP_USER_FLOW_CLIENT_ID_VAR = "OPENORC_GITHUB_APP_USER_FLOW_CLIENT_ID"
 GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR = "OPENORC_GITHUB_APP_USER_FLOW_CLIENT_SECRET"
-# The repeatable GitHub reconciliation/recovery sweep partition count
-# (issue #62): the fixed number of stable-identity buckets each sweep family
-# rotates through so periodic sweeps stay bounded while every eligible unit
-# is serviced without starvation. Scheduling configuration only — correctness
-# never depends on it (every unit re-derives current durable state).
-GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR = "OPENORC_GITHUB_RECONCILIATION_SWEEP_PARTITIONS"
 OTLP_ENDPOINT_VAR = "OPENORC_OTLP_ENDPOINT"
 # Execution-mode selection (issue #86): runtime/deployment environment
 # configuration, not a database setting or build variant. ``regular`` is the
@@ -141,12 +135,6 @@ DEFAULT_DB_POOL_TIMEOUT = 30.0
 # Expected authenticated audience of Supabase Auth access tokens. Supabase
 # Auth mints user access tokens with audience/role "authenticated".
 DEFAULT_SUPABASE_JWT_AUDIENCE = "authenticated"
-# The #62 sweep partitions its bounded current-work families into this many
-# stable-identity buckets; one tick services one bucket per family, so every
-# eligible unit is covered once per this many ticks. 1 means a full sweep of
-# the whole eligible set per invocation. A scheduling knob only: sweep
-# correctness and convergence never depend on the value.
-DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS = 16
 # Bounded local-executor defaults (issue #86): 2 active workers and 8
 # pending-admission slots per serving process. Both bounds are positive by
 # construction (minimum 1); supplied values below the minimum are
@@ -401,12 +389,6 @@ class Settings:
     # absent.
     github_app_user_flow_client_id: str | None = None
     github_app_user_flow_client_secret: str | None = field(default=None, repr=False)
-    # Repeatable GitHub reconciliation sweep partitioning (issue #62). The
-    # partition count bounds each periodic sweep's provider-facing work to one
-    # stable-identity bucket per family; every eligible unit is serviced once
-    # per this many ticks. Scheduling configuration only — the sweep re-derives
-    # its work set and correctness state from Postgres/GitHub every run.
-    github_reconciliation_sweep_partitions: int = DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS
     # Bounded local-executor capacity (issue #86), per serving process:
     # fixed bounded parallelism plus a separate bounded pending-admission
     # capacity so both running and waiting work stay bounded.
@@ -625,18 +607,6 @@ class Settings:
             source, GITHUB_APP_USER_FLOW_CLIENT_SECRET_VAR
         )
 
-        # Repeatable GitHub reconciliation sweep partitioning (issue #62).
-        # Malformed supplied values fail in every environment so
-        # misconfiguration never surfaces at runtime; the default gives the
-        # documented 16-bucket rotation. A supplied value below the minimum is
-        # a configuration error, never silently clamped.
-        github_reconciliation_sweep_partitions = _read_int(
-            source,
-            GITHUB_RECONCILIATION_SWEEP_PARTITIONS_VAR,
-            minimum=1,
-            default=DEFAULT_GITHUB_RECONCILIATION_SWEEP_PARTITIONS,
-        )
-
         # Bounded local-executor capacity (issue #86): positive bounds only;
         # malformed or sub-minimum supplied values fail in every environment
         # so misconfiguration never surfaces at runtime.
@@ -703,7 +673,6 @@ class Settings:
             github_webhook_secret=github_webhook_secret,
             github_app_user_flow_client_id=github_app_user_flow_client_id,
             github_app_user_flow_client_secret=github_app_user_flow_client_secret,
-            github_reconciliation_sweep_partitions=github_reconciliation_sweep_partitions,
             local_executor_workers=local_executor_workers,
             local_executor_pending=local_executor_pending,
             reviewer_neutral_directory=reviewer_neutral_directory,

@@ -39,8 +39,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, cast
+from uuid import UUID
 
 from openorc.services.github_reconciliation_recovery import run_github_reconciliation_sweep
+from openorc.services.github_refresh import (
+    RefreshExecutionSubmission,
+    RefreshSubmissionOutcome,
+)
 from openorc.services.github_webhook_dispatch import (
     EnqueueOutcome,
     WebhookDispatchSubmission,
@@ -60,6 +65,7 @@ from openorc.workers.invocation import (
 from openorc.workers.task_cleanup_operations import F1TerminalFinalizationSubmission
 
 __all__ = [
+    "F1RefreshExecutionSubmission",
     "F1WebhookDispatchSubmission",
     "build_github_operation_handlers",
     "submit_github_reconciliation_sweep",
@@ -96,24 +102,25 @@ def _dispatch_github_webhook_delivery_handler(
 def _run_github_reconciliation_sweep_handler(
     payload: Any, *, dependencies: OperationDependencies
 ) -> None:
-    """Run one reconciliation/recovery sweep (Task-less GitHub kind, F9).
+    """Execute one durable scoped GitHub refresh (Task-less GitHub kind, F9).
 
     The handler only decodes and delegates: the executing process resolves
-    its database pool, GitHub App client, and process settings here, and
-    the shared sweep service owns the bounded work discovery, the fresh
-    authoritative GitHub reads, and every canonical consequence. The tick
-    is a scheduling position only — never authority — and is passed
-    through unchanged. The F10 post-terminal cleanup submission bridge
-    (issue #256) is resolved from the same process-local F1 submitter and
-    forwarded unchanged; the sweep's terminal consequences arrange it
-    strictly post-commit for a newly applied terminal outcome only.
+    its database pool and GitHub App client here, and the shared refresh
+    executor owns the durable record claim, the scope re-derivation, the
+    bounded work discovery, the fresh authoritative GitHub reads, and every
+    canonical consequence. The queued payload carries only the refresh
+    identity — never authorization — and the executor re-derives the
+    authorized scope from durable state. The F10 post-terminal cleanup
+    submission bridge (issue #256) is resolved from the same process-local
+    F1 submitter and forwarded unchanged; the execution's terminal
+    consequences arrange it strictly post-commit for a newly applied
+    terminal outcome only.
     """
     sweep_payload = cast(ReconciliationSweepPayload, payload)
     run_github_reconciliation_sweep(
         dependencies.database_pool(),
         dependencies.github_client(),
-        dependencies.settings,
-        sweep_tick=sweep_payload.sweep_tick,
+        refresh_id=UUID(sweep_payload.refresh_id),
         terminal_finalization_submission=F1TerminalFinalizationSubmission(
             dependencies.continuation_submitter()
         ),
@@ -171,31 +178,68 @@ _dispatch_submission_bridge: type[WebhookDispatchSubmission] = F1WebhookDispatch
 
 
 def submit_github_reconciliation_sweep(
-    submitter: OperationSubmitter, *, sweep_tick: int | None = None
+    submitter: OperationSubmitter, *, refresh_id: UUID
 ) -> SubmissionResult:
-    """Submit one explicit reconciliation/recovery sweep through F1 (issue #255).
+    """Submit one durable scoped-refresh execution through F1 (issues #255, #375).
 
     The trusted/internal, programmatically callable submission seam, mode
     neutral by construction: the caller supplies the active process-local
     :class:`OperationSubmitter` — the serving process's bounded local
     executor in regular execution mode, the canonical queue submission in
-    queue mode. ``sweep_tick=None`` requests the explicitly selected full
-    sweep; a validated nonnegative tick selects the existing bounded
-    partition. The tick is a scheduling position only — never authority —
-    and the sweep service re-derives every subject from durable state.
+    queue mode. The payload carries only the durable refresh record's
+    identity: the executing service re-derives the authorized scope from
+    durable state, so the queued payload is never authorization.
 
     The actual F1 :class:`SubmissionResult` is returned unchanged:
     acceptance is never completion, and a known refusal or uncertain
-    outcome leaves recovery to the existing sweep path instead of
-    triggering a replay. A malformed tick raises the typed invocation
-    error before any submission is attempted. No recurring timer,
-    polling, or Owner-facing command exists here; a future Owner-facing
-    caller would add its own authentication and Workspace authorization
-    before submitting.
+    outcome leaves recovery to the refresh record's bounded lease instead
+    of triggering a replay. A malformed identity raises the typed
+    invocation error before any submission is attempted. No recurring
+    timer, polling, or global sweep exists here; the Owner-facing caller
+    composes its own authentication and Workspace authorization before
+    submitting.
     """
     return submitter.submit(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=sweep_tick),
+            payload=ReconciliationSweepPayload(refresh_id=str(refresh_id)),
         )
     )
+
+
+class F1RefreshExecutionSubmission:
+    """The F1-backed refresh execution submission bridge (issue #375).
+
+    Implements the admission service's submission seam over a supplied
+    process-local F1 :class:`OperationSubmitter`: each durable refresh
+    record identity becomes exactly one ``GITHUB_RECONCILIATION_SWEEP``
+    invocation carrying only that identity, and the F1 submission outcome
+    maps 1:1 onto the service's bounded outcome vocabulary. The bridge owns
+    no transport mechanics of its own, no durable state, and no retry or
+    replay: a known refusal or uncertain submission is returned as such —
+    the durable record stays truthfully recoverable — and acceptance is
+    never completion.
+    """
+
+    def __init__(self, submitter: OperationSubmitter) -> None:
+        self._submitter = submitter
+
+    def submit(self, *, refresh_id: UUID) -> RefreshSubmissionOutcome:
+        """Submit one refresh identity through the supplied F1 submitter."""
+        result = self._submitter.submit(
+            OperationInvocation(
+                kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
+                payload=ReconciliationSweepPayload(refresh_id=str(refresh_id)),
+            )
+        )
+        if result.outcome is SubmissionOutcome.ACCEPTED_FOR_DELIVERY:
+            return RefreshSubmissionOutcome.ACCEPTED
+        if result.outcome is SubmissionOutcome.KNOWN_REFUSED:
+            return RefreshSubmissionOutcome.KNOWN_REFUSED
+        return RefreshSubmissionOutcome.UNCERTAIN
+
+
+# Type-level proof that the bridge satisfies the admission service's
+# submission seam: the service protocol and the F1-backed implementation
+# stay structurally checked without the service ever importing this module.
+_refresh_submission_bridge: type[RefreshExecutionSubmission] = F1RefreshExecutionSubmission

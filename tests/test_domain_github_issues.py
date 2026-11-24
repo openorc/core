@@ -22,8 +22,11 @@ import pytest
 from openorc.domain.github_issues import (
     GitHubIssueDomainError,
     GitHubIssueIdentity,
+    GitHubIssueLabel,
+    GitHubIssueMilestone,
     GitHubIssueProjection,
     GitHubIssueState,
+    GitHubIssueUserRef,
     github_issue_field_names,
     github_issue_requirements_fingerprint,
 )
@@ -140,10 +143,14 @@ def test_the_projection_record_validates_its_durable_invariants() -> None:
         _projection(id="not-a-uuid")  # type: ignore[arg-type]
 
 
-def test_the_projection_exposes_exactly_the_phase_2_issue_facts() -> None:
-    # No credential-bearing field and no presentation surplus: comments,
-    # labels, assignees, reactions, timeline events, and raw provider
-    # payloads have no supported column on the projection.
+def test_the_projection_exposes_exactly_the_documented_issue_facts() -> None:
+    # No credential-bearing field and no raw-payload surplus: comments,
+    # reactions, timeline events, and arbitrary provider navigation data
+    # have no supported column on the projection. Issue #375 adds the agreed
+    # bounded presentation facts: state_reason, the provider-supplied
+    # html_url, provider created/closed instants, the nested user/labels/
+    # assignees/milestone subsets, and the two relations observation-evidence
+    # instants.
     assert github_issue_field_names() == frozenset(
         {
             "id",
@@ -158,5 +165,106 @@ def test_the_projection_exposes_exactly_the_phase_2_issue_facts() -> None:
             "provider_updated_at",
             "created_at",
             "updated_at",
+            "state_reason",
+            "html_url",
+            "provider_created_at",
+            "provider_closed_at",
+            "user",
+            "labels",
+            "assignees",
+            "milestone",
+            "hierarchy_observed_at",
+            "dependencies_observed_at",
         }
     )
+
+
+def test_presentation_facts_default_to_unobserved_none() -> None:
+    # An unobserved presentation fact stays honest: nothing is fabricated
+    # from defaults, and collections distinguish unobserved (None) from
+    # observed empty (an empty tuple).
+    projection = _projection()
+    assert projection.state_reason is None
+    assert projection.html_url is None
+    assert projection.provider_created_at is None
+    assert projection.provider_closed_at is None
+    assert projection.user is None
+    assert projection.labels is None
+    assert projection.assignees is None
+    assert projection.milestone is None
+    assert projection.hierarchy_observed_at is None
+    assert projection.dependencies_observed_at is None
+
+    observed_empty = _projection(labels=(), assignees=())
+    assert observed_empty.labels == ()
+    assert observed_empty.assignees == ()
+
+
+def test_the_projection_validates_the_presentation_fact_shapes() -> None:
+    user = GitHubIssueUserRef(id=1, login="octocat")
+    label = GitHubIssueLabel(id=2, name="bug", color="d73a4a", description=None)
+    milestone = GitHubIssueMilestone(
+        id=3,
+        number=7,
+        title="v1",
+        state="open",
+        html_url="https://github.com/example/repo/milestone/7",
+        description=None,
+        due_on=None,
+    )
+    projection = _projection(
+        state_reason="reopened",
+        html_url="https://github.com/example/repo/issues/42",
+        user=user,
+        labels=(label,),
+        assignees=(user,),
+        milestone=milestone,
+    )
+    assert projection.user == user
+    assert projection.labels == (label,)
+    assert projection.milestone == milestone
+
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(user=("octocat",))  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(labels=(("bug",),))  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(milestone=("v1",))  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(html_url="")
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(state_reason=42)  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(provider_created_at="2026-09-25")  # type: ignore[arg-type]
+    with pytest.raises(GitHubIssueDomainError):
+        _projection(dependencies_observed_at="2026-09-25")  # type: ignore[arg-type]
+
+
+def test_the_presentation_value_objects_validate_their_shapes() -> None:
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueUserRef(id=0, login="octocat")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueUserRef(id=1, login="")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueLabel(id=0, name="bug")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueLabel(id=1, name="")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(id=0, number=1, title="v1", state="open", html_url="https://x")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(id=1, number=0, title="v1", state="open", html_url="https://x")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(id=1, number=1, title="", state="open", html_url="https://x")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(id=1, number=1, title="v1", state="", html_url="https://x")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(id=1, number=1, title="v1", state="open", html_url="")
+    with pytest.raises(GitHubIssueDomainError):
+        GitHubIssueMilestone(
+            id=1,
+            number=1,
+            title="v1",
+            state="open",
+            html_url="https://x",
+            due_on="soon",  # type: ignore[arg-type]
+        )
