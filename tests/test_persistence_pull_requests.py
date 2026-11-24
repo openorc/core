@@ -121,6 +121,23 @@ def _pull_request_row(**overrides: Any) -> tuple[Any, ...]:
         "merged_at": None,
         "created_at": _observed_at(),
         "updated_at": _observed_at(),
+        # The #376 presentation/mergeability columns: an existing row has not
+        # yet observed the facts until a reconciliation supplies them, so the
+        # baseline row is the honest legacy-NULL shape.
+        "title": None,
+        "body": None,
+        "html_url": None,
+        "user_id": None,
+        "user_login": None,
+        "draft": None,
+        "provider_created_at": None,
+        "provider_updated_at": None,
+        "provider_closed_at": None,
+        "base_sha": None,
+        "mergeable": None,
+        "merge_state_status": None,
+        "pr_mergeability_observed_at": None,
+        "pr_mergeability_head_sha": None,
     }
     values.update(overrides)
     return (
@@ -137,6 +154,20 @@ def _pull_request_row(**overrides: Any) -> tuple[Any, ...]:
         values["merged_at"],
         values["created_at"],
         values["updated_at"],
+        values["title"],
+        values["body"],
+        values["html_url"],
+        values["user_id"],
+        values["user_login"],
+        values["draft"],
+        values["provider_created_at"],
+        values["provider_updated_at"],
+        values["provider_closed_at"],
+        values["base_sha"],
+        values["mergeable"],
+        values["merge_state_status"],
+        values["pr_mergeability_observed_at"],
+        values["pr_mergeability_head_sha"],
     )
 
 
@@ -171,8 +202,15 @@ def test_create_task_pull_request_inserts_open_with_the_explicit_state() -> None
     sql, params = fake_conn.executed[0]
     assert "insert into openorc.task_pull_requests" in sql
     # The observed lifecycle carries no database default: the initial open
-    # state is explicit in the creation statement.
-    assert "head_ref, base_ref, head_sha, state)" in sql
+    # state is explicit in the creation statement. A caller reporting no
+    # #376 presentation facts inserts explicit NULLs and omits the
+    # mergeability observation pair from the INSERT column list (no
+    # fabricated observation; the RETURNING projection always carries the
+    # full row shape).
+    insert_columns = sql.split("values")[0]
+    assert "head_ref, base_ref, head_sha, state," in insert_columns
+    assert "title, body, html_url, user_id, user_login, draft," in insert_columns
+    assert "pr_mergeability_observed_at, pr_mergeability_head_sha" not in insert_columns
     assert params == (
         row[1],
         row[2],
@@ -183,6 +221,18 @@ def test_create_task_pull_request_inserts_open_with_the_explicit_state() -> None
         row[7],
         row[8],
         "open",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     assert len(fake_conn.executed) == 1
 
@@ -307,15 +357,35 @@ def test_update_observed_replaces_the_full_observed_snapshot() -> None:
     sql, params = fake_conn.executed[0]
     assert "update openorc.task_pull_requests" in sql
     assert "set head_ref = %s, base_ref = %s, head_sha = %s, state = %s, " in sql
-    assert "merged_at = %s, updated_at = now()" in sql
+    assert "merged_at = %s, title = %s" in sql
     # The identity and address columns are never part of the snapshot: the
     # SET clause carries only the observed reconciliation state (the
-    # RETURNING clause projects the full row and is bounded out).
+    # RETURNING clause projects the full row and is bounded out). A caller
+    # reporting no #376 mergeability reading leaves the retained observation
+    # pair untouched.
     set_clause = sql.split("set")[1].split("where")[0]
     assert "github_pr_id" not in set_clause
     assert "github_pr_number" not in set_clause
     assert "repository_id" not in set_clause
-    assert params == ("openorc/task-42", "main", head, "closed", _observed_at(), merged[0])
+    assert "pr_mergeability_observed_at" not in set_clause
+    assert params == (
+        "openorc/task-42",
+        "main",
+        head,
+        "closed",
+        _observed_at(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        merged[0],
+    )
 
 
 def test_update_observed_rejects_incoherent_snapshots_before_sql() -> None:
@@ -418,6 +488,7 @@ def test_the_module_surface_carries_only_the_pr_repositories() -> None:
         "get_task_pull_request",
         "get_task_pull_request_for_task",
         "get_task_pull_request_for_task_for_update",
+        "get_task_pull_requests_for_tasks",
         "list_task_pull_requests_for_repository",
         "reconcile_task_pull_request_observed",
         "update_task_pull_request_observed",
@@ -471,6 +542,16 @@ def test_reconcile_task_pull_request_observed_updates_the_locked_row_with_the_pr
         "main",
         "fedcba9876543210fedcba9876543210fedcba98",
         "open",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         None,
         locked[0],
     )
@@ -552,3 +633,269 @@ def test_reconcile_task_pull_request_observed_validates_the_payload_before_any_s
         )
     # Nothing reached SQL: the payload is validated at the boundary.
     assert conn.executed == []
+
+
+def test_create_task_pull_request_persists_observed_presentation_and_stamps_mergeability() -> None:
+    # The creation observation is the same authoritative PR response: the
+    # documented presentation facts persist verbatim, and a reported
+    # mergeability reading stamps the head-bound pair to the exact created
+    # head in the same insert (issue #376).
+    row = _pull_request_row(
+        title="Implement issue 375",
+        body="PR description",
+        html_url="https://github.com/example/repo/pull/400",
+        user_id=123,
+        user_login="example",
+        draft=False,
+        provider_created_at=_observed_at(),
+        provider_updated_at=_observed_at(),
+        provider_closed_at=None,
+        base_sha="aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000",
+        mergeable=True,
+        merge_state_status="clean",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    fake_conn = FakeConnection(row)
+    pool = cast(DatabasePool, FakePool(fake_conn))
+
+    record = create_task_pull_request(
+        pool,
+        workspace_id=row[1],
+        task_id=row[2],
+        repository_id=row[3],
+        github_pr_id=row[4],
+        github_pr_number=row[5],
+        head_ref=row[6],
+        base_ref=row[7],
+        head_sha=row[8],
+        title=row[13],
+        body=row[14],
+        html_url=row[15],
+        user_id=row[16],
+        user_login=row[17],
+        draft=row[18],
+        provider_created_at=row[19],
+        provider_updated_at=row[20],
+        provider_closed_at=row[21],
+        base_sha=row[22],
+        mergeable=row[23],
+        merge_state_status=row[24],
+    )
+
+    assert record.title == "Implement issue 375"
+    assert record.body == "PR description"
+    assert record.html_url == "https://github.com/example/repo/pull/400"
+    assert (record.user_id, record.user_login) == (123, "example")
+    assert record.draft is False
+    assert record.provider_created_at == _utc_observed_at()
+    assert record.base_sha == "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+    assert (record.mergeable, record.merge_state_status) == (True, "clean")
+    # The observation pair binds the exact created head, stamped in-SQL.
+    assert record.pr_mergeability_head_sha == row[8]
+    assert record.pr_mergeability_observed_at is not None
+
+    sql, params = fake_conn.executed[0]
+    insert_columns = sql.split("values")[0]
+    assert "pr_mergeability_observed_at, pr_mergeability_head_sha" in insert_columns
+    assert "now()" in sql
+    assert params is not None and params[-1] == row[8]
+
+
+def test_update_observed_mergeability_reading_replaces_the_head_bound_pair() -> None:
+    # A reported mergeability reading — including the documented
+    # not-yet-determined null/`unknown` — replaces the retained pair and
+    # binds it to the exact observed head with a fresh observation instant
+    # (issue #376): no stale result is ever presented as the new head's
+    # observation.
+    row = _pull_request_row(
+        mergeable=True,
+        merge_state_status="clean",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    new_head = "bbbb1111bbbb1111bbbb1111bbbb1111bbbb1111"
+    updated = _pull_request_row(
+        id=row[0],
+        head_sha=new_head,
+        mergeable=None,
+        merge_state_status="unknown",
+        pr_mergeability_observed_at=_observed_at() + timedelta(hours=1),
+        pr_mergeability_head_sha=new_head,
+    )
+    conn = FakeConnection(updated)
+    pool = cast(DatabasePool, FakePool(conn))
+
+    record = update_task_pull_request_observed(
+        pool,
+        task_pull_request_id=row[0],
+        head_ref=row[6],
+        base_ref=row[7],
+        head_sha=new_head,
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+        mergeable=None,
+        merge_state_status="unknown",
+    )
+
+    assert record is not None
+    # The not-determined reading is truthful current observation: the
+    # retained clean result is never presented as the new head's.
+    assert (record.mergeable, record.merge_state_status) == (None, "unknown")
+    assert record.pr_mergeability_head_sha == new_head
+    assert record.pr_mergeability_observed_at == _utc_observed_at() + timedelta(hours=1)
+
+    sql, params = conn.executed[0]
+    assert "pr_mergeability_observed_at = now()" in sql
+    assert "pr_mergeability_head_sha = head_sha" in sql
+    assert params is not None
+    # The mergeability readings travel with the snapshot write.
+    assert params[15] is None and params[16] == "unknown"
+
+
+def test_update_observed_without_mergeability_reading_retains_the_pair() -> None:
+    # A caller reporting no mergeability reading writes the core/presentation
+    # snapshot and leaves the retained head-bound pair untouched — the
+    # last-observed semantics are never fabricated nor erased (issue #376).
+    row = _pull_request_row(
+        mergeable=False,
+        merge_state_status="dirty",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    post_write = _pull_request_row(
+        id=row[0],
+        title="Renamed title",
+        mergeable=False,
+        merge_state_status="dirty",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    conn = FakeConnection(post_write)
+    pool = cast(DatabasePool, FakePool(conn))
+
+    record = update_task_pull_request_observed(
+        pool,
+        task_pull_request_id=row[0],
+        head_ref=row[6],
+        base_ref="main",
+        head_sha=row[8],
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+        title="Renamed title",
+    )
+
+    assert record is not None
+    assert record.title == "Renamed title"
+    assert (record.mergeable, record.merge_state_status) == (False, "dirty")
+    assert record.pr_mergeability_observed_at == _utc_observed_at()
+    assert record.pr_mergeability_head_sha == row[8]
+
+    sql, params = conn.executed[0]
+    assert "mergeable = %s" not in sql
+    assert params is not None and len(params) == 16  # 15 snapshot params + id
+
+
+def test_reconcile_mergeability_reading_binds_to_the_reported_head() -> None:
+    # The serialized reconcile stamps the pair only when the observation
+    # reports a reading, and the identical-observation no-op holds when the
+    # retained pair already binds the exact observed head with the same
+    # readings (issue #376).
+    locked = _pull_request_row(
+        title="Implement issue 375",
+        html_url="https://github.com/example/repo/pull/400",
+        mergeable=True,
+        merge_state_status="clean",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    conn = FakeConnection(responses=[locked])
+
+    result = reconcile_task_pull_request_observed(
+        cast(DatabasePool, FakePool(conn)),
+        task_pull_request_id=locked[0],
+        workspace_id=locked[1],
+        task_id=locked[2],
+        head_ref="openorc/task-42",
+        base_ref="main",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+        title="Implement issue 375",
+        html_url="https://github.com/example/repo/pull/400",
+        mergeable=True,
+        merge_state_status="clean",
+    )
+
+    assert result.outcome is TaskPullRequestReconcileOutcome.UNCHANGED
+    assert len(conn.executed) == 1
+
+
+def test_reconcile_changed_mergeability_reading_is_new_evidence() -> None:
+    # Changed readings on the same head are a real snapshot update — the pair
+    # re-binds with a fresh observation instant (issue #376).
+    locked = _pull_request_row(
+        mergeable=True,
+        merge_state_status="clean",
+        pr_mergeability_observed_at=_observed_at(),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    updated = _pull_request_row(
+        id=locked[0],
+        mergeable=False,
+        merge_state_status="dirty",
+        pr_mergeability_observed_at=_observed_at() + timedelta(minutes=5),
+        pr_mergeability_head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    conn = FakeConnection(responses=[locked, updated])
+
+    result = reconcile_task_pull_request_observed(
+        cast(DatabasePool, FakePool(conn)),
+        task_pull_request_id=locked[0],
+        workspace_id=locked[1],
+        task_id=locked[2],
+        head_ref="openorc/task-42",
+        base_ref="main",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+        state=TaskPullRequestState.OPEN,
+        merged_at=None,
+        mergeable=False,
+        merge_state_status="dirty",
+    )
+
+    assert result.outcome is TaskPullRequestReconcileOutcome.UPDATED
+    assert result.pull_request is not None
+    assert (result.pull_request.mergeable, result.pull_request.merge_state_status) == (
+        False,
+        "dirty",
+    )
+    assert result.pull_request.pr_mergeability_head_sha == locked[8]
+
+
+def test_observed_facts_validate_the_presentation_coherence_before_sql() -> None:
+    # The #376 observed facts mirror the domain's nullable coherence before
+    # any SQL runs (issue #376).
+    fake_conn = FakeConnection()
+    pool = cast(DatabasePool, FakePool(fake_conn))
+    pr_id = uuid.uuid4()
+    head_sha = "0123456789abcdef0123456789abcdef01234567"
+    for kwargs in (
+        {"user_id": 123},  # a partially observed user subset
+        {"user_login": "example"},  # the reverse half
+        {"draft": "yes"},  # a malformed draft flag
+        {"mergeable": "true"},  # a malformed mergeability reading
+        {"title": "   "},  # a blank presentation fact
+        {"merge_state_status": ""},  # a blank merge state
+    ):
+        with pytest.raises(TaskPullRequestDomainError):
+            update_task_pull_request_observed(
+                pool,
+                task_pull_request_id=pr_id,
+                head_ref="h",
+                base_ref="main",
+                head_sha=head_sha,
+                state=TaskPullRequestState.OPEN,
+                merged_at=None,
+                **kwargs,  # type: ignore[arg-type]
+            )
+    assert fake_conn.executed == []

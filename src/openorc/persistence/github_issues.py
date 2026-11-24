@@ -57,6 +57,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from openorc.domain.github_issues import (
+    GitHubIssueDomainError,
     GitHubIssueIdentity,
     GitHubIssueObservedFacts,
     GitHubIssueProjection,
@@ -81,6 +82,7 @@ __all__ = [
     "find_github_issue",
     "find_github_issue_by_id",
     "find_github_issue_by_number",
+    "find_github_issue_projections_by_identity",
     "list_open_repository_github_issues",
     "list_repository_github_issues",
     "list_repository_github_issues_page",
@@ -582,6 +584,35 @@ def find_github_issue_by_id(
             (issue_id, workspace_id, repository_id),
         ).fetchone()
     return None if row is None else _github_issue_from_row(row)
+
+
+def find_github_issue_projections_by_identity(
+    pool: DatabasePool, *, repository_id: UUID, github_issue_ids: Sequence[int]
+) -> dict[int, GitHubIssueProjection]:
+    """Return the projections of the addressed stable issue identities, batched (#376).
+
+    The authorized Task list's GitHub-issue summary lookup: one query over
+    the page's stable issue identities, scoped to the exact Repository so a
+    foreign identity is indistinguishable from an unprojected one. An absent
+    id is the honest not-yet-projected fact the wire presents as nulls.
+    """
+    distinct_ids = list(dict.fromkeys(github_issue_ids))
+    if not distinct_ids:
+        return {}
+    for issue_id in distinct_ids:
+        if isinstance(issue_id, bool) or not isinstance(issue_id, int) or issue_id <= 0:
+            raise GitHubIssueDomainError("github_issue_ids must all be positive integers")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_GITHUB_ISSUE_COLUMNS} from openorc.github_issues "
+            "where repository_id = %s and github_issue_id = any(%s) "
+            "order by github_issue_id",
+            (repository_id, distinct_ids),
+        ).fetchall()
+    return {
+        projection.github_issue_id: projection
+        for projection in map(_github_issue_from_row, rows)
+    }
 
 
 def list_repository_github_issues_page(

@@ -48,6 +48,7 @@ from openorc.persistence.time import normalize_utc
 from openorc.persistence.transactions import transaction
 
 __all__ = [
+    "TASK_ARCHIVAL_FILTERS",
     "archive_task",
     "acknowledge_source_requirements_fingerprint",
     "bind_canonical_branch",
@@ -63,11 +64,15 @@ __all__ = [
     "get_task_planning_bootstrap_claim",
     "get_task_planning_bootstrap_evidence",
     "list_issue_attempts",
+    "list_issue_tasks_page",
     "list_current_repository_tasks",
     "list_queued_tasks",
+    "list_repository_tasks_page",
     "list_task_queue_recovery_workspaces",
     "list_unclaimed_planning_bootstrap_tasks",
     "list_workspace_tasks",
+    "count_workspace_queued_tasks_before",
+    "list_workspace_tasks_page",
     "lock_workspace_task_arbitration",
     "record_planning_bootstrap_stage",
     "set_current_plan_revision",
@@ -455,6 +460,35 @@ def list_queued_tasks(
     return [_task_from_row(row) for row in rows]
 
 
+def count_workspace_queued_tasks_before(
+    pool: DatabasePool, *, workspace_id: UUID, queued_at: datetime, task_id: UUID
+) -> int:
+    """Count the Workspace's queued Tasks ahead of one queue entry (#376).
+
+    The authorized Task read surface's FIFO order context: derived from the
+    durable ``(queued_at, id)`` key at read time — no new position storage
+    and no guaranteed execution rank, exactly the ordering semantics the
+    queue's own keyset paging uses. The addressed entry counts itself out
+    (strictly-before comparison), so the returned number is its zero-based
+    position among the Workspace's current queued Tasks.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    if queued_at.tzinfo is None:
+        raise TaskDomainError("queued_at must be timezone-aware")
+    if not isinstance(task_id, UUID):
+        raise TaskDomainError("task_id must be a UUID")
+    with transaction(pool) as conn:
+        row = conn.execute(
+            "select count(*) from openorc.tasks "
+            "where workspace_id = %s and status = 'queued' and archived_at is null "
+            "and (queued_at, id) < (%s, %s)",
+            (workspace_id, normalize_utc(queued_at), task_id),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
 def list_task_queue_recovery_workspaces(pool: DatabasePool, *, limit: int) -> list[UUID]:
     """Return a bounded set of Workspaces holding current queued Tasks.
 
@@ -476,6 +510,188 @@ def list_task_queue_recovery_workspaces(pool: DatabasePool, *, limit: int) -> li
             (limit,),
         ).fetchall()
     return [row[0] for row in rows]
+
+
+# The #376 authorized Task-read archival filter vocabulary: current
+# (non-archived) attempts, archived attempts only, or all attempts. The
+# Workspace/Repository lists default to current; the issue-attempts list
+# includes archived by default (each Task is one attempt).
+TASK_ARCHIVAL_FILTERS: tuple[str, ...] = ("current", "archived", "all")
+
+
+def _archival_predicate(archival: str) -> str:
+    """Return the SQL archival predicate for one validated archival filter."""
+    if archival == "current":
+        return " and archived_at is null"
+    if archival == "archived":
+        return " and archived_at is not null"
+    return ""
+
+
+def _validate_task_page_filters(
+    statuses: Sequence[TaskStatus], archival: str
+) -> tuple[str, str]:
+    """Validate the #376 page filters and return their SQL fragments."""
+    if not statuses:
+        raise TaskDomainError("a Task page query requires at least one canonical status")
+    for status in statuses:
+        if not isinstance(status, TaskStatus):
+            raise TaskDomainError("Task page status filters must be TaskStatus values")
+    if archival not in TASK_ARCHIVAL_FILTERS:
+        raise TaskDomainError(
+            "Task page archival filters must be one of current, archived, all"
+        )
+    status_list = ", ".join(f"'{status.value}'" for status in statuses)
+    return f" and status in ({status_list})", _archival_predicate(archival)
+
+
+def _task_page_rows(
+    conn: Any,
+    *,
+    where: str,
+    params: list[Any],
+    after_created_at: datetime | None,
+    after_task_id: UUID | None,
+    limit: int,
+) -> list[Task]:
+    """Run one deterministic keyset page query for the #376 Task reads.
+
+    Ordered by the durable ``(created_at, id)`` key; each page continues
+    strictly after the caller's last examined key, so admitted/archived rows
+    leaving the filter never shift a page boundary. The limit+1 probe is the
+    caller's has-more evidence (the G2a list convention).
+    """
+    predicate = where
+    if after_created_at is not None:
+        if not isinstance(after_task_id, UUID):
+            raise TaskDomainError("the Task page cursor must carry both key parts")
+        if after_created_at.tzinfo is None:
+            raise TaskDomainError("the Task page cursor timestamp must be timezone-aware")
+        predicate += " and (created_at, id) > (%s, %s)"
+        params.extend([normalize_utc(after_created_at), after_task_id])
+    params.append(limit)
+    rows = conn.execute(
+        f"select {_TASK_COLUMNS} from openorc.tasks "
+        f"where {predicate} order by created_at, id limit %s",
+        tuple(params),
+    ).fetchall()
+    return [_task_from_row(row) for row in rows]
+
+
+def list_workspace_tasks_page(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    statuses: Sequence[TaskStatus],
+    archival: str,
+    after_created_at: datetime | None = None,
+    after_task_id: UUID | None = None,
+    limit: int,
+) -> list[Task]:
+    """Return one bounded page of the Workspace's Tasks for the #376 list.
+
+    The authorized Workspace Task list's keyset page (issue #376): filtered
+    by canonical statuses and the archival mode, deterministically ordered
+    by ``(created_at, id)``, advanced by the opaque cursor. Database-only;
+    never a scope check (the service layer authorizes).
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    status_fragment, archival_fragment = _validate_task_page_filters(statuses, archival)
+    with transaction(pool) as conn:
+        return _task_page_rows(
+            conn,
+            where=f"workspace_id = %s{status_fragment}{archival_fragment}",
+            params=[workspace_id],
+            after_created_at=after_created_at,
+            after_task_id=after_task_id,
+            limit=limit,
+        )
+
+
+def list_repository_tasks_page(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    statuses: Sequence[TaskStatus],
+    archival: str,
+    after_created_at: datetime | None = None,
+    after_task_id: UUID | None = None,
+    limit: int,
+) -> list[Task]:
+    """Return one bounded page of the Workspace Repository's Tasks (#376).
+
+    The authorized Repository Task list's keyset page (issue #376), scoped to
+    the exact Workspace Repository pairing.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    if not isinstance(repository_id, UUID):
+        raise TaskDomainError("repository_id must be a UUID")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    status_fragment, archival_fragment = _validate_task_page_filters(statuses, archival)
+    with transaction(pool) as conn:
+        return _task_page_rows(
+            conn,
+            where=(
+                "workspace_id = %s and repository_id = %s"
+                f"{status_fragment}{archival_fragment}"
+            ),
+            params=[workspace_id, repository_id],
+            after_created_at=after_created_at,
+            after_task_id=after_task_id,
+            limit=limit,
+        )
+
+
+def list_issue_tasks_page(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+    github_issue_id: int,
+    statuses: Sequence[TaskStatus],
+    archival: str,
+    after_created_at: datetime | None = None,
+    after_task_id: UUID | None = None,
+    limit: int,
+) -> list[Task]:
+    """Return one bounded page of one issue's attempts (#376).
+
+    Every Task attempt for the exact stable issue identity — including
+    archived attempts by default per the caller's archival filter —
+    deterministically ordered by ``(created_at, id)``. Each Task is one
+    attempt; there is no separate Attempt entity.
+    """
+    if not isinstance(workspace_id, UUID):
+        raise TaskDomainError("workspace_id must be a UUID")
+    if not isinstance(repository_id, UUID):
+        raise TaskDomainError("repository_id must be a UUID")
+    if (
+        isinstance(github_issue_id, bool)
+        or not isinstance(github_issue_id, int)
+        or github_issue_id <= 0
+    ):
+        raise TaskDomainError("github_issue_id must be a positive integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise TaskDomainError("limit must be a positive integer")
+    status_fragment, archival_fragment = _validate_task_page_filters(statuses, archival)
+    with transaction(pool) as conn:
+        return _task_page_rows(
+            conn,
+            where=(
+                "workspace_id = %s and repository_id = %s and github_issue_id = %s"
+                f"{status_fragment}{archival_fragment}"
+            ),
+            params=[workspace_id, repository_id, github_issue_id],
+            after_created_at=after_created_at,
+            after_task_id=after_task_id,
+            limit=limit,
+        )
 
 
 def list_unclaimed_planning_bootstrap_tasks(pool: DatabasePool, *, limit: int) -> list[Task]:

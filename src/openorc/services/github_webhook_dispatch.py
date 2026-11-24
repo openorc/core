@@ -773,12 +773,32 @@ def _dispatch_checks(
     *,
     route: GitHubWebhookResolvedRoute,
 ) -> GitHubWebhookDispatchRouteStatus:
-    """Route a check/status notification into the authoritative B7 projection."""
+    """Route a check/status notification into the authoritative B7 projection.
+
+    Issue #376: after the exact-head checks/status projection succeeds for a
+    canonical record, the same notification also re-observes the canonical
+    PR through the existing reconciliation, so the check-dependent
+    mergeability observation (the documented ``mergeable``/``mergeable_state``
+    pair) updates for the exact head the projection read. The projection is
+    inherently current — it reads the durable reconciled head — so the
+    head-bound observation pair is stamped for the record's current head and
+    a check notification about an older head still re-observes current
+    state. The reconciliation stays strictly update-only and writes nothing
+    on an uncertain/failed read.
+    """
     try:
         for record in list_task_pull_requests_for_repository(
             pool, workspace_id=route.workspace_id, repository_id=route.repository_id
         ):
             commit_checks_projection.project_commit_checks(
+                pool,
+                github,
+                workspace_id=route.workspace_id,
+                task_id=record.task_id,
+            )
+            # The #376 mergeability update path: the same check/status
+            # notification re-observes the canonical PR (issue #376).
+            task_pull_request_reconciliation.reconcile_task_pull_request(
                 pool,
                 github,
                 workspace_id=route.workspace_id,

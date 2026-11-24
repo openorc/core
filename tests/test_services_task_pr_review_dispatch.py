@@ -256,6 +256,22 @@ def _pr_row(*, head_sha: str = _HEAD_SHA, task_id: Any = _TASK_ID) -> tuple[Any,
         None,
         _OBSERVED,
         _OBSERVED,
+        # The #376-extended row shape: honest legacy-NULL presentation and
+        # mergeability columns (the row shape the #376 migration carries).
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 

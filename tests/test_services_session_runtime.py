@@ -283,7 +283,9 @@ def _session_row(
     )
 
 
-_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 5
+# Phase 1 (five reads) plus the #376 configured-pair capture read: one
+# more short read-only pool transaction before the external call.
+_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 6
 _FINALIZE_LIFECYCLE = [
     "pool_enter",
     "tx_enter",
@@ -307,17 +309,25 @@ def _establish_results(
     binding_row: tuple[Any, ...],
     connection_row: tuple[Any, ...],
     guidance: str = "",
+    route_row: tuple[Any, ...] | None = None,
     finalize_results: list[_CannedResult] | None = None,
 ) -> ScriptedConnection:
     """Canned establish reads: the Phase-1 validation sequence (no role-route
     read since #189), then the optional finalize-phase sequence (workspace,
-    barrier, initialize write)."""
+    barrier, initialize write).
+
+    The #376 configured provider/model capture reads the durable role-route
+    once after the connection read — a capture, never a gating dependency:
+    the route is recorded exactly as the construction context resolves it,
+    and a changed route still never invalidates the admitted binding.
+    """
     results: list[_CannedResult] = [
         _ws_row(workspace_id, owner_profile_id, guidance=guidance),
         _BARRIER_ROW,
         _task_row(workspace_id),
         binding_row,
         connection_row,
+        route_row,  # the #376 configured-pair capture read (None = unconfigured route)
     ]
     if finalize_results is not None:
         results.extend(finalize_results)
@@ -654,8 +664,13 @@ def test_role_route_change_does_not_block_establishment_of_the_admitted_binding(
         sql for sql, _ in conn.executed if "update openorc.task_agent_sessions" in sql
     ]
     assert len(finalize_updates) == 1
-    # The repointed route was never read and the binding never re-pointed.
-    assert not any("workflow_role_bindings" in sql for sql, _ in conn.executed)
+    # The repointed route never gated the establishment and the binding was
+    # never re-pointed: the single #376 capture read records what the route
+    # reported without ever validating against it (a changed route is future
+    # admission state, issue #189).
+    route_reads = [sql for sql, _ in conn.executed if "workflow_role_bindings" in sql]
+    assert len(route_reads) == 1
+    assert "for update" not in route_reads[0]
 
 
 def test_role_route_change_leaves_already_ready_establishment_idempotent() -> None:
@@ -1972,17 +1987,31 @@ def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot
         lifecycle_status="ready",
         external_session_id="cline-session-1",
         initialized_at=_OBSERVED,
-        snapshot={"adapter": "cline", "configuration": selected_configuration},
+        snapshot={
+            "adapter": "cline",
+            "configuration": selected_configuration,
+            "configured_provider": "configured-provider",
+            "configured_model": "configured-model",
+        },
     )
     conn = ScriptedConnection(
         [
-            # Phase 1: service reads — workspace, barrier, task, binding, and
-            # the admitted Connection carrying the EDITED safe_config.
+            # Phase 1: service reads — workspace, barrier, task, binding, the
+            # admitted Connection carrying the EDITED safe_config, and the
+            # #376 configured-pair capture read (the same durable route the
+            # resolver reads during the handshake).
             _ws_row(workspace_id, owner_profile_id, guidance=guidance),
             _BARRIER_ROW,
             _task_row(workspace_id),
             _session_row(workspace_id, task_id, "producer", connection_id),
             _connection_row(workspace_id, connection_id, safe_config=durable_safe_config),
+            _configured_route_row(
+                workspace_id,
+                "producer",
+                connection_id,
+                configured_provider="configured-provider",
+                configured_model="configured-model",
+            ),
             # Phase 3: the durable resolver's fresh reads — the binding, the
             # admitted Connection (again carrying the EDITED safe_config,
             # which must not be substituted for the selection), and the
@@ -2039,6 +2068,8 @@ def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot
     assert update_params[1].obj == {
         "adapter": "cline",
         "configuration": selected_configuration,
+        "configured_provider": "configured-provider",
+        "configured_model": "configured-model",
     }
     assert update_params[1].obj["configuration"]["repository_base"] == selected_base
 
@@ -2211,6 +2242,7 @@ def _dispatch_results(
         if connection_row is not None
         else _connection_row(workspace_id, connection_id),
         outstanding_receipt,  # the replay guard's outstanding-receipt read
+        None,  # the #376 configured-pair capture read (unconfigured route)
     ]
     if receipt_row is not None:
         results.append(receipt_row)  # the provisional receipt insert

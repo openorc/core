@@ -163,6 +163,18 @@ def _pr_payload(
     merged: bool = False,
     merged_at: str | None = None,
     url: str | None = None,
+    # The #376 documented presentation members: the same facts the documented
+    # GET/create PR response always carries (with GitHub's own nullability).
+    title: str = "Implement issue 375",
+    body: str | None = "PR description",
+    html_url: str = "https://github.com/octocat/hello-world/pull/77",
+    user: Mapping[str, Any] | None = {"id": 501, "login": "octocat"},
+    draft: bool = False,
+    created_at: str = "2026-11-24T01:30:00Z",
+    updated_at: str = "2026-11-24T01:31:00Z",
+    closed_at: str | None = None,
+    mergeable: bool | None = True,
+    mergeable_state: str | None = "clean",
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": pr_id,
@@ -173,6 +185,16 @@ def _pr_payload(
         "state": state,
         "merged": merged,
         "merged_at": merged_at,
+        "title": title,
+        "body": body,
+        "html_url": html_url,
+        "user": user,
+        "draft": draft,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "closed_at": closed_at,
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
     }
     return payload
 

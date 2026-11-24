@@ -787,6 +787,22 @@ def test_published_subjects_reload_from_durable_state_without_a_wire_dto() -> No
             None,
             _OBSERVED,
             _OBSERVED,
+            # The #376-extended row shape: honest legacy-NULL presentation and
+            # mergeability columns.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
     )
 

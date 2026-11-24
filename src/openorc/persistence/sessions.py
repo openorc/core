@@ -91,6 +91,7 @@ __all__ = [
     "mark_task_agent_session_ended",
     "mark_task_agent_session_lost",
     "sum_task_retained_session_costs",
+    "sum_task_retained_session_costs_for_tasks",
 ]
 
 _SESSION_COLUMNS = (
@@ -613,3 +614,38 @@ def sum_task_retained_session_costs(
         known_total_usd=row[0],
         has_unobserved_sessions=bool(row[1]),
     )
+
+
+def sum_task_retained_session_costs_for_tasks(
+    pool: DatabasePool, *, task_ids: Sequence[UUID]
+) -> dict[UUID, TaskRetainedSessionCosts]:
+    """Aggregate the retained known session costs per Task, batched (#376).
+
+    The authorized Task list's derived cost fact: one grouped aggregate
+    statement over the page's Task identities — the same role-agnostic
+    ownership-only semantics as :func:`sum_task_retained_session_costs`,
+    never per-Task role branches. A Task with no session bindings (or none
+    reporting) simply has no aggregate row; the service composes the
+    unknown-not-zero and partial-completeness semantics.
+    """
+    distinct_ids = list(dict.fromkeys(task_ids))
+    if not distinct_ids:
+        return {}
+    for task_id in distinct_ids:
+        if not isinstance(task_id, UUID):
+            raise TaskAgentSessionDomainError("task_ids must all be UUIDs")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            "select task_id, sum(retained_cost_usd), "
+            "coalesce(bool_or(retained_cost_usd is null), false) "
+            "from openorc.task_agent_sessions "
+            "where task_id = any(%s) group by task_id",
+            (distinct_ids,),
+        ).fetchall()
+    return {
+        row[0]: TaskRetainedSessionCosts(
+            known_total_usd=row[1],
+            has_unobserved_sessions=bool(row[2]),
+        )
+        for row in rows
+    }

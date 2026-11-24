@@ -96,7 +96,7 @@ from openorc.domain.sessions import (
 )
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.connections import get_connection
+from openorc.persistence.connections import get_connection, get_role_binding
 from openorc.persistence.detached_turns import (
     get_outstanding_task_detached_turn_receipt,
     refuse_task_detached_turn_receipt,
@@ -313,6 +313,9 @@ def _require_effective_configuration(
 def _assemble_effective_config_snapshot(
     adapter_type: AdapterType,
     effective_configuration: Mapping[str, object],
+    *,
+    configured_provider: str | None = None,
+    configured_model: str | None = None,
 ) -> Mapping[str, object]:
     """Deliberately assemble the non-secret effective configuration snapshot.
 
@@ -327,14 +330,28 @@ def _assemble_effective_config_snapshot(
     snapshot: never raw
     credentials/tokens/auth secrets, initialization Markdown, rendered
     schemas, Workspace guidance, control/prompt bodies, or transcripts.
+
+    Issue #376 adds the Task session's configured provider/model pair — the
+    composition-selected workflow-role route the construction context was
+    built with, captured once at initialization so the authorized read
+    surface presents the historical configured facts and never silently
+    substitutes the current mutable Workspace role binding. The pair is
+    complete-or-absent together (the binding's own coherence rule); the
+    caller supplies exactly what the durable route reported.
     """
-    try:
-        return canonical_effective_config_snapshot(
-            {
-                "adapter": adapter_type.value,
-                "configuration": dict(effective_configuration),
-            }
+    if (configured_provider is None) != (configured_model is None):
+        raise ConflictError(
+            "the configured provider/model pair is complete or absent together"
         )
+    try:
+        assembled: dict[str, object] = {
+            "adapter": adapter_type.value,
+            "configuration": dict(effective_configuration),
+        }
+        if configured_provider is not None and configured_model is not None:
+            assembled["configured_provider"] = configured_provider
+            assembled["configured_model"] = configured_model
+        return canonical_effective_config_snapshot(assembled)
     except TaskAgentSessionDomainError as error:
         raise ConflictError(
             "the effective runtime/session configuration snapshot could not be canonicalized"
@@ -552,7 +569,16 @@ def establish_task_agent_session(
         # canonical #66 initialization is composed through the protocol
         # boundary and the non-secret snapshot is assembled deliberately. ---
         initialization = compose_initialization(role.value, workspace.guidance)
-        snapshot = _assemble_effective_config_snapshot(connection.adapter, effective_configuration)
+        # The #376 configured provider/model capture: the composition-selected
+        # workflow-role route read once at establishment, exactly what the
+        # construction context resolves — never re-read at projection time.
+        route = get_role_binding(pool, workspace_id=workspace_id, role=role)
+        snapshot = _assemble_effective_config_snapshot(
+            connection.adapter,
+            effective_configuration,
+            configured_provider=None if route is None else route.configured_provider,
+            configured_model=None if route is None else route.configured_model,
+        )
         request = AgentSessionCreationRequest(
             workspace_id=workspace_id,
             task_id=task_id,
@@ -806,7 +832,16 @@ def dispatch_task_agent_session_establishment(
         # canonical #66 initialization is composed through the protocol
         # boundary and the non-secret snapshot is assembled deliberately. ---
         initialization = compose_initialization(role.value, workspace.guidance)
-        snapshot = _assemble_effective_config_snapshot(connection.adapter, effective_configuration)
+        # The #376 configured provider/model capture: the composition-selected
+        # workflow-role route read once at establishment, exactly what the
+        # construction context resolves — never re-read at projection time.
+        route = get_role_binding(pool, workspace_id=workspace_id, role=role)
+        snapshot = _assemble_effective_config_snapshot(
+            connection.adapter,
+            effective_configuration,
+            configured_provider=None if route is None else route.configured_provider,
+            configured_model=None if route is None else route.configured_model,
+        )
         request = AgentSessionCreationRequest(
             workspace_id=workspace_id,
             task_id=task_id,

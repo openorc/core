@@ -308,6 +308,21 @@ def _apply_reconciled_state(
             head_sha=observation.head_sha,
             state=observed_state,
             merged_at=observation.merged_at,
+            # The #376 presentation facts ride the same authoritative
+            # observation: the richer snapshot is written whole, and a
+            # reported mergeability reading binds to the exact observed head.
+            title=observation.title,
+            body=observation.body,
+            html_url=observation.html_url,
+            user_id=observation.user_id,
+            user_login=observation.user_login,
+            draft=observation.draft,
+            provider_created_at=observation.provider_created_at,
+            provider_updated_at=observation.provider_updated_at,
+            provider_closed_at=observation.provider_closed_at,
+            base_sha=observation.base_sha,
+            mergeable=observation.mergeable,
+            merge_state_status=observation.merge_state_status,
         )
         if reconcile_result.outcome is TaskPullRequestReconcileOutcome.MISSING:
             # The canonical record (or its scope) disappeared durably between

@@ -147,6 +147,7 @@ from openorc.services.workspace_authorization import require_workspace_task
 
 __all__ = [
     "CostLimitBlockOutcomeKind",
+    "abort_durably_offered",
     "OwnerAuthorizedCostLimitBlock",
     "TaskAbortOutcome",
     "TaskAbortOutcomeKind",
@@ -378,6 +379,37 @@ def _has_admitted_in_flight_activity(
             and execution.status in _OPEN_EXECUTION_STATUSES
             for execution in executions
         )
+    loops = review_records.list_task_review_loops(
+        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
+    )
+    for loop in loops:
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if any(iteration.outcome is None for iteration in iterations):
+            return True
+    return False
+
+
+def abort_durably_offered(transaction_pool: DatabasePool, *, task: Task) -> bool:
+    """Whether the durable facts positively support offering ``abort`` (#376).
+
+    The authorized read surface's backend-generated action projection reuses
+    the authoritative in-flight eligibility fact — the demonstrated durable
+    activity the Owner Abort control interrupts, evaluated role-agnostically:
+    an open Execution anchored to any established Producer binding, or an
+    OPEN ReviewLoop carrying an unfinalized ReviewIteration. Never the
+    primary Task status alone, and never an SDK status reading. Evaluated
+    inside the caller's own transaction; never persisted; never an external
+    call; never a second policy engine. The command still revalidates the
+    exact admitted targets and currentness freshly at execution — offering
+    is neither permission nor a promise.
+    """
+    executions = execution_records.list_task_executions(transaction_pool, task_id=task.id)
+    if any(
+        execution.status in _OPEN_EXECUTION_STATUSES for execution in executions
+    ):
+        return True
     loops = review_records.list_task_review_loops(
         transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
     )

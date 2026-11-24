@@ -360,13 +360,21 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
             (_SECRET,),
-            # Fresh establishment Phase 1 over the LATER durable rows:
+            # Fresh establishment Phase 1 over the LATER durable rows, plus
+            # the #376 configured-pair capture read (the same durable route
+            # the resolver reads inside the handshake):
             _ws_row(workspace_id, owner_profile_id),
             _BARRIER_ROW,
             _task_row(workspace_id),
             _binding_row(workspace_id, task_id, connection_id),
             _connection_row(
                 workspace_id, connection_id, safe_config=later, auth_reference=reference
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
             ),
             # The resolver's fresh reads inside the readiness handshake:
             _binding_row(workspace_id, task_id, connection_id),
@@ -444,7 +452,14 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
     ]
     (update_params,) = updates
     assert update_params is not None
-    assert update_params[1].obj == {"adapter": "cline", "configuration": selected}
+    # The #376 configured pair is captured for this Task session exactly as
+    # the durable route reported it at establishment.
+    assert update_params[1].obj == {
+        "adapter": "cline",
+        "configuration": selected,
+        "configured_provider": "configured-provider",
+        "configured_model": "configured-model",
+    }
 
 
 def test_bound_producer_attachment_keeps_the_snapshot_base_and_exact_identity() -> None:
