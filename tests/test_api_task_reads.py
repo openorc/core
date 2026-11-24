@@ -309,9 +309,11 @@ def _detail(task: Any, issue: Any, gate: Any) -> TaskDetail:
         review_loops=(),
         pending_runtime_interactions=(),
         pending_runtime_requests=(),
+        pending_runtime_requests_total=0,
         outstanding_receipts=(),
         outstanding_receipts_total=0,
         outstanding_intents=(),
+        outstanding_intents_total=0,
     )
 
 

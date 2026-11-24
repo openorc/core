@@ -146,8 +146,11 @@ class TaskObservationRecord:
     review_loops: tuple[ReviewLoop, ...]
     review_iterations: tuple[ReviewIteration, ...]
     runtime_requests: tuple[RuntimeRequest, ...]
+    pending_runtime_requests_total: int
     interrupt_intents: tuple[TaskInterruptIntent, ...]
+    outstanding_interrupt_intents_total: int
     resume_intents: tuple[TaskResumeIntent, ...]
+    outstanding_resume_intents_total: int
     pull_request_close_intent: TaskPullRequestCloseIntent | None
     receipts: tuple[TaskDetachedTurnReceipt, ...]
     outstanding_receipts_total: int
@@ -363,6 +366,10 @@ def load_task_observation(
                 ).fetchall()
             )
         ]
+        pending_runtime_requests_total_row = conn.execute(
+            "select count(*) from openorc.runtime_requests where task_id = %s and status = any(%s)",
+            (task_id, _PENDING_RUNTIME_REQUEST_STATUS_VALUES),
+        ).fetchone()
         interrupt_intents = [
             _interrupt_intent_from_row(row)
             for row in reversed(
@@ -375,6 +382,11 @@ def load_task_observation(
                 ).fetchall()
             )
         ]
+        outstanding_interrupt_intents_total_row = conn.execute(
+            "select count(*) from openorc.task_interrupt_intents "
+            "where task_id = %s and status = any(%s)",
+            (task_id, _OUTSTANDING_INTERRUPT_STATUS_VALUES),
+        ).fetchone()
         resume_intents = [
             _resume_intent_from_row(row)
             for row in reversed(
@@ -386,6 +398,11 @@ def load_task_observation(
                 ).fetchall()
             )
         ]
+        outstanding_resume_intents_total_row = conn.execute(
+            "select count(*) from openorc.task_resume_intents "
+            "where task_id = %s and status = any(%s)",
+            (task_id, _OUTSTANDING_RESUME_STATUS_VALUES),
+        ).fetchone()
         pull_request_close_intent = _optional(
             conn.execute(
                 f"select {_TASK_PULL_REQUEST_CLOSE_INTENT_COLUMNS} "
@@ -463,6 +480,9 @@ def load_task_observation(
         ).fetchone()
     assert cost_row is not None and executions_total_row is not None
     assert outstanding_receipts_total_row is not None
+    assert pending_runtime_requests_total_row is not None
+    assert outstanding_interrupt_intents_total_row is not None
+    assert outstanding_resume_intents_total_row is not None
     return TaskObservationRecord(
         task=task,
         current_gate=current_gate,
@@ -474,8 +494,11 @@ def load_task_observation(
         review_loops=tuple(review_loops),
         review_iterations=tuple(review_iterations),
         runtime_requests=tuple(runtime_requests),
+        pending_runtime_requests_total=int(pending_runtime_requests_total_row[0]),
         interrupt_intents=tuple(interrupt_intents),
+        outstanding_interrupt_intents_total=int(outstanding_interrupt_intents_total_row[0]),
         resume_intents=tuple(resume_intents),
+        outstanding_resume_intents_total=int(outstanding_resume_intents_total_row[0]),
         pull_request_close_intent=pull_request_close_intent,
         receipts=tuple(_receipt_from_row(row) for row in receipts_rows),
         outstanding_receipts_total=int(outstanding_receipts_total_row[0]),

@@ -606,6 +606,7 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
                 )
                 for request in detail.pending_runtime_requests
             ],
+            pending_runtime_requests_total=detail.pending_runtime_requests_total,
             outstanding_receipts=[
                 OpenOrcTaskOutstandingReceiptRead(
                     id=receipt.id,
@@ -633,6 +634,7 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
                 )
                 for intent in detail.outstanding_intents
             ],
+            outstanding_intents_total=detail.outstanding_intents_total,
             actions=list(summary.actions),
             queued_at=task.queued_at,
             queue_position=summary.queue_position,

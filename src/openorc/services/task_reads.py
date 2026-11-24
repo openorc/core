@@ -111,8 +111,8 @@ from openorc.persistence.tasks import (
     list_repository_tasks_page,
     list_workspace_tasks_page,
 )
-from openorc.services.errors import ApplicationError, InvalidCommandError, NotFoundError
-from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.errors import InvalidCommandError, NotFoundError
+from openorc.services.profile_lifecycle_guard import account_operationally_offered
 from openorc.services.task_abort import abort_durably_offered
 from openorc.services.task_cancellation import cancellation_durably_offered
 from openorc.services.task_owner_resume import blocked_continuation_durably_offered
@@ -373,6 +373,19 @@ class TaskOutstandingIntentFacts:
 
 @dataclass(frozen=True, slots=True)
 class TaskDetail:
+    """The composed Task detail (issue #376).
+
+    Every bounded collection carries its companion durable total of exactly
+    the same relevant population. ``pending_runtime_interactions`` is the one
+    collection whose population is invariant-bounded instead: at most one
+    bootstrap interaction (the single planning-bootstrap evidence), at most
+    one unsettled dispatch per session binding (the one-shot claim discipline
+    behind the single-outstanding-run invariant, over the v1 two session
+    bindings), at most one current-subject review attempt, and at most one
+    RUNNING execution in the eligible phase — a bounded projection of current
+    work, never a history-sized collection, so no companion total applies.
+    """
+
     """The ownership-separated Task detail (issue #376).
 
     Extends the shared summary with the current typed records: the block's
@@ -391,9 +404,11 @@ class TaskDetail:
     review_loops: tuple[TaskReviewLoopFacts, ...]
     pending_runtime_interactions: tuple[TaskPendingInteractionFacts, ...]
     pending_runtime_requests: tuple[RuntimeRequest, ...]
+    pending_runtime_requests_total: int
     outstanding_receipts: tuple[TaskDetachedTurnReceipt, ...]
     outstanding_receipts_total: int
     outstanding_intents: tuple[TaskOutstandingIntentFacts, ...]
+    outstanding_intents_total: int
 
 
 def encode_task_page_cursor(last_created_at: datetime, last_task_id: UUID) -> str:
@@ -458,12 +473,15 @@ def _cost_facts(task: Task, observation: TaskObservationRecord) -> TaskCostFacts
 
 
 def _account_operational(tx_view: DatabasePool, *, profile_id: UUID) -> bool:
-    """Whether the authenticated Owner's account-operational barrier holds."""
-    try:
-        require_account_operational(tx_view, profile_id=profile_id)
-    except ApplicationError:
-        return False
-    return True
+    """Whether the authenticated Owner's account-operational barrier holds.
+
+    The read-side non-locking predicate: the same durable deletion-state
+    semantics as the guarded mutation barrier, without the ``FOR KEY SHARE``
+    clause PostgreSQL prohibits inside the composed read-only snapshot
+    transaction (#376). A missing Profile and any existing deletion attempt
+    are simply not offered; the commands revalidate under the locking barrier.
+    """
+    return account_operationally_offered(tx_view, profile_id=profile_id)
 
 
 def _discuss_offered(
@@ -721,12 +739,15 @@ def _execution_facts(execution: Execution) -> TaskExecutionFacts:
 
 def _outstanding_intents(
     observation: TaskObservationRecord,
-) -> tuple[TaskOutstandingIntentFacts, ...]:
-    """Compose the outstanding intent evidence (#376).
+) -> tuple[tuple[TaskOutstandingIntentFacts, ...], int]:
+    """Compose the outstanding intent evidence and its durable total (#376).
 
     The unresolved interrupt/resume/PR-close authorizations and any relevant
     cleanup obligation, exposed as separate typed records — never raw rows,
-    never raw outcome payloads.
+    never raw outcome payloads. The companion total counts exactly the same
+    outstanding population durably (the bounded loaded windows plus the
+    single-record close obligation, unique per Task), so a client always
+    distinguishes a complete collection from a transparently bounded one.
     """
     facts: list[TaskOutstandingIntentFacts] = []
     for intent in observation.interrupt_intents:
@@ -762,7 +783,21 @@ def _outstanding_intents(
                 updated_at=close_intent.updated_at,
             )
         )
-    return tuple(facts)
+    # The interrupt/resume facts come from the bounded loaded windows; their
+    # durable totals come from the loader's own counts of the same status
+    # populations. The close obligation is a single record per Task (the
+    # unique(task_id) intent), presented exactly when it is pending.
+    return tuple(facts), (
+        observation.outstanding_interrupt_intents_total
+        + observation.outstanding_resume_intents_total
+        + (
+            1
+            if observation.pull_request_close_intent is not None
+            and observation.pull_request_close_intent.status
+            is TaskPullRequestCloseIntentStatus.PENDING
+            else 0
+        )
+    )
 
 
 def _compose_summary(
@@ -1036,8 +1071,11 @@ def _compose_list_item(
         review_loops=(),
         review_iterations=(),
         runtime_requests=(),
+        pending_runtime_requests_total=0,
         interrupt_intents=(),
+        outstanding_interrupt_intents_total=0,
         resume_intents=(),
+        outstanding_resume_intents_total=0,
         pull_request_close_intent=None,
         receipts=(),
         outstanding_receipts_total=0,
@@ -1125,6 +1163,7 @@ def get_task_for_owner(
                 for loop in observation.review_loops
                 if loop.status is ReviewLoopStatus.OPEN
             )
+            intent_facts, intents_total = _outstanding_intents(observation)
             detail = TaskDetail(
                 summary=summary,
                 current_plan=current_plan,
@@ -1153,8 +1192,10 @@ def get_task_for_owner(
                     for request in observation.runtime_requests
                     if request.status is RuntimeRequestStatus.PENDING
                 ),
+                pending_runtime_requests_total=observation.pending_runtime_requests_total,
                 outstanding_receipts=observation.receipts,
                 outstanding_receipts_total=observation.outstanding_receipts_total,
-                outstanding_intents=_outstanding_intents(observation),
+                outstanding_intents=intent_facts,
+                outstanding_intents_total=intents_total,
             )
         return detail

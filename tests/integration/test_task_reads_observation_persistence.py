@@ -17,9 +17,12 @@ existing cancellation/abort suites and are not duplicated here.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
 import pytest
+from psycopg import connect
 
 from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.executions import ExecutionStatus
@@ -29,6 +32,7 @@ from openorc.persistence import gates as gate_records
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.task_reads import load_task_observation
+from openorc.services import task_reads
 from tests.integration.persistence_fixtures import (
     _insert_connection,
     _insert_installation,
@@ -66,6 +70,7 @@ def _seed_task(conn: Any, *, status: str) -> dict[str, uuid.UUID]:
         (status, task_id),
     )
     return {
+        "owner_profile_id": profile_id,
         "workspace_id": workspace_id,
         "repository_id": repository_id,
         "task_id": task_id,
@@ -278,3 +283,102 @@ def test_outstanding_receipt_evidence_survives_a_large_settled_history(
     assert len(observation.receipts) == 1
     assert observation.receipts[0].status is TaskDetachedTurnReceiptStatus.CLAIMED
     assert observation.receipts[0].task_agent_session_id == reviewer_session_id
+
+
+class _ReaderConnectionPool:
+    """A pool adapter over one standalone reader connection.
+
+    Mirrors the production pool's per-checkout commit discipline (commit on
+    clean exit, rollback on error) so the authorized read service's
+    pre-composition authorization reads and the composed read-only snapshot
+    transaction sequence exactly as they do against a real pool.
+    """
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    @contextmanager
+    def connection(self) -> Iterator[Any]:
+        with self._connection:
+            yield self._connection
+
+    def close(self) -> None:
+        raise AssertionError("the test owns the reader connection")
+
+
+def test_authorized_task_read_composes_actions_inside_the_read_only_snapshot(
+    migrated_database: str,
+) -> None:
+    """The issue #376 coherence boundary exercised end to end: one actual
+    authorized Task detail read — Workspace ownership, the account barrier,
+    the composed repeatable-read snapshot, and the backend-generated action
+    projection — against real Postgres. The read-only transaction must never
+    carry a locking statement (the account barrier is the non-locking
+    read-side predicate), and the composition offers the PR_AUTHORIZATION
+    menu from the seeded durable facts."""
+    with connect(migrated_database, autocommit=True, prepare_threshold=None) as writer:
+        seeded = _seed_task(writer, status="waiting_for_owner")
+        pool = cast(DatabasePool, _SingleConnectionPool(writer))
+        task = task_records.get_task(pool, seeded["task_id"])
+        assert task is not None
+        gate = gate_records.create_owner_gate(
+            pool,
+            workspace_id=seeded["workspace_id"],
+            task_id=seeded["task_id"],
+            gate_type=OwnerGateType.PR_AUTHORIZATION,
+            subject_head_sha="ab" * 20,
+        )
+        installed = task_records.set_current_owner_gate(
+            pool,
+            seeded["task_id"],
+            expected_state_token=task.state_token,
+            owner_gate_id=gate.id,
+        )
+        assert installed is not None
+        _seed_attempt(
+            pool,
+            seeded,
+            execution_number=1,
+            final_status=ExecutionStatus.SUCCEEDED,
+            implementation_result=_RESULT,
+        )
+
+        with connect(migrated_database, prepare_threshold=None) as reader:
+            reader_pool = cast(DatabasePool, _ReaderConnectionPool(reader))
+            detail = task_reads.get_task_for_owner(
+                reader_pool,
+                profile_id=seeded["owner_profile_id"],
+                workspace_id=seeded["workspace_id"],
+                task_id=seeded["task_id"],
+            )
+
+        assert detail.summary.current_gate is not None
+        # The composed action projection: the PR_AUTHORIZATION menu from the
+        # seeded durable facts — cancel eligible (no outstanding runtime
+        # work), no Task-level duplicate, nothing else offered.
+        assert detail.summary.current_gate.actions == ("approve", "cancel_task")
+        assert detail.summary.actions == ()
+        assert detail.executions_total == 1
+        assert detail.executions[0].result is not None
+        assert detail.executions[0].result["branch"] == "openorc/issue-42"
+        assert detail.outstanding_receipts == ()
+        assert detail.outstanding_receipts_total == 0
+        assert detail.pending_runtime_requests == ()
+        assert detail.pending_runtime_requests_total == 0
+        assert detail.outstanding_intents == ()
+        assert detail.outstanding_intents_total == 0
+
+        # A later authorized read observes the committed change: the snapshot
+        # transaction released with its composition scope.
+        writer.execute(
+            "update openorc.tasks set status = 'cancelled' where id = %s",
+            (seeded["task_id"],),
+        )
+        with connect(migrated_database, prepare_threshold=None) as reader:
+            reread = task_reads.get_task_for_owner(
+                cast(DatabasePool, _ReaderConnectionPool(reader)),
+                profile_id=seeded["owner_profile_id"],
+                workspace_id=seeded["workspace_id"],
+                task_id=seeded["task_id"],
+            )
+            assert reread.summary.task.status.value == "cancelled"

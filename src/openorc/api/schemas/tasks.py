@@ -550,9 +550,11 @@ class OpenOrcTaskDetailBlockRead(OpenOrcTaskSummaryRead):
     review_loops: list[OpenOrcTaskReviewLoopRead]
     pending_runtime_interactions: list[OpenOrcTaskPendingInteractionRead]
     pending_runtime_requests: list[OpenOrcTaskRuntimeRequestRead]
+    pending_runtime_requests_total: StrictInt
     outstanding_receipts: list[OpenOrcTaskOutstandingReceiptRead]
     outstanding_receipts_total: StrictInt
     outstanding_intents: list[OpenOrcTaskOutstandingIntentRead]
+    outstanding_intents_total: StrictInt
 
 
 class TaskHistoryPlanRevisionRead(BaseModel):

@@ -35,6 +35,7 @@ from openorc.domain.detached_turns import (
 )
 from openorc.domain.executions import Execution, ExecutionStatus
 from openorc.domain.gates import OwnerGate, OwnerGateStatus, OwnerGateType
+from openorc.domain.intents import TaskInterruptIntent, TaskInterruptIntentStatus
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.pending_interactions import PendingTaskRuntimeInteractionOperation
 from openorc.domain.reviews import (
@@ -88,8 +89,11 @@ def _observation(task: Any, **overrides: Any) -> TaskObservationRecord:
         "review_loops": (),
         "review_iterations": (),
         "runtime_requests": (),
+        "pending_runtime_requests_total": 0,
         "interrupt_intents": (),
+        "outstanding_interrupt_intents_total": 0,
         "resume_intents": (),
+        "outstanding_resume_intents_total": 0,
         "pull_request_close_intent": None,
         "receipts": (),
         "outstanding_receipts_total": 0,
@@ -906,6 +910,24 @@ def test_detail_carries_the_completed_implementation_result_and_outstanding_evid
         executions_total=1,
         receipts=(claimed_receipt,),
         outstanding_receipts_total=1,
+        interrupt_intents=(
+            TaskInterruptIntent(  # type: ignore[call-arg]
+                id=uuid.uuid4(),
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                task_agent_session_id=uuid.uuid4(),
+                task_block_id=None,
+                workflow_role=WorkflowRole.PRODUCER,
+                external_session_id="producer-ext-1",
+                requested_by_profile_id=uuid.uuid4(),
+                status=TaskInterruptIntentStatus.UNSETTLED,
+                outcome={},
+                created_at=_OBSERVED,
+                updated_at=_OBSERVED,
+            ),
+        ),
+        outstanding_interrupt_intents_total=2,
+        pending_runtime_requests_total=3,
     )
 
     monkeypatch.setattr(task_reads, "require_workspace_task", lambda *args, **kwargs: None)
@@ -919,7 +941,9 @@ def test_detail_carries_the_completed_implementation_result_and_outstanding_evid
         "list_pending_task_runtime_interactions",
         lambda pool, *, workspace_id, task_id: [],
     )
-    monkeypatch.setattr(task_reads, "require_account_operational", lambda pool, *, profile_id: None)
+    monkeypatch.setattr(
+        task_reads, "account_operationally_offered", lambda pool, *, profile_id: True
+    )
     monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
     monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: False)
 
@@ -943,6 +967,15 @@ def test_detail_carries_the_completed_implementation_result_and_outstanding_evid
     # The outstanding evidence survives with its matching total.
     assert detail.outstanding_receipts == (claimed_receipt,)
     assert detail.outstanding_receipts_total == 1
+    # The bounded intent and pending-request collections carry companion
+    # totals of exactly the same durable populations: the presentation window
+    # carries the one loaded outstanding intent while the companion total
+    # counts the two durable outstanding interrupts.
+    assert len(detail.outstanding_intents) == 1
+    assert detail.outstanding_intents[0].kind == "interrupt"
+    assert detail.outstanding_intents_total == 2
+    assert detail.pending_runtime_requests == ()
+    assert detail.pending_runtime_requests_total == 3
 
 
 def test_list_items_supply_the_discussion_evidence(
@@ -996,7 +1029,9 @@ def test_list_items_supply_the_discussion_evidence(
     )
     monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: True)
     monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
-    monkeypatch.setattr(task_reads, "require_account_operational", lambda pool, *, profile_id: None)
+    monkeypatch.setattr(
+        task_reads, "account_operationally_offered", lambda pool, *, profile_id: True
+    )
 
     summary = task_reads._compose_list_item(_RecordingPool(), task=task, profile_id=uuid.uuid4())
 
