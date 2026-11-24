@@ -610,7 +610,7 @@ def find_github_issue_projections_by_identity(
             (repository_id, distinct_ids),
         ).fetchall()
     return {
-        projection.github_issue_id: projection
+        projection.identity.github_issue_id: projection
         for projection in map(_github_issue_from_row, rows)
     }
 

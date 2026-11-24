@@ -78,10 +78,11 @@ cancellation accounting's resume lineage (issue #343).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 from uuid import UUID
 
@@ -187,6 +188,7 @@ __all__ = [
     "SessionResumeObservationRegistrar",
     "SessionResumeOutcome",
     "SessionResumeOutcomeKind",
+    "blocked_continuation_durably_offered",
     "dispatch_authorized_task_resume",
     "resume_task_after_abort",
 ]
@@ -715,6 +717,69 @@ def _authorize_blocked_task_continuation(
     return _BlockedContinuationSubject(
         task=task, gate=gate, block=block, targets=targets, routing=routing
     )
+
+
+# The exceptional blocked-Task gate kinds whose guarded continuation runs
+# through this module's shared derivation: the OWNER_ABORT gate's Resume
+# (issue #292) and the COST_LIMIT gate's Continue (issue #291), each
+# addressing its own Level 3 blocking condition (issue #286).
+_BLOCKED_CONTINUATION_GATE_CONDITIONS: Final[Mapping[OwnerGateType, Level3BlockingCondition]] = (
+    MappingProxyType(
+        {
+            OwnerGateType.OWNER_ABORT: Level3BlockingCondition.OWNER_ABORT_ISSUED,
+            OwnerGateType.COST_LIMIT: Level3BlockingCondition.TASK_COST_LIMIT_REACHED,
+        }
+    )
+)
+
+
+def blocked_continuation_durably_offered(
+    transaction_pool: DatabasePool, *, task: Task, gate: OwnerGate
+) -> bool:
+    """Whether the durable facts positively support the blocked-Task continuation
+    actions — the OWNER_ABORT gate's ``resume`` and the COST_LIMIT gate's
+    ``continue`` (#376).
+
+    The authorized read surface's backend-generated action projection reuses
+    this module's authoritative guarded-continuation derivation in
+    predicate mode: the blocked status, the exact current pending gate of a
+    supported continuation type, its sole unresolved TaskBlock with coherent
+    episode evidence for the addressed blocking condition, the interrupted
+    session targets re-derived from the block context, every Interrupt
+    intent bound to that episode positively ``settled`` (the #342
+    precondition — an unsettled current interruption never advertises the
+    continuation), the result-routing derivation, and no independently
+    outstanding or uncertain runtime work. Evaluated inside the caller's own
+    transaction with NO row locks, never persisted, never an external call,
+    and never a second policy engine; a refused, stale, or unclassifiable
+    shape is simply not offered. The command still revalidates the exact
+    currentness and targets freshly at execution under its own locks —
+    offering is neither permission nor a promise.
+    """
+    condition = _BLOCKED_CONTINUATION_GATE_CONDITIONS.get(gate.gate_type)
+    if condition is None:
+        return False
+    if task.status is not TaskStatus.BLOCKED:
+        return False
+    if gate.status is not OwnerGateStatus.PENDING or gate.task_id != task.id:
+        return False
+    try:
+        block = require_owner_gate_unresolved_block_subject(transaction_pool, task=task, gate=gate)
+        try:
+            validate_blocking_case_evidence(condition, block.context)
+        except BlockingCaseDomainError as error:
+            raise ConflictError(
+                f"the {condition.value} block carries incoherent episode evidence"
+            ) from error
+        targets = _resolve_resume_targets(transaction_pool, task=task, context=block)
+        _require_episode_interruptions_settled(
+            transaction_pool, task=task, block=block, targets=targets
+        )
+        routing = _derive_resume_routing(transaction_pool, task=task, targets=targets)
+        _require_no_independent_outstanding_work(transaction_pool, task=task, routing=routing)
+    except ApplicationError:
+        return False
+    return True
 
 
 def resume_task_after_abort(

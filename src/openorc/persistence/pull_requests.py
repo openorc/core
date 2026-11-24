@@ -112,9 +112,7 @@ def _task_pull_request_from_row(row: Sequence[Any]) -> TaskPullRequest:
         base_sha=row[22],
         mergeable=row[23],
         merge_state_status=row[24],
-        pr_mergeability_observed_at=(
-            None if row[25] is None else normalize_utc(row[25])
-        ),
+        pr_mergeability_observed_at=(None if row[25] is None else normalize_utc(row[25])),
         pr_mergeability_head_sha=row[26],
     )
 
@@ -157,17 +155,13 @@ def _validate_observed_facts(
     if merge_state_status is not None:
         _require_nonblank_str(merge_state_status, "merge_state_status")
     if (user_id is None) != (user_login is None):
-        raise TaskPullRequestDomainError(
-            "the observed user subset is present or absent together"
-        )
+        raise TaskPullRequestDomainError("the observed user subset is present or absent together")
     if user_id is not None:
         _require_positive_int(user_id, "user_id")
     if draft is not None and not isinstance(draft, bool):
         raise TaskPullRequestDomainError("the observed draft flag must be None or a boolean")
     if mergeable is not None and not isinstance(mergeable, bool):
-        raise TaskPullRequestDomainError(
-            "the observed mergeability must be None or a boolean"
-        )
+        raise TaskPullRequestDomainError("the observed mergeability must be None or a boolean")
 
 
 # The observed-snapshot SET fragment shared by the #376-extended write paths:
@@ -193,24 +187,70 @@ _OBSERVED_SNAPSHOT_SET_COLUMNS = (
 )
 
 
-def _observed_snapshot_write_sql(*, mergeability_reported: bool) -> str:
-    """Return the SET fragment for one observed-snapshot write."""
-    fragments = [f"{column} = %s" for column in _OBSERVED_SNAPSHOT_SET_COLUMNS]
-    if mergeability_reported:
-        # A reported reading — including GitHub's documented not-yet-determined
-        # null/`unknown` — replaces the retained pair and binds it to the exact
-        # observed head with a fresh observation instant. A stale result is
-        # never presented as the new head's observation.
-        fragments.extend(
-            [
-                "mergeable = %s",
-                "merge_state_status = %s",
-                "pr_mergeability_observed_at = now()",
-                "pr_mergeability_head_sha = head_sha",
-            ]
-        )
-    fragments.append("updated_at = now()")
-    return ", ".join(fragments)
+# The SET fragments of one observed-snapshot write, literal per variant so the
+# composed statements stay provably literal SQL (the driver's query typing).
+# The mergeability variant: a reported reading — including GitHub's documented
+# not-yet-determined null/`unknown` — replaces the retained pair and binds it
+# to the exact observed head with a fresh observation instant. A stale result
+# is never presented as the new head's observation.
+_OBSERVED_SNAPSHOT_WRITE_SQL = ", ".join(
+    (
+        "head_ref = %s",
+        "base_ref = %s",
+        "head_sha = %s",
+        "state = %s",
+        "merged_at = %s",
+        "title = %s",
+        "body = %s",
+        "html_url = %s",
+        "user_id = %s",
+        "user_login = %s",
+        "draft = %s",
+        "provider_created_at = %s",
+        "provider_updated_at = %s",
+        "provider_closed_at = %s",
+        "base_sha = %s",
+        "updated_at = now()",
+    )
+)
+# The literal insert statement fragments of one canonical-PR publication row:
+# the base 21-column projection plus the optional head-bound mergeability
+# observation pair, stamped exactly at the created head.
+_INSERT_COLUMNS = (
+    "workspace_id, task_id, repository_id, github_pr_id, github_pr_number, "
+    "head_ref, base_ref, head_sha, state, title, body, html_url, user_id, "
+    "user_login, draft, provider_created_at, provider_updated_at, "
+    "provider_closed_at, base_sha, mergeable, merge_state_status"
+)
+_INSERT_VALUES = "%s, " * 20 + "%s"
+_INSERT_MERGEABILITY_COLUMNS = ", pr_mergeability_observed_at, pr_mergeability_head_sha"
+_INSERT_MERGEABILITY_VALUES = ", now(), %s"
+
+
+_OBSERVED_SNAPSHOT_WRITE_SQL_MERGEABILITY = ", ".join(
+    (
+        "head_ref = %s",
+        "base_ref = %s",
+        "head_sha = %s",
+        "state = %s",
+        "merged_at = %s",
+        "title = %s",
+        "body = %s",
+        "html_url = %s",
+        "user_id = %s",
+        "user_login = %s",
+        "draft = %s",
+        "provider_created_at = %s",
+        "provider_updated_at = %s",
+        "provider_closed_at = %s",
+        "base_sha = %s",
+        "mergeable = %s",
+        "merge_state_status = %s",
+        "pr_mergeability_observed_at = now()",
+        "pr_mergeability_head_sha = head_sha",
+        "updated_at = now()",
+    )
+)
 
 
 def _observed_snapshot_write_params(
@@ -328,29 +368,6 @@ def create_task_pull_request(
         merge_state_status=merge_state_status,
     )
     mergeability_reported = mergeable is not None or merge_state_status is not None
-    columns = [
-        "workspace_id",
-        "task_id",
-        "repository_id",
-        "github_pr_id",
-        "github_pr_number",
-        "head_ref",
-        "base_ref",
-        "head_sha",
-        "state",
-        "title",
-        "body",
-        "html_url",
-        "user_id",
-        "user_login",
-        "draft",
-        "provider_created_at",
-        "provider_updated_at",
-        "provider_closed_at",
-        "base_sha",
-        "mergeable",
-        "merge_state_status",
-    ]
     values: list[Any] = [
         workspace_id,
         task_id,
@@ -374,16 +391,16 @@ def create_task_pull_request(
         mergeable,
         merge_state_status,
     ]
-    placeholders = ["%s"] * len(columns)
     if mergeability_reported:
         # The head-bound observation pair stamps exactly the created head.
-        columns.extend(["pr_mergeability_observed_at", "pr_mergeability_head_sha"])
-        placeholders.extend(["now()", "%s"])
         values.append(head_sha)
     with transaction(pool) as conn:
         row = conn.execute(
-            "insert into openorc.task_pull_requests "
-            f"({', '.join(columns)}) values ({', '.join(placeholders)}) "
+            f"insert into openorc.task_pull_requests "
+            f"({_INSERT_COLUMNS}"
+            f"{_INSERT_MERGEABILITY_COLUMNS if mergeability_reported else ''}) "
+            f"values ({_INSERT_VALUES}"
+            f"{_INSERT_MERGEABILITY_VALUES if mergeability_reported else ''}) "
             f"returning {_TASK_PULL_REQUEST_COLUMNS}",
             tuple(values),
         ).fetchone()
@@ -531,9 +548,7 @@ def get_task_pull_requests_for_tasks(
             "where task_id = any(%s) order by task_id",
             (distinct_ids,),
         ).fetchall()
-    return {
-        record.task_id: record for record in map(_task_pull_request_from_row, rows)
-    }
+    return {record.task_id: record for record in map(_task_pull_request_from_row, rows)}
 
 
 def update_task_pull_request_observed(
@@ -610,16 +625,18 @@ def update_task_pull_request_observed(
         mergeable=mergeable,
         merge_state_status=merge_state_status,
     )
+    mergeability_reported = mergeable is not None or merge_state_status is not None
     with transaction(pool) as conn:
         row = conn.execute(
-            "update openorc.task_pull_requests "
-            "set "
-            + _observed_snapshot_write_sql(
-                mergeability_reported=(
-                    mergeable is not None or merge_state_status is not None
+            f"update openorc.task_pull_requests "
+            f"set {
+                (
+                    _OBSERVED_SNAPSHOT_WRITE_SQL_MERGEABILITY
+                    if mergeability_reported
+                    else _OBSERVED_SNAPSHOT_WRITE_SQL
                 )
-            )
-            + " where id = %s "
+            } "
+            f"where id = %s "
             f"returning {_TASK_PULL_REQUEST_COLUMNS}",
             (
                 *_observed_snapshot_write_params(
@@ -820,10 +837,15 @@ def reconcile_task_pull_request_observed(
                 previous_merged_at=current.merged_at,
             )
         row = conn.execute(
-            "update openorc.task_pull_requests "
-            "set "
-            + _observed_snapshot_write_sql(mergeability_reported=mergeability_reported)
-            + " where id = %s "
+            f"update openorc.task_pull_requests "
+            f"set {
+                (
+                    _OBSERVED_SNAPSHOT_WRITE_SQL_MERGEABILITY
+                    if mergeability_reported
+                    else _OBSERVED_SNAPSHOT_WRITE_SQL
+                )
+            } "
+            f"where id = %s "
             f"returning {_TASK_PULL_REQUEST_COLUMNS}",
             (
                 *_observed_snapshot_write_params(

@@ -107,9 +107,7 @@ AuthenticatedProfile = Annotated[Profile, Depends(authenticated_profile)]
 _TASKS_PATH = "/workspaces/{workspace_id}/tasks"
 _TASK_PATH = "/workspaces/{workspace_id}/tasks/{task_id}"
 _TASK_HISTORY_PATH = "/workspaces/{workspace_id}/tasks/{task_id}/history"
-_REPOSITORY_TASKS_PATH = (
-    "/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
-)
+_REPOSITORY_TASKS_PATH = "/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
 _ISSUE_TASKS_PATH = (
     "/workspaces/{workspace_id}/repositories/{repository_id}/issues/{issue_id}/tasks"
 )
@@ -169,9 +167,7 @@ def _pr_to_wire(pull_request: TaskPullRequest) -> GitHubTaskPullRequestRead:
 def _github_facts_to_wire(item: TaskSummaryItem) -> GitHubTaskFactsRead:
     return GitHubTaskFactsRead(
         issue=None if item.github_issue is None else _issue_summary_to_wire(item.github_issue),
-        pull_request=(
-            None if item.pull_request is None else _pr_to_wire(item.pull_request)
-        ),
+        pull_request=(None if item.pull_request is None else _pr_to_wire(item.pull_request)),
     )
 
 
@@ -232,9 +228,7 @@ def _summary_to_wire(item: TaskSummaryItem) -> TaskListItemRead:
             repository_id=task.repository_id,
             status=task.status.value,
             state_token=task.state_token,
-            task_pull_request_id=(
-                None if item.pull_request is None else item.pull_request.id
-            ),
+            task_pull_request_id=(None if item.pull_request is None else item.pull_request.id),
             cost=_cost_to_wire(item.cost),
             current_owner_gate=_gate_summary_to_wire(item.current_gate),
             current_block=_block_summary_to_wire(item.current_block),
@@ -244,12 +238,8 @@ def _summary_to_wire(item: TaskSummaryItem) -> TaskListItemRead:
             created_at=task.created_at,
             updated_at=task.updated_at,
             archived_at=task.archived_at,
-            terminal_cause=(
-                None if task.terminal_cause is None else task.terminal_cause.value
-            ),
-            terminalization=_terminalization_to_wire(
-                task_reads.terminalization_facts(task)
-            ),
+            terminal_cause=(None if task.terminal_cause is None else task.terminal_cause.value),
+            terminalization=_terminalization_to_wire(task_reads.terminalization_facts(task)),
         ),
     )
 
@@ -467,15 +457,19 @@ def _execution_result_to_wire(
 ) -> OpenOrcTaskExecutionResultRead | None:
     if result is None:
         return None
+    status_value = result.get("status")
+    branch_value = result.get("branch")
+    summary_value = result.get("summary")
+    changes_value = result.get("changes")
+    validation_value = result.get("validation")
+    notes_value = result.get("notes")
     return OpenOrcTaskExecutionResultRead(
-        status=result.get("status") if isinstance(result.get("status"), str) else None,
-        branch=result.get("branch") if isinstance(result.get("branch"), str) else None,
-        summary=result.get("summary") if isinstance(result.get("summary"), str) else None,
-        changes=result.get("changes") if isinstance(result.get("changes"), list) else None,
-        validation=(
-            result.get("validation") if isinstance(result.get("validation"), list) else None
-        ),
-        notes=result.get("notes") if isinstance(result.get("notes"), str) else None,
+        status=status_value if isinstance(status_value, str) else None,
+        branch=branch_value if isinstance(branch_value, str) else None,
+        summary=summary_value if isinstance(summary_value, str) else None,
+        changes=changes_value if isinstance(changes_value, list) else None,
+        validation=validation_value if isinstance(validation_value, list) else None,
+        notes=notes_value if isinstance(notes_value, str) else None,
     )
 
 
@@ -582,9 +576,7 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
             canonical_feature_branch=task.canonical_feature_branch,
             cost=_cost_to_wire(summary.cost),
             current_owner_gate=(
-                None
-                if summary.current_gate is None
-                else _gate_detail_to_wire(summary.current_gate)
+                None if summary.current_gate is None else _gate_detail_to_wire(summary.current_gate)
             ),
             current_block=_block_detail_to_wire(summary.current_block),
             current_plan=_plan_to_wire(detail.current_plan),
@@ -592,16 +584,14 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
             executions=[_execution_to_wire(facts) for facts in detail.executions],
             executions_total=detail.executions_total,
             planning_bootstrap_stage=detail.planning_bootstrap_stage,
-            review_loops=[
-                _review_loop_to_wire(facts) for facts in detail.review_loops
-            ],
+            review_loops=[_review_loop_to_wire(facts) for facts in detail.review_loops],
             pending_runtime_interactions=[
                 OpenOrcTaskPendingInteractionRead(
-                    operation=interaction["operation"],
-                    role=interaction["role"],
-                    task_agent_session_id=interaction["task_agent_session_id"],
-                    subject=dict(interaction["subject"]),
-                    started_at=interaction["started_at"],
+                    operation=interaction.operation,
+                    role=interaction.role,
+                    task_agent_session_id=interaction.task_agent_session_id,
+                    subject=interaction.subject,
+                    started_at=interaction.started_at,
                 )
                 for interaction in detail.pending_runtime_interactions
             ],
@@ -635,11 +625,11 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
             outstanding_receipts_total=detail.outstanding_receipts_total,
             outstanding_intents=[
                 OpenOrcTaskOutstandingIntentRead(
-                    id=intent["id"],
-                    kind=intent["kind"],
-                    status=intent["status"],
-                    created_at=intent["created_at"],
-                    updated_at=intent["updated_at"],
+                    id=intent.id,
+                    kind=intent.kind,
+                    status=intent.status,
+                    created_at=intent.created_at,
+                    updated_at=intent.updated_at,
                 )
                 for intent in detail.outstanding_intents
             ],
@@ -649,12 +639,8 @@ def _detail_to_wire(detail: TaskDetail) -> OpenOrcTaskDetailRead:
             created_at=task.created_at,
             updated_at=task.updated_at,
             archived_at=task.archived_at,
-            terminal_cause=(
-                None if task.terminal_cause is None else task.terminal_cause.value
-            ),
-            terminalization=_terminalization_detail_to_wire(
-                task_reads.terminalization_facts(task)
-            ),
+            terminal_cause=(None if task.terminal_cause is None else task.terminal_cause.value),
+            terminalization=_terminalization_detail_to_wire(task_reads.terminalization_facts(task)),
         ),
     )
 
@@ -758,38 +744,7 @@ def _history_collection_to_wire(collection: HistoryCollection) -> TaskHistoryCol
                     result=(
                         None
                         if not isinstance(item.implementation_result, dict)
-                        else OpenOrcTaskExecutionResultRead(
-                            status=(
-                                item.implementation_result.get("status")
-                                if isinstance(item.implementation_result.get("status"), str)
-                                else None
-                            ),
-                            branch=(
-                                item.implementation_result.get("branch")
-                                if isinstance(item.implementation_result.get("branch"), str)
-                                else None
-                            ),
-                            summary=(
-                                item.implementation_result.get("summary")
-                                if isinstance(item.implementation_result.get("summary"), str)
-                                else None
-                            ),
-                            changes=(
-                                item.implementation_result.get("changes")
-                                if isinstance(item.implementation_result.get("changes"), list)
-                                else None
-                            ),
-                            validation=(
-                                item.implementation_result.get("validation")
-                                if isinstance(item.implementation_result.get("validation"), list)
-                                else None
-                            ),
-                            notes=(
-                                item.implementation_result.get("notes")
-                                if isinstance(item.implementation_result.get("notes"), str)
-                                else None
-                            ),
-                        )
+                        else _execution_result_to_wire(item.implementation_result)
                     ),
                 )
             )
@@ -810,9 +765,7 @@ def _history_collection_to_wire(collection: HistoryCollection) -> TaskHistoryCol
                     kind=item.kind.value,
                     external_approval_id=item.external_approval_id,
                     status=item.status.value,
-                    resolution=(
-                        None if item.resolution is None else item.resolution.value
-                    ),
+                    resolution=(None if item.resolution is None else item.resolution.value),
                     closed_at=item.closed_at,
                     created_at=item.created_at,
                     producer_session_id=item.producer_session_id,
@@ -931,7 +884,5 @@ def get_task_history(
     )
     return TaskHistoryRead(
         task_id=history.task_id,
-        collections=[
-            _history_collection_to_wire(collection) for collection in history.collections
-        ],
+        collections=[_history_collection_to_wire(collection) for collection in history.collections],
     )

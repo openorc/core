@@ -56,6 +56,7 @@ from openorc.adapters.github.observations_pull_request import (
     GitHubPullRequestFacts,
     GitHubPullRequestObservation,
     parse_merge_response_payload,
+    parse_pull_request_facts,
     parse_pull_request_payload,
 )
 from openorc.adapters.github.transport import GITHUB_API_BASE_URL, HttpGitHubRestClient
@@ -323,6 +324,113 @@ def test_pull_request_observation_normalizes_the_documented_facts() -> None:
     assert observation.merged is False
     assert observation.merged_at is None
     assert fetch.calls[1][0] == f"{GITHUB_API_BASE_URL}/repos/octocat/hello-world/pulls/77"
+
+
+def test_unavailable_or_malformed_presentation_members_are_honest_nulls() -> None:
+    """Regression (#376 review): a missing or malformed presentation-only
+    member normalizes to the honest unobserved ``None`` and never turns an
+    otherwise interpretable authoritative PR observation into an uncertain
+    outcome, while the strict core identity/head/state validation holds."""
+    payload = _pr_payload()
+    # Remove every presentation member the documented response may omit and
+    # malform the ones that arrive in an unusable shape.
+    for member in (
+        "title",
+        "body",
+        "html_url",
+        "user",
+        "draft",
+        "created_at",
+        "updated_at",
+        "closed_at",
+        "mergeable",
+        "mergeable_state",
+    ):
+        payload.pop(member)
+    payload["title"] = 42
+    payload["html_url"] = ""
+    payload["user"] = "octocat"
+    payload["draft"] = "yes"
+    payload["created_at"] = "not-an-instant"
+    payload["closed_at"] = 7
+    payload["mergeable"] = "maybe"
+    payload["mergeable_state"] = 42
+    payload["base"] = {"ref": "main", "sha": 9}
+
+    observation = parse_pull_request_payload(
+        payload, owner_login="octocat", repository_name="hello-world", pull_number=_PULL_NUMBER
+    )
+
+    # The strict core facts are intact.
+    assert observation.github_pr_id == 900_719_925_474_099
+    assert observation.pull_number == _PULL_NUMBER
+    assert observation.head_ref == "openorc/task-42"
+    assert observation.head_sha == _HEAD_SHA
+    assert observation.base_ref == "main"
+    assert observation.state == "open"
+    assert observation.merged is False
+    assert observation.merged_at is None
+    # Every presentation member is the honest unobserved None.
+    assert observation.title is None
+    assert observation.body is None
+    assert observation.html_url is None
+    assert observation.user_id is None
+    assert observation.user_login is None
+    assert observation.draft is None
+    assert observation.provider_created_at is None
+    assert observation.provider_updated_at is None
+    assert observation.provider_closed_at is None
+    assert observation.base_sha is None
+    assert observation.mergeable is None
+    assert observation.merge_state_status is None
+
+
+def test_well_formed_presentation_members_are_carried_verbatim() -> None:
+    observation = parse_pull_request_payload(
+        _pr_payload(),
+        owner_login="octocat",
+        repository_name="hello-world",
+        pull_number=_PULL_NUMBER,
+    )
+
+    assert observation.title == "Implement issue 375"
+    assert observation.body == "PR description"
+    assert observation.html_url == "https://github.com/octocat/hello-world/pull/77"
+    assert observation.user_id == 501
+    assert observation.user_login == "octocat"
+    assert observation.draft is False
+    assert observation.provider_created_at == datetime(2026, 11, 24, 1, 30, 0, tzinfo=UTC)
+    assert observation.provider_updated_at == datetime(2026, 11, 24, 1, 31, 0, tzinfo=UTC)
+    assert observation.provider_closed_at is None
+    assert observation.base_sha == _OTHER_SHA
+    assert observation.mergeable is True
+    assert observation.merge_state_status == "clean"
+
+
+def test_create_response_presentation_members_are_optional_with_validation() -> None:
+    """The PR-create response shares the extraction: a partially unusable
+    presentation set still yields the authoritative created-PR identity and
+    head facts with honest null presentation members."""
+    payload = _pr_payload()
+    payload["title"] = None
+    payload["draft"] = []
+    payload["user"] = {"id": "not-an-int", "login": "octocat"}
+    payload["created_at"] = "not-an-instant"
+
+    facts = parse_pull_request_facts(payload)
+
+    assert facts.github_pr_id == 900_719_925_474_099
+    assert facts.pull_number == _PULL_NUMBER
+    assert facts.head_ref == "openorc/task-42"
+    assert facts.head_sha == _HEAD_SHA
+    assert facts.base_ref == "main"
+    assert facts.state == "open"
+    assert facts.merged is False
+    assert facts.title is None
+    assert facts.draft is None
+    assert facts.user_id is None
+    assert facts.user_login is None
+    assert facts.provider_created_at is None
 
 
 def test_a_merged_pull_request_observation_carries_its_instant() -> None:

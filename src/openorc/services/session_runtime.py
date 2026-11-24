@@ -96,7 +96,7 @@ from openorc.domain.sessions import (
 )
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.connections import get_connection, get_role_binding
+from openorc.persistence.connections import get_connection
 from openorc.persistence.detached_turns import (
     get_outstanding_task_detached_turn_receipt,
     refuse_task_detached_turn_receipt,
@@ -310,6 +310,31 @@ def _require_effective_configuration(
         ) from error
 
 
+def _require_configured_pair(
+    configured_provider: str | None, configured_model: str | None
+) -> tuple[str | None, str | None]:
+    """Validate the #376 selected configured provider/model pair at command shape.
+
+    The pair is the composition-selected workflow-role route's captured
+    construction facts, carried verbatim into the immutable READY snapshot,
+    so it is validated before any authorization, persistence mutation, or
+    telemetry: complete or absent together (the binding's own coherence
+    rule), and present members are non-empty strings. An unconfigured legacy
+    route honestly carries ``None``/``None``.
+    """
+    if (configured_provider is None) != (configured_model is None):
+        raise InvalidCommandError(
+            "the selected configured provider/model pair is complete or absent together"
+        )
+    for name, value in (
+        ("configured_provider", configured_provider),
+        ("configured_model", configured_model),
+    ):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise InvalidCommandError(f"the selected {name} must be a non-empty string or None")
+    return configured_provider, configured_model
+
+
 def _assemble_effective_config_snapshot(
     adapter_type: AdapterType,
     effective_configuration: Mapping[str, object],
@@ -340,9 +365,7 @@ def _assemble_effective_config_snapshot(
     caller supplies exactly what the durable route reported.
     """
     if (configured_provider is None) != (configured_model is None):
-        raise ConflictError(
-            "the configured provider/model pair is complete or absent together"
-        )
+        raise ConflictError("the configured provider/model pair is complete or absent together")
     try:
         assembled: dict[str, object] = {
             "adapter": adapter_type.value,
@@ -480,6 +503,8 @@ def establish_task_agent_session(
     task_id: UUID,
     role: WorkflowRole,
     effective_configuration: Mapping[str, object],
+    configured_provider: str | None,
+    configured_model: str | None,
 ) -> TaskAgentSession:
     """Establish one admitted Task/role binding through runtime readiness.
 
@@ -500,6 +525,17 @@ def establish_task_agent_session(
     between the selection and the runtime call is absorbed by the selection
     instead of silently diverging. No database transaction is open when the
     selection is read.
+
+    ``configured_provider``/``configured_model`` are the #376 captured
+    construction facts: the non-secret configured pair of the
+    composition-selected workflow-role route, selected ONCE at the
+    composition boundary and shared with the injected construction-context
+    resolver, so the durable READY snapshot records exactly the pair the
+    fresh session was constructed with — never a second, independently timed
+    durable read. An unconfigured legacy route carries ``None``/``None``
+    (honestly unknown, never zero-substituted); a changed route remains
+    future admission state (issue #189) and never invalidates the admitted
+    binding.
 
     Returns the READY binding. An exact already-READY binding is idempotent
     success with no runtime call. Raises the typed authorization/not-found
@@ -525,6 +561,7 @@ def establish_task_agent_session(
         _require_workflow_role(role)
         _require_runtime_adapter(adapter)
         _require_effective_configuration(effective_configuration)
+        _require_configured_pair(configured_provider, configured_model)
         annotate_span(
             span,
             operation=_ESTABLISH_SPAN_NAME,
@@ -570,14 +607,17 @@ def establish_task_agent_session(
         # boundary and the non-secret snapshot is assembled deliberately. ---
         initialization = compose_initialization(role.value, workspace.guidance)
         # The #376 configured provider/model capture: the composition-selected
-        # workflow-role route read once at establishment, exactly what the
-        # construction context resolves — never re-read at projection time.
-        route = get_role_binding(pool, workspace_id=workspace_id, role=role)
+        # workflow-role route pair carried into this establishment — the
+        # exact pair the injected construction-context resolver builds the
+        # fresh session with — never a second, independently timed durable
+        # read. A between-reads configuration change is absorbed by the
+        # selection (issue #189); the pair is complete or absent together
+        # (the binding's own coherence rule).
         snapshot = _assemble_effective_config_snapshot(
             connection.adapter,
             effective_configuration,
-            configured_provider=None if route is None else route.configured_provider,
-            configured_model=None if route is None else route.configured_model,
+            configured_provider=configured_provider,
+            configured_model=configured_model,
         )
         request = AgentSessionCreationRequest(
             workspace_id=workspace_id,
@@ -715,6 +755,8 @@ def dispatch_task_agent_session_establishment(
     task_id: UUID,
     role: WorkflowRole,
     effective_configuration: Mapping[str, object],
+    configured_provider: str | None,
+    configured_model: str | None,
     original_attempt_kind: OriginalAttemptKind,
     original_attempt_id: UUID,
     observation_registrar: EstablishmentObservationRegistrar,
@@ -730,6 +772,14 @@ def dispatch_task_agent_session_establishment(
     verbatim. No ``send`` and no prompt-inside-``start`` shortcut exists in
     this path, and no database transaction is ever held across a runtime
     call.
+
+    ``configured_provider``/``configured_model`` are the #376 captured
+    construction facts — the composition-selected workflow-role route pair
+    selected ONCE at the composition boundary and shared with the injected
+    construction-context resolver — carried verbatim into the
+    dispatch-composed snapshot, so the durable READY snapshot records exactly
+    the pair the allocated session was built with (an unconfigured legacy
+    route honestly carries ``None``/``None``).
 
     Durable semantics:
 
@@ -774,6 +824,7 @@ def dispatch_task_agent_session_establishment(
             raise InvalidCommandError(
                 "dispatch_task_agent_session_establishment requires an OriginalAttemptKind"
             )
+        _require_configured_pair(configured_provider, configured_model)
         registrar = _require_observation_registrar(observation_registrar)
         runtime = _require_detached_capability(adapter)
         annotate_span(
@@ -833,14 +884,17 @@ def dispatch_task_agent_session_establishment(
         # boundary and the non-secret snapshot is assembled deliberately. ---
         initialization = compose_initialization(role.value, workspace.guidance)
         # The #376 configured provider/model capture: the composition-selected
-        # workflow-role route read once at establishment, exactly what the
-        # construction context resolves — never re-read at projection time.
-        route = get_role_binding(pool, workspace_id=workspace_id, role=role)
+        # workflow-role route pair carried into this dispatch — the exact pair
+        # the injected construction-context resolver builds the allocated
+        # session with — never a second, independently timed durable read. A
+        # between-reads configuration change is absorbed by the selection
+        # (issue #189); the pair is complete or absent together (the binding's
+        # own coherence rule).
         snapshot = _assemble_effective_config_snapshot(
             connection.adapter,
             effective_configuration,
-            configured_provider=None if route is None else route.configured_provider,
-            configured_model=None if route is None else route.configured_model,
+            configured_provider=configured_provider,
+            configured_model=configured_model,
         )
         request = AgentSessionCreationRequest(
             workspace_id=workspace_id,

@@ -406,9 +406,7 @@ def abort_durably_offered(transaction_pool: DatabasePool, *, task: Task) -> bool
     is neither permission nor a promise.
     """
     executions = execution_records.list_task_executions(transaction_pool, task_id=task.id)
-    if any(
-        execution.status in _OPEN_EXECUTION_STATUSES for execution in executions
-    ):
+    if any(execution.status in _OPEN_EXECUTION_STATUSES for execution in executions):
         return True
     loops = review_records.list_task_review_loops(
         transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN

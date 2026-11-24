@@ -67,7 +67,7 @@ from openorc.adapters.cline.construction import (
     ClineConstructionContextResolver,
     ClineSessionIdentity,
 )
-from openorc.domain.connections import AdapterType, WorkflowRole
+from openorc.domain.connections import AdapterType, WorkflowRole, WorkflowRoleBinding
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.persistence.connections import get_connection, get_role_binding
 from openorc.persistence.pool import DatabasePool
@@ -125,6 +125,19 @@ class DurableClineConstructionContextResolver(ClineConstructionContextResolver):
       instance serves (``None`` means the phase has not supplied one yet,
       which passes through so identity-only adapter operations still resolve
       while reconstruction fails closed adapter-side).
+    - ``selected_role_route`` — the Workspace workflow-role binding route
+      selected ONCE at the composition boundary and shared with the
+      establishment service, so the configured provider/model pair the fresh
+      construction is built with and the pair the durable READY snapshot
+      records are the exact same captured construction facts (#376): a
+      configuration change between the selection and the runtime call is
+      absorbed by the selection instead of silently persisting a pair the
+      constructed session was never supplied. ``None`` means no route was
+      selected — fresh construction fails closed exactly as when the durable
+      read found none; an unconfigured legacy route (both members ``None``)
+      resolves honestly unconfigured. Subsequent bound-session
+      reconstruction is deliberately NEVER frozen to this selection: the
+      later reconstruction context keeps reading the current mutable route.
     """
 
     def __init__(
@@ -133,6 +146,7 @@ class DurableClineConstructionContextResolver(ClineConstructionContextResolver):
         *,
         bootstrap_repository_base: str | None = None,
         working_directory: str | None = None,
+        selected_role_route: WorkflowRoleBinding | None = None,
     ) -> None:
         if bootstrap_repository_base is not None and (
             not isinstance(bootstrap_repository_base, str)
@@ -150,18 +164,38 @@ class DurableClineConstructionContextResolver(ClineConstructionContextResolver):
                 "the composition-supplied working directory must be None or a "
                 "non-empty runtime-side path"
             )
+        if selected_role_route is not None and not isinstance(
+            selected_role_route, WorkflowRoleBinding
+        ):
+            raise ValueError(
+                "the composition-selected workflow-role route must be a WorkflowRoleBinding or None"
+            )
         self._pool = pool
         self._bootstrap_repository_base = bootstrap_repository_base
         self._working_directory = working_directory
+        self._selected_role_route = selected_role_route
 
     def resolve_construction_context(
         self, workspace_id: UUID, task_id: UUID, role: WorkflowRole
     ) -> ClineConstructionContext:
-        """Resolve the fresh-construction context for the exact Task/role."""
+        """Resolve the fresh-construction context for the exact Task/role.
+
+        The construction facts come from the composition-selected role
+        route — the exact selection the establishment service carries into
+        the durable READY snapshot — never a second, independently timed
+        durable read (#376). No route selected fails closed exactly as when
+        the durable read finds none.
+        """
         _require_uuid(workspace_id, "workspace_id")
         _require_uuid(task_id, "task_id")
         if not isinstance(role, WorkflowRole):
             raise ValueError("the construction-context request role must be a WorkflowRole")
+        route = self._selected_role_route
+        if route is None or route.workspace_id != workspace_id or route.role is not role:
+            raise AgentRuntimeConfigurationRejectedError(
+                "the current workflow role configuration for the requested fresh "
+                "construction could not be established"
+            )
         binding = get_task_agent_session(self._pool, task_id=task_id, role=role)
         if binding is None or binding.workspace_id != workspace_id or binding.task_id != task_id:
             raise AgentRuntimeConfigurationRejectedError(
@@ -188,12 +222,6 @@ class DurableClineConstructionContextResolver(ClineConstructionContextResolver):
         if not connection.enabled:
             raise AgentRuntimeConfigurationRejectedError(
                 "the admitted Connection bound to this Task/role is currently disabled"
-            )
-        route = get_role_binding(self._pool, workspace_id=workspace_id, role=role)
-        if route is None or route.workspace_id != workspace_id:
-            raise AgentRuntimeConfigurationRejectedError(
-                "the current workflow role configuration for the requested fresh "
-                "construction could not be established"
             )
         if role is WorkflowRole.PRODUCER:
             if self._bootstrap_repository_base is None:

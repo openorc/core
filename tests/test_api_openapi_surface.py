@@ -51,9 +51,7 @@ _ACCOUNT_DELETION_PATH = "/api/v1/profile/account"
 _TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
 _TASKS_PATH = "/api/v1/workspaces/{workspace_id}/tasks"
 _TASK_HISTORY_PATH = _TASK_PATH + "/history"
-_REPOSITORY_TASKS_PATH = (
-    "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
-)
+_REPOSITORY_TASKS_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
 _ISSUE_TASKS_PATH = (
     "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/issues/{issue_id}/tasks"
 )

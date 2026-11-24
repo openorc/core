@@ -231,6 +231,7 @@ def cancellation_durably_offered(transaction_pool: DatabasePool, *, task: Task) 
         return False
     return True
 
+
 _SERVICE_TRACER_SCOPE = "openorc.services.task_cancellation"
 _CANCEL_SPAN_NAME = "task_cancellation.cancel_task"
 _COMPOSITION_SPAN_NAME = "task_cancellation.cancel_task_composition"

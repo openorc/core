@@ -20,6 +20,7 @@ detached-turn, #339, G2a, and persistence suites — never repeated here.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -83,6 +84,7 @@ def _observation(task: Any, **overrides: Any) -> TaskObservationRecord:
         "current_plan": None,
         "sessions": (),
         "executions": (),
+        "executions_total": 0,
         "review_loops": (),
         "review_iterations": (),
         "runtime_requests": (),
@@ -90,7 +92,7 @@ def _observation(task: Any, **overrides: Any) -> TaskObservationRecord:
         "resume_intents": (),
         "pull_request_close_intent": None,
         "receipts": (),
-        "receipts_total": 0,
+        "outstanding_receipts_total": 0,
         "send_claims": (),
         "planning_bootstrap": None,
         "pull_request": None,
@@ -110,6 +112,9 @@ class _RecordingPool:
 
     def connection(self):  # noqa: ANN201 - test double
         raise AssertionError("the eligibility predicates must join the caller's transaction")
+
+    def close(self) -> None:
+        raise AssertionError("read composition tests never close pools")
 
 
 def test_cost_facts_are_unknown_not_zero_and_budget_semantics_hold() -> None:
@@ -202,26 +207,31 @@ def _gate(gate_type: OwnerGateType, *, status: str = "pending") -> Any:
         OwnerGateType.COST_LIMIT,
         OwnerGateType.OWNER_ABORT,
     )
+    plan_revision_id: uuid.UUID | None = None
+    subject_head_sha: str | None = None
+    task_pull_request_id: uuid.UUID | None = None
+    task_block_id: uuid.UUID | None = None
     if gate_type is OwnerGateType.IMPLEMENTATION_AUTHORIZATION:
-        subject = {"plan_revision_id": _GATE_PLAN_REVISION_ID}
+        plan_revision_id = _GATE_PLAN_REVISION_ID
     elif gate_type is OwnerGateType.PR_AUTHORIZATION:
-        subject = {"subject_head_sha": _HEAD_SHA}
+        subject_head_sha = _HEAD_SHA
     elif gate_type is OwnerGateType.MERGE_DECISION:
-        subject = {"subject_head_sha": _HEAD_SHA, "task_pull_request_id": _GATE_PR_ID}
+        subject_head_sha = _HEAD_SHA
+        task_pull_request_id = _GATE_PR_ID
     elif exceptional:
-        subject = {"task_block_id": _GATE_TASK_BLOCK_ID}
+        task_block_id = _GATE_TASK_BLOCK_ID
     else:  # review_resolution on the planning subject: the PlanRevision only.
-        subject = {"plan_revision_id": _GATE_PLAN_REVISION_ID}
+        plan_revision_id = _GATE_PLAN_REVISION_ID
     return OwnerGate(
         id=uuid.uuid4(),
         workspace_id=_WORKSPACE_ID,
         task_id=_TASK_ID,
         gate_type=gate_type,
         status=OwnerGateStatus(status),
-        plan_revision_id=subject.get("plan_revision_id"),
-        subject_head_sha=subject.get("subject_head_sha"),
-        task_pull_request_id=subject.get("task_pull_request_id"),
-        task_block_id=subject.get("task_block_id"),
+        plan_revision_id=plan_revision_id,
+        subject_head_sha=subject_head_sha,
+        task_pull_request_id=task_pull_request_id,
+        task_block_id=task_block_id,
         decided_at=None if status == "pending" else _OBSERVED,
         created_at=_OBSERVED,
     )
@@ -236,9 +246,7 @@ def _reviewer_session(ready: bool) -> Any:
         connection_id=uuid.uuid4(),
         external_session_id="ext-2" if ready else None,
         lifecycle_status=(
-            TaskSessionLifecycleStatus.READY
-            if ready
-            else TaskSessionLifecycleStatus.CONNECTING
+            TaskSessionLifecycleStatus.READY if ready else TaskSessionLifecycleStatus.CONNECTING
         ),
         effective_config_snapshot=None if not ready else {},
         reported_provider=None,
@@ -251,10 +259,24 @@ def _reviewer_session(ready: bool) -> Any:
     )
 
 
+def _eligible_predicates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin every reused command-boundary predicate to its positively-offerable
+    shape, so the menu-shape tests exercise the projection's own composition."""
+
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: True)
+    monkeypatch.setattr(
+        task_reads,
+        "blocked_continuation_durably_offered",
+        lambda pool, *, task, gate: True,
+    )
+    monkeypatch.setattr(task_reads, "ignore_durably_offered", lambda pool, *, task, gate: True)
+
+
 def test_ordinary_gate_menus_match_the_agreed_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
     gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
     sessions = [_reviewer_session(ready=True)]
+    _eligible_predicates(monkeypatch)
 
     def _no_receipts(*args: Any, **kwargs: Any) -> list[Any]:
         return []
@@ -266,7 +288,7 @@ def test_ordinary_gate_menus_match_the_agreed_contract(monkeypatch: pytest.Monke
     )
 
     menu = task_reads._gate_menu(
-        _RecordingPool(), task=task, gate=gate, sessions=sessions
+        _RecordingPool(), task=task, gate=gate, sessions=sessions, account_operational=True
     )
 
     assert menu == ("approve", "discuss", "cancel_task")
@@ -278,47 +300,57 @@ def test_ordinary_gate_menus_match_the_agreed_contract(monkeypatch: pytest.Monke
         task=task,
         gate=_gate(OwnerGateType.PR_AUTHORIZATION),
         sessions=sessions,
+        account_operational=True,
     ) == ("approve", "cancel_task")
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.REVIEW_RESOLUTION),
         sessions=sessions,
+        account_operational=True,
     ) == ("discuss", "cancel_task")
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.MERGE_DECISION),
         sessions=sessions,
+        account_operational=True,
     ) == ("approve", "discuss", "cancel_task")
 
 
-def test_exceptional_gate_menus_come_from_the_domain_vocabulary() -> None:
+def test_exceptional_gate_menus_come_from_the_domain_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     task = _task(status="blocked", source_requirements_fingerprint="a" * 64)
+    _eligible_predicates(monkeypatch)
 
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.BLOCK_RESOLUTION),
         sessions=[],
+        account_operational=True,
     ) == ("cancel_task",)
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.GITHUB_ISSUE_CHANGE),
         sessions=[],
+        account_operational=True,
     ) == ("ignore", "cancel_task")
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.COST_LIMIT),
         sessions=[],
+        account_operational=True,
     ) == ("continue", "cancel_task")
     assert task_reads._gate_menu(
         _RecordingPool(),
         task=task,
         gate=_gate(OwnerGateType.OWNER_ABORT),
         sessions=[],
+        account_operational=True,
     ) == ("resume", "cancel_task")
     # The legacy gate exposes a cancel-only menu — never the retired retry.
     assert task_reads._gate_menu(
@@ -326,6 +358,7 @@ def test_exceptional_gate_menus_come_from_the_domain_vocabulary() -> None:
         task=task,
         gate=_gate(OwnerGateType.GITHUB_STATE_MISMATCH),
         sessions=[],
+        account_operational=True,
     ) == ("cancel_task",)
 
 
@@ -334,6 +367,7 @@ def test_discuss_is_suppressed_without_a_ready_reviewer_session(
 ) -> None:
     task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
     gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
+    _eligible_predicates(monkeypatch)
 
     def _fail(*args: Any, **kwargs: Any) -> list[Any]:
         raise AssertionError("the discussion receipts are never read without a READY Reviewer")
@@ -349,6 +383,7 @@ def test_discuss_is_suppressed_without_a_ready_reviewer_session(
         task=task,
         gate=gate,
         sessions=[_reviewer_session(ready=False)],
+        account_operational=True,
     )
 
     assert menu == ("approve", "cancel_task")
@@ -359,6 +394,7 @@ def test_discuss_is_suppressed_while_an_outstanding_discussion_receipt_stands(
 ) -> None:
     task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
     gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
+    _eligible_predicates(monkeypatch)
     receipt = TaskDetachedTurnReceipt(  # type: ignore[call-arg]
         id=uuid.uuid4(),
         workspace_id=_WORKSPACE_ID,
@@ -392,6 +428,7 @@ def test_discuss_is_suppressed_while_an_outstanding_discussion_receipt_stands(
         task=task,
         gate=gate,
         sessions=[_reviewer_session(ready=True)],
+        account_operational=True,
     )
 
     assert menu == ("approve", "cancel_task")
@@ -406,6 +443,7 @@ def test_resolved_history_gates_never_advertise_a_menu() -> None:
             task=task,
             gate=_gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION, status="approved"),
             sessions=[],
+            account_operational=True,
         )
         == ()
     )
@@ -422,10 +460,14 @@ def test_task_level_actions_follow_the_authoritative_rules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An eligible current ready_to_plan attempt offers start (no gate); the
-    # cancel/abort eligibility predicates are the authoritative ones and are
-    # invoked inside the caller's transaction.
+    # start/cancel/abort eligibility predicates are the authoritative ones
+    # and are invoked inside the caller's transaction.
     task = _task()
     called: dict[str, bool] = {}
+
+    def _start_eligible(pool: Any, *, task: Any) -> bool:
+        called["start"] = True
+        return True
 
     def _cancel_eligible(pool: Any, *, task: Any) -> bool:
         called["cancel"] = True
@@ -435,6 +477,7 @@ def test_task_level_actions_follow_the_authoritative_rules(
         called["abort"] = True
         return False
 
+    monkeypatch.setattr(task_reads, "start_durably_offered", _start_eligible)
     monkeypatch.setattr(task_reads, "cancellation_durably_offered", _cancel_eligible)
     monkeypatch.setattr(task_reads, "abort_durably_offered", _abort_eligible)
 
@@ -443,7 +486,30 @@ def test_task_level_actions_follow_the_authoritative_rules(
     )
 
     assert actions == ("start", "cancel_task")
-    assert called == {"cancel": True, "abort": True}
+    assert called == {"start": True, "cancel": True, "abort": True}
+
+
+def test_start_is_suppressed_when_the_durable_projection_eligibility_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A ready_to_plan Task whose durable GitHub projection has closed (or
+    # otherwise contradicted the #76 queue-eligibility guard) is never
+    # offered, even though the primary status alone would suggest it.
+    task = _task()
+
+    def _ineligible(pool: Any, *, task: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(task_reads, "start_durably_offered", _ineligible)
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: False)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+
+    assert (
+        task_reads._task_level_actions(
+            _RecordingPool(), task=task, account_operational=True, gate_offers_cancel=False
+        )
+        == ()
+    )
 
 
 def test_task_level_cancel_is_never_duplicated_when_the_gate_offers_it(
@@ -455,9 +521,7 @@ def test_task_level_cancel_is_never_duplicated_when_the_gate_offers_it(
         raise AssertionError("cancel eligibility is never evaluated for a gate-offered cancel")
 
     monkeypatch.setattr(task_reads, "cancellation_durably_offered", _unexpected)
-    monkeypatch.setattr(
-        task_reads, "abort_durably_offered", lambda pool, *, task: False
-    )
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
 
     actions = task_reads._task_level_actions(
         _RecordingPool(), task=task, account_operational=True, gate_offers_cancel=True
@@ -478,9 +542,12 @@ def test_terminalization_bars_ordinary_commands_and_archived_offers_only_purge(
         terminalization_origin="owner_cancelled",
         terminalization_established_at=_OBSERVED,
     )
-    assert task_reads._task_level_actions(
-        _RecordingPool(), task=committed, account_operational=True, gate_offers_cancel=False
-    ) == ()
+    assert (
+        task_reads._task_level_actions(
+            _RecordingPool(), task=committed, account_operational=True, gate_offers_cancel=False
+        )
+        == ()
+    )
 
     # An archived attempt offers only the applicable purge.
     archived = _task(
@@ -565,21 +632,13 @@ def test_review_iteration_presentation_never_bounds_the_relevant_or_latest_recor
             task_id=_TASK_ID,
             review_loop_id=loop.id,
             iteration_number=number,
-            plan_revision_id=(
-                task.current_plan_revision_id if number == 7 else uuid.uuid4()
-            ),
+            plan_revision_id=(task.current_plan_revision_id if number == 7 else uuid.uuid4()),
             task_pull_request_id=None,
             reviewed_head_sha=None,
-            outcome=(
-                None
-                if number == 7
-                else ReviewOutcome.CHANGES_REQUESTED
-            ),
+            outcome=(None if number == 7 else ReviewOutcome.CHANGES_REQUESTED),
             summary=None if number == 7 else f"round {number}",
             findings=(
-                None
-                if number == 7
-                else [{"summary": f"finding {number}", "details": "details"}]
+                None if number == 7 else [{"summary": f"finding {number}", "details": "details"}]
             ),
             decided_at=None if number == 7 else _OBSERVED + timedelta(minutes=number),
             created_at=_OBSERVED + timedelta(minutes=number),
@@ -625,3 +684,331 @@ def test_cursor_roundtrip_is_opaque_and_deterministic() -> None:
 
     with pytest.raises(task_reads.InvalidCommandError):
         decode_task_page_cursor("not-a-cursor")
+
+
+# --- composition-level offered menus and detail projections ------------------
+
+
+class _ReadTransactionConnection:
+    """The no-op connection double the composed read transaction runs over."""
+
+    def transaction(self) -> Any:
+        return contextlib.nullcontext()
+
+    def execute(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+class _ReadPool:
+    """Yields the no-op connection double for the composed read transaction."""
+
+    def connection(self) -> Any:
+        return contextlib.nullcontext(_ReadTransactionConnection())
+
+    def close(self) -> None:
+        raise AssertionError("read composition tests never close pools")
+
+
+def _completed_execution() -> Any:
+    return Execution(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        producer_session_id=uuid.uuid4(),
+        execution_number=2,
+        status=ExecutionStatus.SUCCEEDED,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        implementation_result={
+            "type": "implementation_result",
+            "schema_version": 1,
+            "status": "COMPLETED",
+            "branch": "openorc/issue-42",
+            "summary": "Implemented the change.",
+            "changes": ["Added the read surface."],
+            "validation": ["Deterministic suite green."],
+            "notes": None,
+        },
+        last_qualifying_activity_at=_OBSERVED,
+        review_iteration_id=None,
+    )
+
+
+def test_summary_vetoes_gate_cancel_while_the_accounted_runtime_barrier_stands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The composed summary's actual offered menu: an unsettled current
+    Interrupt (#342) vetoes cancel_task in the gate menu exactly as it vetoes
+    the Task-level action — the veto is never Task-level only."""
+    task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
+    gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
+    sessions = [_reviewer_session(ready=True)]
+
+    def _no_receipts(*args: Any, **kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        task_reads,
+        "list_task_detached_turn_receipts_for_original_attempt",
+        _no_receipts,
+    )
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: False)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+
+    summary = task_reads._compose_summary(
+        _RecordingPool(),
+        task=task,
+        observation=_observation(task, current_gate=gate, sessions=tuple(sessions)),
+        issue=None,
+        pull_request=None,
+        account_operational=True,
+    )
+
+    assert summary.current_gate is not None
+    assert summary.current_gate.actions == ("approve", "discuss")
+    assert summary.actions == ()
+
+
+def test_summary_suppresses_resume_while_the_episode_settlement_is_outstanding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The composed summary's actual offered menu on the blocked OWNER_ABORT
+    gate: the guarded continuation derivation's #342 precondition keeps
+    ``resume`` unadvertised while the episode interruption is not positively
+    settled, and the eligible cancel survives."""
+    task = _task(status="blocked", source_requirements_fingerprint="a" * 64)
+    gate = _gate(OwnerGateType.OWNER_ABORT)
+
+    monkeypatch.setattr(
+        task_reads,
+        "blocked_continuation_durably_offered",
+        lambda pool, *, task, gate: False,
+    )
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: True)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+
+    summary = task_reads._compose_summary(
+        _RecordingPool(),
+        task=task,
+        observation=_observation(task, current_gate=gate),
+        issue=None,
+        pull_request=None,
+        account_operational=True,
+    )
+
+    assert summary.current_gate is not None
+    assert summary.current_gate.actions == ("cancel_task",)
+    # The Task-level projection never duplicates the gate-offered cancel.
+    assert summary.actions == ()
+
+
+def test_summary_offers_resume_when_the_guarded_continuation_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task(status="blocked", source_requirements_fingerprint="a" * 64)
+    gate = _gate(OwnerGateType.OWNER_ABORT)
+
+    monkeypatch.setattr(
+        task_reads,
+        "blocked_continuation_durably_offered",
+        lambda pool, *, task, gate: True,
+    )
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: True)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+
+    summary = task_reads._compose_summary(
+        _RecordingPool(),
+        task=task,
+        observation=_observation(task, current_gate=gate),
+        issue=None,
+        pull_request=None,
+        account_operational=True,
+    )
+
+    assert summary.current_gate is not None
+    assert summary.current_gate.actions == ("resume", "cancel_task")
+
+
+def test_gate_menus_respect_the_account_and_terminalization_barriers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate-scoped menu is computed under the same barriers as the
+    Task-level projection: a claimed account deletion or a committed
+    terminalization bars every offered command, gate menus included."""
+    task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
+    gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
+
+    def _unexpected(*args: Any, **kwargs: Any) -> bool:
+        raise AssertionError("no eligibility predicate runs behind a barrier")
+
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", _unexpected)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", _unexpected)
+
+    assert (
+        task_reads._gate_menu(
+            _RecordingPool(),
+            task=task,
+            gate=gate,
+            sessions=[],
+            account_operational=False,
+        )
+        == ()
+    )
+    committed = _task(
+        status="waiting_for_owner",
+        source_requirements_fingerprint="a" * 64,
+        terminalization_outcome="cancelled",
+        terminalization_origin="owner_cancelled",
+        terminalization_established_at=_OBSERVED,
+    )
+    assert (
+        task_reads._gate_menu(
+            _RecordingPool(),
+            task=committed,
+            gate=gate,
+            sessions=[],
+            account_operational=True,
+        )
+        == ()
+    )
+
+
+def test_detail_carries_the_completed_implementation_result_and_outstanding_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Task detail at the PR_AUTHORIZATION decision point projects the
+    completed implementation result (safe typed fields only) with a matching
+    executions_total, and the outstanding receipt evidence is carried with
+    its matching total."""
+    task = _task(status="waiting_for_owner", source_requirements_fingerprint="a" * 64)
+    completed = _completed_execution()
+    claimed_receipt = TaskDetachedTurnReceipt(  # type: ignore[call-arg]
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        task_agent_session_id=uuid.uuid4(),
+        operation=PendingTaskRuntimeInteractionOperation.OWNER_REVIEWER_DISCUSSION,
+        original_attempt_kind=OriginalAttemptKind.OWNER_GATE_DISCUSSION,
+        original_attempt_id=uuid.uuid4(),
+        expected_formal_family="none",
+        admitted_turn_reference=None,
+        status=TaskDetachedTurnReceiptStatus.CLAIMED,
+        outcome={},
+        contradicted_at=None,
+        claimed_at=_OBSERVED,
+        admitted_at=None,
+        settled_at=None,
+        updated_at=_OBSERVED,
+    )
+    observation = _observation(
+        task,
+        executions=(completed,),
+        executions_total=1,
+        receipts=(claimed_receipt,),
+        outstanding_receipts_total=1,
+    )
+
+    monkeypatch.setattr(task_reads, "require_workspace_task", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        task_reads,
+        "load_task_observation",
+        lambda pool, *, workspace_id, task_id: observation,
+    )
+    monkeypatch.setattr(
+        task_reads,
+        "list_pending_task_runtime_interactions",
+        lambda pool, *, workspace_id, task_id: [],
+    )
+    monkeypatch.setattr(task_reads, "require_account_operational", lambda pool, *, profile_id: None)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: False)
+
+    detail = task_reads.get_task_for_owner(
+        _ReadPool(),
+        profile_id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+    )
+
+    assert detail.executions_total == 1
+    assert len(detail.executions) == 1
+    projected = detail.executions[0]
+    assert projected.execution.id == completed.id
+    assert projected.result is not None
+    # The safe typed projection: the Owner-authored completion facts only.
+    assert projected.result["status"] == "COMPLETED"
+    assert projected.result["branch"] == "openorc/issue-42"
+    assert "type" not in projected.result
+    assert "schema_version" not in projected.result
+    # The outstanding evidence survives with its matching total.
+    assert detail.outstanding_receipts == (claimed_receipt,)
+    assert detail.outstanding_receipts_total == 1
+
+
+def test_list_items_supply_the_discussion_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The composed list item's actual offered menu: an eligible READY
+    Reviewer offers ``discuss`` in the list exactly as in the detail — the
+    summary is never a suppression of a durably offered action — and a
+    binding without a READY Reviewer suppresses it again."""
+    gate = _gate(OwnerGateType.IMPLEMENTATION_AUTHORIZATION)
+    task = _task(
+        status="waiting_for_owner",
+        source_requirements_fingerprint="a" * 64,
+        current_owner_gate_id=gate.id,
+    )
+
+    monkeypatch.setattr(
+        task_reads,
+        "find_github_issue_projections_by_identity",
+        lambda pool, *, repository_id, github_issue_ids: {},
+    )
+    monkeypatch.setattr(task_reads, "get_task_pull_request_for_task", lambda pool, *, task_id: None)
+    monkeypatch.setattr(
+        task_reads,
+        "list_owner_gates_by_ids",
+        lambda pool, *, owner_gate_ids: {gate.id: gate},
+    )
+    monkeypatch.setattr(
+        task_reads,
+        "list_current_task_blocks_for_tasks",
+        lambda pool, *, task_ids: {},
+    )
+    monkeypatch.setattr(
+        task_reads,
+        "sum_task_retained_session_costs_for_tasks",
+        lambda pool, *, task_ids: {},
+    )
+    monkeypatch.setattr(
+        task_reads,
+        "list_task_agent_sessions_for_tasks",
+        lambda pool, *, task_ids: {_TASK_ID: [_reviewer_session(ready=True)]},
+    )
+
+    def _no_receipts(*args: Any, **kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        task_reads,
+        "list_task_detached_turn_receipts_for_original_attempt",
+        _no_receipts,
+    )
+    monkeypatch.setattr(task_reads, "cancellation_durably_offered", lambda pool, *, task: True)
+    monkeypatch.setattr(task_reads, "abort_durably_offered", lambda pool, *, task: False)
+    monkeypatch.setattr(task_reads, "require_account_operational", lambda pool, *, profile_id: None)
+
+    summary = task_reads._compose_list_item(_RecordingPool(), task=task, profile_id=uuid.uuid4())
+
+    assert summary.current_gate is not None
+    assert summary.current_gate.actions == ("approve", "discuss", "cancel_task")
+
+    # Without a READY Reviewer binding the discussion prerequisite fails again.
+    monkeypatch.setattr(
+        task_reads,
+        "list_task_agent_sessions_for_tasks",
+        lambda pool, *, task_ids: {_TASK_ID: [_reviewer_session(ready=False)]},
+    )
+    suppressed = task_reads._compose_list_item(_RecordingPool(), task=task, profile_id=uuid.uuid4())
+    assert suppressed.current_gate is not None
+    assert suppressed.current_gate.actions == ("approve", "cancel_task")

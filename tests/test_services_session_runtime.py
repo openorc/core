@@ -53,7 +53,7 @@ from openorc.adapters.cline import (
     ClineSessionIdentity,
 )
 from openorc.adapters.cline.values import ClineStartResult
-from openorc.domain.connections import WorkflowRole
+from openorc.domain.connections import WorkflowRole, WorkflowRoleBinding
 from openorc.domain.detached_turns import TaskDetachedTurnReceiptStatus
 from openorc.domain.operational_failures import OriginalAttemptKind
 from openorc.domain.sessions import TaskSessionLifecycleStatus
@@ -283,9 +283,10 @@ def _session_row(
     )
 
 
-# Phase 1 (five reads) plus the #376 configured-pair capture read: one
-# more short read-only pool transaction before the external call.
-_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 6
+# Phase 1 (five reads): workspace, account barrier, task, binding, admitted
+# Connection. The #376 configured pair is carried IN as the composition
+# selection — never re-read here.
+_PHASE1_LIFECYCLE = ["pool_enter", "pool_exit"] * 5
 _FINALIZE_LIFECYCLE = [
     "pool_enter",
     "tx_enter",
@@ -309,17 +310,17 @@ def _establish_results(
     binding_row: tuple[Any, ...],
     connection_row: tuple[Any, ...],
     guidance: str = "",
-    route_row: tuple[Any, ...] | None = None,
     finalize_results: list[_CannedResult] | None = None,
 ) -> ScriptedConnection:
     """Canned establish reads: the Phase-1 validation sequence (no role-route
-    read since #189), then the optional finalize-phase sequence (workspace,
+    read since #189 and no second #376 pair read since the selection is
+    carried in), then the optional finalize-phase sequence (workspace,
     barrier, initialize write).
 
-    The #376 configured provider/model capture reads the durable role-route
-    once after the connection read — a capture, never a gating dependency:
-    the route is recorded exactly as the construction context resolves it,
-    and a changed route still never invalidates the admitted binding.
+    The #376 configured provider/model pair arrives as the composition
+    selection (``establish_task_agent_session(..., configured_provider=...,
+    configured_model=...)``) — the exact pair the construction context was
+    built with — so establishment never re-reads the mutable route.
     """
     results: list[_CannedResult] = [
         _ws_row(workspace_id, owner_profile_id, guidance=guidance),
@@ -327,7 +328,6 @@ def _establish_results(
         _task_row(workspace_id),
         binding_row,
         connection_row,
-        route_row,  # the #376 configured-pair capture read (None = unconfigured route)
     ]
     if finalize_results is not None:
         results.extend(finalize_results)
@@ -353,7 +353,11 @@ def _establish_adapter(
 
 
 def _establish_kwargs(
-    workspace_id: Any, task_id: Any, *, effective_configuration: Any = None
+    workspace_id: Any,
+    task_id: Any,
+    *,
+    effective_configuration: Any = None,
+    configured_pair: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "workspace_id": workspace_id,
@@ -362,6 +366,8 @@ def _establish_kwargs(
         "effective_configuration": (
             {} if effective_configuration is None else effective_configuration
         ),
+        "configured_provider": None if configured_pair is None else configured_pair[0],
+        "configured_model": None if configured_pair is None else configured_pair[1],
     }
 
 
@@ -665,12 +671,11 @@ def test_role_route_change_does_not_block_establishment_of_the_admitted_binding(
     ]
     assert len(finalize_updates) == 1
     # The repointed route never gated the establishment and the binding was
-    # never re-pointed: the single #376 capture read records what the route
-    # reported without ever validating against it (a changed route is future
-    # admission state, issue #189).
+    # never re-pointed: establishment never reads the mutable route at all —
+    # the #376 configured pair is carried in as the composition selection —
+    # so a changed route is purely future admission state (issue #189).
     route_reads = [sql for sql, _ in conn.executed if "workflow_role_bindings" in sql]
-    assert len(route_reads) == 1
-    assert "for update" not in route_reads[0]
+    assert route_reads == []
 
 
 def test_role_route_change_leaves_already_ready_establishment_idempotent() -> None:
@@ -1726,6 +1731,8 @@ def test_establish_malformed_role_fails_inside_the_span_without_database_access(
             task_id=uuid.uuid4(),
             role=malformed_role,
             effective_configuration={},
+            configured_provider=None,
+            configured_model=None,
         )
 
     assert conn.executed == []
@@ -1747,6 +1754,8 @@ def test_establish_non_adapter_runtime_is_an_invalid_command() -> None:
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
             effective_configuration={},
+            configured_provider=None,
+            configured_model=None,
         )
 
     assert conn.executed == []
@@ -1779,6 +1788,8 @@ def test_establish_malformed_effective_configuration_is_an_invalid_command(
             task_id=uuid.uuid4(),
             role=WorkflowRole.PRODUCER,
             effective_configuration=malformed_selection,
+            configured_provider=None,
+            configured_model=None,
         )
 
     assert conn.executed == []
@@ -1938,27 +1949,26 @@ def test_establishment_through_the_real_cline_adapter_and_scripted_backend() -> 
     assert conn.lifecycle == _PHASE1_LIFECYCLE + _FINALIZE_LIFECYCLE
 
 
-def _configured_route_row(
+def _selected_route_binding(
     workspace_id: Any,
-    role: str,
+    role: WorkflowRole,
     connection_id: Any,
     *,
     configured_provider: str | None,
     configured_model: str | None,
-    role_prompt_override: str | None = None,
-) -> tuple[Any, ...]:
-    # Canned row matching the #162 binding columns with a concrete
-    # configuration state (the unconfigured sibling rows carry Nones).
-    return (
-        uuid.uuid4(),
-        workspace_id,
-        role,
-        connection_id,
-        configured_provider,
-        configured_model,
-        role_prompt_override,
-        _OBSERVED,
-        _OBSERVED,
+) -> WorkflowRoleBinding:
+    """The composition-selected workflow-role route the attachment lease and
+    the establishment service share (the #376 captured construction facts)."""
+    return WorkflowRoleBinding(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        role=role,
+        connection_id=connection_id,
+        configured_provider=configured_provider,
+        configured_model=configured_model,
+        role_prompt_override=None,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
     )
 
 
@@ -1996,35 +2006,21 @@ def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot
     )
     conn = ScriptedConnection(
         [
-            # Phase 1: service reads — workspace, barrier, task, binding, the
-            # admitted Connection carrying the EDITED safe_config, and the
-            # #376 configured-pair capture read (the same durable route the
-            # resolver reads during the handshake).
+            # Phase 1: service reads — workspace, barrier, task, binding, and
+            # the admitted Connection carrying the EDITED safe_config. The
+            # #376 configured pair is carried IN as the composition selection
+            # (never re-read here) and shared with the resolver below.
             _ws_row(workspace_id, owner_profile_id, guidance=guidance),
             _BARRIER_ROW,
             _task_row(workspace_id),
             _session_row(workspace_id, task_id, "producer", connection_id),
             _connection_row(workspace_id, connection_id, safe_config=durable_safe_config),
-            _configured_route_row(
-                workspace_id,
-                "producer",
-                connection_id,
-                configured_provider="configured-provider",
-                configured_model="configured-model",
-            ),
-            # Phase 3: the durable resolver's fresh reads — the binding, the
-            # admitted Connection (again carrying the EDITED safe_config,
-            # which must not be substituted for the selection), and the
-            # current role configuration.
+            # Phase 3: the durable resolver's fresh reads — the binding and
+            # the admitted Connection (again carrying the EDITED safe_config,
+            # which must not be substituted for the selection). The resolver
+            # consumes the SAME selected route the establishment carries.
             _session_row(workspace_id, task_id, "producer", connection_id),
             _connection_row(workspace_id, connection_id, safe_config=durable_safe_config),
-            _configured_route_row(
-                workspace_id,
-                "producer",
-                connection_id,
-                configured_provider="configured-provider",
-                configured_model="configured-model",
-            ),
             # Phase 4: finalize reads — workspace, barrier, initialize write.
             _ws_row(workspace_id, owner_profile_id),
             _BARRIER_ROW,
@@ -2040,15 +2036,29 @@ def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot
             "text": json.dumps({"type": "session_ready", "schema_version": 1, "status": "READY"}),
         },
     )
+    selected_route = _selected_route_binding(
+        workspace_id,
+        WorkflowRole.PRODUCER,
+        connection_id,
+        configured_provider="configured-provider",
+        configured_model="configured-model",
+    )
     resolver = DurableClineConstructionContextResolver(
-        _pool(conn), bootstrap_repository_base=selected_base
+        _pool(conn),
+        bootstrap_repository_base=selected_base,
+        selected_role_route=selected_route,
     )
     adapter = ClineAdapter(backend, resolver)
 
     session = establish_task_agent_session(
         _pool(conn),
         adapter,
-        **_establish_kwargs(workspace_id, task_id, effective_configuration=selected_configuration),
+        **_establish_kwargs(
+            workspace_id,
+            task_id,
+            effective_configuration=selected_configuration,
+            configured_pair=("configured-provider", "configured-model"),
+        ),
     )
 
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
@@ -2074,10 +2084,132 @@ def test_establish_pins_the_composition_selected_base_agreeing_with_the_snapshot
     assert update_params[1].obj["configuration"]["repository_base"] == selected_base
 
     # No database transaction was held across the runtime call: Phase 1,
-    # then the resolver's three reads inside the runtime call, then finalize.
+    # then the resolver's two reads inside the runtime call, then finalize.
     assert conn.lifecycle == (
-        _PHASE1_LIFECYCLE + ["pool_enter", "pool_exit"] * 3 + _FINALIZE_LIFECYCLE
+        _PHASE1_LIFECYCLE + ["pool_enter", "pool_exit"] * 2 + _FINALIZE_LIFECYCLE
     )
+
+
+def test_establish_pins_the_selected_configured_pair_agreeing_with_the_snapshot() -> None:
+    """Regression (#376 review): the configured provider/model pair the READY
+    snapshot records is the exact composition-selected pair carried into the
+    establishment — the pair the fresh session was constructed with — never a
+    second, independently timed durable route read. Establishment never reads
+    the mutable route at all, so a between-reads configuration change cannot
+    make the constructed session's pair and the pinned snapshot disagree; a
+    changed route remains future admission state (issue #189)."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    guidance = "Owner-authored guidance composed upstream into the initialization."
+    safe_config = {"repository_base": "/srv/selected/repositories"}
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+        snapshot={
+            "adapter": "cline",
+            "configuration": safe_config,
+            "configured_provider": "selected-provider",
+            "configured_model": "selected-model",
+        },
+    )
+    conn = _establish_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        connection_id,
+        binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
+        connection_row=_connection_row(workspace_id, connection_id, safe_config=safe_config),
+        guidance=guidance,
+        finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
+    )
+    adapter = FakeAgentRuntimeAdapter(
+        reported_provider="fake-provider",
+        reported_model="fake-model",
+        reported_runtime_version="fake-1.2.3",
+        lifecycle=conn.lifecycle,
+    )
+    adapter.queue_creation(session_ready_candidate())
+
+    session = establish_task_agent_session(
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(
+            workspace_id,
+            task_id,
+            effective_configuration=safe_config,
+            configured_pair=("selected-provider", "selected-model"),
+        ),
+    )
+
+    assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
+    update_params = _initialize_updates(conn)[0][1]
+    assert update_params is not None
+    # The pinned READY snapshot records exactly the selected pair.
+    assert update_params[1].obj == {
+        "adapter": "cline",
+        "configuration": safe_config,
+        "configured_provider": "selected-provider",
+        "configured_model": "selected-model",
+    }
+    # The mutable route is never read at establishment: the pair arrived as
+    # the composition selection shared with the construction context.
+    route_reads = [sql for sql, _ in conn.executed if "workflow_role_bindings" in sql]
+    assert route_reads == []
+    assert conn.lifecycle == _PHASE1_LIFECYCLE + ["create_session"] + _FINALIZE_LIFECYCLE
+
+
+def test_establish_records_an_unconfigured_route_as_an_absent_pair() -> None:
+    """Legacy-null behavior (#376): an unconfigured workflow-role route
+    honestly records no configured pair — never a zero-substituted value —
+    and the snapshot stays complete-or-absent together."""
+    owner_profile_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    safe_config = {"repository_base": "/srv/selected/repositories"}
+    ready_row = _session_row(
+        workspace_id,
+        task_id,
+        "producer",
+        connection_id,
+        lifecycle_status="ready",
+        external_session_id="ext-1",
+        initialized_at=_OBSERVED,
+        snapshot={"adapter": "cline", "configuration": safe_config},
+    )
+    conn = _establish_results(
+        workspace_id,
+        owner_profile_id,
+        task_id,
+        connection_id,
+        binding_row=_session_row(workspace_id, task_id, "producer", connection_id),
+        connection_row=_connection_row(workspace_id, connection_id, safe_config=safe_config),
+        finalize_results=[_ws_row(workspace_id, owner_profile_id), _BARRIER_ROW, ready_row],
+    )
+    adapter = FakeAgentRuntimeAdapter(
+        reported_provider="fake-provider",
+        reported_model="fake-model",
+        reported_runtime_version="fake-1.2.3",
+        lifecycle=conn.lifecycle,
+    )
+    adapter.queue_creation(session_ready_candidate())
+
+    establish_task_agent_session(
+        _pool(conn),
+        adapter,
+        **_establish_kwargs(workspace_id, task_id, effective_configuration=safe_config),
+    )
+
+    update_params = _initialize_updates(conn)[0][1]
+    assert update_params is not None
+    assert update_params[1].obj == {"adapter": "cline", "configuration": safe_config}
 
 
 @pytest.mark.parametrize("mode", ["disabled", "missing", "cross-workspace"])
@@ -2098,17 +2230,18 @@ def test_fresh_cline_construction_fails_closed_on_an_ineligible_admitted_connect
         "missing": None,
         "cross-workspace": _connection_row(uuid.uuid4(), connection_id),
     }[mode]
-    route_row = _configured_route_row(
-        workspace_id,
-        "producer",
-        connection_id,
-        configured_provider="configured-provider",
-        configured_model="configured-model",
-    )
-    conn = ScriptedConnection([binding_row, connection_row, route_row])
+    conn = ScriptedConnection([binding_row, connection_row])
     backend = FakeClineSdkBackend()
     resolver = DurableClineConstructionContextResolver(
-        _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
+        _pool(conn),
+        bootstrap_repository_base="/srv/selected/repositories",
+        selected_role_route=_selected_route_binding(
+            workspace_id,
+            WorkflowRole.PRODUCER,
+            connection_id,
+            configured_provider="configured-provider",
+            configured_model="configured-model",
+        ),
     )
     adapter = ClineAdapter(backend, resolver)
 
@@ -2242,7 +2375,6 @@ def _dispatch_results(
         if connection_row is not None
         else _connection_row(workspace_id, connection_id),
         outstanding_receipt,  # the replay guard's outstanding-receipt read
-        None,  # the #376 configured-pair capture read (unconfigured route)
     ]
     if receipt_row is not None:
         results.append(receipt_row)  # the provisional receipt insert
@@ -2260,6 +2392,7 @@ def _dispatch_kwargs(
     task_id: Any,
     *,
     effective_configuration: Any = None,
+    configured_pair: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "workspace_id": workspace_id,
@@ -2268,6 +2401,8 @@ def _dispatch_kwargs(
         "effective_configuration": (
             {} if effective_configuration is None else effective_configuration
         ),
+        "configured_provider": None if configured_pair is None else configured_pair[0],
+        "configured_model": None if configured_pair is None else configured_pair[1],
         "original_attempt_kind": OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
         "original_attempt_id": uuid.uuid4(),
     }

@@ -31,6 +31,12 @@ explicit outer transaction block:
   of that, so nothing here commits and the fixture rollback still discards
   every row at test end.
 
+``composed_read_transaction`` is proven separately below with its own
+autocommit writer connection: the read-side composition's REPEATABLE READ
+snapshot pins the reader's view against a concurrently committed writer (the
+issue #376 coherence boundary READ COMMITTED cannot provide), and the
+READ ONLY characteristics refuse any write through the read composition.
+
 Run explicitly when a target has been made available:
 
     OPENORC_TEST_DATABASE_URL=<supplied non-production branch database URL> \
@@ -50,14 +56,18 @@ from contextlib import contextmanager
 from typing import Any, cast
 
 import pytest
-from psycopg import Connection
+from psycopg import Connection, connect
+from psycopg import errors as psycopg_errors
 from psycopg.errors import UniqueViolation
 
 from openorc.domain.events import WorkflowEventActor, WorkflowEventType
 from openorc.persistence import events as event_repositories
 from openorc.persistence import tasks as task_repositories
 from openorc.persistence.pool import DatabasePool
-from openorc.services.transaction_composition import composed_transaction
+from openorc.services.transaction_composition import (
+    composed_read_transaction,
+    composed_transaction,
+)
 
 # Every test in this module requires the explicitly supplied non-production
 # branch database. The marker excludes the module from ordinary DB-free runs
@@ -272,3 +282,59 @@ def test_composition_recovers_from_a_handled_nested_failure(conn: Connection[Any
 
     assert _task_count(conn, 920_101) == 1
     assert _task_count(conn, 930_201) == 1
+
+
+def test_composed_read_transaction_pins_a_stable_snapshot_against_a_concurrent_writer(
+    migrated_database: str,
+) -> None:
+    """The issue #376 coherence boundary on real Postgres.
+
+    The composed Task list/detail reads must observe ONE committed snapshot:
+    a workflow transition committing between the composition's statements can
+    never produce a response mixing an old state token with newly resolved
+    gate or subject facts. The reader composes through
+    ``composed_read_transaction`` while a second connection commits an update
+    in between its two reads; REPEATABLE READ pins the reader's view to the
+    pre-commit snapshot (READ COMMITTED would expose the update), and the
+    READ ONLY characteristics refuse any write through the read composition.
+    """
+    probe_table = "integration_read_snapshot_probe"
+    with connect(  # noqa: SIM117 - distinct lifetimes keep the roles explicit
+        migrated_database, autocommit=True, prepare_threshold=None
+    ) as writer:
+        writer.execute(f"create table {probe_table} (id int primary key, value text)")
+        try:
+            writer.execute(f"insert into {probe_table} values (1, 'before')")
+            with connect(
+                migrated_database, autocommit=True, prepare_threshold=None
+            ) as reader_connection:
+                pool = cast(DatabasePool, _BorrowedConnectionPool(reader_connection))
+
+                def _read_current_value(view: DatabasePool) -> str:
+                    with view.connection() as probe_conn:
+                        row = probe_conn.execute(
+                            f"select value from {probe_table} where id = 1"
+                        ).fetchone()
+                    assert row is not None
+                    return str(row[0])
+
+                with composed_read_transaction(pool) as view:
+                    assert _read_current_value(view) == "before"
+                    # The concurrent writer commits between the reader's two
+                    # composed reads.
+                    writer.execute(f"update {probe_table} set value = 'after' where id = 1")
+                    # The composed read still observes the snapshot taken at
+                    # its transaction start — the coherent observation every
+                    # Task list/detail response composes from.
+                    assert _read_current_value(view) == "before"
+                    # READ ONLY: no write can ride the read composition.
+                    with (
+                        pytest.raises(psycopg_errors.ReadOnlySqlTransaction),
+                        view.connection() as write_conn,
+                    ):
+                        write_conn.execute(f"insert into {probe_table} values (2, 'rogue')")
+                    # The failed write was a handled savepoint rejection; the
+                    # snapshot view stays usable.
+                    assert _read_current_value(view) == "before"
+        finally:
+            writer.execute(f"drop table {probe_table}")

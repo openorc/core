@@ -346,6 +346,8 @@ class _ScriptedBootstrapRuntime(TaskBootstrapRuntimeComposition):
             yield TaskBootstrapEstablishmentLease(
                 adapter=self._adapters[role],
                 selected_configuration=dict(self._selected_configuration),
+                selected_configured_provider=None,
+                selected_configured_model=None,
             )
 
         return lease()
@@ -462,8 +464,6 @@ def _establish_results(
         task_row,
         binding_row,
         connection_row,
-        # The #376 configured-pair capture read (unconfigured route here).
-        None,
         _ws_row(workspace_id, owner_profile_id),
         _BARRIER_ROW,
         ready_row if ready_row is not None else (None,),
@@ -1403,8 +1403,6 @@ def _dispatch_phase_results(
         binding_row,
         env.connection_row,
         None,  # no outstanding receipt
-        # The #376 configured-pair capture read (unconfigured route here).
-        None,
     ]
     if receipt_row is not None:
         results.append(receipt_row)

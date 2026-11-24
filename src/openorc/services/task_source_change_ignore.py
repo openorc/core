@@ -114,6 +114,7 @@ from openorc.services.workspace_authorization import require_workspace_task
 __all__ = [
     "IgnoredSourceChange",
     "IgnoredSourceChangeBoundary",
+    "ignore_durably_offered",
     "ignore_github_source_change",
 ]
 
@@ -261,6 +262,35 @@ def _require_block_evidence(block: TaskBlock, *, task: Task) -> str:
             "task's stored comparison value; the ignore action is refused"
         )
     return observed
+
+
+def ignore_durably_offered(transaction_pool: DatabasePool, *, task: Task, gate: OwnerGate) -> bool:
+    """Whether the durable facts positively support offering ``ignore`` (#376).
+
+    The authorized read surface's backend-generated action projection reuses
+    the authoritative Ignore verification's durable Phase-1 predicates — the
+    blocked status, the exact current pending ``github_issue_change`` gate,
+    its sole unresolved TaskBlock subject, and the block's coherent
+    requirements-change evidence — exactly as the command boundary applies
+    them, evaluated inside the caller's own transaction with NO row locks,
+    never persisted, and never an external call. The fresh authoritative
+    GitHub exactness the command re-proves before any effect stays
+    command-side: reads never call GitHub, so the offer rests on the durable
+    preconditions alone. The command still revalidates everything freshly at
+    execution; offering is neither permission nor a promise.
+    """
+    if task.status is not TaskStatus.BLOCKED:
+        return False
+    if gate.status is not OwnerGateStatus.PENDING or gate.task_id != task.id:
+        return False
+    if gate.gate_type is not OwnerGateType.GITHUB_ISSUE_CHANGE:
+        return False
+    try:
+        block = require_owner_gate_unresolved_block_subject(transaction_pool, task=task, gate=gate)
+        _require_block_evidence(block, task=task)
+    except (ConflictError, NotFoundError, StaleOperationError):
+        return False
+    return True
 
 
 def _verify_ignore_subject(

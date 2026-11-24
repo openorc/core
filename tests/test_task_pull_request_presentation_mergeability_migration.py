@@ -22,9 +22,7 @@ MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
 def _migration_text() -> str:
     matches = sorted(
         p.name
-        for p in MIGRATIONS_DIR.glob(
-            "*_add_task_pull_request_presentation_and_mergeability.sql"
-        )
+        for p in MIGRATIONS_DIR.glob("*_add_task_pull_request_presentation_and_mergeability.sql")
     )
     assert len(matches) == 1, (
         f"expected exactly one add_task_pull_request_presentation_and_mergeability "

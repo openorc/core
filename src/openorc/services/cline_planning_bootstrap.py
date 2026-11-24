@@ -106,6 +106,8 @@ class ClineBootstrapRuntimeComposition(TaskBootstrapRuntimeComposition):
         return TaskBootstrapEstablishmentLease(
             adapter=attached.adapter,
             selected_configuration=attached.selected_configuration,
+            selected_configured_provider=attached.selected_configured_provider,
+            selected_configured_model=attached.selected_configured_model,
         )
 
     @contextmanager

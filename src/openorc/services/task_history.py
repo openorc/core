@@ -131,9 +131,7 @@ def decode_history_cursor(cursor: str) -> tuple[str, tuple[str, ...]]:
             raise ValueError("unknown collection")
         return collection, tuple(rest.split("|")) if rest else ()
     except (ValueError, UnicodeDecodeError) as error:
-        raise InvalidCommandError(
-            "the cursor is not a valid workflow-history cursor"
-        ) from error
+        raise InvalidCommandError("the cursor is not a valid workflow-history cursor") from error
 
 
 def _require_uuid_command(value: object, name: str) -> None:
@@ -168,7 +166,9 @@ def _page_collection(
 ) -> HistoryCollection:
     """Page one history collection by its own deterministic key (#376)."""
 
-    def _two_key_instant(parts: tuple[str, ...]) -> tuple[datetime, UUID] | None:
+    def _two_key_instant(
+        parts: tuple[str, ...] | None,
+    ) -> tuple[datetime, UUID] | None:
         if parts is None:
             return None
         return datetime.fromisoformat(parts[0]), UUID(parts[1])
@@ -274,11 +274,7 @@ def _page_collection(
             name=collection, items=tuple(items), next_cursor=next_cursor, total=None
         )
     if collection == "executions":
-        after = (
-            None
-            if key is None
-            else (int(key[0]), UUID(key[1]))
-        )
+        after = None if key is None else (int(key[0]), UUID(key[1]))
         items = list_task_history_executions_page(
             tx_view,
             workspace_id=workspace_id,

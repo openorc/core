@@ -33,7 +33,11 @@ Boundary and discipline:
   own current read, so the dialed endpoint and the authentication credential
   are mutually current — and supplied verbatim as the fresh establishment's
   ``effective_configuration`` and as the fresh Producer's
-  ``bootstrap_repository_base``. A between-reads Owner configuration edit is
+  ``bootstrap_repository_base``. On the fresh path the Workspace workflow-role
+  route is likewise selected once and shared with the establishment service,
+  so the configured provider/model pair the fresh construction is built with
+  and the pair the durable READY snapshot records are one captured
+  construction fact (#376). A between-reads Owner configuration edit is
   absorbed by the selection, never silently substituted.
 - Attachment failures preserve the existing normalized taxonomy through the
   adapter's ``classify_backend_failure`` seam: an uncertain connect outcome
@@ -79,7 +83,7 @@ from openorc.domain.connections import AdapterType, Connection, WorkflowRole
 from openorc.domain.intents import TaskInterruptIntent
 from openorc.domain.sessions import TaskAgentSession, TaskSessionLifecycleStatus
 from openorc.observability import annotate_span, application_span
-from openorc.persistence.connections import get_connection
+from openorc.persistence.connections import get_connection, get_role_binding
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.sessions import get_task_agent_session
 from openorc.services import task_abort
@@ -138,12 +142,21 @@ class AttachedClineRuntime:
     path: the invoking service passes it verbatim as
     ``establish_task_agent_session(..., effective_configuration=...)`` so the
     fresh construction and the durable READY snapshot agree by construction.
-    It is ``None`` on the bound path, where the durable READY snapshot is
-    already authoritative.
+    ``selected_configured_provider``/``selected_configured_model`` are the
+    #376 configured pair of the workflow-role route selected ONCE at this
+    composition boundary and shared between the fresh construction and the
+    establishment service for the exact same reason: the invoking service
+    passes them verbatim as ``establish_task_agent_session(...,
+    configured_provider=..., configured_model=...)`` so the durable READY
+    snapshot records exactly the pair the constructed session was built
+    with. All three selections are ``None`` on the bound path, where the
+    durable READY snapshot is already authoritative.
     """
 
     adapter: ClineAdapter
     selected_configuration: Mapping[str, object] | None
+    selected_configured_provider: str | None
+    selected_configured_model: str | None
 
 
 def _require_uuid_command(value: object, name: str) -> UUID:
@@ -357,18 +370,33 @@ def attach_cline_runtime(
             external_session_id=external_session_id,
         )
         annotate_span(span, connection_id=str(binding.connection_id))
-        # The mutable role-binding route is never consulted: the persisted
-        # admitted Connection is the routing authority for both paths.
+        # The mutable role-binding route never decides routing: the persisted
+        # admitted Connection is the routing authority for both paths. The
+        # fresh path reads it once — below — solely as the #376 configured
+        # provider/model selection shared by the fresh construction and the
+        # establishment service.
         _require_attachable_connection(
             get_connection(pool, binding.connection_id), workspace_id=workspace_id
         )
 
-        # --- Phase 2: trusted credential resolution (the #55 boundary's own
-        # current read) and the ONE non-secret configuration selection. The
-        # endpoint and the credential come from the same durable read, so the
-        # dialed attachment is mutually current. All Postgres/Vault reads
-        # finish before any bridge/SDK network I/O and no transaction is
-        # held across attachment. ---
+        # --- Phase 2: the #376 configured-pair selection, trusted credential
+        # resolution (the #55 boundary's own current read), and the ONE
+        # non-secret configuration selection. On the fresh path the
+        # composition-selected workflow-role route is read once here and
+        # shared with the establishment service; the endpoint and the
+        # credential come from the same durable read, so the dialed
+        # attachment is mutually current. All Postgres/Vault reads finish
+        # before any bridge/SDK network I/O and no transaction is held
+        # across attachment. ---
+        selected_role_route = None
+        if phase is ClineAttachmentPhase.FRESH:
+            # The ONE #376 configured provider/model selection: read once and
+            # shared with the establishment service, so the fresh construction
+            # and the durable READY snapshot record one authoritative captured
+            # pair — never a second, independently timed durable read. A
+            # between-reads configuration change is absorbed by the selection;
+            # a changed route applies to future admissions (issue #189).
+            selected_role_route = get_role_binding(pool, workspace_id=workspace_id, role=role)
         credential_connection, secret = resolve_connection_runtime_credential(
             pool, workspace_id=workspace_id, connection_id=binding.connection_id
         )
@@ -424,6 +452,7 @@ def attach_cline_runtime(
                 pool,
                 bootstrap_repository_base=bootstrap_repository_base,
                 working_directory=working_directory,
+                selected_role_route=selected_role_route,
             )
             adapter = ClineAdapter(backend, resolver)
             # The live cost-enforcement observation (issue #291, F8f): on the
@@ -466,6 +495,16 @@ def attach_cline_runtime(
                     adapter=adapter,
                     selected_configuration=(
                         selection if phase is ClineAttachmentPhase.FRESH else None
+                    ),
+                    selected_configured_provider=(
+                        None
+                        if selected_role_route is None
+                        else selected_role_route.configured_provider
+                    ),
+                    selected_configured_model=(
+                        None
+                        if selected_role_route is None
+                        else selected_role_route.configured_model
                     ),
                 )
             finally:

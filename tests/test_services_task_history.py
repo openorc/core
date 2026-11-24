@@ -44,9 +44,10 @@ def test_the_collection_selection_validates_the_documented_vocabulary() -> None:
     assert task_history._selected_collections(None) == HISTORY_COLLECTIONS
     assert task_history._selected_collections(["owner_gates"]) == ("owner_gates",)
     # Duplicates collapse; order is the caller's selection order.
-    assert task_history._selected_collections(
-        ["owner_gates", "owner_gates", "executions"]
-    ) == ("owner_gates", "executions")
+    assert task_history._selected_collections(["owner_gates", "owner_gates", "executions"]) == (
+        "owner_gates",
+        "executions",
+    )
 
     with pytest.raises(task_history.InvalidCommandError):
         task_history._selected_collections([])
@@ -76,6 +77,9 @@ class _ScriptedPool:
     def connection(self):  # noqa: ANN201 - test double
         raise AssertionError("history pages never open an independent transaction")
 
+    def close(self) -> None:
+        raise AssertionError("history tests never close pools")
+
 
 def test_pr_close_intent_is_a_single_record_collection(monkeypatch: pytest.MonkeyPatch) -> None:
     """The PR-close obligation is one record per Task: its page never carries
@@ -83,7 +87,8 @@ def test_pr_close_intent_is_a_single_record_collection(monkeypatch: pytest.Monke
     calls: list[str] = []
 
     def _intents_page(pool: Any, **kwargs: Any) -> tuple[list[Any], list[Any], Any]:
-        calls.append(kwargs.get("after_created_at"))
+        after = kwargs.get("after_created_at")
+        calls.append(after if after is not None else "none")
         return [], [], None
 
     monkeypatch.setattr(task_history, "list_task_history_intents_page", _intents_page)
@@ -101,4 +106,4 @@ def test_pr_close_intent_is_a_single_record_collection(monkeypatch: pytest.Monke
     assert page.items == ()
     assert page.next_cursor is None
     assert page.total == 0
-    assert calls == [None]
+    assert calls == ["none"]

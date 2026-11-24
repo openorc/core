@@ -153,12 +153,8 @@ def service_seam(monkeypatch: pytest.MonkeyPatch):
             return history
 
         monkeypatch.setattr(task_reads_router, "get_database_pool", _fake_pool)
-        monkeypatch.setattr(
-            task_reads, "list_workspace_tasks_for_owner", _list("workspace")
-        )
-        monkeypatch.setattr(
-            task_reads, "list_repository_tasks_for_owner", _list("repository")
-        )
+        monkeypatch.setattr(task_reads, "list_workspace_tasks_for_owner", _list("workspace"))
+        monkeypatch.setattr(task_reads, "list_repository_tasks_for_owner", _list("repository"))
         monkeypatch.setattr(task_reads, "list_issue_tasks_for_owner", _list("issue"))
         monkeypatch.setattr(task_reads, "get_task_for_owner", _detail)
         monkeypatch.setattr(task_history_service, "list_task_history_for_owner", _history)
@@ -270,9 +266,7 @@ def test_the_repository_list_is_scoped_to_the_addressed_repository(
     seam = service_seam()
     client = _client(settings_factory(), owner_profile)
 
-    response = client.get(
-        f"/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
-    )
+    response = client.get(f"/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks")
 
     assert response.status_code == 200
     assert seam["lists"][0]["kind"] == "repository"
@@ -281,9 +275,7 @@ def test_the_repository_list_is_scoped_to_the_addressed_repository(
     # A foreign-scope probe is the uniform not-found, never an oracle.
     seam = service_seam(list_error=NotFoundError("the requested workspace is not available"))
     client = _client(settings_factory(), owner_profile)
-    response = client.get(
-        f"/api/v1/workspaces/{uuid.uuid4()}/repositories/{uuid.uuid4()}/tasks"
-    )
+    response = client.get(f"/api/v1/workspaces/{uuid.uuid4()}/repositories/{uuid.uuid4()}/tasks")
     assert response.status_code == 404
 
 
@@ -419,9 +411,7 @@ def test_the_history_delegates_the_collection_selection_and_per_collection_curso
     }
 
     # An undocumented collection is the typed invalid command.
-    service_seam(
-        history_error=task_history_service.InvalidCommandError("unknown collection")
-    )
+    service_seam(history_error=task_history_service.InvalidCommandError("unknown collection"))
     client = _client(settings_factory(), owner_profile)
     response = client.get(
         f"/api/v1/workspaces/{workspace_id}/tasks/{task_id}/history",

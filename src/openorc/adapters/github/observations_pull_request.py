@@ -16,6 +16,13 @@ accepted partial truth. The documented merge coherence is enforced at the
 parse boundary — a merged PR is a closed PR and carries its merge instant —
 mirroring the durable model's CHECK.
 
+The #376 documented presentation members (title, body, html_url, user,
+draft, provider lifecycle instants, base SHA, mergeability) are
+optional-with-validation: an unavailable or malformed presentation-only
+fact normalizes to the honest unobserved ``None`` and never invalidates an
+otherwise interpretable authoritative PR observation, while the strict
+core identity/head/state validation is unchanged.
+
 The normalized exact-head merge-request result carries the documented
 response classes of ``PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge``:
 the successful merge (with the merge commit SHA GitHub reports), the
@@ -142,9 +149,10 @@ class GitHubPullRequestObservation:
     state: str
     merged: bool
     merged_at: datetime | None
-    # The #376 documented presentation members: the parser fills the
-    # documented required members from the response; direct construction
-    # defaults every one to the honest unobserved ``None`` (issue #376).
+    # The #376 documented presentation members: the parser fills them
+    # optional-with-validation (absent or malformed normalizes to the honest
+    # unobserved ``None``); direct construction defaults every one to the
+    # same honest ``None`` (issue #376).
     title: str | None = None
     body: str | None = None
     html_url: str | None = None
@@ -334,9 +342,10 @@ class GitHubPullRequestFacts:
     state: str
     merged: bool
     merged_at: datetime | None
-    # The #376 documented presentation members: the parser fills the
-    # documented required members from the response; direct construction
-    # defaults every one to the honest unobserved ``None`` (issue #376).
+    # The #376 documented presentation members: the parser fills them
+    # optional-with-validation (absent or malformed normalizes to the honest
+    # unobserved ``None``); direct construction defaults every one to the
+    # same honest ``None`` (issue #376).
     title: str | None = None
     body: str | None = None
     html_url: str | None = None
@@ -360,15 +369,45 @@ def _extract_required_string(payload: dict[str, object], member: str, descriptio
     return value
 
 
-def _parse_pull_request_presentation_members(payload: dict[str, object]) -> tuple[
-    str,
+def _optional_presentation_string(payload: dict[str, object], member: str) -> str | None:
+    """One optional presentation string member, optional-with-validation.
+
+    Absent, null, blank, and malformed values all normalize to the honest
+    unobserved ``None`` — a presentation-only fact never invalidates an
+    otherwise interpretable authoritative workflow observation (#376).
+    """
+    value = payload.get(member)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _optional_presentation_instant(raw: object) -> datetime | None:
+    """One optional presentation instant, optional-with-validation.
+
+    Absent, null, and malformed values all normalize to the honest
+    unobserved ``None`` (#376); the provider timestamp is never inferred
+    from an OpenOrc timestamp.
+    """
+    if raw is None:
+        return None
+    try:
+        return parse_instant(raw, "the pull request presentation instant")
+    except GitHubOutcomeUncertainError:
+        return None
+
+
+def _parse_pull_request_presentation_members(
+    payload: dict[str, object],
+) -> tuple[
     str | None,
-    str,
+    str | None,
+    str | None,
     int | None,
     str | None,
-    bool,
-    datetime,
-    datetime,
+    bool | None,
+    datetime | None,
+    datetime | None,
     datetime | None,
     str | None,
     bool | None,
@@ -376,78 +415,65 @@ def _parse_pull_request_presentation_members(payload: dict[str, object]) -> tupl
 ]:
     """Extract the #376 documented presentation members from one PR payload.
 
-    The same members appear on the PR read and the PR-create response.
-    Nullable provider facts (``body``, ``closed_at``, ``mergeable``, a
-    deleted account's ``user``, a base without an authoritative SHA) stay
-    ``None`` verbatim; a present-but-malformed member classifies as an
-    uncertain outcome, never a silently accepted fact. ``mergeable`` is
-    GitHub's documented nullable conflict-mergeability answer: ``None``
-    while GitHub has not yet determined it. ``merge_state_status`` is the
-    documented ``mergeable_state`` vocabulary verbatim — ``unknown`` is
-    preserved as the provider's own not-safely-observable reading.
+    The same members appear on the PR read and the PR-create response. The
+    presentation members are optional-with-validation (#376): an absent
+    member is the honest unobserved ``None``, and a present-but-malformed
+    presentation member normalizes to the same honest ``None`` — a missing
+    or malformed presentation-only fact can never turn an otherwise
+    interpretable authoritative PR response into an uncertain consequential
+    operation. The strict core identity/head/state validation lives in the
+    calling parsers and is unchanged. Nullable provider facts (``body``,
+    ``closed_at``, ``mergeable``, a deleted account's ``user``, a base
+    without an authoritative SHA) stay ``None`` verbatim. The user pair is
+    together-or-absent: any absent or malformed member of the ``user``
+    object normalizes both members to ``None``. ``mergeable`` is GitHub's
+    documented nullable conflict-mergeability answer: ``None`` while GitHub
+    has not yet determined it (a malformed reading normalizes to the same
+    not-determined ``None``, which the persistence boundary treats as a
+    no-reading write). ``merge_state_status`` is the documented
+    ``mergeable_state`` vocabulary verbatim — ``unknown`` is preserved as
+    the provider's own not-safely-observable reading.
     """
-    title = _extract_required_string(payload, "title", "pull request title")
+    title = _optional_presentation_string(payload, "title")
     body_raw = payload.get("body")
     if body_raw is not None and not isinstance(body_raw, str):
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the pull request body is malformed"
-        )
-    html_url = _extract_required_string(payload, "html_url", "pull request URL")
+        body_raw = None
+    html_url = _optional_presentation_string(payload, "html_url")
     user_raw = payload.get("user")
-    if user_raw is not None and not isinstance(user_raw, dict):
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the pull request user is malformed"
-        )
-    if user_raw is None:
-        user_id = user_login = None
-    else:
-        user_id = user_raw.get("id")
-        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-            raise GitHubOutcomeUncertainError(
-                "the GitHub response is not interpretable: the pull request user identity "
-                "is malformed"
-            )
-        user_login = _extract_required_string(user_raw, "login", "pull request user login")
-    draft = payload.get("draft")
-    if not isinstance(draft, bool):
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the pull request draft flag is malformed"
-        )
-    provider_created_at = parse_instant(
-        payload.get("created_at"), "the pull request creation instant"
-    )
-    provider_updated_at = parse_instant(
-        payload.get("updated_at"), "the pull request update instant"
-    )
-    closed_at_raw = payload.get("closed_at")
-    provider_closed_at = (
-        None
-        if closed_at_raw is None
-        else parse_instant(closed_at_raw, "the pull request closure instant")
-    )
+    user_id: int | None = None
+    user_login: str | None = None
+    if isinstance(user_raw, dict):
+        raw_id = user_raw.get("id")
+        raw_login = user_raw.get("login")
+        if (
+            not isinstance(raw_id, bool)
+            and isinstance(raw_id, int)
+            and raw_id > 0
+            and isinstance(raw_login, str)
+            and raw_login.strip()
+        ):
+            user_id = raw_id
+            user_login = raw_login
+    draft_raw = payload.get("draft")
+    draft = draft_raw if isinstance(draft_raw, bool) else None
+    provider_created_at = _optional_presentation_instant(payload.get("created_at"))
+    provider_updated_at = _optional_presentation_instant(payload.get("updated_at"))
+    provider_closed_at = _optional_presentation_instant(payload.get("closed_at"))
     mergeable_raw = payload.get("mergeable")
-    if mergeable_raw is not None and not isinstance(mergeable_raw, bool):
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the pull request mergeability is malformed"
-        )
+    mergeable = mergeable_raw if isinstance(mergeable_raw, bool) else None
     merge_state_raw = payload.get("mergeable_state")
-    if merge_state_raw is not None and (
-        not isinstance(merge_state_raw, str) or not merge_state_raw.strip()
-    ):
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: the pull request merge state is malformed"
-        )
+    merge_state_status = (
+        merge_state_raw if isinstance(merge_state_raw, str) and merge_state_raw.strip() else None
+    )
     base_raw = payload.get("base")
-    base_sha = None
+    base_sha: str | None = None
     if isinstance(base_raw, dict):
         # The base branch head SHA where GitHub authoritatively reported one
-        # (a fork or missing base ref may report none — honestly absent).
+        # (a fork or missing base ref may report none — honestly absent; a
+        # malformed one normalizes to the same honest absence).
         sha_raw = base_raw.get("sha")
-        if sha_raw is not None and (not isinstance(sha_raw, str) or not sha_raw.strip()):
-            raise GitHubOutcomeUncertainError(
-                "the GitHub response is not interpretable: the pull request base SHA is malformed"
-            )
-        base_sha = sha_raw
+        if isinstance(sha_raw, str) and sha_raw.strip():
+            base_sha = sha_raw
     return (
         title,
         body_raw,
@@ -459,8 +485,8 @@ def _parse_pull_request_presentation_members(payload: dict[str, object]) -> tupl
         provider_updated_at,
         provider_closed_at,
         base_sha,
-        mergeable_raw,
-        merge_state_raw,
+        mergeable,
+        merge_state_status,
     )
 
 

@@ -18,10 +18,23 @@ Backend-generated actions are computed dynamically in application/domain
 code from the same coherent durable observation, reusing the authoritative
 eligibility predicates the command services apply — never stored, never a
 client-side state machine, never a new independent eligibility engine.
-Offered actions are neither permission nor a promise of success: the G3
-command routes (issue #93) revalidate everything freshly at execution. No
-read ever calls GitHub or a runtime provider, mutates workflow, or initiates
-a refresh.
+Every offered action — gate-scoped and Task-level alike — is evaluated
+under the same durable prerequisites the command boundaries apply: the
+account-operational and terminalization barriers, the #342 unsettled-current-Interrupt
+veto, the guarded blocked-Task continuation derivations, the discussion
+prerequisites, and the durable GitHub-projection start eligibility. Offered
+actions are neither permission nor a promise of success: the G3 command
+routes (issue #93) revalidate everything freshly at execution. No read ever
+calls GitHub or a runtime provider, mutates workflow, or initiates a
+refresh.
+
+Every read composes inside ONE ``composed_read_transaction`` — a
+transaction-scoped REPEATABLE READ READ ONLY snapshot — so the state token,
+the exact current gate, the block, the subject facts, and every
+eligibility fact the offered menus evaluate are one durable observation
+instead of READ COMMITTED's per-statement views: a concurrent workflow
+transition committing between the composition's statements can never
+produce a response mixing an old state token with newly resolved facts.
 
 Presentation bounding is transparent (the G2a bound-plus-total pattern): a
 potentially large detail collection presents at most
@@ -54,7 +67,7 @@ from openorc.domain.detached_turns import (
     TaskDetachedTurnReceipt,
     TaskDetachedTurnReceiptStatus,
 )
-from openorc.domain.executions import Execution, ExecutionStatus
+from openorc.domain.executions import Execution
 from openorc.domain.gates import (
     ExceptionalOwnerGateAction,
     OwnerGate,
@@ -87,7 +100,10 @@ from openorc.persistence.github_issues import (
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import get_task_pull_request_for_task
-from openorc.persistence.sessions import sum_task_retained_session_costs_for_tasks
+from openorc.persistence.sessions import (
+    list_task_agent_sessions_for_tasks,
+    sum_task_retained_session_costs_for_tasks,
+)
 from openorc.persistence.task_reads import TaskObservationRecord, load_task_observation
 from openorc.persistence.tasks import (
     count_workspace_queued_tasks_before,
@@ -99,10 +115,13 @@ from openorc.services.errors import ApplicationError, InvalidCommandError, NotFo
 from openorc.services.profile_lifecycle_guard import require_account_operational
 from openorc.services.task_abort import abort_durably_offered
 from openorc.services.task_cancellation import cancellation_durably_offered
+from openorc.services.task_owner_resume import blocked_continuation_durably_offered
 from openorc.services.task_pending_runtime_interactions import (
     list_pending_task_runtime_interactions,
 )
-from openorc.services.transaction_composition import composed_transaction
+from openorc.services.task_source_change_ignore import ignore_durably_offered
+from openorc.services.task_start import start_durably_offered
+from openorc.services.transaction_composition import composed_read_transaction
 from openorc.services.workspace_authorization import (
     require_profile_workspace,
     require_workspace_repository,
@@ -118,6 +137,8 @@ __all__ = [
     "TaskDetail",
     "TaskExecutionFacts",
     "TaskGateSummary",
+    "TaskOutstandingIntentFacts",
+    "TaskPendingInteractionFacts",
     "TaskReviewIterationFacts",
     "TaskReviewLoopFacts",
     "TaskSessionFacts",
@@ -172,14 +193,8 @@ _ORDINARY_GATE_MENUS: dict[OwnerGateType, tuple[str, ...]] = {
 
 # The exceptional menus' wire tokens, mapped from the domain's fixed
 # decision vocabulary (domain.gates.exceptional_owner_gate_actions).
-_UNSETTLED_EXECUTION_STATUSES: frozenset[ExecutionStatus] = frozenset(
-    {
-        ExecutionStatus.QUEUED,
-        ExecutionStatus.RUNNING,
-        ExecutionStatus.PAUSED,
-        ExecutionStatus.PAUSED_FOR_APPROVAL,
-    }
-)
+# The exceptional menus' wire tokens, mapped from the domain's fixed
+# decision vocabulary (domain.gates.exceptional_owner_gate_actions).
 _EXCEPTIONAL_ACTION_TOKENS: dict[ExceptionalOwnerGateAction, str] = {
     ExceptionalOwnerGateAction.IGNORE: OwnerGateActionToken.IGNORE.value,
     ExceptionalOwnerGateAction.CONTINUE: OwnerGateActionToken.CONTINUE.value,
@@ -213,9 +228,14 @@ class TaskGateSummary:
     """The exact current pending OwnerGate and its offered menu (#376).
 
     ``actions`` is the backend-generated gate-scoped menu: the gate type's
-    canonical ordinary or exceptional decisions, guarded by the durable
-    prerequisites (``discuss`` only where the #339 discussion prerequisites
-    positively hold). A resolved or historical gate never appears here.
+    canonical ordinary or exceptional decisions, guarded by the same durable
+    prerequisites the command boundaries apply — the account-operational and
+    terminalization barriers, the per-action eligibility predicates
+    (``discuss`` only where the #339 discussion prerequisites positively
+    hold, ``cancel_task`` only where the accounted-runtime veto permits it,
+    ``resume``/``continue``/``ignore`` only where their guarded
+    blocked-Task continuation derivations positively hold). A resolved or
+    historical gate never appears here.
     """
 
     gate: OwnerGate
@@ -320,6 +340,38 @@ class TaskReviewLoopFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPendingInteractionFacts:
+    """One outstanding runtime interaction's safe typed facts (#376).
+
+    Exactly the #376 pending-interaction surface: the closed operation and
+    role vocabulary values, the exact bound session identity, the safe typed
+    subject, and the committed start instant — never raw claim rows, runtime
+    payloads, or a proof of live activity.
+    """
+
+    operation: str
+    role: str
+    task_agent_session_id: UUID | None
+    subject: dict[str, object]
+    started_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskOutstandingIntentFacts:
+    """One outstanding intent's safe typed facts (#376).
+
+    ``kind`` carries the closed intent vocabulary (``interrupt``, ``resume`",
+    ``pr_close``); ``status`` is the intent's own durable status value.
+    """
+
+    id: UUID
+    kind: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class TaskDetail:
     """The ownership-separated Task detail (issue #376).
 
@@ -337,11 +389,11 @@ class TaskDetail:
     executions_total: int
     planning_bootstrap_stage: str | None
     review_loops: tuple[TaskReviewLoopFacts, ...]
-    pending_runtime_interactions: tuple[dict[str, object], ...]
+    pending_runtime_interactions: tuple[TaskPendingInteractionFacts, ...]
     pending_runtime_requests: tuple[RuntimeRequest, ...]
     outstanding_receipts: tuple[TaskDetachedTurnReceipt, ...]
     outstanding_receipts_total: int
-    outstanding_intents: tuple[dict[str, object], ...]
+    outstanding_intents: tuple[TaskOutstandingIntentFacts, ...]
 
 
 def encode_task_page_cursor(last_created_at: datetime, last_task_id: UUID) -> str:
@@ -360,9 +412,7 @@ def decode_task_page_cursor(cursor: str) -> tuple[datetime, UUID]:
             raise ValueError("unexpected cursor prefix")
         return datetime.fromtimestamp(int(micros_text) / 1_000_000, tz=UTC), UUID(task_id_text)
     except (ValueError, UnicodeDecodeError) as error:
-        raise InvalidCommandError(
-            "the page cursor is not a valid Task page cursor"
-        ) from error
+        raise InvalidCommandError("the page cursor is not a valid Task page cursor") from error
 
 
 def _require_uuid_command(value: object, name: str) -> None:
@@ -458,15 +508,28 @@ def _gate_menu(
     task: Task,
     gate: OwnerGate,
     sessions: Sequence[TaskAgentSession],
+    account_operational: bool,
 ) -> tuple[str, ...]:
     """Generate the exact current gate's offered menu from durable facts (#376).
 
     The canonical ordinary menus and the domain's fixed exceptional menus are
-    the decision vocabulary; the offered subset is guarded by the durable
-    prerequisites, never the gate type alone. A non-pending gate (resolved
-    history) never advertises a menu.
+    the decision vocabulary; the offered subset is guarded by the same
+    durable prerequisites the command boundaries apply, never the gate type
+    alone: the account-operational and terminalization barriers (a committed
+    terminalization bars every ordinary command, the gate-scoped ones
+    included), the #342 unsettled-current-Interrupt accounted-runtime veto on
+    every offered cancel, the #339 discussion prerequisites, and the guarded
+    blocked-Task continuation derivations behind resume/continue. A
+    non-pending gate (resolved history) never advertises a menu.
     """
     if gate.status is not OwnerGateStatus.PENDING or gate.task_id != task.id:
+        return ()
+    if not account_operational or task.terminalization_outcome is not None:
+        # The same ordinary-command barriers the Task-level projection
+        # applies: a claimed account deletion or a committed terminalization
+        # bars every offered command, the gate menu included.
+        return ()
+    if task.archived_at is not None:
         return ()
     if gate.gate_type in _ORDINARY_GATE_MENUS:
         menu = list(_ORDINARY_GATE_MENUS[gate.gate_type])
@@ -474,6 +537,10 @@ def _gate_menu(
             tx_view, task=task, gate=gate, sessions=sessions
         ):
             menu.remove(OwnerGateActionToken.DISCUSS.value)
+        if OwnerGateActionToken.CANCEL_TASK.value in menu and not cancellation_durably_offered(
+            tx_view, task=task
+        ):
+            menu.remove(OwnerGateActionToken.CANCEL_TASK.value)
         return tuple(menu)
     try:
         exceptional = exceptional_owner_gate_actions(gate.gate_type)
@@ -481,7 +548,39 @@ def _gate_menu(
         # Ordinary gate types carry no exceptional menu; the fixed domain
         # vocabulary fails closed rather than inventing an action.
         return ()
-    return tuple(_EXCEPTIONAL_ACTION_TOKENS[action] for action in exceptional)
+    return tuple(
+        _EXCEPTIONAL_ACTION_TOKENS[action]
+        for action in exceptional
+        if _exceptional_action_offered(tx_view, task=task, gate=gate, action=action)
+    )
+
+
+def _exceptional_action_offered(
+    tx_view: DatabasePool,
+    *,
+    task: Task,
+    gate: OwnerGate,
+    action: ExceptionalOwnerGateAction,
+) -> bool:
+    """Whether one exceptional decision's durable prerequisites hold (#376).
+
+    Each decision reuses its own command boundary's authoritative predicate:
+    cancel through the shared cancellation guard, resume and continue
+    through the guarded blocked-Task continuation derivation (the #342
+    unsettled-current-Interrupt precondition included), and ignore through
+    the Ignore verification's durable Phase-1 checks. Unknown vocabulary is
+    never offered.
+    """
+    if action is ExceptionalOwnerGateAction.CANCEL_TASK:
+        return cancellation_durably_offered(tx_view, task=task)
+    if action in (
+        ExceptionalOwnerGateAction.RESUME,
+        ExceptionalOwnerGateAction.CONTINUE,
+    ):
+        return blocked_continuation_durably_offered(tx_view, task=task, gate=gate)
+    if action is ExceptionalOwnerGateAction.IGNORE:
+        return ignore_durably_offered(tx_view, task=task, gate=gate)
+    return False
 
 
 def _task_level_actions(
@@ -493,7 +592,9 @@ def _task_level_actions(
 ) -> tuple[str, ...]:
     """Generate the Task-level offered command tokens from durable facts (#376).
 
-    ``start`` only for an eligible current ``ready_to_plan`` attempt;
+    ``start`` only for an eligible current ``ready_to_plan`` attempt whose
+    durable GitHub-projection queue eligibility positively holds (the #76
+    guard re-derived from durable facts, never a fresh external call);
     ``abort`` only under the established eligible runtime/workflow
     conditions (the authoritative in-flight fact); ``cancel_task`` only
     under the existing safe-inactivity/accounted-interrupt/gate rules — and
@@ -513,7 +614,7 @@ def _task_level_actions(
     if task.archived_at is not None:
         return (TaskActionToken.PURGE.value,)
     actions: list[str] = []
-    if task.status is TaskStatus.READY_TO_PLAN:
+    if task.status is TaskStatus.READY_TO_PLAN and start_durably_offered(tx_view, task=task):
         actions.append(TaskActionToken.START.value)
     if abort_durably_offered(tx_view, task=task):
         actions.append(TaskActionToken.ABORT.value)
@@ -591,8 +692,7 @@ def _review_loop_facts(
     ]
     bounded = remainder[:TASK_DETAIL_PRESENTATION_BOUND]
     presented = tuple(
-        TaskReviewIterationFacts(iteration=iteration)
-        for iteration in [*always, *bounded]
+        TaskReviewIterationFacts(iteration=iteration) for iteration in [*always, *bounded]
     )
     return TaskReviewLoopFacts(
         loop=loop,
@@ -621,46 +721,46 @@ def _execution_facts(execution: Execution) -> TaskExecutionFacts:
 
 def _outstanding_intents(
     observation: TaskObservationRecord,
-) -> tuple[dict[str, object], ...]:
+) -> tuple[TaskOutstandingIntentFacts, ...]:
     """Compose the outstanding intent evidence (#376).
 
     The unresolved interrupt/resume/PR-close authorizations and any relevant
     cleanup obligation, exposed as separate typed records — never raw rows,
     never raw outcome payloads.
     """
-    facts: list[dict[str, object]] = []
+    facts: list[TaskOutstandingIntentFacts] = []
     for intent in observation.interrupt_intents:
         if intent.status is not TaskInterruptIntentStatus.SETTLED:
             facts.append(
-                {
-                    "id": intent.id,
-                    "kind": "interrupt",
-                    "status": intent.status.value,
-                    "created_at": intent.created_at,
-                    "updated_at": intent.updated_at,
-                }
+                TaskOutstandingIntentFacts(
+                    id=intent.id,
+                    kind="interrupt",
+                    status=intent.status.value,
+                    created_at=intent.created_at,
+                    updated_at=intent.updated_at,
+                )
             )
     for intent in observation.resume_intents:
         if intent.status in (TaskResumeIntentStatus.AUTHORIZED, TaskResumeIntentStatus.DISPATCHED):
             facts.append(
-                {
-                    "id": intent.id,
-                    "kind": "resume",
-                    "status": intent.status.value,
-                    "created_at": intent.created_at,
-                    "updated_at": intent.updated_at,
-                }
+                TaskOutstandingIntentFacts(
+                    id=intent.id,
+                    kind="resume",
+                    status=intent.status.value,
+                    created_at=intent.created_at,
+                    updated_at=intent.updated_at,
+                )
             )
     close_intent = observation.pull_request_close_intent
     if close_intent is not None and close_intent.status is TaskPullRequestCloseIntentStatus.PENDING:
         facts.append(
-            {
-                "id": close_intent.id,
-                "kind": "pr_close",
-                "status": close_intent.status.value,
-                "created_at": close_intent.created_at,
-                "updated_at": close_intent.updated_at,
-            }
+            TaskOutstandingIntentFacts(
+                id=close_intent.id,
+                kind="pr_close",
+                status=close_intent.status.value,
+                created_at=close_intent.created_at,
+                updated_at=close_intent.updated_at,
+            )
         )
     return tuple(facts)
 
@@ -679,7 +779,13 @@ def _compose_summary(
     gate = observation.current_gate
     gate_actions: tuple[str, ...] = ()
     if gate is not None:
-        gate_actions = _gate_menu(tx_view, task=task, gate=gate, sessions=sessions)
+        gate_actions = _gate_menu(
+            tx_view,
+            task=task,
+            gate=gate,
+            sessions=sessions,
+            account_operational=account_operational,
+        )
     gate_offers_cancel = OwnerGateActionToken.CANCEL_TASK.value in gate_actions
     actions = _task_level_actions(
         tx_view,
@@ -755,7 +861,7 @@ def list_workspace_tasks_for_owner(
     with application_span(_READS_TRACER_SCOPE, _LIST_SPAN_NAME) as span:
         annotate_span(span, operation=_LIST_SPAN_NAME)
         require_profile_workspace(pool, profile_id=profile_id, workspace_id=workspace_id)
-        with composed_transaction(pool) as tx_view:
+        with composed_read_transaction(pool) as tx_view:
             tasks = list_workspace_tasks_page(
                 tx_view,
                 workspace_id=workspace_id,
@@ -768,8 +874,7 @@ def list_workspace_tasks_for_owner(
             has_more = len(tasks) > TASK_PAGE_LIMIT
             tasks = tasks[:TASK_PAGE_LIMIT]
             items = [
-                _compose_list_item(tx_view, task=task, profile_id=profile_id)
-                for task in tasks
+                _compose_list_item(tx_view, task=task, profile_id=profile_id) for task in tasks
             ]
             next_cursor = (
                 encode_task_page_cursor(tasks[-1].created_at, tasks[-1].id)
@@ -804,7 +909,7 @@ def list_repository_tasks_for_owner(
         require_workspace_repository(
             pool, profile_id=profile_id, workspace_id=workspace_id, repository_id=repository_id
         )
-        with composed_transaction(pool) as tx_view:
+        with composed_read_transaction(pool) as tx_view:
             tasks = list_repository_tasks_page(
                 tx_view,
                 workspace_id=workspace_id,
@@ -818,8 +923,7 @@ def list_repository_tasks_for_owner(
             has_more = len(tasks) > TASK_PAGE_LIMIT
             tasks = tasks[:TASK_PAGE_LIMIT]
             items = [
-                _compose_list_item(tx_view, task=task, profile_id=profile_id)
-                for task in tasks
+                _compose_list_item(tx_view, task=task, profile_id=profile_id) for task in tasks
             ]
             next_cursor = (
                 encode_task_page_cursor(tasks[-1].created_at, tasks[-1].id)
@@ -858,7 +962,7 @@ def list_issue_tasks_for_owner(
         require_workspace_repository(
             pool, profile_id=profile_id, workspace_id=workspace_id, repository_id=repository_id
         )
-        with composed_transaction(pool) as tx_view:
+        with composed_read_transaction(pool) as tx_view:
             projection = find_github_issue_by_id(
                 tx_view, workspace_id=workspace_id, repository_id=repository_id, issue_id=issue_id
             )
@@ -870,7 +974,7 @@ def list_issue_tasks_for_owner(
                 tx_view,
                 workspace_id=workspace_id,
                 repository_id=repository_id,
-                github_issue_id=projection.github_issue_id,
+                github_issue_id=projection.identity.github_issue_id,
                 statuses=statuses,
                 archival=archival,
                 after_created_at=None if after is None else after[0],
@@ -880,8 +984,7 @@ def list_issue_tasks_for_owner(
             has_more = len(tasks) > ISSUE_ATTEMPTS_PAGE_LIMIT
             tasks = tasks[:ISSUE_ATTEMPTS_PAGE_LIMIT]
             items = [
-                _compose_list_item(tx_view, task=task, profile_id=profile_id)
-                for task in tasks
+                _compose_list_item(tx_view, task=task, profile_id=profile_id) for task in tasks
             ]
             next_cursor = (
                 encode_task_page_cursor(tasks[-1].created_at, tasks[-1].id)
@@ -902,8 +1005,11 @@ def _compose_list_item(
     The page-level batched reads (issues, canonical PRs, current gates,
     costs, current blocks) ran before this composer; the per-Task action
     eligibility reuses the authoritative predicates inside the same composed
-    transaction, so every offered action is computed from the same coherent
-    durable observation the commands themselves revalidate against.
+    snapshot transaction, so every offered action is computed from the same
+    coherent durable observation the commands themselves revalidate against.
+    The Task's actual session bindings supply the discussion-prerequisite
+    evidence, exactly as the detail projection supplies them: an eligible
+    READY Reviewer is never suppressed because the list is a summary.
     """
     issue = find_github_issue_projections_by_identity(
         tx_view, repository_id=task.repository_id, github_issue_ids=[task.github_issue_id]
@@ -918,13 +1024,15 @@ def _compose_list_item(
     )
     blocks = list_current_task_blocks_for_tasks(tx_view, task_ids=[task.id]).get(task.id, [])
     costs = sum_task_retained_session_costs_for_tasks(tx_view, task_ids=[task.id]).get(task.id)
+    sessions = list_task_agent_sessions_for_tasks(tx_view, task_ids=[task.id]).get(task.id, [])
     observation = TaskObservationRecord(
         task=task,
         current_gate=gate,
         current_blocks=tuple(blocks),
         current_plan=None,
-        sessions=(),
+        sessions=tuple(sessions),
         executions=(),
+        executions_total=0,
         review_loops=(),
         review_iterations=(),
         runtime_requests=(),
@@ -932,7 +1040,7 @@ def _compose_list_item(
         resume_intents=(),
         pull_request_close_intent=None,
         receipts=(),
-        receipts_total=0,
+        outstanding_receipts_total=0,
         send_claims=(),
         planning_bootstrap=None,
         pull_request=pull_request,
@@ -974,7 +1082,7 @@ def get_task_for_owner(
         require_workspace_task(
             pool, profile_id=profile_id, workspace_id=workspace_id, task_id=task_id
         )
-        with composed_transaction(pool) as tx_view:
+        with composed_read_transaction(pool) as tx_view:
             observation = load_task_observation(tx_view, workspace_id=workspace_id, task_id=task_id)
             if observation is None:
                 raise NotFoundError("the requested task is not available in this workspace")
@@ -1000,11 +1108,9 @@ def get_task_for_owner(
                 )
                 for session in sessions
             )
-            executions_total = len(observation.executions)
+            executions_total = observation.executions_total
             execution_facts = tuple(
-                _execution_facts(execution)
-                for execution in observation.executions
-                if execution.status in _UNSETTLED_EXECUTION_STATUSES
+                _execution_facts(execution) for execution in observation.executions
             )
             iterations_by_loop: dict[UUID, list[ReviewIteration]] = {}
             for iteration in observation.review_iterations:
@@ -1033,13 +1139,13 @@ def get_task_for_owner(
                 ),
                 review_loops=review_loop_facts,
                 pending_runtime_interactions=tuple(
-                    {
-                        "operation": interaction.operation.value,
-                        "role": interaction.role.value,
-                        "task_agent_session_id": interaction.task_agent_session_id,
-                        "subject": dict(interaction.subject),
-                        "started_at": interaction.started_at,
-                    }
+                    TaskPendingInteractionFacts(
+                        operation=interaction.operation.value,
+                        role=interaction.role.value,
+                        task_agent_session_id=interaction.task_agent_session_id,
+                        subject=dict(interaction.subject),
+                        started_at=interaction.started_at,
+                    )
                     for interaction in pending_interactions
                 ),
                 pending_runtime_requests=tuple(
@@ -1048,7 +1154,7 @@ def get_task_for_owner(
                     if request.status is RuntimeRequestStatus.PENDING
                 ),
                 outstanding_receipts=observation.receipts,
-                outstanding_receipts_total=observation.receipts_total,
+                outstanding_receipts_total=observation.outstanding_receipts_total,
                 outstanding_intents=_outstanding_intents(observation),
             )
         return detail

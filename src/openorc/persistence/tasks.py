@@ -528,9 +528,7 @@ def _archival_predicate(archival: str) -> str:
     return ""
 
 
-def _validate_task_page_filters(
-    statuses: Sequence[TaskStatus], archival: str
-) -> tuple[str, str]:
+def _validate_task_page_filters(statuses: Sequence[TaskStatus], archival: str) -> tuple[str, str]:
     """Validate the #376 page filters and return their SQL fragments."""
     if not statuses:
         raise TaskDomainError("a Task page query requires at least one canonical status")
@@ -538,9 +536,7 @@ def _validate_task_page_filters(
         if not isinstance(status, TaskStatus):
             raise TaskDomainError("Task page status filters must be TaskStatus values")
     if archival not in TASK_ARCHIVAL_FILTERS:
-        raise TaskDomainError(
-            "Task page archival filters must be one of current, archived, all"
-        )
+        raise TaskDomainError("Task page archival filters must be one of current, archived, all")
     status_list = ", ".join(f"'{status.value}'" for status in statuses)
     return f" and status in ({status_list})", _archival_predicate(archival)
 
@@ -637,10 +633,7 @@ def list_repository_tasks_page(
     with transaction(pool) as conn:
         return _task_page_rows(
             conn,
-            where=(
-                "workspace_id = %s and repository_id = %s"
-                f"{status_fragment}{archival_fragment}"
-            ),
+            where=(f"workspace_id = %s and repository_id = %s{status_fragment}{archival_fragment}"),
             params=[workspace_id, repository_id],
             after_created_at=after_created_at,
             after_task_id=after_task_id,
