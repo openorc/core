@@ -108,6 +108,9 @@ def _seed_attempt(
     )
     running = execution_records.claim_execution_running(pool, execution_id=attempt.id)
     assert running is not None
+    if final_status is ExecutionStatus.RUNNING:
+        # Already claimed RUNNING: the requested state holds.
+        return
     if final_status is ExecutionStatus.SUCCEEDED:
         assert implementation_result is not None
         completed = execution_records.complete_execution_with_result(
@@ -299,11 +302,19 @@ class _ReaderConnectionPool:
 
     @contextmanager
     def connection(self) -> Iterator[Any]:
-        with self._connection:
+        # Production pool checkout semantics WITHOUT the lifetime management:
+        # psycopg 3's ``with connection:`` block closes the connection on
+        # exit, so the commit/rollback discipline is reproduced explicitly and
+        # the connection's lifetime stays with the enclosing test.
+        try:
             yield self._connection
-
-    def close(self) -> None:
-        raise AssertionError("the test owns the reader connection")
+        except BaseException:
+            if not self._connection.closed:
+                self._connection.rollback()
+            raise
+        else:
+            if not self._connection.closed:
+                self._connection.commit()
 
 
 def test_authorized_task_read_composes_actions_inside_the_read_only_snapshot(
