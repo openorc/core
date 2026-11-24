@@ -246,24 +246,71 @@ def mark_github_webhook_delivery_processed(pool: DatabasePool, *, delivery_id: U
 
 
 def list_github_webhook_deliveries_requiring_recovery(
-    pool: DatabasePool, *, limit: int
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID | None,
+    limit: int,
 ) -> list[GitHubWebhookDelivery]:
-    """List accepted relevant deliveries whose processing is still unresolved.
+    """List accepted relevant deliveries with unresolved in-scope routes.
 
-    The bounded recovery work set for the #62 repeatable reconciliation sweep:
-    durable delivery records only (never payloads, signatures, or queue
-    state), oldest first with a deterministic tiebreak, and explicitly limited
-    so one sweep invocation's recovery batch stays bounded — completed
-    deliveries leave the set through the bounded ``processed_at`` marking, so
-    repeated sweeps drain the backlog. The limit must be a positive integer.
+    The bounded recovery work set for the scoped refresh execution: durable
+    delivery records only (never payloads, signatures, or queue state) whose
+    routed fan-out still carries at least one outstanding route inside the
+    requested scope — every route of the addressed Workspace (``repository_id``
+    is ``None``) or the one addressed Workspace Repository. The scope filter
+    applies BEFORE the batch limit, so an unrelated Workspace's backlog can
+    never exhaust the batch, starve in-scope recovery, or leak its delivery
+    identities into the caller's outcomes. Rows come oldest first with a
+    deterministic tiebreak and are explicitly limited so one execution's
+    recovery batch stays bounded — completed deliveries leave the set
+    through the per-route completion evidence and the bounded ``processed_at``
+    marking, so repeated executions drain the backlog. The limit must be a
+    positive integer.
     """
+    if not isinstance(workspace_id, UUID):
+        raise ValueError("workspace_id must be a UUID")
+    if repository_id is not None and not isinstance(repository_id, UUID):
+        raise ValueError("repository_id must be a UUID or None")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("limit must be a positive integer")
-    with transaction(pool) as conn:
-        rows = conn.execute(
+    # The two supported scope shapes are static SQL (like the observation
+    # evidence stamping): the inner EXISTS matches only the scope's
+    # unresolved routes, and the outer limit applies last.
+    if repository_id is None:
+        statement = (
             f"select {_DELIVERY_COLUMNS} from openorc.github_webhook_deliveries "
             "where classification = %s and processed_at is null "
-            "order by received_at, id limit %s",
-            (GitHubWebhookDeliveryClassification.RELEVANT.value, limit),
-        ).fetchall()
+            "and exists ("
+            "select 1 from openorc.github_webhook_delivery_routes "
+            "where delivery_id = openorc.github_webhook_deliveries.id "
+            "and resolved_at is null "
+            "and openorc.github_webhook_delivery_routes.workspace_id = %s) "
+            "order by received_at, id limit %s"
+        )
+        params: tuple[Any, ...] = (
+            GitHubWebhookDeliveryClassification.RELEVANT.value,
+            workspace_id,
+            limit,
+        )
+    else:
+        statement = (
+            f"select {_DELIVERY_COLUMNS} from openorc.github_webhook_deliveries "
+            "where classification = %s and processed_at is null "
+            "and exists ("
+            "select 1 from openorc.github_webhook_delivery_routes "
+            "where delivery_id = openorc.github_webhook_deliveries.id "
+            "and resolved_at is null "
+            "and openorc.github_webhook_delivery_routes.workspace_id = %s "
+            "and openorc.github_webhook_delivery_routes.repository_id = %s) "
+            "order by received_at, id limit %s"
+        )
+        params = (
+            GitHubWebhookDeliveryClassification.RELEVANT.value,
+            workspace_id,
+            repository_id,
+            limit,
+        )
+    with transaction(pool) as conn:
+        rows = conn.execute(statement, params).fetchall()
     return [_delivery_from_row(row) for row in rows]

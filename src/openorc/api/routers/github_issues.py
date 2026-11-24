@@ -149,28 +149,54 @@ def _relations_to_wire(
     item: RepositoryIssueListItem,
 ) -> tuple[
     GitHubIssueParentRefRead | None,
-    list[GitHubIssueSubIssueRefRead],
-    int,
-    list[GitHubIssueBlockedByRefRead],
-    int,
+    list[GitHubIssueSubIssueRefRead] | None,
+    int | None,
+    list[GitHubIssueBlockedByRefRead] | None,
+    int | None,
 ]:
-    """Map one item's composed parent/sub-issue/blocked-by presentation."""
+    """Map one item's composed parent/sub-issue/blocked-by presentation.
+
+    Each relationship family projects independently through its durable
+    observation evidence (issue #375): the hierarchy family (parent and
+    sub-issues) through ``hierarchy_observed_at`` and the dependencies
+    family (blocked-by) through ``dependencies_observed_at``. An unobserved
+    family presents null collections and null totals — never a fabricated
+    empty observation — while an observed family presents its bounded
+    collection with the durable total.
+    """
+    projection = item.projection
+    hierarchy_observed = projection.hierarchy_observed_at is not None
+    dependencies_observed = projection.dependencies_observed_at is not None
     sub_presented, sub_total = _presented(item.sub_issues)
     blocked_presented, blocked_total = _presented(item.blocked_by)
     parent = (
         None
-        if item.parent is None
+        if not hierarchy_observed or item.parent is None
         else _relation_to_wire(item.parent, item.resolved_related, GitHubIssueParentRefRead)
     )
-    sub_issues = [
-        _relation_to_wire(endpoint, item.resolved_related, _SUB_ISSUE_WIRE)
-        for endpoint in sub_presented
-    ]
-    blocked_by = [
-        _relation_to_wire(endpoint, item.resolved_related, _BLOCKED_BY_WIRE)
-        for endpoint in blocked_presented
-    ]
-    return parent, sub_issues, sub_total, blocked_by, blocked_total
+    sub_issues = (
+        None
+        if not hierarchy_observed
+        else [
+            _relation_to_wire(endpoint, item.resolved_related, _SUB_ISSUE_WIRE)
+            for endpoint in sub_presented
+        ]
+    )
+    blocked_by = (
+        None
+        if not dependencies_observed
+        else [
+            _relation_to_wire(endpoint, item.resolved_related, _BLOCKED_BY_WIRE)
+            for endpoint in blocked_presented
+        ]
+    )
+    return (
+        parent,
+        sub_issues,
+        None if not hierarchy_observed else sub_total,
+        blocked_by,
+        None if not dependencies_observed else blocked_total,
+    )
 
 
 def _github_list_block_to_wire(item: RepositoryIssueListItem) -> GitHubIssueListItemBlockRead:

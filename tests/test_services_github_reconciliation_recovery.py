@@ -76,6 +76,7 @@ from openorc.services.github_webhook_dispatch import (
     GitHubWebhookDispatchResult,
     GitHubWebhookDispatchRouteOutcome,
     GitHubWebhookDispatchRouteStatus,
+    GitHubWebhookRouteScope,
 )
 from openorc.services.task_pull_request_reconciliation import TaskPullRequestReconciliation
 from tests.fakes.task_rows import task_row
@@ -511,12 +512,12 @@ def _durable_repository() -> Repository:
     )
 
 
-def _refresh_record() -> Any:
+def _refresh_record(*, repository_id: uuid.UUID | None = None) -> Any:
     """The claimed durable refresh record projection (the execution's scope)."""
     return GitHubRefreshRecord(
         id=_REFRESH_ID,
         workspace_id=_WORKSPACE_A,
-        repository_id=None,
+        repository_id=repository_id,
         status=GitHubRefreshStatus.RUNNING,
         requested_at=_NOW,
         started_at=_NOW,
@@ -1301,7 +1302,7 @@ def test_a_failed_delivery_dispatch_stays_recoverable_and_uncertainty_has_preced
     # them; nothing was guessed or destructively advanced.
 
 
-def test_the_delivery_recovery_batch_is_bounded(harness_factory) -> None:
+def test_the_delivery_recovery_work_set_is_scoped_and_bounded(harness_factory) -> None:
     harness = harness_factory()
     conn = harness.conn
     conn.on("from openorc.repositories", [_repository_row()])
@@ -1317,8 +1318,127 @@ def test_the_delivery_recovery_batch_is_bounded(harness_factory) -> None:
     )
     assert deliveries_params is not None
     assert deliveries_params[0] == "relevant"
-    assert deliveries_params[1] == MAX_RECOVERY_DELIVERY_BATCH
+    assert deliveries_params[1] == _WORKSPACE_A
+    assert deliveries_params[2] == MAX_RECOVERY_DELIVERY_BATCH
     assert "processed_at is null" in deliveries_sql
+    # The work set is selected within the refresh's scope — deliveries with
+    # at least one unresolved route of the Workspace — and the scope filter
+    # applies BEFORE the batch limit, so an unrelated Workspace's backlog can
+    # never exhaust the batch, starve in-scope recovery, or leak its delivery
+    # GUIDs into this execution's outcomes.
+    assert "resolved_at is null" in deliveries_sql
+    assert "workspace_id = %s" in deliveries_sql
+    assert "repository_id = %s" not in deliveries_sql
+    assert deliveries_sql.index("resolved_at is null") < deliveries_sql.index("limit %s")
+
+
+def test_a_repository_scope_refresh_filters_the_delivery_work_set(harness_factory) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("order by received_at, id limit %s", [])
+    harness.refresh_claims.results = [_refresh_record(repository_id=_REPOSITORY_A)]
+
+    run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
+
+    deliveries_sql, deliveries_params = next(
+        (sql, params) for sql, params in conn.executed if "limit %s" in sql
+    )
+    assert deliveries_params is not None
+    # The repository scope binds the unresolved routes to the addressed
+    # Workspace Repository on top of the Workspace scope, still before the
+    # batch limit.
+    assert deliveries_params[:4] == (
+        "relevant",
+        _WORKSPACE_A,
+        _REPOSITORY_A,
+        MAX_RECOVERY_DELIVERY_BATCH,
+    )
+    assert "repository_id = %s" in deliveries_sql
+    assert deliveries_sql.index("repository_id = %s") < deliveries_sql.index("limit %s")
+
+
+def test_the_dispatch_reenters_the_boundary_with_the_durable_scope(harness_factory) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("order by received_at, id limit %s", [_delivery_row(delivery_guid="guid-1")])
+    harness.dispatch.results = [_dispatch_result()]
+
+    run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
+
+    # Only the scope's routes are ever dispatched, by the exact durable scope
+    # the execution re-derived — never an out-of-scope route.
+    assert harness.dispatch.calls == [
+        {
+            "delivery_guid": "guid-1",
+            "route_scope": GitHubWebhookRouteScope(workspace_id=_WORKSPACE_A, repository_id=None),
+        }
+    ]
+
+
+def test_a_partially_resolved_shared_delivery_reconciles_in_scope(harness_factory) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("order by received_at, id limit %s", [_delivery_row(delivery_guid="guid-shared")])
+    harness.dispatch.results = [
+        _dispatch_result(processed=False, route_status=GitHubWebhookDispatchRouteStatus.RECONCILED)
+    ]
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
+
+    delivery_outcomes = [
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.DELIVERY
+    ]
+    # The in-scope route reconciled; the shared fan-out delivery is NOT
+    # processed because another Workspace's route remains outstanding. The
+    # scoped recovery is a success independently of the whole-delivery
+    # processed_at instant — neither a fabricated failure nor a fabricated
+    # whole-delivery completion — and it contributes no refresh error fact.
+    assert [(o.status, o.delivery_processed) for o in delivery_outcomes] == [
+        (GitHubReconciliationSweepUnitStatus.RECONCILED, False)
+    ]
+    assert harness.refresh_completions.calls[0]["errors"] == ()
+
+
+def test_a_delivery_without_applicable_route_outcomes_stays_a_known_failure(
+    harness_factory,
+) -> None:
+    harness = harness_factory()
+    conn = harness.conn
+    conn.on("from openorc.repositories", [_repository_row()])
+    conn.on("from openorc.github_issues", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("from openorc.tasks", [])
+    conn.on("order by received_at, id limit %s", [_delivery_row(delivery_guid="guid-1")])
+    harness.dispatch.results = [_dispatch_result(processed=False)]
+
+    result = run_github_reconciliation_sweep(harness.pool, _github_client(), refresh_id=_REFRESH_ID)
+
+    delivery_outcomes = [
+        outcome
+        for outcome in result.outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.DELIVERY
+    ]
+    # An unexpected durable shape (no applicable route outcome at all, logged
+    # by the dispatch boundary) is never promoted to success: it stays a
+    # known, recoverable failure with the whole delivery unprocessed.
+    assert [o.status for o in delivery_outcomes] == [
+        GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
+    ]
+    assert all(o.delivery_processed is False for o in delivery_outcomes)
 
 
 def test_one_units_failure_does_not_corrupt_independent_units(harness_factory) -> None:

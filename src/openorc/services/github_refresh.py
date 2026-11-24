@@ -6,9 +6,13 @@ service owns authorization and admission; routers stay thin transports.
 
 - **Admission** composes the authenticated Owner authorization (the
   #52/#57 Workspace-ownership guards, uniform anti-probing not-found) with
-  the atomic durable admission (the per-scope active-overlap containment,
-  expired-record recovery, bounded retention) and the F1 execution
-  submission. HTTP 202 acknowledges authorization and established
+  the account-wide Owner-mutation barrier (#97 — an active or uncertain
+  account-deletion attempt refuses admission and submission, composed
+  atomically with the durable admission in one short Profile-first
+  transaction), the atomic durable admission (the per-scope active-overlap
+  containment, expired-record recovery, bounded retention), and the F1
+  execution submission strictly outside any database transaction. HTTP 202
+  acknowledges authorization and established
   submission acceptance only: a F1 submission the operation boundary
   refused before delivery is a durable terminal ``failed`` record and a
   typed failure — never a 202; an uncertain submission outcome is never
@@ -55,6 +59,8 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
+from openorc.services.profile_lifecycle_guard import require_account_operational
+from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import (
     require_profile_workspace,
     require_workspace_repository,
@@ -129,11 +135,29 @@ def _admit_and_submit(
     pool: DatabasePool,
     submission: RefreshExecutionSubmission,
     *,
+    profile_id: UUID,
     workspace_id: UUID,
     repository_id: UUID | None,
 ) -> GitHubRefreshRecord:
-    """Run the atomic admission and the execution submission, truthfully."""
-    admission = admit_github_refresh(pool, workspace_id=workspace_id, repository_id=repository_id)
+    """Run the atomic admission decision, then submit the execution, truthfully.
+
+    The account-wide Owner-mutation barrier (issue #97) composes FIRST
+    inside the one short database-only transaction — the Profile ``FOR KEY
+    SHARE`` read is the composition's first lock acquisition and conflicts
+    with the account-deletion transaction's Profile-root ``FOR UPDATE`` —
+    and the durable admission joins the same composition, so an active or
+    uncertain deletion attempt refuses admission and can never race past
+    it. The F1 submission (and the known-refusal durable failure) stay
+    strictly outside any database transaction.
+    """
+    with composed_transaction(pool) as transaction_pool:
+        # The account-wide Owner-mutation barrier first (issue #97): the
+        # Profile FOR KEY SHARE read is the composition's first lock
+        # acquisition, before the admission's Workspace row lock.
+        require_account_operational(transaction_pool, profile_id=profile_id)
+        admission = admit_github_refresh(
+            transaction_pool, workspace_id=workspace_id, repository_id=repository_id
+        )
     if admission.workspace_missing:
         # The Workspace vanished between authorization and admission (a
         # deletion race): the uniform not-found outcome, never a probing
@@ -193,7 +217,13 @@ def request_workspace_github_refresh_for_owner(
     with application_span(_SERVICE_TRACER_SCOPE, _ADMIT_WS_SPAN_NAME) as span:
         annotate_span(span, operation=_ADMIT_WS_SPAN_NAME, workspace_id=str(workspace_id))
         require_profile_workspace(pool, profile_id=profile_id, workspace_id=workspace_id)
-        return _admit_and_submit(pool, submission, workspace_id=workspace_id, repository_id=None)
+        return _admit_and_submit(
+            pool,
+            submission,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id=None,
+        )
 
 
 def request_repository_github_refresh_for_owner(
@@ -214,7 +244,11 @@ def request_repository_github_refresh_for_owner(
             pool, profile_id=profile_id, workspace_id=workspace_id, repository_id=repository_id
         )
         return _admit_and_submit(
-            pool, submission, workspace_id=workspace_id, repository_id=repository_id
+            pool,
+            submission,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
         )
 
 

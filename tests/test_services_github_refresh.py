@@ -1,20 +1,24 @@
 """Deterministic fake-seam tests for the refresh admission/status services (#375).
 
 Proves the Owner-facing boundary truthfulness: the atomic admission
-composition (Workspace/repository authorization, uniform anti-probing
-not-found on a deletion race, the typed conflict on an active overlapping
-scope), the three submission outcomes (a 202-acknowledged established
-acceptance, the durable terminal ``failed`` on a known refusal — never a
-202, and the conservative ``accepted`` retention on an uncertain submission
-that is never a known non-delivery), and the truthful status projection
-(verbatim stored facts; an expired accepted/running record presents as
-``unknown``; foreign records are the uniform not-found). No live GitHub,
-Valkey, or Postgres.
+composition (Workspace/repository authorization, the #97 account-deletion
+Owner-mutation barrier composed Profile-first in the SAME transaction as the
+durable admission, uniform anti-probing not-found on a deletion race, the
+typed conflict on an active overlapping scope), the three submission outcomes
+(a 202-acknowledged established acceptance, the durable terminal ``failed``
+on a known refusal — never a 202, and the conservative ``accepted`` retention
+on an uncertain submission that is never a known non-delivery), and the
+truthful status projection (verbatim stored facts; an expired accepted/running
+record presents as ``unknown``; foreign records are the uniform not-found;
+status reads compose no mutation barrier). No live GitHub, Valkey, or
+Postgres.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -40,19 +44,69 @@ _REPOSITORY_ID = uuid.uuid4()
 _PROFILE_ID = uuid.uuid4()
 _NOW = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
 
+# The account-deletion Owner-mutation barrier (issue #97) composes as the
+# FIRST database read of the admission; the REAL guard runs against the
+# scripted connection, so the canned result row for an operational account
+# carries the all-NULL attempt-state tuple, and an in-flight attempt carries
+# its durable state (active or uncertain — both refuse).
+_GUARD_OPERATIONAL_ROW = (None, None, None)
+_GUARD_DELETION_ACTIVE_ROW = ("active", uuid.uuid4(), _NOW)
+_GUARD_DELETION_UNCERTAIN_ROW = ("uncertain", uuid.uuid4(), _NOW)
 
-class _Pool:
-    """Authorization is stubbed at the module boundary; no SQL ever runs."""
 
-    def connection(self) -> Any:  # pragma: no cover
-        raise AssertionError("refresh service tests never open connections")
+class FakeCursor:
+    def __init__(self, row: tuple[Any, ...] | None) -> None:
+        self._row = row
 
-    def close(self) -> None:  # pragma: no cover
+    def fetchone(self) -> tuple[Any, ...] | None:
+        return self._row
+
+
+class ScriptedConnection:
+    """Plays back canned statement results in order, recording executed SQL.
+
+    Serves the REAL issue #97 account-deletion barrier read — the one SQL the
+    admission path executes that the harness does not stub at the module
+    boundary. An unexpected statement (or a consumed script) fails loudly.
+    """
+
+    def __init__(self, results: list[Any] | None = None) -> None:
+        self.results: list[Any] = list(results or [])
+        self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> FakeCursor:
+        self.executed.append((sql, params))
+        if not self.results:
+            raise AssertionError(f"unexpected statement without a scripted result: {sql}")
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeCursor(result)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        # Supports composed_transaction's outer transaction entry and the
+        # nested repository scopes under it.
+        yield
+
+
+class FakePool:
+    def __init__(self, conn: ScriptedConnection) -> None:
+        self._conn = conn
+
+    def connection(self) -> Any:
+        @contextmanager
+        def managed() -> Iterator[ScriptedConnection]:
+            yield self._conn
+
+        return managed()
+
+    def close(self) -> None:
         raise AssertionError("refresh service tests never close pools")
 
 
-def _pool() -> Any:
-    return _Pool()
+def _pool(conn: ScriptedConnection | None = None) -> Any:
+    return FakePool(conn if conn is not None else ScriptedConnection([_GUARD_OPERATIONAL_ROW]))
 
 
 class RecordingSubmission:
@@ -89,17 +143,31 @@ def _record(
 
 @pytest.fixture
 def admission_harness(monkeypatch: pytest.MonkeyPatch):
-    """Stub the authorization guards and script the atomic admission outcome."""
+    """Stub the authorization guards and script the atomic admission outcome.
+
+    The #97 account-deletion barrier is deliberately NOT stubbed: the real
+    guard reads its canned ``profiles`` row through the scripted connection
+    (the workspace-lifecycle seam), so the barrier-first composition and both
+    refusal states are proven against the real guard while the ownership
+    guards stay stubbed at the module boundary.
+    """
 
     class Harness:
-        def __init__(self) -> None:
+        def __init__(self, conn: ScriptedConnection) -> None:
+            self.conn = conn
+            self.pool: Any = FakePool(conn)
             self.admissions: list[dict[str, Any]] = []
             self.workspace_checked: list[uuid.UUID] = []
             self.repository_checked: list[uuid.UUID] = []
+            self.admission_after_statements: list[int] = []
             self.admission_result: Any = _admission_success(_record())
 
         def admit(self, pool: Any, *, workspace_id: uuid.UUID, repository_id: uuid.UUID | None):
             self.admissions.append({"workspace_id": workspace_id, "repository_id": repository_id})
+            # How many statements the REAL guard had executed when the durable
+            # admission was reached: 1 proves the barrier composes first
+            # inside the same composed transaction.
+            self.admission_after_statements.append(len(self.conn.executed))
             result = self.admission_result
             if isinstance(result, Exception):
                 raise result
@@ -120,7 +188,7 @@ def admission_harness(monkeypatch: pytest.MonkeyPatch):
             self.repository_checked.append(repository_id)
             return object()
 
-    harness = Harness()
+    harness = Harness(ScriptedConnection([_GUARD_OPERATIONAL_ROW]))
     monkeypatch.setattr(
         github_refresh,
         "admit_github_refresh",
@@ -133,10 +201,17 @@ def admission_harness(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def status_harness(monkeypatch: pytest.MonkeyPatch):
-    """Stub the authorization guard and script the stored record read."""
+    """Stub the authorization guard and script the stored record read.
+
+    The scripted connection stays scriptless: the status path must execute
+    no SQL at all (the ownership guard is stubbed and no account-mutation
+    barrier composes on a read), which the dedicated no-barrier test proves.
+    """
 
     class Harness:
         def __init__(self) -> None:
+            self.conn = ScriptedConnection()
+            self.pool: Any = FakePool(self.conn)
             self.stored: GitHubRefreshRecord | None = None
             self.workspace_checked: list[uuid.UUID] = []
 
@@ -242,6 +317,50 @@ def test_a_deletion_race_is_the_uniform_not_found(admission_harness) -> None:
     assert submission.submitted == []
 
 
+def test_an_unresolved_account_deletion_attempt_refuses_admission_and_submission(
+    admission_harness,
+) -> None:
+    submission = RecordingSubmission(github_refresh.RefreshSubmissionOutcome.ACCEPTED)
+
+    for deletion_row in (_GUARD_DELETION_ACTIVE_ROW, _GUARD_DELETION_UNCERTAIN_ROW):
+        admission_harness.conn.results = [deletion_row]
+        with pytest.raises(ConflictError):
+            github_refresh.request_workspace_github_refresh_for_owner(
+                admission_harness.pool,
+                submission,
+                profile_id=_PROFILE_ID,
+                workspace_id=_WORKSPACE_ID,
+            )
+
+    # The #97 barrier refused inside the admission composition: no durable
+    # admission was attempted and no F1 submission ever happened — exactly
+    # one real barrier read ran per attempt.
+    assert admission_harness.admissions == []
+    assert submission.submitted == []
+    assert len(admission_harness.conn.executed) == 2
+    assert all("openorc.profiles" in sql for sql, _ in admission_harness.conn.executed)
+
+
+def test_the_account_barrier_is_the_first_lock_of_the_admission(admission_harness) -> None:
+    submission = RecordingSubmission(github_refresh.RefreshSubmissionOutcome.ACCEPTED)
+
+    record = github_refresh.request_workspace_github_refresh_for_owner(
+        admission_harness.pool, submission, profile_id=_PROFILE_ID, workspace_id=_WORKSPACE_ID
+    )
+
+    assert record.status is GitHubRefreshStatus.ACCEPTED
+    # The REAL #97 guard ran as the composition's first statement — the
+    # Profile FOR KEY SHARE read — and the durable admission joined the same
+    # composed transaction only after it; the F1 submission followed the
+    # committed admission.
+    guard_sql, guard_params = admission_harness.conn.executed[0]
+    assert "openorc.profiles" in guard_sql
+    assert "for key share" in guard_sql
+    assert guard_params == (_PROFILE_ID,)
+    assert admission_harness.admission_after_statements == [1]
+    assert submission.submitted == [record.id]
+
+
 def test_a_known_refusal_is_a_durable_failure_and_never_a_202(
     admission_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -279,7 +398,7 @@ def test_an_uncertain_submission_is_never_a_known_non_delivery(admission_harness
 
 def test_the_status_projection_is_verbatim_for_a_fresh_record(status_harness) -> None:
     projection = github_refresh.get_workspace_github_refresh_for_owner(
-        _pool(),
+        status_harness.pool,
         profile_id=_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         refresh_id=status_harness.stored.id,
@@ -288,6 +407,8 @@ def test_the_status_projection_is_verbatim_for_a_fresh_record(status_harness) ->
     assert projection.status is GitHubRefreshStatus.ACCEPTED
     assert projection.completed_at is None
     assert projection.summary is None
+    # A status read composes no account-mutation barrier: no SQL at all.
+    assert status_harness.conn.executed == []
 
 
 def test_an_expired_running_record_projects_as_unknown(status_harness) -> None:
@@ -297,7 +418,7 @@ def test_an_expired_running_record_projects_as_unknown(status_harness) -> None:
     )
 
     projection = github_refresh.get_workspace_github_refresh_for_owner(
-        _pool(),
+        status_harness.pool,
         profile_id=_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         refresh_id=status_harness.stored.id,
@@ -322,7 +443,7 @@ def test_a_terminal_record_projects_verbatim(status_harness) -> None:
     )
 
     projection = github_refresh.get_workspace_github_refresh_for_owner(
-        _pool(),
+        status_harness.pool,
         profile_id=_PROFILE_ID,
         workspace_id=_WORKSPACE_ID,
         refresh_id=status_harness.stored.id,
@@ -350,7 +471,7 @@ def test_a_foreign_refresh_record_is_the_uniform_not_found(status_harness) -> No
 
     with pytest.raises(NotFoundError):
         github_refresh.get_workspace_github_refresh_for_owner(
-            _pool(),
+            status_harness.pool,
             profile_id=_PROFILE_ID,
             workspace_id=_WORKSPACE_ID,
             refresh_id=status_harness.stored.id,

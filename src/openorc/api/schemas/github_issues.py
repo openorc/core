@@ -99,10 +99,13 @@ class GitHubIssueDetailBlockRead(BaseModel):
 
     Native names/types/meaning preserved, including nested objects and
     GitHub nulls. ``parent``/``sub_issues``/``blocked_by`` are composed from
-    separate GitHub relationship operations: ``null`` means the relation was
-    never observed, ``[]`` an observed empty one. ``sub_issues_total`` and
-    ``blocked_by_total`` are the durable observed counts; when a collection
-    presents fewer entries than its total, the presentation is transparently
+    separate GitHub relationship operations, each family gated on its own
+    durable observation evidence: ``null`` means the family was never
+    observed (hierarchy through ``hierarchy_observed_at``, dependencies
+    through ``dependencies_observed_at``), ``[]`` an observed empty one.
+    ``sub_issues_total`` and ``blocked_by_total`` are the durable observed
+    counts and are null with an unobserved family; when a collection presents
+    fewer entries than its total, the presentation is transparently
     bounded — never silently truncated, and never an eligibility input.
     ``html_url`` is the provider-supplied link carried verbatim for
     "View on GitHub"; it is navigation, never authority.
@@ -123,17 +126,20 @@ class GitHubIssueDetailBlockRead(BaseModel):
     assignees: list[GitHubIssueUserRefRead] | None
     milestone: GitHubIssueMilestoneRead | None
     parent: GitHubIssueParentRefRead | None
-    sub_issues: list[GitHubIssueSubIssueRefRead]
-    sub_issues_total: int
-    blocked_by: list[GitHubIssueBlockedByRefRead]
-    blocked_by_total: int
+    sub_issues: list[GitHubIssueSubIssueRefRead] | None
+    sub_issues_total: int | None
+    blocked_by: list[GitHubIssueBlockedByRefRead] | None
+    blocked_by_total: int | None
 
 
 class GitHubIssueListItemBlockRead(BaseModel):
     """The ``github`` block of one list item (no full issue body).
 
     Identical native fact set to the detail block except that the full body
-    is deliberately absent: the bounded list never carries issue bodies.
+    is deliberately absent: the bounded list never carries issue bodies. The
+    relationship families follow the same observation-evidence contract:
+    an unobserved family presents ``null`` collections and totals, an
+    observed one its bounded collection with the durable total.
     """
 
     id: StrictInt
@@ -150,10 +156,10 @@ class GitHubIssueListItemBlockRead(BaseModel):
     assignees: list[GitHubIssueUserRefRead] | None
     milestone: GitHubIssueMilestoneRead | None
     parent: GitHubIssueParentRefRead | None
-    sub_issues: list[GitHubIssueSubIssueRefRead]
-    sub_issues_total: int
-    blocked_by: list[GitHubIssueBlockedByRefRead]
-    blocked_by_total: int
+    sub_issues: list[GitHubIssueSubIssueRefRead] | None
+    sub_issues_total: int | None
+    blocked_by: list[GitHubIssueBlockedByRefRead] | None
+    blocked_by_total: int | None
 
 
 class OpenOrcCurrentTaskRead(BaseModel):

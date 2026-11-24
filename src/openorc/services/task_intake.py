@@ -371,6 +371,12 @@ def durably_eligible_for_create_task_action(
     - the owning Workspace's account is operational (the account-deletion
       barrier).
 
+    Expected prerequisite refusals — the typed account-deletion barrier and
+    the uniform not-found of an absent/unusable installation route — are
+    ordinary ineligibility that withholds the action without failing the
+    authorized read of retained issue facts; unexpected operational failures
+    still propagate.
+
     Hierarchy is categorically absent from the predicate (non-gating), and
     the offered action is never fresh eligibility: the existing intake
     command boundary revalidates everything freshly and authoritatively at
@@ -392,8 +398,16 @@ def durably_eligible_for_create_task_action(
     workspace = get_workspace(pool, workspace_id)
     if workspace is None:
         return False
-    require_account_operational(pool, profile_id=workspace.owner_profile_id)
-    resolve_system_repository_installation_route(
-        pool, workspace_id=workspace_id, repository_id=repository_id
-    )
+    try:
+        # Expected prerequisite refusals are ordinary action ineligibility:
+        # the account-deletion barrier and the uniform not-found of an
+        # absent/unusable installation route withhold the action without
+        # failing the authorized read of the retained issue facts. Anything
+        # unexpected — a real operational failure — still propagates.
+        require_account_operational(pool, profile_id=workspace.owner_profile_id)
+        resolve_system_repository_installation_route(
+            pool, workspace_id=workspace_id, repository_id=repository_id
+        )
+    except (ConflictError, NotFoundError):
+        return False
     return True

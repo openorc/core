@@ -279,30 +279,76 @@ def test_already_processed_or_absent_marking_returns_false() -> None:
     assert mark_github_webhook_delivery_processed(_pool(conn), delivery_id=uuid.uuid4()) is False
 
 
-def test_recovery_listing_maps_unresolved_relevant_deliveries_bounded() -> None:
+def test_recovery_listing_maps_unresolved_in_scope_deliveries_bounded() -> None:
     unresolved = _delivery_row()
     fake_conn = FakeConnection(None, [unresolved, _delivery_row()])
+    workspace_id = uuid.uuid4()
 
-    listed = list_github_webhook_deliveries_requiring_recovery(_pool(fake_conn), limit=25)
+    listed = list_github_webhook_deliveries_requiring_recovery(
+        _pool(fake_conn), workspace_id=workspace_id, repository_id=None, limit=25
+    )
 
     assert [delivery.delivery_guid for delivery in listed] == ["guid-1", "guid-1"]
     assert all(delivery.processed_at is None for delivery in listed)
     sql, params = fake_conn.executed[0]
-    # The bounded recovery work set: relevant and unresolved only, oldest
-    # first, explicitly limited.
+    # The bounded recovery work set: relevant, unprocessed, and carrying at
+    # least one unresolved route (the per-route resolved_at evidence) inside
+    # the requested Workspace scope — the scope filter precedes the batch
+    # limit, oldest first.
     assert "classification = %s" in sql
     assert "processed_at is null" in sql
+    assert "exists" in sql
+    assert "resolved_at is null" in sql
+    assert "workspace_id = %s" in sql
+    assert "repository_id = %s" not in sql
     assert "order by received_at, id limit %s" in sql
-    assert params == ("relevant", 25)
+    assert sql.index("resolved_at is null") < sql.index("limit %s")
+    assert params == ("relevant", workspace_id, 25)
 
 
-def test_the_recovery_listing_rejects_a_non_positive_limit() -> None:
+def test_the_repository_scope_additionally_binds_the_route_repository() -> None:
+    fake_conn = FakeConnection(None, [_delivery_row()])
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+
+    listed = list_github_webhook_deliveries_requiring_recovery(
+        _pool(fake_conn), workspace_id=workspace_id, repository_id=repository_id, limit=5
+    )
+
+    assert [delivery.delivery_guid for delivery in listed] == ["guid-1"]
+    sql, params = fake_conn.executed[0]
+    # The repository scope binds the unresolved routes to the addressed
+    # Workspace Repository on top of the Workspace scope, before the limit.
+    assert "workspace_id = %s" in sql
+    assert "repository_id = %s" in sql
+    assert sql.index("repository_id = %s") < sql.index("limit %s")
+    assert params == ("relevant", workspace_id, repository_id, 5)
+
+
+def test_the_recovery_listing_rejects_a_malformed_scope_or_limit() -> None:
     conn = FakeConnection(row=None)
+    workspace_id = uuid.uuid4()
 
     for bad_limit in (0, -1, True, 2.5, "5"):
         with pytest.raises(ValueError):
             list_github_webhook_deliveries_requiring_recovery(
                 _pool(conn),
+                workspace_id=workspace_id,
+                repository_id=None,
                 limit=bad_limit,  # type: ignore[arg-type]
             )
+    with pytest.raises(ValueError):
+        list_github_webhook_deliveries_requiring_recovery(
+            _pool(conn),
+            workspace_id="not-a-uuid",  # type: ignore[arg-type]
+            repository_id=None,
+            limit=5,
+        )
+    with pytest.raises(ValueError):
+        list_github_webhook_deliveries_requiring_recovery(
+            _pool(conn),
+            workspace_id=workspace_id,
+            repository_id="not-a-uuid",  # type: ignore[arg-type]
+            limit=5,
+        )
     assert conn.executed == []

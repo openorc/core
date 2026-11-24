@@ -42,7 +42,14 @@ _OBSERVED = datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC)
 _FINGERPRINT = github_issue_requirements_fingerprint("Found a bug", "Steps")
 
 
-def _projection(workspace_id: Any, repository_id: Any, *, body: str | None = "Steps") -> Any:
+def _projection(
+    workspace_id: Any,
+    repository_id: Any,
+    *,
+    body: str | None = "Steps",
+    hierarchy_observed: bool = True,
+    dependencies_observed: bool = True,
+) -> Any:
     return GitHubIssueProjection(
         id=uuid.uuid4(),
         workspace_id=workspace_id,
@@ -72,16 +79,27 @@ def _projection(workspace_id: Any, repository_id: Any, *, body: str | None = "St
             description=None,
             due_on=None,
         ),
-        hierarchy_observed_at=_OBSERVED,
-        dependencies_observed_at=_OBSERVED,
+        hierarchy_observed_at=_OBSERVED if hierarchy_observed else None,
+        dependencies_observed_at=_OBSERVED if dependencies_observed else None,
     )
 
 
 def _item(
-    workspace_id: Any, repository_id: Any, *, body: str | None = "Steps"
+    workspace_id: Any,
+    repository_id: Any,
+    *,
+    body: str | None = "Steps",
+    hierarchy_observed: bool = True,
+    dependencies_observed: bool = True,
 ) -> RepositoryIssueListItem:
     return RepositoryIssueListItem(
-        projection=_projection(workspace_id, repository_id, body=body),
+        projection=_projection(
+            workspace_id,
+            repository_id,
+            body=body,
+            hierarchy_observed=hierarchy_observed,
+            dependencies_observed=dependencies_observed,
+        ),
         parent=None,
         sub_issues=(RelatedIssueEndpoint(github_repository_id=42, github_issue_id=100),),
         blocked_by=(),
@@ -212,6 +230,8 @@ def test_list_items_carry_the_github_block_without_a_body_and_the_openorc_block(
         {"id": 11, "name": "bug", "color": "d73a4a", "description": None}
     ]
     assert github_block["milestone"]["number"] == 7
+    # Both families observed here: the observed sub-issue collection with its
+    # durable total, and the observed-empty dependency collection.
     assert github_block["sub_issues_total"] == 1
     assert github_block["sub_issues"] == [
         {
@@ -223,6 +243,8 @@ def test_list_items_carry_the_github_block_without_a_body_and_the_openorc_block(
             "html_url": None,
         }
     ]
+    assert github_block["blocked_by"] == []
+    assert github_block["blocked_by_total"] == 0
     openorc_block = item["openorc"]
     assert openorc_block["workspace_id"] == str(workspace_id)
     assert openorc_block["repository_id"] == str(repository_id)
@@ -257,6 +279,63 @@ def test_the_detail_carries_the_full_nullable_body_and_the_same_fact_set(
             "issue_id": item.projection.id,
         }
     ]
+
+
+def test_an_unobserved_relationship_family_presents_null_collections_and_totals(
+    service_seam, settings_factory, owner_profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    item = _item(workspace_id, repository_id, hierarchy_observed=False, dependencies_observed=False)
+    service_seam(list_items=[item], detail=RepositoryIssueDetail(item=item))
+    client = _client(settings_factory(), owner_profile)
+    list_path = f"/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/issues"
+
+    list_response = client.get(list_path)
+    detail_response = client.get(f"{list_path}/{item.projection.id}")
+
+    # A never-observed family is never a fabricated empty observation: null
+    # collections and null totals, on both the list item and the detail.
+    assert list_response.status_code == 200
+    github_block = list_response.json()["items"][0]["github"]
+    assert github_block["parent"] is None
+    assert github_block["sub_issues"] is None
+    assert github_block["sub_issues_total"] is None
+    assert github_block["blocked_by"] is None
+    assert github_block["blocked_by_total"] is None
+    assert detail_response.status_code == 200
+    detail_block = detail_response.json()["github"]
+    assert detail_block["parent"] is None
+    assert detail_block["sub_issues"] is None
+    assert detail_block["sub_issues_total"] is None
+    assert detail_block["blocked_by"] is None
+    assert detail_block["blocked_by_total"] is None
+
+
+def test_relationship_families_project_independently_of_each_other(
+    service_seam, settings_factory, owner_profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    observed_hierarchy = _item(workspace_id, repository_id, dependencies_observed=False)
+    observed_dependencies = _item(workspace_id, repository_id, hierarchy_observed=False)
+    service_seam(list_items=[observed_hierarchy, observed_dependencies])
+    client = _client(settings_factory(), owner_profile)
+
+    response = client.get(f"/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/issues")
+
+    first, second = response.json()["items"][0]["github"], response.json()["items"][1]["github"]
+    # Hierarchy observed, dependencies never observed.
+    assert first["sub_issues_total"] == 1
+    assert len(first["sub_issues"]) == 1
+    assert first["blocked_by"] is None
+    assert first["blocked_by_total"] is None
+    # Dependencies observed (empty), hierarchy never observed.
+    assert second["blocked_by"] == []
+    assert second["blocked_by_total"] == 0
+    assert second["sub_issues"] is None
+    assert second["sub_issues_total"] is None
+    assert second["parent"] is None
 
 
 def test_a_malformed_state_filter_is_rejected_before_the_service(

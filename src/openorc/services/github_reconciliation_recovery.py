@@ -134,12 +134,12 @@ _SERVICE_TRACER_SCOPE = "openorc.services.github_reconciliation_recovery"
 _SWEEP_SPAN_NAME = "github_reconciliation_recovery.run_github_reconciliation_sweep"
 
 # The delivery-recovery batch cap: one refresh invocation re-dispatches at
-# most this many unresolved deliveries, oldest first. Completed deliveries
-# leave the eligible set through the per-route completion evidence and the
-# bounded ``processed_at`` marking, so repeated refreshes drain any backlog;
-# persistently failing deliveries stay visible in each execution's outcomes.
-# A bounded cap keeps one execution's provider work bounded regardless of how
-# long an outage lasted.
+# most this many unresolved in-scope deliveries, oldest first. Completed
+# deliveries leave the eligible set through the per-route completion evidence
+# and the bounded ``processed_at`` marking, so repeated refreshes drain any
+# backlog; persistently failing deliveries stay visible in each execution's
+# outcomes. A bounded cap keeps one execution's provider work bounded
+# regardless of how long an outage lasted.
 MAX_RECOVERY_DELIVERY_BATCH = 50
 
 # The bounded per-unit error facts a refresh record carries: sanitized typed
@@ -1107,17 +1107,31 @@ def _delivery_dispatch_status(
 ) -> GitHubReconciliationSweepUnitStatus:
     """Map a re-dispatched delivery's bounded outcomes to one sweep status.
 
-    ``processed`` is the known success; otherwise the aggregate route
-    classification is the sweep's fact, with uncertainty taking precedence so
-    an unknown outcome is never reported as a clean known failure.
+    ``processed`` is the known success. Otherwise the applicable in-scope
+    route outcomes decide, independently of the whole-delivery ``processed_at``
+    instant: every dispatched route reconciled or typedly declined is the
+    scoped recovery's success — the delivery's whole-fan-out processed
+    marking remains the dispatch boundary's rule, so another Workspace's
+    still-outstanding route is not this scope's failure. Uncertainty takes
+    precedence over unexpected over known failures so an unknown outcome is
+    never reported as a clean known failure. An empty applicable-outcome set
+    (an unexpected durable shape, logged by the dispatch boundary)
+    conservatively stays a known failure.
     """
     if result.processed:
         return GitHubReconciliationSweepUnitStatus.RECONCILED
     route_statuses = {outcome.status for outcome in result.route_outcomes}
+    if not route_statuses:
+        return GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
     if GitHubWebhookDispatchRouteStatus.FAILED_UNCERTAIN in route_statuses:
         return GitHubReconciliationSweepUnitStatus.FAILED_UNCERTAIN
     if GitHubWebhookDispatchRouteStatus.FAILED_UNEXPECTED in route_statuses:
         return GitHubReconciliationSweepUnitStatus.FAILED_UNEXPECTED
+    if route_statuses <= {
+        GitHubWebhookDispatchRouteStatus.RECONCILED,
+        GitHubWebhookDispatchRouteStatus.DECLINED,
+    }:
+        return GitHubReconciliationSweepUnitStatus.RECONCILED
     return GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
 
 
@@ -1126,27 +1140,33 @@ def _sweep_delivery_units(
     github: GitHubAppClient,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
     *,
-    route_scope: GitHubWebhookRouteScope | None = None,
+    route_scope: GitHubWebhookRouteScope,
 ) -> list[GitHubReconciliationSweepOutcome]:
     """Recover recorded deliveries whose downstream dispatch did not complete.
 
-    Each unresolved delivery re-enters the untouched #120 dispatch boundary:
-    it reloads durable state by the delivery GUID, re-validates current
-    routing, re-runs the routed authoritative reconciliation, and marks only
-    the bounded ``processed_at`` recovery instant when every routed
-    reconciliation completed or typedly declined. With the optional
-    ``route_scope`` (issue #375), only the scope's routes are dispatched —
-    never an out-of-scope route — and the delivery is marked processed only
-    when every routed route of the whole fan-out carries completion
-    evidence, so a shared fan-out delivery is never marked processed solely
-    because one selected route completed. The provider delivery identity is
-    never rewritten, inbox status is never GitHub truth, and the
-    oldest-first batch cap keeps the recovery work bounded while the backlog
-    drains across repeated refreshes.
+    The work set is selected durably within the addressed scope — only
+    deliveries with at least one unresolved route of the scope are listed
+    (the scope filter applies before the bounded batch cap), so an unrelated
+    Workspace's backlog can never exhaust the batch, starve in-scope
+    recovery, or leak its delivery identities into this execution's
+    outcomes. Each listed delivery re-enters the untouched #120 dispatch
+    boundary: it reloads durable state by the delivery GUID, re-validates
+    current routing, re-runs the routed authoritative reconciliation, and
+    marks only the bounded ``processed_at`` recovery instant when every
+    routed reconciliation of the whole fan-out completed or typedly
+    declined. With the ``route_scope``, only the scope's routes are
+    dispatched — never an out-of-scope route — and a shared fan-out delivery
+    is never marked processed solely because one selected route completed.
+    The provider delivery identity is never rewritten, inbox status is never
+    GitHub truth, and the oldest-first batch cap keeps the recovery work
+    bounded while the backlog drains across repeated refreshes.
     """
     outcomes: list[GitHubReconciliationSweepOutcome] = []
     deliveries = list_github_webhook_deliveries_requiring_recovery(
-        pool, limit=MAX_RECOVERY_DELIVERY_BATCH
+        pool,
+        workspace_id=route_scope.workspace_id,
+        repository_id=route_scope.repository_id,
+        limit=MAX_RECOVERY_DELIVERY_BATCH,
     )
     for delivery in deliveries:
         try:

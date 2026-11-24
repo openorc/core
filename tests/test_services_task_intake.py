@@ -40,6 +40,11 @@ from openorc.adapters.github import (
 )
 from openorc.adapters.github.transport import is_github_api_origin
 from openorc.domain.github_issue_relations import RelatedIssueEndpoint
+from openorc.domain.github_issues import (
+    GitHubIssueIdentity,
+    GitHubIssueProjection,
+    GitHubIssueState,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_intake
 from openorc.services.errors import (
@@ -841,3 +846,119 @@ def test_the_owner_boundary_composes_ownership_before_the_primitive() -> None:
         issue_number=_ISSUE_NUMBER,
     )
     assert result.created is True
+
+
+# --- The read-side create_task action eligibility (issue #375) -------------
+#
+# The DB-only eligibility assessment behind the authorized issue read
+# surface's ``openorc.actions``: expected prerequisite refusals (the #97
+# account-deletion barrier, the uniform not-found of an absent/unusable
+# installation route) are ordinary ineligibility that withholds the action
+# without failing the authorized read, while unexpected operational failures
+# still propagate. The authoritative command guards above are unchanged.
+
+
+def _eligibility_projection(*, dependencies_observed: bool = True) -> GitHubIssueProjection:
+    """An open issue whose dependencies are (by default) observed empty."""
+    return GitHubIssueProjection(
+        id=uuid.uuid4(),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        identity=GitHubIssueIdentity(github_issue_id=_GITHUB_ISSUE_ID),
+        issue_number=_ISSUE_NUMBER,
+        title="Found a bug",
+        body=None,
+        state=GitHubIssueState.OPEN,
+        requirements_fingerprint=_FINGERPRINT,
+        provider_updated_at=_OBSERVED,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+        dependencies_observed_at=_OBSERVED if dependencies_observed else None,
+    )
+
+
+def _script_eligibility_prerequisites(conn: ScriptedConnection, *, guard_row: Any) -> None:
+    """Script the reads the eligibility assessment runs through the barrier."""
+    conn.on("from openorc.github_issue_dependencies", [])
+    conn.on("from openorc.tasks", None)
+    conn.on("from openorc.workspaces", _ws_row())
+    conn.on("from openorc.profiles", guard_row)
+
+
+def test_the_read_side_action_requires_all_durable_prerequisites() -> None:
+    conn = ScriptedConnection()
+    _script_eligibility_prerequisites(conn, guard_row=(None, None, None))
+    _script_route_resolution(conn)
+
+    eligible = task_intake.durably_eligible_for_create_task_action(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        projection=_eligibility_projection(),
+    )
+
+    assert eligible is True
+
+
+def test_a_disconnected_installation_route_withholds_the_action() -> None:
+    conn = ScriptedConnection()
+    _script_eligibility_prerequisites(conn, guard_row=(None, None, None))
+    # A Repository with no configured installation route: the resolver's
+    # uniform not-found is an eligibility refusal, never a read failure.
+    conn.on(
+        "select id, project_id, workspace_id, github_repository_id",
+        _repository_row()[:-1] + (None,),
+    )
+
+    eligible = task_intake.durably_eligible_for_create_task_action(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        projection=_eligibility_projection(),
+    )
+
+    assert eligible is False
+
+
+def test_an_account_deletion_attempt_withholds_the_action() -> None:
+    for state in ("active", "uncertain"):
+        conn = ScriptedConnection()
+        _script_eligibility_prerequisites(conn, guard_row=(state, uuid.uuid4(), _OBSERVED))
+
+        eligible = task_intake.durably_eligible_for_create_task_action(
+            _pool(conn),
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            projection=_eligibility_projection(),
+        )
+
+        assert eligible is False
+
+
+def test_an_unexpected_operational_failure_is_not_action_ineligibility() -> None:
+    conn = ScriptedConnection()
+    _script_eligibility_prerequisites(conn, guard_row=RuntimeError("database unavailable"))
+
+    with pytest.raises(RuntimeError):
+        task_intake.durably_eligible_for_create_task_action(
+            _pool(conn),
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            projection=_eligibility_projection(),
+        )
+
+
+def test_unobserved_dependencies_never_establish_eligibility() -> None:
+    conn = ScriptedConnection()
+
+    eligible = task_intake.durably_eligible_for_create_task_action(
+        _pool(conn),
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        projection=_eligibility_projection(dependencies_observed=False),
+    )
+
+    # The dependency observation evidence is missing: never eligible, and
+    # nothing is even read — the observation evidence is the first fact.
+    assert eligible is False
+    assert conn.executed == []
