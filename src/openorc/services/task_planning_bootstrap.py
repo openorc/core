@@ -222,10 +222,18 @@ class TaskBootstrapEstablishmentLease:
     invoking continuation passes it verbatim as
     ``establish_task_agent_session(..., effective_configuration=...)`` so the
     fresh construction and the durable READY snapshot agree by construction.
+    ``selected_configured_provider``/``selected_configured_model`` are the
+    #376 captured construction facts — the non-secret configured pair of the
+    composition-selected workflow-role route — passed verbatim as
+    ``establish_task_agent_session(..., configured_provider=...,
+    configured_model=...)`` so the durable READY snapshot records exactly the
+    pair the fresh session was constructed with.
     """
 
     adapter: AgentRuntimeAdapter
     selected_configuration: Mapping[str, object]
+    selected_configured_provider: str | None
+    selected_configured_model: str | None
 
 
 class TaskBootstrapRuntimeComposition(ABC):
@@ -1050,6 +1058,8 @@ def prepare_task_for_planning(
                         task_id=task_id,
                         role=role,
                         effective_configuration=lease.selected_configuration,
+                        configured_provider=lease.selected_configured_provider,
+                        configured_model=lease.selected_configured_model,
                         original_attempt_kind=OriginalAttemptKind.PLANNING_BOOTSTRAP_CLAIM,
                         original_attempt_id=claim_token,
                         observation_registrar=observation_registrar,
@@ -1064,6 +1074,8 @@ def prepare_task_for_planning(
                         task_id=task_id,
                         role=role,
                         effective_configuration=lease.selected_configuration,
+                        configured_provider=lease.selected_configured_provider,
+                        configured_model=lease.selected_configured_model,
                     )
                     bindings[role] = established
         if dispatched_detached:

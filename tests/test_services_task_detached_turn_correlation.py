@@ -612,6 +612,22 @@ def _script_remediation_subject(conn: ScriptedConnection, *, head_sha: str) -> N
             None,
             _OBSERVED,
             _OBSERVED,
+            # The #376-extended row shape: honest legacy-NULL presentation and
+            # mergeability columns.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
     )
 
@@ -3064,6 +3080,22 @@ def _review_pr_row() -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        # The #376-extended row shape: honest legacy-NULL presentation and
+        # mergeability columns.
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 

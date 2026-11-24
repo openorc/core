@@ -171,6 +171,22 @@ def _pull_request_row() -> tuple[Any, ...]:
         None,
         _OBSERVED,
         _OBSERVED,
+        # The #376-extended row shape: honest legacy-NULL presentation and
+        # mergeability columns (the row shape the #376 migration carries).
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 

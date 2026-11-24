@@ -167,6 +167,7 @@ __all__ = [
     "TaskEligibilityContradictedError",
     "TaskEligibilityFailure",
     "TaskSourceIdentityLossError",
+    "start_durably_offered",
     "TaskStartOutcome",
     "TaskStartStateConflictError",
     "find_unclaimed_bootstrap_handoff",
@@ -683,6 +684,28 @@ def _require_startable_task(task: Task) -> None:
             "only a ready_to_plan task can be started; a queued task is re-evaluated "
             "by the queued-Tasks sweep"
         )
+
+
+def start_durably_offered(transaction_pool: DatabasePool, *, task: Task) -> bool:
+    """Whether the durable facts positively support offering ``start`` (#376).
+
+    The authorized read surface's backend-generated action projection reuses
+    the authoritative Start eligibility predicates — the startable-state
+    rule and the durable GitHub-projection queue eligibility — exactly as
+    the command boundary applies them, evaluated inside the caller's own
+    transaction and never persisted, never an external call, and never a
+    second policy engine. A ready_to_plan Task whose durable projection has
+    closed, lost its stable identity, acquired a mirrored blocker, or
+    drifted from its frozen baseline is never offered. The command still
+    revalidates everything freshly at execution; offering is neither
+    permission nor a promise.
+    """
+    try:
+        _require_startable_task(task)
+        _require_durable_queue_eligibility(transaction_pool, task=task)
+    except (TaskEligibilityContradictedError, ConflictError, StaleOperationError):
+        return False
+    return True
 
 
 def start_task_for_owner(

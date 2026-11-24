@@ -32,7 +32,10 @@ from psycopg import Connection
 
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.transactions import transaction
-from openorc.services.transaction_composition import composed_transaction
+from openorc.services.transaction_composition import (
+    composed_read_transaction,
+    composed_transaction,
+)
 
 
 class FakeConnection:
@@ -40,6 +43,7 @@ class FakeConnection:
 
     def __init__(self) -> None:
         self.events: list[str] = []
+        self.statements: list[str] = []
         self._in_transaction = False
         self._savepoint_depth = 0
 
@@ -57,6 +61,7 @@ class FakeConnection:
 
     def execute(self, *args: Any, **kwargs: Any) -> None:
         self.events.append("execute")
+        self.statements.append(str(args[0]) if args else "")
         self._in_transaction = True  # implicit transaction opens (autocommit off)
 
     def __enter__(self) -> FakeConnection:
@@ -285,4 +290,85 @@ def test_context_created_while_active_cannot_be_entered_after_expiry() -> None:
     # after the outer composition has ended: the bound connection has
     # returned to the process pool and may already be reused elsewhere.
     with pytest.raises(RuntimeError, match="expired"), delayed:
+        pass  # pragma: no cover - the block can never be entered
+
+
+def test_composed_read_transaction_pins_the_snapshot_before_any_composed_read() -> None:
+    conn = FakeConnection()
+    pool = FakePool(conn)
+
+    with composed_read_transaction(cast(DatabasePool, pool)) as scoped:
+        with transaction(scoped) as first:
+            assert first is conn
+            first.execute("select 1")
+        with transaction(scoped) as second:
+            assert second is conn
+            second.execute("select 2")
+
+    # The read-side composition opens the same one explicit outer
+    # transaction, but its FIRST statement is the transaction-scoped
+    # REPEATABLE READ READ ONLY snapshot characteristics — issued before the
+    # view is yielded and before any repository scope joins the transaction,
+    # so every composed read observes one committed snapshot. The repository
+    # scopes remain nested savepoints, and the composition commits once.
+    assert conn.events == [
+        "checkout",
+        "begin",
+        "execute",
+        "savepoint:1",
+        "execute",
+        "release:1",
+        "savepoint:1",
+        "execute",
+        "release:1",
+        "commit",
+        "return",
+    ]
+    assert conn.statements == [
+        "set transaction isolation level repeatable read read only",
+        "select 1",
+        "select 2",
+    ]
+    assert pool.returned == 1
+
+
+def test_composed_read_transaction_commits_on_clean_exit_and_returns_the_connection() -> None:
+    conn = FakeConnection()
+    pool = FakePool(conn)
+
+    with (
+        composed_read_transaction(cast(DatabasePool, pool)) as scoped,
+        transaction(scoped) as first,
+    ):
+        first.execute("select the coherent state token")
+
+    assert conn.events == [
+        "checkout",
+        "begin",
+        "execute",
+        "savepoint:1",
+        "execute",
+        "release:1",
+        "commit",
+        "return",
+    ]
+    assert pool.returned == 1
+
+
+def test_composed_read_transaction_rolls_back_and_expires_on_error() -> None:
+    conn = FakeConnection()
+    pool = FakePool(conn)
+    leaked: DatabasePool | None = None
+
+    with (
+        pytest.raises(RuntimeError, match="read composition failed"),
+        composed_read_transaction(cast(DatabasePool, pool)) as scoped,
+    ):
+        leaked = scoped
+        raise RuntimeError("read composition failed")
+
+    assert conn.events == ["checkout", "begin", "execute", "rollback", "return"]
+    assert pool.returned == 1
+    assert leaked is not None
+    with pytest.raises(RuntimeError, match="expired"), transaction(cast(DatabasePool, leaked)):
         pass  # pragma: no cover - the block can never be entered

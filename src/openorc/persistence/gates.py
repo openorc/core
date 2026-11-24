@@ -73,6 +73,7 @@ __all__ = [
     "OwnerGateSupersessionOutcome",
     "create_owner_gate",
     "get_owner_gate",
+    "list_owner_gates_by_ids",
     "list_task_owner_gates",
     "resolve_owner_gate",
     "supersede_current_owner_gate",
@@ -305,6 +306,32 @@ def get_owner_gate(pool: DatabasePool, *, owner_gate_id: UUID) -> OwnerGate | No
             (owner_gate_id,),
         ).fetchone()
     return None if row is None else _owner_gate_from_row(row)
+
+
+def list_owner_gates_by_ids(
+    pool: DatabasePool, *, owner_gate_ids: Sequence[UUID]
+) -> dict[UUID, OwnerGate]:
+    """Return the addressed OwnerGates keyed by their ids (#376).
+
+    The batched current-gate lookup behind the authorized Task list
+    composition: one query over the page's current-gate pointer values,
+    deterministically ordered. A missing id is simply absent from the
+    mapping — an absent pointer (a Task with no current gate) never
+    addresses this read at all.
+    """
+    distinct_ids = list(dict.fromkeys(owner_gate_ids))
+    if not distinct_ids:
+        return {}
+    for gate_id in distinct_ids:
+        if not isinstance(gate_id, UUID):
+            raise OwnerGateDomainError("owner_gate_ids must all be UUIDs")
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_OWNER_GATE_COLUMNS} from openorc.owner_gates "
+            "where id = any(%s) order by created_at, id",
+            (distinct_ids,),
+        ).fetchall()
+    return {_owner_gate_from_row(row).id: _owner_gate_from_row(row) for row in rows}
 
 
 def list_task_owner_gates(pool: DatabasePool, *, task_id: UUID) -> list[OwnerGate]:

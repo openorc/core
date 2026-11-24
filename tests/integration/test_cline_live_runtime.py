@@ -993,6 +993,8 @@ def _establish_fresh(
         task_id=state.task_id,
         role=role,
         effective_configuration=runtime.selected_configuration,
+        configured_provider=runtime.selected_configured_provider,
+        configured_model=runtime.selected_configured_model,
     )
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
     assert session.external_session_id is not None and session.external_session_id.strip()

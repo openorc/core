@@ -114,7 +114,8 @@ def test_record_is_frozen() -> None:
 def test_field_set_carries_only_the_pr_record_facts() -> None:
     # The exact field set is asserted so future drift cannot appear
     # silently: stable GitHub identity plus repository-local address, the
-    # mutable observed reconciliation state, and no review outcomes (exact
+    # mutable observed reconciliation state, the #376 presentation and
+    # head-bound mergeability observations, and no review outcomes (exact
     # reviewed heads live as immutable history on the review records).
     assert task_pull_request_field_names() == frozenset(
         {
@@ -131,5 +132,19 @@ def test_field_set_carries_only_the_pr_record_facts() -> None:
             "merged_at",
             "created_at",
             "updated_at",
+            "title",
+            "body",
+            "html_url",
+            "user_id",
+            "user_login",
+            "draft",
+            "provider_created_at",
+            "provider_updated_at",
+            "provider_closed_at",
+            "base_sha",
+            "mergeable",
+            "merge_state_status",
+            "pr_mergeability_observed_at",
+            "pr_mergeability_head_sha",
         }
     )

@@ -37,13 +37,16 @@ from openorc.persistence.tasks import (
     get_task_planning_bootstrap_claim,
     list_current_repository_tasks,
     list_issue_attempts,
+    list_issue_tasks_page,
     list_queued_tasks,
     list_workspace_tasks,
+    list_workspace_tasks_page,
     lock_workspace_task_arbitration,
     restore_blocked_task_status,
     set_current_owner_gate,
     update_task_status,
 )
+from tests.fakes.task_rows import task_row
 
 
 class FakeCursor:
@@ -1239,3 +1242,142 @@ def test_restore_blocked_task_status_without_a_threshold_touches_no_allowance() 
     # RETURNING projection, never in the SET clause.
     assert "effective_cost_threshold_usd = %s" not in sql
     assert params == ("planning", row[0], original_token)
+
+
+def _page_pool(rows: list[tuple[Any, ...]]) -> DatabasePool:
+    class _Cursor:
+        def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+            self._rows = rows
+
+        def fetchall(self) -> list[tuple[Any, ...]]:
+            return list(self._rows)
+
+        def fetchone(self) -> tuple[Any, ...] | None:
+            return self._rows[0] if self._rows else None
+
+    class _Conn:
+        def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+            self._rows = rows
+            self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
+
+        def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> _Cursor:
+            self.executed.append((sql, params))
+            return _Cursor(self._rows)
+
+    class _Pool:
+        def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+            self._conn = _Conn(rows)
+
+        def connection(self):  # noqa: ANN201
+            import contextlib
+
+            @contextlib.contextmanager
+            def managed():  # noqa: ANN202
+                yield self._conn
+
+            return managed()
+
+    return cast(DatabasePool, _Pool(rows))
+
+
+def test_the_issue_attempts_page_scopes_the_exact_issue_and_bounds_the_keyset() -> None:
+    """The #376 issue-attempts page: every attempt for the exact stable issue
+    identity, deterministically ordered by the ``(created_at, id)`` key, with
+    the full-key continuation carried into the comparison."""
+    workspace_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    rows = [
+        task_row(
+            id=uuid.uuid4(),
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=6550419907,
+            status="cancelled",
+            archived_at=_observed_at(),
+            source_requirements_fingerprint="a" * 64,
+        ),
+        task_row(
+            id=uuid.uuid4(),
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=6550419907,
+            status="waiting_for_owner",
+            source_requirements_fingerprint="a" * 64,
+        ),
+    ]
+    pool = _page_pool(rows)
+
+    tasks = list_issue_tasks_page(
+        pool,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        github_issue_id=6550419907,
+        statuses=(TaskStatus.CANCELLED, TaskStatus.WAITING_FOR_OWNER),
+        archival="all",
+        after_created_at=_observed_at(),
+        after_task_id=uuid.uuid4(),
+        limit=50,
+    )
+
+    assert [task.status for task in tasks] == [TaskStatus.CANCELLED, TaskStatus.WAITING_FOR_OWNER]
+    sql, params = cast(Any, pool)._conn.executed[0]
+    assert "from openorc.tasks" in sql
+    assert "github_issue_id = %s" in sql
+    assert "(created_at, id) > (%s, %s)" in sql
+    assert "order by created_at, id limit %s" in sql
+    assert params[2] == 6550419907
+    # The archival 'all' filter adds no WHERE predicate (the SELECT column
+    # projection always carries the column name).
+    where_clause = sql.split("where")[1]
+    assert "archived_at" not in where_clause
+
+
+def test_the_workspace_page_carries_the_archival_predicate() -> None:
+    workspace_id = uuid.uuid4()
+    pool = _page_pool([])
+
+    tasks = list_workspace_tasks_page(
+        pool,
+        workspace_id=workspace_id,
+        statuses=(TaskStatus.QUEUED,),
+        archival="current",
+        limit=10,
+    )
+
+    assert tasks == []
+    sql, _ = cast(Any, pool)._conn.executed[0]
+    assert "workspace_id = %s" in sql
+    assert "status in ('queued')" in sql
+    assert "and archived_at is null" in sql
+
+
+def test_a_malformed_page_cursor_or_limit_is_rejected_before_sql() -> None:
+    workspace_id = uuid.uuid4()
+    pool = _page_pool([])
+
+    with pytest.raises(TaskDomainError):
+        list_workspace_tasks_page(
+            pool,
+            workspace_id=workspace_id,
+            statuses=(TaskStatus.QUEUED,),
+            archival="current",
+            after_created_at=_observed_at(),
+            after_task_id=None,
+            limit=10,
+        )
+    with pytest.raises(TaskDomainError):
+        list_workspace_tasks_page(
+            pool,
+            workspace_id=workspace_id,
+            statuses=(TaskStatus.QUEUED,),
+            archival="fabricated",
+            limit=10,
+        )
+    with pytest.raises(TaskDomainError):
+        list_workspace_tasks_page(
+            pool,
+            workspace_id=workspace_id,
+            statuses=(TaskStatus.QUEUED,),
+            archival="current",
+            limit=0,
+        )

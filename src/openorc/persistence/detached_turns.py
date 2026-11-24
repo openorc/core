@@ -37,6 +37,7 @@ external call ever occurs inside these transactions.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Final
 from uuid import UUID
 
@@ -83,6 +84,7 @@ __all__ = [
     "get_task_detached_turn_receipt",
     "get_task_detached_turn_receipt_for_update",
     "list_outstanding_session_initialization_receipts",
+    "list_task_detached_turn_receipts",
     "list_task_detached_turn_receipts_for_original_attempt",
     "mark_task_detached_turn_admission_attempted",
     "mark_task_detached_turn_receipt_contradicted",
@@ -732,6 +734,48 @@ def list_task_detached_turn_receipts_for_original_attempt(
             "and original_attempt_kind = %s and original_attempt_id = %s "
             "order by claimed_at desc, id desc",
             (workspace_id, task_id, original_attempt_kind.value, original_attempt_id),
+        ).fetchall()
+    return [_receipt_from_row(row) for row in rows]
+
+
+def list_task_detached_turn_receipts(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    after_claimed_at: datetime | None = None,
+    after_receipt_id: UUID | None = None,
+    limit: int,
+) -> list[TaskDetachedTurnReceipt]:
+    """Return one bounded page of a Task's detached-turn receipts (#376).
+
+    The authorized Task read surface's outstanding-evidence listing: every
+    receipt family of the Task (initialization, run, discussion, terminal
+    cleanup), newest-claimed first, advanced by the opaque ``(claimed_at,
+    id)`` keyset cursor so a long history loads without unbounded
+    aggregates. The Task/Workspace scope is enforced by the query, so a
+    foreign Task is indistinguishable from addressing something absent.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_uuid(task_id, "task_id")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("the receipts page limit must be a positive integer")
+    predicate = "workspace_id = %s and task_id = %s"
+    params: list[Any] = [workspace_id, task_id]
+    if after_claimed_at is not None:
+        if not isinstance(after_receipt_id, UUID):
+            raise ValueError("the receipts page cursor must carry both key parts")
+        if after_claimed_at.tzinfo is None:
+            raise ValueError("the receipts page cursor timestamp must be timezone-aware")
+        predicate += " and (claimed_at, id) < (%s, %s)"
+        params.extend([normalize_utc(after_claimed_at), after_receipt_id])
+    params.append(limit)
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_RECEIPT_COLUMNS} from openorc.task_hub_run_receipts "
+            f"where {predicate} "
+            "order by claimed_at desc, id desc limit %s",
+            tuple(params),
         ).fetchall()
     return [_receipt_from_row(row) for row in rows]
 

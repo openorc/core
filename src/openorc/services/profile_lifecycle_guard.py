@@ -40,11 +40,14 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from openorc.persistence.ownership import read_account_deletion_state_for_key_share
+from openorc.persistence.ownership import (
+    read_account_deletion_state,
+    read_account_deletion_state_for_key_share,
+)
 from openorc.persistence.pool import DatabasePool
 from openorc.services.errors import ConflictError, NotFoundError
 
-__all__ = ["require_account_operational"]
+__all__ = ["account_operationally_offered", "require_account_operational"]
 
 
 def require_account_operational(pool: DatabasePool, *, profile_id: UUID) -> None:
@@ -65,3 +68,20 @@ def require_account_operational(pool: DatabasePool, *, profile_id: UUID) -> None
         raise ConflictError(
             "the account is being deleted: changes are rejected until the deletion attempt resolves"
         )
+
+
+def account_operationally_offered(pool: DatabasePool, *, profile_id: UUID) -> bool:
+    """Whether the account-operational barrier holds, read-side (issue #376).
+
+    The authorized Task read surface's non-locking counterpart of
+    :func:`require_account_operational`: the same durable deletion-state
+    semantics and fail-closed decision facts through the non-locking
+    :func:`openorc.persistence.ownership.read_account_deletion_state`, so the
+    predicate composes inside a read-only snapshot transaction (a locking
+    clause is prohibited there and would fail every ordinary read). A missing
+    Profile and any existing deletion attempt are simply not offered. The
+    guarded mutations keep the ``FOR KEY SHARE`` barrier unchanged; the
+    command routes revalidate everything freshly at execution.
+    """
+    exists, state = read_account_deletion_state(pool, profile_id=profile_id)
+    return exists and state is None

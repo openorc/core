@@ -8,8 +8,8 @@ operations — for example a canonical mutation plus its WorkflowEvent
 insert — without duplicating repository SQL or holding a transaction across
 external I/O.
 
-``composed_transaction`` is the one production-supported composition
-primitive:
+``composed_transaction`` is the one production-supported mutation
+composition primitive:
 
 1. it opens ONE outer transaction from the process-local pool;
 2. it yields a transaction-scoped ``DatabasePool`` view over that
@@ -19,6 +19,17 @@ primitive:
    transactions (SAVEPOINTs) on the outer transaction;
 4. the whole composition commits together on clean exit, or rolls back
    together on error.
+
+``composed_read_transaction`` is the read-side composition seam: the same
+one-outer-transaction composition whose explicit outer block establishes a
+transaction-scoped stable snapshot — ``SET TRANSACTION ISOLATION LEVEL
+REPEATABLE READ READ ONLY`` issued as the transaction's FIRST statement —
+so every composed read joins one repeatable-read snapshot instead of
+READ COMMITTED's per-statement views (READ COMMITTED remains the normal
+isolation level of every command transaction; the snapshot semantics are
+established only inside this seam's own transaction block, so no
+session-local state is ever set and pooler neutrality is preserved). The
+authorized Task list/detail reads compose through it.
 
 ``pool.connection()`` only checks a connection out of the pool — it does
 not establish a transaction. The explicit ``conn.transaction()`` entry
@@ -50,7 +61,7 @@ from psycopg import Connection
 
 from openorc.persistence.pool import DatabasePool
 
-__all__ = ["composed_transaction"]
+__all__ = ["composed_read_transaction", "composed_transaction"]
 
 
 class _ConnectionBoundPool:
@@ -139,6 +150,56 @@ def composed_transaction(pool: DatabasePool) -> Iterator[DatabasePool]:
     call. See the module docstring for the external-I/O rule.
     """
     with pool.connection() as conn, conn.transaction():
+        scoped = _ConnectionBoundPool(conn)
+        try:
+            yield scoped
+        finally:
+            scoped._expire()
+
+
+# The transaction-scoped snapshot characteristics the read-side composition
+# establishes: one repeatable-read, read-only transaction per composed read.
+# Transaction-scoped (not session-local), so a pooled connection never leaks
+# the characteristics to a later borrower and every pooler mode behaves
+# identically.
+_SNAPSHOT_CHARACTERISTICS = "set transaction isolation level repeatable read read only"
+
+
+@contextmanager
+def composed_read_transaction(pool: DatabasePool) -> Iterator[DatabasePool]:
+    """Compose repository READS inside ONE stable-snapshot transaction.
+
+    The read-side counterpart of :func:`composed_transaction`: the same
+    one outer transaction from the process-local pool, the same
+    transaction-scoped :class:`~openorc.persistence.pool.DatabasePool` view
+    over that exact connection, and the same nested-SAVEPOINT behavior for
+    repository functions called through the view. Before the view is
+    yielded, the explicit outer transaction block issues
+    ``SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`` as the
+    transaction's FIRST statement, so every read composed through the view
+    observes ONE committed snapshot instead of READ COMMITTED's
+    per-statement views: a concurrent workflow transition committing between
+    the composition's statements can never produce a response mixing an old
+    state token with newly resolved gate, block, session, or action-evidence
+    facts.
+
+    The composition stays database-only and side-effect free: READ ONLY
+    makes any write through the view a database error, and the outer block
+    commits (releasing the snapshot) on clean exit exactly like the mutation
+    composition. READ COMMITTED remains the normal isolation level of every
+    command transaction — the characteristics are transaction-scoped and
+    never leak session-local state onto the pooled connection.
+
+    Keep the block short and database-only: never hold it open across a
+    GitHub, Supabase Auth HTTP, Cline/runtime, model, or any other external
+    call. See the module docstring for the external-I/O rule.
+    """
+    with pool.connection() as conn, conn.transaction():
+        # Must be the first statement of the transaction: SET TRANSACTION
+        # applies to the transaction the explicit block just opened, before
+        # any composed read has touched it. psycopg executes the outer
+        # block's BEGIN eagerly on entry, so the statement lands inside it.
+        conn.execute(_SNAPSHOT_CHARACTERISTICS)
         scoped = _ConnectionBoundPool(conn)
         try:
             yield scoped

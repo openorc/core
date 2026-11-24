@@ -257,6 +257,7 @@ def test_the_module_surface_is_history_shaped() -> None:
         "create_task_block",
         "get_task_block",
         "list_current_task_blocks",
+        "list_current_task_blocks_for_tasks",
         "list_task_blocks",
         "resolve_task_block",
     }

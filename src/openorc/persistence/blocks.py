@@ -43,6 +43,7 @@ __all__ = [
     "create_task_block",
     "get_task_block",
     "list_current_task_blocks",
+    "list_current_task_blocks_for_tasks",
     "list_task_blocks",
     "resolve_task_block",
 ]
@@ -132,6 +133,35 @@ def list_current_task_blocks(pool: DatabasePool, *, task_id: UUID) -> list[TaskB
             (task_id,),
         ).fetchall()
     return [_task_block_from_row(row) for row in rows]
+
+
+def list_current_task_blocks_for_tasks(
+    pool: DatabasePool, *, task_ids: Sequence[UUID]
+) -> dict[UUID, list[TaskBlock]]:
+    """Return the addressed Tasks' current (unresolved) blocks, batched (#376).
+
+    The authorized Task list's current-block lookup: one query over the
+    page's Task identities, deterministically ordered. Tasks with no current
+    block are simply absent from the mapping — the honest no-block fact.
+    """
+    distinct_ids = list(dict.fromkeys(task_ids))
+    if not distinct_ids:
+        return {}
+    for task_id in distinct_ids:
+        if not isinstance(task_id, UUID):
+            raise TaskBlockDomainError("task_ids must all be UUIDs")
+    grouped: dict[UUID, list[TaskBlock]] = {}
+    with transaction(pool) as conn:
+        rows = conn.execute(
+            f"select {_TASK_BLOCK_COLUMNS} from openorc.task_blocks "
+            "where task_id = any(%s) and resolved_at is null "
+            "order by created_at desc, id desc",
+            (distinct_ids,),
+        ).fetchall()
+    for row in rows:
+        block = _task_block_from_row(row)
+        grouped.setdefault(block.task_id, []).append(block)
+    return grouped
 
 
 def resolve_task_block(pool: DatabasePool, *, task_block_id: UUID) -> TaskBlock | None:

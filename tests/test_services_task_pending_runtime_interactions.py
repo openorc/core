@@ -262,6 +262,22 @@ def _pr_row(*, pr_id: Any = None, head_sha: Any = None, state: str = "open") -> 
         None,
         _OBSERVED,
         _OBSERVED,
+        # The #376-extended row shape: honest legacy-NULL presentation and
+        # mergeability columns (the row shape the #376 migration carries).
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 
@@ -467,6 +483,22 @@ def test_pr_compose_claim_lists_only_without_a_canonical_pr() -> None:
             None,
             _OBSERVED,
             _OBSERVED,
+            # The #376-extended row shape: honest legacy-NULL presentation
+            # and mergeability columns.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
     )
     assert (

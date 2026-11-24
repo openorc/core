@@ -428,6 +428,22 @@ def _family_rows(workspace_id: Any) -> dict[str, tuple[Any, ...]]:
             None,
             _OBSERVED,
             _OBSERVED,
+            # The #376-extended row shape: honest legacy-NULL presentation and
+            # mergeability columns.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
         "workflow event": (
             uuid.uuid4(),

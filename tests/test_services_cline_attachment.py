@@ -351,16 +351,24 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
     )
     conn = ScriptedConnection(
         [
-            # Composition: binding, connection validation, credential + Vault.
+            # Composition: binding, connection validation, the ONE #376
+            # configured-pair route selection, credential + Vault.
             _binding_row(workspace_id, task_id, connection_id),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
             ),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
             (_SECRET,),
-            # Fresh establishment Phase 1 over the LATER durable rows:
+            # Fresh establishment Phase 1 over the LATER durable rows — the
+            # configured pair is carried IN as the selection (never re-read):
             _ws_row(workspace_id, owner_profile_id),
             _BARRIER_ROW,
             _task_row(workspace_id),
@@ -368,16 +376,11 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
             _connection_row(
                 workspace_id, connection_id, safe_config=later, auth_reference=reference
             ),
-            # The resolver's fresh reads inside the readiness handshake:
+            # The resolver's fresh reads inside the readiness handshake (the
+            # route arrives as the shared selection, never re-read):
             _binding_row(workspace_id, task_id, connection_id),
             _connection_row(
                 workspace_id, connection_id, safe_config=later, auth_reference=reference
-            ),
-            _route_row(
-                workspace_id,
-                connection_id,
-                provider="configured-provider",
-                model="configured-model",
             ),
             # READY finalization:
             _ws_row(workspace_id, owner_profile_id),
@@ -418,6 +421,8 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
             task_id=task_id,
             role=WorkflowRole.PRODUCER,
             effective_configuration=attached.selected_configuration,
+            configured_provider=attached.selected_configured_provider,
+            configured_model=attached.selected_configured_model,
         )
 
     assert session.lifecycle_status is TaskSessionLifecycleStatus.READY
@@ -444,7 +449,14 @@ def test_fresh_producer_attachment_selects_one_configuration_and_agrees_with_est
     ]
     (update_params,) = updates
     assert update_params is not None
-    assert update_params[1].obj == {"adapter": "cline", "configuration": selected}
+    # The #376 configured pair is captured for this Task session exactly as
+    # the durable route reported it at establishment.
+    assert update_params[1].obj == {
+        "adapter": "cline",
+        "configuration": selected,
+        "configured_provider": "configured-provider",
+        "configured_model": "configured-model",
+    }
 
 
 def test_bound_producer_attachment_keeps_the_snapshot_base_and_exact_identity() -> None:
@@ -551,21 +563,22 @@ def test_fresh_reviewer_attachment_uses_the_supplied_neutral_directory() -> None
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
-            _connection_row(
-                workspace_id, connection_id, safe_config=selected, auth_reference=reference
-            ),
-            (_SECRET,),
-            # The resolver's fresh reads:
-            _binding_row(workspace_id, task_id, connection_id, role="reviewer"),
-            _connection_row(
-                workspace_id, connection_id, safe_config=selected, auth_reference=reference
-            ),
             _route_row(
                 workspace_id,
                 connection_id,
                 role="reviewer",
                 provider="configured-provider",
                 model="configured-model",
+            ),
+            _connection_row(
+                workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            (_SECRET,),
+            # The resolver's fresh reads (the route arrives as the shared
+            # selection, never re-read):
+            _binding_row(workspace_id, task_id, connection_id, role="reviewer"),
+            _connection_row(
+                workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
         ]
     )
@@ -609,6 +622,12 @@ def test_a_changed_role_route_never_redirects_the_attachment() -> None:
                 safe_config=_selected_config(),
                 auth_reference=reference,
             ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
+            ),
             _connection_row(
                 workspace_id,
                 connection_id,
@@ -627,10 +646,13 @@ def test_a_changed_role_route_never_redirects_the_attachment() -> None:
     ):
         pass
 
-    # Only the four composition reads ran, and the mutable role-binding
-    # route was never consulted for routing.
-    assert len(conn.executed) == 4
-    assert all("workflow_role_bindings" not in sql for sql, _ in conn.executed)
+    # The five composition reads ran; the #376 route selection was one plain
+    # read whose pair is carried to the fresh construction and the snapshot —
+    # the persisted admitted Connection alone decided the routing.
+    assert len(conn.executed) == 5
+    route_reads = [sql for sql, _ in conn.executed if "workflow_role_bindings" in sql]
+    assert len(route_reads) == 1
+    assert "for update" not in route_reads[0]
     (connect_call,) = [call for call in backend.calls() if call.operation == "connect"]
     assert connect_call.remote is not None
     assert connect_call.remote.endpoint == _ENDPOINT
@@ -709,6 +731,12 @@ def _refusal_script(
             [
                 binding,
                 good_connection,
+                _route_row(
+                    workspace_id,
+                    connection_id,
+                    provider="configured-provider",
+                    model="configured-model",
+                ),
                 _connection_row(
                     workspace_id,
                     connection_id,
@@ -719,7 +747,7 @@ def _refusal_script(
             ],
             {},
             ConflictError,
-            4,
+            5,
         )
     if mode == "malformed-endpoint":
         malformed = {
@@ -730,6 +758,12 @@ def _refusal_script(
             [
                 binding,
                 good_connection,
+                _route_row(
+                    workspace_id,
+                    connection_id,
+                    provider="configured-provider",
+                    model="configured-model",
+                ),
                 _connection_row(
                     workspace_id, connection_id, safe_config=malformed, auth_reference=reference
                 ),
@@ -737,24 +771,36 @@ def _refusal_script(
             ],
             {},
             ConflictError,
-            4,
+            5,
         )
     if mode == "missing-credential":
         return (
             [
                 binding,
                 good_connection,
+                _route_row(
+                    workspace_id,
+                    connection_id,
+                    provider="configured-provider",
+                    model="configured-model",
+                ),
                 _connection_row(workspace_id, connection_id, safe_config=_selected_config()),
             ],
             {},
             ConflictError,
-            3,
+            4,
         )
     if mode == "malformed-credential-reference":
         return (
             [
                 binding,
                 good_connection,
+                _route_row(
+                    workspace_id,
+                    connection_id,
+                    provider="configured-provider",
+                    model="configured-model",
+                ),
                 _connection_row(
                     workspace_id,
                     connection_id,
@@ -764,10 +810,26 @@ def _refusal_script(
             ],
             {},
             ConflictError,
-            3,
+            4,
         )
     if mode == "dangling-credential":
-        return [binding, good_connection, good_connection, None], {}, ConflictError, 4
+        return (
+            [
+                binding,
+                good_connection,
+                _route_row(
+                    workspace_id,
+                    connection_id,
+                    provider="configured-provider",
+                    model="configured-model",
+                ),
+                good_connection,
+                None,
+            ],
+            {},
+            ConflictError,
+            5,
+        )
     raise AssertionError(mode)
 
 
@@ -810,7 +872,7 @@ def test_known_pre_dial_refusals_fail_closed_before_any_backend_connect(mode: st
 
     assert factory.constructed == 0
     assert len(conn.executed) == expected_reads
-    if expected_reads < 4:
+    if expected_reads < 5:
         assert all("vault.decrypted_secrets" not in sql for sql, _ in conn.executed)
 
 
@@ -912,6 +974,12 @@ def test_attachment_failures_preserve_the_normalized_taxonomy(
                 safe_config=_selected_config(),
                 auth_reference=reference,
             ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
+            ),
             _connection_row(
                 workspace_id,
                 connection_id,
@@ -987,6 +1055,12 @@ def test_an_unexpected_or_interrupted_connect_still_disposes_the_backend_exactly
                 connection_id,
                 safe_config=_selected_config(),
                 auth_reference=reference,
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
             ),
             _connection_row(
                 workspace_id,
@@ -1078,6 +1152,12 @@ def test_the_lease_disposes_on_success_and_a_new_attachment_never_replays() -> N
                 safe_config=_selected_config(),
                 auth_reference=reference,
             ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
+            ),
             _connection_row(
                 workspace_id,
                 connection_id,
@@ -1133,6 +1213,12 @@ def test_attachment_failures_never_leak_secret_or_endpoint_material(
             _binding_row(workspace_id, task_id, connection_id),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
             ),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
@@ -1195,6 +1281,12 @@ def test_attachment_failures_never_leak_secret_or_endpoint_material(
                 connection_id,
                 safe_config=_selected_config(),
                 auth_reference=reference,
+            ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
             ),
             _connection_row(
                 workspace_id,
@@ -1310,6 +1402,12 @@ def test_fresh_attachment_subscribes_no_usage_observer() -> None:
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
+            _route_row(
+                workspace_id,
+                connection_id,
+                provider="configured-provider",
+                model="configured-model",
+            ),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
             ),
@@ -1317,12 +1415,6 @@ def test_fresh_attachment_subscribes_no_usage_observer() -> None:
             _binding_row(workspace_id, task_id, connection_id),
             _connection_row(
                 workspace_id, connection_id, safe_config=selected, auth_reference=reference
-            ),
-            _route_row(
-                workspace_id,
-                connection_id,
-                provider="configured-provider",
-                model="configured-model",
             ),
         ]
     )

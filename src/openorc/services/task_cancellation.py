@@ -208,7 +208,29 @@ __all__ = [
     "cancel_task",
     "cancel_task_composition",
     "cancel_task_for_confirmed_pr_closure",
+    "cancellation_durably_offered",
 ]
+
+
+def cancellation_durably_offered(transaction_pool: DatabasePool, *, task: Task) -> bool:
+    """Whether the durable facts positively support offering ``cancel_task`` (#376).
+
+    The authorized read surface's backend-generated action projection reuses
+    the authoritative Cancel eligibility predicates — the status rule and the
+    accounted-runtime veto — exactly as the command boundary applies them,
+    evaluated inside the caller's own transaction and never persisted, never
+    an external call, and never a second policy engine. An unsettled current
+    Interrupt vetoes the offer through the same accounted-runtime predicate
+    that vetoes the command (#342). The command still revalidates everything
+    freshly at execution; offering is neither permission nor a promise.
+    """
+    try:
+        _require_cancel_eligible_status(task)
+        _require_runtime_work_accounted(transaction_pool, task=task)
+    except ConflictError:
+        return False
+    return True
+
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_cancellation"
 _CANCEL_SPAN_NAME = "task_cancellation.cancel_task"

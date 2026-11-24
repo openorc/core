@@ -57,6 +57,7 @@ __all__ = [
     "list_workspace_repositories",
     "list_workspaces_for_owner",
     "mark_account_deletion_attempt_uncertain",
+    "read_account_deletion_state",
     "read_account_deletion_state_for_key_share",
     "reclaim_expired_account_deletion_attempt",
     "reclaim_uncertain_account_deletion_attempt",
@@ -666,6 +667,28 @@ def read_account_deletion_state_for_key_share(
     with transaction(pool) as conn:
         row = conn.execute(
             f"select {_ATTEMPT_STATE_COLUMNS} from openorc.profiles where id = %s for key share",
+            (profile_id,),
+        ).fetchone()
+    if row is None:
+        return False, None
+    return True, _attempt_state_from_row(profile_id, row)
+
+
+def read_account_deletion_state(
+    pool: DatabasePool, *, profile_id: UUID
+) -> tuple[bool, AccountDeletionAttemptState | None]:
+    """Non-locking read of one Profile's deletion-attempt state.
+
+    The read-side counterpart of :func:`read_account_deletion_state_for_key_share`
+    (issue #376): the same durable deletion-state semantics and the same
+    fail-closed decision facts, selected WITHOUT any locking clause so the
+    read composes inside a read-only snapshot transaction (PostgreSQL
+    prohibits locking clauses there). Never a mutation barrier: guarded Owner
+    mutations keep using the ``FOR KEY SHARE`` read.
+    """
+    with transaction(pool) as conn:
+        row = conn.execute(
+            f"select {_ATTEMPT_STATE_COLUMNS} from openorc.profiles where id = %s",
             (profile_id,),
         ).fetchone()
     if row is None:

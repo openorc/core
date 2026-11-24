@@ -26,7 +26,7 @@ from typing import Any, cast
 import pytest
 
 from openorc.adapters.agent_runtime.errors import AgentRuntimeConfigurationRejectedError
-from openorc.domain.connections import WorkflowRole
+from openorc.domain.connections import WorkflowRole, WorkflowRoleBinding
 from openorc.domain.sessions import TaskAgentSessionDomainError
 from openorc.persistence.pool import DatabasePool
 from openorc.services.cline_construction import DurableClineConstructionContextResolver
@@ -191,14 +191,39 @@ def _connection_row(
     )
 
 
+def _route_binding(
+    workspace_id: Any,
+    connection_id: Any,
+    *,
+    role: WorkflowRole = WorkflowRole.PRODUCER,
+    provider: str | None = None,
+    model: str | None = None,
+    override: str | None = None,
+) -> WorkflowRoleBinding:
+    """The composition-selected workflow-role route (the #376 construction
+    facts the fresh resolver now consumes instead of re-reading the row)."""
+    return WorkflowRoleBinding(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        role=role,
+        connection_id=connection_id,
+        configured_provider=provider,
+        configured_model=model,
+        role_prompt_override=override,
+        created_at=_OBSERVED,
+        updated_at=_OBSERVED,
+    )
+
+
 def _fresh_results(
     *,
     binding_row: tuple[Any, ...] | None,
     connection_row: tuple[Any, ...] | None,
-    route_row: tuple[Any, ...] | None,
 ) -> ScriptedConnection:
-    """Canned fresh-path reads: binding, admitted Connection, current route."""
-    return ScriptedConnection([binding_row, connection_row, route_row])
+    """Canned fresh-path reads: binding, admitted Connection. The #376 route
+    is no longer read on the fresh path — it arrives as the composition
+    selection."""
+    return ScriptedConnection([binding_row, connection_row])
 
 
 def _bound_results(
@@ -226,16 +251,17 @@ def test_fresh_producer_resolves_the_selected_bootstrap_base_and_role_configurat
         connection_row=_connection_row(
             workspace_id, connection_id, safe_config={"repository_base": "/srv/other/base"}
         ),
-        route_row=_route_row(
+    )
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn),
+        bootstrap_repository_base="/srv/selected/repositories",
+        selected_role_route=_route_binding(
             workspace_id,
             connection_id,
             provider="configured-provider",
             model="configured-model",
             override="# Owner's verbatim override",
         ),
-    )
-    resolver = DurableClineConstructionContextResolver(
-        _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
     )
 
     context = resolver.resolve_construction_context(workspace_id, task_id, WorkflowRole.PRODUCER)
@@ -261,9 +287,10 @@ def test_fresh_producer_fails_closed_without_a_selected_bootstrap_base() -> None
     conn = _fresh_results(
         binding_row=_binding_row(workspace_id, task_id, connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
-        route_row=_route_row(workspace_id, connection_id),
     )
-    resolver = DurableClineConstructionContextResolver(_pool(conn))
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn), selected_role_route=_route_binding(workspace_id, connection_id)
+    )
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
         resolver.resolve_construction_context(workspace_id, task_id, WorkflowRole.PRODUCER)
@@ -276,10 +303,11 @@ def test_fresh_producer_fails_closed_for_a_missing_binding() -> None:
     conn = _fresh_results(
         binding_row=None,
         connection_row=_connection_row(workspace_id, connection_id),
-        route_row=_route_row(workspace_id, connection_id),
     )
     resolver = DurableClineConstructionContextResolver(
-        _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
+        _pool(conn),
+        bootstrap_repository_base="/srv/selected/repositories",
+        selected_role_route=_route_binding(workspace_id, connection_id),
     )
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
@@ -301,10 +329,11 @@ def test_fresh_producer_fails_closed_for_a_non_connecting_binding() -> None:
     conn = _fresh_results(
         binding_row=ready_row,
         connection_row=_connection_row(workspace_id, connection_id),
-        route_row=_route_row(workspace_id, connection_id),
     )
     resolver = DurableClineConstructionContextResolver(
-        _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
+        _pool(conn),
+        bootstrap_repository_base="/srv/selected/repositories",
+        selected_role_route=_route_binding(workspace_id, connection_id),
     )
 
     # Fresh construction is definitionally the establishment of an admitted
@@ -325,10 +354,11 @@ def test_fresh_producer_fails_closed_for_an_ineligible_admitted_connection() -> 
         conn = _fresh_results(
             binding_row=_binding_row(workspace_id, task_id, connection_id),
             connection_row=connection_row,
-            route_row=_route_row(workspace_id, connection_id),
         )
         resolver = DurableClineConstructionContextResolver(
-            _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
+            _pool(conn),
+            bootstrap_repository_base="/srv/selected/repositories",
+            selected_role_route=_route_binding(workspace_id, connection_id),
         )
 
         with pytest.raises(AgentRuntimeConfigurationRejectedError):
@@ -338,14 +368,15 @@ def test_fresh_producer_fails_closed_for_an_ineligible_admitted_connection() -> 
         assert len(conn.executed) == 2
 
 
-def test_fresh_producer_fails_closed_without_a_current_role_route() -> None:
+def test_fresh_producer_fails_closed_without_a_selected_role_route() -> None:
     workspace_id = uuid.uuid4()
     task_id = uuid.uuid4()
     connection_id = uuid.uuid4()
+    # No route was selected at the composition boundary (the durable read
+    # found none): fresh construction fails closed before any durable read.
     conn = _fresh_results(
         binding_row=_binding_row(workspace_id, task_id, connection_id),
         connection_row=_connection_row(workspace_id, connection_id),
-        route_row=None,
     )
     resolver = DurableClineConstructionContextResolver(
         _pool(conn), bootstrap_repository_base="/srv/selected/repositories"
@@ -353,6 +384,7 @@ def test_fresh_producer_fails_closed_without_a_current_role_route() -> None:
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
         resolver.resolve_construction_context(workspace_id, task_id, WorkflowRole.PRODUCER)
+    assert conn.executed == []
 
 
 def test_fresh_reviewer_resolves_the_supplied_neutral_directory() -> None:
@@ -364,16 +396,17 @@ def test_fresh_reviewer_resolves_the_supplied_neutral_directory() -> None:
     conn = _fresh_results(
         binding_row=_binding_row(workspace_id, task_id, connection_id, role="reviewer"),
         connection_row=_connection_row(workspace_id, connection_id, safe_config={}),
-        route_row=_route_row(
+    )
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn),
+        working_directory="/srv/neutral/review",
+        selected_role_route=_route_binding(
             workspace_id,
             connection_id,
-            role="reviewer",
+            role=WorkflowRole.REVIEWER,
             provider="reviewer-provider",
             model="reviewer-model",
         ),
-    )
-    resolver = DurableClineConstructionContextResolver(
-        _pool(conn), working_directory="/srv/neutral/review"
     )
 
     context = resolver.resolve_construction_context(workspace_id, task_id, WorkflowRole.REVIEWER)
@@ -393,13 +426,15 @@ def test_fresh_reviewer_fails_closed_without_a_supplied_directory() -> None:
     conn = _fresh_results(
         binding_row=_binding_row(workspace_id, task_id, connection_id, role="reviewer"),
         connection_row=_connection_row(workspace_id, connection_id, safe_config={}),
-        route_row=_route_row(workspace_id, connection_id, role="reviewer"),
     )
-    resolver = DurableClineConstructionContextResolver(_pool(conn))
+    resolver = DurableClineConstructionContextResolver(
+        _pool(conn),
+        selected_role_route=_route_binding(workspace_id, connection_id, role=WorkflowRole.REVIEWER),
+    )
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
         resolver.resolve_construction_context(workspace_id, task_id, WorkflowRole.REVIEWER)
-    assert len(conn.executed) == 3
+    assert len(conn.executed) == 2
 
 
 # --- bound sessions ------------------------------------------------------

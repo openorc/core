@@ -346,6 +346,8 @@ class _ScriptedBootstrapRuntime(TaskBootstrapRuntimeComposition):
             yield TaskBootstrapEstablishmentLease(
                 adapter=self._adapters[role],
                 selected_configuration=dict(self._selected_configuration),
+                selected_configured_provider=None,
+                selected_configured_model=None,
             )
 
         return lease()

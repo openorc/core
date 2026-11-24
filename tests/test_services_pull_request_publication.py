@@ -241,6 +241,9 @@ def _pull_request_row(
     state: str = "open",
     merged_at: Any = None,
 ) -> tuple[Any, ...]:
+    # The #376-extended row shape: the presentation/mergeability columns are
+    # the honest legacy-NULL shape here (this module proves the publication
+    # boundary, not the observation mapping).
     return (
         uuid.uuid4(),
         _WORKSPACE_ID,
@@ -255,6 +258,20 @@ def _pull_request_row(
         merged_at,
         _OBSERVED,
         _OBSERVED,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 

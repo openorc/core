@@ -574,6 +574,7 @@ def test_the_module_surface_carries_the_resolution_contract() -> None:
         "OwnerGateSupersessionOutcome",
         "create_owner_gate",
         "get_owner_gate",
+        "list_owner_gates_by_ids",
         "list_task_owner_gates",
         "resolve_owner_gate",
         "supersede_current_owner_gate",
