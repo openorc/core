@@ -363,33 +363,37 @@ def test_authorized_task_read_composes_actions_inside_the_read_only_snapshot(
                 task_id=seeded["task_id"],
             )
 
-        assert detail.summary.current_gate is not None
-        # The composed action projection: the PR_AUTHORIZATION menu from the
-        # seeded durable facts — cancel eligible (no outstanding runtime
-        # work), no Task-level duplicate, nothing else offered.
-        assert detail.summary.current_gate.actions == ("approve", "cancel_task")
-        assert detail.summary.actions == ()
-        assert detail.executions_total == 1
-        assert detail.executions[0].result is not None
-        assert detail.executions[0].result["branch"] == "openorc/issue-42"
-        assert detail.outstanding_receipts == ()
-        assert detail.outstanding_receipts_total == 0
-        assert detail.pending_runtime_requests == ()
-        assert detail.pending_runtime_requests_total == 0
-        assert detail.outstanding_intents == ()
-        assert detail.outstanding_intents_total == 0
+            assert detail.summary.current_gate is not None
+            # The composed action projection: the PR_AUTHORIZATION menu from
+            # the seeded durable facts — cancel eligible (no outstanding
+            # runtime work), no Task-level duplicate, nothing else offered.
+            assert detail.summary.current_gate.actions == ("approve", "cancel_task")
+            assert detail.summary.actions == ()
+            assert detail.executions_total == 1
+            assert detail.executions[0].result is not None
+            assert detail.executions[0].result["branch"] == "openorc/issue-42"
+            assert detail.outstanding_receipts == ()
+            assert detail.outstanding_receipts_total == 0
+            assert detail.pending_runtime_requests == ()
+            assert detail.pending_runtime_requests_total == 0
+            assert detail.outstanding_intents == ()
+            assert detail.outstanding_intents_total == 0
 
-        # A later authorized read observes the committed change: the snapshot
-        # transaction released with its composition scope.
-        writer.execute(
-            "update openorc.tasks set status = 'cancelled' where id = %s",
-            (seeded["task_id"],),
-        )
-        with connect(migrated_database, prepare_threshold=None) as reader:
+            # A later authorized read over the SAME connection observes a
+            # committed durable change: the snapshot transaction released
+            # with its composition scope. The observable change is the
+            # optimistic-concurrency state token rotation — a plain durable
+            # column write (the status CHECK couples terminal statuses to
+            # archived_at, so a bare status update is not a valid change).
+            rotated_token = uuid.uuid4()
+            writer.execute(
+                "update openorc.tasks set state_token = %s where id = %s",
+                (rotated_token, seeded["task_id"]),
+            )
             reread = task_reads.get_task_for_owner(
-                cast(DatabasePool, _ReaderConnectionPool(reader)),
+                reader_pool,
                 profile_id=seeded["owner_profile_id"],
                 workspace_id=seeded["workspace_id"],
                 task_id=seeded["task_id"],
             )
-            assert reread.summary.task.status.value == "cancelled"
+            assert reread.summary.task.state_token == rotated_token
