@@ -61,6 +61,15 @@ _FINGERPRINT = github_issue_requirements_fingerprint("Found a bug", "Requirement
 
 
 class _FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """A local fixed-observation client for the durable-composition checks."""
 
     def get_installation_repository(
@@ -91,6 +100,14 @@ class _FakeGitHubAppClient:
             state="open",
             provider_updated_at=_OBSERVED_AT,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED_AT,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         )
 
     def get_repository_branch(self, **_kwargs: Any) -> Any:

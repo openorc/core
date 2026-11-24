@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +39,8 @@ from openorc.workers.invocation import (
     execute_operation_job,
     invoke_operation,
 )
+
+_SWEEP_REFRESH_ID = uuid.uuid4()
 
 UUID_A = "0f1c2d3e-4a5b-6c7d-8e9f-000102030405"
 UUID_B = "1f2c3d4e-5a6b-7c8d-9eaf-010203040506"
@@ -102,7 +105,7 @@ def test_webhook_delivery_dispatch_payload_round_trips_exactly() -> None:
 def test_reconciliation_sweep_payload_round_trips_with_a_tick() -> None:
     original = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=5),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     decoded = decode_operation_invocation(original.encode())
@@ -110,17 +113,17 @@ def test_reconciliation_sweep_payload_round_trips_with_a_tick() -> None:
     assert decoded == original
 
 
-def test_reconciliation_sweep_payload_round_trips_without_a_tick() -> None:
+def test_reconciliation_sweep_payload_round_trips_the_refresh_identity() -> None:
     original = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=None),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     decoded = decode_operation_invocation(original.encode())
 
     assert decoded == original
     assert isinstance(decoded.payload, ReconciliationSweepPayload)
-    assert decoded.payload.sweep_tick is None
+    assert decoded.payload.refresh_id == str(_SWEEP_REFRESH_ID)
 
 
 def test_queue_wake_payload_round_trips_without_a_cursor() -> None:
@@ -206,12 +209,15 @@ def test_a_half_continuation_cursor_is_refused_at_payload_construction() -> None
 def test_encoded_wire_form_is_stable_json() -> None:
     invocation_to_encode = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=7),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     encoded = json.loads(invocation_to_encode.encode())
 
-    assert encoded == {"kind": "github_reconciliation_sweep", "payload": {"sweep_tick": 7}}
+    assert encoded == {
+        "kind": "github_reconciliation_sweep",
+        "payload": {"refresh_id": str(_SWEEP_REFRESH_ID)},
+    }
 
 
 def test_mismatched_kind_and_payload_is_refused_at_construction() -> None:
@@ -343,7 +349,7 @@ def test_invoke_operation_resolves_dependencies_only_on_request(
     decoded = decode_operation_invocation(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
         ).encode()
     )
 
@@ -362,7 +368,7 @@ def test_invoke_operation_fails_closed_for_an_unregistered_kind(
     decoded = decode_operation_invocation(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
         ).encode()
     )
 
@@ -439,7 +445,7 @@ def test_queue_submission_enqueues_the_encoded_invocation(
     submitter = invocation.RQQueueOperationSubmission(queue_mode_settings)
     wire = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=3),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     result = submitter.submit(wire)
@@ -467,7 +473,7 @@ def test_queue_submission_classifies_a_queue_timeout_as_uncertain(
     result = submitter.submit(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
         )
     )
 
@@ -487,7 +493,7 @@ def test_queue_submission_classifies_redis_errors_as_known_refusal(
     result = submitter.submit(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
         )
     )
 
@@ -507,7 +513,7 @@ def test_queue_submission_refuses_without_a_configured_url(
     result = submitter.submit(
         OperationInvocation(
             kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-            payload=ReconciliationSweepPayload(sweep_tick=None),
+            payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
         )
     )
 
@@ -575,14 +581,14 @@ def test_entrypoint_reaches_the_injected_handler_through_the_same_dispatcher(
     )
     wire = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=11),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     execute_operation_job(wire.encode())
 
     assert len(handler.calls) == 1
     payload, resolved = handler.calls[0]
-    assert payload == ReconciliationSweepPayload(sweep_tick=11)
+    assert payload == ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID))
     assert resolved is dependencies
     assert pool_provider.calls == []
     assert github_provider.calls == []
@@ -620,7 +626,7 @@ def test_entrypoint_wraps_handler_failures_with_safe_classification(
     )
     wire = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=None),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     with pytest.raises(invocation.OperationExecutionError) as raised:
@@ -687,7 +693,7 @@ def test_entrypoint_sanitizes_handler_raised_command_errors(
     )
     wire = OperationInvocation(
         kind=OperationKind.GITHUB_RECONCILIATION_SWEEP,
-        payload=ReconciliationSweepPayload(sweep_tick=2),
+        payload=ReconciliationSweepPayload(refresh_id=str(_SWEEP_REFRESH_ID)),
     )
 
     with pytest.raises(invocation.OperationExecutionError) as raised:

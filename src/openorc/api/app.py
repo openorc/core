@@ -25,6 +25,7 @@ from openorc.api.request_correlation import (
 from openorc.api.routers.account import router as account_router
 from openorc.api.routers.connections import router as connections_router
 from openorc.api.routers.github_installations import router as github_installations_router
+from openorc.api.routers.github_issues import router as github_issues_router
 from openorc.api.routers.github_user_authorization import (
     router as github_user_authorization_router,
 )
@@ -40,6 +41,7 @@ from openorc.api.routers.projects import router as projects_router
 from openorc.api.routers.repositories import router as repositories_router
 from openorc.api.routers.role_bindings import router as role_bindings_router
 from openorc.api.routers.tasks import router as tasks_router
+from openorc.api.routers.workspace_refresh import router as workspace_refresh_router
 from openorc.api.routers.workspaces import router as workspaces_router
 from openorc.config import ExecutionMode, Settings
 from openorc.observability import ObservabilitySurface, initialize_observability
@@ -429,6 +431,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(github_user_authorization_callback_router)
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(repositories_router, prefix="/api/v1")
+    app.include_router(github_issues_router, prefix="/api/v1")
+    app.include_router(workspace_refresh_router, prefix="/api/v1")
     app.include_router(role_bindings_router, prefix="/api/v1")
     app.include_router(tasks_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport

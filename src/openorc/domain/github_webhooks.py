@@ -285,13 +285,23 @@ class GitHubWebhookResolvedRoute:
 
 @dataclass(frozen=True, slots=True)
 class GitHubWebhookDeliveryRoute:
-    """One persisted resolved Workspace routing linkage of an accepted delivery."""
+    """One persisted resolved Workspace routing linkage of an accepted delivery.
+
+    ``resolved_at`` (issue #375) is the minimal per-route completion
+    evidence: the instant this route's routed reconciliation last completed
+    or typedly declined. It lets a scope-limited recovery prove that every
+    route of a shared fan-out delivery is resolved before the whole delivery
+    is marked processed — across invocations, without dispatching any
+    out-of-scope route — while the delivery-level ``processed_at`` keeps its
+    established meaning.
+    """
 
     id: UUID
     delivery_id: UUID
     workspace_id: UUID
     repository_id: UUID
     created_at: datetime
+    resolved_at: datetime | None = None
 
 
 def github_webhook_delivery_field_names() -> frozenset[str]:

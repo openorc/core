@@ -1,59 +1,61 @@
-"""Repeatable GitHub reconciliation and missed-delivery recovery services
-(issue #62).
+"""The scoped on-demand GitHub refresh executor (issues #62, #375).
 
-The independent, repeatable recovery sweep that composes the authoritative
-reconciliation capabilities (B3/B4/B7, issues #59/#60/#63) and the webhook
-dispatch boundary (#120) so that missed, delayed, duplicated, or
-out-of-order GitHub webhook delivery can never permanently strand OpenOrc's
-mirrored GitHub state. The sweep is a correctness backstop, not a second
-webhook path: every unit re-reads current authoritative GitHub state and
-compares it to current durable OpenOrc state, so replayed, duplicated, and
-out-of-order recovery work converges on the newest authority.
+The executor behind the authorized Workspace/Repository on-demand refresh:
+it composes the authoritative reconciliation capabilities (B3/B4/B7,
+issues #59/#60/#63), the #375 bounded open-issue listing synchronization,
+and the webhook dispatch boundary (#120) so that one authorized refresh
+re-reads current authoritative GitHub state for its scope and converges the
+mirrored OpenOrc state onto it. The execution is a correctness backstop,
+not a second webhook path: every unit re-reads current authoritative GitHub
+state and compares it to current durable OpenOrc state, so replayed,
+duplicated, and out-of-order executions converge on the newest authority.
 
-One operation — :func:`run_github_reconciliation_sweep` — serves periodic
-scheduled reconciliation, operator/manual recovery, retry after a known-safe
-reconciliation failure, and recovery of a recorded webhook delivery whose
-downstream dispatch did not complete. The sweep:
+One operation — :func:`run_github_reconciliation_sweep` — executes one
+durable refresh record, claimed through its CAS at execution start. The
+execution:
 
-- derives a bounded, current-work work set from durable Postgres only:
-  repositories explicitly routed to an installation, open tracked issue
-  projections unioned with the issues of current (non-archived) Tasks, the
-  canonical branches/PR records of current Tasks, and delivery records whose
-  processing is still unresolved. Historical/closed subjects with no current
-  Task never enter the work set, and nothing is ever crawled on GitHub;
-- bounds each invocation with explicit deterministic batching: every family
-  partitions its eligible units into ``partitions`` buckets by stable durable
-  identity, and one ``sweep_tick`` services one bucket per family. Bucket
-  membership depends only on stable identities, so every eligible unit is
-  serviced exactly once per ``partitions``-tick rotation — starvation-free
-  eventual coverage with no persisted cursor, no queue-held correctness
-  state, and no second scheduler state machine. ``sweep_tick=None`` is the
-  operator's full sweep of the whole eligible set;
-- performs no GitHub I/O itself: every unit composes an existing focused
-  capability that owns its own short transactions around its external reads,
-  so no database transaction ever spans a GitHub call;
+- claims the record (``accepted → running``) and re-derives its authorized
+  scope from durable state — the queued payload carries only the refresh
+  identity and is never authorization;
+- derives a bounded, current-work work set from durable Postgres only: the
+  scope's repositories explicitly routed to an installation, the bounded
+  open-issue listing synchronization (one-way, through the existing
+  identity-guarded reconciliation primitive), the known-relevant issue set
+  (open tracked projections unioned with current-Task issues), the canonical
+  branches/PR records of current Tasks, and the delivery routes inside the
+  scope whose processing is still unresolved. Historical/closed subjects
+  with no current Task never enter the known-relevant set, and nothing is
+  ever crawled on GitHub;
+- performs no GitHub I/O itself outside the composed units: every unit
+  composes an existing focused capability that owns its own short
+  transactions around its external reads, so no database transaction ever
+  spans a GitHub call;
 - isolates unit failures: a known failure, an uncertain outcome, or an
   unexpected error in one repository/issue/Task unit never rolls back or
-  blocks the independent units, and the sweep is safe to re-run after any
-  partial completion;
-- reports normalized durable fact changes to the later workflow layer and,
-  since E10a (issue #227) and E10c (issue #229), applies exactly two narrow
-  workflow consequences: a successfully reconciled merged canonical PR for a
-  current Task invokes the shared completion seam, and a successfully
-  reconciled closed-unmerged canonical PR invokes the trusted cancellation
-  entrypoint. Every other Phase 2E consequence (``BLOCKED /
-  GITHUB_SOURCE_CHANGED``, Reviewer dispatch, merge
-  authorization) is still decided elsewhere. Hierarchy changes are recovered for
-  presentation only and never become blocking semantics; requirements drift
-  is detected against the Task's immutable B4 source baseline without
-  rewriting it; access loss is a normalized integration fact without any
-  credential fallback.
+  blocks the independent units, and the execution is safe to re-run;
+- closes issues only through an explicit fresh authoritative read — never
+  from absence in an open-issue listing or an incomplete page chain;
+- reports normalized durable fact changes to the later workflow layer and
+  applies exactly two narrow workflow consequences (issues #227/#229): a
+  successfully reconciled merged canonical PR invokes the shared completion
+  seam, and a successfully reconciled closed-unmerged canonical PR invokes
+  the trusted cancellation entrypoint. Every other Phase 2E consequence is
+  still decided elsewhere. Hierarchy changes are recovered for presentation
+  only and never become blocking semantics; requirements drift is detected
+  against the Task's immutable B4 source baseline without rewriting it;
+  access loss is a normalized integration fact without any credential
+  fallback;
+- aggregates the contract summary counts (actual completed observations and
+  durable changes, never queued work) and the bounded sanitized per-unit
+  error classifications, and stamps the durable record's truthful terminal
+  outcome through its completion CAS.
 
 Delivery recovery re-enters the untouched #120 dispatch boundary per
-unresolved delivery — re-running routed reconciliation and marking only the
-bounded ``processed_at`` recovery instant when every routed reconciliation
-completed or typedly declined. Provider delivery identity is never
-rewritten, and inbox status is never GitHub truth.
+unresolved delivery within the scope — dispatching only in-scope routes,
+stamping each resolved route's per-route completion evidence, and marking
+the delivery processed only when every routed route of the whole fan-out is
+resolved. Provider delivery identity is never rewritten, and inbox status
+is never GitHub truth.
 """
 
 from __future__ import annotations
@@ -66,11 +68,20 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from openorc.adapters.github import GitHubAppClient
-from openorc.config import Settings
+from openorc.domain.github_issues import GitHubIssueState
+from openorc.domain.github_refreshes import (
+    GitHubRefreshStatus,
+    GitHubRefreshSummary,
+    GitHubRefreshUnitError,
+)
 from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.domain.tasks import Task
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.github_issues import list_open_repository_github_issues
+from openorc.persistence.github_refreshes import (
+    claim_github_refresh,
+    complete_github_refresh,
+)
 from openorc.persistence.github_webhook_deliveries import (
     list_github_webhook_deliveries_requiring_recovery,
 )
@@ -94,10 +105,12 @@ from openorc.services.errors import (
     ExternalOperationUncertainError,
     InvalidCommandError,
     NotFoundError,
+    StaleOperationError,
 )
 from openorc.services.github_webhook_dispatch import (
     GitHubWebhookDispatchResult,
     GitHubWebhookDispatchRouteStatus,
+    GitHubWebhookRouteScope,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +122,7 @@ __all__ = [
     "GitHubReconciliationSweepResult",
     "GitHubReconciliationSweepUnitStatus",
     "MAX_RECOVERY_DELIVERY_BATCH",
+    "MAX_REFRESH_ERROR_FACTS",
     "run_github_reconciliation_sweep",
 ]
 
@@ -119,19 +133,26 @@ logger = logging.getLogger(__name__)
 _SERVICE_TRACER_SCOPE = "openorc.services.github_reconciliation_recovery"
 _SWEEP_SPAN_NAME = "github_reconciliation_recovery.run_github_reconciliation_sweep"
 
-# The delivery-recovery batch cap: one sweep invocation re-dispatches at most
-# this many unresolved deliveries, oldest first. Completed deliveries leave
-# the eligible set through the bounded ``processed_at`` marking, so repeated
-# sweeps drain any backlog; persistently failing deliveries stay visible in
-# each sweep's outcomes. A bounded cap keeps one sweep's provider work
-# bounded regardless of how long an outage lasted.
+# The delivery-recovery batch cap: one refresh invocation re-dispatches at
+# most this many unresolved in-scope deliveries, oldest first. Completed
+# deliveries leave the eligible set through the per-route completion evidence
+# and the bounded ``processed_at`` marking, so repeated refreshes drain any
+# backlog; persistently failing deliveries stay visible in each execution's
+# outcomes. A bounded cap keeps one execution's provider work bounded
+# regardless of how long an outage lasted.
 MAX_RECOVERY_DELIVERY_BATCH = 50
+
+# The bounded per-unit error facts a refresh record carries: sanitized typed
+# classifications only (family, safe resource identities, error code), never
+# provider payloads, secrets, or other Workspace information.
+MAX_REFRESH_ERROR_FACTS = 50
 
 
 class GitHubReconciliationSweepFamily(StrEnum):
     """The bounded sweep unit families, in one invocation's execution order."""
 
     REPOSITORY = "repository"
+    ISSUE_LISTING = "issue_listing"
     ISSUE = "issue"
     RELATIONS = "relations"
     BRANCH = "branch"
@@ -192,7 +213,17 @@ class GitHubReconciliationSweepOutcome:
     issue_requirements_changed: bool = False
     issue_previous_fingerprint: str | None = None
     issue_current_fingerprint: str | None = None
+    # The serialized pre-image observed state: the direction of an open/closed
+    # transition (the #375 summary's issues_closed counting).
+    issue_previous_state: GitHubIssueState | None = None
+    # A durable write whose fingerprint and state did not change persisted
+    # presentation-fact changes only (issue #375).
+    issue_presentation_changed: bool = False
     task_baseline_drift: bool | None = None
+    # Listing unit facts: the bounded open-issue listing observation's
+    # completeness and skipped-pseudo-issue counts (issue #375).
+    issue_listing_complete: bool | None = None
+    issue_listing_pr_entries_skipped: int | None = None
     # Relations unit facts: the dependency (blocking-sequencing) mirror and
     # the presentation-only hierarchy mirror transitions.
     dependency_blocked: bool | None = None
@@ -224,32 +255,19 @@ class GitHubReconciliationSweepOutcome:
 
 @dataclass(frozen=True, slots=True)
 class GitHubReconciliationSweepResult:
-    """The typed result of one sweep invocation.
+    """The typed result of one scoped refresh execution.
 
-    ``tick`` is the scheduling position that selected the serviced buckets
-    (``None`` for the operator's full sweep) and ``partitions`` the stable
-    rotation count the tick was taken modulo. ``outcomes`` is the
-    deterministic, execution-ordered record of every serviced unit —
-    including its failures — so partial sweeps stay visible and re-runnable.
+    ``refresh_id``/``workspace_id``/``repository_id`` are the claimed
+    record's durable scope (``repository_id`` ``None`` for the workspace
+    scope). ``outcomes`` is the deterministic, execution-ordered record of
+    every serviced unit — including its failures — so partial executions
+    stay visible and re-runnable.
     """
 
-    tick: int | None
-    partitions: int
+    refresh_id: UUID
+    workspace_id: UUID
+    repository_id: UUID | None
     outcomes: tuple[GitHubReconciliationSweepOutcome, ...]
-
-
-def _in_tick_bucket(stable: int, sweep_tick: int | None, partitions: int) -> bool:
-    """Whether one stable-identity unit is serviced by this sweep tick.
-
-    Bucket membership depends only on the stable identity and the rotation,
-    never on the eligible set's size or order, so units can never be starved:
-    every eligible identity is serviced exactly once per ``partitions``
-    ticks, regardless of set growth, shrinkage, or prior failures. A
-    ``None`` tick (the operator's full sweep) services every bucket.
-    """
-    if sweep_tick is None:
-        return True
-    return stable % partitions == sweep_tick % partitions
 
 
 def _known_failure_outcome(
@@ -522,8 +540,141 @@ def _sweep_issue_unit(
         issue_requirements_changed=reconciliation.requirements_changed,
         issue_previous_fingerprint=reconciliation.previous_fingerprint,
         issue_current_fingerprint=reconciliation.issue.requirements_fingerprint,
+        issue_previous_state=reconciliation.previous_state,
+        issue_presentation_changed=reconciliation.issue_presentation_changed,
         task_baseline_drift=drift,
     )
+
+
+def _sweep_issue_listing_unit(
+    pool: DatabasePool, github: GitHubAppClient, *, workspace_id: UUID, repository_id: UUID
+) -> tuple[GitHubReconciliationSweepOutcome, list[GitHubReconciliationSweepOutcome]]:
+    """Synchronize one repository's bounded open-issue listing (issue #375).
+
+    Returns the listing observation's own outcome plus one ISSUE-family
+    outcome per synchronized entry. The listing observation is one-way
+    GitHub-authoritative synchronization through the existing primitive's
+    guarded internals: discovery is the insertion outcome, closure is never
+    inferred from absence, and a bounded (incomplete) listing is a typed
+    partial fact — the unit reconciles what it observed and reports the
+    incompleteness truthfully.
+    """
+    try:
+        synchronization = github_reconciliation.synchronize_repository_open_issue_listing(
+            pool, github, workspace_id=workspace_id, repository_id=repository_id
+        )
+    except AuthorizationError:
+        return (
+            _access_lost_outcome(
+                GitHubReconciliationSweepFamily.ISSUE_LISTING,
+                workspace_id=workspace_id,
+                repository_id=repository_id,
+                task_id=None,
+                github_issue_id=None,
+                delivery_guid=None,
+            ),
+            [],
+        )
+    except ApplicationError as error:
+        return (
+            _known_failure_outcome(
+                GitHubReconciliationSweepFamily.ISSUE_LISTING,
+                workspace_id=workspace_id,
+                repository_id=repository_id,
+                task_id=None,
+                github_issue_id=None,
+                delivery_guid=None,
+                error=error,
+            ),
+            [],
+        )
+    except Exception as error:  # noqa: BLE001 - contained with safe classification
+        return (
+            _unexpected_failure_outcome(
+                GitHubReconciliationSweepFamily.ISSUE_LISTING,
+                workspace_id=workspace_id,
+                repository_id=repository_id,
+                task_id=None,
+                github_issue_id=None,
+                delivery_guid=None,
+                error=error,
+            ),
+            [],
+        )
+    listing_outcome = GitHubReconciliationSweepOutcome(
+        family=GitHubReconciliationSweepFamily.ISSUE_LISTING,
+        status=GitHubReconciliationSweepUnitStatus.RECONCILED,
+        workspace_id=workspace_id,
+        repository_id=repository_id,
+        issue_listing_complete=synchronization.listing_complete,
+        issue_listing_pr_entries_skipped=synchronization.pull_request_entries_skipped,
+    )
+    entry_status = {
+        github_reconciliation.RepositoryIssueListingEntryOutcome.RECONCILED: (
+            GitHubReconciliationSweepUnitStatus.RECONCILED
+        ),
+        github_reconciliation.RepositoryIssueListingEntryOutcome.DECLINED: (
+            GitHubReconciliationSweepUnitStatus.DECLINED
+        ),
+        github_reconciliation.RepositoryIssueListingEntryOutcome.FAILED_KNOWN: (
+            GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
+        ),
+        github_reconciliation.RepositoryIssueListingEntryOutcome.FAILED_UNCERTAIN: (
+            GitHubReconciliationSweepUnitStatus.FAILED_UNCERTAIN
+        ),
+        github_reconciliation.RepositoryIssueListingEntryOutcome.FAILED_UNEXPECTED: (
+            GitHubReconciliationSweepUnitStatus.FAILED_UNEXPECTED
+        ),
+        github_reconciliation.RepositoryIssueListingEntryOutcome.ACCESS_LOST: (
+            GitHubReconciliationSweepUnitStatus.ACCESS_LOST
+        ),
+    }
+    entry_outcomes = [
+        GitHubReconciliationSweepOutcome(
+            family=GitHubReconciliationSweepFamily.ISSUE,
+            status=entry_status[entry.outcome],
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            github_issue_id=(
+                entry.reconciliation.issue.identity.github_issue_id
+                if entry.reconciliation is not None
+                else None
+            ),
+            issue_created=(
+                entry.reconciliation.issue_created if entry.reconciliation is not None else False
+            ),
+            issue_state_changed=(
+                entry.reconciliation.issue_state_changed
+                if entry.reconciliation is not None
+                else False
+            ),
+            issue_requirements_changed=(
+                entry.reconciliation.requirements_changed
+                if entry.reconciliation is not None
+                else False
+            ),
+            issue_previous_fingerprint=(
+                entry.reconciliation.previous_fingerprint
+                if entry.reconciliation is not None
+                else None
+            ),
+            issue_current_fingerprint=(
+                entry.reconciliation.issue.requirements_fingerprint
+                if entry.reconciliation is not None
+                else None
+            ),
+            issue_previous_state=(
+                entry.reconciliation.previous_state if entry.reconciliation is not None else None
+            ),
+            issue_presentation_changed=(
+                entry.reconciliation.issue_presentation_changed
+                if entry.reconciliation is not None
+                else False
+            ),
+        )
+        for entry in synchronization.entries
+    ]
+    return listing_outcome, entry_outcomes
 
 
 def _sweep_relations_unit(
@@ -956,17 +1107,31 @@ def _delivery_dispatch_status(
 ) -> GitHubReconciliationSweepUnitStatus:
     """Map a re-dispatched delivery's bounded outcomes to one sweep status.
 
-    ``processed`` is the known success; otherwise the aggregate route
-    classification is the sweep's fact, with uncertainty taking precedence so
-    an unknown outcome is never reported as a clean known failure.
+    ``processed`` is the known success. Otherwise the applicable in-scope
+    route outcomes decide, independently of the whole-delivery ``processed_at``
+    instant: every dispatched route reconciled or typedly declined is the
+    scoped recovery's success — the delivery's whole-fan-out processed
+    marking remains the dispatch boundary's rule, so another Workspace's
+    still-outstanding route is not this scope's failure. Uncertainty takes
+    precedence over unexpected over known failures so an unknown outcome is
+    never reported as a clean known failure. An empty applicable-outcome set
+    (an unexpected durable shape, logged by the dispatch boundary)
+    conservatively stays a known failure.
     """
     if result.processed:
         return GitHubReconciliationSweepUnitStatus.RECONCILED
     route_statuses = {outcome.status for outcome in result.route_outcomes}
+    if not route_statuses:
+        return GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
     if GitHubWebhookDispatchRouteStatus.FAILED_UNCERTAIN in route_statuses:
         return GitHubReconciliationSweepUnitStatus.FAILED_UNCERTAIN
     if GitHubWebhookDispatchRouteStatus.FAILED_UNEXPECTED in route_statuses:
         return GitHubReconciliationSweepUnitStatus.FAILED_UNEXPECTED
+    if route_statuses <= {
+        GitHubWebhookDispatchRouteStatus.RECONCILED,
+        GitHubWebhookDispatchRouteStatus.DECLINED,
+    }:
+        return GitHubReconciliationSweepUnitStatus.RECONCILED
     return GitHubReconciliationSweepUnitStatus.FAILED_KNOWN
 
 
@@ -974,21 +1139,34 @@ def _sweep_delivery_units(
     pool: DatabasePool,
     github: GitHubAppClient,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+    *,
+    route_scope: GitHubWebhookRouteScope,
 ) -> list[GitHubReconciliationSweepOutcome]:
     """Recover recorded deliveries whose downstream dispatch did not complete.
 
-    Each unresolved delivery re-enters the untouched #120 dispatch boundary:
-    it reloads durable state by the delivery GUID, re-validates current
-    routing, re-runs the routed authoritative reconciliation, and marks only
-    the bounded ``processed_at`` recovery instant when every routed
-    reconciliation completed or typedly declined. The provider delivery
-    identity is never rewritten, inbox status is never GitHub truth, and the
-    oldest-first batch cap keeps the recovery work bounded while the backlog
-    drains across repeated sweeps.
+    The work set is selected durably within the addressed scope — only
+    deliveries with at least one unresolved route of the scope are listed
+    (the scope filter applies before the bounded batch cap), so an unrelated
+    Workspace's backlog can never exhaust the batch, starve in-scope
+    recovery, or leak its delivery identities into this execution's
+    outcomes. Each listed delivery re-enters the untouched #120 dispatch
+    boundary: it reloads durable state by the delivery GUID, re-validates
+    current routing, re-runs the routed authoritative reconciliation, and
+    marks only the bounded ``processed_at`` recovery instant when every
+    routed reconciliation of the whole fan-out completed or typedly
+    declined. With the ``route_scope``, only the scope's routes are
+    dispatched — never an out-of-scope route — and a shared fan-out delivery
+    is never marked processed solely because one selected route completed.
+    The provider delivery identity is never rewritten, inbox status is never
+    GitHub truth, and the oldest-first batch cap keeps the recovery work
+    bounded while the backlog drains across repeated refreshes.
     """
     outcomes: list[GitHubReconciliationSweepOutcome] = []
     deliveries = list_github_webhook_deliveries_requiring_recovery(
-        pool, limit=MAX_RECOVERY_DELIVERY_BATCH
+        pool,
+        workspace_id=route_scope.workspace_id,
+        repository_id=route_scope.repository_id,
+        limit=MAX_RECOVERY_DELIVERY_BATCH,
     )
     for delivery in deliveries:
         try:
@@ -997,6 +1175,7 @@ def _sweep_delivery_units(
                 github,
                 delivery_guid=delivery.delivery_guid,
                 terminal_finalization_submission=terminal_finalization_submission,
+                route_scope=route_scope,
             )
         except ApplicationError as error:
             outcomes.append(
@@ -1075,51 +1254,158 @@ def _repository_issue_work_set(
     )
 
 
+def _summarize_and_complete(
+    pool: DatabasePool,
+    *,
+    refresh_id: UUID,
+    outcomes: list[GitHubReconciliationSweepOutcome],
+) -> None:
+    """Stamp the durable record's truthful terminal outcome (issue #375).
+
+    The summary counts actual completed observations and durable changes —
+    never queued work. ``completed`` requires every unit reconciled or
+    typedly declined and every listing complete; ``failed`` means nothing
+    reconciled and at least one unit attempted and failed; everything else
+    (including any partial listing) is truthfully ``partially_completed``.
+    The errors list is the bounded sanitized per-unit classification: a
+    family token, a safe code, and the unit's own safe stable identifiers —
+    never provider payloads, secrets, or other Workspace information.
+    """
+    summary = GitHubRefreshSummary(
+        repositories_checked=sum(
+            1
+            for outcome in outcomes
+            if outcome.family is GitHubReconciliationSweepFamily.REPOSITORY
+            and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+        ),
+        issues_discovered=sum(1 for outcome in outcomes if outcome.issue_created),
+        issues_updated=sum(
+            1
+            for outcome in outcomes
+            if outcome.family is GitHubReconciliationSweepFamily.ISSUE
+            and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+            and not outcome.issue_created
+            and (
+                outcome.issue_state_changed
+                or outcome.issue_requirements_changed
+                or outcome.issue_presentation_changed
+            )
+        ),
+        issues_closed=sum(
+            1
+            for outcome in outcomes
+            if outcome.family is GitHubReconciliationSweepFamily.ISSUE
+            and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+            and outcome.issue_previous_state is GitHubIssueState.OPEN
+            and not outcome.issue_created
+            and outcome.issue_state_changed
+        ),
+        pull_requests_checked=sum(
+            1
+            for outcome in outcomes
+            if outcome.family is GitHubReconciliationSweepFamily.PULL_REQUEST
+            and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+        ),
+    )
+    failure_statuses = {
+        GitHubReconciliationSweepUnitStatus.FAILED_KNOWN,
+        GitHubReconciliationSweepUnitStatus.FAILED_UNCERTAIN,
+        GitHubReconciliationSweepUnitStatus.FAILED_UNEXPECTED,
+        GitHubReconciliationSweepUnitStatus.ACCESS_LOST,
+    }
+    clean_statuses = {
+        GitHubReconciliationSweepUnitStatus.RECONCILED,
+        GitHubReconciliationSweepUnitStatus.DECLINED,
+    }
+    errors = tuple(
+        GitHubRefreshUnitError(
+            family=outcome.family.value,
+            code=outcome.status.value,
+            workspace_id=outcome.workspace_id,
+            repository_id=outcome.repository_id,
+            github_issue_id=outcome.github_issue_id,
+            delivery_guid=outcome.delivery_guid,
+        )
+        for outcome in outcomes
+        if outcome.status in failure_statuses
+    )[:MAX_REFRESH_ERROR_FACTS]
+    attempted = any(
+        outcome.status is not GitHubReconciliationSweepUnitStatus.DECLINED for outcome in outcomes
+    )
+    listings_complete = all(
+        outcome.issue_listing_complete is not False
+        for outcome in outcomes
+        if outcome.family is GitHubReconciliationSweepFamily.ISSUE_LISTING
+        and outcome.status is GitHubReconciliationSweepUnitStatus.RECONCILED
+    )
+    all_clean = all(outcome.status in clean_statuses for outcome in outcomes) and listings_complete
+    if all_clean or not attempted:
+        terminal = GitHubRefreshStatus.COMPLETED
+    elif all(outcome.status in failure_statuses for outcome in outcomes):
+        terminal = GitHubRefreshStatus.FAILED
+    else:
+        terminal = GitHubRefreshStatus.PARTIALLY_COMPLETED
+    complete_github_refresh(
+        pool,
+        refresh_id=refresh_id,
+        status=terminal,
+        summary=summary,
+        errors=errors,
+    )
+
+
 def run_github_reconciliation_sweep(
     pool: DatabasePool,
     github: GitHubAppClient,
-    settings: Settings,
     *,
-    sweep_tick: int | None = None,
+    refresh_id: UUID,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
 ) -> GitHubReconciliationSweepResult:
-    """Run one bounded, repeatable GitHub reconciliation/recovery sweep.
+    """Execute one durable scoped GitHub refresh (issues #62, #375).
 
-    The single shared entry point for periodic scheduled reconciliation,
-    operator/manual recovery, retry after a known-safe reconciliation
-    failure, and recovery of recorded deliveries whose dispatch did not
-    complete. ``sweep_tick`` selects the serviced stable-identity bucket of
-    every family (``None`` services the whole eligible set); the partition
-    count comes from the process settings and bounds the per-invocation
-    provider-facing work. Every unit re-derives its subject from durable
-    Postgres at its own start and re-reads fresh authoritative GitHub state,
-    so any tick is safe to run, re-run, replay, or reorder, and the sweep
-    converges on current GitHub truth without ever promoting webhook or
-    queue state into authority.
-
-    The sweep performs no GitHub I/O itself: each unit composes an existing
-    focused capability that owns its short transactions around its external
-    reads, and the work-set derivation is database-only. The execution order
-    is the family order — repository metadata, then issues with their
-    relations, then bound branches and canonical PRs with their checks
-    projections, then the bounded delivery-recovery batch.
+    The queued payload carries only the refresh identity; the execution
+    claims the durable record through its CAS and re-derives the authorized
+    scope from durable state — the queued scope is never authorization. A
+    refused claim (an expired or already-recovered record) is a stale
+    operation: the execution never claims expired work and never fabricates
+    completion. Within the re-derived scope the families run in order —
+    repository metadata, the bounded open-issue listing synchronization plus
+    the known-relevant issue/relations units, bound branches and canonical
+    PRs with their checks projections, then the bounded scope-filtered
+    delivery recovery — and the record's truthful terminal outcome is
+    stamped through its completion CAS. Every unit re-derives its subject
+    from durable Postgres and re-reads fresh authoritative GitHub state, so
+    any replayed, delayed, or reordered execution is harmless and converges
+    on current GitHub truth without ever promoting webhook or queue state
+    into authority.
     """
-    if sweep_tick is not None and (
-        isinstance(sweep_tick, bool) or not isinstance(sweep_tick, int) or sweep_tick < 0
-    ):
-        raise InvalidCommandError("sweep_tick must be a non-negative integer or None")
-    partitions = settings.github_reconciliation_sweep_partitions
-    if isinstance(partitions, bool) or not isinstance(partitions, int) or partitions < 1:
-        raise InvalidCommandError("the sweep partition count must be a positive integer")
+    if not isinstance(refresh_id, UUID):
+        raise InvalidCommandError("refresh_id must be a UUID")
     with application_span(_SERVICE_TRACER_SCOPE, _SWEEP_SPAN_NAME) as span:
         annotate_span(span, operation=_SWEEP_SPAN_NAME)
+        record = claim_github_refresh(pool, refresh_id=refresh_id)
+        if record is None:
+            # The record expired and was recovered to ``unknown``, or moved
+            # on: never claimable by this stale job, and never completed by
+            # it either.
+            raise StaleOperationError(
+                "the addressed github refresh is no longer claimable for execution"
+            )
+        scope_workspace_id = record.workspace_id
+        scope_repository_id = record.repository_id
+        annotate_span(span, workspace_id=str(scope_workspace_id))
         outcomes: list[GitHubReconciliationSweepOutcome] = []
-        repositories = list_github_routed_repositories(pool)
+        # The durable, re-derived scope: only the scope's explicitly routed
+        # repositories participate (a repository-scope refresh whose mapping
+        # vanished between admission and execution has no units to run).
+        repositories = list_github_routed_repositories(pool, workspace_id=scope_workspace_id)
+        if scope_repository_id is not None:
+            repositories = [
+                repository for repository in repositories if repository.id == scope_repository_id
+            ]
 
-        # Family 1 — repository metadata (bucketed by repository identity).
+        # Family 1 — repository metadata.
         for repository in repositories:
-            if not _in_tick_bucket(repository.id.int, sweep_tick, partitions):
-                continue
             outcomes.append(
                 _sweep_repository_unit(
                     pool,
@@ -1129,15 +1415,22 @@ def run_github_reconciliation_sweep(
                 )
             )
 
-        # Family 2 — issue + relation units (bucketed by stable issue
-        # identity), over each configured repository's bounded current-work
-        # issue set.
+        # Family 2 — the bounded open-issue listing synchronization (one-way,
+        # through the existing identity-guarded primitive), then the
+        # known-relevant issue + relations units. Closure is established only
+        # by the explicit fresh per-issue reads — never by listing absence.
         for repository in repositories:
+            listing_outcome, entry_outcomes = _sweep_issue_listing_unit(
+                pool,
+                github,
+                workspace_id=repository.workspace_id,
+                repository_id=repository.id,
+            )
+            outcomes.append(listing_outcome)
+            outcomes.extend(entry_outcomes)
             for github_issue_id, issue_number, current_task in _repository_issue_work_set(
                 pool, workspace_id=repository.workspace_id, repository_id=repository.id
             ):
-                if not _in_tick_bucket(github_issue_id, sweep_tick, partitions):
-                    continue
                 outcomes.append(
                     _sweep_issue_unit(
                         pool,
@@ -1160,22 +1453,19 @@ def run_github_reconciliation_sweep(
                     )
                 )
 
-        # Family 3 — branch / pull-request / checks units (bucketed by Task
-        # identity), over each configured repository's current Tasks. The
-        # checks unit is strictly dependent on its PR unit: only a completed
-        # PR reconciliation establishes the current authoritative head in
-        # this sweep, so a failed, uncertain, unexpected, or declined PR unit
-        # is never followed by a checks projection — the durable
-        # ``head_sha`` it would address is the last reconciled head, and
-        # presenting it as current CI evidence would misrepresent stale
-        # state. The next rotation (or an operator re-run) re-derives the
-        # unit pair from durable state.
+        # Family 3 — branch / pull-request / checks units over the scope's
+        # current Tasks. The checks unit is strictly dependent on its PR
+        # unit: only a completed PR reconciliation establishes the current
+        # authoritative head in this execution, so a failed, uncertain,
+        # unexpected, or declined PR unit is never followed by a checks
+        # projection — the durable ``head_sha`` it would address is the last
+        # reconciled head, and presenting it as current CI evidence would
+        # misrepresent stale state. A re-run re-derives the unit pair from
+        # durable state.
         for repository in repositories:
             for task in list_current_repository_tasks(
                 pool, workspace_id=repository.workspace_id, repository_id=repository.id
             ):
-                if not _in_tick_bucket(task.id.int, sweep_tick, partitions):
-                    continue
                 if task.canonical_feature_branch is not None:
                     outcomes.append(
                         _sweep_branch_unit(
@@ -1206,7 +1496,7 @@ def run_github_reconciliation_sweep(
                     # persisted the authoritative merged facts update-only;
                     # the shared completion seam owns the durable
                     # completion/audit effects and is idempotent under
-                    # duplicate sweep/webhook/Owner completion races. The
+                    # duplicate refresh/webhook/Owner completion races. The
                     # checks unit below still projects the merged PR's
                     # checks surface.
                     consequence_failure = _complete_merged_task_consequence(
@@ -1225,7 +1515,7 @@ def run_github_reconciliation_sweep(
                     # closed-unmerged facts update-only; the trusted
                     # GitHub-observation cancellation entrypoint owns the
                     # durable terminal effects and is idempotent under
-                    # duplicate sweep/webhook races.
+                    # duplicate refresh/webhook races.
                     consequence_failure = _cancel_closed_unmerged_task_consequence(
                         pool,
                         workspace_id=repository.workspace_id,
@@ -1245,11 +1535,26 @@ def run_github_reconciliation_sweep(
                     )
                 )
 
-        # Family 4 — bounded delivery-recovery batch (oldest first).
-        outcomes.extend(_sweep_delivery_units(pool, github, terminal_finalization_submission))
+        # Family 4 — the bounded, scope-filtered delivery-recovery batch
+        # (oldest first): only the scope's routes are dispatched, and a
+        # shared fan-out delivery is processed only when its whole fan-out
+        # carries completion evidence.
+        outcomes.extend(
+            _sweep_delivery_units(
+                pool,
+                github,
+                terminal_finalization_submission,
+                route_scope=GitHubWebhookRouteScope(
+                    workspace_id=scope_workspace_id,
+                    repository_id=scope_repository_id,
+                ),
+            )
+        )
 
+        _summarize_and_complete(pool, refresh_id=refresh_id, outcomes=outcomes)
         return GitHubReconciliationSweepResult(
-            tick=sweep_tick,
-            partitions=partitions,
+            refresh_id=refresh_id,
+            workspace_id=scope_workspace_id,
+            repository_id=scope_repository_id,
             outcomes=tuple(outcomes),
         )

@@ -182,7 +182,7 @@ def _delivery_row(
 
 
 def _route_row(workspace_id: uuid.UUID, repository_id: uuid.UUID) -> tuple[Any, ...]:
-    return (uuid.uuid4(), _DELIVERY_ID, workspace_id, repository_id, _NOW)
+    return (uuid.uuid4(), _DELIVERY_ID, workspace_id, repository_id, _NOW, None)
 
 
 def _issue_projection_row(
@@ -201,6 +201,16 @@ def _issue_projection_row(
         None,
         _NOW,
         _NOW,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 
@@ -388,8 +398,20 @@ def _script_delivery(conn: ScriptedConnection, row: tuple[Any, ...] | None) -> N
     conn.on("from openorc.github_webhook_deliveries", row)
 
 
-def _script_routes(conn: ScriptedConnection, rows: list[tuple[Any, ...]]) -> None:
+def _script_routes(
+    conn: ScriptedConnection, rows: list[tuple[Any, ...]], *, unresolved_after: int = 0
+) -> None:
+    """Script the routes read plus the #375 per-route completion flow.
+
+    Each scripted route that the dispatch resolves stamps its own
+    ``resolved_at`` completion evidence; the trailing unresolved-count read
+    answers ``unresolved_after`` (0 = every route resolved, so the delivery
+    is marked processed; >0 = something remains outstanding).
+    """
     conn.on("from openorc.github_webhook_delivery_routes", rows)
+    for row in rows:
+        conn.on("set resolved_at = now()", (row[0],))
+    conn.on("resolved_at is null", [(unresolved_after,)])
 
 
 def _script_processed(conn: ScriptedConnection, delivery_id: uuid.UUID | None) -> None:
@@ -551,7 +573,7 @@ def test_an_issue_reconciliation_conflict_fails_known_and_stays_recoverable(
         "the GitHub issue number durably maps to a different stable issue identity"
     )
     _script_delivery(harness.conn, _delivery_row())
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)], unresolved_after=1)
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(
         harness.pool, _github_client(), delivery_guid="guid-1"
@@ -570,7 +592,7 @@ def test_issue_state_known_provider_failure_leaves_the_delivery_recoverable(
     harness = harness_factory()
     harness.issue_reconcile._error = ExternalOperationFailedError("rate limited")
     _script_delivery(harness.conn, _delivery_row())
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)], unresolved_after=1)
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(
         harness.pool, _github_client(), delivery_guid="guid-1"
@@ -587,7 +609,7 @@ def test_issue_state_uncertain_outcome_stays_uncertain_and_recoverable(harness_f
     harness = harness_factory()
     harness.issue_reconcile._error = ExternalOperationUncertainError("unknown outcome")
     _script_delivery(harness.conn, _delivery_row())
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)], unresolved_after=1)
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(
         harness.pool, _github_client(), delivery_guid="guid-1"
@@ -676,7 +698,7 @@ def test_issue_relations_failure_fails_the_route_closed(harness_factory) -> None
             github_issue_number=None,
         ),
     )
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)], unresolved_after=1)
     _script_issues(harness.conn, [_issue_projection_row(_WORKSPACE_A, _REPOSITORY_A, 503, 42)])
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(
@@ -759,7 +781,7 @@ def test_repository_metadata_access_loss_fails_known_and_stays_recoverable(harne
             github_issue_number=None,
         ),
     )
-    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)])
+    _script_routes(harness.conn, [_route_row(_WORKSPACE_A, _REPOSITORY_A)], unresolved_after=1)
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(
         harness.pool, _github_client(), delivery_guid="guid-1"
@@ -1014,6 +1036,7 @@ def test_multi_route_dispatch_marks_processed_only_when_every_route_completes(
             _route_row(_WORKSPACE_A, _REPOSITORY_A),
             _route_row(_WORKSPACE_B, _REPOSITORY_B),
         ],
+        unresolved_after=1,
     )
 
     result = github_webhook_dispatch.dispatch_github_webhook_delivery(

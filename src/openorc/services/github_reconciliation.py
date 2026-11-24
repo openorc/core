@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from enum import StrEnum
 from uuid import UUID
 
 from openorc.adapters.github import (
@@ -71,6 +71,7 @@ from openorc.adapters.github import (
 )
 from openorc.domain.github_issues import (
     GitHubIssueIdentity,
+    GitHubIssueObservedFacts,
     GitHubIssueProjection,
     GitHubIssueState,
     github_issue_requirements_fingerprint,
@@ -106,11 +107,15 @@ from openorc.services.transaction_composition import composed_transaction
 from openorc.services.workspace_authorization import require_workspace_repository
 
 __all__ = [
+    "RepositoryIssueListingEntry",
+    "RepositoryIssueListingEntryOutcome",
+    "RepositoryIssueListingSynchronization",
     "RepositoryIssueReconciliation",
     "RepositoryObservationReconciliation",
     "reconcile_repository_issue",
     "reconcile_repository_issue_for_owner",
     "reconcile_repository_observation",
+    "synchronize_repository_open_issue_listing",
 ]
 
 logger = logging.getLogger(__name__)
@@ -150,6 +155,14 @@ class RepositoryIssueReconciliation:
     issue_state_changed: bool
     requirements_changed: bool
     previous_fingerprint: str | None
+    # The serialized pre-image observed state (None for a creation): the
+    # direction of an open/closed transition (issue #375 summary counting).
+    previous_state: GitHubIssueState | None = None
+    # Issue #375: a durable write whose fingerprint and observed state did
+    # not change persisted presentation-fact changes only. It is a real
+    # durable observation change (updated_at advanced), never a requirements
+    # change and never source drift.
+    issue_presentation_changed: bool = False
 
 
 def _require_uuid_command(value: object, name: str) -> None:
@@ -236,12 +249,7 @@ def _apply_reconciled_state(
     read_installation_id: UUID,
     repository_observation: GitHubRepositoryObservation,
     identity: GitHubIssueIdentity,
-    issue_number: int,
-    title: str,
-    body: str | None,
-    state: GitHubIssueState,
-    requirements_fingerprint: str,
-    provider_updated_at: datetime | None,
+    facts: GitHubIssueObservedFacts,
 ) -> RepositoryIssueReconciliation:
     """Apply the serialized durable write phase inside one short transaction.
 
@@ -293,18 +301,13 @@ def _apply_reconciled_state(
             workspace_id=workspace_id,
             repository_id=reloaded.id,
             github_issue_id=identity.github_issue_id,
-            issue_number=issue_number,
-            title=title,
-            body=body,
-            state=state,
-            requirements_fingerprint=requirements_fingerprint,
-            provider_updated_at=provider_updated_at,
+            facts=facts,
         )
         return _map_reconcile_result(
             current_repository,
             metadata_changed,
             reconcile_result,
-            requirements_fingerprint=requirements_fingerprint,
+            requirements_fingerprint=facts.requirements_fingerprint,
         )
 
 
@@ -343,8 +346,14 @@ def _map_reconcile_result(
             issue_state_changed=False,
             requirements_changed=False,
             previous_fingerprint=None,
+            previous_state=None,
         )
     if result.outcome is GitHubIssueReconcileOutcome.UPDATED:
+        state_changed = (
+            result.previous_state is not None
+            and result.previous_state is not result.projection.state
+        )
+        requirements_changed = result.previous_fingerprint != requirements_fingerprint
         return RepositoryIssueReconciliation(
             repository=repository,
             repository_metadata_changed=metadata_changed,
@@ -352,12 +361,13 @@ def _map_reconcile_result(
             issue_created=False,
             # Only a genuine open/closed transition is a state change: a
             # requirements-only or provider-metadata-only write is not one.
-            issue_state_changed=(
-                result.previous_state is not None
-                and result.previous_state is not result.projection.state
-            ),
-            requirements_changed=result.previous_fingerprint != requirements_fingerprint,
+            issue_state_changed=state_changed,
+            requirements_changed=requirements_changed,
             previous_fingerprint=result.previous_fingerprint,
+            previous_state=result.previous_state,
+            # A durable write with no state and no fingerprint change
+            # persisted presentation-fact changes only (issue #375).
+            issue_presentation_changed=not state_changed and not requirements_changed,
         )
     return RepositoryIssueReconciliation(
         repository=repository,
@@ -367,6 +377,37 @@ def _map_reconcile_result(
         issue_state_changed=False,
         requirements_changed=False,
         previous_fingerprint=result.previous_fingerprint,
+        previous_state=result.previous_state,
+    )
+
+
+def _observed_facts(
+    issue_number: int, observation: GitHubIssueObservation
+) -> GitHubIssueObservedFacts:
+    """Build the coherent observed-facts snapshot of one issue observation.
+
+    The fingerprint stays exactly title+body; the #375 presentation facts
+    persist as presentation only. Shared by the single-issue primitive and
+    the listing synchronization so both write exactly the same fact set.
+    """
+    state = GitHubIssueState(observation.state)
+    return GitHubIssueObservedFacts(
+        issue_number=issue_number,
+        title=observation.title,
+        body=observation.body,
+        state=state,
+        requirements_fingerprint=github_issue_requirements_fingerprint(
+            observation.title, observation.body
+        ),
+        provider_updated_at=observation.provider_updated_at,
+        state_reason=observation.state_reason,
+        html_url=observation.html_url,
+        provider_created_at=observation.provider_created_at,
+        provider_closed_at=observation.provider_closed_at,
+        user=observation.user,
+        labels=observation.labels,
+        assignees=observation.assignees,
+        milestone=observation.milestone,
     )
 
 
@@ -431,10 +472,10 @@ def reconcile_repository_issue(
         if issue_observation.is_pull_request:
             raise ConflictError("the addressed GitHub number is a pull request, not an issue")
         identity = GitHubIssueIdentity(github_issue_id=issue_observation.github_issue_id)
-        state = GitHubIssueState(issue_observation.state)
-        fingerprint = github_issue_requirements_fingerprint(
-            issue_observation.title, issue_observation.body
-        )
+        # One coherent observed-facts snapshot: the #59 core facts plus the
+        # #375 presentation facts. The fingerprint stays exactly title+body;
+        # the presentation facts persist as presentation only.
+        facts = _observed_facts(issue_number, issue_observation)
         return _apply_reconciled_state(
             pool,
             workspace_id=workspace_id,
@@ -442,12 +483,7 @@ def reconcile_repository_issue(
             read_installation_id=installation_id,
             repository_observation=repository_observation,
             identity=identity,
-            issue_number=issue_number,
-            title=issue_observation.title,
-            body=issue_observation.body,
-            state=state,
-            requirements_fingerprint=fingerprint,
-            provider_updated_at=issue_observation.provider_updated_at,
+            facts=facts,
         )
 
 
@@ -597,3 +633,191 @@ def _apply_repository_observation(
         if updated is None:  # pragma: no cover - the row lock excludes deletion
             raise NotFoundError("the requested repository is not available in this workspace")
         return RepositoryObservationReconciliation(repository=updated, metadata_changed=True)
+
+
+class RepositoryIssueListingEntryOutcome(StrEnum):
+    """The bounded outcome of one listing entry's synchronization.
+
+    The same classification vocabulary the recovery sweep reports per unit,
+    kept transport-neutral here: ``reconciled`` (a durable transition or a
+    true no-op), ``declined`` (nothing to synchronize), ``failed_known``,
+    ``failed_uncertain``, ``failed_unexpected``, and ``access_lost`` — the
+    normalized integration condition.
+    """
+
+    RECONCILED = "reconciled"
+    DECLINED = "declined"
+    FAILED_KNOWN = "failed_known"
+    FAILED_UNCERTAIN = "failed_uncertain"
+    FAILED_UNEXPECTED = "failed_unexpected"
+    ACCESS_LOST = "access_lost"
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryIssueListingEntry:
+    """One listing entry's synchronization outcome (issue #375).
+
+    ``reconciliation`` carries the durable before→current facts when the
+    entry synchronized (including the true no-op); ``outcome`` classifies
+    the bounded result. A failed entry leaves its prior projection
+    byte-identical and never blocks the remaining entries.
+    """
+
+    issue_number: int
+    outcome: RepositoryIssueListingEntryOutcome
+    reconciliation: RepositoryIssueReconciliation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryIssueListingSynchronization:
+    """The bounded result of one repository's open-issue listing synchronization.
+
+    ``listing_complete`` is the adapter's own completeness fact: ``False``
+    means the bounded walk ended before GitHub reported its pagination end,
+    so the observation is deliberately partial — closure, deletion, and
+    complete discovery are never inferred from it, and unlisted issues are
+    simply not synchronized by this observation.
+    """
+
+    repository: Repository
+    listing_complete: bool
+    pull_request_entries_skipped: int
+    entries: tuple[RepositoryIssueListingEntry, ...]
+
+
+def _entry_outcome_from_application_error(
+    error: ApplicationError,
+) -> RepositoryIssueListingEntryOutcome:
+    """Classify one contained entry failure, safely and without provider detail."""
+    if isinstance(error, AuthorizationError):
+        return RepositoryIssueListingEntryOutcome.ACCESS_LOST
+    if isinstance(error, ExternalOperationUncertainError):
+        return RepositoryIssueListingEntryOutcome.FAILED_UNCERTAIN
+    if isinstance(error, ApplicationError):
+        return RepositoryIssueListingEntryOutcome.FAILED_KNOWN
+    return RepositoryIssueListingEntryOutcome.FAILED_UNEXPECTED
+
+
+_LISTING_SPAN_NAME = "github_reconciliation.synchronize_repository_open_issue_listing"
+
+
+def synchronize_repository_open_issue_listing(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    workspace_id: UUID,
+    repository_id: UUID,
+) -> RepositoryIssueListingSynchronization:
+    """Synchronize one repository's bounded open-issue listing (issue #375).
+
+    One-way GitHub-authoritative issue synchronization composed from the
+    existing primitive's own guarded internals — no second reconciliation
+    policy: the route is resolved once, ONE fresh authoritative repository
+    observation is addressed by every entry, and each successfully observed
+    non-PR entry then performs its own fresh single-issue read (bound to the
+    addressed number and repository) followed by the same serialized
+    identity-guarded write phase every reconciliation uses. Discovery is
+    the insertion outcome of synchronization, never a separate semantic:
+    new, already known, and previously closed entries all synchronize
+    through the same upsert, so a missed reopening webhook is recovered
+    exactly like any other state change, and closure is never inferred from
+    listing absence. Per-entry failures are contained and classified — one
+    entry never blocks the rest — and a partial or failed listing never
+    implies closure, deletion, or successful full discovery.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(repository_id, "repository_id")
+    with application_span(_SERVICE_TRACER_SCOPE, _LISTING_SPAN_NAME) as span:
+        annotate_span(span, operation=_LISTING_SPAN_NAME, workspace_id=str(workspace_id))
+        route = resolve_system_repository_installation_route(
+            pool, workspace_id=workspace_id, repository_id=repository_id
+        )
+        repository = route.repository
+        installation_id = route.installation_id
+        external_installation_id = route.github_installation_id
+        try:
+            repository_observation = github.get_installation_repository(
+                github_installation_id=external_installation_id,
+                github_repository_id=repository.identity.github_repository_id,
+            )
+        except (
+            GitHubAuthorizationRejectedError,
+            GitHubRateLimitedError,
+            GitHubAuthenticationRejectedError,
+            GitHubRequestRejectedError,
+            GitHubOutcomeUncertainError,
+        ) as error:
+            raise _translate_github_outcome(error) from error
+        try:
+            listing = github.list_repository_open_issues(
+                github_installation_id=external_installation_id,
+                owner_login=repository_observation.owner_login,
+                repository_name=repository_observation.name,
+            )
+        except (
+            GitHubAuthorizationRejectedError,
+            GitHubRateLimitedError,
+            GitHubAuthenticationRejectedError,
+            GitHubRequestRejectedError,
+            GitHubOutcomeUncertainError,
+        ) as error:
+            raise _translate_github_outcome(error) from error
+        entries: list[RepositoryIssueListingEntry] = []
+        for observation in listing.issues:
+            entry_number = observation.issue_number
+            try:
+                issue_observation = github.get_repository_issue(
+                    github_installation_id=external_installation_id,
+                    owner_login=repository_observation.owner_login,
+                    repository_name=repository_observation.name,
+                    issue_number=entry_number,
+                )
+                if issue_observation.is_pull_request:
+                    # The listing already rejects documented PR entries; a
+                    # discriminator on the fresh read is a typed decline.
+                    entries.append(
+                        RepositoryIssueListingEntry(
+                            issue_number=entry_number,
+                            outcome=RepositoryIssueListingEntryOutcome.DECLINED,
+                        )
+                    )
+                    continue
+                identity = GitHubIssueIdentity(github_issue_id=issue_observation.github_issue_id)
+                reconciliation = _apply_reconciled_state(
+                    pool,
+                    workspace_id=workspace_id,
+                    repository_id=repository_id,
+                    read_installation_id=installation_id,
+                    repository_observation=repository_observation,
+                    identity=identity,
+                    facts=_observed_facts(entry_number, issue_observation),
+                )
+            except ApplicationError as error:
+                entries.append(
+                    RepositoryIssueListingEntry(
+                        issue_number=entry_number,
+                        outcome=_entry_outcome_from_application_error(error),
+                    )
+                )
+                continue
+            except Exception:  # noqa: BLE001 - contained with safe classification
+                entries.append(
+                    RepositoryIssueListingEntry(
+                        issue_number=entry_number,
+                        outcome=RepositoryIssueListingEntryOutcome.FAILED_UNEXPECTED,
+                    )
+                )
+                continue
+            entries.append(
+                RepositoryIssueListingEntry(
+                    issue_number=entry_number,
+                    outcome=RepositoryIssueListingEntryOutcome.RECONCILED,
+                    reconciliation=reconciliation,
+                )
+            )
+        return RepositoryIssueListingSynchronization(
+            repository=repository,
+            listing_complete=listing.complete,
+            pull_request_entries_skipped=listing.pull_request_entries_skipped,
+            entries=tuple(entries),
+        )

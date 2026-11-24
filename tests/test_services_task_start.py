@@ -258,6 +258,16 @@ def _issue_projection_row(
         _OBSERVED,
         _OBSERVED,
         _OBSERVED,
+        None,
+        "https://github.com/octocat/hello-world/issues/42",
+        _OBSERVED,
+        None,
+        None,
+        [],
+        [],
+        None,
+        None,
+        None,
     )
 
 
@@ -359,6 +369,15 @@ def _event_row(actor_type: str = "owner", actor_id: Any = _OWNER_PROFILE_ID) -> 
 
 
 class FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """Scripted adapter fake recording call order — zero calls is assertable.
 
     When constructed with the test's pool fake, each call also records how
@@ -409,6 +428,14 @@ class FakeGitHubAppClient:
             state="open",
             provider_updated_at=_OBSERVED,
             is_pull_request=False,
+            state_reason=None,
+            html_url="https://github.com/octocat/hello-world/issues/42",
+            provider_created_at=_OBSERVED,
+            provider_closed_at=None,
+            user=None,
+            labels=(),
+            assignees=(),
+            milestone=None,
         )
 
     def get_issue_blocked_by(

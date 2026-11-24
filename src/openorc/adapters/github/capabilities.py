@@ -58,6 +58,7 @@ __all__ = [
     "GITHUB_MINT_INSTALLATION_TOKEN_PATH",
     "GITHUB_GRAPHQL_PATH",
     "GITHUB_REPOSITORY_ISSUE_PATH",
+    "GITHUB_REPOSITORY_ISSUES_COLLECTION_PATH",
     "GITHUB_REPOSITORY_BRANCH_PATH",
     "GITHUB_REPOSITORY_PULL_REQUEST_PATH",
     "GITHUB_PULL_REQUEST_MERGE_PATH",
@@ -165,6 +166,9 @@ GITHUB_MINT_INSTALLATION_TOKEN_PATH = "/app/installations/{installation_id}/acce
 GITHUB_INSTALLATION_PATH = "/app/installations/{installation_id}"
 GITHUB_INSTALLATION_REPOSITORIES_PATH = "/installation/repositories"
 GITHUB_REPOSITORY_ISSUE_PATH = "/repos/{owner}/{repo}/issues/{issue_number}"
+# The documented open-issue listing collection (issue #375): the bounded,
+# provider-paginated repository issue synchronization source.
+GITHUB_REPOSITORY_ISSUES_COLLECTION_PATH = "/repos/{owner}/{repo}/issues"
 GITHUB_REPOSITORY_BRANCH_PATH = "/repos/{owner}/{repo}/branches/{branch}"
 GITHUB_REPOSITORY_PULL_REQUEST_PATH = "/repos/{owner}/{repo}/pulls/{pull_number}"
 GITHUB_PULL_REQUEST_MERGE_PATH = "/repos/{owner}/{repo}/pulls/{pull_number}/merge"

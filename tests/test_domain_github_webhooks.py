@@ -189,6 +189,7 @@ def test_delivery_field_sets_carry_no_payload_or_secret_field() -> None:
 def test_route_field_names_are_the_persisted_linkage_shape() -> None:
     field_names = github_webhook_delivery_route_field_names()
 
+    # The #375 per-route completion evidence instant joins the linkage shape.
     assert field_names == frozenset(
-        {"id", "delivery_id", "workspace_id", "repository_id", "created_at"}
+        {"id", "delivery_id", "workspace_id", "repository_id", "created_at", "resolved_at"}
     )

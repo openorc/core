@@ -251,6 +251,16 @@ def _issue_row(*, fingerprint: str = _FINGERPRINT) -> tuple[Any, ...]:
         _OBSERVED,
         _OBSERVED,
         _OBSERVED,
+        None,
+        "https://github.com/octocat/hello-world/issues/42",
+        _OBSERVED,
+        None,
+        None,
+        [],
+        [],
+        None,
+        None,
+        None,
     )
 
 

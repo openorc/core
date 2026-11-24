@@ -140,6 +140,15 @@ class FakePool:
 
 
 class FakeGitHubAppClient:
+    def list_repository_open_issues(
+        self,
+        *,
+        github_installation_id: int,
+        owner_login: str,
+        repository_name: str,
+    ) -> Any:
+        raise AssertionError("this fake must not observe the open-issue listing")
+
     """The adapter Protocol fake recording the exact routing arguments."""
 
     def __init__(

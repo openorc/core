@@ -60,9 +60,11 @@ from openorc.domain.pull_requests import TaskPullRequestState
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.github_issues import list_repository_github_issues
 from openorc.persistence.github_webhook_deliveries import (
+    count_unresolved_github_webhook_delivery_routes,
     get_github_webhook_delivery,
     list_github_webhook_delivery_routes,
     mark_github_webhook_delivery_processed,
+    mark_github_webhook_delivery_route_resolved,
 )
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.pull_requests import (
@@ -95,11 +97,30 @@ __all__ = [
     "GitHubWebhookDispatchRouteStatus",
     "GitHubWebhookDispatchSubmissionResult",
     "GitHubWebhookIntakeAndDispatch",
+    "GitHubWebhookRouteScope",
     "WebhookDispatchSubmission",
     "dispatch_github_webhook_delivery",
     "intake_and_dispatch_github_webhook",
     "submit_github_webhook_dispatch",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubWebhookRouteScope:
+    """The scoped on-demand refresh's delivery-recovery containment (#375).
+
+    Only routes matching the addressed scope are dispatched: every route of
+    the addressed Workspace (``repository_id`` ``None`` — the workspace
+    scope) or the one addressed Workspace Repository. The delivery-level
+    processed rule still requires every routed route's completion evidence,
+    so an out-of-scope route is never dispatched and a shared fan-out
+    delivery is never marked processed solely because one selected route
+    completed.
+    """
+
+    workspace_id: UUID
+    repository_id: UUID | None = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +311,7 @@ def dispatch_github_webhook_delivery(
     *,
     delivery_guid: str,
     terminal_finalization_submission: TerminalFinalizationSubmission | None = None,
+    route_scope: GitHubWebhookRouteScope | None = None,
 ) -> GitHubWebhookDispatchResult:
     """Dispatch one accepted delivery into authoritative reconciliation (#120).
 
@@ -303,6 +325,17 @@ def dispatch_github_webhook_delivery(
     recoverable for #62. Duplicate, replayed, delayed, and out-of-order jobs
     converge because every reconciliation re-reads current authoritative
     GitHub state.
+
+    The optional ``route_scope`` (issue #375) is the scoped on-demand
+    refresh's recovery containment: only routes matching the addressed
+    scope are dispatched — never an out-of-scope route — and each dispatched
+    route's resolution stamps its own per-route completion evidence. The
+    delivery-level ``processed_at`` is marked only when EVERY routed route
+    of the delivery carries completion evidence, so a shared fan-out
+    delivery is processed exactly once its last outstanding route resolves,
+    across invocations, and never solely because one selected route
+    completed. Without a scope the boundary dispatches every route exactly
+    as before.
     """
     with application_span(_SERVICE_TRACER_SCOPE, _DISPATCH_SPAN_NAME) as span:
         annotate_span(span, operation=_DISPATCH_SPAN_NAME)
@@ -333,6 +366,18 @@ def dispatch_github_webhook_delivery(
         routes = list_github_webhook_delivery_routes(pool, delivery_id=delivery.id)
         if not routes:
             return _unexpected_delivery_shape(delivery)
+        selected_routes = [
+            persisted_route
+            for persisted_route in routes
+            if route_scope is None
+            or (
+                persisted_route.workspace_id == route_scope.workspace_id
+                and (
+                    route_scope.repository_id is None
+                    or persisted_route.repository_id == route_scope.repository_id
+                )
+            )
+        ]
         route_outcomes = tuple(
             GitHubWebhookDispatchRouteOutcome(
                 workspace_id=persisted_route.workspace_id,
@@ -348,16 +393,23 @@ def dispatch_github_webhook_delivery(
                     terminal_finalization_submission=terminal_finalization_submission,
                 ),
             )
-            for persisted_route in routes
+            for persisted_route in selected_routes
         )
-        processed = all(
-            outcome.status
-            in (
+        # The per-route completion evidence (issue #375): a dispatched route
+        # that completed or typedly decline leaves nothing outstanding for
+        # itself. The unscoped path stamps every route exactly as its
+        # all-routes rule requires; the scoped path stamps only its own.
+        for persisted_route, outcome in zip(selected_routes, route_outcomes, strict=True):
+            if outcome.status in (
                 GitHubWebhookDispatchRouteStatus.RECONCILED,
                 GitHubWebhookDispatchRouteStatus.DECLINED,
-            )
-            for outcome in route_outcomes
-        )
+            ):
+                mark_github_webhook_delivery_route_resolved(pool, route_id=persisted_route.id)
+        # The delivery leaves the recovery set only when nothing remains
+        # outstanding across its whole routed fan-out — never solely because
+        # one selected route completed.
+        unresolved = count_unresolved_github_webhook_delivery_routes(pool, delivery_id=delivery.id)
+        processed = unresolved == 0
         if processed:
             mark_github_webhook_delivery_processed(pool, delivery_id=delivery.id)
         return GitHubWebhookDispatchResult(

@@ -482,20 +482,33 @@ def find_repository_by_github_identity(
     return None if row is None else _repository_from_row(row)
 
 
-def list_github_routed_repositories(pool: DatabasePool) -> list[Repository]:
-    """List every Repository with a configured GitHub installation route.
+def list_github_routed_repositories(
+    pool: DatabasePool, *, workspace_id: UUID | None = None
+) -> list[Repository]:
+    """List routed repositories, optionally scoped to one Workspace.
 
-    The bounded work-set enumeration for the #62 repeatable reconciliation
-    sweep: only repositories explicitly routed to an installation participate
-    in GitHub reconciliation, and the listing is database-only (no external
-    I/O), deterministic (ordered by Workspace then record id), and inherently
-    bounded by deployment configuration — never a GitHub-side crawl.
+    The bounded work-set enumeration for the repeatable reconciliation sweep
+    (#62) and the #375 scoped on-demand refresh: only repositories explicitly
+    routed to an installation participate in GitHub reconciliation, and the
+    listing is database-only (no external I/O), deterministic (ordered by
+    Workspace then record id), and inherently bounded by deployment
+    configuration — never a GitHub-side crawl. The optional Workspace scope
+    is the refresh's durable re-derived authorization scope: an execution
+    enumerates only its own scope's routed repositories.
     """
     with transaction(pool) as conn:
-        rows = conn.execute(
-            f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
-            "where github_installation_id is not null order by workspace_id, id",
-        ).fetchall()
+        if workspace_id is None:
+            rows = conn.execute(
+                f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
+                "where github_installation_id is not null order by workspace_id, id",
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"select {_REPOSITORY_COLUMNS} from openorc.repositories "
+                "where github_installation_id is not null and workspace_id = %s "
+                "order by workspace_id, id",
+                (workspace_id,),
+            ).fetchall()
     return [_repository_from_row(row) for row in rows]
 
 

@@ -26,6 +26,17 @@ own discriminator marking the addressed number as a pull request viewed
 through the issues endpoint; the parser records it as a typed fact and
 application services decide the workflow consequence. Error messages never
 contain provider URLs, response bodies, or credential material.
+
+Issue #375 adds the repository open-issue listing entry parser
+(:func:`parse_repository_issue_list_entry`) — the shared issue-object core
+used by the single-issue read, applied to the documented
+``GET /repos/{owner}/{repo}/issues`` listing entries so a bounded
+synchronization observation carries the same normalized fact set — and
+extends the issue fact set with the agreed presentation metadata
+(``state_reason``, the verbatim provider ``html_url``, provider
+created/closed instants, and the bounded nested user/label/assignee/
+milestone subsets), which application services persist as presentation
+facts only.
 """
 
 from __future__ import annotations
@@ -36,12 +47,19 @@ from datetime import datetime
 from openorc.adapters.github.capabilities import parse_instant
 from openorc.adapters.github.errors import GitHubOutcomeUncertainError
 from openorc.adapters.github.transport import github_repository_api_address, is_github_api_origin
+from openorc.domain.github_issues import (
+    GitHubIssueLabel,
+    GitHubIssueMilestone,
+    GitHubIssueUserRef,
+)
 
 __all__ = [
     "GitHubIssueObservation",
+    "GitHubRepositoryIssueListing",
     "GitHubRepositoryObservation",
     "parse_installation_repository_entry",
     "parse_issue_payload",
+    "parse_repository_issue_list_entry",
 ]
 
 _DOCUMENTED_ISSUE_STATES = frozenset({"open", "closed"})
@@ -61,6 +79,84 @@ def _require_positive_int(value: object, description: str) -> int:
             f"the GitHub response is not interpretable: {description} is malformed"
         )
     return value
+
+
+def _parse_nullable_str(value: object, description: str) -> str | None:
+    """Preserve a documented nullable string fact verbatim (issue #375)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GitHubOutcomeUncertainError(
+            f"the GitHub response is not interpretable: {description} is malformed"
+        )
+    return value
+
+
+def _parse_required_user_ref(value: object, description: str) -> GitHubIssueUserRef:
+    """Normalize one documented user/assignee object to the bounded subset."""
+    if not isinstance(value, dict):
+        raise GitHubOutcomeUncertainError(
+            f"the GitHub response is not interpretable: {description} is malformed"
+        )
+    return GitHubIssueUserRef(
+        id=_require_positive_int(value.get("id"), f"{description} identity"),
+        login=_require_non_empty_str(value.get("login"), f"{description} login"),
+    )
+
+
+def _parse_user_refs(value: object, description: str) -> tuple[GitHubIssueUserRef, ...]:
+    """Normalize one documented user/assignee array to the bounded subset."""
+    if not isinstance(value, list):
+        raise GitHubOutcomeUncertainError(
+            f"the GitHub response is not interpretable: {description} is malformed"
+        )
+    return tuple(_parse_required_user_ref(entry, description) for entry in value)
+
+
+def _parse_labels(value: object) -> tuple[GitHubIssueLabel, ...]:
+    """Normalize one documented label array to the bounded native-field subset."""
+    if not isinstance(value, list):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the issue labels are malformed"
+        )
+    labels: list[GitHubIssueLabel] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise GitHubOutcomeUncertainError(
+                "the GitHub response is not interpretable: an issue label is malformed"
+            )
+        labels.append(
+            GitHubIssueLabel(
+                id=_require_positive_int(entry.get("id"), "the label identity"),
+                name=_require_non_empty_str(entry.get("name"), "the label name"),
+                color=_parse_nullable_str(entry.get("color"), "the label color"),
+                description=_parse_nullable_str(entry.get("description"), "the label description"),
+            )
+        )
+    return tuple(labels)
+
+
+def _parse_milestone(value: object) -> GitHubIssueMilestone | None:
+    """Normalize the documented nullable milestone object to the bounded subset."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: the issue milestone is malformed"
+        )
+    return GitHubIssueMilestone(
+        id=_require_positive_int(value.get("id"), "the milestone identity"),
+        number=_require_positive_int(value.get("number"), "the milestone number"),
+        title=_require_non_empty_str(value.get("title"), "the milestone title"),
+        state=_require_non_empty_str(value.get("state"), "the milestone state"),
+        html_url=_require_non_empty_str(value.get("html_url"), "the milestone URL"),
+        description=_parse_nullable_str(value.get("description"), "the milestone description"),
+        due_on=(
+            None
+            if value.get("due_on") is None
+            else parse_instant(value.get("due_on"), "the milestone due instant")
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +246,16 @@ class GitHubIssueObservation:
     ``pull_request`` member — the response's own discriminator that the
     addressed number is a pull request viewed through the issues endpoint —
     carried as a typed fact; application services decide the consequence.
+
+    Issue #375 adds the agreed presentation facts, all normalized to the
+    documented bounded native-field subsets: ``state_reason``, the
+    provider-supplied ``html_url`` carried verbatim (a navigation fact, never
+    reconstructed and never authority), the provider ``created_at``/
+    ``closed_at`` instants, and the nested user/labels/assignees/milestone
+    subsets. Nullable provider facts (``state_reason``, ``closed_at``,
+    ``milestone``, a null ``user``) stay ``None`` verbatim; the label and
+    assignee collections are always observed arrays on the documented issue
+    object.
     """
 
     github_issue_id: int
@@ -159,22 +265,54 @@ class GitHubIssueObservation:
     state: str
     provider_updated_at: datetime
     is_pull_request: bool
+    state_reason: str | None
+    html_url: str
+    provider_created_at: datetime
+    provider_closed_at: datetime | None
+    user: GitHubIssueUserRef | None
+    labels: tuple[GitHubIssueLabel, ...]
+    assignees: tuple[GitHubIssueUserRef, ...]
+    milestone: GitHubIssueMilestone | None
 
 
-def parse_issue_payload(
-    payload: object, *, owner_login: str, repository_name: str, issue_number: int
+@dataclass(frozen=True, slots=True)
+class GitHubRepositoryIssueListing:
+    """One bounded open-issue listing observation of one repository (issue #375).
+
+    ``issues`` carries every successfully parsed, repository-bound issue
+    entry of the bounded page walk. ``pull_request_entries_skipped`` counts
+    the documented ``pull_request`` entries the walk observed and rejected
+    as pseudo-issues — typed evidence, never projected issues.
+    ``complete`` states whether the bounded walk exhausted the provider's
+    pagination chain: ``False`` means the listing was bounded before GitHub
+    reported its end, so the observation is deliberately partial — the
+    application service must never infer closure, deletion, or complete
+    discovery from it, and unlisted issues are simply not synchronized by
+    this observation.
+    """
+
+    issues: tuple[GitHubIssueObservation, ...]
+    pull_request_entries_skipped: int
+    complete: bool
+
+
+def _parse_issue_object(
+    payload: object, *, owner_login: str, repository_name: str
 ) -> GitHubIssueObservation:
-    """Normalize one documented issue response, bound to the addressed subject.
+    """Normalize one documented issue object, bound to the addressed repository.
 
-    The response binds to the exact subject the adapter addressed: its
-    ``number`` must equal the addressed number and its ``repository_url``
-    must be the addressed repository's documented opaque API address on the
-    exact trusted GitHub API origin (case-insensitively, matching GitHub's
-    documented case-insensitive name handling; never decomposed into
-    owner/name parts — issue #122). A mismatch means the answer does not
-    bind to the addressed subject — for example a transfer racing the two
-    reconciliation reads — and classifies as an uninterpretable outcome
-    rather than a silently accepted fact.
+    Shared core of the single-issue read and the repository open-issue
+    listing entry (issue #375): the same documented fact set — identity,
+    number, title, nullable body, state, provider instants, the
+    ``pull_request`` discriminator, and the #375 presentation facts — with
+    the response's ``repository_url`` validated as the addressed
+    repository's documented opaque API address on the exact trusted GitHub
+    API origin (case-insensitively, matching GitHub's documented
+    case-insensitive name handling; never decomposed into owner/name parts —
+    issue #122). A mismatch means the answer does not bind to the addressed
+    repository and classifies as an uninterpretable outcome rather than a
+    silently accepted fact. The provider-supplied ``html_url`` is carried
+    verbatim as a navigation fact: never reconstructed and never authority.
     """
     if not isinstance(payload, dict):
         raise GitHubOutcomeUncertainError(
@@ -182,10 +320,6 @@ def parse_issue_payload(
         )
     reported_id = _require_positive_int(payload.get("id"), "the issue identity")
     reported_number = _require_positive_int(payload.get("number"), "the issue number")
-    if reported_number != issue_number:
-        raise GitHubOutcomeUncertainError(
-            "the GitHub response is not interpretable: it reports a different issue number"
-        )
     title = _require_non_empty_str(payload.get("title"), "the issue title")
     body_raw = payload.get("body")
     if body_raw is not None and not isinstance(body_raw, str):
@@ -198,6 +332,17 @@ def parse_issue_payload(
             "the GitHub response is not interpretable: the issue state is unexpected"
         )
     provider_updated_at = parse_instant(payload.get("updated_at"), "the issue update instant")
+    provider_created_at = parse_instant(payload.get("created_at"), "the issue creation instant")
+    closed_at_raw = payload.get("closed_at")
+    provider_closed_at = (
+        None if closed_at_raw is None else parse_instant(closed_at_raw, "the issue closure instant")
+    )
+    state_reason = _parse_nullable_str(payload.get("state_reason"), "the issue state reason")
+    html_url = _require_non_empty_str(payload.get("html_url"), "the issue URL")
+    user = _parse_user_ref_object(payload.get("user"))
+    labels = _parse_labels(payload.get("labels"))
+    assignees = _parse_user_refs(payload.get("assignees"), "the issue assignees")
+    milestone = _parse_milestone(payload.get("milestone"))
     repository_url = _require_non_empty_str(
         payload.get("repository_url"), "the issue repository reference"
     )
@@ -228,4 +373,66 @@ def parse_issue_payload(
         state=state,
         provider_updated_at=provider_updated_at,
         is_pull_request=is_pull_request,
+        state_reason=state_reason,
+        html_url=html_url,
+        provider_created_at=provider_created_at,
+        provider_closed_at=provider_closed_at,
+        user=user,
+        labels=labels,
+        assignees=assignees,
+        milestone=milestone,
     )
+
+
+def _parse_user_ref_object(value: object) -> GitHubIssueUserRef | None:
+    """Normalize the documented nullable issue ``user`` object (issue #375).
+
+    GitHub documents ``user`` as nullable — a deleted account reports a null
+    user — so ``None`` is a preserved provider fact on a fresh observation.
+    """
+    if value is None:
+        return None
+    return _parse_required_user_ref(value, "the issue user")
+
+
+def parse_issue_payload(
+    payload: object, *, owner_login: str, repository_name: str, issue_number: int
+) -> GitHubIssueObservation:
+    """Normalize one documented issue response, bound to the addressed subject.
+
+    The response binds to the exact subject the adapter addressed: its
+    ``number`` must equal the addressed number and its ``repository_url``
+    must be the addressed repository's documented opaque API address on the
+    exact trusted GitHub API origin (case-insensitively, matching GitHub's
+    documented case-insensitive name handling; never decomposed into
+    owner/name parts — issue #122). A mismatch means the answer does not
+    bind to the addressed subject — for example a transfer racing the two
+    reconciliation reads — and classifies as an uninterpretable outcome
+    rather than a silently accepted fact.
+    """
+    observation = _parse_issue_object(
+        payload, owner_login=owner_login, repository_name=repository_name
+    )
+    if observation.issue_number != issue_number:
+        raise GitHubOutcomeUncertainError(
+            "the GitHub response is not interpretable: it reports a different issue number"
+        )
+    return observation
+
+
+def parse_repository_issue_list_entry(
+    entry: object, *, owner_login: str, repository_name: str
+) -> GitHubIssueObservation:
+    """Normalize one documented repository-issue-listing entry (issue #375).
+
+    The documented ``GET /repos/{owner}/{repo}/issues`` listing answers full
+    issue objects carrying the same documented fact set as the single-issue
+    read, so the entry parser is exactly the shared issue-object parser:
+    every entry binds to the addressed repository through its own
+    ``repository_url`` and carries the same presentation facts. A
+    ``pull_request`` member is GitHub's own discriminator that the entry is
+    a pull request viewed through the issues endpoint — carried as a typed
+    fact so the application service can reject the pseudo-issue without
+    inventing any workflow meaning here.
+    """
+    return _parse_issue_object(entry, owner_login=owner_login, repository_name=repository_name)
