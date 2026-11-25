@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -141,6 +141,25 @@ def _record(
     )
 
 
+class _FrozenDatetime(datetime):
+    """The controlled test clock for the lease-aware status projection.
+
+    Production reads the wall clock through ``datetime.now(tz=UTC)`` when it
+    demotes an expired accepted/running record to ``unknown``. The status
+    tests freeze that exact seam to the fixture's ``_NOW`` instant, so lease
+    freshness is deterministic relative to the fixture timestamps instead of
+    rotting against the real calendar (the fresh record's lease is
+    ``_NOW + 10 minutes`` — always valid at the frozen clock, an expired
+    lease is authored as ``_NOW - 1 minute`` — always behind it).
+    """
+
+    frozen_at: ClassVar[datetime] = _NOW
+
+    @classmethod
+    def now(cls, tz: Any = None) -> datetime:
+        return cls.frozen_at
+
+
 @pytest.fixture
 def admission_harness(monkeypatch: pytest.MonkeyPatch):
     """Stub the authorization guards and script the atomic admission outcome.
@@ -206,6 +225,9 @@ def status_harness(monkeypatch: pytest.MonkeyPatch):
     The scripted connection stays scriptless: the status path must execute
     no SQL at all (the ownership guard is stubbed and no account-mutation
     barrier composes on a read), which the dedicated no-barrier test proves.
+    The lease-aware projection's clock seam is frozen to the fixture's
+    ``_NOW`` instant so the fresh/expired lease tests stay deterministic
+    instead of rotting against the real calendar.
     """
 
     class Harness:
@@ -226,6 +248,7 @@ def status_harness(monkeypatch: pytest.MonkeyPatch):
     harness.stored = _record()
     monkeypatch.setattr(github_refresh, "require_profile_workspace", harness.require_ws)
     monkeypatch.setattr(github_refresh, "get_github_refresh", harness.get)
+    monkeypatch.setattr(github_refresh, "datetime", _FrozenDatetime)
     return harness
 
 
@@ -414,7 +437,9 @@ def test_the_status_projection_is_verbatim_for_a_fresh_record(status_harness) ->
 def test_an_expired_running_record_projects_as_unknown(status_harness) -> None:
     status_harness.stored = _record(
         status=GitHubRefreshStatus.RUNNING,
-        lease=datetime.now(tz=UTC) - timedelta(minutes=1),
+        # Authored relative to the frozen fixture clock (_NOW): always one
+        # minute behind it, so the demotion is deterministic.
+        lease=_NOW - timedelta(minutes=1),
     )
 
     projection = github_refresh.get_workspace_github_refresh_for_owner(
