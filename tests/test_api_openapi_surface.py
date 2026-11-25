@@ -52,6 +52,10 @@ _TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
 _TASKS_PATH = "/api/v1/workspaces/{workspace_id}/tasks"
 _TASK_HISTORY_PATH = _TASK_PATH + "/history"
 _TASK_START_PATH = _TASK_PATH + "/start"
+_GATE_PATH = _TASK_PATH + "/owner-gates/{owner_gate_id}"
+_APPROVE_IMPL_PATH = _GATE_PATH + "/approve-implementation-authorization"
+_APPROVE_PR_PATH = _GATE_PATH + "/approve-pr-authorization"
+_APPROVE_MERGE_PATH = _GATE_PATH + "/approve-merge-decision"
 _WORKSPACE_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/events"
 _TASK_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/events"
 _REPOSITORY_TASKS_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
@@ -109,6 +113,9 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_TASK_PATH, "get"): "get_task",
     (_TASK_HISTORY_PATH, "get"): "get_task_history",
     (_TASK_START_PATH, "post"): "start_task",
+    (_APPROVE_IMPL_PATH, "post"): "approve_implementation_authorization",
+    (_APPROVE_PR_PATH, "post"): "approve_pr_authorization",
+    (_APPROVE_MERGE_PATH, "post"): "approve_merge_decision",
     (_WORKSPACE_EVENTS_PATH, "get"): "list_workspace_events",
     (_TASK_EVENTS_PATH, "get"): "list_task_events",
     (_TASK_PATH, "delete"): "purge_archived_task",
@@ -164,6 +171,9 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_TASK_PATH, "get"): "tasks",
     (_TASK_HISTORY_PATH, "get"): "tasks",
     (_TASK_START_PATH, "post"): "tasks",
+    (_APPROVE_IMPL_PATH, "post"): "tasks",
+    (_APPROVE_PR_PATH, "post"): "tasks",
+    (_APPROVE_MERGE_PATH, "post"): "tasks",
     (_WORKSPACE_EVENTS_PATH, "get"): "tasks",
     (_TASK_EVENTS_PATH, "get"): "tasks",
     (_TASK_PATH, "delete"): "tasks",
@@ -219,6 +229,9 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_TASK_PATH, "get"): {"401", "404", "503"},
     (_TASK_HISTORY_PATH, "get"): {"401", "404", "422", "503"},
     (_TASK_START_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_APPROVE_IMPL_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_APPROVE_PR_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_APPROVE_MERGE_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_TASK_PATH, "delete"): {"401", "404", "409", "503"},
     (_ACCOUNT_DELETION_PATH, "delete"): {"401", "409", "503"},
     (_ISSUES_PATH, "get"): {"401", "404", "422", "503"},
