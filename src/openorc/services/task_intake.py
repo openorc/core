@@ -55,6 +55,7 @@ from openorc.domain.tasks import Task, TaskStatus
 from openorc.observability import annotate_span, application_span
 from openorc.persistence.events import record_workflow_event
 from openorc.persistence.github_issue_relations import list_github_issue_blocked_by_edges
+from openorc.persistence.github_issues import find_github_issue_by_id
 from openorc.persistence.ownership import get_workspace
 from openorc.persistence.pool import DatabasePool
 from openorc.persistence.tasks import create_task, find_current_task_for_issue
@@ -77,6 +78,7 @@ __all__ = [
     "IssueBlockedEligibilityError",
     "RepositoryTaskIntake",
     "intake_repository_task",
+    "intake_repository_task_for_issue_projection_for_owner",
     "intake_repository_task_for_owner",
 ]
 
@@ -85,6 +87,9 @@ logger = logging.getLogger(__name__)
 _SERVICE_TRACER_SCOPE = "openorc.services.task_intake"
 _INTAKE_SPAN_NAME = "task_intake.intake_repository_task"
 _OWNER_INTAKE_SPAN_NAME = "task_intake.intake_repository_task_for_owner"
+_OWNER_INTAKE_PROJECTION_SPAN_NAME = (
+    "task_intake.intake_repository_task_for_issue_projection_for_owner"
+)
 
 _OPENORC_ACTOR = WorkflowActorContext(WorkflowEventActor.OPENORC, None)
 
@@ -341,6 +346,57 @@ def intake_repository_task_for_owner(
             workspace_id=workspace_id,
             repository_id=repository_id,
             issue_number=issue_number,
+        )
+
+
+def intake_repository_task_for_issue_projection_for_owner(
+    pool: DatabasePool,
+    github: GitHubAppClient,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    repository_id: UUID,
+    issue_id: UUID,
+) -> RepositoryTaskIntake:
+    """Intake a Task addressed by the exact issue projection UUID (issue #378).
+
+    The public issue-level ``create_task`` command's Owner boundary: the G2a
+    projection UUID is the only issue address, resolved strictly within the
+    authenticated Workspace and the addressed Repository — the same scoped
+    resolution the authorized issue reads compose — before delegating
+    unchanged to the authoritative :func:`intake_repository_task_for_owner`,
+    which independently revalidates the account barrier, the exact
+    Workspace/Repository ownership, and the full fresh GitHub eligibility at
+    the command boundary. An absent or foreign projection (another
+    Workspace, or another Repository of the same Workspace) is the uniform
+    not-found outcome, never a probing oracle, and no GitHub call or intake
+    write happens for an unresolvable address.
+    """
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(repository_id, "repository_id")
+    _require_uuid_command(issue_id, "issue_id")
+    with application_span(_SERVICE_TRACER_SCOPE, _OWNER_INTAKE_PROJECTION_SPAN_NAME) as span:
+        annotate_span(
+            span,
+            operation=_OWNER_INTAKE_PROJECTION_SPAN_NAME,
+            workspace_id=str(workspace_id),
+        )
+        require_workspace_repository(
+            pool, profile_id=profile_id, workspace_id=workspace_id, repository_id=repository_id
+        )
+        projection = find_github_issue_by_id(
+            pool, workspace_id=workspace_id, repository_id=repository_id, issue_id=issue_id
+        )
+        if projection is None:
+            raise NotFoundError("the requested github issue is not available in this repository")
+        return intake_repository_task_for_owner(
+            pool,
+            github,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            repository_id=repository_id,
+            issue_number=projection.issue_number,
         )
 
 

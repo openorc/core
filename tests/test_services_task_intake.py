@@ -45,6 +45,7 @@ from openorc.domain.github_issues import (
     GitHubIssueProjection,
     GitHubIssueState,
 )
+from openorc.domain.tasks import Task, TaskStatus
 from openorc.persistence.pool import DatabasePool
 from openorc.services import task_intake
 from openorc.services.errors import (
@@ -53,6 +54,7 @@ from openorc.services.errors import (
     InvalidCommandError,
     NotFoundError,
 )
+from openorc.services.task_intake import RepositoryTaskIntake
 from tests.fakes.task_rows import task_row
 
 _OBSERVED = datetime(2026, 9, 26, 12, 0, 0, tzinfo=UTC)
@@ -962,3 +964,152 @@ def test_unobserved_dependencies_never_establish_eligibility() -> None:
     # nothing is even read — the observation evidence is the first fact.
     assert eligible is False
     assert conn.executed == []
+
+
+# --- The issue-projection-UUID command boundary (issue #378) ----------------
+#
+# The public issue-level ``create_task`` command addresses the exact G2a
+# projection UUID. The wrapper's own contract is the composition: compose the
+# #52/#57 ownership gate FIRST, resolve the projection strictly through the
+# scope-checked read carrying exactly the authenticated Workspace and the
+# addressed Repository, refuse an unresolvable address uniformly before any
+# GitHub call, and delegate unchanged to the authoritative Owner intake with
+# the resolved issue number. The scope-checking WHERE clause of the read
+# itself, the ownership gate, and the full intake eligibility/concurrency
+# matrix are owned by the persistence, workspace-authorization, and existing
+# intake suites — never repeated here.
+
+
+class _ResolutionComposition:
+    """Recording stubs over the wrapper's focused collaborators."""
+
+    def __init__(self) -> None:
+        self.order: list[str] = []
+        self.gate_kwargs: list[dict[str, Any]] = []
+        self.resolution_kwargs: list[dict[str, Any]] = []
+        self.delegation_kwargs: list[dict[str, Any]] = []
+
+
+def _install_resolution_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    composition: _ResolutionComposition,
+    *,
+    resolution: GitHubIssueProjection | None,
+    intake_result: RepositoryTaskIntake,
+) -> None:
+    def fake_gate(pool: Any, **kwargs: Any) -> None:
+        composition.order.append("gate")
+        composition.gate_kwargs.append(kwargs)
+
+    def fake_scoped_read(pool: Any, **kwargs: Any) -> GitHubIssueProjection | None:
+        composition.order.append("resolution")
+        composition.resolution_kwargs.append(kwargs)
+        return resolution
+
+    def fake_delegation(pool: Any, github: Any, **kwargs: Any) -> RepositoryTaskIntake:
+        composition.order.append("delegation")
+        composition.delegation_kwargs.append(kwargs)
+        return intake_result
+
+    monkeypatch.setattr(task_intake, "require_workspace_repository", fake_gate)
+    monkeypatch.setattr(task_intake, "find_github_issue_by_id", fake_scoped_read)
+    monkeypatch.setattr(task_intake, "intake_repository_task_for_owner", fake_delegation)
+
+
+def _command_intake_result(*, status: TaskStatus) -> RepositoryTaskIntake:
+    """One authoritative intake outcome carrying the given returned status."""
+    return RepositoryTaskIntake(
+        task=Task(
+            id=_TASK_ID,
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            github_issue_id=_GITHUB_ISSUE_ID,
+            github_issue_number=_ISSUE_NUMBER,
+            status=status,
+            archived_at=None,
+            queued_at=None,
+            canonical_feature_branch=None,
+            state_token=_STATE_TOKEN,
+            current_plan_revision_id=None,
+            current_owner_gate_id=None,
+            source_requirements_fingerprint=None,
+            created_at=_OBSERVED,
+            updated_at=_OBSERVED,
+        ),
+        created=True,
+    )
+
+
+def test_the_projection_command_resolves_within_the_addressed_scope_and_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    composition = _ResolutionComposition()
+    intake_result = _command_intake_result(status=TaskStatus.READY_TO_PLAN)
+    _install_resolution_stubs(
+        monkeypatch, composition, resolution=_eligibility_projection(), intake_result=intake_result
+    )
+    issue_id = uuid.uuid4()
+
+    result = task_intake.intake_repository_task_for_issue_projection_for_owner(
+        _pool(ScriptedConnection()),
+        FakeGitHubAppClient(blocked_by=[]),  # never invoked: the delegation is stubbed
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        repository_id=_REPOSITORY_ID,
+        issue_id=issue_id,
+    )
+
+    # The authoritative intake outcome is propagated verbatim.
+    assert result is intake_result
+    # Composition order: the ownership gate FIRST, then the scoped
+    # resolution, then the authoritative delegation.
+    assert composition.order == ["gate", "resolution", "delegation"]
+    # The scoped read carries EXACTLY the authenticated Workspace and the
+    # addressed Repository — the resolution can never widen past them.
+    assert composition.resolution_kwargs == [
+        {
+            "workspace_id": _WORKSPACE_ID,
+            "repository_id": _REPOSITORY_ID,
+            "issue_id": issue_id,
+        }
+    ]
+    # The delegation addresses the resolved issue number under the same
+    # authenticated boundary — the full fresh eligibility stays the
+    # authoritative intake's own revalidation.
+    assert composition.delegation_kwargs == [
+        {
+            "profile_id": _OWNER_PROFILE_ID,
+            "workspace_id": _WORKSPACE_ID,
+            "repository_id": _REPOSITORY_ID,
+            "issue_number": _ISSUE_NUMBER,
+        }
+    ]
+
+
+def test_an_unresolvable_projection_address_refuses_before_any_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    composition = _ResolutionComposition()
+    intake_result = _command_intake_result(status=TaskStatus.READY_TO_PLAN)
+    github = FakeGitHubAppClient(blocked_by=[])
+    _install_resolution_stubs(
+        monkeypatch, composition, resolution=None, intake_result=intake_result
+    )
+
+    with pytest.raises(NotFoundError):
+        task_intake.intake_repository_task_for_issue_projection_for_owner(
+            _pool(ScriptedConnection()),
+            github,  # never invoked: nothing delegates
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            repository_id=_REPOSITORY_ID,
+            issue_id=uuid.uuid4(),
+        )
+
+    # The uniform not-found happens strictly after the ownership gate and
+    # the scoped read, and before any authoritative delegation — a foreign
+    # or absent projection is never a probing oracle, never reaches the
+    # intake critical path, and never triggers a GitHub call.
+    assert composition.order == ["gate", "resolution"]
+    assert composition.delegation_kwargs == []
+    assert github.calls == []

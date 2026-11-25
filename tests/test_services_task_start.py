@@ -691,6 +691,9 @@ def test_owner_start_only_queues_and_arranges_the_post_commit_wake() -> None:
     # Exactly one post-commit wake invitation for the started Task's
     # Workspace, arranged strictly after the arbitration transaction.
     assert wake.workspaces == [_WORKSPACE_ID]
+    # The invocation result carries the seam's ACTUAL delivery outcome
+    # (issue #378): the authoritative wake evidence the transports project.
+    assert outcome.queue_wake_outcome is TaskQueueWakeSubmissionOutcome.ACCEPTED_FOR_DELIVERY
 
     # Phase A: the account-operational barrier is the FIRST statement, and
     # the exact ownership reads follow before the subject load.
@@ -732,6 +735,59 @@ def test_owner_start_only_queues_and_arranges_the_post_commit_wake() -> None:
         "blocked_by",
         "resolve_related_endpoints",
     ]
+
+
+@pytest.mark.parametrize(
+    ("seam_result", "expected_outcome"),
+    [
+        (
+            TaskQueueWakeSubmissionOutcome.KNOWN_REFUSED,
+            TaskQueueWakeSubmissionOutcome.KNOWN_REFUSED,
+        ),
+        (TaskQueueWakeSubmissionOutcome.UNCERTAIN, TaskQueueWakeSubmissionOutcome.UNCERTAIN),
+        # A submission error is an unknown outcome — never a known
+        # non-delivery, never a replay (the shared seam's containment).
+        (RuntimeError("wake channel unavailable"), TaskQueueWakeSubmissionOutcome.UNCERTAIN),
+    ],
+)
+def test_owner_start_reports_the_actual_wake_delivery_outcome(
+    seam_result: TaskQueueWakeSubmissionOutcome | Exception,
+    expected_outcome: TaskQueueWakeSubmissionOutcome,
+) -> None:
+    conn = ScriptedConnection()
+    pool = FakePool(conn)
+    github = FakeGitHubAppClient(pool=pool)
+    wake = FakeQueueWake(seam_result)
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs(), queue_wake=wake)
+
+    # The committed queue entry stands regardless of the wake delivery, and
+    # the invocation result carries the seam's ACTUAL outcome (issue #378):
+    # the authoritative evidence transports project — never inferred from
+    # the Task status, never a duplicated submission.
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert outcome.task.queued_at is not None
+    assert outcome.queue_wake_outcome is expected_outcome
+    assert wake.workspaces == [_WORKSPACE_ID]
+
+
+def test_owner_start_with_an_unwired_wake_reports_none() -> None:
+    conn = ScriptedConnection()
+    pool = FakePool(conn)
+    github = FakeGitHubAppClient(pool=pool)
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+
+    # An unwired seam arranges nothing and reports the honest ``None`` —
+    # the committed queue entry is never conditioned on wake delivery, and
+    # the durable ``queued`` facts own recovery.
+    assert outcome.task.status is TaskStatus.QUEUED
+    assert outcome.task.queued_at is not None
+    assert outcome.queue_wake_outcome is None
 
 
 def test_owner_start_records_the_task_started_event_after_the_queue_write() -> None:
