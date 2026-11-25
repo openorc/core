@@ -539,7 +539,11 @@ class TestSafePublicProjection:
                 WorkflowEventType.OWNER_REVIEWER_DISCUSSION_MESSAGE,
                 {"direction": "owner_to_reviewer"},
             ),
-            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "stale_authority"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "authority_stale"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "runtime_pre_effect"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "observed_run_failure"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "malformed_run_result"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "failed_workspace_result"}),
             (WorkflowEventType.PLAN_REVIEWED, {"outcome": "accepted"}),
             (WorkflowEventType.PR_REVIEWED, {"outcome": "changes_requested"}),
             (WorkflowEventType.MERGE_REQUESTED, {"owner_gate_id": str(uuid.uuid4())}),
@@ -572,18 +576,46 @@ class TestSafePublicProjection:
             # A non-finite decimal string under a money-shaped key.
             (WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED, {"previous": "NaN"}),
             (WorkflowEventType.OWNER_GATE_RESOLVED, {"cost_observed_usd": "Infinity"}),
-            # Free-form/error-shaped content under the bounded-token key.
-            (
-                WorkflowEventType.EXECUTION_FAILED,
-                {"failure_kind": "x" * (event_reads._SAFE_TOKEN_MAX_LENGTH + 1)},
-            ),
+            # Short, printable, but UNSUPPORTED values under the closed
+            # failure-kind vocabulary: not one of the established
+            # classification tokens, so a short credential-like string, an
+            # exception message, or prompt/transcript prose can never pass.
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "boom"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "credential=hunter2"}),
+            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "prompt text"}),
             (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "stack trace:\nboom"}),
-            (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": "  padded  "}),
             (WorkflowEventType.EXECUTION_FAILED, {"failure_kind": 7}),
         ]
         for event_type, context in unsafe:
             event = _domain_event(event_type=event_type, context=context)
             assert event_reads.project_public_context(event) == {}
+
+    def test_the_failure_kind_projection_matches_the_producer_vocabulary(self) -> None:
+        """The closed public failure-kind set is exactly the producer set.
+
+        The projection omits unsupported values fail-closed; this alignment
+        assertion keeps the read vocabulary honest when a producer adds a
+        classification token (a new token must be extended here deliberately,
+        never leaked through, never silently missing from public reads).
+        """
+        from openorc.services.task_authorized_implementation_execution import (
+            _AUTHORITY_STALE_FAILURE_KIND,
+            _RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            OBSERVED_RUN_FAILURE_KIND,
+        )
+        from openorc.services.task_detached_turn_correlation import (
+            _FAILED_WORKSPACE_RESULT_FAILURE_KIND,
+            _MALFORMED_RUN_RESULT_FAILURE_KIND,
+        )
+
+        producer_tokens = {
+            OBSERVED_RUN_FAILURE_KIND,
+            _AUTHORITY_STALE_FAILURE_KIND,
+            _RUNTIME_PRE_EFFECT_FAILURE_KIND,
+            _MALFORMED_RUN_RESULT_FAILURE_KIND,
+            _FAILED_WORKSPACE_RESULT_FAILURE_KIND,
+        }
+        assert producer_tokens == event_reads._FAILURE_KIND_TOKENS
 
     def test_an_event_type_with_no_context_projects_the_empty_object(self) -> None:
         # The lifecycle facts (task_created, task_started, planning_started,

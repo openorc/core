@@ -98,10 +98,6 @@ _WORKSPACE_SCOPE_KEY: Final[str] = "w"
 _TASK_SCOPE_KEY: Final[str] = "t"
 _EVENT_CURSOR_PREFIX: Final[str] = "e"
 
-# The bounded, printable classification-token shape (e.g. ``failure_kind``):
-# a stable content-safe token, never free-form error content.
-_SAFE_TOKEN_MAX_LENGTH = 128
-
 
 @dataclass(frozen=True, slots=True)
 class EventPageFilters:
@@ -292,17 +288,28 @@ def _safe_config_value(value: object) -> object:
     return _safe_decimal_text(value)
 
 
-def _safe_token(value: object) -> object:
-    """Accept only a bounded, printable, non-blank classification token."""
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > _SAFE_TOKEN_MAX_LENGTH
-        or value.strip() != value
-        or not value.isprintable()
-    ):
-        return _OMIT
-    return value
+_FAILURE_KIND_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        # The locked, content-safe classification tokens the existing
+        # producers pass to ``record_execution_failed_event``:
+        # ``authority_stale``/``runtime_pre_effect``/
+        # ``observed_run_failure`` (task_authorized_implementation_execution,
+        # task_pr_remediation, task_runtime_send_claims,
+        # task_workflow_operation_coordinator) and
+        # ``malformed_run_result``/``failed_workspace_result``
+        # (task_detached_turn_correlation). A failure kind is one of these
+        # stable classification tokens and nothing else: a short
+        # credential-like string, an exception message, prompt or transcript
+        # prose, or any other unsupported value is omitted fail-closed from
+        # the public projection. A new producer token extends this set
+        # deliberately (its alignment is asserted by the read tests).
+        "authority_stale",
+        "runtime_pre_effect",
+        "observed_run_failure",
+        "malformed_run_result",
+        "failed_workspace_result",
+    }
+)
 
 
 _SETTING_TOKENS: Final[frozenset[str]] = frozenset(
@@ -347,7 +354,7 @@ _SAFE_CONTEXT_SHAPES: Final[dict[WorkflowEventType, dict[str, Callable[[object],
         "direction": _safe_vocabulary(_DIRECTION_VALUES),
     },
     WorkflowEventType.EXECUTION_FAILED: {
-        "failure_kind": _safe_token,
+        "failure_kind": _safe_vocabulary(_FAILURE_KIND_TOKENS),
     },
     WorkflowEventType.PLAN_REVIEWED: {
         "outcome": _safe_vocabulary(_REVIEW_OUTCOMES),

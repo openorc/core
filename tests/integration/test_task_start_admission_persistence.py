@@ -6,8 +6,9 @@ Task-start invariants directly against a real Postgres: the DB-clock
 queue-entry timestamp and its iff-QUEUED CHECK, the ``(queued_at, id)`` FIFO
 order, the Owner start's atomic claim (both role reservations + planning +
 one planning_started event) with its same-transaction Owner-attributed
-``task_started`` audit fact (issue #377) and the rollback coupling of that
-pair, the bounded sweep's FIFO advancement, no
+``task_started`` audit fact (issue #377) and the required
+event-insertion-failure rollback proof for that pair, the bounded sweep's
+FIFO advancement, no
 overtaking of a feasible older waiter, no oversubscription, duplicate-free
 concurrent sweeps, the durable-projection eligibility guard, the structural
 configuration outcome, replay idempotence, and the capacity-release
@@ -35,11 +36,12 @@ import threading
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
 from psycopg import Connection, connect
-from psycopg.errors import CheckViolation, LockNotAvailable, QueryCanceled
+from psycopg.errors import CheckViolation, ForeignKeyViolation, LockNotAvailable, QueryCanceled
 
 from openorc.adapters.github import (
     GitHubIssueObservation,
@@ -51,6 +53,7 @@ from openorc.domain.github_issues import github_issue_requirements_fingerprint
 from openorc.domain.tasks import TaskStatus
 from openorc.persistence import tasks as task_records
 from openorc.persistence.pool import DatabasePool
+from openorc.services import event_coordination
 from openorc.services.session_admission import AdmissionStatus, admit_task_agent_sessions
 from openorc.services.session_runtime import end_task_agent_session
 from openorc.services.task_start import (
@@ -60,6 +63,7 @@ from openorc.services.task_start import (
     reevaluate_queued_tasks,
     start_task_for_owner,
 )
+from openorc.services.transaction_composition import composed_transaction
 
 pytestmark = pytest.mark.integration
 
@@ -230,6 +234,46 @@ def _insert_profile(conn: Connection[Any]) -> uuid.UUID:
     conn.execute("insert into auth.users (id) values (%s)", (profile_id,))
     conn.execute("insert into openorc.profiles (id) values (%s)", (profile_id,))
     return profile_id
+
+
+def _foreign_task_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID]:
+    """One minimal foreign ownership chain for scope-violation seeds.
+
+    Profile -> Workspace -> Project -> Repository with distinct stable
+    identity (a different external GitHub repository), so a Task inserted
+    under this chain belongs to a different Workspace than the tested one.
+    Returns (workspace_id, repository_id).
+    """
+    profile_id = _insert_profile(conn)
+    workspace_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.workspaces (id, owner_profile_id, name) values (%s, %s, %s)",
+        (workspace_id, profile_id, "foreign workspace"),
+    )
+    project_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.projects (id, workspace_id, name) values (%s, %s, %s)",
+        (project_id, workspace_id, "foreign project"),
+    )
+    repository_id = uuid.uuid4()
+    conn.execute(
+        "insert into openorc.repositories "
+        "(id, project_id, workspace_id, github_repository_id, owner_login, name, "
+        "html_url, is_private, default_branch) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            repository_id,
+            project_id,
+            workspace_id,
+            60_000_002,
+            "octocat",
+            "other-repo",
+            "https://github.com/octocat/other-repo",
+            False,
+            "main",
+        ),
+    )
+    return workspace_id, repository_id
 
 
 def _ownership_chain(conn: Connection[Any]) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -591,58 +635,80 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
     assert _started_event_count(conn, task_id) == 1
 
 
-def test_the_task_started_event_commits_and_rolls_back_with_the_queue_write(
+def test_the_task_started_insertion_failure_rolls_back_the_queue_write(
     conn: Connection[Any],
 ) -> None:
-    """The audit fact shares the start transaction's fate (issue #377).
+    """The required atomicity proof (issue #377, the #56 failure pattern).
 
-    The guarded queued write and its Owner-attributed ``task_started`` fact
-    commit as one transaction: rolling back the enclosing savepoint that
-    carried the start removes both effects together — neither the queue
-    entry nor the audit fact survives alone. (The event-insert-failure
-    rollback direction is the established #56 coordination contract proven
-    by its own integration suite; this is this emission's coupling proof.)
+    The exact transaction pairing the successful Start composes — the
+    guarded QUEUED write (fresh fingerprint and then-current budget frozen
+    by the same statement) plus its Owner-attributed ``task_started``
+    emission through the same coordination helper — with the event insertion
+    made to fail against real rows: a scope-violating
+    ``(task_id, workspace_id)`` pair rejects the event at statement time and
+    the whole composition rolls back together. The Task stays
+    ``ready_to_plan`` with its queue timestamp and frozen baseline/budget
+    unset, and no ``task_started`` event survives. The command-level wiring
+    (that Start performs exactly this pairing) is proven by the unit suite.
     """
-
-    class _StartRollbackProbe(Exception):
-        """Deliberately rolls the carrying savepoint back (psycopg 3 idiom)."""
-
     owner, workspace_id, repository_id = _ownership_chain(conn)
     task_id, state_token = _insert_task(
         conn, workspace_id=workspace_id, repository_id=repository_id
     )
-    connection_id = _insert_connection(conn, workspace_id=workspace_id, session_capacity=2)
-    _set_role_bindings(conn, workspace_id=workspace_id, connection_id=connection_id)
+    # A Task of a DIFFERENT Workspace: the (task_id, workspace_id) scope
+    # agreement composite foreign key rejects the paired event insert at
+    # statement time (the #56 transaction-failure pattern).
+    foreign_workspace_id, foreign_repository_id = _foreign_task_chain(conn)
+    foreign_task_id, _ = _insert_task(
+        conn,
+        workspace_id=foreign_workspace_id,
+        repository_id=foreign_repository_id,
+        github_issue_id=400000,
+        github_issue_number=400,
+    )
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
-    with pytest.raises(_StartRollbackProbe), conn.transaction():
-        outcome = start_task_for_owner(
-            pool,
-            _ScriptedGitHub(),
-            profile_id=owner,
-            workspace_id=workspace_id,
-            task_id=task_id,
+    with pytest.raises(ForeignKeyViolation), composed_transaction(pool) as transaction_pool:
+        queued = task_records.update_task_status(
+            transaction_pool,
+            task_id,
             expected_state_token=state_token,
+            status=TaskStatus.QUEUED,
+            # The exact guarded write the successful Start performs (issues
+            # #233/#240): the fresh fingerprint and the then-current budget
+            # freeze in the SAME statement as the queue entry.
+            capture_source_requirements_fingerprint=_FINGERPRINT,
+            capture_authorized_task_budget_usd=Decimal("25.00"),
         )
-        assert outcome.task.status is TaskStatus.QUEUED
-        # Both effects are visible inside the same enclosing transaction.
-        assert _started_event_count(conn, task_id) == 1
-        queued = conn.execute(
-            "select status from openorc.tasks where id = %s",
-            (task_id,),
-        ).fetchone()
-        assert queued is not None and queued[0] == "queued"
-        raise _StartRollbackProbe()
+        assert queued is not None
+        assert queued.status is TaskStatus.QUEUED
+        # The Owner Start audit fact as the Start composition emits it, with
+        # the scope-violating task pair making the INSERT fail.
+        event_coordination.record_task_started_event(
+            transaction_pool,
+            workspace_id=workspace_id,
+            task_id=foreign_task_id,
+            actor=event_coordination.owner_actor(owner),
+        )
 
-    # The rolled-back start left neither effect.
+    # Neither side of the composition survived: the Task keeps its pre-Start
+    # state — no queue entry, no frozen baseline or budget, no rotated token,
+    # and no task_started event.
     row = conn.execute(
-        "select status, queued_at from openorc.tasks where id = %s",
+        "select status, queued_at, source_requirements_fingerprint, "
+        "authorized_task_budget_usd, state_token "
+        "from openorc.tasks where id = %s",
         (task_id,),
     ).fetchone()
     assert row is not None
     assert row[0] == "ready_to_plan"
     assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
+    assert row[4] == state_token
     assert _started_event_count(conn, task_id) == 0
+    # The per-test transaction stayed valid after the savepoint rollback.
+    conn.execute("select 1")
 
 
 def test_structurally_infeasible_start_is_an_error_without_a_queue_write(
