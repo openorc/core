@@ -31,6 +31,7 @@ No live runtime or Postgres access.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -51,8 +52,12 @@ from openorc.persistence import executions as execution_records
 from openorc.persistence import intents as intent_records
 from openorc.persistence import reviews as review_records
 from openorc.persistence.pool import DatabasePool
+from openorc.services import cline_attachment
+from openorc.services.cline_attachment import OwnerAbortInterruptDispatcher
 from openorc.services.errors import (
     ConflictError,
+    ExternalOperationFailedError,
+    ExternalOperationUncertainError,
     InvalidCommandError,
     StaleOperationError,
 )
@@ -1361,3 +1366,137 @@ def test_owner_abort_rejects_a_malformed_dispatch_seam_before_any_state() -> Non
         )
 
     assert conn.executed == []
+
+
+class _ScriptedAttachment:
+    """The patched per-target runtime attachment boundary of the real seam."""
+
+    def __init__(self, outcomes: tuple[Any, ...]) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._outcomes = list(outcomes)
+
+    def __call__(
+        self,
+        pool: Any,
+        *,
+        workspace_id: Any,
+        task_id: Any,
+        role: WorkflowRole,
+        phase: Any,
+        external_session_id: str,
+    ) -> Any:
+        self.calls.append((role.value, external_session_id))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+
+        @contextmanager
+        def lease() -> Any:
+            yield SimpleNamespace(adapter=outcome)
+
+        return lease()
+
+
+def test_owner_abort_records_a_first_target_attachment_failure_and_still_dispatches_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The required representative case, exercising the actual new
+    # attachment-dispatch seam: expected attachment-stage failures are
+    # handled within the per-target dispatch boundary — the definitive
+    # non-delivery is recorded on the durable intent (never implying
+    # settlement) and the remaining registered target is still dispatched,
+    # so no authorized target is silently skipped after the blocking
+    # composition committed.
+    loop, iterations_by_loop = _open_loop_with_unfinalized_iteration()
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="reviewing", session=_ready_session_row())
+    conn.on(_SESSION_READ, _reviewer_session_row())
+    _wire_activity(
+        monkeypatch,
+        executions=[_open_execution()],
+        loops=[loop],
+        iterations_by_loop=iterations_by_loop,
+    )
+    conn.on(_INTENTS_LIST, [])
+    _script_block_composition(conn, status="reviewing")
+    conn.on(_INTENT_INSERT, _intent_row())
+    conn.on(
+        _INTENT_INSERT,
+        _intent_row(role="reviewer", external_id=_REVIEWER_EXTERNAL_SESSION_ID),
+    )
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="failed", outcome={"dispatch": "attachment_failed"}),
+    )
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="unsettled", outcome={"dispatch": "acknowledged"}),
+    )
+    adapter = _FakeClineAdapter()
+    attachment = _ScriptedAttachment((ExternalOperationFailedError("runtime unavailable"), adapter))
+    monkeypatch.setattr(cline_attachment, "attach_cline_runtime", attachment)
+    dispatcher = OwnerAbortInterruptDispatcher(_pool(conn))
+
+    outcome = _owner_dispatch_call(_pool(conn), dispatcher)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    assert attachment.calls == [
+        ("producer", _EXTERNAL_SESSION_ID),
+        ("reviewer", _REVIEWER_EXTERNAL_SESSION_ID),
+    ]
+    # The failed attachment is the durable non-delivery ``failed`` — never
+    # settlement — and the second target was still dispatched.
+    assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.FAILED
+    assert outcome.interrupt_outcomes[0].detail == "failed"
+    assert outcome.interrupt_outcomes[1].status is TaskInterruptIntentStatus.UNSETTLED
+    assert outcome.interrupt_outcomes[1].detail == "acknowledged"
+    assert adapter.abort_calls == [_REVIEWER_EXTERNAL_SESSION_ID]
+
+
+def test_owner_abort_preserves_uncertainty_for_an_uncertain_attachment_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An uncertain attachment outcome leaves the runtime state unconfirmable:
+    # the truthful durable classification is ``unknown`` — never a known
+    # failure, never settlement, never blindly replayed — and the remaining
+    # registered target is still dispatched.
+    loop, iterations_by_loop = _open_loop_with_unfinalized_iteration()
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="reviewing", session=_ready_session_row())
+    conn.on(_SESSION_READ, _reviewer_session_row())
+    _wire_activity(
+        monkeypatch,
+        executions=[_open_execution()],
+        loops=[loop],
+        iterations_by_loop=iterations_by_loop,
+    )
+    conn.on(_INTENTS_LIST, [])
+    _script_block_composition(conn, status="reviewing")
+    conn.on(_INTENT_INSERT, _intent_row())
+    conn.on(
+        _INTENT_INSERT,
+        _intent_row(role="reviewer", external_id=_REVIEWER_EXTERNAL_SESSION_ID),
+    )
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="unknown", outcome={"dispatch": "attachment_uncertain"}),
+    )
+    conn.on(
+        _INTENT_UPDATE,
+        _intent_row(status="unsettled", outcome={"dispatch": "acknowledged"}),
+    )
+    adapter = _FakeClineAdapter()
+    attachment = _ScriptedAttachment(
+        (ExternalOperationUncertainError("connect outcome uncertain"), adapter)
+    )
+    monkeypatch.setattr(cline_attachment, "attach_cline_runtime", attachment)
+    dispatcher = OwnerAbortInterruptDispatcher(_pool(conn))
+
+    outcome = _owner_dispatch_call(_pool(conn), dispatcher)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.UNKNOWN
+    assert outcome.interrupt_outcomes[0].detail == "uncertain"
+    assert outcome.interrupt_outcomes[1].status is TaskInterruptIntentStatus.UNSETTLED
+    assert outcome.interrupt_outcomes[1].detail == "acknowledged"
+    assert adapter.abort_calls == [_REVIEWER_EXTERNAL_SESSION_ID]

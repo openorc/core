@@ -164,6 +164,7 @@ __all__ = [
     "abort_task_activity_for_owner",
     "apply_owner_authorized_cost_limit_block",
     "dispatch_registered_task_interrupt",
+    "record_interrupt_dispatch_attachment_failure",
     "establish_owner_authorized_cost_limit_block",
     "find_annotated_task_interrupt_observation",
     "settle_annotated_task_interrupt",
@@ -1002,6 +1003,50 @@ def _interrupt_outcome(
         workflow_role=intent.workflow_role,
         status=status,
         detail=detail,
+    )
+
+
+def record_interrupt_dispatch_attachment_failure(
+    pool: DatabasePool,
+    *,
+    intent: TaskInterruptIntent,
+    uncertain: bool,
+) -> TaskInterruptOutcome:
+    """Record one attachment-stage dispatch failure's truthful classification.
+
+    The composition-rooted per-target dispatch seam (issue #380) invokes this
+    when the exact admitted binding's runtime attachment failed before the
+    shared E10b dispatch machinery could run: a definitive attachment failure
+    records ``failed`` — the Interrupt was provably never submitted through
+    this dispatch — while an uncertain attachment outcome records ``unknown``
+    (never blindly replayed), preserving the truth that the runtime state is
+    unconfirmable. Neither classification ever implies settlement: the
+    one-shot conditional write applies only while the intent is still
+    unsettled, so a raced terminal outcome is left untouched — the durable
+    record the flow already holds is the truth.
+    """
+    if uncertain:
+        recorded = intent_records.record_task_interrupt_intent_outcome(
+            pool,
+            task_interrupt_intent_id=intent.id,
+            status=TaskInterruptIntentStatus.UNKNOWN,
+            outcome={"dispatch": "attachment_uncertain"},
+        )
+        return _interrupt_outcome(
+            intent,
+            status=recorded.status if recorded is not None else intent.status,
+            detail="uncertain",
+        )
+    recorded = intent_records.record_task_interrupt_intent_outcome(
+        pool,
+        task_interrupt_intent_id=intent.id,
+        status=TaskInterruptIntentStatus.FAILED,
+        outcome={"dispatch": "attachment_failed"},
+    )
+    return _interrupt_outcome(
+        intent,
+        status=recorded.status if recorded is not None else intent.status,
+        detail="failed",
     )
 
 
