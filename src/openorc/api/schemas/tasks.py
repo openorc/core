@@ -14,10 +14,14 @@ application services' authoritative post-write snapshots — never a
 re-derived current-state projection and never a command-status ledger —
 the ordinary OwnerGate decision command models (issue #379): the
 approve command body for the three ordinary decision gates and their
-classified outcome envelopes, and the Task-level Owner Abort and shared
+classified outcome envelopes, the Task-level Owner Abort and shared
 Cancel Task command models (issue #380): the state_token-only command
 bodies and their classified outcome envelopes with the committed
-post-write snapshots and the separately-typed per-target dispatch facts.
+post-write snapshots and the separately-typed per-target dispatch facts,
+and the exceptional gate action command models (issue #381): the
+gate-scoped Ignore, Continue, and Resume command body and their outcome
+envelopes with the committed post-write snapshots and the separately-typed
+one-shot continuation delivery evidence.
 """
 
 from __future__ import annotations
@@ -69,10 +73,15 @@ __all__ = [
     "ImplementationAuthorizationApprovalRead",
     "MergeDecisionOutcomeRead",
     "MergeRetryAttemptRead",
+    "OwnerGateActionCommand",
+    "OwnerGateContinueRead",
     "OwnerGateDecisionCommand",
     "OwnerGateDecisionSnapshotRead",
+    "OwnerGateIgnoreRead",
     "OwnerGateResolutionRead",
+    "OwnerGateResumeRead",
     "PrAuthorizationApprovalRead",
+    "PresentedApprovalGateRead",
     "ReviewerConversationMessageRead",
     "ReviewerConversationRead",
     "TaskAbortCommand",
@@ -1142,3 +1151,115 @@ class TaskCancellationOutcomeRead(BaseModel):
     closed_loops: list[TaskClosedReviewLoopRead]
     pull_request: GitHubTaskPullRequestRead | None
     close_intent: TaskCloseIntentRead | None
+
+
+class OwnerGateActionCommand(BaseModel):
+    """The exceptional gate action command body (issue #381).
+
+    The same single-input contract as the Start, decision, Abort, and Cancel
+    commands: the opaque ``state_token`` is the optimistic-concurrency token
+    the guarded action is conditional on — a token that no longer matches the
+    current Task is the typed stale outcome, never a second logical action.
+    The addressed Task, its exact current gate, and the caller's authenticated
+    Profile carry everything else; a projected ``ignore``, ``continue``, or
+    ``resume`` action never grants authority by itself — every command
+    independently revalidates the Profile, the current Task token, the exact
+    current gate, and the applicable subject at the service boundary.
+    """
+
+    state_token: UUID
+
+
+class PresentedApprovalGateRead(BaseModel):
+    """The interrupted approval boundary's re-presented gate (issue #381).
+
+    ``owner_gate`` is the existing ordinary approval gate a successful Ignore
+    re-presents in the same commit — the durable handoff the Owner addresses
+    next — together with the boundary's exact bound subject facts: the bound
+    PlanRevision for the implementation-authorization boundary, or the
+    verified canonical branch and the GitHub-observed head SHA for the
+    PR-authorization boundary.
+    """
+
+    owner_gate: OwnerGateResolutionRead
+    plan_revision_id: UUID | None
+    canonical_branch: str | None
+    verified_head_sha: str | None
+
+
+class OwnerGateIgnoreRead(BaseModel):
+    """The committed outcome of one Owner Ignore command (issue #381).
+
+    Maps the G2b gate-scoped ``ignore`` action (a pending
+    ``GITHUB_ISSUE_CHANGE`` gate) to the ONE Owner Ignore service. ``task``
+    is the authoritative post-presentation snapshot (the Task restored to the
+    interrupted boundary's approval gate under a rotated token),
+    ``owner_gate`` the exceptional gate resolved APPROVED with truthful OWNER
+    provenance, ``task_block`` the resolved blocking condition whose
+    fingerprint evidence stays retained untouched, ``boundary`` the
+    interrupted approval boundary the Ignore resumed, and
+    ``acknowledged_fingerprint`` the exact observed fingerprint the Task
+    baseline was overwritten with. ``presented`` documents the re-presented
+    approval gate committed in the same transaction. The service's fresh
+    GitHub exactness, boundary safety, and all-or-nothing rollback are its
+    own: a refusal or failure applies nothing and leaves the Task blocked at
+    the pending gate, and HTTP success certifies only these committed facts.
+    """
+
+    task: OwnerGateDecisionSnapshotRead
+    owner_gate: OwnerGateResolutionRead
+    task_block: OpenOrcTaskBlockSummaryRead
+    boundary: StrictStr
+    acknowledged_fingerprint: StrictStr
+    presented: PresentedApprovalGateRead
+
+
+class OwnerGateContinueRead(BaseModel):
+    """The committed outcome of one Owner Continue command (issue #381).
+
+    Maps the G2b gate-scoped ``continue`` action (a pending ``COST_LIMIT``
+    gate) to the ONE Owner Continue service. ``task`` is the authoritative
+    post-write snapshot (the guarded pre-block status restored under a
+    rotated token carrying the refreshed allowance),
+    ``effective_cost_threshold_usd`` the committed refreshed cumulative
+    spending threshold (latest retained known spend plus the frozen original
+    budget) as canonical decimal text, ``owner_gate`` the exceptional gate
+    resolved APPROVED with truthful OWNER provenance, and ``task_block`` the
+    resolved blocking condition. ``continuation_outcome`` is the
+    separately-typed post-commit one-shot session-resume submission evidence
+    — ``accepted_for_delivery``, ``known_refused``, or ``uncertain`` — a
+    refused or uncertain submission never fails or reverses the committed
+    authorization, and the continuation's later outcome and operation
+    settlement are new episodes observed through the G2b reads, never a
+    result of HTTP success.
+    """
+
+    task: OwnerGateDecisionSnapshotRead
+    owner_gate: OwnerGateResolutionRead
+    task_block: OpenOrcTaskBlockSummaryRead
+    effective_cost_threshold_usd: StrictStr
+    continuation_outcome: StrictStr
+
+
+class OwnerGateResumeRead(BaseModel):
+    """The committed outcome of one Owner Resume command (issue #381).
+
+    Maps the G2b gate-scoped ``resume`` action (a pending ``OWNER_ABORT``
+    gate) to the ONE Owner Resume service. ``task`` is the authoritative
+    post-write snapshot (the guarded pre-abort status restored under a
+    rotated token), ``owner_gate`` the exceptional gate resolved APPROVED
+    with truthful OWNER provenance, and ``task_block`` the resolved blocking
+    condition whose evidence stays retained untouched.
+    ``continuation_outcome`` is the separately-typed post-commit one-shot
+    session-resume submission evidence — ``accepted_for_delivery``,
+    ``known_refused``, or ``uncertain`` — a refused or uncertain submission
+    never fails or reverses the committed authorization, and the original
+    gate and block remain resolved history whatever later happens to the
+    runtime continuation: a failed Resume is a NEW operational episode
+    observed through the G2b reads, never a reopen.
+    """
+
+    task: OwnerGateDecisionSnapshotRead
+    owner_gate: OwnerGateResolutionRead
+    task_block: OpenOrcTaskBlockSummaryRead
+    continuation_outcome: StrictStr

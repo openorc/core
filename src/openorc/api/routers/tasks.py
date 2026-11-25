@@ -48,6 +48,25 @@ per-target dispatch/close-obligation facts verbatim — committed
 terminalization never implies archived or capacity-released status, an
 acknowledged Interrupt is never settlement, and no event is ever emitted
 from HTTP.
+
+The exceptional gate action commands (G3d, issue #381) are three synchronous
+sync-handler delegations with the same state_token-only body, each mapping
+exactly one G2b gate-scoped action token to its ONE dedicated service: the
+gate-scoped ``ignore`` action (a pending ``GITHUB_ISSUE_CHANGE`` gate) to
+``task_source_change_ignore`` with the GitHub App boundary composed per
+request, the gate-scoped ``continue`` action (a pending ``COST_LIMIT`` gate)
+to ``task_owner_cost_continue``, and the gate-scoped ``resume`` action (a
+pending ``OWNER_ABORT`` gate) to ``task_owner_resume``. The committed
+Continue and Resume authorizations arrange the ONE shared post-commit
+one-shot original-session continuation submission through the process's
+operation-invocation seam with separately-typed delivery evidence; a refused
+or uncertain submission never fails the committed authorization, and the
+continuation's later outcome and operation settlement are new episodes the
+G2b reads own — HTTP success never implies a model result, and the settled
+gate and block are never reopened. Every exceptional-gate ``cancel_task``
+offering reuses the single shared Cancel command (issue #380), and status
+and diagnostics stay on the existing G2b Task/pending-interaction reads —
+no gate-scoped cancellation or diagnostics routes exist.
 """
 
 from __future__ import annotations
@@ -80,10 +99,15 @@ from openorc.api.schemas.tasks import (
     MergeRetryAttemptRead,
     OpenOrcTaskBlockSummaryRead,
     OpenOrcTaskTerminalizationRead,
+    OwnerGateActionCommand,
+    OwnerGateContinueRead,
     OwnerGateDecisionCommand,
     OwnerGateDecisionSnapshotRead,
+    OwnerGateIgnoreRead,
     OwnerGateResolutionRead,
+    OwnerGateResumeRead,
     PrAuthorizationApprovalRead,
+    PresentedApprovalGateRead,
     ReviewerConversationMessageRead,
     ReviewerConversationRead,
     TaskAbortCommand,
@@ -107,7 +131,10 @@ from openorc.services import (
     task_cancellation,
     task_implementation_authorization,
     task_merge_lifecycle,
+    task_owner_cost_continue,
+    task_owner_resume,
     task_pr_authorization,
+    task_source_change_ignore,
 )
 from openorc.services.cline_attachment import OwnerAbortInterruptDispatcher
 from openorc.services.errors import (
@@ -115,16 +142,19 @@ from openorc.services.errors import (
     ExternalOperationUncertainError,
     NotFoundError,
 )
+from openorc.services.task_implementation_authorization import ImplementationGateOpened
 from openorc.services.task_owner_reviewer_discussion import (
     get_owner_gate_discussion_status,
     prepare_owner_reviewer_discussion,
     release_prepared_discussion_receipt,
 )
+from openorc.services.task_pr_authorization import PrAuthorizationGateOpened
 from openorc.services.task_reads import terminalization_facts
 from openorc.services.task_reviewer_conversation_projection import (
     build_cline_reviewer_conversation_factory,
     project_task_reviewer_conversation,
 )
+from openorc.services.task_source_change_ignore import IgnoredSourceChange
 from openorc.workers.invocation import (
     OperationDependencies,
     OperationInvocation,
@@ -141,6 +171,7 @@ from openorc.workers.task_workflow import (
     default_reviewer_neutral_directory_provider,
     submit_authorized_implementation_after_approval,
     submit_pr_composition_after_approval,
+    submit_task_session_resume_after_authorization,
 )
 
 router = APIRouter(tags=["tasks"])
@@ -793,4 +824,195 @@ def cancel_task(
                 status=outcome.close_intent.status.value,
             )
         ),
+    )
+
+
+# --- The exceptional OwnerGate action commands (G3d, issue #381) ----------------
+
+
+def _presented_approval_gate_to_wire(outcome: IgnoredSourceChange) -> PresentedApprovalGateRead:
+    """Map the interrupted boundary's re-presented approval gate onto the wire.
+
+    Verbatim identity/type/status for the re-presented gate plus the
+    boundary's exact bound subject: the bound PlanRevision for the
+    implementation-authorization boundary, or the verified canonical branch
+    and the GitHub-observed head SHA for the PR-authorization boundary. No
+    action menu is projected here — menus stay the G2b read surface's
+    current-context projection, never a command re-derivation.
+    """
+    presented: ImplementationGateOpened | PrAuthorizationGateOpened = outcome.presented
+    if isinstance(presented, PrAuthorizationGateOpened):
+        return PresentedApprovalGateRead(
+            owner_gate=_gate_resolution_to_wire(presented.owner_gate),
+            plan_revision_id=None,
+            canonical_branch=presented.canonical_branch,
+            verified_head_sha=presented.verified_head_sha,
+        )
+    return PresentedApprovalGateRead(
+        owner_gate=_gate_resolution_to_wire(presented.owner_gate),
+        plan_revision_id=presented.plan_revision.id,
+        canonical_branch=None,
+        verified_head_sha=None,
+    )
+
+
+@router.post(
+    _GATE_PATH + "/ignore-source-change",
+    response_model=OwnerGateIgnoreRead,
+    operation_id="ignore_github_source_change",
+    responses=_GATE_COMMAND_RESPONSES,
+)
+def ignore_github_source_change(
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    command: OwnerGateActionCommand,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> OwnerGateIgnoreRead:
+    """Ignore the exact observed GitHub issue change (the G2b ``ignore`` action).
+
+    One synchronous Owner-accountable command mapping the G2b gate-scoped
+    ``ignore`` action for the exact current pending ``GITHUB_ISSUE_CHANGE``
+    gate to the ONE Owner Ignore service: the exact current gate and its sole
+    unresolved ``github_source_changed`` block resolve APPROVED with truthful
+    OWNER provenance, the Task's single source fingerprint is overwritten
+    with the exact observed value the block carries (freshly re-proven
+    against the authoritative GitHub issue by the service), and the
+    interrupted E5 implementation-authorization or E7 PR-authorization
+    approval boundary re-presents its existing approval gate in the same
+    all-or-nothing commit. The GitHub App boundary is composed per request;
+    the response projects the service's committed post-write facts verbatim,
+    and a refusal or failure applies nothing — the Task stays blocked at the
+    pending gate, safe for a re-issued Ignore or the shared Cancel command.
+    No continuation is submitted here: the re-presented approval gate is the
+    committed handoff the Owner addresses next through the ordinary decision
+    commands, and no event is ever emitted from HTTP.
+    """
+    settings: Settings = request.app.state.settings
+    outcome = task_source_change_ignore.ignore_github_source_change(
+        get_database_pool(settings),
+        resolve_github_app_client(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=command.state_token,
+    )
+    return OwnerGateIgnoreRead(
+        task=_decision_snapshot_to_wire(outcome.task),
+        owner_gate=_gate_resolution_to_wire(outcome.resolved_owner_gate),
+        task_block=_block_summary_to_wire(outcome.resolved_task_block),
+        boundary=outcome.boundary.value,
+        acknowledged_fingerprint=outcome.acknowledged_fingerprint,
+        presented=_presented_approval_gate_to_wire(outcome),
+    )
+
+
+@router.post(
+    _GATE_PATH + "/continue-cost-limit",
+    response_model=OwnerGateContinueRead,
+    operation_id="continue_task_after_cost_limit",
+    responses=_GATE_COMMAND_RESPONSES,
+)
+def continue_task_after_cost_limit(
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    command: OwnerGateActionCommand,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> OwnerGateContinueRead:
+    """Refresh the spending allowance and reauthorize the work (the G2b ``continue`` action).
+
+    One synchronous Owner-accountable command mapping the G2b gate-scoped
+    ``continue`` action for the exact current pending ``COST_LIMIT`` gate to
+    the ONE Owner Continue service: the exact current gate resolves APPROVED
+    with truthful OWNER provenance, its sole unresolved block resolves, and
+    the guarded pre-block status restores under a rotated token carrying the
+    refreshed effective cumulative spending threshold (latest retained known
+    spend plus the frozen original budget) in the same atomic commit. The
+    committed authorization then arranges the separately-typed one-shot
+    original-session continuation submission through the process's
+    operation-invocation seam: ``continuation_outcome`` is delivery evidence
+    only — a refused or uncertain submission never fails or reverses the
+    committed authorization — and the continuation's later outcome and
+    operation settlement are new episodes the G2b Task/pending-interaction
+    reads own. HTTP success never implies a model result, the settled gate
+    and block are never reopened, and no event is ever emitted from HTTP.
+    """
+    settings: Settings = request.app.state.settings
+    outcome = task_owner_cost_continue.continue_task_after_cost_limit(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=command.state_token,
+    )
+    submission = submit_task_session_resume_after_authorization(
+        outcome,
+        dependencies=_continuation_dependencies(request),
+    )
+    return OwnerGateContinueRead(
+        task=_decision_snapshot_to_wire(outcome.task),
+        owner_gate=_gate_resolution_to_wire(outcome.resolved_owner_gate),
+        task_block=_block_summary_to_wire(outcome.resolved_task_block),
+        effective_cost_threshold_usd=str(outcome.effective_cost_threshold_usd),
+        continuation_outcome=submission.outcome.value,
+    )
+
+
+@router.post(
+    _GATE_PATH + "/resume-abort",
+    response_model=OwnerGateResumeRead,
+    operation_id="resume_task_after_abort",
+    responses=_GATE_COMMAND_RESPONSES,
+)
+def resume_task_after_abort(
+    workspace_id: UUID,
+    task_id: UUID,
+    owner_gate_id: UUID,
+    command: OwnerGateActionCommand,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> OwnerGateResumeRead:
+    """Reauthorize the aborted work on its original session (the G2b ``resume`` action).
+
+    One synchronous Owner-accountable command mapping the G2b gate-scoped
+    ``resume`` action for the exact current pending ``OWNER_ABORT`` gate to
+    the ONE Owner Resume service: the exact current gate resolves APPROVED
+    with truthful OWNER provenance, its sole unresolved block resolves, and
+    the guarded pre-abort status restores under a rotated token — with the
+    service independently proving the exact interrupted session identities,
+    the positively settled Interrupts, the unique original operation/session
+    routing, and no independently outstanding or uncertain runtime work. The
+    committed authorization then arranges the separately-typed one-shot
+    original-session continuation submission through the process's
+    operation-invocation seam: ``continuation_outcome`` is delivery evidence
+    only — a refused or uncertain submission never fails or reverses the
+    committed authorization — and the continuation's later outcome and
+    operation settlement are NEW Level 1/2/3 episodes the G2b
+    Task/pending-interaction reads own: the original gate and block remain
+    resolved history and are never reopened, HTTP success never implies a
+    model result, and no event is ever emitted from HTTP.
+    """
+    settings: Settings = request.app.state.settings
+    outcome = task_owner_resume.resume_task_after_abort(
+        get_database_pool(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        owner_gate_id=owner_gate_id,
+        expected_state_token=command.state_token,
+    )
+    submission = submit_task_session_resume_after_authorization(
+        outcome,
+        dependencies=_continuation_dependencies(request),
+    )
+    return OwnerGateResumeRead(
+        task=_decision_snapshot_to_wire(outcome.task),
+        owner_gate=_gate_resolution_to_wire(outcome.resolved_owner_gate),
+        task_block=_block_summary_to_wire(outcome.resolved_task_block),
+        continuation_outcome=submission.outcome.value,
     )
