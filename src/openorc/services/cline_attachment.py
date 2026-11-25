@@ -103,6 +103,7 @@ __all__ = [
     "OPENORC_CLIENT_IDENTITY",
     "AttachedClineRuntime",
     "ClineAttachmentPhase",
+    "OwnerAbortInterruptDispatcher",
     "attach_cline_runtime",
     "dispatch_cost_limit_interrupt",
     "settle_observed_detached_interrupt",
@@ -621,4 +622,68 @@ def settle_observed_detached_interrupt(
                 task_id=task_id,
                 intent=intent,
                 external_session_id=external_session_id,
+            )
+
+
+class OwnerAbortInterruptDispatcher:
+    """The composition-rooted per-target Owner-Abort Interrupt dispatch seam (#380).
+
+    The public Task-level Owner Abort command (issue #380) composes this
+    callable: strictly after the blocking composition committed, with no
+    database transaction open, each registered Interrupt intent's dispatch
+    acquires one short trusted attachment lease for the intent's exact
+    admitted Task/role/Connection session and records the shared E10b
+    machinery's safe classified outcome on the durable intent — exactly like
+    the cost-policy control's post-commit dispatch. The adapter's classified
+    outcomes are never interpreted here: a dispatch failure is recorded on
+    the durable intent by that machinery.
+
+    Expected attachment-stage failures are handled within this per-target
+    dispatch boundary, never allowed to escape past the committed blocking
+    composition: a definitive attachment failure (configuration rejection,
+    runtime unavailability, or a binding validation refusal — the Interrupt
+    was provably never submitted through this dispatch) records the truthful
+    durable non-delivery ``failed``, while an uncertain attachment outcome
+    records ``unknown`` — preserving the truth that the runtime state is
+    unconfirmable and must never be blindly replayed. Neither classification
+    implies settlement, and every remaining registered target is still
+    dispatched. Unexpected failures are not attachment-stage expectations and
+    remain exceptional.
+    """
+
+    def __init__(self, pool: DatabasePool) -> None:
+        self._pool = pool
+
+    def __call__(
+        self, *, intent: TaskInterruptIntent, external_session_id: str
+    ) -> task_abort.TaskInterruptOutcome:
+        try:
+            with attach_cline_runtime(
+                self._pool,
+                workspace_id=intent.workspace_id,
+                task_id=intent.task_id,
+                role=intent.workflow_role,
+                phase=ClineAttachmentPhase.BOUND,
+                external_session_id=external_session_id,
+            ) as attached:
+                return task_abort.dispatch_registered_task_interrupt(
+                    self._pool,
+                    attached.adapter,
+                    intent=intent,
+                    external_session_id=external_session_id,
+                )
+        except ExternalOperationUncertainError:
+            # An uncertain attachment outcome leaves the runtime state
+            # unconfirmable — possibly submitted, provably unaccounted: the
+            # truthful classification is ``unknown``, never a known failure
+            # and never settlement.
+            return task_abort.record_interrupt_dispatch_attachment_failure(
+                self._pool, intent=intent, uncertain=True
+            )
+        except (ExternalOperationFailedError, ConflictError, NotFoundError):
+            # A definitive attachment failure happened before any Interrupt
+            # could be submitted through this dispatch: the truthful
+            # classification is the durable non-delivery ``failed``.
+            return task_abort.record_interrupt_dispatch_attachment_failure(
+                self._pool, intent=intent, uncertain=False
             )

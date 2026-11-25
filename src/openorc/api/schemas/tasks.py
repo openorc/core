@@ -12,9 +12,12 @@ The module also carries the Owner Task-command wire models (issue #378):
 the Start command body and the command-outcome envelopes, which project the
 application services' authoritative post-write snapshots — never a
 re-derived current-state projection and never a command-status ledger —
-and the ordinary OwnerGate decision command models (issue #379): the
+the ordinary OwnerGate decision command models (issue #379): the
 approve command body for the three ordinary decision gates and their
-classified outcome envelopes.
+classified outcome envelopes, and the Task-level Owner Abort and shared
+Cancel Task command models (issue #380): the state_token-only command
+bodies and their classified outcome envelopes with the committed
+post-write snapshots and the separately-typed per-target dispatch facts.
 """
 
 from __future__ import annotations
@@ -72,6 +75,13 @@ __all__ = [
     "PrAuthorizationApprovalRead",
     "ReviewerConversationMessageRead",
     "ReviewerConversationRead",
+    "TaskAbortCommand",
+    "TaskAbortInterruptOutcomeRead",
+    "TaskAbortOutcomeRead",
+    "TaskCancellationOutcomeRead",
+    "TaskCancelCommand",
+    "TaskCloseIntentRead",
+    "TaskClosedReviewLoopRead",
 ]
 
 
@@ -999,3 +1009,136 @@ class MergeDecisionOutcomeRead(BaseModel):
     task_block: OpenOrcTaskBlockSummaryRead | None
     merge_commit_sha: StrictStr | None
     retry_attempt: MergeRetryAttemptRead | None
+
+
+# --- The Task-level Owner Abort and shared Cancel Task commands (issue #380) --
+
+
+class TaskAbortCommand(BaseModel):
+    """The Task-level Owner Abort command body (#380).
+
+    The same single-input contract as the #378 Start command: the opaque
+    ``state_token`` is the optimistic-concurrency token the guarded blocking
+    composition is conditional on — a token that no longer matches the
+    current Task is the typed stale outcome, never a second logical abort.
+    No client-selected interruption targets exist: the application service
+    derives the exact targets from the durable admitted-operation evidence
+    inside its establish transaction, and no settlement evidence is an HTTP
+    input — the addressed Task and the caller's authenticated Profile carry
+    everything else.
+    """
+
+    state_token: UUID
+
+
+class TaskAbortInterruptOutcomeRead(BaseModel):
+    """One exact-target Interrupt's durable post-dispatch facts (#380).
+
+    The safe classified outcome the shared E10b dispatch machinery recorded
+    on the durable one-shot intent, verbatim: the intent identity, the
+    targeted workflow role, the durable intent status (an acknowledgement
+    stays ``unsettled`` — an SDK acknowledgement proves request acceptance,
+    never quiescence), and the safe classified detail. These are separately
+    typed follow-on-submission facts, kept deliberately distinct from the
+    committed blocking composition.
+    """
+
+    task_interrupt_intent_id: UUID
+    workflow_role: StrictStr
+    status: StrictStr
+    detail: StrictStr
+
+
+class TaskAbortOutcomeRead(BaseModel):
+    """The classified outcome of one Task-level Owner Abort command (#380).
+
+    ``kind`` maps the service's classified outcome verbatim (the HTTP
+    command's dispatch is ``interrupted``; the settlement kinds require
+    positive D6b evidence that is never an HTTP input, so an
+    already-``blocked`` Task aborts to the typed unresolved-interruption
+    conflict instead). ``task`` is the authoritative post-write snapshot of
+    the committed blocking composition — the Task blocked under its rotated
+    token with the pending ``OWNER_ABORT`` gate installed — and
+    ``task_block`` is the applied blocking condition's summary.
+    ``interrupt_outcomes`` carries each exact target's separately-typed
+    dispatch facts: the committed Abort and the acknowledged or uncertain
+    follow-on submissions are distinct facts, and an acknowledged Interrupt
+    is never settlement. Subsequent state comes from the G2b Task reads.
+    """
+
+    kind: StrictStr
+    task: OwnerGateDecisionSnapshotRead
+    task_block: OpenOrcTaskBlockSummaryRead | None
+    interrupt_outcomes: list[TaskAbortInterruptOutcomeRead]
+
+
+class TaskCancelCommand(BaseModel):
+    """The shared Owner Cancel Task command body (#380).
+
+    The same single-input contract as the Start and decision commands: the
+    opaque ``state_token`` is the optimistic-concurrency token the guarded
+    terminalization is conditional on. One shared command serves both the
+    Task-level ``cancel_task`` offering and the current gate's menu — no
+    gate identifier exists and no gate-scoped cancel route does: the service
+    re-proves the exact current gate under the Task lock itself, and a
+    projected ``cancel_task`` action never grants authority by itself.
+    """
+
+    state_token: UUID
+
+
+class TaskClosedReviewLoopRead(BaseModel):
+    """One ReviewLoop the Cancel command closed, as the service returned it (#380)."""
+
+    id: UUID
+    purpose: StrictStr
+    status: StrictStr
+    closed_at: datetime | None
+
+
+class TaskCloseIntentRead(BaseModel):
+    """The cancellation's one-shot PR-close obligation facts (#380).
+
+    The durable one-shot close intent recorded atomically with the
+    terminalization exactly when the canonical open/unmerged pull request
+    may require closure, verbatim: its identity, the bound stable GitHub PR
+    identity, and the forward-only status (``pending`` is the unresolved
+    obligation; the terminal values are outcome records). The post-commit
+    closure attempt's classified outcome lives on the durable intent, never
+    synthesized here.
+    """
+
+    id: UUID
+    github_pr_id: StrictInt
+    github_pr_number: StrictInt
+    status: StrictStr
+
+
+class TaskCancellationOutcomeRead(BaseModel):
+    """The classified outcome of one shared Owner Cancel Task command (#380).
+
+    ``kind`` states which committed disposition actually occurred, verbatim:
+    ``cancelled`` — the exact-Task terminalization committed (the
+    ``terminalization`` facts projected from the returned Task; the mandatory
+    archival is the F10 terminal finalizer's follow-up, so a committed
+    terminalization can truthfully coexist with a still ``null``
+    ``task.archived_at``); ``completed`` — the canonical PR was already
+    authoritatively confirmed merged at the point of decision, so the command
+    routed to the shared completion path instead of an Owner ``CANCELLED``
+    claim. ``owner_gate`` is the exact current gate resolved with truthful
+    OWNER provenance (``null`` when none existed), ``closed_loops`` the
+    ReviewLoops closed as actually present, ``pull_request`` the
+    authoritative canonical PR the classification is grounded in, and
+    ``close_intent`` the pending one-shot close obligation when applicable.
+    Cancel does not mean Interrupt, and committed terminalization never
+    implies archived or capacity-released status before the final archival
+    transaction; subsequent state comes from the G2b Task reads.
+    """
+
+    kind: StrictStr
+    task: OwnerGateDecisionSnapshotRead
+    terminalization: OpenOrcTaskTerminalizationRead | None
+    owner_gate: OwnerGateResolutionRead | None
+    closed_loops: list[TaskClosedReviewLoopRead]
+    pull_request: GitHubTaskPullRequestRead | None
+    close_intent: TaskCloseIntentRead | None

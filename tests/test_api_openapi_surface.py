@@ -52,6 +52,8 @@ _TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
 _TASKS_PATH = "/api/v1/workspaces/{workspace_id}/tasks"
 _TASK_HISTORY_PATH = _TASK_PATH + "/history"
 _TASK_START_PATH = _TASK_PATH + "/start"
+_TASK_ABORT_PATH = _TASK_PATH + "/abort"
+_TASK_CANCEL_PATH = _TASK_PATH + "/cancel"
 _GATE_PATH = _TASK_PATH + "/owner-gates/{owner_gate_id}"
 _APPROVE_IMPL_PATH = _GATE_PATH + "/approve-implementation-authorization"
 _APPROVE_PR_PATH = _GATE_PATH + "/approve-pr-authorization"
@@ -113,6 +115,8 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_TASK_PATH, "get"): "get_task",
     (_TASK_HISTORY_PATH, "get"): "get_task_history",
     (_TASK_START_PATH, "post"): "start_task",
+    (_TASK_ABORT_PATH, "post"): "abort_task",
+    (_TASK_CANCEL_PATH, "post"): "cancel_task",
     (_APPROVE_IMPL_PATH, "post"): "approve_implementation_authorization",
     (_APPROVE_PR_PATH, "post"): "approve_pr_authorization",
     (_APPROVE_MERGE_PATH, "post"): "approve_merge_decision",
@@ -171,6 +175,8 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_TASK_PATH, "get"): "tasks",
     (_TASK_HISTORY_PATH, "get"): "tasks",
     (_TASK_START_PATH, "post"): "tasks",
+    (_TASK_ABORT_PATH, "post"): "tasks",
+    (_TASK_CANCEL_PATH, "post"): "tasks",
     (_APPROVE_IMPL_PATH, "post"): "tasks",
     (_APPROVE_PR_PATH, "post"): "tasks",
     (_APPROVE_MERGE_PATH, "post"): "tasks",
@@ -229,6 +235,8 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_TASK_PATH, "get"): {"401", "404", "503"},
     (_TASK_HISTORY_PATH, "get"): {"401", "404", "422", "503"},
     (_TASK_START_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_TASK_ABORT_PATH, "post"): {"401", "404", "409", "422", "503"},
+    (_TASK_CANCEL_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_APPROVE_IMPL_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_APPROVE_PR_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_APPROVE_MERGE_PATH, "post"): {"401", "404", "409", "422", "503"},
