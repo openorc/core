@@ -42,9 +42,12 @@ def _event(**overrides: Any) -> WorkflowEvent:
     return WorkflowEvent(**values)
 
 
-def test_event_type_vocabulary_is_exactly_the_locked_34() -> None:
+def test_event_type_vocabulary_is_exactly_the_locked_35() -> None:
     locked = {
         "task_created",
+        # The G2c vocabulary extension (issue #377): the Owner-attributed
+        # queue-first Start authorization.
+        "task_started",
         "agent_session_created",
         "agent_session_bound",
         "agent_session_lost",
@@ -84,7 +87,7 @@ def test_event_type_vocabulary_is_exactly_the_locked_34() -> None:
         "workspace_configuration_changed",
     }
     assert {member.value for member in WorkflowEventType} == locked
-    assert len(WorkflowEventType) == 34
+    assert len(WorkflowEventType) == 35
 
 
 def test_excluded_crud_event_types_do_not_exist() -> None:

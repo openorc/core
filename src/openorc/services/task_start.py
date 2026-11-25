@@ -483,8 +483,11 @@ def _queue_task_for_capacity(
     ``authorized_task_budget_usd`` (issue #240), frozen by the same
     statement: a queued Task carries its original spending authorization
     when capacity later becomes available, and no later default edit or
-    wakeup rewrites it. No reservation is made, no queue event exists, and
-    the returned Task carries the entry timestamp the FIFO order uses.
+    wakeup rewrites it. No reservation is made and no scheduler/capacity
+    event exists here — the one ``task_started`` audit fact is the Owner
+    Start composition's, recorded atomically beside this guarded write
+    (issue #377) — and the returned Task carries the entry timestamp the
+    FIFO order uses.
     """
     queued = task_records.update_task_status(
         transaction_pool,
@@ -884,6 +887,19 @@ def _arbitrate_target_start(
                 task=task,
                 source_requirements_fingerprint=source_requirements_fingerprint,
                 authorized_task_budget_usd=workspace.default_task_budget_usd,
+            )
+            # The Owner Start audit fact (issue #377): the authenticated
+            # Owner's successful Start authorization is recorded in the SAME
+            # transaction as the guarded QUEUED write it authorized — event
+            # insertion failure rolls the start back, and a losing, stale, or
+            # failed decision never reaches this emission. The actor is the
+            # authenticated caller's Profile, never a supplied actor ID or
+            # the Workspace Owner inferred later.
+            event_coordination.record_task_started_event(
+                transaction_pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                actor=event_coordination.owner_actor(profile_id),
             )
             return TaskStartOutcome(task=queued)
 

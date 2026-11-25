@@ -5,7 +5,9 @@ supplied non-production Supabase branch database and prove the durable
 Task-start invariants directly against a real Postgres: the DB-clock
 queue-entry timestamp and its iff-QUEUED CHECK, the ``(queued_at, id)`` FIFO
 order, the Owner start's atomic claim (both role reservations + planning +
-one planning_started event), the bounded sweep's FIFO advancement, no
+one planning_started event) with its same-transaction Owner-attributed
+``task_started`` audit fact (issue #377) and the rollback coupling of that
+pair, the bounded sweep's FIFO advancement, no
 overtaking of a feasible older waiter, no oversubscription, duplicate-free
 concurrent sweeps, the durable-projection eligibility guard, the structural
 configuration outcome, replay idempotence, and the capacity-release
@@ -396,6 +398,27 @@ def _planning_event_count(conn: Connection[Any], task_id: uuid.UUID) -> int:
     return row[0]
 
 
+def _started_event_count(conn: Connection[Any], task_id: uuid.UUID) -> int:
+    row = conn.execute(
+        "select count(*) from openorc.workflow_events "
+        "where task_id = %s and event_type = 'task_started'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _started_event_row(conn: Connection[Any], task_id: uuid.UUID) -> tuple[Any, ...]:
+    row = conn.execute(
+        "select actor_type, actor_id, subject_type, subject_id, context "
+        "from openorc.workflow_events "
+        "where task_id = %s and event_type = 'task_started'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
 def _cleanup_account(conn: Connection[Any], profile_id: uuid.UUID) -> None:
     """Remove committed seed rows through the sanctioned Auth-root cascade."""
     conn.execute("delete from auth.users where id = %s", (profile_id,))
@@ -506,6 +529,16 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
     assert outcome.task.queued_at is not None
     assert _active_session_count(conn, connection_id) == 0
     assert _planning_event_count(conn, task_id) == 0
+    # The Owner Start audit fact (issue #377) committed with the queue
+    # entry: exactly one Owner-attributed task_started, the authenticated
+    # caller's Profile as actor, no subject pair, and no context.
+    assert _started_event_count(conn, task_id) == 1
+    started_row = _started_event_row(conn, task_id)
+    assert started_row[0] == "owner"
+    assert started_row[1] == str(owner)
+    assert started_row[2] is None
+    assert started_row[3] is None
+    assert started_row[4] == {}
     queued_row = conn.execute(
         "select status, queued_at, state_token, source_requirements_fingerprint "
         "from openorc.tasks where id = %s",
@@ -526,6 +559,9 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
     assert sweep.exhausted is True
     assert _active_session_count(conn, connection_id) == 2
     assert _planning_event_count(conn, task_id) == 1
+    # The FIFO admission is not a Start authorization: no second
+    # task_started fact exists after admission (issue #377).
+    assert _started_event_count(conn, task_id) == 1
     row = conn.execute(
         "select status, queued_at, state_token, source_requirements_fingerprint "
         "from openorc.tasks where id = %s",
@@ -550,6 +586,63 @@ def test_owner_start_claims_planning_atomically_against_real_rows(
         )
     assert _active_session_count(conn, connection_id) == 2
     assert _planning_event_count(conn, task_id) == 1
+    # The replayed start is a stale refusal: no second audit fact (issue
+    # #377).
+    assert _started_event_count(conn, task_id) == 1
+
+
+def test_the_task_started_event_commits_and_rolls_back_with_the_queue_write(
+    conn: Connection[Any],
+) -> None:
+    """The audit fact shares the start transaction's fate (issue #377).
+
+    The guarded queued write and its Owner-attributed ``task_started`` fact
+    commit as one transaction: rolling back the enclosing savepoint that
+    carried the start removes both effects together — neither the queue
+    entry nor the audit fact survives alone. (The event-insert-failure
+    rollback direction is the established #56 coordination contract proven
+    by its own integration suite; this is this emission's coupling proof.)
+    """
+
+    class _StartRollbackProbe(Exception):
+        """Deliberately rolls the carrying savepoint back (psycopg 3 idiom)."""
+
+    owner, workspace_id, repository_id = _ownership_chain(conn)
+    task_id, state_token = _insert_task(
+        conn, workspace_id=workspace_id, repository_id=repository_id
+    )
+    connection_id = _insert_connection(conn, workspace_id=workspace_id, session_capacity=2)
+    _set_role_bindings(conn, workspace_id=workspace_id, connection_id=connection_id)
+    pool = cast(DatabasePool, _SingleConnectionPool(conn))
+
+    with pytest.raises(_StartRollbackProbe), conn.transaction():
+        outcome = start_task_for_owner(
+            pool,
+            _ScriptedGitHub(),
+            profile_id=owner,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=state_token,
+        )
+        assert outcome.task.status is TaskStatus.QUEUED
+        # Both effects are visible inside the same enclosing transaction.
+        assert _started_event_count(conn, task_id) == 1
+        queued = conn.execute(
+            "select status from openorc.tasks where id = %s",
+            (task_id,),
+        ).fetchone()
+        assert queued is not None and queued[0] == "queued"
+        raise _StartRollbackProbe()
+
+    # The rolled-back start left neither effect.
+    row = conn.execute(
+        "select status, queued_at from openorc.tasks where id = %s",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "ready_to_plan"
+    assert row[1] is None
+    assert _started_event_count(conn, task_id) == 0
 
 
 def test_structurally_infeasible_start_is_an_error_without_a_queue_write(

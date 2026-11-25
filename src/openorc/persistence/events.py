@@ -28,7 +28,11 @@ normalized to timezone-aware UTC at this boundary.
   ``list_task_events`` is a Task-id-scoped read — Workspace filtering
   and authorization for those lookups are service-layer concerns, not
   repository predicates. Reads are deterministically ordered newest-first
-  with the event id as tiebreaker.
+  with the event id as tiebreaker. The #377 authorized read pages
+  (``list_workspace_events_page``, ``list_task_events_page``) follow the
+  same rules with optional canonical filters, a documented
+  inclusive/exclusive time range, and opaque keyset continuation bound to
+  their scope.
 
 This module knows nothing about prompt mutation: prompt override
 repositories do not write events, and this module does not reference
@@ -44,6 +48,7 @@ service-layer concern, not a persistence one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -67,6 +72,8 @@ __all__ = [
     "list_recent_events_by_type",
     "list_recent_workspace_events",
     "list_task_events",
+    "list_task_events_page",
+    "list_workspace_events_page",
     "record_workflow_event",
 ]
 
@@ -223,6 +230,86 @@ def list_task_events(pool: DatabasePool, *, task_id: UUID, limit: int) -> list[W
     return [_workflow_event_from_row(row) for row in rows]
 
 
+def list_workspace_events_page(
+    pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    event_type: WorkflowEventType | None = None,
+    actor_type: WorkflowEventActor | None = None,
+    from_created_at: datetime | None = None,
+    to_created_at: datetime | None = None,
+    after_created_at: datetime | None = None,
+    after_event_id: UUID | None = None,
+    limit: int,
+) -> list[WorkflowEvent]:
+    """Return one bounded page of the Workspace's events for the #377 reads.
+
+    The authorized Workspace event list's keyset page (issue #377): filtered
+    by canonical vocabulary values and the documented time range (``from``
+    inclusive, ``to`` exclusive), deterministically ordered newest-first by
+    ``(created_at, id)``, advanced by the opaque cursor. Database-only;
+    never a scope check (the service layer authorizes). The page includes
+    the Workspace's Task-scoped events and its Workspace-level facts, and
+    serves the same established indexes as the simple list reads.
+    """
+    _require_uuid(workspace_id, "workspace_id")
+    _require_positive_int(limit, "limit")
+    fragment, filter_params = _event_page_filters(
+        event_type=event_type,
+        actor_type=actor_type,
+        from_created_at=from_created_at,
+        to_created_at=to_created_at,
+    )
+    with transaction(pool) as conn:
+        return _event_page_rows(
+            conn,
+            predicate=f"workspace_id = %s{fragment}",
+            params=[workspace_id, *filter_params],
+            after_created_at=after_created_at,
+            after_event_id=after_event_id,
+            limit=limit,
+        )
+
+
+def list_task_events_page(
+    pool: DatabasePool,
+    *,
+    task_id: UUID,
+    event_type: WorkflowEventType | None = None,
+    actor_type: WorkflowEventActor | None = None,
+    from_created_at: datetime | None = None,
+    to_created_at: datetime | None = None,
+    after_created_at: datetime | None = None,
+    after_event_id: UUID | None = None,
+    limit: int,
+) -> list[WorkflowEvent]:
+    """Return one bounded page of one Task's events for the #377 reads.
+
+    The authorized Task event list's keyset page (issue #377): the exact
+    Task's event history, current or archived, with the same filters, range
+    semantics, ordering, and cursor continuation as the Workspace page.
+    Database-only; never a scope check — the service layer authorizes the
+    Task against the caller's Workspace before this read.
+    """
+    _require_uuid(task_id, "task_id")
+    _require_positive_int(limit, "limit")
+    fragment, filter_params = _event_page_filters(
+        event_type=event_type,
+        actor_type=actor_type,
+        from_created_at=from_created_at,
+        to_created_at=to_created_at,
+    )
+    with transaction(pool) as conn:
+        return _event_page_rows(
+            conn,
+            predicate=f"task_id = %s{fragment}",
+            params=[task_id, *filter_params],
+            after_created_at=after_created_at,
+            after_event_id=after_event_id,
+            limit=limit,
+        )
+
+
 def list_recent_events_by_type(
     pool: DatabasePool, *, workspace_id: UUID, event_type: WorkflowEventType, limit: int
 ) -> list[WorkflowEvent]:
@@ -296,3 +383,84 @@ def find_events_by_subject(
             (workspace_id, subject_type, subject_id, limit),
         ).fetchall()
     return [_workflow_event_from_row(row) for row in rows]
+
+
+def _event_page_filters(
+    *,
+    event_type: WorkflowEventType | None,
+    actor_type: WorkflowEventActor | None,
+    from_created_at: datetime | None,
+    to_created_at: datetime | None,
+) -> tuple[str, list[Any]]:
+    """Return the optional event page filter fragment and its parameters.
+
+    Every admitted filter is a fixed literal predicate with a parameterized
+    value: canonical vocabulary members or timezone-aware instants only.
+    ``from`` is inclusive and ``to`` is exclusive, so an instant inside the
+    range is a member of exactly one page window.
+    """
+    fragments: list[str] = []
+    params: list[Any] = []
+    if event_type is not None:
+        if not isinstance(event_type, WorkflowEventType):
+            raise WorkflowEventDomainError("the event page event_type must be a WorkflowEventType")
+        fragments.append("event_type = %s")
+        params.append(event_type.value)
+    if actor_type is not None:
+        if not isinstance(actor_type, WorkflowEventActor):
+            raise WorkflowEventDomainError("the event page actor_type must be a WorkflowEventActor")
+        fragments.append("actor_type = %s")
+        params.append(actor_type.value)
+    if from_created_at is not None:
+        _require_aware_instant(from_created_at, "the event page from bound")
+        fragments.append("created_at >= %s")
+        params.append(normalize_utc(from_created_at))
+    if to_created_at is not None:
+        _require_aware_instant(to_created_at, "the event page to bound")
+        fragments.append("created_at < %s")
+        params.append(normalize_utc(to_created_at))
+    return "".join(f" and {fragment}" for fragment in fragments), params
+
+
+def _event_page_rows(
+    conn: Any,
+    *,
+    predicate: str,
+    params: list[Any],
+    after_created_at: datetime | None,
+    after_event_id: UUID | None,
+    limit: int,
+) -> list[WorkflowEvent]:
+    """Run one deterministic keyset page query for the #377 event reads.
+
+    Ordered newest-first by the durable ``(created_at, id)`` key; each page
+    continues strictly after the caller's last examined key, so rows sharing
+    a timestamp keep their stable id-tiebreaker order across pages and are
+    never skipped or duplicated within an unchanged result set. The limit+1
+    probe is the caller's has-more evidence (the established list
+    convention). This is historical ordering over visible committed records,
+    not a commit-order or replay sequence.
+    """
+    if after_created_at is not None:
+        if not isinstance(after_event_id, UUID):
+            raise WorkflowEventDomainError("the event page cursor must carry both key parts")
+        _require_aware_instant(after_created_at, "the event page cursor timestamp")
+        predicate += " and (created_at, id) < (%s, %s)"
+        params.extend([normalize_utc(after_created_at), after_event_id])
+    params.append(limit)
+    rows = conn.execute(
+        f"select {_WORKFLOW_EVENT_COLUMNS} from openorc.workflow_events "
+        f"where {predicate} order by created_at desc, id desc limit %s",
+        tuple(params),
+    ).fetchall()
+    return [_workflow_event_from_row(row) for row in rows]
+
+
+def _require_aware_instant(value: object, name: str) -> None:
+    """Reject a naive datetime before it reaches the database boundary."""
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.tzinfo.utcoffset(value) is None
+    ):
+        raise WorkflowEventDomainError(f"{name} must be a timezone-aware timestamp")

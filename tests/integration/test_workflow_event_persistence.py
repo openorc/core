@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, cast
 
 import pytest
@@ -330,3 +331,115 @@ def test_event_context_round_trips_as_a_canonical_json_object(conn: Connection[A
     assert reread.context["gate_kind"] == "plan_approval"
     assert reread.context["note"] is None
     assert reread.subject_type == "owner_gate"
+
+
+def test_the_authorized_event_pages_order_filter_and_continue_deterministically(
+    conn: Connection[Any],
+) -> None:
+    """The #377 keyset page reads against real rows.
+
+    Newest-first ``(created_at, id)`` ordering with the equal-timestamp id
+    tiebreaker (events recorded in one transaction share the transaction
+    clock by design), the documented inclusive/exclusive range bounds, the
+    canonical vocabulary filters, the Workspace/Task scope split, and the
+    opaque continuation that never skips or duplicates rows within an
+    unchanged result set.
+    """
+    workspace_id, _, task_id, pool = _fresh_task(conn)
+    recorded_ids: list[uuid.UUID] = []
+    for event_type in (
+        WorkflowEventType.TASK_CREATED,
+        WorkflowEventType.TASK_STARTED,
+        WorkflowEventType.PLANNING_STARTED,
+    ):
+        recorded_ids.append(
+            event_repositories.record_workflow_event(
+                pool,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                event_type=event_type,
+                actor_type=WorkflowEventActor.OPENORC,
+            ).id
+        )
+    workspace_event = event_repositories.record_workflow_event(
+        pool,
+        workspace_id=workspace_id,
+        event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
+        actor_type=WorkflowEventActor.OPENORC,
+        subject_type="workspace",
+        subject_id=workspace_id,
+        context={"setting": "guidance"},
+    )
+    recorded_ids.append(workspace_event.id)
+
+    # The Workspace page includes the Task-scoped facts and the
+    # Workspace-level fact; the Task page carries only the Task's three.
+    workspace_page = event_repositories.list_workspace_events_page(
+        pool, workspace_id=workspace_id, limit=10
+    )
+    task_page = event_repositories.list_task_events_page(pool, task_id=task_id, limit=10)
+    assert {event.id for event in workspace_page} == set(recorded_ids)
+    assert {event.id for event in task_page} == set(recorded_ids[:3])
+    # All rows share the transaction clock; the id tiebreaker keeps the
+    # order deterministic (a re-query reproduces the exact same sequence).
+    assert len({event.created_at for event in workspace_page}) == 1
+    assert [event.id for event in task_page] == [
+        event.id
+        for event in event_repositories.list_task_events_page(pool, task_id=task_id, limit=10)
+    ]
+
+    # The keyset continuation over equal-timestamp rows: pages 1 and 2
+    # partition the result without skipping or duplicating a row.
+    first = event_repositories.list_task_events_page(pool, task_id=task_id, limit=1)
+    assert len(first) == 1
+    rest = event_repositories.list_task_events_page(
+        pool,
+        task_id=task_id,
+        after_created_at=first[0].created_at,
+        after_event_id=first[0].id,
+        limit=10,
+    )
+    assert len(rest) == 2
+    assert {event.id for event in first} | {event.id for event in rest} == set(recorded_ids[:3])
+    assert not {event.id for event in first} & {event.id for event in rest}
+
+    # The canonical filters select their exact populations.
+    typed = event_repositories.list_workspace_events_page(
+        pool, workspace_id=workspace_id, event_type=WorkflowEventType.TASK_STARTED, limit=10
+    )
+    assert [event.event_type for event in typed] == [WorkflowEventType.TASK_STARTED]
+    workspace_scoped_only = event_repositories.list_workspace_events_page(
+        pool,
+        workspace_id=workspace_id,
+        event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
+        limit=10,
+    )
+    assert [event.id for event in workspace_scoped_only] == [workspace_event.id]
+
+    # The documented range boundaries: ``from`` inclusive, ``to`` exclusive.
+    shared_instant = workspace_page[0].created_at
+    assert (
+        len(
+            event_repositories.list_workspace_events_page(
+                pool, workspace_id=workspace_id, from_created_at=shared_instant, limit=10
+            )
+        )
+        == 4
+    )
+    assert (
+        event_repositories.list_workspace_events_page(
+            pool, workspace_id=workspace_id, to_created_at=shared_instant, limit=10
+        )
+        == []
+    )
+    assert (
+        len(
+            event_repositories.list_workspace_events_page(
+                pool,
+                workspace_id=workspace_id,
+                to_created_at=shared_instant + timedelta(microseconds=1),
+                limit=10,
+            )
+        )
+        == 4
+    )

@@ -353,6 +353,8 @@ def test_the_event_persistence_surface_is_insert_only() -> None:
         "get_workflow_event",
         "list_recent_workspace_events",
         "list_task_events",
+        "list_workspace_events_page",
+        "list_task_events_page",
         "list_recent_events_by_type",
         "list_recent_events_by_actor",
         "find_events_by_subject",

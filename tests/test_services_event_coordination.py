@@ -452,6 +452,60 @@ class TestOwnerGateResolvedEvent:
         assert conn.executed == []
 
 
+class TestTaskStartedEvent:
+    def test_maps_the_task_scoped_owner_start_fact(self) -> None:
+        pool, conn = _pool([_event_row()])
+        event_coordination.record_task_started_event(
+            pool,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+        )
+        assert len(conn.executed) == 1
+        sql, params = conn.executed[0]
+        assert "insert into openorc.workflow_events" in sql
+        assert params is not None
+        # Task-scoped with the exact Task reference, no redundant subject
+        # pair, and the authenticated Owner Profile as the actor identity.
+        assert params[:7] == (
+            _WORKSPACE_ID,
+            _TASK_ID,
+            "task_started",
+            "owner",
+            str(_OWNER_PROFILE_ID),
+            None,
+            None,
+        )
+        # The Start authorization's audit fact, not a scheduler/capacity
+        # event: no context parameter exists to accept any.
+        assert params[7].obj == {}
+
+    def test_rejects_malformed_subject_before_any_write(self) -> None:
+        pool, conn = _pool([])
+        with pytest.raises(InvalidCommandError):
+            event_coordination.record_task_started_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id="not-a-uuid",  # type: ignore[arg-type]
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+            )
+        assert conn.executed == []
+
+    def test_failure_propagates_for_the_calling_composition(self) -> None:
+        """The event insert is the last coordinated step; its failure must be
+        observable by the start composition so the guarded queue write rolls
+        back with it (real rollback proven by the integration suite)."""
+        pool, conn = _pool([RuntimeError("event insertion failed")])
+        with pytest.raises(RuntimeError, match="event insertion failed"):
+            event_coordination.record_task_started_event(
+                pool,
+                workspace_id=_WORKSPACE_ID,
+                task_id=_TASK_ID,
+                actor=event_coordination.owner_actor(_OWNER_PROFILE_ID),
+            )
+        assert len(conn.executed) == 1
+
+
 class TestEventInsertionFailure:
     def test_failure_propagates_for_the_calling_composition(self) -> None:
         """The event insert is the last coordinated step; its failure must be
