@@ -75,6 +75,7 @@ class WorkflowEventType(StrEnum):
     """
 
     TASK_CREATED = "task_created"
+    TASK_STARTED = "task_started"
     AGENT_SESSION_CREATED = "agent_session_created"
     AGENT_SESSION_BOUND = "agent_session_bound"
     AGENT_SESSION_LOST = "agent_session_lost"

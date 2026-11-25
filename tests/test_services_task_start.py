@@ -680,7 +680,10 @@ def test_owner_start_only_queues_and_arranges_the_post_commit_wake() -> None:
     assert outcome.task.state_token != _STATE_TOKEN
     assert outcome.task.source_requirements_fingerprint == _FINGERPRINT
     _assert_no_session_reservations(conn)
-    assert not any("insert into openorc.workflow_events" in sql for sql, _ in conn.executed)
+    # The one Owner-attributed ``task_started`` audit fact (issue #377),
+    # recorded in the same arbitration transaction as the guarded queued
+    # write — the only workflow_events insert on the whole start path.
+    _assert_single_task_started_event(conn)
     assert not any(
         "update openorc.tasks" in sql and params is not None and params[0] == "planning"
         for sql, params in conn.executed
@@ -729,6 +732,34 @@ def test_owner_start_only_queues_and_arranges_the_post_commit_wake() -> None:
         "blocked_by",
         "resolve_related_endpoints",
     ]
+
+
+def test_owner_start_records_the_task_started_event_after_the_queue_write() -> None:
+    """The audit fact is the arbitration transaction's last coordinated step.
+
+    The guarded queued write must apply first: a losing, stale, or failed
+    start never reaches the emission, and the event rides the same composed
+    transaction (rollback coupling proven by the integration suite).
+    """
+    conn = ScriptedConnection()
+    pool = FakePool(conn)
+    github = FakeGitHubAppClient(pool=pool)
+    _script_success_start(conn, capacity=2, occupancy=[])
+    _queue_page(conn, [])
+
+    outcome = start_task_for_owner(_pool(conn), github, **_start_kwargs())
+
+    assert outcome.task.status is TaskStatus.QUEUED
+    _assert_single_task_started_event(conn)
+    queue_write_index = next(
+        index for index, (sql, _) in enumerate(conn.executed) if "update openorc.tasks" in sql
+    )
+    event_index = next(
+        index
+        for index, (sql, _) in enumerate(conn.executed)
+        if "insert into openorc.workflow_events" in sql
+    )
+    assert queue_write_index < event_index
 
 
 @pytest.mark.parametrize(
@@ -1019,7 +1050,7 @@ def test_temporarily_occupied_capacity_queues_without_reservations() -> None:
     assert len(queued_updates) == 1
     assert "when %s = 'queued' and status <> 'queued' then now()" in queued_updates[0][0]
     _assert_no_session_reservations(conn)
-    assert not any("insert into openorc.workflow_events" in sql for sql, _ in conn.executed)
+    _assert_single_task_started_event(conn)
 
 
 def test_distinct_capacity_one_connections_admit_together_through_the_processor() -> None:
@@ -1272,6 +1303,14 @@ def test_sweep_advances_candidates_with_the_workspace_owner_as_the_barrier() -> 
     ]
     assert len(openorc_events) == 1
     assert openorc_events[0][1] == _CANDIDATE_ID
+    # The FIFO admission is not a Start authorization: the sweep never emits
+    # the Owner-attributed ``task_started`` fact (issue #377).
+    assert not any(
+        "insert into openorc.workflow_events" in sql
+        and params is not None
+        and params[2] == "task_started"
+        for sql, params in conn.executed
+    )
 
 
 def _assert_no_task_writes(conn: ScriptedConnection) -> None:
@@ -1280,6 +1319,26 @@ def _assert_no_task_writes(conn: ScriptedConnection) -> None:
 
 def _assert_no_session_reservations(conn: ScriptedConnection) -> None:
     assert not any("insert into openorc.task_agent_sessions" in sql for sql, _ in conn.executed)
+
+
+def _assert_single_task_started_event(conn: ScriptedConnection) -> None:
+    """Exactly one Owner-attributed ``task_started`` audit fact (issue #377)."""
+    inserts = [
+        params
+        for sql, params in conn.executed
+        if "insert into openorc.workflow_events" in sql and params is not None
+    ]
+    assert len(inserts) == 1
+    event_params = inserts[0]
+    assert event_params[1] == _TASK_ID
+    assert event_params[2] == "task_started"
+    assert event_params[3] == "owner"
+    assert event_params[4] == str(_OWNER_PROFILE_ID)
+    # No redundant subject pair and no context: the Start authorization's
+    # audit fact, not a scheduler/capacity event.
+    assert event_params[5] is None
+    assert event_params[6] is None
+    assert event_params[7].obj == {}
 
 
 def _start_kwargs() -> dict[str, Any]:

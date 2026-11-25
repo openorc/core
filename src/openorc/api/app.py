@@ -24,6 +24,7 @@ from openorc.api.request_correlation import (
 )
 from openorc.api.routers.account import router as account_router
 from openorc.api.routers.connections import router as connections_router
+from openorc.api.routers.event_reads import router as event_reads_router
 from openorc.api.routers.github_installations import router as github_installations_router
 from openorc.api.routers.github_issues import router as github_issues_router
 from openorc.api.routers.github_user_authorization import (
@@ -437,6 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(role_bindings_router, prefix="/api/v1")
     app.include_router(tasks_router, prefix="/api/v1")
     app.include_router(task_reads_router, prefix="/api/v1")
+    app.include_router(event_reads_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport
     # (issue #346): deployment-only, authenticated, and nonpublic; it serves
     # the serving process's own observation host and is never an application

@@ -95,6 +95,7 @@ __all__ = [
     "record_review_limit_reached_event",
     "record_role_binding_configuration_changed_event",
     "record_task_blocked_event",
+    "record_task_started_event",
     "record_task_terminal_event",
 ]
 
@@ -386,6 +387,38 @@ def record_planning_started_event(
         workspace_id=workspace_id,
         task_id=task_id,
         event_type=WorkflowEventType.PLANNING_STARTED,
+        actor_type=actor.actor_type,
+        actor_id=actor.actor_id,
+    )
+
+
+def record_task_started_event(
+    transaction_pool: DatabasePool,
+    *,
+    workspace_id: UUID,
+    task_id: UUID,
+    actor: WorkflowActorContext,
+) -> None:
+    """Record one successful Owner Start authorization (issue #377).
+
+    Task-scoped: the Task is the subject and ``task_id`` is the exact
+    reference, so no redundant subject pair is added, and the helper accepts
+    no provider/model/prompt/session parameter — the event records only that
+    the authenticated Owner successfully authorized the queue-first Start.
+    It is recorded by the same composed transaction that commits the guarded
+    ``queued`` write with its frozen fingerprint and budget, so a losing,
+    stale, or failed start never writes it and a successful start never
+    omits it. It is the Start authorization's audit fact, not a
+    scheduler/capacity event: no ``task_queued`` vocabulary exists by design
+    and the later FIFO admission keeps its own ``planning_started`` fact.
+    """
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    event_records.record_workflow_event(
+        transaction_pool,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type=WorkflowEventType.TASK_STARTED,
         actor_type=actor.actor_type,
         actor_id=actor.actor_id,
     )
