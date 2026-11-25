@@ -31,6 +31,23 @@ service's classified outcome kinds verbatim. The commands never re-derive
 action menus (the G2b read owns that projection), never add cancellation
 routes (G3c #380 owns the shared ``cancel_task`` command), and never treat
 a projected ``approve`` action as granted authority.
+
+The Task-level Owner Abort and shared Cancel Task commands (issue #380) are
+two synchronous sync-handler delegations with state_token-only bodies: the
+Abort command delegates to the ONE Owner Abort service, which derives the
+exact interruption targets from the durable admitted-operation evidence
+inside its establish transaction (never a client-selected role list, never
+settlement evidence) and dispatches each registered Interrupt post-commit
+through the composition-rooted ``cline_attachment`` seam; the one shared
+Cancel command serves both the Task-level ``cancel_task`` offering and the
+current gate's menu (no gate identifier, no gate-scoped cancel route — G3d
+#381 reuses it) with the GitHub App and Profile user-token boundaries and
+the F10 terminal-finalization seam composed per request. Responses project
+the services' authoritative post-write snapshots and the separately-typed
+per-target dispatch/close-obligation facts verbatim — committed
+terminalization never implies archived or capacity-released status, an
+acknowledged Interrupt is never settlement, and no event is ever emitted
+from HTTP.
 """
 
 from __future__ import annotations
@@ -69,6 +86,13 @@ from openorc.api.schemas.tasks import (
     PrAuthorizationApprovalRead,
     ReviewerConversationMessageRead,
     ReviewerConversationRead,
+    TaskAbortCommand,
+    TaskAbortInterruptOutcomeRead,
+    TaskAbortOutcomeRead,
+    TaskCancelCommand,
+    TaskCancellationOutcomeRead,
+    TaskClosedReviewLoopRead,
+    TaskCloseIntentRead,
 )
 from openorc.config import Settings
 from openorc.domain.blocks import TaskBlock
@@ -79,10 +103,13 @@ from openorc.domain.tasks import Task
 from openorc.persistence.pool import get_database_pool
 from openorc.services import (
     administrative_deletion,
+    task_abort,
+    task_cancellation,
     task_implementation_authorization,
     task_merge_lifecycle,
     task_pr_authorization,
 )
+from openorc.services.cline_attachment import OwnerAbortInterruptDispatcher
 from openorc.services.errors import (
     ExternalOperationFailedError,
     ExternalOperationUncertainError,
@@ -619,6 +646,151 @@ def approve_merge_decision(
                 ordinal=outcome.retry_attempt.ordinal,
                 due=outcome.retry_attempt.not_before,
                 error_code=outcome.retry_attempt.error_code.value,
+            )
+        ),
+    )
+
+
+# --- The Task-level Owner Abort and shared Cancel Task commands (issue #380) --
+
+
+def _interrupt_outcomes_to_wire(
+    outcomes: Any,
+) -> list[TaskAbortInterruptOutcomeRead]:
+    """Map the service's per-target Interrupt outcomes onto the #380 wire."""
+    return [
+        TaskAbortInterruptOutcomeRead(
+            task_interrupt_intent_id=interrupt.task_interrupt_intent_id,
+            workflow_role=interrupt.workflow_role.value,
+            status=interrupt.status.value,
+            detail=interrupt.detail,
+        )
+        for interrupt in outcomes
+    ]
+
+
+@router.post(
+    "/workspaces/{workspace_id}/tasks/{task_id}/abort",
+    response_model=TaskAbortOutcomeRead,
+    operation_id="abort_task",
+    responses=_GATE_COMMAND_RESPONSES,
+)
+def abort_task(
+    workspace_id: UUID,
+    task_id: UUID,
+    command: TaskAbortCommand,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> TaskAbortOutcomeRead:
+    """Abort the Task's authorized active workflow activity with an Interrupt.
+
+    One synchronous Owner-accountable command through the ONE Owner Abort
+    service: the exact current Task under its optimistic-concurrency token is
+    blocked by the atomic ``OWNER_ABORT`` blocking composition (the
+    ``owner_action_required`` TaskBlock, its pending Level 3-selected
+    ``OWNER_ABORT`` gate, and the one-shot exact-session Interrupt intents)
+    BEFORE any runtime I/O, and the service derives the interruption targets
+    from the durable admitted-operation evidence inside its establish
+    transaction — never a client-selected role list. The response projects
+    the committed post-write snapshot plus each exact target's
+    separately-typed dispatch facts: the committed Abort and the acknowledged
+    or uncertain follow-on submissions are distinct facts, an acknowledged
+    Interrupt is never settlement, and an already-``blocked`` Task aborts to
+    the typed unresolved-interruption conflict. Subsequent state comes from
+    the G2b Task reads.
+    """
+    settings: Settings = request.app.state.settings
+    pool = get_database_pool(settings)
+    outcome = task_abort.abort_task_activity_for_owner(
+        pool,
+        OwnerAbortInterruptDispatcher(pool),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=command.state_token,
+    )
+    return TaskAbortOutcomeRead(
+        kind=outcome.kind.value,
+        task=_decision_snapshot_to_wire(outcome.task),
+        task_block=(
+            None if outcome.task_block is None else _block_summary_to_wire(outcome.task_block)
+        ),
+        interrupt_outcomes=_interrupt_outcomes_to_wire(outcome.interrupt_outcomes),
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/tasks/{task_id}/cancel",
+    response_model=TaskCancellationOutcomeRead,
+    operation_id="cancel_task",
+    responses=_GATE_COMMAND_RESPONSES,
+)
+def cancel_task(
+    workspace_id: UUID,
+    task_id: UUID,
+    command: TaskCancelCommand,
+    request: Request,
+    profile: AuthenticatedProfile,
+) -> TaskCancellationOutcomeRead:
+    """Cancel the Task from a current safely inactive state (the shared command).
+
+    One synchronous Owner-accountable command through the ONE unified Cancel
+    service — the shared ``cancel_task`` command for both the Task-level
+    offering and the current gate's menu, with no gate identifier: the
+    service re-proves the exact current gate under the Task lock itself and
+    the outstanding-work guards hold as established. The canonical PR facts
+    are established before any irreversible mutation, the guarded
+    terminalization commits atomically (the exact current gate resolved with
+    truthful OWNER provenance, the OPEN ReviewLoops closed, the one-shot
+    PR-close obligation recorded when applicable), and the GitHub App and
+    Profile user-token boundaries plus the F10 terminal-finalization seam are
+    composed per request. The response projects the committed post-write
+    snapshot verbatim: a committed terminalization can truthfully coexist
+    with a still ``null`` ``archived_at`` (the mandatory archival is the F10
+    finalizer's follow-up), and a canonical PR already confirmed merged
+    routes to the shared completion instead of an Owner ``CANCELLED`` claim.
+    Cancel does not mean Interrupt; subsequent state comes from the G2b Task
+    reads.
+    """
+    settings: Settings = request.app.state.settings
+    submitter: OperationSubmitter = request.app.state.operation_submitter
+    outcome = task_cancellation.cancel_task(
+        get_database_pool(settings),
+        resolve_github_app_client(settings),
+        resolve_profile_user_token_resolver(settings),
+        profile_id=profile.id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        expected_state_token=command.state_token,
+        terminal_finalization_submission=F1TerminalFinalizationSubmission(submitter),
+    )
+    return TaskCancellationOutcomeRead(
+        kind=outcome.kind.value,
+        task=_decision_snapshot_to_wire(outcome.task),
+        terminalization=_terminalization_to_wire(outcome.task),
+        owner_gate=(
+            None if outcome.owner_gate is None else _gate_resolution_to_wire(outcome.owner_gate)
+        ),
+        closed_loops=[
+            TaskClosedReviewLoopRead(
+                id=loop.id,
+                purpose=loop.purpose.value,
+                status=loop.status.value,
+                closed_at=loop.closed_at,
+            )
+            for loop in outcome.closed_loops
+        ],
+        pull_request=(
+            None if outcome.pull_request is None else _pull_request_to_wire(outcome.pull_request)
+        ),
+        close_intent=(
+            None
+            if outcome.close_intent is None
+            else TaskCloseIntentRead(
+                id=outcome.close_intent.id,
+                github_pr_id=outcome.close_intent.github_pr_id,
+                github_pr_number=outcome.close_intent.github_pr_number,
+                status=outcome.close_intent.status.value,
             )
         ),
     )

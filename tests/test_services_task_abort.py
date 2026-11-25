@@ -60,6 +60,7 @@ from openorc.services.task_abort import (
     TaskAbortOutcomeKind,
     TaskInterruptSettlement,
     abort_task_activity,
+    abort_task_activity_for_owner,
     settle_annotated_task_interrupt,
     settle_observed_task_interrupt,
 )
@@ -1149,3 +1150,214 @@ def test_abort_rejects_an_idle_owner_gate_without_in_flight_activity(
         assert _count(conn, _BLOCK_INSERT) == 0
         assert _count(conn, _TASK_BLOCK_UPDATE) == 0
         assert _event_types(conn) == []
+
+
+# --- The Task-level Owner Abort command (issue #380) ---------------------------
+
+_REVIEWER_SESSION_ID = uuid4()
+_REVIEWER_EXTERNAL_SESSION_ID = "fake-session-2"
+
+
+def _reviewer_session_row(*, lifecycle: str = "ready") -> tuple[Any, ...]:
+    return _session_row(
+        "reviewer", _REVIEWER_SESSION_ID, _REVIEWER_EXTERNAL_SESSION_ID, lifecycle=lifecycle
+    )
+
+
+class _RecordingInterruptDispatch:
+    """The composition-rooted per-target dispatch seam double (#380)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, str]] = []
+
+    def __call__(self, *, intent: Any, external_session_id: str) -> Any:
+        self.calls.append((intent, external_session_id))
+        return SimpleNamespace(
+            task_interrupt_intent_id=intent.id,
+            workflow_role=intent.workflow_role,
+            status=TaskInterruptIntentStatus.UNSETTLED,
+            detail="acknowledged",
+        )
+
+
+def _owner_dispatch_call(
+    pool: DatabasePool,
+    dispatch: Any,
+    *,
+    expected_state_token: Any = _STATE_TOKEN,
+) -> Any:
+    return abort_task_activity_for_owner(
+        pool,
+        cast(Any, dispatch),
+        profile_id=_OWNER_PROFILE_ID,
+        workspace_id=_WORKSPACE_ID,
+        task_id=_TASK_ID,
+        expected_state_token=expected_state_token,
+    )
+
+
+def test_owner_abort_derives_the_working_producer_target_despite_an_idle_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The required representative case: candidate roles are derived from the
+    # durable admitted-operation evidence FIRST, so the unrelated inactive
+    # reviewer binding — even a non-READY (ENDED) one — is never queried and
+    # can never block the valid active producer target. A binding-first
+    # derivation would resolve this ENDED row and hard-fail the command.
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="implementing", session=_ready_session_row())
+    conn.on(_SESSION_READ, _reviewer_session_row(lifecycle="ended"))
+    _wire_activity(monkeypatch, executions=[_open_execution()])
+    conn.on(_INTENTS_LIST, [])
+    _script_block_composition(conn, status="implementing")
+    conn.on(_INTENT_INSERT, _intent_row())
+    dispatch = _RecordingInterruptDispatch()
+
+    outcome = _owner_dispatch_call(_pool(conn), dispatch)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    assert outcome.task.status is TaskStatus.BLOCKED
+    assert len(dispatch.calls) == 1
+    intent, external_session_id = dispatch.calls[0]
+    assert intent.workflow_role is WorkflowRole.PRODUCER
+    assert external_session_id == _EXTERNAL_SESSION_ID
+    assert outcome.interrupt_outcomes[0].detail == "acknowledged"
+    assert outcome.interrupt_outcomes[0].status is TaskInterruptIntentStatus.UNSETTLED
+    assert _count(conn, _SESSION_WRITE) == 0
+    assert _event_types(conn) == ["task_blocked", "owner_gate_created"]
+
+
+def test_owner_abort_derives_the_reviewer_target_for_an_unfinalized_review_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reviewer-owned in-flight evidence derives the reviewer target: the
+    # idle producer session is never interrupted, and an unrelated ended
+    # producer binding never blocks the valid review-turn target.
+    loop, iterations_by_loop = _open_loop_with_unfinalized_iteration()
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="reviewing", session=_reviewer_session_row())
+    conn.on(_SESSION_READ, _ready_session_row(lifecycle="ended"))
+    _wire_activity(monkeypatch, loops=[loop], iterations_by_loop=iterations_by_loop)
+    conn.on(_INTENTS_LIST, [])
+    _script_block_composition(conn, status="reviewing")
+    conn.on(
+        _INTENT_INSERT,
+        _intent_row(role="reviewer", external_id=_REVIEWER_EXTERNAL_SESSION_ID),
+    )
+    dispatch = _RecordingInterruptDispatch()
+
+    outcome = _owner_dispatch_call(_pool(conn), dispatch)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    intent, external_session_id = dispatch.calls[0]
+    assert intent.workflow_role is WorkflowRole.REVIEWER
+    assert external_session_id == _REVIEWER_EXTERNAL_SESSION_ID
+
+
+def test_owner_abort_targets_both_roles_when_both_hold_in_flight_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two demonstrated in-flight activities derive both exact targets, in
+    # the deterministic role order, each through its own exact READY binding.
+    loop, iterations_by_loop = _open_loop_with_unfinalized_iteration()
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="reviewing", session=_ready_session_row())
+    conn.on(_SESSION_READ, _reviewer_session_row())
+    _wire_activity(
+        monkeypatch,
+        executions=[_open_execution()],
+        loops=[loop],
+        iterations_by_loop=iterations_by_loop,
+    )
+    conn.on(_INTENTS_LIST, [])
+    _script_block_composition(conn, status="reviewing")
+    conn.on(_INTENT_INSERT, _intent_row())
+    conn.on(
+        _INTENT_INSERT,
+        _intent_row(role="reviewer", external_id=_REVIEWER_EXTERNAL_SESSION_ID),
+    )
+    dispatch = _RecordingInterruptDispatch()
+
+    outcome = _owner_dispatch_call(_pool(conn), dispatch)
+
+    assert outcome.kind is TaskAbortOutcomeKind.INTERRUPTED
+    assert [call[0].workflow_role for call in dispatch.calls] == [
+        WorkflowRole.PRODUCER,
+        WorkflowRole.REVIEWER,
+    ]
+    assert [call[1] for call in dispatch.calls] == [
+        _EXTERNAL_SESSION_ID,
+        _REVIEWER_EXTERNAL_SESSION_ID,
+    ]
+
+
+def test_owner_abort_refuses_without_durable_in_flight_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No demonstrated in-flight activity derives no candidates: the typed
+    # conflict applies nothing — no block, no intents, no runtime dispatch.
+    conn = ScriptedConnection()
+    _script_dispatch_head(conn, status="waiting_for_owner", session=_ready_session_row())
+    _wire_activity(monkeypatch)
+    conn.on(_INTENTS_LIST, [])
+    dispatch = _RecordingInterruptDispatch()
+
+    with pytest.raises(ConflictError, match="no authorized active workflow activity"):
+        _owner_dispatch_call(_pool(conn), dispatch)
+
+    assert dispatch.calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _TASK_BLOCK_UPDATE) == 0
+    assert _event_types(conn) == []
+
+
+def test_owner_abort_fails_closed_when_the_relevant_binding_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Outstanding producer activity whose exact binding is ENDED cannot be
+    # safely interrupted: the command fails closed instead of silently
+    # discarding the outstanding runtime work.
+    conn = ScriptedConnection()
+    _script_dispatch_head(
+        conn, status="implementing", session=_ready_session_row(lifecycle="ended")
+    )
+    _wire_activity(monkeypatch, executions=[_open_execution()])
+    dispatch = _RecordingInterruptDispatch()
+
+    with pytest.raises(ConflictError, match="not a ready external session"):
+        _owner_dispatch_call(_pool(conn), dispatch)
+
+    assert dispatch.calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+    assert _count(conn, _INTENT_INSERT) == 0
+
+
+def test_owner_abort_on_a_blocked_task_refuses_the_unresolved_interruption() -> None:
+    # The owner command never carries settlement evidence: an already-blocked
+    # Task aborts to the typed unresolved-interruption refusal — never
+    # re-interrupting and never settling.
+    conn = ScriptedConnection()
+    _script_settlement_head(conn, intents=[_intent_row()])
+    dispatch = _RecordingInterruptDispatch()
+
+    with pytest.raises(ConflictError, match="unresolved"):
+        _owner_dispatch_call(_pool(conn), dispatch, expected_state_token=_BLOCKED_TOKEN)
+
+    assert dispatch.calls == []
+    assert _count(conn, _BLOCK_INSERT) == 0
+
+
+def test_owner_abort_rejects_a_malformed_dispatch_seam_before_any_state() -> None:
+    conn = ScriptedConnection()
+
+    with pytest.raises(InvalidCommandError, match="interrupt_dispatch"):
+        abort_task_activity_for_owner(
+            _pool(conn),
+            "not-a-dispatch-seam",  # type: ignore[arg-type]
+            profile_id=_OWNER_PROFILE_ID,
+            workspace_id=_WORKSPACE_ID,
+            task_id=_TASK_ID,
+            expected_state_token=_STATE_TOKEN,
+        )
+
+    assert conn.executed == []

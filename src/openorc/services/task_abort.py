@@ -8,6 +8,13 @@ the existing exact ClineBox session(s). Abort is an OpenOrc workflow action;
 is not a Task cancellation, a session deletion, a resume command, or a
 recovery path — F4b (#230) owns later non-cancellation recovery.
 
+The public Task-level command (issue #380) is
+:func:`abort_task_activity_for_owner`: the Owner names the exact current Task
+and its optimistic-concurrency token only, and the service derives the exact
+interruption targets from the durable admitted-operation evidence inside the
+establish transaction — never a client-selected role list — before resolving
+the relevant exact session bindings under the same guarded composition.
+
 The command has exactly two phases, distinguished by authoritative durable
 state and never by Cline's instantaneous busy/status field:
 
@@ -154,6 +161,7 @@ __all__ = [
     "TaskInterruptOutcome",
     "TaskInterruptSettlement",
     "abort_task_activity",
+    "abort_task_activity_for_owner",
     "apply_owner_authorized_cost_limit_block",
     "dispatch_registered_task_interrupt",
     "establish_owner_authorized_cost_limit_block",
@@ -164,6 +172,7 @@ __all__ = [
 
 _SERVICE_TRACER_SCOPE = "openorc.services.task_abort"
 _ABORT_SPAN_NAME = "task_abort.abort_task_activity"
+_OWNER_ABORT_SPAN_NAME = "task_abort.abort_task_activity_for_owner"
 _OBSERVED_SETTLEMENT_SPAN_NAME = "task_abort.settle_observed_task_interrupt"
 _ANNOTATED_SETTLEMENT_SPAN_NAME = "task_abort.settle_annotated_task_interrupt"
 
@@ -185,6 +194,23 @@ class _D6bSettlementDiscipline(Protocol):
     def settle_abort(
         self, session_id: str, *, runtime_work_settled: bool, operation_accounted_for: bool
     ) -> AgentRuntimeSettlementOutcome: ...
+
+
+class OwnerAbortInterruptDispatch(Protocol):
+    """The composition-rooted per-target Interrupt dispatch seam (issue #380).
+
+    Strictly after the Owner Abort's blocking composition commits — never
+    inside a database transaction — the composition-rooted callable acquires
+    the exact admitted Task/role session's runtime attachment and dispatches
+    the registered one-shot Interrupt through the shared E10b machinery,
+    recording its safe classified outcome on the durable intent. The
+    classified outcome is returned verbatim for the command's truthful
+    per-target representation.
+    """
+
+    def __call__(
+        self, *, intent: TaskInterruptIntent, external_session_id: str
+    ) -> TaskInterruptOutcome: ...
 
 
 # The workflow phases whose authorized autonomous progression (or in-flight
@@ -475,6 +501,58 @@ def _owner_abort_block_context(targets: tuple[_InterruptTarget, ...]) -> dict[st
     }
 
 
+def _derive_owner_interrupt_targets(
+    transaction_pool: DatabasePool, *, task: Task
+) -> tuple[_InterruptTarget, ...]:
+    """Derive the exact interruption targets from durable admitted-operation evidence.
+
+    The public Task-level Owner Abort command (issue #380) never accepts a
+    caller-named target list: the candidate roles are determined FIRST from
+    the same durable in-flight evidence the authorized read's offer
+    (:func:`abort_durably_offered`) and the established eligibility predicates
+    evaluate — a durably OPEN Execution anchoring the Task's producer
+    activity, or an OPEN ReviewLoop carrying an unfinalized ReviewIteration —
+    before any session binding is touched, so an unrelated inactive role's
+    binding state can never influence candidacy. Only the relevant roles'
+    exact bindings are then resolved and validated: a relevant candidate that
+    cannot be paired with a safely resolved READY binding fails closed, and
+    outstanding runtime work is never silently discarded.
+    """
+    producer_candidate = any(
+        execution.status in _OPEN_EXECUTION_STATUSES
+        for execution in execution_records.list_task_executions(transaction_pool, task_id=task.id)
+    )
+    reviewer_candidate = False
+    for loop in review_records.list_task_review_loops(
+        transaction_pool, task_id=task.id, status=ReviewLoopStatus.OPEN
+    ):
+        iterations = review_records.list_review_loop_iterations(
+            transaction_pool, review_loop_id=loop.id
+        )
+        if any(iteration.outcome is None for iteration in iterations):
+            reviewer_candidate = True
+            break
+    if not producer_candidate and not reviewer_candidate:
+        raise ConflictError(
+            "the addressed task has no authorized active workflow activity to abort"
+        )
+    targets: list[_InterruptTarget] = []
+    for role, candidate in (
+        (WorkflowRole.PRODUCER, producer_candidate),
+        (WorkflowRole.REVIEWER, reviewer_candidate),
+    ):
+        if not candidate:
+            continue
+        target = _resolve_interrupt_target(transaction_pool, task=task, role=role)
+        if not _has_admitted_in_flight_activity(transaction_pool, task=task, target=target):
+            raise ConflictError(
+                "the addressed session owns no durably admitted in-flight runtime "
+                "activity to interrupt"
+            )
+        targets.append(target)
+    return tuple(targets)
+
+
 def _establish_abort_plan(
     pool: DatabasePool,
     *,
@@ -484,6 +562,7 @@ def _establish_abort_plan(
     expected_state_token: UUID,
     target_roles: tuple[WorkflowRole, ...],
     settlement: TaskInterruptSettlement | None,
+    derive_targets: bool = False,
 ) -> _DispatchPlan | _SettlementPlan:
     """The authoritative pre-external composition of one Abort command.
 
@@ -492,7 +571,12 @@ def _establish_abort_plan(
     lock, the currentness re-proof, then the phase classification. The
     dispatch branch applies the whole blocking composition atomically; the
     settlement branch only reads the outstanding intents (their settlement
-    happens outside the transaction through the adapter).
+    happens outside the transaction through the adapter). In derivation mode
+    (``derive_targets``, the public Task-level command of issue #380) the
+    dispatch branch derives its exact targets from the durable
+    admitted-operation evidence before resolving the relevant exact session
+    bindings; explicit ``target_roles`` callers keep the established
+    targeting.
     """
     with composed_transaction(pool) as transaction_pool:
         require_account_operational(transaction_pool, profile_id=profile_id)
@@ -536,9 +620,13 @@ def _establish_abort_plan(
             raise InvalidCommandError(
                 "settlement evidence is only admitted for a task already blocked by the owner abort"
             )
-        targets = tuple(
-            _resolve_interrupt_target(transaction_pool, task=task, role=role)
-            for role in target_roles
+        targets = (
+            _derive_owner_interrupt_targets(transaction_pool, task=task)
+            if derive_targets
+            else tuple(
+                _resolve_interrupt_target(transaction_pool, task=task, role=role)
+                for role in target_roles
+            )
         )
         if intent_records.list_unsettled_task_interrupt_intents(transaction_pool, task_id=task_id):
             raise StaleOperationError(
@@ -1376,4 +1464,88 @@ def abort_task_activity(
             task=plan.task,
             task_block=None,
             interrupt_outcomes=outcomes,
+        )
+
+
+def abort_task_activity_for_owner(
+    pool: DatabasePool,
+    interrupt_dispatch: OwnerAbortInterruptDispatch,
+    *,
+    profile_id: UUID,
+    workspace_id: UUID,
+    task_id: UUID,
+    expected_state_token: UUID,
+) -> TaskAbortOutcome:
+    """Abort the Task's authorized active workflow activity with an Interrupt.
+
+    The public Task-level Owner Abort command (issue #380): the Owner names
+    the exact current Task and its optimistic-concurrency token only — never
+    a caller-selected target list and never settlement evidence. One short
+    composed transaction proves the account/Owner/currentness guards, derives
+    the exact interruption targets from the durable admitted-operation
+    evidence (an OPEN Execution anchoring producer activity, an OPEN
+    ReviewLoop carrying an unfinalized iteration — the same facts the G2b
+    offer evaluates), resolves and validates only the relevant exact session
+    bindings fail-closed, and applies the same atomic blocking composition
+    :func:`abort_task_activity` applies. An unrelated idle role's binding —
+    whatever its lifecycle — never influences candidacy; a relevant candidate
+    whose evidence cannot be paired with a safely resolved READY binding
+    fails closed, never silently discarding outstanding runtime work.
+
+    Strictly after the commit — never inside a transaction — the
+    composition-rooted ``interrupt_dispatch`` seam dispatches each registered
+    one-shot Interrupt through its exact admitted binding's runtime
+    attachment and records the shared E10b machinery's safe classified
+    outcome. Dispatch, settlement-or-refusal, and every other established
+    Abort semantic are unchanged: the owner command carries no settlement
+    evidence, so an already-``blocked`` Task aborts to the typed
+    unresolved-interruption refusal.
+    """
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(task_id, "task_id")
+    _require_uuid_command(expected_state_token, "expected_state_token")
+    if not callable(interrupt_dispatch):
+        raise InvalidCommandError(
+            "interrupt_dispatch must be a callable dispatching one registered "
+            "Interrupt intent through its exact admitted binding's runtime"
+        )
+    with application_span(_SERVICE_TRACER_SCOPE, _OWNER_ABORT_SPAN_NAME) as span:
+        # Attach only after the caller-supplied identifiers proved valid: a
+        # malformed command is classified without exporting its values.
+        annotate_span(
+            span,
+            operation=_OWNER_ABORT_SPAN_NAME,
+            workspace_id=str(workspace_id),
+            task_id=str(task_id),
+        )
+        plan = _establish_abort_plan(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            expected_state_token=expected_state_token,
+            target_roles=(),
+            settlement=None,
+            derive_targets=True,
+        )
+        if isinstance(plan, _DispatchPlan):
+            return TaskAbortOutcome(
+                kind=TaskAbortOutcomeKind.INTERRUPTED,
+                task=plan.task,
+                task_block=plan.task_block,
+                interrupt_outcomes=tuple(
+                    interrupt_dispatch(
+                        intent=intent, external_session_id=target.external_session_id
+                    )
+                    for intent, target in plan.targets
+                ),
+            )
+        # Unreachable by construction: derivation mode never admits a
+        # settlement plan — the owner command carries no settlement evidence,
+        # and the blocked-Task abort already raised the typed
+        # unresolved-interruption refusal inside the establish step.
+        raise ConflictError(
+            "the owner activity interruption is unresolved; it must be "
+            "positively settled or reconciled before another abort command"
         )

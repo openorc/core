@@ -103,6 +103,7 @@ __all__ = [
     "OPENORC_CLIENT_IDENTITY",
     "AttachedClineRuntime",
     "ClineAttachmentPhase",
+    "OwnerAbortInterruptDispatcher",
     "attach_cline_runtime",
     "dispatch_cost_limit_interrupt",
     "settle_observed_detached_interrupt",
@@ -619,6 +620,42 @@ def settle_observed_detached_interrupt(
                 pool,
                 attached.adapter,
                 task_id=task_id,
+                intent=intent,
+                external_session_id=external_session_id,
+            )
+
+
+class OwnerAbortInterruptDispatcher:
+    """The composition-rooted per-target Owner-Abort Interrupt dispatch seam (#380).
+
+    The public Task-level Owner Abort command (issue #380) composes this
+    callable: strictly after the blocking composition committed, with no
+    database transaction open, each registered Interrupt intent's dispatch
+    acquires one short trusted attachment lease for the intent's exact
+    admitted Task/role/Connection session and records the shared E10b
+    machinery's safe classified outcome on the durable intent — exactly like
+    the cost-policy control's post-commit dispatch. The adapter's classified
+    outcomes are never interpreted here: a dispatch failure is recorded on
+    the durable intent by that machinery.
+    """
+
+    def __init__(self, pool: DatabasePool) -> None:
+        self._pool = pool
+
+    def __call__(
+        self, *, intent: TaskInterruptIntent, external_session_id: str
+    ) -> task_abort.TaskInterruptOutcome:
+        with attach_cline_runtime(
+            self._pool,
+            workspace_id=intent.workspace_id,
+            task_id=intent.task_id,
+            role=intent.workflow_role,
+            phase=ClineAttachmentPhase.BOUND,
+            external_session_id=external_session_id,
+        ) as attached:
+            return task_abort.dispatch_registered_task_interrupt(
+                self._pool,
+                attached.adapter,
                 intent=intent,
                 external_session_id=external_session_id,
             )
