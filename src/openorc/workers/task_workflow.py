@@ -107,6 +107,7 @@ from openorc.services.task_implementation_authorization import (
     ImplementationAuthorization,
     open_implementation_authorization,
 )
+from openorc.services.task_owner_cost_continue import AuthorizedTaskCostContinue
 from openorc.services.task_owner_resume import (
     AuthorizedTaskResume,
     dispatch_authorized_task_resume,
@@ -609,22 +610,23 @@ def submit_authorized_implementation_after_approval(
 
 
 def submit_task_session_resume_after_authorization(
-    authorized: AuthorizedTaskResume,
+    authorized: AuthorizedTaskResume | AuthorizedTaskCostContinue,
     *,
     dependencies: OperationDependencies,
 ) -> SubmissionResult:
-    """Submit the authorized session-resume continuation after one Resume (F8g).
+    """Submit the authorized session-resume continuation after one authorization.
 
     The explicitly invoked application continuation of the Owner's Resume
-    authorization: the ``AuthorizedTaskResume`` carries the restored Task
-    with its rotated token and the committed one-shot session-resume record —
-    the durable handoff the continuation addresses — so this helper
-    constructs the exact typed invocation from that outcome and submits it
-    for delivery. The record's routing context is re-derived by the executing
-    continuation and is never carried on the wire. The returned submission
-    outcome is transport information only, never Task truth: a known refusal
-    or uncertain submission never fails the already-completed authorization
-    and is never retried here.
+    (F8g, issue #292) or Continue (F8f, issue #291) authorization: the
+    committed authorization carries the restored Task with its rotated token
+    and the one-shot session-resume record — the durable handoff the
+    continuation addresses — so this helper constructs the exact typed
+    invocation from that outcome and submits it for delivery. The record's
+    routing context is re-derived by the executing continuation and is never
+    carried on the wire. The returned submission outcome is transport
+    information only, never Task truth: a known refusal or uncertain
+    submission never fails the already-completed authorization and is never
+    retried here.
     """
     return _submit_continuation(
         dependencies,
