@@ -51,6 +51,7 @@ _ACCOUNT_DELETION_PATH = "/api/v1/profile/account"
 _TASK_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}"
 _TASKS_PATH = "/api/v1/workspaces/{workspace_id}/tasks"
 _TASK_HISTORY_PATH = _TASK_PATH + "/history"
+_TASK_START_PATH = _TASK_PATH + "/start"
 _WORKSPACE_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/events"
 _TASK_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/events"
 _REPOSITORY_TASKS_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
@@ -104,8 +105,10 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_TASKS_PATH, "get"): "list_workspace_tasks",
     (_REPOSITORY_TASKS_PATH, "get"): "list_repository_tasks",
     (_ISSUE_TASKS_PATH, "get"): "list_repository_issue_tasks",
+    (_ISSUE_TASKS_PATH, "post"): "create_repository_issue_task",
     (_TASK_PATH, "get"): "get_task",
     (_TASK_HISTORY_PATH, "get"): "get_task_history",
+    (_TASK_START_PATH, "post"): "start_task",
     (_WORKSPACE_EVENTS_PATH, "get"): "list_workspace_events",
     (_TASK_EVENTS_PATH, "get"): "list_task_events",
     (_TASK_PATH, "delete"): "purge_archived_task",
@@ -157,8 +160,10 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_TASKS_PATH, "get"): "tasks",
     (_REPOSITORY_TASKS_PATH, "get"): "tasks",
     (_ISSUE_TASKS_PATH, "get"): "tasks",
+    (_ISSUE_TASKS_PATH, "post"): "tasks",
     (_TASK_PATH, "get"): "tasks",
     (_TASK_HISTORY_PATH, "get"): "tasks",
+    (_TASK_START_PATH, "post"): "tasks",
     (_WORKSPACE_EVENTS_PATH, "get"): "tasks",
     (_TASK_EVENTS_PATH, "get"): "tasks",
     (_TASK_PATH, "delete"): "tasks",
@@ -210,8 +215,10 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_TASKS_PATH, "get"): {"401", "404", "422", "503"},
     (_REPOSITORY_TASKS_PATH, "get"): {"401", "404", "422", "503"},
     (_ISSUE_TASKS_PATH, "get"): {"401", "404", "422", "503"},
+    (_ISSUE_TASKS_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_TASK_PATH, "get"): {"401", "404", "503"},
     (_TASK_HISTORY_PATH, "get"): {"401", "404", "422", "503"},
+    (_TASK_START_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_TASK_PATH, "delete"): {"401", "404", "409", "503"},
     (_ACCOUNT_DELETION_PATH, "delete"): {"401", "409", "503"},
     (_ISSUES_PATH, "get"): {"401", "404", "422", "503"},

@@ -110,7 +110,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -153,6 +153,7 @@ from openorc.services.session_admission import (
 from openorc.services.task_intake import IssueBlockedEligibilityError
 from openorc.services.task_queue_wake import (
     TaskQueueWakeSubmission,
+    TaskQueueWakeSubmissionOutcome,
     arrange_task_queue_wake,
 )
 from openorc.services.transaction_composition import composed_transaction
@@ -300,9 +301,17 @@ class TaskStartOutcome:
     reservations, and no bootstrap submission from Start — the ONE FIFO
     processor owns every admission, and its ``ADMITTED`` outcomes carry the
     post-claim facts the next F1 handoff addresses.
+
+    ``queue_wake_outcome`` is the actual post-commit wake-delivery evidence
+    returned by the shared arrangement helper (issue #378): the bounded
+    submission outcome exactly as the seam reported it, or ``None`` for an
+    unwired seam. It is transport-facing delivery evidence only — never a
+    Task-state, currentness, or authorization fact, and never a condition
+    of the committed queue entry.
     """
 
     task: Task
+    queue_wake_outcome: TaskQueueWakeSubmissionOutcome | None = None
 
 
 class QueuedCandidateDisposition(StrEnum):
@@ -778,12 +787,17 @@ def start_task_for_owner(
             expected_state_token=expected_state_token,
             source_requirements_fingerprint=fresh_fingerprint,
         )
-        arrange_task_queue_wake(
+        # The post-commit queue-processor wake: the actual delivery outcome
+        # the shared seam returned (including the unwired ``None``) is part
+        # of the truthful invocation result (issue #378). An unwired,
+        # refused, or uncertain wake never fails or reverses the committed
+        # queue entry — the durable ``queued`` facts own recovery.
+        wake_outcome = arrange_task_queue_wake(
             queue_wake,
             workspace_id=workspace_id,
             origin="owner_task_start",
         )
-        return outcome
+        return replace(outcome, queue_wake_outcome=wake_outcome)
 
 
 def _arbitrate_target_start(

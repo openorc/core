@@ -7,6 +7,11 @@ service/domain validation — FastAPI parses the declared shapes and the
 router delegates. No model ever carries conversation text durably: the
 request message travels to the operation invocation, and the conversation
 read projects the runtime-owned messages transiently.
+
+The module also carries the Owner Task-command wire models (issue #378):
+the Start command body and the command-outcome envelopes, which project the
+application services' authoritative post-write snapshots — never a
+re-derived current-state projection and never a command-status ledger.
 """
 
 from __future__ import annotations
@@ -45,8 +50,13 @@ __all__ = [
     "OpenOrcTaskSummaryRead",
     "OpenOrcTaskTerminalizationDetailRead",
     "OpenOrcTaskTerminalizationRead",
+    "RepositoryIssueTaskCreatedRead",
+    "TaskCommandSnapshotRead",
     "TaskListItemRead",
     "TaskListRead",
+    "TaskStartCommand",
+    "TaskStartSnapshotRead",
+    "TaskStartedRead",
     "DiscussionAdmissionRead",
     "DiscussionMessageCreate",
     "DiscussionStatusRead",
@@ -734,3 +744,90 @@ class TaskHistoryRead(BaseModel):
 
     task_id: UUID
     collections: list[TaskHistoryCollectionRead]
+
+
+class TaskStartCommand(BaseModel):
+    """One Owner Start command addressing the exact current Task state token.
+
+    The opaque ``state_token`` is the optimistic-concurrency token the
+    command's guarded ``queued`` write is conditional on: a token that no
+    longer matches the current Task is the typed stale outcome, never a
+    second logical start. No other command input exists — the addressed
+    Task and the caller's authenticated Profile carry everything else.
+    """
+
+    state_token: UUID
+
+
+class TaskCommandSnapshotRead(BaseModel):
+    """The authoritative post-write Task facts of one command outcome (#378).
+
+    These are the committed facts exactly as the command's application
+    service returned them — the snapshot the guarded write produced, not a
+    current-state projection. Subsequent FIFO admission, workflow
+    progression, or concurrent work can move the Task immediately after the
+    command commits; the current-state retrieval is the existing Task-read
+    resource's job, never a re-derivation behind this envelope and never a
+    command-status ledger.
+    """
+
+    task_id: UUID
+    workspace_id: UUID
+    repository_id: UUID
+    github_issue_id: StrictInt
+    github_issue_number: StrictInt
+    status: StrictStr
+    state_token: UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class TaskStartSnapshotRead(TaskCommandSnapshotRead):
+    """The Start command's committed ``queued`` snapshot facts (#378).
+
+    ``queued_at`` is the original durable queue-entry timestamp; the frozen
+    ``source_requirements_fingerprint`` and ``authorized_task_budget_usd``
+    (an exact decimal string, ``null`` when spending policy is disabled)
+    were captured atomically with the same guarded ``queued`` write.
+    """
+
+    queued_at: datetime | None
+    source_requirements_fingerprint: StrictStr | None
+    authorized_task_budget_usd: StrictStr | None
+
+
+class RepositoryIssueTaskCreatedRead(BaseModel):
+    """The intake command outcome for one addressed issue projection (#378).
+
+    ``task`` is the returned Task snapshot exactly as the intake service
+    produced it — its ``status`` is the Task's actual returned status, never
+    an assumed ``ready_to_plan``. ``created`` is the intake uniqueness
+    evidence: ``true`` exactly for the invocation whose insert won the
+    current-Task invariant, ``false`` when a concurrent duplicate converged
+    onto the existing current Task. A fresh Task carries no requirements
+    baseline and no budget (issue #233) — Owner Start, not intake, freezes
+    them — and successful intake never enqueues, never begins planning.
+    """
+
+    task: TaskCommandSnapshotRead
+    created: bool
+
+
+class TaskStartedRead(BaseModel):
+    """The Start command outcome: the committed queue entry plus wake evidence (#378).
+
+    ``task`` is the post-write snapshot of the guarded ``queued`` write,
+    even when FIFO admission advances the Task before this response is
+    written — successful Start means enqueue, never FIFO admission, READY
+    sessions, or completed planning. ``queue_wake_outcome`` is the actual
+    post-commit queue-wake delivery evidence the owning service captured
+    from the shared seam — ``accepted_for_delivery``, ``known_refused``, or
+    ``uncertain`` — with ``null`` for an unwired seam. Delivery evidence is
+    transport information only, kept deliberately separate from the
+    committed queue entry: a refused or uncertain wake never fails or
+    reverses the committed entry, and the durable ``queued`` facts own
+    recovery.
+    """
+
+    task: TaskStartSnapshotRead
+    queue_wake_outcome: StrictStr | None
