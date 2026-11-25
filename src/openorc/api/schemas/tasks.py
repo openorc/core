@@ -11,7 +11,10 @@ read projects the runtime-owned messages transiently.
 The module also carries the Owner Task-command wire models (issue #378):
 the Start command body and the command-outcome envelopes, which project the
 application services' authoritative post-write snapshots — never a
-re-derived current-state projection and never a command-status ledger.
+re-derived current-state projection and never a command-status ledger —
+and the ordinary OwnerGate decision command models (issue #379): the
+approve command body for the three ordinary decision gates and their
+classified outcome envelopes.
 """
 
 from __future__ import annotations
@@ -60,6 +63,13 @@ __all__ = [
     "DiscussionAdmissionRead",
     "DiscussionMessageCreate",
     "DiscussionStatusRead",
+    "ImplementationAuthorizationApprovalRead",
+    "MergeDecisionOutcomeRead",
+    "MergeRetryAttemptRead",
+    "OwnerGateDecisionCommand",
+    "OwnerGateDecisionSnapshotRead",
+    "OwnerGateResolutionRead",
+    "PrAuthorizationApprovalRead",
     "ReviewerConversationMessageRead",
     "ReviewerConversationRead",
 ]
@@ -831,3 +841,161 @@ class TaskStartedRead(BaseModel):
 
     task: TaskStartSnapshotRead
     queue_wake_outcome: StrictStr | None
+
+
+# --- The ordinary OwnerGate decision commands (issue #379) -------------------
+
+
+class OwnerGateDecisionCommand(BaseModel):
+    """The ordinary gate decision command body (#379).
+
+    The same single-input contract as the #378 Start command: the opaque
+    ``state_token`` is the optimistic-concurrency token the guarded gate
+    resolution is conditional on — a token that no longer matches the
+    current Task is the typed stale outcome, never a second logical
+    decision. The addressed Task, its exact current gate, and the caller's
+    authenticated Profile carry everything else; a projected ``approve``
+    action never grants authority by itself — every command independently
+    revalidates the Profile, the current Task token, the exact current
+    gate, and the applicable subject at the service boundary.
+    """
+
+    state_token: UUID
+
+
+class OwnerGateDecisionSnapshotRead(TaskCommandSnapshotRead):
+    """The gate decision commands' authoritative post-write Task facts (#379).
+
+    The #378 command snapshot contract plus ``archived_at``: the merge
+    decision's ``completed`` outcome kind confirms the GitHub-confirmed
+    merge and commits the Task's terminalization, while the mandatory
+    archival belongs to the F10 terminal finalizer strictly after that
+    commitment — so a completed merge can truthfully coexist with a still
+    ``null`` ``archived_at``. The snapshot is the service's returned facts
+    verbatim and never claims archival the Task does not yet carry.
+    """
+
+    archived_at: datetime | None
+
+
+class OwnerGateResolutionRead(BaseModel):
+    """One OwnerGate's resolved or pending subject facts (#379).
+
+    The gate identity, type, status, ``decided_at``, and the exact bound
+    subject form — ``plan_revision_id`` for the plan subject,
+    ``subject_head_sha`` for pre-PR head subjects, and
+    ``task_pull_request_id`` plus the exact ``subject_head_sha`` for PR
+    subjects — verbatim from the service's returned OwnerGate. Deliberately
+    no action menu: menus are the G2b read surface's current-context
+    projection, never a command re-derivation; subsequent gate state comes
+    from the G2b reads.
+    """
+
+    id: UUID
+    gate_type: StrictStr
+    status: StrictStr
+    decided_at: datetime | None
+    plan_revision_id: UUID | None
+    subject_head_sha: StrictStr | None
+    task_pull_request_id: UUID | None
+
+
+class OwnerGateApprovalRead(BaseModel):
+    """The committed ordinary approval outcome of both pure-decision gates (#379).
+
+    ``task`` is the authoritative post-write snapshot (``implementing``
+    after the implementation authorization — the one irreversible planning
+    boundary; still ``waiting_for_owner`` after the PR authorization — that
+    approval is neither a transition nor a PR creation), ``owner_gate`` is
+    the gate resolved APPROVED with truthful OWNER provenance, and
+    ``continuation_outcome`` is the separately-typed post-commit F1
+    delivery evidence for the workflow continuation the approval arranged —
+    ``accepted_for_delivery``, ``known_refused``, or ``uncertain``.
+    Delivery evidence is transport information only, kept deliberately
+    separate from the committed decision: a refused or uncertain
+    continuation never fails or reverses the committed approval, and the
+    committed facts own recovery. Approval alone never certifies
+    implementation completion or PR publication; subsequent state comes
+    from the G2b reads.
+    """
+
+    task: OwnerGateDecisionSnapshotRead
+    owner_gate: OwnerGateResolutionRead
+    continuation_outcome: StrictStr | None
+
+
+class ImplementationAuthorizationApprovalRead(OwnerGateApprovalRead):
+    """The implementation-authorization approval outcome (E5 → E6, #379).
+
+    The committed APPROVED resolution of the exact current
+    IMPLEMENTATION_AUTHORIZATION gate bound to the review-cleared
+    PlanRevision, the ``implementing`` Task with its rotated token, and the
+    separately-typed E5→E6 continuation delivery evidence.
+    """
+
+
+class PrAuthorizationApprovalRead(OwnerGateApprovalRead):
+    """The PR-authorization approval outcome (E7 → E8, #379).
+
+    The committed APPROVED resolution of the exact current
+    PR_AUTHORIZATION gate bound to the authorized committed head (before a
+    canonical PR exists), the still-``waiting_for_owner`` Task under its
+    rotated token, and the separately-typed E7→E8 PR-composition
+    continuation delivery evidence.
+    """
+
+
+class MergeRetryAttemptRead(BaseModel):
+    """The durably authorized automatic merge retry attempt (#379).
+
+    The classified ``retry_authorized`` outcome's committed facts: the
+    exact authorized attempt identity, its 1..3 ``ordinal`` within the
+    episode's bounded budget, the persisted exponential-backoff ``due``
+    instant, and the typed ``error_code`` classification. The due-time
+    wakeup scheduling belongs to the F12 recovery machinery, never to this
+    envelope: the Task stays ``waiting_for_owner`` with no current gate and
+    the committed authorization row owns recovery.
+    """
+
+    id: UUID
+    ordinal: StrictInt
+    due: datetime
+    error_code: StrictStr
+
+
+class MergeDecisionOutcomeRead(BaseModel):
+    """The classified outcome of one Owner merge decision command (#379).
+
+    ``kind`` states which external effect actually occurred:
+    ``completed`` — a GitHub-confirmed merge committed the Task's
+    terminalization (the ``terminalization`` facts projected from the
+    returned Task; the mandatory archival is the F10 terminal finalizer's
+    follow-up, so a confirmed merge can be visible while
+    ``task.archived_at`` is still ``null``); ``retry_gate_installed`` — a
+    definitive no-merge outcome installed the NEW pending exact-head
+    ``retry_gate`` (fresh Owner authorization required);
+    ``retry_authorized`` — the merge send's own classified transient
+    transport failure received ONE durably authorized bounded retry
+    (``retry_attempt``); and ``blocked_stale_operation`` /
+    ``blocked_uncertain`` — the expected-head mismatch or unconfirmable
+    outcome applied the ``task_block`` blocking condition. Every classified
+    kind is a committed durable disposition of a validly addressed command
+    — not an HTTP error. ``pull_request`` is the authoritative reconciled
+    canonical PR the classification is grounded in;
+    ``merge_commit_sha`` carries GitHub's confirmed merge commit exactly
+    where the merge send itself confirmed it — ``null`` when the merge was
+    confirmed through authoritative reconciliation without that SHA, never
+    synthesized. Hard precondition failures are typed HTTP errors, never a
+    classified outcome; approval alone does not certify the merge (an
+    uncertain outcome blocks) and subsequent state comes from the G2b
+    reads.
+    """
+
+    kind: StrictStr
+    task: OwnerGateDecisionSnapshotRead
+    pull_request: GitHubTaskPullRequestRead
+    terminalization: OpenOrcTaskTerminalizationRead | None
+    retry_gate: OwnerGateResolutionRead | None
+    task_block: OpenOrcTaskBlockSummaryRead | None
+    merge_commit_sha: StrictStr | None
+    retry_attempt: MergeRetryAttemptRead | None
