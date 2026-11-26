@@ -189,14 +189,18 @@ def test_real_publications_deliver_through_independent_workspace_subscriptions(
 
         # 2. A committed audit fact publishes the workflow_event hint; the
         #    subscription resolves it through the focused authorized read and
-        #    projects the real durable record.
+        #    projects the real durable record. The recorded context is the
+        #    real guidance producer's shape (workspace_configuration.py: the
+        #    guidance event identifies only the setting change — Owner-authored
+        #    prose is never copied into event context), so the established G2c
+        #    safe-context projection preserves it verbatim.
         event = event_repositories.record_workflow_event(
             pool,
             workspace_id=workspace_a,
             event_type=WorkflowEventType.WORKSPACE_CONFIGURATION_CHANGED,
             actor_type=WorkflowEventActor.OWNER,
             actor_id=str(profile_a),
-            context={"setting": "guidance", "new": "stream guidance"},
+            context={"setting": "guidance"},
         )
         terminal_a, batch_a = _await_batch(subscription_a)
         assert terminal_a is None
@@ -209,8 +213,9 @@ def test_real_publications_deliver_through_independent_workspace_subscriptions(
         assert len(events) == 1
         assert events[0].event.id == event.id
         assert events[0].event.workspace_id == workspace_a
-        # The real G2c safe-context projection ran over the durable row.
-        assert events[0].event.context == {"setting": "guidance", "new": "stream guidance"}
+        # The real G2c safe-context projection ran over the durable row: the
+        # producer-shaped context passes through verbatim.
+        assert events[0].event.context == {"setting": "guidance"}
         assert _quiesce(subscription_b) == []
 
         # 3. A contract-shaped hint for an event that does not exist is
