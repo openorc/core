@@ -12,11 +12,16 @@ and periodic heartbeats — never a third application message.
 
 Transport rules owned here:
 
-- Authorization is re-proved before the response starts (off the event loop)
-  and re-proved on the fixed bounded cadence by the service; the stream also
-  terminates no later than the earlier of the verified credential expiry and
-  the fixed maximum stream lifetime. Known access loss ends the stream; the
-  documented client reconnect re-subscribes and reloads.
+- Authorization is re-proved before the response starts (off the event loop),
+  rechecked after registration together with the subscription's terminal
+  facts (an invalidated subscription or a listener that lost readiness fails
+  closed as 503 — the readiness comment is never emitted for a dead stream),
+  and enforced volume-independently for the stream's whole lifetime: the
+  deadline and the fixed bounded-cadence re-proof run at the top of every
+  bounded drain cycle and every emitted frame is re-checked, so sustained
+  delivery or a slow consumer can never bypass credential expiry, the fixed
+  maximum stream lifetime, or a known invalidation. Known access loss ends
+  the stream; the documented client reconnect re-subscribes and reloads.
 - The consumer is registered and listener readiness is positively checked
   before the initial readiness comment is emitted; an unavailable listener
   fails closed (503) instead of reporting a healthy live stream. There is no
@@ -79,6 +84,13 @@ _STREAM_PATH = "/workspaces/{workspace_id}/stream"
 # every other bound live in the service. There are deliberately no
 # environment knobs.
 _HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+# The drain cap per enforcement cycle (issue #399): the deadline check and
+# the periodic authorization revalidation run at least once per cycle
+# regardless of notification volume, and every emitted frame is re-checked
+# against the deadline and the subscription's terminal facts — sustained
+# delivery can never bypass either bound.
+_MAX_DRAIN_BATCHES_PER_CYCLE = 4
 
 # The transport-level readiness comment: emitted strictly after the consumer
 # is registered on a positively ready listener, before any application
@@ -236,6 +248,18 @@ async def stream_workspace_updates(
     registration: NotificationConsumerRegistration = listener.register_consumer(
         subscription.on_listener_event
     )
+    # The registration raced the listener's health: recheck readiness and the
+    # subscription's terminal facts before any readiness signal. A listener
+    # that lost readiness, or a subscription already invalidated between the
+    # registration and here (a loss or overflow landed first), fails closed
+    # as 503 — the readiness comment is never emitted for a dead stream and
+    # the consumer is cleaned up.
+    if not listener.ready or subscription.terminal is not None:
+        listener.unregister_consumer(registration)
+        subscription.mark_closed()
+        raise IntegrationNotConfiguredError(
+            "the live Workspace update stream is not available in this serving process"
+        )
     return StreamingResponse(
         _stream_events(
             pool=pool,
@@ -248,6 +272,7 @@ async def stream_workspace_updates(
             wake=wake,
             heartbeat_interval=_HEARTBEAT_INTERVAL_SECONDS,
             revalidation_interval=workspace_stream.STREAM_REVALIDATION_INTERVAL_SECONDS,
+            drain_batch_cap=_MAX_DRAIN_BATCHES_PER_CYCLE,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
@@ -266,19 +291,30 @@ async def _stream_events(
     wake: asyncio.Event,
     heartbeat_interval: float,
     revalidation_interval: float,
+    drain_batch_cap: int,
 ) -> AsyncIterator[str]:
     """Run one authorized stream to its termination (issue #399).
 
     Drains the subscription's bounded staging buffer terminal-first, frames
     the two named application message kinds, emits comment-line heartbeats,
     and re-proves access on the fixed bounded cadence — including on quiet
-    streams. Termination is the generator ending: the deadline (credential
-    expiry or maximum lifetime), a listener-loss or overflow terminal fact,
-    or any typed revalidation failure. Cleanup unregisters the consumer and
-    releases the buffer on every exit path, including client disconnect and
-    shutdown.
+    streams. Enforcement is volume-independent: the deadline and the
+    authorization revalidation run at the top of every bounded drain cycle,
+    and every emitted frame is re-checked against the deadline and the
+    subscription's terminal facts, so sustained delivery or a slow consumer
+    can never carry an already-drained batch past credential expiry or past a
+    known invalidation. Termination is the generator ending: the deadline
+    (credential expiry or maximum lifetime), a listener-loss or overflow
+    terminal fact, or any typed revalidation failure. Cleanup unregisters
+    the consumer and releases the buffer on every exit path, including
+    client disconnect and shutdown.
     """
     try:
+        # Readiness is re-checked before the comment: an invalidated
+        # subscription (defense in depth behind the route's post-registration
+        # recheck) never reports a healthy live stream.
+        if subscription.terminal is not None or not listener.ready:
+            return
         # Transport-level readiness: strictly after registration on a
         # positively ready listener, before any application message. No
         # replay exists before or after it.
@@ -286,11 +322,25 @@ async def _stream_events(
         next_heartbeat = _utcnow() + timedelta(seconds=heartbeat_interval)
         next_revalidation = _utcnow() + timedelta(seconds=revalidation_interval)
         while True:
-            if _utcnow() >= deadline:
+            # The per-cycle enforcement checkpoint: deadline first, then the
+            # fixed-cadence re-proof — both effective regardless of
+            # notification volume because the drain below is bounded.
+            now = _utcnow()
+            if now >= deadline:
                 return
-            # Terminal-first drain: a terminal fact closes the stream without
-            # ever emitting staged data past it.
-            while True:
+            if now >= next_revalidation:
+                # The fixed-cadence re-proof (off the event loop), including
+                # on quiet streams; a typed failure terminates the stream.
+                await asyncio.to_thread(
+                    workspace_stream.revalidate_workspace_stream_access,
+                    pool,
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                )
+                next_revalidation = now + timedelta(seconds=revalidation_interval)
+            # Bounded drain: at most ``drain_batch_cap`` batches per cycle so
+            # the enforcement checkpoint above is always reached.
+            for _ in range(drain_batch_cap):
                 terminal, batch = subscription.take_batch()
                 if terminal is not None:
                     return
@@ -304,6 +354,10 @@ async def _stream_events(
                     batch=batch,
                 )
                 for message in messages:
+                    # Per-frame re-check: an already-drained batch never
+                    # emits past credential expiry or a known invalidation.
+                    if _utcnow() >= deadline or subscription.terminal is not None:
+                        return
                     yield _frame_for(message)
             # Bounded wait: the next wake, heartbeat, revalidation, or the
             # deadline — whichever comes first.
@@ -314,16 +368,6 @@ async def _stream_events(
                     await asyncio.wait_for(wake.wait(), timeout=remaining)
             wake.clear()
             now = _utcnow()
-            if now >= next_revalidation:
-                # The fixed-cadence re-proof (off the event loop), including
-                # on quiet streams; a typed failure terminates the stream.
-                await asyncio.to_thread(
-                    workspace_stream.revalidate_workspace_stream_access,
-                    pool,
-                    profile_id=profile_id,
-                    workspace_id=workspace_id,
-                )
-                next_revalidation = now + timedelta(seconds=revalidation_interval)
             if now >= next_heartbeat:
                 yield _HEARTBEAT_COMMENT
                 next_heartbeat = now + timedelta(seconds=heartbeat_interval)

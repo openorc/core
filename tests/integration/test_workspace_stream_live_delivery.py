@@ -80,12 +80,24 @@ def pool(writer: Connection[Any]) -> _SingleConnectionPool:
 
 @pytest.fixture
 def listener(migrated_database: str) -> Iterator[PostgresNotificationListener]:
-    """The real listener over the branch database's session-capable endpoint."""
+    """The real listener over the branch database's session-capable endpoint.
+
+    ``start()`` is asynchronous — the reader establishes the PostgreSQL
+    connection and executes LISTEN on its own thread — so readiness is waited
+    for with a bounded poll instead of asserted synchronously, and the clean
+    stop runs even when startup never became ready.
+    """
     listener = PostgresNotificationListener(migrated_database)
     listener.start()
-    assert listener.ready, "the real listener never became ready"
-    yield listener
-    listener.stop()
+    try:
+        deadline = time.monotonic() + 10.0
+        while not listener.ready:
+            if time.monotonic() >= deadline:
+                raise AssertionError("the real listener never became ready")
+            time.sleep(0.05)
+        yield listener
+    finally:
+        listener.stop()
 
 
 def _subscribe(

@@ -175,13 +175,17 @@ def _project_seam(
     drained: threading.Event | None = None,
     wf_event: PublicWorkflowEvent | None = None,
     read_error: Exception | None = None,
+    release: threading.Event | None = None,
 ) -> list[Any]:
     """Script the focused G2c resolution and record the real batch projection.
 
     The real ``project_stream_batch`` runs (proving the wiring); only the
     focused authorized read it composes is scripted. ``drained`` fires after
     the first projected batch so a driver can terminate the stream
-    deterministically only after the staged messages were emitted.
+    deterministically only after the staged messages were emitted;
+    ``release``, when supplied, blocks the projection's return until the
+    driver sets it — the deterministic way to land invalidation between the
+    drain and the frame emission.
     """
     calls: list[Any] = []
 
@@ -201,6 +205,8 @@ def _project_seam(
         calls.append(("project", list(batch)))
         if drained is not None:
             drained.set()
+        if release is not None:
+            assert release.wait(5), "the driver never released the projection"
         return messages
 
     monkeypatch.setattr(stream_router.workspace_stream, "project_stream_batch", _project)
@@ -232,10 +238,33 @@ def _no_historical_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(event_reads, "list_task_events_for_owner", _forbidden)
 
 
+def _frame_seam(monkeypatch: pytest.MonkeyPatch, *, expected: int) -> threading.Event:
+    """Fire once the expected number of application frames has been framed.
+
+    Framing precedes yielding, so a driver that waits for this gate knows the
+    expected frames are already past their per-frame suppression checks and
+    will be emitted; a loss dispatched after the gate cannot suppress them.
+    """
+    framed = threading.Event()
+    count = {"n": 0}
+    real_frame_for = stream_router._frame_for
+
+    def _frame(message: Any) -> str:
+        payload = real_frame_for(message)
+        count["n"] += 1
+        if count["n"] >= expected:
+            framed.set()
+        return payload
+
+    monkeypatch.setattr(stream_router, "_frame_for", _frame)
+    return framed
+
+
 def _drive_loss_after(
     drained: threading.Event | None,
     listener: FakeNotificationListener,
     *,
+    gates: tuple[threading.Event, ...] = (),
     script: list[Any] | None = None,
     pre_loss_delay: float = 0.0,
 ) -> threading.Thread:
@@ -245,6 +274,8 @@ def _drive_loss_after(
         try:
             if drained is not None:
                 assert drained.wait(5), "the projected batch never drained"
+            for gate in gates:
+                assert gate.wait(5), "the expected frames were never framed"
             if pre_loss_delay:
                 time.sleep(pre_loss_delay)
             for event in script or []:
@@ -298,11 +329,12 @@ def test_the_stream_delivers_both_exact_wire_kinds_after_the_readiness_comment(
     calls = _project_seam(
         monkeypatch, drained=drained, wf_event=_public_event(event_id, workspace_id)
     )
+    framed = _frame_seam(monkeypatch, expected=2)
     revalidations = _revalidation_seam(monkeypatch)
     _no_historical_reads(monkeypatch)
     session = _session(owner_profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
 
-    driver = _drive_loss_after(drained, listener)
+    driver = _drive_loss_after(drained, listener, gates=(framed,))
     with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
         response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
     driver.join(5)
@@ -368,10 +400,11 @@ def test_a_hinted_event_that_no_longer_resolves_is_omitted_while_invalidations_f
         drained=drained,
         read_error=NotFoundError("the requested workflow event is not available in this workspace"),
     )
+    framed = _frame_seam(monkeypatch, expected=1)
     _revalidation_seam(monkeypatch)
     session = _session(owner_profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
 
-    driver = _drive_loss_after(drained, listener)
+    driver = _drive_loss_after(drained, listener, gates=(framed,))
     with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
         response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
     driver.join(5)
@@ -490,13 +523,22 @@ def test_the_stream_terminates_no_later_than_credential_expiry(
 
     def _fake_utcnow() -> datetime:
         clock_calls["count"] += 1
-        # The route's deadline call and the generator's first checks run at
-        # t0; every later check is past the credential expiry.
-        return t0 if clock_calls["count"] <= 4 else t0 + timedelta(hours=1)
+        # The route's deadline call, the generator's setup and first cycle
+        # run at t0; one enforcement cycle elapses past the patched revalidation
+        # interval but still inside the credential validity; every later check
+        # is past the credential expiry.
+        if clock_calls["count"] <= 4:
+            return t0
+        if clock_calls["count"] <= 6:
+            return t0 + timedelta(seconds=0.06)
+        return t0 + timedelta(hours=1)
 
     monkeypatch.setattr(stream_router, "_utcnow", _fake_utcnow)
-    # The quiet stream's first bounded wait is the patched heartbeat tick.
+    # The quiet stream's bounded waits are the patched transport ticks, and
+    # the revalidation cadence is patched to fire inside the credential
+    # validity window.
     monkeypatch.setattr(stream_router, "_HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(workspace_stream, "STREAM_REVALIDATION_INTERVAL_SECONDS", 0.05)
     deadline_calls: list[Any] = []
     real_deadline = workspace_stream.stream_deadline
 
@@ -516,24 +558,25 @@ def test_the_stream_terminates_no_later_than_credential_expiry(
     assert body.startswith(_READY_COMMENT)
     # Termination at expiry is silent: no application message is ever sent —
     # only the transport-level heartbeat comments kept the quiet stream
-    # observable, and the bounded revalidation ran during its lifetime.
+    # observable, and the bounded revalidation ran while the credential was
+    # still valid.
     assert "event:" not in body
     assert ": heartbeat" in body
     assert deadline_calls == [(expiry, workspace_stream.STREAM_MAX_LIFETIME_SECONDS)]
-    assert len(revalidations) >= 1
+    assert len(revalidations) == 1
     assert len(listener.unregistered) == 1
 
 
 # --- subscription bounds and isolation -----------------------------------------
 
 
-def test_a_slow_subscriber_overflows_only_its_own_subscription(
+def test_a_slow_subscriber_overflow_fails_the_stream_closed_before_any_frame(
     monkeypatch: pytest.MonkeyPatch, settings_factory: Any, owner_profile: Profile
 ) -> None:
     workspace_id = uuid.uuid4()
     # Shrink the bound: the complete handoff is the staging buffer plus at
     # most one pending wake, so a burst staged while the drain is blocked
-    # overflows the buffer — terminally, for this subscription only.
+    # overflows the buffer — terminally, before the stream ever starts.
     monkeypatch.setattr(workspace_stream, "STREAM_STAGING_BUFFER_DEPTH", 1)
     burst = [
         NotificationDelivery(
@@ -552,11 +595,13 @@ def test_a_slow_subscriber_overflows_only_its_own_subscription(
     with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
         response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
 
-    assert response.status_code == 200
-    # The terminal-first drain closes the stream on the overflow fact without
-    # ever emitting a staged item; the fifty callbacks all completed without
-    # blocking the dispatcher (the request returned at all).
-    assert response.text == _READY_COMMENT
+    # The post-registration recheck catches the terminal overflow before any
+    # readiness signal: fail closed (503), no readiness comment, no frame,
+    # and the fifty callbacks all completed without blocking the dispatcher
+    # (the request returned at all). Only this subscription is affected.
+    assert response.status_code == 503
+    assert _READY_COMMENT not in response.text
+    assert "event:" not in response.text
     assert len(listener.unregistered) == 1
 
 
@@ -611,11 +656,12 @@ def test_independent_connections_receive_only_their_own_workspace_messages(
         )
         drained = threading.Event()
         _project_seam(monkeypatch, drained=drained, wf_event=_public_event(event_id, workspace_id))
+        framed = _frame_seam(monkeypatch, expected=1)
         _revalidation_seam(monkeypatch)
         profile = Profile(id=uuid.uuid4(), created_at=_OBSERVED)
         session = _session(profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
 
-        driver = _drive_loss_after(drained, listener)
+        driver = _drive_loss_after(drained, listener, gates=(framed,))
         with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
             response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
         driver.join(5)
@@ -628,3 +674,171 @@ def test_independent_connections_receive_only_their_own_workspace_messages(
         assert [name for name, _ in frames] == ["workflow_event"]
         assert str(event_id) in frames[0][1]
         assert str(other_workspace) not in frames[0][1]
+
+
+# --- remediated enforcement bounds (PR review) ---------------------------------
+
+
+def test_a_subscription_invalidated_before_the_stream_starts_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, owner_profile: Profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    # The loss lands between the registration and the route's post-registration
+    # recheck: the readiness comment is never emitted for a dead stream.
+    listener = FakeNotificationListener(burst_on_register=[NotificationDeliveryLost(generation=1)])
+    _revalidation_seam(monkeypatch)
+    session = _session(owner_profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
+    with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
+        response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
+
+    assert response.status_code == 503
+    assert _READY_COMMENT not in response.text
+    assert "event:" not in response.text
+    # The raced consumer is cleaned up: exactly one unregistration, no
+    # healthy stream ever reported.
+    assert len(listener.unregistered) == 1
+
+
+def test_no_application_frame_is_emitted_after_invalidation_is_known(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, owner_profile: Profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    # Three messages are drained (and projected) BEFORE the loss lands: the
+    # per-frame recheck must still suppress every frame of the already-drained
+    # batch once the invalidation is known.
+    burst = [
+        NotificationDelivery(
+            generation=1,
+            message=DataChangedNotification(
+                workspace_id=workspace_id,
+                resource_type=NotificationResourceType.TASK,
+                resource_id=uuid.uuid4(),
+            ),
+        )
+        for _ in range(3)
+    ]
+    listener = FakeNotificationListener(burst_on_register=burst)
+    drained = threading.Event()
+    loss_dispatched = threading.Event()
+    _project_seam(monkeypatch, drained=drained, release=loss_dispatched)
+    _revalidation_seam(monkeypatch)
+    session = _session(owner_profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
+
+    def run() -> None:
+        try:
+            assert drained.wait(5), "the staged batch never drained"
+            listener.dispatch(NotificationDeliveryLost(generation=listener.generation_value))
+        finally:
+            loss_dispatched.set()
+
+    driver = threading.Thread(target=run, daemon=True)
+    driver.start()
+    with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
+        response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
+    driver.join(5)
+    assert not driver.is_alive()
+
+    assert response.status_code == 200
+    # The readiness comment was truthfully emitted (the stream was live and
+    # the batch drained before the loss), but no application frame of the
+    # already-drained batch flows past the known invalidation.
+    assert response.text == _READY_COMMENT
+    assert len(listener.unregistered) == 1
+
+
+def test_sustained_delivery_cannot_bypass_credential_expiry(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, owner_profile: Profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    t0 = datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)
+    expiry = t0 + timedelta(seconds=60)
+    clock_calls = {"count": 0}
+
+    def _fake_utcnow() -> datetime:
+        clock_calls["count"] += 1
+        # The route's deadline call, the generator's setup and first cycle
+        # run at t0; the first emitted frame's recheck still runs at t0; every
+        # later per-frame recheck is past the credential expiry.
+        if clock_calls["count"] <= 5:
+            return t0
+        return t0 + timedelta(hours=1)
+
+    monkeypatch.setattr(stream_router, "_utcnow", _fake_utcnow)
+    burst = [
+        NotificationDelivery(
+            generation=1,
+            message=DataChangedNotification(
+                workspace_id=workspace_id,
+                resource_type=NotificationResourceType.TASK,
+                resource_id=uuid.uuid4(),
+            ),
+        )
+        for _ in range(6)
+    ]
+    listener = FakeNotificationListener(burst_on_register=burst)
+    _revalidation_seam(monkeypatch)
+    session = _session(owner_profile, expires_at=expiry)
+    with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
+        response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.startswith(_READY_COMMENT)
+    frames = _parse_frames(body)
+    # Sustained (already-staged) delivery cannot carry the drained batch past
+    # credential expiry: exactly the frame whose recheck preceded the expiry
+    # was emitted; every later frame was suppressed and the stream ended.
+    assert [name for name, _ in frames] == ["data_changed"]
+    assert len(listener.unregistered) == 1
+
+
+def test_sustained_delivery_cannot_bypass_authorization_revalidation(
+    monkeypatch: pytest.MonkeyPatch, settings_factory: Any, owner_profile: Profile
+) -> None:
+    workspace_id = uuid.uuid4()
+    # Sustained delivery keeps the staging buffer non-empty across the whole
+    # revalidation interval: the bounded drain cap must still hand control to
+    # the enforcement checkpoint, where the re-proof runs.
+    monkeypatch.setattr(workspace_stream, "STREAM_REVALIDATION_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(stream_router, "_HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(workspace_stream, "STREAM_STAGING_BUFFER_DEPTH", 256)
+    listener = FakeNotificationListener()
+    revalidations = _revalidation_seam(monkeypatch)
+    session = _session(owner_profile, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
+
+    def run() -> None:
+        try:
+            # Sustained delivery spanning several revalidation intervals, each
+            # message waking the drain — the buffer never empties for long and
+            # never overflows (bounded depth 256).
+            for _ in range(40):
+                listener.dispatch(
+                    NotificationDelivery(
+                        generation=1,
+                        message=DataChangedNotification(
+                            workspace_id=workspace_id,
+                            resource_type=NotificationResourceType.TASK,
+                            resource_id=uuid.uuid4(),
+                        ),
+                    )
+                )
+                time.sleep(0.005)
+        finally:
+            listener.dispatch(NotificationDeliveryLost(generation=listener.generation_value))
+
+    driver = threading.Thread(target=run, daemon=True)
+    driver.start()
+    with _stream_client(monkeypatch, settings_factory(), session, listener) as client:
+        response = client.get(f"/api/v1/workspaces/{workspace_id}/stream")
+    driver.join(5)
+    assert not driver.is_alive()
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.startswith(_READY_COMMENT)
+    # The re-proof ran while notifications kept flowing — the enforcement
+    # checkpoint is reached under sustained delivery, not only on quiet
+    # streams — and the messages delivered throughout.
+    assert len(revalidations) >= 1
+    assert len(_parse_frames(body)) >= 1
+    assert len(listener.unregistered) == 1
