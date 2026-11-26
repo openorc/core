@@ -16,6 +16,7 @@ import json
 import logging
 import time
 import urllib.error
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -152,7 +153,25 @@ def test_valid_token_resolves_the_sub_uuid_principal() -> None:
 
     principal = verifier.verify(_sign(private_key, claims))
 
-    assert principal == AuthenticatedPrincipal(user_id=UUID(claims["sub"]))
+    assert principal == AuthenticatedPrincipal(
+        user_id=UUID(claims["sub"]),
+        expires_at=datetime.fromtimestamp(claims["exp"], tz=UTC),
+    )
+
+
+def test_valid_token_surfaces_the_verified_expiry_bound() -> None:
+    # The verified ``exp`` claim is the principal's token validity bound: the
+    # authorized Workspace SSE stream (issue #399) terminates no later than
+    # this instant. It is the normalized verified claim value — no other
+    # token material is carried on the principal.
+    private_key = _ec_private_key()
+    claims = _base_claims()
+    verifier = _verifier([_jwk_entry(private_key, "key-1", "ES256")])
+
+    principal = verifier.verify(_sign(private_key, claims))
+
+    assert principal.expires_at == datetime.fromtimestamp(claims["exp"], tz=UTC)
+    assert principal.expires_at.tzinfo is UTC
 
 
 def test_valid_rsa_signed_token_resolves_the_principal() -> None:

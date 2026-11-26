@@ -45,6 +45,7 @@ from openorc.api.routers.task_commands import router as task_commands_router
 from openorc.api.routers.task_reads import router as task_reads_router
 from openorc.api.routers.tasks import router as tasks_router
 from openorc.api.routers.workspace_refresh import router as workspace_refresh_router
+from openorc.api.routers.workspace_stream import router as workspace_stream_router
 from openorc.api.routers.workspaces import router as workspaces_router
 from openorc.config import ExecutionMode, Settings
 from openorc.notifications.listener import (
@@ -86,8 +87,9 @@ API_DESCRIPTION = (
     "#372), the Profile's GitHub user-authorization status/start/"
     "reauthorization/revocation routes (issue #373), the safe administrative "
     "disconnect/deletion and permanent account-deletion routes (issue #374), "
-    "the role-binding configuration routes (issue #162), and the Task "
-    "discussion/conversation routes (issue #339), authenticated by a "
+    "the role-binding configuration routes (issue #162), the Task "
+    "discussion/conversation routes (issue #339), and the authorized "
+    "Workspace SSE live-update stream (issue #399), authenticated by a "
     "Supabase Auth session JWT (GitHub-only sign-in) supplied as an HTTP "
     "Bearer credential — publishable and secret Supabase keys are not user "
     "JWTs. Deterministic health (/healthz), provider webhook ingress "
@@ -198,6 +200,25 @@ OPENAPI_TAG_METADATA = [
             "supported Supabase Auth Admin delete with no transaction open. "
             "Only the caller's own account is addressable; the truthful end "
             "states, guarded conflicts, and honest known/unknown failures."
+        ),
+    },
+    {
+        "name": "workspace-stream",
+        "description": (
+            "Authorized Workspace SSE live updates (issue #399): the one "
+            "Owner-authorized per-Workspace text/event-stream subscription "
+            "over the shared process-local notification listener. Exactly two "
+            "named application message kinds — workflow_event (the durable "
+            "audit fact in the exact G2c read shape, resolved per hint through "
+            "the focused authorized event read) and data_changed (the "
+            "identifier-only invalidation envelope over the closed resource "
+            "vocabulary, deletion-agnostic). One subscription covers every "
+            "Task and Repository in the Workspace; delivery is best-effort "
+            "with no replay — the stream ends no later than the earlier of "
+            "credential expiry and a fixed maximum lifetime, and on any lost "
+            "periodic access re-proof; clients reconnect with a fresh "
+            "subscription and reload through the existing reads. SSE comments "
+            "are transport-level readiness and heartbeats only."
         ),
     },
     {
@@ -485,6 +506,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(task_reads_router, prefix="/api/v1")
     app.include_router(task_commands_router, prefix="/api/v1")
     app.include_router(event_reads_router, prefix="/api/v1")
+    # The authorized Workspace SSE live-update stream (issue #399): the one
+    # Owner-authorized per-Workspace subscription over the shared
+    # process-local notification listener, delivering exactly two named
+    # application message kinds beside the audit reads.
+    app.include_router(workspace_stream_router, prefix="/api/v1")
     # The private queue-mode detached-turn observation registration transport
     # (issue #346): deployment-only, authenticated, and nonpublic; it serves
     # the serving process's own observation host and is never an application

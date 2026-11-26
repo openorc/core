@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -97,7 +98,9 @@ def test_service_authentication_fails_closed_for_a_deleted_auth_user(
     # A permanently deleted Auth user with a still-valid JWT: Profile
     # bootstrap is impossible (FK) and the service translates the violation
     # into a typed authentication failure instead of recreating the identity.
-    principal = AuthenticatedPrincipal(user_id=uuid.uuid4())
+    principal = AuthenticatedPrincipal(
+        user_id=uuid.uuid4(), expires_at=datetime(2099, 1, 1, tzinfo=UTC)
+    )
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
 
     with pytest.raises(AuthenticationError, match="no longer exists"):
@@ -114,7 +117,9 @@ def test_service_authentication_resolves_the_bootstrapped_profile(
     user_id = uuid.uuid4()
     conn.execute("insert into auth.users (id) values (%s)", (user_id,))
     pool = cast(DatabasePool, _SingleConnectionPool(conn))
-    verifier = _StaticVerifier(AuthenticatedPrincipal(user_id=user_id))
+    verifier = _StaticVerifier(
+        AuthenticatedPrincipal(user_id=user_id, expires_at=datetime(2099, 1, 1, tzinfo=UTC))
+    )
 
     result = authenticate(pool, cast(Any, verifier), token="unused-by-the-static-verifier")
 

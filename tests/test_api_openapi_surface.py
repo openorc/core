@@ -63,6 +63,7 @@ _CONTINUE_COST_LIMIT_PATH = _GATE_PATH + "/continue-cost-limit"
 _RESUME_ABORT_PATH = _GATE_PATH + "/resume-abort"
 _WORKSPACE_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/events"
 _TASK_EVENTS_PATH = "/api/v1/workspaces/{workspace_id}/tasks/{task_id}/events"
+_WORKSPACE_STREAM_PATH = "/api/v1/workspaces/{workspace_id}/stream"
 _REPOSITORY_TASKS_PATH = "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/tasks"
 _ISSUE_TASKS_PATH = (
     "/api/v1/workspaces/{workspace_id}/repositories/{repository_id}/issues/{issue_id}/tasks"
@@ -128,6 +129,7 @@ _PUBLIC_V1_OPERATIONS: dict[tuple[str, str], str] = {
     (_RESUME_ABORT_PATH, "post"): "resume_task_after_abort",
     (_WORKSPACE_EVENTS_PATH, "get"): "list_workspace_events",
     (_TASK_EVENTS_PATH, "get"): "list_task_events",
+    (_WORKSPACE_STREAM_PATH, "get"): "stream_workspace_updates",
     (_TASK_PATH, "delete"): "purge_archived_task",
     (_ACCOUNT_DELETION_PATH, "delete"): "delete_account",
     (_ISSUES_PATH, "get"): "list_repository_github_issues",
@@ -191,6 +193,7 @@ _OPERATION_TAGS: dict[tuple[str, str], str] = {
     (_RESUME_ABORT_PATH, "post"): "tasks",
     (_WORKSPACE_EVENTS_PATH, "get"): "tasks",
     (_TASK_EVENTS_PATH, "get"): "tasks",
+    (_WORKSPACE_STREAM_PATH, "get"): "workspace-stream",
     (_TASK_PATH, "delete"): "tasks",
     (_ACCOUNT_DELETION_PATH, "delete"): "account",
     (_ISSUES_PATH, "get"): "github-issues",
@@ -259,6 +262,7 @@ _DOCUMENTED_ERROR_STATUSES: dict[tuple[str, str], set[str]] = {
     (_WORKSPACE_REFRESH_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_REPOSITORY_REFRESH_PATH, "post"): {"401", "404", "409", "422", "503"},
     (_REFRESH_STATUS_PATH, "get"): {"401", "404", "422", "503"},
+    (_WORKSPACE_STREAM_PATH, "get"): {"401", "404", "503"},
 }
 
 
@@ -333,6 +337,7 @@ def test_public_operations_carry_stable_operation_ids_and_public_tags(settings_f
         "repositories",
         "role-bindings",
         "tasks",
+        "workspace-stream",
         "account",
         "health",
         "github-webhooks",

@@ -51,6 +51,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import urlparse
 from uuid import UUID
@@ -578,4 +579,20 @@ class SupabaseAccessTokenVerifier:
                 "authentication failed: the access token subject is not a valid account identifier"
             ) from exc
 
-        return AuthenticatedPrincipal(user_id=user_id)
+        # The ``exp`` claim is required and freshness-validated by the decode
+        # above; it is surfaced (normalized to UTC) as the principal's verified
+        # validity bound for the authorized Workspace SSE stream lifetime rule
+        # (issue #399). No other claim value is carried on the principal.
+        expiry = claims.get("exp")
+        if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+            raise SupabaseAccessTokenRejectedError(
+                "authentication failed: the access token expiry claim is invalid"
+            )
+        try:
+            expires_at = datetime.fromtimestamp(expiry, tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise SupabaseAccessTokenRejectedError(
+                "authentication failed: the access token expiry claim is invalid"
+            ) from exc
+
+        return AuthenticatedPrincipal(user_id=user_id, expires_at=expires_at)

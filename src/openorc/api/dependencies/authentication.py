@@ -26,6 +26,8 @@ and hands the resolved Profile to authorized routes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from typing import Annotated
 
@@ -39,7 +41,12 @@ from openorc.persistence.pool import get_database_pool
 from openorc.services.authentication import authenticate
 from openorc.services.errors import AuthenticationError, IntegrationNotConfiguredError
 
-__all__ = ["authenticated_profile", "supabase_session_jwt_bearer"]
+__all__ = [
+    "AuthenticatedSession",
+    "authenticated_profile",
+    "authenticated_session",
+    "supabase_session_jwt_bearer",
+]
 
 _UNAUTHENTICATED_MESSAGE = "authentication failed: the access token is missing or malformed"
 
@@ -77,6 +84,46 @@ def authenticated_profile(
         _verifier_for(settings),
         token=_extract_bearer_token(credentials),
     ).profile
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedSession:
+    """The authenticated Profile plus its verified credential expiry.
+
+    The dependency's response to the authorized Workspace SSE stream boundary
+    (issue #399): the same single #52 authentication resolution, with the
+    principal's verified ``exp`` surfaced so a live stream terminates no later
+    than credential validity. The expiry is an ordinary verified claim value —
+    never credential material — and the Profile is ordinary authenticated
+    identity, never itself an authorization capability.
+    """
+
+    profile: Profile
+    expires_at: datetime
+
+
+def authenticated_session(
+    request: Request,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Security(supabase_session_jwt_bearer)
+    ] = None,
+) -> AuthenticatedSession:
+    """Resolve the authenticated Profile and its verified credential expiry (#399).
+
+    The same single ``authenticate`` boundary as :func:`authenticated_profile`
+    (one verification, one Profile resolution); the Workspace stream route is
+    the first consumer of the verified token validity bound. No new
+    authentication subsystem and no token-refresh mechanism exist: a stream
+    outliving its credential is prevented by terminating at the expiry, and
+    the client's documented reconnect re-authenticates.
+    """
+    settings: Settings = request.app.state.settings
+    user = authenticate(
+        get_database_pool(settings),
+        _verifier_for(settings),
+        token=_extract_bearer_token(credentials),
+    )
+    return AuthenticatedSession(profile=user.profile, expires_at=user.principal.expires_at)
 
 
 def _extract_bearer_token(credentials: HTTPAuthorizationCredentials | None) -> str:
