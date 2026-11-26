@@ -672,6 +672,12 @@ def test_deletion_publishes_old_identities_through_cascades(
         writer, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=7701
     )
     task_id = _insert_task(writer, workspace_id=workspace_id, repository_id=repository_id)
+    project_row = writer.execute(
+        "select project_id from openorc.repositories where id = %s",
+        (repository_id,),
+    ).fetchone()
+    assert project_row is not None
+    project_id = project_row[0]
     collector.quiesce()
 
     deleted = deletion_repositories.delete_repository(pool, repository_id)
@@ -689,10 +695,18 @@ def test_deletion_publishes_old_identities_through_cascades(
     }
 
     # Workspace removal publishes its own identity for stream invalidation.
+    # The repository deletion above leaves the Workspace's Project in place,
+    # so the sanctioned workspace cascade also removes it: its project hint
+    # publishes alongside the removed Workspace's own identity, and the
+    # installation's conservative workspace hint coalesces into the same
+    # workspace payload.
     deleted_workspace = deletion_repositories.delete_workspace(pool, workspace_id)
     assert deleted_workspace is not None
-    hints = _hints(collector, count=1)
-    assert hints == [_data_changed(workspace_id, NotificationResourceType.WORKSPACE, workspace_id)]
+    hints = _hints(collector, count=2)
+    assert _hint_identities(hints) == {
+        (workspace_id, NotificationResourceType.WORKSPACE, workspace_id),
+        (workspace_id, NotificationResourceType.PROJECT, project_id),
+    }
 
 
 def test_queue_membership_changes_publish_workspace_hints(
