@@ -125,6 +125,29 @@ def test_workspace_resource_identity_round_trips() -> None:
     )
 
 
+def test_workspace_resource_identity_mismatch_is_rejected() -> None:
+    payload = (
+        '{"kind":"data_changed",'
+        '"workspace_id":"00000000-0000-0000-0000-000000000001",'
+        '"resource_type":"workspace",'
+        '"resource_id":"00000000-0000-0000-0000-000000000009"}'
+    )
+
+    with pytest.raises(NotificationContractError, match="workspace_id"):
+        decode_notification_payload(payload)
+
+
+def test_encoding_rejects_workspace_identity_mismatch() -> None:
+    with pytest.raises(NotificationContractError, match="workspace_id"):
+        encode_notification_payload(
+            DataChangedNotification(
+                workspace_id=UUID("00000000-0000-0000-0000-000000000001"),
+                resource_type=NotificationResourceType.WORKSPACE,
+                resource_id=UUID("00000000-0000-0000-0000-000000000009"),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_fragment"),
     [

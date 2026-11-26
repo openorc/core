@@ -10,6 +10,7 @@ and a clean idempotent stop. No database and no real connection is touched.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from time import monotonic
@@ -30,9 +31,11 @@ from openorc.notifications.listener import (
     BOUNDED_DELIVERY_QUEUE_DEPTH,
     ConnectionFactory,
     NotificationConsumerEvent,
+    NotificationDelivery,
     NotificationDeliveryLost,
     NotificationDeliveryReady,
     PostgresNotificationListener,
+    _DeliveryState,
 )
 
 _LISTENER_CONNINFO = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
@@ -135,20 +138,20 @@ def static_connect(connection: FakeConnection) -> ConnectionFactory:
     return cast(ConnectionFactory, lambda _conninfo: connection)
 
 
+def workflow_message() -> WorkflowEventNotification:
+    return WorkflowEventNotification(workspace_id=uuid4(), workflow_event_id=uuid4())
+
+
+def data_changed_message() -> DataChangedNotification:
+    return DataChangedNotification(
+        workspace_id=uuid4(),
+        resource_type=NotificationResourceType.TASK,
+        resource_id=uuid4(),
+    )
+
+
 def workflow_payload() -> str:
-    return encode_notification_payload(
-        WorkflowEventNotification(workspace_id=uuid4(), workflow_event_id=uuid4())
-    )
-
-
-def data_changed_payload() -> str:
-    return encode_notification_payload(
-        DataChangedNotification(
-            workspace_id=uuid4(),
-            resource_type=NotificationResourceType.TASK,
-            resource_id=uuid4(),
-        )
-    )
+    return encode_notification_payload(workflow_message())
 
 
 def _listener(
@@ -186,13 +189,15 @@ def test_delivers_generation_tagged_messages_in_order() -> None:
     listener.register_consumer(collector)
     listener._note_listen_ready()
 
-    listener._deliver_incoming_payload(workflow_payload())
-    listener._deliver_incoming_payload(data_changed_payload())
+    first = workflow_message()
+    second = data_changed_message()
+    listener._deliver_incoming_payload(encode_notification_payload(first))
+    listener._deliver_incoming_payload(encode_notification_payload(second))
 
     assert listener._run_dispatch_cycle() is False
     assert collector.events[0] == NotificationDeliveryReady(generation=1)
-    assert isinstance(collector.events[1], WorkflowEventNotification)
-    assert isinstance(collector.events[2], DataChangedNotification)
+    assert collector.events[1] == NotificationDelivery(generation=1, message=first)
+    assert collector.events[2] == NotificationDelivery(generation=1, message=second)
 
 
 def test_overflow_invalidates_generation_and_suppresses_stale_entries() -> None:
@@ -203,11 +208,14 @@ def test_overflow_invalidates_generation_and_suppresses_stale_entries() -> None:
     assert listener.generation == 1
     assert listener.ready is True
 
-    listener._deliver_incoming_payload(workflow_payload())
-    listener._deliver_incoming_payload(workflow_payload())
+    first = workflow_message()
+    second = workflow_message()
+    third = workflow_message()
+    listener._deliver_incoming_payload(encode_notification_payload(first))
+    listener._deliver_incoming_payload(encode_notification_payload(second))
     # The bounded queue is full: the next message triggers the overflow path
     # and is dropped — the reader never blocks on the queue.
-    listener._deliver_incoming_payload(workflow_payload())
+    listener._deliver_incoming_payload(encode_notification_payload(third))
     assert listener.generation == 2
 
     assert listener._run_dispatch_cycle() is False
@@ -221,9 +229,10 @@ def test_overflow_invalidates_generation_and_suppresses_stale_entries() -> None:
         NotificationDeliveryReady(generation=2),
     ]
 
-    listener._deliver_incoming_payload(workflow_payload())
+    recovered = workflow_message()
+    listener._deliver_incoming_payload(encode_notification_payload(recovered))
     assert listener._run_dispatch_cycle() is False
-    assert isinstance(collector.events[2], WorkflowEventNotification)
+    assert collector.events[2] == NotificationDelivery(generation=2, message=recovered)
 
 
 def test_multi_episode_collapse_supersedes_false_readiness() -> None:
@@ -336,16 +345,86 @@ def test_stop_supersedes_pending_readiness_and_ends_dispatch() -> None:
     assert collector.events == []
 
 
+def test_stopped_listener_refuses_late_transitions() -> None:
+    # Shutdown is irreversible: a late connection establishment, overflow, or
+    # connection failure after the stop can never restore readiness, churn
+    # the generation, or pend control signals.
+    state = _DeliveryState()
+    state.note_stopped()
+
+    state.note_listen_ready()
+    state.note_overflow()
+    state.note_connection_lost()
+
+    assert state.stopped is True
+    assert state.ready is False
+    assert state.generation == 0
+    assert state.pending_loss is False
+    assert state.pending_ready is False
+
+
+def test_invalidation_during_dispatch_gates_remaining_consumers() -> None:
+    listener = _listener()
+    gate_collector = EventCollector()
+    late_collector = EventCollector()
+
+    def invalidating_consumer(event: NotificationConsumerEvent) -> None:
+        gate_collector.events.append(event)
+        if isinstance(event, NotificationDelivery):
+            # Invalidate the delivery generation while the dispatcher is
+            # handing the message to the registered consumer snapshot.
+            listener._note_connection_lost()
+
+    listener.register_consumer(invalidating_consumer)
+    listener.register_consumer(late_collector)
+    listener._note_listen_ready()
+
+    # Flush the initial readiness signal so both consumers are established
+    # on the quiescent current generation before the message dispatch.
+    assert listener._run_dispatch_cycle() is False
+    assert gate_collector.events == [NotificationDeliveryReady(generation=1)]
+    assert late_collector.events == [NotificationDeliveryReady(generation=1)]
+
+    message = workflow_message()
+    listener._deliver_incoming_payload(encode_notification_payload(message))
+
+    assert listener._run_dispatch_cycle() is False
+
+    # The first consumer received the then-current delivery; its callback
+    # invalidated the generation, so the remaining consumer of the same
+    # snapshot never receives the now-stale delivery.
+    assert gate_collector.events == [
+        NotificationDeliveryReady(generation=1),
+        NotificationDelivery(generation=1, message=message),
+    ]
+    assert late_collector.events == [NotificationDeliveryReady(generation=1)]
+
+    # The coalesced loss is a monotone fact and is handed to every consumer
+    # on the following cycle — with no further PostgreSQL notifications.
+    assert listener._run_dispatch_cycle() is False
+    assert gate_collector.events == [
+        NotificationDeliveryReady(generation=1),
+        NotificationDelivery(generation=1, message=message),
+        NotificationDeliveryLost(generation=2),
+    ]
+    assert late_collector.events == [
+        NotificationDeliveryReady(generation=1),
+        NotificationDeliveryLost(generation=2),
+    ]
+
+
 def test_queue_depth_must_be_positive() -> None:
     with pytest.raises(ValueError, match="positive"):
         _listener(delivery_queue_depth=0)
 
 
 def test_start_delivers_readiness_and_messages_and_stops_cleanly() -> None:
+    first = workflow_message()
+    second = data_changed_message()
     connection = FakeConnection(
         notifications=[
-            FakeNotify(NOTIFICATION_CHANNEL, workflow_payload()),
-            FakeNotify(NOTIFICATION_CHANNEL, data_changed_payload()),
+            FakeNotify(NOTIFICATION_CHANNEL, encode_notification_payload(first)),
+            FakeNotify(NOTIFICATION_CHANNEL, encode_notification_payload(second)),
         ]
     )
     listener = _listener(connect=static_connect(connection))
@@ -357,8 +436,8 @@ def test_start_delivers_readiness_and_messages_and_stops_cleanly() -> None:
     assert connection.executed_sql == [f"LISTEN {NOTIFICATION_CHANNEL}"]
     assert collector.wait_for(3) is True
     assert collector.events[0] == NotificationDeliveryReady(generation=1)
-    assert isinstance(collector.events[1], WorkflowEventNotification)
-    assert isinstance(collector.events[2], DataChangedNotification)
+    assert collector.events[1] == NotificationDelivery(generation=1, message=first)
+    assert collector.events[2] == NotificationDelivery(generation=1, message=second)
 
     listener.stop()
     assert connection.closed is True
@@ -385,15 +464,12 @@ def test_reconnect_restores_readiness_with_a_new_generation() -> None:
     assert collector.wait_for(3) is True
     losses = [e for e in collector.events if isinstance(e, NotificationDeliveryLost)]
     readies = [e for e in collector.events if isinstance(e, NotificationDeliveryReady)]
-    messages = [
-        e
-        for e in collector.events
-        if isinstance(e, (WorkflowEventNotification, DataChangedNotification))
-    ]
+    messages = [e for e in collector.events if isinstance(e, NotificationDelivery)]
     assert len(losses) >= 1
     assert losses[-1].generation <= listener.generation
     assert readies and readies[-1].generation == listener.generation
     assert len(messages) == 1
+    assert messages[0].generation == listener.generation
 
     listener.stop()
     assert recovered.closed is True
@@ -413,3 +489,44 @@ def test_start_is_idempotent() -> None:
     assert listener._reader is reader
     assert listener._dispatcher is dispatcher
     listener.stop()
+
+
+class BlockingConnectFactory:
+    """Connection factory that blocks in establishment until released."""
+
+    def __init__(self) -> None:
+        self.establishing = threading.Event()
+        self.release = threading.Event()
+        self.connection: FakeConnection | None = None
+
+    def __call__(self, conninfo: str) -> FakeConnection:
+        self.establishing.set()
+        assert self.release.wait(5.0), "the blocked establishment was never released"
+        self.connection = FakeConnection()
+        return self.connection
+
+
+def test_stop_during_connection_establishment_cannot_restore_readiness() -> None:
+    # Shutdown occurring while a connection attempt is in flight is
+    # irreversible: the late establishment and its LISTEN execution must
+    # never restore readiness on the already-stopped listener.
+    factory = BlockingConnectFactory()
+    listener = _listener(connect=cast(ConnectionFactory, factory))
+    collector = EventCollector()
+    listener.register_consumer(collector)
+
+    listener.start()
+    assert factory.establishing.wait(5.0) is True
+
+    stopper = threading.Thread(target=listener.stop)
+    stopper.start()
+    # Release the establishment only after the stop has been signaled.
+    assert wait_until(lambda: listener._stop_event.is_set()) is True
+    factory.release.set()
+    stopper.join(10.0)
+
+    assert listener.ready is False
+    assert listener.generation == 0
+    assert factory.connection is not None and factory.connection.closed is True
+    assert listener._reader is not None and not listener._reader.is_alive()
+    assert collector.events == []

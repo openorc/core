@@ -307,7 +307,9 @@ def _serving_lifespan(
     teardown, after the executor drained and the observer was disposed, so
     late-commit notifications during drain still deliver. The listener never
     runs at import, in ``create_app()``, in an RQ parent or workhorse, or per
-    browser connection.
+    browser connection, and its entire started lifetime is enclosed by a
+    cleanup boundary: a startup failure after ``start()`` or a raising
+    teardown step still reaches the clean stop.
     """
 
     @asynccontextmanager
@@ -322,101 +324,106 @@ def _serving_lifespan(
         # resolved from settings.
         listener = _build_notification_listener(settings)
         listener.start()
-        dependencies = build_default_operation_dependencies(settings)
-        if settings.execution_mode is ExecutionMode.REGULAR:
-            # The process-owned detached-turn observation host (issue #323):
-            # started before any operation can dispatch and disposed after
-            # the executor drained, so a registration from an in-flight
-            # operation is still served during teardown. Its post-commit
-            # completion handoff (issues #324/#333) routes each settled
-            # validated completion by its explicit operation family,
-            # resolving every dependency lazily so the binding order of
-            # executor and observer does not matter.
-            observer = _build_detached_turn_observer(dependencies)
-            observer.start()
-            dependencies.bind_regular_process_detached_turn_observer(observer)
-            executor = BoundedLocalExecutor(
-                workers=settings.local_executor_workers,
-                pending=settings.local_executor_pending,
-                handlers=build_production_handlers(),
-                dependencies=dependencies,
-            )
-            # The serving process's own executor is the regular-mode
-            # continuation submitter: authorized follow-up operations are
-            # admitted back into the same bounded executor (issue #253).
-            dependencies.bind_regular_process_submitter(executor)
-        else:
-            # The queue-mode hosting (issue #346): the serving
-            # API/control-plane process owns the ONE long-lived observation
-            # host independently of every RQ workhorse process, then runs its
-            # one bounded durable restart reconciliation off the event loop
-            # so a host restart re-proves the durable outstanding receipts
-            # through the existing registration gates. The v1 single-host
-            # deployment assumption is explicit: multiple API instances must
-            # not silently split session registrations.
-            observer = _build_detached_turn_observer(dependencies)
-            observer.start()
-            await asyncio.to_thread(observer.reconcile_durable_outstanding_sessions)
-        submitter = build_operation_submitter(settings, local_executor=executor)
-        # The F11 bounded post-restart Task-queue recovery (issue #257), off
-        # the event loop in BOTH execution modes: re-arrange lost capacity
-        # wakes for the persisted queued Tasks and recover a lost F1
-        # planning-bootstrap handoff only where the durable state positively
-        # proves the bootstrap was never consumed. Regular mode delivers the
-        # recovered arrangements through its own bounded local executor;
-        # queue mode submits them to the canonical queue beside the
-        # reconciliation above. Scheduling only — a failed pass is contained
-        # and the next supported trigger revisits the rest; the durable
-        # queued facts own recovery.
+        # The listener's entire started lifetime is protected by this cleanup
+        # boundary (issue #397): a startup failure after start() or a raising
+        # teardown step still reaches the clean stop below, which runs last.
         try:
-            await asyncio.to_thread(
-                arrange_task_queue_recovery,
-                dependencies.database_pool(),
-                submitter,
-            )
-        except Exception as error:  # noqa: BLE001 - contained recovery pass
-            logger.warning(
-                "the bounded task-queue recovery pass failed (error type %s); "
-                "the durable queued facts own recovery until the next trigger",
-                type(error).__name__,
-            )
-        # The F12 bounded post-restart authorized-retry recovery (issue
-        # #316), off the event loop in BOTH execution modes: resubmit the
-        # same typed F1 retry invocation for each still-outstanding durably
-        # authorized Level 2 retry — never into the F11 Task FIFO or its
-        # capacity processor (these Tasks own their reserved sessions), and
-        # never clearing, resetting, or rewriting the retry ledger. The
-        # executing F1 worker/job performs any remaining ``not_before``
-        # wait; duplicate deliveries are rejected by the F5 one-shot
-        # consumption. Scheduling only — a failed pass is contained and the
-        # next supported trigger revisits the rest.
-        try:
-            await asyncio.to_thread(
-                arrange_task_retry_recovery,
-                dependencies.database_pool(),
-                submitter,
-            )
-        except Exception as error:  # noqa: BLE001 - contained recovery pass
-            logger.warning(
-                "the bounded authorized-retry recovery pass failed (error type %s); "
-                "the committed authorization rows own recovery until the next trigger",
-                type(error).__name__,
-            )
-        app.state.operation_executor = executor
-        app.state.detached_turn_observer = observer
-        app.state.operation_submitter = submitter
-        app.state.notification_listener = listener
-        try:
-            yield
+            dependencies = build_default_operation_dependencies(settings)
+            if settings.execution_mode is ExecutionMode.REGULAR:
+                # The process-owned detached-turn observation host (issue #323):
+                # started before any operation can dispatch and disposed after
+                # the executor drained, so a registration from an in-flight
+                # operation is still served during teardown. Its post-commit
+                # completion handoff (issues #324/#333) routes each settled
+                # validated completion by its explicit operation family,
+                # resolving every dependency lazily so the binding order of
+                # executor and observer does not matter.
+                observer = _build_detached_turn_observer(dependencies)
+                observer.start()
+                dependencies.bind_regular_process_detached_turn_observer(observer)
+                executor = BoundedLocalExecutor(
+                    workers=settings.local_executor_workers,
+                    pending=settings.local_executor_pending,
+                    handlers=build_production_handlers(),
+                    dependencies=dependencies,
+                )
+                # The serving process's own executor is the regular-mode
+                # continuation submitter: authorized follow-up operations are
+                # admitted back into the same bounded executor (issue #253).
+                dependencies.bind_regular_process_submitter(executor)
+            else:
+                # The queue-mode hosting (issue #346): the serving
+                # API/control-plane process owns the ONE long-lived observation
+                # host independently of every RQ workhorse process, then runs its
+                # one bounded durable restart reconciliation off the event loop
+                # so a host restart re-proves the durable outstanding receipts
+                # through the existing registration gates. The v1 single-host
+                # deployment assumption is explicit: multiple API instances must
+                # not silently split session registrations.
+                observer = _build_detached_turn_observer(dependencies)
+                observer.start()
+                await asyncio.to_thread(observer.reconcile_durable_outstanding_sessions)
+            submitter = build_operation_submitter(settings, local_executor=executor)
+            # The F11 bounded post-restart Task-queue recovery (issue #257), off
+            # the event loop in BOTH execution modes: re-arrange lost capacity
+            # wakes for the persisted queued Tasks and recover a lost F1
+            # planning-bootstrap handoff only where the durable state positively
+            # proves the bootstrap was never consumed. Regular mode delivers the
+            # recovered arrangements through its own bounded local executor;
+            # queue mode submits them to the canonical queue beside the
+            # reconciliation above. Scheduling only — a failed pass is contained
+            # and the next supported trigger revisits the rest; the durable
+            # queued facts own recovery.
+            try:
+                await asyncio.to_thread(
+                    arrange_task_queue_recovery,
+                    dependencies.database_pool(),
+                    submitter,
+                )
+            except Exception as error:  # noqa: BLE001 - contained recovery pass
+                logger.warning(
+                    "the bounded task-queue recovery pass failed (error type %s); "
+                    "the durable queued facts own recovery until the next trigger",
+                    type(error).__name__,
+                )
+            # The F12 bounded post-restart authorized-retry recovery (issue
+            # #316), off the event loop in BOTH execution modes: resubmit the
+            # same typed F1 retry invocation for each still-outstanding durably
+            # authorized Level 2 retry — never into the F11 Task FIFO or its
+            # capacity processor (these Tasks own their reserved sessions), and
+            # never clearing, resetting, or rewriting the retry ledger. The
+            # executing F1 worker/job performs any remaining ``not_before``
+            # wait; duplicate deliveries are rejected by the F5 one-shot
+            # consumption. Scheduling only — a failed pass is contained and the
+            # next supported trigger revisits the rest.
+            try:
+                await asyncio.to_thread(
+                    arrange_task_retry_recovery,
+                    dependencies.database_pool(),
+                    submitter,
+                )
+            except Exception as error:  # noqa: BLE001 - contained recovery pass
+                logger.warning(
+                    "the bounded authorized-retry recovery pass failed (error type %s); "
+                    "the committed authorization rows own recovery until the next trigger",
+                    type(error).__name__,
+                )
+            app.state.operation_executor = executor
+            app.state.detached_turn_observer = observer
+            app.state.operation_submitter = submitter
+            app.state.notification_listener = listener
+            try:
+                yield
+            finally:
+                if executor is not None:
+                    executor.shutdown()
+                if observer is not None:
+                    observer.dispose()
         finally:
-            if executor is not None:
-                executor.shutdown()
-            if observer is not None:
-                observer.dispose()
-            # The notification listener stops last (issue #397): after the
-            # executor drained and the observer was disposed, so
-            # late-commit notifications during teardown still deliver
-            # through the bounded interface before the clean stop.
+            # The listener stops last (issue #397): after the executor
+            # drained and the observer was disposed in the happy path —
+            # and still on any startup or teardown failure, because the
+            # entire started lifetime is enclosed by this cleanup boundary.
             listener.stop()
 
     return lifespan

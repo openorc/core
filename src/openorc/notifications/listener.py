@@ -187,8 +187,25 @@ class NotificationDeliveryReady:
     generation: int
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationDelivery:
+    """Generation-bearing delivery of one decoded notification message.
+
+    ``generation`` records the delivery generation the message was read in.
+    Downstream consumers must perform the documented currentness check before
+    establishing continuity: a delivery is current only while its generation
+    equals the listener's current generation (via the handle or the
+    ``generation`` accessor). A delivery whose generation differs — or one
+    received after a :class:`NotificationDeliveryLost` for a later generation
+    — is stale and requires fresh downstream synchronization.
+    """
+
+    generation: int
+    message: NotificationMessage
+
+
 NotificationConsumerEvent = (
-    NotificationMessage | NotificationDeliveryLost | NotificationDeliveryReady
+    NotificationDelivery | NotificationDeliveryLost | NotificationDeliveryReady
 )
 NotificationConsumer = Callable[[NotificationConsumerEvent], None]
 
@@ -237,7 +254,13 @@ class _DeliveryState:
         self.stopped = False
 
     def note_listen_ready(self) -> None:
-        """Successful LISTEN established readiness for a fresh generation."""
+        """Successful LISTEN established readiness for a fresh generation.
+
+        Ignored once stopped: shutdown is irreversible and a late connection
+        establishment or LISTEN execution can never restore readiness.
+        """
+        if self.stopped:
+            return
         self.generation += 1
         self.ready = True
         self.pending_ready = True
@@ -248,14 +271,22 @@ class _DeliveryState:
         A fresh delivery generation begins and requires downstream
         resynchronization (the pre-break buffered entries become stale by
         construction); the connection itself remains ready, so the fresh
-        generation is genuinely live.
+        generation is genuinely live. Ignored once stopped.
         """
+        if self.stopped:
+            return
         self.generation += 1
         self.pending_loss = True
         self.pending_ready = True
 
     def note_connection_lost(self) -> None:
-        """Connection loss invalidates readiness and supersedes pending readiness."""
+        """Connection loss invalidates readiness and supersedes pending readiness.
+
+        Ignored once stopped: shutdown is irreversible, so a late connection
+        failure after the stop cannot churn the generation or pend signals.
+        """
+        if self.stopped:
+            return
         self.generation += 1
         self.ready = False
         self.pending_ready = False
@@ -447,8 +478,16 @@ class PostgresNotificationListener:
                     return
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
                 continue
+            # Shutdown supersedes an in-flight connection attempt: a LISTEN
+            # that completed while the stop was signaled must never restore
+            # readiness on an already-stopped listener.
+            if self._stop_event.is_set():
+                self._close_quietly(connection)
+                return
             # Readiness is published only after LISTEN is active on the live
-            # connection — never before.
+            # connection — never before. The state transition itself also
+            # refuses a stopped listener (defense in depth against the race
+            # between this check and the transition).
             self._note_listen_ready()
             backoff = RECONNECT_BACKOFF_INITIAL_SECONDS
             try:
@@ -568,14 +607,19 @@ class PostgresNotificationListener:
     def _run_dispatch_cycle(self) -> bool:
         """Run one dispatch cycle. Returns True when the dispatcher must exit.
 
-        Coalesced control signals are emitted first, then queued deliveries.
-        ``DeliveryReady`` is emitted only when the taken generation is still
-        the current generation AND readiness is still authoritative at
-        delivery time — a readiness snapshot concurrently superseded by a
-        connection loss or shutdown can never establish downstream
-        continuity. Queued entries whose tagged generation differs from the
-        freshly-read current generation are stale and are never delivered as
-        current messages.
+        Coalesced control signals are emitted first, then queued deliveries,
+        each wrapped in a generation-bearing :class:`NotificationDelivery`.
+        Currentness is enforced per consumer handoff through the
+        :meth:`_handoff_permitted` gate: a message or readiness signal is
+        handed to a consumer only while its generation is still the current
+        generation (and readiness is still authoritative for a readiness
+        signal) at that consumer's handoff, so an invalidation occurring
+        during dispatch — including between the callbacks of one registered
+        consumer snapshot — can never establish downstream continuity for the
+        remaining consumers. No lock is held across any consumer callback;
+        the generation-bearing event plus the documented downstream
+        currentness check cover the residual race between the gate and any
+        single callback.
         """
         take = self._take_state()
         if take.stopped:
@@ -590,40 +634,58 @@ class PostgresNotificationListener:
             if take.stopped:
                 return True
             self._emit_control_signals(take)
-            if entry.generation != take.generation:
-                continue
-            self._dispatch_event(entry.message)
+            self._dispatch_event(
+                NotificationDelivery(generation=entry.generation, message=entry.message)
+            )
 
     def _emit_control_signals(self, take: _ControlTake) -> None:
-        """Emit the coalesced loss signal, then an authoritative readiness.
+        """Emit the coalesced loss signal, then the pending readiness.
 
-        A pending readiness is delivered only when the taken generation is
-        still current and the state still reports readiness at delivery time;
-        superseded readiness (connection loss or shutdown cleared it) is
-        dropped, so no readiness without an active LISTEN is ever emitted.
+        The :meth:`_handoff_permitted` gate enforces currentness at each
+        consumer handoff: superseded readiness (connection loss or shutdown
+        cleared it) is never handed off, so no readiness without an active
+        LISTEN is ever emitted, while the loss signal — a monotone fact — is
+        always handed off.
         """
         if take.pending_loss:
             self._dispatch_event(NotificationDeliveryLost(generation=take.generation))
         if take.pending_ready:
-            with self._state_lock:
-                readiness_current = (
-                    not self._state.stopped
-                    and self._state.ready
-                    and self._state.generation == take.generation
-                )
-            if readiness_current:
-                self._dispatch_event(NotificationDeliveryReady(generation=take.generation))
+            self._dispatch_event(NotificationDeliveryReady(generation=take.generation))
+
+    def _handoff_permitted(self, event: NotificationConsumerEvent) -> bool:
+        """Lock-protected currentness gate for one consumer handoff.
+
+        :class:`NotificationDeliveryLost` is a monotone fact and is always
+        handed off. A :class:`NotificationDelivery` or
+        :class:`NotificationDeliveryReady` is handed off only while its
+        generation is still the current generation — and readiness is still
+        authoritative for a readiness signal — at that consumer's handoff.
+        The lock is released before the callback runs.
+        """
+        if isinstance(event, NotificationDeliveryLost):
+            return True
+        with self._state_lock:
+            if self._state.stopped:
+                return False
+            if isinstance(event, NotificationDeliveryReady):
+                return event.generation == self._state.generation and self._state.ready
+            return event.generation == self._state.generation
 
     def _dispatch_event(self, event: NotificationConsumerEvent) -> None:
         """Hand one typed event to every registered consumer.
 
-        Consumer failures are contained per consumer with sanitized
-        diagnostics and never affect other consumers, the listener threads,
-        or any committed work.
+        Each consumer's handoff is individually gated on generation
+        currentness (:meth:`_handoff_permitted`); once the generation is
+        invalidated mid-dispatch, the remaining consumers of the snapshot
+        never receive the stale event. Consumer failures are contained per
+        consumer with sanitized diagnostics and never affect other
+        consumers, the listener threads, or any committed work.
         """
         with self._registration_lock:
             consumers = tuple(self._consumers.items())
         for consumer_id, callback in consumers:
+            if not self._handoff_permitted(event):
+                return
             try:
                 callback(event)
             except Exception as error:  # noqa: BLE001 - contained consumer failure

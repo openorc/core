@@ -138,6 +138,14 @@ def encode_notification_payload(message: NotificationMessage) -> str:
             "workflow_event_id": str(message.workflow_event_id),
         }
     else:
+        if (
+            message.resource_type is NotificationResourceType.WORKSPACE
+            and message.resource_id != message.workspace_id
+        ):
+            raise NotificationContractError(
+                "cannot encode a workspace data_changed notification whose "
+                "resource_id differs from workspace_id"
+            )
         envelope = {
             "kind": KIND_DATA_CHANGED,
             "workspace_id": str(message.workspace_id),
@@ -185,10 +193,17 @@ def decode_notification_payload(payload: str) -> NotificationMessage:
         raise NotificationContractError(
             "notification payload field 'resource_type' is not in the fixed resource vocabulary"
         ) from None
+    workspace_id = _parse_canonical_uuid(decoded, "workspace_id")
+    resource_id = _parse_canonical_uuid(decoded, "resource_id")
+    if resource_type is NotificationResourceType.WORKSPACE and resource_id != workspace_id:
+        raise NotificationContractError(
+            "notification payload field 'resource_id' must equal field "
+            "'workspace_id' for the workspace resource"
+        )
     return DataChangedNotification(
-        workspace_id=_parse_canonical_uuid(decoded, "workspace_id"),
+        workspace_id=workspace_id,
         resource_type=resource_type,
-        resource_id=_parse_canonical_uuid(decoded, "resource_id"),
+        resource_id=resource_id,
     )
 
 

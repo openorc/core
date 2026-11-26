@@ -4,10 +4,13 @@ The serving lifespan owns exactly one process-local notification listener
 per serving process in either execution mode, bound on ``app.state``, and
 never at import or factory construction. A module-level factory seam injects
 a deterministic fake listener; no database and no real connection is touched.
+The listener's entire started lifetime is enclosed by a cleanup boundary, so
+a startup failure after ``start()`` still reaches the clean stop.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 import pytest
@@ -116,5 +119,39 @@ def test_lifespan_owns_exactly_one_listener_in_queue_mode(
         assert listener.built_with == [settings]
         assert client.get("/healthz").status_code == 200
 
+    assert listener.stop_calls == 1
+    shutdown_observability()
+
+
+def test_lifespan_initialization_failure_still_stops_the_listener(
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory()
+    listener = FakeNotificationListener()
+    _install_listener_factory(monkeypatch, listener)
+
+    def raising_dependencies(settings: Settings) -> OperationDependencies:
+        raise RuntimeError("dependencies unavailable")
+
+    monkeypatch.setattr(
+        app_module,
+        "build_default_operation_dependencies",
+        raising_dependencies,
+        raising=True,
+    )
+
+    app = create_app(settings)
+
+    async def drive() -> None:
+        async with app_module._serving_lifespan(settings)(app):
+            pass  # never reached: initialization raises
+
+    with pytest.raises(RuntimeError, match="dependencies unavailable"):
+        asyncio.run(drive())
+
+    # The listener's entire started lifetime is enclosed by the cleanup
+    # boundary: the startup failure after start() still reaches the stop.
+    assert listener.start_calls == 1
     assert listener.stop_calls == 1
     shutdown_observability()
