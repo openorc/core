@@ -130,6 +130,29 @@ def _quiesce(subscription: WorkspaceStreamSubscription) -> list[Any]:
     return batch
 
 
+def _settle(subscriptions: list[WorkspaceStreamSubscription]) -> None:
+    """Drain the seed writes' late-dispatched hints until both stay quiet.
+
+    The subscriptions register after the seeding commits, and the listener's
+    dispatcher is asynchronous: a seed INSERT's workspace hint can be
+    dispatched to a subscription registered later (a subscription correctly
+    stages its own Workspace's change). The dispatcher delivers committed
+    notifications within a bounded tick, so draining until two consecutive
+    quiet windows deterministically settles the seed hints before the
+    asserted writes; an unsettled dispatcher is an honest bounded failure.
+    """
+    quiet_streak = 0
+    deadline = time.monotonic() + 10.0
+    while quiet_streak < 2:
+        if time.monotonic() >= deadline:
+            raise AssertionError("the stream subscriptions never settled")
+        staged_any = False
+        for subscription in subscriptions:
+            _, batch = _await_batch(subscription, timeout=_QUIESCE_SECONDS)
+            staged_any = staged_any or bool(batch)
+        quiet_streak = quiet_streak + 1 if not staged_any else 0
+
+
 def test_real_publications_deliver_through_independent_workspace_subscriptions(
     writer: Connection[Any], pool: _SingleConnectionPool, listener: PostgresNotificationListener
 ) -> None:
@@ -139,6 +162,10 @@ def test_real_publications_deliver_through_independent_workspace_subscriptions(
     workspace_b = _insert_workspace(writer, profile_b)
     subscription_a, registration_a = _subscribe(listener, workspace_a)
     subscription_b, registration_b = _subscribe(listener, workspace_b)
+    # The seeding above already committed its own notification hints and the
+    # listener's dispatcher is asynchronous: settle both subscriptions before
+    # the asserted writes so each scenario observes exactly its own hint.
+    _settle([subscription_a, subscription_b])
     try:
         # 1. A non-audit configuration change publishes the workspace hint;
         #    only the subscribed Workspace's stream stages it.
