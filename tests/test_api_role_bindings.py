@@ -339,11 +339,15 @@ def auth_seam(monkeypatch: pytest.MonkeyPatch):
 
 
 def _auth_user(profile: Profile) -> Any:
+    from datetime import UTC, datetime
+
     from openorc.domain.identity import AuthenticatedPrincipal
     from openorc.services.authentication import AuthenticatedUser
 
     return AuthenticatedUser(
-        principal=AuthenticatedPrincipal(user_id=profile.id),
+        principal=AuthenticatedPrincipal(
+            user_id=profile.id, expires_at=datetime(2099, 1, 1, tzinfo=UTC)
+        ),
         profile=profile,
     )
 

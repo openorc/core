@@ -11,6 +11,7 @@ are not identity and have no domain surface here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 __all__ = ["AuthenticatedPrincipal"]
@@ -22,9 +23,14 @@ class AuthenticatedPrincipal:
 
     ``user_id`` is the canonical Supabase Auth user UUID — the verified JWT
     ``sub`` claim by value, identical to the corresponding
-    :class:`~openorc.domain.ownership.Profile` identifier. GitHub username,
+    :class:`~openorc.domain.ownership.Profile` identifier. ``expires_at`` is
+    the verified ``exp`` claim normalized to UTC — the token's validity bound
+    the authorized Workspace SSE stream boundary (issue #399) consumes to
+    terminate a live stream no later than credential expiry. GitHub username,
     email, and other presentation claims are deliberately not carried: they
-    never constitute OpenOrc identity.
+    never constitute OpenOrc identity, and no other token material is
+    surfaced here.
     """
 
     user_id: UUID
+    expires_at: datetime

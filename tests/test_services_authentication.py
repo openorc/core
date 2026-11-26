@@ -44,6 +44,7 @@ from openorc.services.errors import (
 TOKEN = "bearer-token-value-must-never-leak"
 OBSERVED_AT = datetime(2026, 9, 16, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
 _UTC_NOW = datetime(2026, 9, 16, 10, 0, 0, tzinfo=UTC)
+_EXPIRES_AT = datetime(2026, 9, 16, 12, 0, 0, tzinfo=UTC)
 
 
 class FakeVerifier:
@@ -62,7 +63,7 @@ class RejectingVerifier(FakeVerifier):
     """Fake verifier raising the given normalized error after recording the token."""
 
     def __init__(self, error: Exception) -> None:
-        super().__init__(AuthenticatedPrincipal(user_id=uuid4()))
+        super().__init__(AuthenticatedPrincipal(user_id=uuid4(), expires_at=_EXPIRES_AT))
         self._error = error
 
     def verify(self, token: str) -> AuthenticatedPrincipal:
@@ -113,7 +114,7 @@ class FakePool:
 
 
 def _principal() -> AuthenticatedPrincipal:
-    return AuthenticatedPrincipal(user_id=uuid4())
+    return AuthenticatedPrincipal(user_id=uuid4(), expires_at=_EXPIRES_AT)
 
 
 def test_valid_token_resolves_principal_and_bootstraps_profile() -> None:

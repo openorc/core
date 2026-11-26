@@ -1,25 +1,27 @@
 """Authorized WorkflowEvent audit read services (issue #377).
 
 The read-side composition behind the authorized WorkflowEvent audit
-surface — the non-live counterpart to G4's authorized SSE: Owner-authorized,
-database-only, and strictly side-effect free. Two scopes share one contract:
-the Workspace's visible events (its Task-scoped facts plus its Workspace-level
-facts) and one exact Task's event history (current or archived attempt). Both
-are bounded, deterministically ordered newest-first by the durable
-``(created_at, id)`` key, and advanced by an opaque keyset cursor bound to
-the exact scope and filter set.
+surface — the historical counterpart to the authorized Workspace SSE live
+stream (issue #399): Owner-authorized, database-only, and strictly
+side-effect free. Two scopes share one contract: the Workspace's visible
+events (its Task-scoped facts plus its Workspace-level facts) and one exact
+Task's event history (current or archived attempt). Both are bounded,
+deterministically ordered newest-first by the durable ``(created_at, id)``
+key, and advanced by an opaque keyset cursor bound to the exact scope and
+filter set.
 
 Historical ordering is not commit order: ``workflow_events`` UUID/created_at
 values cannot prove the instant a transaction actually committed, so the page
 cursor is a stable continuation over visible committed records — never a
 forward SSE high-water mark that provably prevents missing late commits,
 never a frozen multi-request snapshot, and never a commit-order/replay
-sequence. G4 (issue #94) owns the bounded reconnect/replay mechanism and any
-additional durable ordering evidence it needs; this surface adds no
-sequencing system. G4 also owns the audit/invalidation distinction: a
-WorkflowEvent is a consequential committed audit fact, not a generic
-notification for every durable mutation, and no event type exists for UI
-reactivity.
+sequence. The live stream (issue #399) is best-effort delivery with no
+replay, so a fresh subscription reloads current resources and bounded
+history through this surface; this surface adds no sequencing system and the
+audit/invalidation distinction stands: a WorkflowEvent is a consequential
+committed audit fact (delivered live as the stream's ``workflow_event``
+message kind), while generic data invalidation is the stream's separate
+``data_changed`` kind — no event type exists for UI reactivity.
 
 The safe public projection: every projected ``context`` passes through the
 per-event-type established shape inventory — the exact context keys the
@@ -69,6 +71,7 @@ from openorc.services.event_coordination import OwnerReviewerDiscussionDirection
 from openorc.services.transaction_composition import composed_read_transaction
 from openorc.services.workspace_authorization import (
     require_profile_workspace,
+    require_workspace_event,
     require_workspace_task,
 )
 
@@ -83,6 +86,7 @@ __all__ = [
     "list_task_events_for_owner",
     "list_workspace_events_for_owner",
     "project_public_context",
+    "read_workflow_event_for_owner",
 ]
 
 # The bounded page size (the established G2b read default) and the shared
@@ -623,6 +627,33 @@ def list_task_events_for_owner(
         page_cursor=page_cursor,
         limit=limit,
         read_page=read_page,
+    )
+
+
+def read_workflow_event_for_owner(
+    pool: DatabasePool, *, profile_id: UUID, workspace_id: UUID, workflow_event_id: UUID
+) -> PublicWorkflowEvent:
+    """Read one visible WorkflowEvent for the authenticated Owner (#377, #399).
+
+    Owner-authorized, database-only, and side-effect free: the focused
+    authorized resolver (:func:`require_workspace_event`) re-proves Workspace
+    ownership and Task scope for the addressed event, and the safe public
+    projection is the G2c read's own — the same allowlisted context and
+    locked vocabularies the listings serve. The Workspace SSE stream
+    (issue #399) resolves each hinted event UUID through this focused read;
+    a missing, foreign-Workspace, or absent event is the uniform not-found
+    outcome and is omitted from the live stream, never forwarded raw.
+    """
+    _require_uuid_command(profile_id, "profile_id")
+    _require_uuid_command(workspace_id, "workspace_id")
+    _require_uuid_command(workflow_event_id, "workflow_event_id")
+    return _public_event(
+        require_workspace_event(
+            pool,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            workflow_event_id=workflow_event_id,
+        )
     )
 
 

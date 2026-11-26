@@ -15,8 +15,10 @@ route handlers; the v1 persistence surface is synchronous). The addressed
 errors are the typed application vocabulary, mapped to HTTP by the
 application-level handler. The listing is historical ordering over visible
 committed records — not a frozen multi-request snapshot and not a
-commit-order/replay sequence; G4 (issue #94) owns replay refinement, and
-WorkflowEvents are audit facts, not client data-invalidation notifications.
+commit-order/replay sequence; the authorized Workspace SSE stream
+(issue #399) owns live delivery of these same audit facts (best-effort, no
+replay), and WorkflowEvents are audit facts, never generic
+client data-invalidation notifications.
 """
 
 from __future__ import annotations
