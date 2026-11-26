@@ -43,6 +43,7 @@ from openorc.notifications.contract import (
 )
 from openorc.notifications.listener import (
     NotificationConsumerEvent,
+    NotificationDelivery,
     NotificationDeliveryReady,
     PostgresNotificationListener,
 )
@@ -81,12 +82,17 @@ def _settle(seconds: float = 2.0) -> None:
 
 
 def _message_count(events: list[NotificationConsumerEvent], message: object) -> int:
+    # The revised listener delivers messages inside generation-bearing
+    # NotificationDelivery wrappers; compare the wrapped message field.
     return sum(
         1
         for event in events
-        if isinstance(event, (WorkflowEventNotification, DataChangedNotification))
-        and event == message
+        if isinstance(event, NotificationDelivery) and event.message == message
     )
+
+
+def _has_ready_signal(events: list[NotificationConsumerEvent]) -> bool:
+    return any(isinstance(event, NotificationDeliveryReady) for event in events)
 
 
 class _SavepointRollback(Exception):
@@ -104,73 +110,77 @@ def test_notification_transport_cross_connection(database_url: str) -> None:
     listener.register_consumer(collector)
 
     listener.start()
-    # Explicit readiness only after LISTEN is active on the live connection.
-    _wait_until(lambda: listener.ready)
-    events = collector.snapshot()
-    assert events and isinstance(events[0], NotificationDeliveryReady)
-    assert listener.generation >= 1
+    try:
+        # Explicit readiness only after LISTEN is active on the live
+        # connection, and only once the dispatched readiness signal has
+        # actually reached the consumer interface.
+        _wait_until(lambda: listener.ready)
+        _wait_until(lambda: _has_ready_signal(collector.snapshot()))
+        events = collector.snapshot()
+        assert events and isinstance(events[0], NotificationDeliveryReady)
+        assert listener.generation >= 1
 
-    workspace_id = uuid4()
-    workflow_message = WorkflowEventNotification(
-        workspace_id=workspace_id, workflow_event_id=uuid4()
-    )
-    project_message = DataChangedNotification(
-        workspace_id=workspace_id,
-        resource_type=NotificationResourceType.PROJECT,
-        resource_id=uuid4(),
-    )
-    task_message = DataChangedNotification(
-        workspace_id=workspace_id,
-        resource_type=NotificationResourceType.TASK,
-        resource_id=uuid4(),
-    )
-    suppressed_message = DataChangedNotification(
-        workspace_id=workspace_id,
-        resource_type=NotificationResourceType.REPOSITORY,
-        resource_id=uuid4(),
-    )
-    savepoint_message = DataChangedNotification(
-        workspace_id=workspace_id,
-        resource_type=NotificationResourceType.CONNECTION,
-        resource_id=uuid4(),
-    )
+        workspace_id = uuid4()
+        workflow_message = WorkflowEventNotification(
+            workspace_id=workspace_id, workflow_event_id=uuid4()
+        )
+        project_message = DataChangedNotification(
+            workspace_id=workspace_id,
+            resource_type=NotificationResourceType.PROJECT,
+            resource_id=uuid4(),
+        )
+        task_message = DataChangedNotification(
+            workspace_id=workspace_id,
+            resource_type=NotificationResourceType.TASK,
+            resource_id=uuid4(),
+        )
+        suppressed_message = DataChangedNotification(
+            workspace_id=workspace_id,
+            resource_type=NotificationResourceType.REPOSITORY,
+            resource_id=uuid4(),
+        )
+        savepoint_message = DataChangedNotification(
+            workspace_id=workspace_id,
+            resource_type=NotificationResourceType.CONNECTION,
+            resource_id=uuid4(),
+        )
 
-    with connect(database_url) as writer:
-        # The outer commit makes the notification visible to the listener.
-        _notify(writer, encode_notification_payload(workflow_message))
-        writer.commit()
-        _wait_until(lambda: _message_count(collector.snapshot(), workflow_message) == 1)
+        with connect(database_url) as writer:
+            # The outer commit makes the notification visible to the listener.
+            _notify(writer, encode_notification_payload(workflow_message))
+            writer.commit()
+            _wait_until(lambda: _message_count(collector.snapshot(), workflow_message) == 1)
 
-        # A rolled-back transaction suppresses its notification entirely.
-        _notify(writer, encode_notification_payload(suppressed_message))
-        writer.rollback()
-        _settle()
-        assert _message_count(collector.snapshot(), suppressed_message) == 0
+            # A rolled-back transaction suppresses its notification entirely.
+            _notify(writer, encode_notification_payload(suppressed_message))
+            writer.rollback()
+            _settle()
+            assert _message_count(collector.snapshot(), suppressed_message) == 0
 
-        # A nested savepoint rollback suppresses only the savepoint's
-        # notification; the outer commit publishes the rest. The savepoint is
-        # rolled back exactly the way composed-transaction scopes roll back:
-        # an exception inside the nested transaction context, caught inside
-        # the still-open outer transaction.
-        with writer.transaction():
-            _notify(writer, encode_notification_payload(project_message))
-            try:
-                with writer.transaction():
-                    _notify(writer, encode_notification_payload(savepoint_message))
-                    raise _SavepointRollback
-            except _SavepointRollback:
-                pass
-            _notify(writer, encode_notification_payload(task_message))
-        _wait_until(lambda: _message_count(collector.snapshot(), project_message) == 1)
-        _wait_until(lambda: _message_count(collector.snapshot(), task_message) == 1)
-        assert _message_count(collector.snapshot(), savepoint_message) == 0
-
-        # Identical channel+payload within one transaction coalesce into one
-        # delivered notification (guaranteed by PostgreSQL).
-        with writer.transaction():
-            for _ in range(2):
+            # A nested savepoint rollback suppresses only the savepoint's
+            # notification; the outer commit publishes the rest. The savepoint
+            # is rolled back exactly the way composed-transaction scopes roll
+            # back: an exception inside the nested transaction context, caught
+            # inside the still-open outer transaction.
+            with writer.transaction():
                 _notify(writer, encode_notification_payload(project_message))
-        _wait_until(lambda: _message_count(collector.snapshot(), project_message) == 2)
+                try:
+                    with writer.transaction():
+                        _notify(writer, encode_notification_payload(savepoint_message))
+                        raise _SavepointRollback
+                except _SavepointRollback:
+                    pass
+                _notify(writer, encode_notification_payload(task_message))
+            _wait_until(lambda: _message_count(collector.snapshot(), project_message) == 1)
+            _wait_until(lambda: _message_count(collector.snapshot(), task_message) == 1)
+            assert _message_count(collector.snapshot(), savepoint_message) == 0
 
-    listener.stop()
+            # Identical channel+payload within one transaction coalesce into
+            # one delivered notification (guaranteed by PostgreSQL).
+            with writer.transaction():
+                for _ in range(2):
+                    _notify(writer, encode_notification_payload(project_message))
+            _wait_until(lambda: _message_count(collector.snapshot(), project_message) == 2)
+    finally:
+        listener.stop()
     assert listener.ready is False
