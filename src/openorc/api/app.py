@@ -47,6 +47,10 @@ from openorc.api.routers.tasks import router as tasks_router
 from openorc.api.routers.workspace_refresh import router as workspace_refresh_router
 from openorc.api.routers.workspaces import router as workspaces_router
 from openorc.config import ExecutionMode, Settings
+from openorc.notifications.listener import (
+    PostgresNotificationListener,
+    build_db_notification_listener,
+)
 from openorc.observability import ObservabilitySurface, initialize_observability
 from openorc.services.cline_attachment import dispatch_cost_limit_interrupt
 from openorc.services.connection_credentials import resolve_connection_runtime_credential
@@ -258,6 +262,17 @@ def _build_detached_turn_observer(
     )
 
 
+def _build_notification_listener(settings: Settings) -> PostgresNotificationListener:
+    """Build the serving process's process-local notification listener.
+
+    Module-level seam (issue #397) so lifespan tests can inject a
+    deterministic fake; production resolves the dedicated listener DSN
+    through the notifications package, failing fast at serving startup on
+    endpoint misconfiguration.
+    """
+    return build_db_notification_listener(settings)
+
+
 def _serving_lifespan(
     settings: Settings,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
@@ -284,6 +299,15 @@ def _serving_lifespan(
     #108). Executor teardown stops new admission and drains within the
     bounded default timeout, asserting nothing about any outstanding
     operation's outcome.
+
+    Both execution modes additionally start exactly one process-local
+    PostgreSQL notification listener (issue #397) — the dedicated LISTEN
+    connection and its bounded delivery interface, started before the yield
+    beside the other process-owned infrastructure and stopped last in
+    teardown, after the executor drained and the observer was disposed, so
+    late-commit notifications during drain still deliver. The listener never
+    runs at import, in ``create_app()``, in an RQ parent or workhorse, or per
+    browser connection.
     """
 
     @asynccontextmanager
@@ -291,6 +315,13 @@ def _serving_lifespan(
         initialize_observability(settings, ObservabilitySurface.API)
         executor: BoundedLocalExecutor | None = None
         observer: DetachedTurnObservationHost | None = None
+        # The process-local PostgreSQL notification listener (issue #397):
+        # exactly one per serving process in either execution mode. Built
+        # here — inside the serving process, never at import or factory
+        # construction — with the dedicated session-capable listener DSN
+        # resolved from settings.
+        listener = _build_notification_listener(settings)
+        listener.start()
         dependencies = build_default_operation_dependencies(settings)
         if settings.execution_mode is ExecutionMode.REGULAR:
             # The process-owned detached-turn observation host (issue #323):
@@ -374,6 +405,7 @@ def _serving_lifespan(
         app.state.operation_executor = executor
         app.state.detached_turn_observer = observer
         app.state.operation_submitter = submitter
+        app.state.notification_listener = listener
         try:
             yield
         finally:
@@ -381,6 +413,11 @@ def _serving_lifespan(
                 executor.shutdown()
             if observer is not None:
                 observer.dispose()
+            # The notification listener stops last (issue #397): after the
+            # executor drained and the observer was disposed, so
+            # late-commit notifications during teardown still deliver
+            # through the bounded interface before the clean stop.
+            listener.stop()
 
     return lifespan
 

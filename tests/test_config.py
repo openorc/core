@@ -10,6 +10,7 @@ from openorc.config import (
     API_RELOAD_VAR,
     CORS_ALLOWED_ORIGINS_VAR,
     DATABASE_URL_VAR,
+    DB_LISTENER_URL_VAR,
     DB_POOL_MAX_VAR,
     DB_POOL_MIN_VAR,
     DB_POOL_TIMEOUT_VAR,
@@ -37,6 +38,7 @@ from openorc.config import (
     ExecutionMode,
     Settings,
 )
+from openorc.notifications.listener import resolve_db_listener_conninfo
 
 
 def test_defaults_when_environment_is_empty() -> None:
@@ -762,3 +764,115 @@ def test_cors_origins_are_parsed_trimmed_normalized_and_deduplicated() -> None:
 def test_malformed_cors_origin_values_are_rejected(raw: str) -> None:
     with pytest.raises(ConfigurationError, match="OPENORC_CORS_ALLOWED_ORIGINS"):
         Settings.from_env({CORS_ALLOWED_ORIGINS_VAR: raw})
+
+
+def test_db_listener_url_defaults_to_unset() -> None:
+    settings = Settings.from_env({})
+
+    assert settings.db_listener_url is None
+
+
+def test_db_listener_url_is_read_from_the_environment() -> None:
+    settings = Settings.from_env({DB_LISTENER_URL_VAR: "postgresql://listener:5432/postgres"})
+
+    assert settings.db_listener_url == "postgresql://listener:5432/postgres"
+
+
+def test_blank_db_listener_url_fails_closed_without_echo() -> None:
+    with pytest.raises(ConfigurationError) as raised:
+        Settings.from_env({DB_LISTENER_URL_VAR: "   "})
+
+    assert "supplied blank" in str(raised.value)
+
+
+def test_listener_endpoint_falls_back_to_database_url() -> None:
+    settings = Settings.from_env(
+        {DATABASE_URL_VAR: "postgresql://postgres:postgres@127.0.0.1:54322/postgres"}
+    )
+
+    assert resolve_db_listener_conninfo(settings) == settings.database_url
+
+
+def test_listener_endpoint_uses_the_explicit_dsn_when_supplied() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:pw@transaction-host:6543/postgres",
+            DB_LISTENER_URL_VAR: "postgresql://openorc:pw@session-host:5432/postgres",
+        }
+    )
+
+    assert (
+        resolve_db_listener_conninfo(settings)
+        == "postgresql://openorc:pw@session-host:5432/postgres"
+    )
+
+
+def test_listener_endpoint_refuses_the_transaction_pooler_fallback() -> None:
+    settings = Settings.from_env(
+        {DATABASE_URL_VAR: "postgresql://openorc:pw@pooler-host:6543/postgres"}
+    )
+
+    with pytest.raises(ConfigurationError, match="transaction-pooler"):
+        resolve_db_listener_conninfo(settings)
+
+
+def test_listener_endpoint_refuses_an_explicit_transaction_pooler_port() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:pw@direct-host:5432/postgres",
+            DB_LISTENER_URL_VAR: "postgresql://openorc:pw@pooler-host:6543/postgres",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="transaction-pooler"):
+        resolve_db_listener_conninfo(settings)
+
+
+def test_listener_endpoint_rejects_a_database_name_mismatch() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:pw@direct-host:5432/postgres",
+            DB_LISTENER_URL_VAR: "postgresql://openorc:pw@session-host:5432/other",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="does not agree"):
+        resolve_db_listener_conninfo(settings)
+
+
+def test_listener_endpoint_requires_explicit_database_names() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:pw@direct-host:5432/postgres",
+            DB_LISTENER_URL_VAR: "postgresql://openorc:pw@session-host:5432",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="explicit database name"):
+        resolve_db_listener_conninfo(settings)
+
+
+def test_listener_endpoint_rejects_an_unaccepted_scheme() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:pw@direct-host:5432/postgres",
+            DB_LISTENER_URL_VAR: "mysql://openorc:pw@session-host:5432/postgres",
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="schemes"):
+        resolve_db_listener_conninfo(settings)
+
+
+def test_listener_endpoint_errors_never_echo_the_dsn() -> None:
+    settings = Settings.from_env(
+        {
+            DATABASE_URL_VAR: "postgresql://openorc:secret-password@direct-host:5432/postgres",
+            DB_LISTENER_URL_VAR: ("postgresql://openorc:secret-password@pooler-host:6543/postgres"),
+        }
+    )
+
+    with pytest.raises(ConfigurationError) as raised:
+        resolve_db_listener_conninfo(settings)
+
+    assert "secret-password" not in str(raised.value)

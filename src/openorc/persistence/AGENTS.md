@@ -18,6 +18,7 @@ Persistence owns durable representation and explicit data-access mechanics for O
 
 - Use synchronous psycopg 3 with psycopg_pool.ConnectionPool. Do not introduce a parallel async persistence stack.
 - Pools are process-local and must be created in the OS process that uses them, never inherited across an RQ fork boundary.
+- The notification listener (issue #397) owns a dedicated autocommit LISTEN connection outside this pool boundary (`openorc.notifications`): an ordinary pooled connection is never held across a subscription, pool bounds are unaffected, and the listener's single extra connection is counted separately in deployment sizing.
 - Pool access fails closed on PID change. Do not reuse, replace, or close a stale inherited pool.
 - Pool bounds are per process; deployment sizing accounts for process count × pool size.
 - Keep persistence pooler-neutral: prepare_threshold=None, no search_path dependence, no session-local GUC/state when transaction-scoped behavior suffices.
