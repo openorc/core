@@ -25,4 +25,15 @@ It does not own database triggers or publication SQL (G4b), browser transport, S
 - Consumers must be non-blocking and own their own resynchronization. No per-client queues or browser-owned state belong in this package (G4c's leaf adds those downstream).
 - DSN values are credential material: never logged, never returned, never echoed in errors.
 
+## Publication rules (G4b, issue #398)
+
+Publication lives in the tracked migration `20261126120000_add_notification_publication_triggers.sql` (SQL side), not in this package; these rules bind that machinery to the contract above.
+
+- Triggers only publish change hints: no business writes, no state inference, no audit generation, no external I/O. The SQL payload construction exists ONLY in the two helper functions, whose envelopes are byte-identical to `encode_notification_payload` output (proven by the static convention test).
+- AFTER row-level INSERT/UPDATE/DELETE triggers publish the changed row's NEW/OLD identity. Genuine unchanged UPDATEs publish nothing (whole-row `IS DISTINCT FROM` suppression); the account-deletion barrier trigger is additionally WHEN-scoped to exactly `account_deletion_state`.
+- Conservative dependent-scope invalidation replaces reverse-dependency enumeration: `github_issues` changes publish issue + workspace hints (covering cross-repository related-issue presentation and current AND archived Task attempts embedding the issue projection); relationship edges publish the anchored endpoint's issue hint + workspace hint; `tasks` queue membership changes (NULL-safe `queued_at` comparison) publish a workspace hint covering other queued Tasks' derived `queue_position`; `github_refreshes` publish refresh + repository hints when repository-addressed and refresh + workspace hints otherwise. Task changes additionally publish the linked issue's hint (bounded unique lookup) so intake/archive/purge and eligibility changes cover affected issue summaries.
+- Profile-scoped fan-out (GitHub user authorization changes; account-deletion barrier establish/clear) publishes workspace hints only to Workspaces owned by the Profile through the authoritative ownership lookup — never credentials, Vault references, or OAuth state.
+- `record_workflow_event` remains the sole application audit writer; the `workflow_events` trigger is INSERT-only and publishes one workflow_event hint per committed event. Full workflow_event DTO projection stays G4c's responsibility.
+- Transaction semantics are PostgreSQL-native: hints are visible only after the outer commit, rollback/savepoint rollback suppresses them, identical channel+payload pairs coalesce within one transaction. No replay, ledger, or delivery guarantee; the migration header carries the authoritative table-to-public-resource coverage map including explicit omissions.
+
 Read `src/openorc/api/AGENTS.md` for the lifespan ownership rule and `src/openorc/persistence/AGENTS.md` for the connection-separation rule.
