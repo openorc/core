@@ -230,12 +230,41 @@ def test_the_account_barrier_trigger_is_when_scoped_to_the_state_column() -> Non
 def test_unchanged_updates_are_suppressed_whole_row() -> None:
     code = _code_text()
     # Every dedicated trigger function guards UPDATE with the whole-row
-    # comparison (dispatcher, task, issue, relation, refresh, and user
-    # authorization); the account barrier relies on its WHEN scope. The
-    # queue-membership workspace hint uses the null-safe comparison of the
+    # comparison (dispatcher, workspace root, task, issue, relation, refresh,
+    # and user authorization); the account barrier relies on its WHEN scope.
+    # The queue-membership workspace hint uses the null-safe comparison of the
     # queue-entry instants.
-    assert code.count("old is not distinct from new") == 6
+    assert code.count("old is not distinct from new") == 7
     assert "v_entry_queued_at is distinct from v_exit_queued_at" in code
+
+
+def test_the_workspace_root_trigger_uses_the_row_id_identity() -> None:
+    raw = _collapsed(_migration_text_raw())
+    match = re.search(
+        r"create trigger notify_workspaces_changed .*?execute function [^;]+;",
+        raw,
+    )
+    assert match is not None, "expected the workspace root publication trigger"
+    # The workspaces table has no workspace_id column: its primary key id IS
+    # the Workspace identity. The generic dispatcher (which extracts a
+    # workspace_id column that does not exist on this table) must never be
+    # attached to it; the dedicated root function uses the row id for both
+    # envelope UUIDs.
+    assert "openorc.notify_workspace_root_changed ()" in match.group(0)
+    body = _helper_body("notify_workspace_root_changed")
+    assert (
+        "perform openorc.notify_data_changed(v_workspace_id, 'workspace', v_workspace_id);"
+        in _collapsed(body)
+    )
+    dispatcher_tables = {
+        dispatcher.group(1)
+        for dispatcher in re.finditer(
+            r"create trigger \w+[^;]*? on openorc\.(\w+)"
+            r"[^;]*?execute function openorc\.notify_row_data_changed [^;]*;",
+            raw,
+        )
+    }
+    assert "workspaces" not in dispatcher_tables
 
 
 def test_dispatcher_arguments_stay_in_the_closed_vocabulary() -> None:

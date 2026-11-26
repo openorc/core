@@ -498,8 +498,13 @@ def test_configuration_writes_publish_resource_hints(
     writer: Connection[Any], pool: _SingleConnectionPool, collector: NotificationCollector
 ) -> None:
     profile_id = _insert_profile(writer)
-    workspace_id = _insert_workspace(writer, profile_id)
     collector.quiesce()
+
+    # Workspace root creation, configuration update, and deletion (asserted in
+    # the deletion suite below) all publish the row-id workspace hint.
+    workspace_id = _insert_workspace(writer, profile_id)
+    hints = _hints(collector, count=1)
+    assert hints == [_data_changed(workspace_id, NotificationResourceType.WORKSPACE, workspace_id)]
 
     created = connection_repositories.create_connection(
         pool,
@@ -700,40 +705,59 @@ def test_queue_membership_changes_publish_workspace_hints(
     )
     collector.quiesce()
 
-    queued = task_repositories.create_task(
+    # Intake: READY_TO_PLAN with no frozen fingerprint (the intake contract).
+    # queued_at is non-null exactly when the status is queued, and only the
+    # guarded ready_to_plan -> queued transition populates it.
+    intake = task_repositories.create_task(
         pool,
         workspace_id=workspace_id,
         repository_id=repository_id,
         github_issue_id=7701,
         github_issue_number=42,
-        source_requirements_fingerprint=_FINGERPRINT,
-        status=TaskStatus.QUEUED,
+        status=TaskStatus.READY_TO_PLAN,
     )
-    hints = _hints(collector, count=3)
-    # Task + linked-issue hints, plus the workspace hint covering other queued
-    # Tasks' derived queue_position and the Workspace queue projection.
+    hints = _hints(collector, count=2)
     assert _hint_identities(hints) == {
-        (workspace_id, NotificationResourceType.TASK, queued.id),
+        (workspace_id, NotificationResourceType.TASK, intake.id),
+        (workspace_id, NotificationResourceType.ISSUE, issue_id),
+    }
+
+    # Owner Start: the guarded transition freezes the requirements baseline
+    # atomically with queue entry; the workspace hint covers other queued
+    # Tasks' derived queue_position and the Workspace queue projection.
+    queued = task_repositories.update_task_status(
+        pool,
+        intake.id,
+        expected_state_token=intake.state_token,
+        status=TaskStatus.QUEUED,
+        capture_source_requirements_fingerprint=_FINGERPRINT,
+    )
+    assert queued is not None
+    hints = _hints(collector, count=3)
+    assert _hint_identities(hints) == {
+        (workspace_id, NotificationResourceType.TASK, intake.id),
         (workspace_id, NotificationResourceType.ISSUE, issue_id),
         (workspace_id, NotificationResourceType.WORKSPACE, workspace_id),
     }
 
+    # Queue exit: the queued -> planning claim clears queued_at.
     claimed = task_repositories.update_task_status(
         pool,
-        queued.id,
+        intake.id,
         expected_state_token=queued.state_token,
         status=TaskStatus.PLANNING,
     )
     assert claimed is not None
     hints = _hints(collector, count=3)
     assert _hint_identities(hints) == {
-        (workspace_id, NotificationResourceType.TASK, queued.id),
+        (workspace_id, NotificationResourceType.TASK, intake.id),
         (workspace_id, NotificationResourceType.ISSUE, issue_id),
         (workspace_id, NotificationResourceType.WORKSPACE, workspace_id),
     }
 
     # A non-queued intake publishes no workspace hint (a different observed
-    # issue keeps the one-current-Task-per-issue invariant intact).
+    # issue keeps the one-current-Task-per-issue invariant intact; still no
+    # frozen fingerprint before an Owner Start).
     second_issue_id = _insert_issue(
         writer, workspace_id=workspace_id, repository_id=repository_id, github_issue_id=7702
     )
@@ -744,7 +768,6 @@ def test_queue_membership_changes_publish_workspace_hints(
         repository_id=repository_id,
         github_issue_id=7702,
         github_issue_number=43,
-        source_requirements_fingerprint=_FINGERPRINT,
         status=TaskStatus.READY_TO_PLAN,
     )
     hints = _hints(collector, count=2)

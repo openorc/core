@@ -188,6 +188,31 @@ begin
 end;
 $notifier$;
 
+-- Workspace aggregate root: the workspaces table has no workspace_id column
+-- (its primary key id IS the Workspace identity), so this dedicated trigger
+-- uses the row's id for both envelope UUIDs. The generic dispatcher is never
+-- attached to this table.
+create function openorc.notify_workspace_root_changed () returns trigger
+language plpgsql
+as $notifier$
+declare
+    v_workspace_id uuid;
+begin
+    if tg_op = 'UPDATE' then
+        if old is not distinct from new then
+            return null;
+        end if;
+    end if;
+    if tg_op = 'DELETE' then
+        v_workspace_id := old.id;
+    else
+        v_workspace_id := new.id;
+    end if;
+    perform openorc.notify_data_changed(v_workspace_id, 'workspace', v_workspace_id);
+    return null;
+end;
+$notifier$;
+
 -- Task aggregate root: task hint always, issue hint for the linked GitHub
 -- issue projection (Task intake/archive/purge and eligibility changes must
 -- cover affected issue summaries and lists), and a workspace hint when queue
@@ -394,10 +419,11 @@ begin
 end;
 $notifier$;
 
--- Simple one-row-per-resource configuration and projection families.
+-- Simple one-row-per-resource configuration and projection families. The
+-- Workspace root uses its dedicated identity function (see above).
 create trigger notify_workspaces_changed
     after insert or update or delete on openorc.workspaces
-    for each row execute function openorc.notify_row_data_changed ('workspace', 'id');
+    for each row execute function openorc.notify_workspace_root_changed ();
 
 create trigger notify_projects_changed
     after insert or update or delete on openorc.projects
@@ -525,6 +551,7 @@ create trigger notify_workflow_events_inserted
 revoke execute on function openorc.notify_data_changed (uuid, text, uuid) from public;
 revoke execute on function openorc.notify_workflow_event (uuid, uuid) from public;
 revoke execute on function openorc.notify_row_data_changed () from public;
+revoke execute on function openorc.notify_workspace_root_changed () from public;
 revoke execute on function openorc.notify_task_changed () from public;
 revoke execute on function openorc.notify_github_issue_changed () from public;
 revoke execute on function openorc.notify_github_issue_relation_changed () from public;
