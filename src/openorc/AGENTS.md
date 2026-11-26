@@ -33,6 +33,8 @@ Forbidden dependency directions include:
 
 Domain/services must be usable without an HTTP request or queue job object.
 
+`src/openorc/notifications/` (issue #397) is the focused boundary for the shared internal PostgreSQL LISTEN/NOTIFY transport: the fixed identifier-only channel and envelope contract, the serving process's dedicated autocommit LISTEN connection, and the bounded coalesced delivery interface consumed by G4c and published to by G4b. It is process-local serving infrastructure — never authorization input, never workflow authority, never a public DTO surface — and never starts in domain, services, adapters, or workers.
+
 ## Module organization
 
 - Organize Python modules around cohesive capabilities and responsibilities rather than broad catch-all files.

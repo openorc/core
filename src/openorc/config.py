@@ -20,6 +20,17 @@ API_PORT_VAR = "OPENORC_API_PORT"
 API_RELOAD_VAR = "OPENORC_API_RELOAD"
 VALKEY_URL_VAR = "VALKEY_URL"
 DATABASE_URL_VAR = "DATABASE_URL"
+# The dedicated LISTEN/NOTIFY listener DSN (issue #397): one explicit
+# session-capable endpoint for the API serving process's process-local
+# notification listener, independent of the ordinary request-pool
+# DATABASE_URL (which may target a transaction pooler). Deliberately
+# OPTIONAL on this shared surface: only the API serving lifespan consumes
+# it, so a worker process never receives or validates it. Unset falls back
+# to DATABASE_URL; the endpoint guards (transaction-pooler port,
+# database-name agreement) are enforced by the notification listener's
+# resolution seam. The DSN is credential material: a supplied-but-blank
+# value fails closed without echoing it, and the value is never logged.
+DB_LISTENER_URL_VAR = "OPENORC_DB_LISTENER_URL"
 DB_POOL_MIN_VAR = "OPENORC_DB_POOL_MIN"
 DB_POOL_MAX_VAR = "OPENORC_DB_POOL_MAX"
 DB_POOL_TIMEOUT_VAR = "OPENORC_DB_POOL_TIMEOUT"
@@ -165,10 +176,20 @@ _FALSY = frozenset({"0", "false", "no", "off"})
 # configuration error boundary instead of surfacing from deep client code.
 _VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
 
-# Schemes accepted for the direct Postgres connection URL (standard libpq
+# Schemes accepted for direct Postgres connection URLs (standard libpq
 # conninfo URLs). Driver-qualified schemes (e.g. SQLAlchemy-style suffixes)
-# are not part of this configuration boundary.
-_DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
+# are not part of this configuration boundary. Shared with the dedicated
+# notification-listener DSN (issue #397), which accepts the same URL forms.
+DATABASE_URL_SCHEMES = frozenset({"postgresql", "postgres"})
+
+# Known Supavisor transaction-pooler ports (issue #397). LISTEN is
+# session-bound and cannot function through a transaction-pooling endpoint,
+# so the notification listener's resolution seam refuses an effective
+# listener endpoint on one of these ports instead of silently subscribing
+# through a mode that would never deliver. This is best-effort detection of
+# the documented default transaction-pooler port; the operator invariant
+# (session-capable listener endpoint) remains documented configuration.
+DB_TRANSACTION_POOLER_PORTS = frozenset({6543})
 
 # Schemes accepted for the queue-mode observer registration transport base URL
 # (issue #346). Plain http is the same-network reference form; https is the
@@ -363,6 +384,11 @@ class Settings:
     queue_observer_registration_url: str | None = None
     queue_observer_registration_secret: str | None = field(default=None, repr=False)
     database_url: str = DEFAULT_DATABASE_URL
+    # The dedicated notification-listener DSN (issue #397). Optional: unset
+    # falls back to database_url at the listener's resolution seam, where the
+    # session-capability and same-database guards are enforced. Credential
+    # material: never logged, never returned, never echoed in errors.
+    db_listener_url: str | None = None
     db_pool_min: int = DEFAULT_DB_POOL_MIN
     db_pool_max: int = DEFAULT_DB_POOL_MAX
     db_pool_timeout: float = DEFAULT_DB_POOL_TIMEOUT
@@ -517,10 +543,25 @@ class Settings:
 
         database_url = _read(source, DATABASE_URL_VAR) or DEFAULT_DATABASE_URL
         db_scheme = urlparse(database_url).scheme.lower()
-        if db_scheme not in _DATABASE_URL_SCHEMES:
+        if db_scheme not in DATABASE_URL_SCHEMES:
             raise ConfigurationError(
                 f"{DATABASE_URL_VAR} must use one of the schemes "
-                f"{', '.join(sorted(_DATABASE_URL_SCHEMES))}; got scheme {db_scheme!r}"
+                f"{', '.join(sorted(DATABASE_URL_SCHEMES))}; got scheme {db_scheme!r}"
+            )
+
+        # The dedicated notification-listener DSN (issue #397). Reading only:
+        # a supplied-but-blank value is a configuration error raised WITHOUT
+        # echoing the value (credential material, same discipline as other
+        # DSN-class settings). The endpoint guards (accepted schemes, known
+        # transaction-pooler port refusal, database-name agreement with
+        # DATABASE_URL) are enforced by the notification listener's resolution
+        # seam — the only consumer of this setting — so a worker process that
+        # never runs the listener neither requires nor validates it.
+        db_listener_url = _read(source, DB_LISTENER_URL_VAR)
+        if db_listener_url is not None and not db_listener_url.strip():
+            raise ConfigurationError(
+                f"{DB_LISTENER_URL_VAR} was supplied blank: provide the listener "
+                "DSN value or leave the variable unset"
             )
 
         # Pool bounds describe one process's pool, never a deployment-wide cap.
@@ -662,6 +703,7 @@ class Settings:
             queue_observer_registration_url=queue_observer_registration_url,
             queue_observer_registration_secret=queue_observer_registration_secret,
             database_url=database_url,
+            db_listener_url=db_listener_url,
             db_pool_min=db_pool_min,
             db_pool_max=db_pool_max,
             db_pool_timeout=db_pool_timeout,

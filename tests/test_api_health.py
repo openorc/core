@@ -60,6 +60,7 @@ def test_create_app_is_executor_free(settings_factory: Callable[..., Settings]) 
     assert not hasattr(app.state, "operation_executor")
     assert not hasattr(app.state, "operation_submitter")
     assert not hasattr(app.state, "detached_turn_observer")
+    assert not hasattr(app.state, "notification_listener")
 
 
 def test_healthz_returns_deterministic_payload(settings_factory: Callable[..., Settings]) -> None:
