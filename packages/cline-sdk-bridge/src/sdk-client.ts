@@ -9,6 +9,15 @@
  * classification. No `@cline/llms` dependency, no `Agent`/`AgentRuntime`, no
  * approval executors, no provider catalog, and no synthesized flags.
  *
+ * Consequential-dispatch safety (issue #407): every effectful Hub command
+ * this bridge issues — `run.enqueue` admission — passes the documented public
+ * `retryAfterDispatch: false` command option (issue #407), so the pinned
+ * SDK's transport recovery can never retransmit an already-dispatched
+ * consequential command. Read-only queries (`run.list`) keep the SDK default.
+ * Read-only queries may retain safe SDK reconnect behavior; a retransmitted
+ * admission is never acceptable because dispatch alone does not confirm
+ * Hub-side acceptance.
+ *
  * Hub-native operations (issue #321) run through one officially exported
  * `NodeHubClient` per attachment generation: constructed lazily on the first
  * hub operation from the same admitted endpoint, authentication, and client
@@ -36,18 +45,28 @@ import type { WireRemoteConfig } from "./types.js";
  * #321).
  *
  * The pinned SDK's declaration file re-exports the class through directory
- * star-exports (`export * from "./hub"`, `export * from "./client"`) that
- * this package's pinned NodeNext module resolution cannot follow, so the
- * public constructor and URL normalizer are extracted through the package
- * namespace with one documented boundary cast — the same discipline as the
- * start-input cast in `start`. The runtime object is the unmodified SDK
- * class (`@cline/sdk` star-re-exports `@cline/core`, whose public surface
- * exports both symbols); the structural surface covers exactly the
- * documented members the bridge consumes, and no private shape is assumed. */
+ * star-exports that this package's pinned NodeNext module resolution cannot
+ * follow — verified against the pinned 0.2.1 root declaration, which still
+ * re-exports only the derived API factories, not the class or the URL
+ * normalizer — so the public constructor, URL normalizer, and command
+ * options are extracted through the package namespace with one documented
+ * boundary cast — the same discipline as the start-input cast in `start`.
+ * The runtime object is the unmodified SDK class (`@cline/sdk` star-re-exports
+ * `@cline/core`, whose public surface exports both symbols); the structural
+ * surface covers exactly the documented members the bridge consumes, and no
+ * private shape is assumed. */
 interface HubClientOptionsInput {
   url: string;
   authToken?: string;
   clientType?: string;
+}
+
+/** Structural surface of the pinned SDK's documented per-command options
+ * (issue #407). Only the members the bridge consumes are listed; the SDK's
+ * own `HubCommandOptions` type is deliberately not exported through the
+ * declaration entry point, so it is carried through the same boundary cast. */
+interface HubCommandOptionsInput {
+  retryAfterDispatch?: boolean;
 }
 
 interface HubCommandReplyLike {
@@ -60,6 +79,7 @@ interface NodeHubClientLike {
     command: string,
     payload?: Record<string, unknown>,
     sessionId?: string,
+    options?: HubCommandOptionsInput,
   ): Promise<HubCommandReplyLike>;
   subscribe(
     listener: (event: SdkHubEvent) => void,
@@ -87,8 +107,9 @@ class ClineCoreBridgeClient implements BridgeSdkClient {
 
   async start(input: SdkStartInput): Promise<SdkStartResult> {
     // Single documented boundary cast: the D2 contract forbids synthesizing
-    // `enableSpawnAgent`/`enableAgentTeams`, which the SDK config type marks
-    // as required; the pinned runtime treats absent flags as disabled.
+    // `enableSpawnAgent`/`enableAgentTeams`, which the pinned 0.2.1 SDK config
+    // type (`CoreRuntimeFeatures`) still marks as required booleans; the
+    // pinned runtime treats absent flags as disabled.
     const result = await this.core.start(input as unknown as ClineCoreStartInput);
     return result.result === undefined
       ? { sessionId: result.sessionId }
@@ -149,7 +170,21 @@ class ClineCoreBridgeClient implements BridgeSdkClient {
 
   async enqueue(input: { sessionId: string; prompt: string }): Promise<unknown> {
     const hub = await this.requireHub();
-    const reply = await hub.command("run.enqueue", { prompt: input.prompt }, input.sessionId);
+    // Consequential admission (issue #407): `retryAfterDispatch: false` is
+    // applied authoritatively at the real SDK call site — it is a per-command
+    // options argument, never part of the construction options, so neither
+    // the opaque `remote_options` nor any remote configuration can override
+    // it. The pinned SDK performs one transport-recovery resend after
+    // dispatch unless this option is passed; a retransmitted admission is
+    // never acceptable because dispatch alone does not confirm Hub-side
+    // acceptance and the bridge's uncertain-outcome discipline (never a
+    // resend) owns the recovery decision.
+    const reply = await hub.command(
+      "run.enqueue",
+      { prompt: input.prompt },
+      input.sessionId,
+      { retryAfterDispatch: false },
+    );
     return reply.payload ?? {};
   }
 

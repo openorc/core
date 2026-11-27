@@ -56,7 +56,9 @@ delivery, continuity, success, or Task progress). Reported usage values are
 finite and non-negative: missing, mistyped, or negative readings stay
 unreported rather than becoming invented numbers.
 
-Pinned-SDK mapping limits (0.0.90): only demonstrated supported
+Pinned-SDK mapping limits (qualified against the 0.0.90 baseline; the
+supported baseline is now 0.2.1 per issue #407, with projection
+requalification owned by #413): only demonstrated supported
 ``CoreSessionEvent``/``AgentEvent`` shapes are projected. ``chunk`` is not
 a reliably typed assistant-text/reasoning feed and is never projected;
 media content, hook/team/pending events, and unknown or malformed events

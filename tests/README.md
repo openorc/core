@@ -68,13 +68,13 @@ OPENORC_TEST_DATABASE_URL=<supplied non-production Supabase branch database URL>
 
 ### D7 live Cline runtime validation (opt-in, Owner-operated)
 
-`tests/integration/test_cline_live_runtime.py` (issue #149) drives the assembled production Cline path — `attach_cline_runtime` with the real `ClineBridgeProcessBackend` and Node D3 bridge, the durable construction-context resolver, and the `ClineAdapter` — against a ready managed ClineBox. It is a bounded compatibility/integration check for the frozen supported trio `cline 3.0.68` / `@cline/core 0.0.90` / `@cline/sdk 0.0.90`, not a certification framework; it is never part of CI and never runs in the ordinary deterministic baseline.
+`tests/integration/test_cline_live_runtime.py` (issues #149, #407) drives the assembled production Cline path — `attach_cline_runtime` with the real `ClineBridgeProcessBackend` and Node D3 bridge, the durable construction-context resolver, and the `ClineAdapter` — against a ready managed ClineBox. It is a bounded compatibility/integration check for the frozen supported trio `cline 3.0.75` / `@cline/core 0.2.1` / `@cline/sdk 0.2.1` (the SDK1/SDK2a-qualified baseline, openorc/cloud#57), not a certification framework; it is never part of CI and never runs in the ordinary deterministic baseline.
 
 Owner run command (the Box must already be READY and reachable; `devserver.sh` provisions the disposable branch database):
 
 ```bash
 OPENORC_CLINE_LIVE=1 \
-OPENORC_CLINE_LIVE_ATTESTED_VERSIONS='cline@3.0.68 core@0.0.90 sdk@0.0.90' \
+OPENORC_CLINE_LIVE_ATTESTED_VERSIONS='cline@3.0.75 core@0.2.1 sdk@0.2.1' \
 OPENORC_CLINE_LIVE_CONTROL_ENDPOINT='<ws(s):// host:port path of the Box Hub>' \
 OPENORC_CLINE_LIVE_HUB_TOKEN='<current Hub attach credential — secret; never logged>' \
 OPENORC_CLINE_LIVE_PRODUCER_PROVIDER='openrouter' \

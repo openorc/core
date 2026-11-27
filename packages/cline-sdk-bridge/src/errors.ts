@@ -9,7 +9,7 @@
  * Classification discipline (evidence-based, in order):
  *
  * 1. Positively identified exact-session absence: the SDK's session-not-found
- *    shape (`error.code === "session_not_found"`, the pinned 0.0.90 class
+ *    shape (`error.code === "session_not_found"`, the pinned 0.2.1 class
  *    constant) maps to `session_not_found`.
  * 2. A safe machine code on `error.code` (lowercase snake_case, bounded) maps
  *    to `sdk_operation_rejected` carrying that code — e.g. the qualified
@@ -137,9 +137,9 @@ export const HUB_COMMAND_OPERATIONS: ReadonlySet<string> = new Set([
   "subscribe_hub",
 ]);
 
-/** The pinned 0.0.90 `HubTransportErrorCode` union. These codes report the
- * client transport, not a Hub answer, so hub-command failures carrying them
- * are uncertain outcomes. */
+/** The pinned 0.2.1 `HubTransportErrorCode` union (unchanged from 0.0.90).
+ * These codes report the client transport, not a Hub answer, so hub-command
+ * failures carrying them are uncertain outcomes. */
 export const HUB_TRANSPORT_CODES: ReadonlySet<string> = new Set([
   "hub_connect_timeout",
   "hub_connect_failed",
