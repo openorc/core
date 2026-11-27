@@ -499,6 +499,7 @@ class _Live:
         self.producer_session_id: str | None = None
         self.reviewer_session_id: str | None = None
         self.producer_count_before_restart: int | None = None
+        self.producer_usage_before_restart: str | None = None
         self.evidence: dict[str, str] = {}
 
     @property
@@ -715,6 +716,8 @@ class _Live:
         self.repository_base = base
         self.producer_session_id = str(external_session_id)
         self.producer_count_before_restart = int(handoff["producer_transcript_count"])
+        usage = handoff.get("producer_usage_before_restart")
+        self.producer_usage_before_restart = usage if isinstance(usage, str) else None
 
     def box_check(self, path: str, *, expect_exists: bool) -> str:
         """Verify a Box-side path through the Owner-approved operator hook.
@@ -788,6 +791,7 @@ class _Live:
             "producer_session_id": self.producer_session_id,
             "reviewer_session_id": self.reviewer_session_id,
             "producer_transcript_count": self.producer_count_before_restart,
+            "producer_usage_before_restart": self.producer_usage_before_restart,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1491,6 +1495,33 @@ def test_e_activity_and_usage_observations(live: _Live) -> None:
 # --- scenario D3: required Hub-restart recovery (completion gate) -------------
 
 
+def _usage_summary_text(snapshot: Any) -> str:
+    """Bounded, content-free rendering of one usage snapshot observation.
+
+    The aggregate scope is preferred and the root scope is labeled when the
+    aggregate is absent; a genuinely observed zero stays zero (real
+    evidence, never unknown), and an absent or unusable scope renders as
+    unknown. No invented spend, no inference across scopes, and no cost
+    accounting here — this is diagnostic text for the recorded evidence.
+    """
+    aggregate = getattr(snapshot, "aggregate_usage", None)
+    usage = getattr(snapshot, "usage", None)
+    scope = aggregate if aggregate is not None else usage
+    label = "aggregate" if aggregate is not None else "root"
+    if scope is None:
+        return "unknown"
+
+    def _number(value: Any) -> str:
+        numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return f"{value}" if numeric else "unknown"
+
+    return (
+        f"{label} in={_number(getattr(scope, 'input_tokens', None))} "
+        f"out={_number(getattr(scope, 'output_tokens', None))} "
+        f"cost_usd={_number(getattr(scope, 'total_cost', None))}"
+    )
+
+
 def test_d3_hub_restart_recovery(live: _Live) -> None:
     """The required real Hub-restart recovery completion gate.
 
@@ -1511,8 +1542,9 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         producer_id = live.producer_session_id
         checkout = f"{live.repository_base}/{live.task_id}"
         if os.environ.get(_RESTART_COMMAND_ENV, "").strip():
-            # Record the pre-restart transcript extent through the ordinary
-            # public reads, then perform the Owner-approved restart.
+            # Record the pre-restart transcript extent and the same-session
+            # aggregate usage through the ordinary public reads, then perform
+            # the Owner-approved restart.
             with ExitStack() as stack:
                 bound = _attach_bound(
                     live,
@@ -1524,6 +1556,9 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
                 reconciliation = bound.adapter.reconcile_session(producer_id)
                 assert reconciliation.transcript_message_count is not None
                 live.producer_count_before_restart = reconciliation.transcript_message_count
+                live.producer_usage_before_restart = _usage_summary_text(
+                    bound.adapter.read_activity_snapshot(producer_id)
+                )
             _run_restart_hook()
         elif os.environ.get(_PAUSE_SENTINEL_ENV, "").strip():
             with ExitStack() as stack:
@@ -1537,6 +1572,9 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
                 reconciliation = bound.adapter.reconcile_session(producer_id)
                 assert reconciliation.transcript_message_count is not None
                 live.producer_count_before_restart = reconciliation.transcript_message_count
+                live.producer_usage_before_restart = _usage_summary_text(
+                    bound.adapter.read_activity_snapshot(producer_id)
+                )
             _pause_for_owner_restart()
         else:
             pytest.fail(
@@ -1585,18 +1623,31 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
             "the persisted transcript shrank across the Hub restart"
         )
         # The authorized same-ID recovery: no initialization resend, no
-        # replacement session; the recovery itself positively establishes the
-        # surviving transcript before any stop/start and honors a positively
-        # identified stop absence if the prior incarnation is non-addressable.
+        # replacement session; the recovery positively establishes the
+        # surviving transcript before any effect and honors a positively
+        # identified stop absence if the prior incarnation is non-addressable,
+        # then the Hub's native session.resume restores the exact identity
+        # with Hub-side saved-history loading (issue #408) — no transcript is
+        # ever uploaded.
         bound.adapter.recover_session(producer_id, target_mode=ClineConstructionMode.ACT)
         reply = bound.adapter.send(producer_id, "Reply with the single word: recovered.")
         assert isinstance(reply, AgentTextResponse)
+        # The same-session aggregate usage after the controlled restart,
+        # recorded honestly against the pre-restart reading: continuity,
+        # a genuine reset, and absence are each distinct observations, and
+        # none of them is spend evidence, failure evidence, or a workflow
+        # claim. The application cost accounting is never changed here.
+        usage_after = _usage_summary_text(bound.adapter.read_activity_snapshot(producer_id))
+    pre_usage = live.producer_usage_before_restart
     live.record(
         "D3 hub-restart recovery",
         "EXECUTED" if not resume else "EXECUTED (stage-two resume)",
         f"current-credential reattachment, transcript survival "
         f"(pre {live.producer_count_before_restart} / post {count} messages), "
-        "and same-ID recover_session with a post-recovery continuation turn",
+        "native same-ID recover_session with a post-recovery continuation turn, "
+        f"aggregate usage pre [{pre_usage if pre_usage else 'unobserved'}] / "
+        f"post [{usage_after}] (honest observation; a reset or absence is "
+        "recorded as such, never as spend or loss)",
     )
 
 

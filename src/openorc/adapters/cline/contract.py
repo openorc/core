@@ -36,11 +36,27 @@ Operation semantics (exactly the qualified v1 surface):
   ``session_ready`` is not validated, the optional SDK ``result`` is not
   assumed to have executed an initial turn, and no ``AgentSessionCreated``
   is produced. The complete v1 construction bundle arrives as explicit
-  ``ClineStartRequest`` fields, forwarded unchanged; a same-ID start
-  carries the same complete inputs plus the raw persisted message array as
-  ``initial_messages``. The backend neither decides when to stop/start nor
-  runs the read → stop → start reconstruction sequence; the adapter owns
-  that serialized policy and checks the exact returned ID.
+  ``ClineStartRequest`` fields, forwarded unchanged. Fresh construction
+  only: same-ID reconstruction is ``resume_session`` (issue #408), never a
+  same-ID re-start carrying a transcript. The backend neither decides when
+  to stop/resume nor runs the stop → resume reconstruction sequence; the
+  adapter owns that serialized policy and checks the exact restored ID.
+- ``resume_session`` (issue #408) is the native same-ID reconstruction: one
+  public ``NodeHubClient.command("session.resume", …)`` call carrying the
+  complete ``ClineResumeRequest`` construction bundle for the exact
+  existing session, with Hub-side saved-history loading — no transcript is
+  ever uploaded, and no fallback reconstruction mechanism exists. The
+  consequential dispatch passes the documented public
+  ``retryAfterDispatch: false`` command option authoritatively at the real
+  call site. The only success value is the verified exact restored session
+  identity (:class:`ClineResumeResult`); a positively identified Hub
+  refusal (resident session, absent saved record, empty/unavailable saved
+  conversation, unsupported command) raises
+  :class:`ClineSdkOperationRejectedError` carrying the Hub's machine code
+  (exact saved-record absence maps to :class:`ClineSessionNotFoundError`),
+  and every unproven outcome — transport loss, dispatch timeout, lost or
+  mismatched reply — raises :class:`ClineBackendUncertainOutcomeError`.
+  A lost reply never authorizes another resume.
 - ``send`` addresses only the supplied exact ID and sends the supplied
   prompt verbatim. Its result is the SDK-native plain-JSON ``AgentResult``
   (or None for the SDK's legitimate undefined response), never parsed into
@@ -50,7 +66,7 @@ Operation semantics (exactly the qualified v1 surface):
   It is transport evidence for later exact correlation, never a workflow
   decision: admission is neither delivery nor execution, and an uncertain
   outcome never authorizes a resend.
-- ``stop`` releases the runtime incarnation for serialized same-ID
+- ``stop`` releases the runtime incarnation for serialized native-resume
   reconstruction; ``abort`` interrupts active work. They are distinct
   operations, and neither implies deleting or replacing an OpenOrc Task
   session. No user-facing ``stop`` action and no ``delete`` operation exist
@@ -60,7 +76,9 @@ Operation semantics (exactly the qualified v1 surface):
   including absent/null values where the SDK permits them. Record/status
   and usage observations are non-authoritative: interpretation belongs to
   reconciliation/observation work, and usage may reset across Hub
-  lifetimes.
+  lifetimes. ``read_messages`` serves the conversation-read/reconciliation
+  capabilities and positive continuity evidence — never a transcript
+  upload.
 - ``list_runs`` (issue #321) exposes the attachment's status-only Hub run
   records as opaque observations, and ``subscribe_hub`` (issue #321)
   forwards Hub event envelopes with envelope-owned session identity, event
@@ -92,6 +110,8 @@ from typing import Protocol, runtime_checkable
 from openorc.adapters.cline.values import (
     ClineHubEvent,
     ClineRemoteConfig,
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
@@ -119,7 +139,26 @@ class ClineSdkBackend(Protocol):
         ...
 
     def start(self, request: ClineStartRequest) -> ClineStartResult:
-        """Allocate/bind one external session; allocation, not readiness."""
+        """Allocate/bind one fresh external session; allocation, not
+        readiness. Same-ID reconstruction is ``resume_session``."""
+        ...
+
+    def resume_session(self, request: ClineResumeRequest) -> ClineResumeResult:
+        """Restore the exact existing external session through the Hub's
+        native ``session.resume`` with Hub-side saved-history loading.
+
+        One consequential Hub command (issue #408) carrying the complete
+        :class:`ClineResumeRequest` construction bundle verbatim, with the
+        documented public ``retryAfterDispatch: false`` option applied
+        authoritatively at the real call site. Returns the verified exact
+        restored session identity; a positively identified Hub refusal
+        raises :class:`ClineSdkOperationRejectedError` carrying the Hub's
+        machine code (exact saved-record absence maps to
+        :class:`ClineSessionNotFoundError`), and every unproven outcome —
+        transport loss, dispatch timeout, lost or mismatched reply — raises
+        :class:`ClineBackendUncertainOutcomeError`. Never a transcript
+        upload, never a resend, and no fallback reconstruction mechanism.
+        """
         ...
 
     def send(self, session_id: str, prompt: str) -> JsonObject | None:
@@ -148,7 +187,7 @@ class ClineSdkBackend(Protocol):
         ...
 
     def stop(self, session_id: str) -> None:
-        """Release the runtime incarnation for serialized same-ID
+        """Release the runtime incarnation for serialized native-resume
         reconstruction. Distinct from ``abort``; no session deletion."""
         ...
 
@@ -163,8 +202,9 @@ class ClineSdkBackend(Protocol):
         ...
 
     def read_messages(self, session_id: str) -> list[JsonObject]:
-        """Read the session's raw public message array. Losslessly
-        round-trips into a later same-ID ``start``."""
+        """Read the session's raw public message array. Serves the
+        conversation-read/reconciliation capabilities and positive
+        continuity evidence — never a transcript upload."""
         ...
 
     def list_history(self) -> list[JsonObject]:

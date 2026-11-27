@@ -1,8 +1,9 @@
-/** Construction mapping tests (issue #72 test 2): every D2 construction field
- * maps onto the actual qualified SDK argument shape — `config.sessionId`,
- * `config.mode`, additive rules, blank system prompt, working roots, tool
- * policies, and the exact nested `read_messages → initial_messages` round
- * trip — with no synthesized flags, approval callbacks, or initial prompt. */
+/** Construction mapping tests (issue #72 test 2; native reconstruction issue
+ * #408): every D2 construction field maps onto the actual qualified SDK
+ * argument shape — `config.mode`, additive rules, blank system prompt,
+ * working roots, tool policies, and the native `resume` reconstruction
+ * operation carrying the complete bundle with no transcript — with no
+ * synthesized flags, approval callbacks, or initial prompt. */
 
 import { describe, expect, it } from "vitest";
 import { FakeClineCoreClient, type RecordedCall } from "./helpers/fake-client.js";
@@ -25,7 +26,13 @@ const START = {
   tool_policies: { "*": { autoApprove: true }, ask_question: { enabled: false } },
 };
 
-function expectedStartInput(sessionId?: string, initialMessages?: JsonObject[], mode = "plan"): JsonObject {
+const RESUME = {
+  session_id: "exact-session-9",
+  ...START,
+  mode: "act",
+};
+
+function expectedStartInput(mode = "plan"): JsonObject {
   return {
     config: {
       providerId: "provider-a",
@@ -36,27 +43,47 @@ function expectedStartInput(sessionId?: string, initialMessages?: JsonObject[], 
       cwd: "/workspace/producer",
       workspaceRoot: "/workspace",
       enableTools: true,
-      ...(sessionId !== undefined ? { sessionId } : {}),
     },
     interactive: true,
     toolPolicies: { "*": { autoApprove: true }, ask_question: { enabled: false } },
-    ...(initialMessages !== undefined ? { initialMessages } : {}),
   };
 }
 
-async function startCalls(fake: FakeClineCoreClient, request: JsonObject): Promise<RecordedCall[]> {
+function expectedResumeInput(): JsonObject {
+  return {
+    sessionId: "exact-session-9",
+    construction: {
+      providerId: "provider-a",
+      modelId: "model-a",
+      mode: "act",
+      rules: "# Producer rules\nBe careful.",
+      systemPrompt: "",
+      cwd: "/workspace/producer",
+      workspaceRoot: "/workspace",
+      enableTools: true,
+      interactive: true,
+    },
+    toolPolicies: { "*": { autoApprove: true }, ask_question: { enabled: false } },
+  };
+}
+
+async function wireCalls(
+  fake: FakeClineCoreClient,
+  method: string,
+  request: JsonObject,
+): Promise<RecordedCall[]> {
   const bridge = startTestBridge(fixedFactory(fake));
   bridge.feed(`${requestLine(1, "connect", CONNECT)}\n`);
   await until(() => (bridge.frames.some((frame) => frame["id"] === 1) ? true : undefined));
-  bridge.feed(`${requestLine(2, "start", request)}\n`);
+  bridge.feed(`${requestLine(2, method, request)}\n`);
   await until(() => (bridge.frames.some((frame) => frame["id"] === 2) ? true : undefined));
-  return fake.callsOf("start");
+  return fake.callsOf(method);
 }
 
 describe("start construction mapping", () => {
   it("maps every D2 fresh-construction field onto the SDK start input", async () => {
     const fake = new FakeClineCoreClient();
-    const calls = await startCalls(fake, START as JsonObject);
+    const calls = await wireCalls(fake, "start", START as JsonObject);
     expect(calls.length).toBe(1);
     expect(calls[0]?.args).toEqual(expectedStartInput());
     const config = calls[0]?.args["config"] as JsonObject;
@@ -68,45 +95,25 @@ describe("start construction mapping", () => {
     expect(Object.hasOwn(calls[0]?.args as JsonObject, "capabilities")).toBe(false);
   });
 
-  it("maps same-ID starts through config.sessionId with the unmodified raw message array", async () => {
+  it("maps the native resume operation with the full construction bundle and no transcript", async () => {
     const fake = new FakeClineCoreClient();
-    const messages: JsonObject[] = [
-      { role: "user", content: "first", metadata: { nested: { deep: [1, 2, { key: "value" }] } } },
-      { role: "assistant", content: "reply", metadata: { ts: 123, partial: false } },
-    ];
-    const calls = await startCalls(fake, {
-      ...START,
-      mode: "act",
-      session_id: "exact-session-9",
-      initial_messages: messages,
-    } as JsonObject);
-    expect(calls[0]?.args).toEqual(expectedStartInput("exact-session-9", messages, "act"));
-    expect((calls[0]?.args["config"] as JsonObject)["mode"]).toBe("act");
-    expect((calls[0]?.args["config"] as JsonObject)["sessionId"]).toBe("exact-session-9");
+    fake.script("resume", [{ ok: { sessionId: "exact-session-9" } }]);
+    const calls = await wireCalls(fake, "resume", RESUME as JsonObject);
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.args).toEqual(expectedResumeInput());
+    expect(Object.hasOwn(calls[0]?.args as JsonObject, "initialMessages")).toBe(false);
+    expect(Object.hasOwn(calls[0]?.args["construction"] as JsonObject, "sessionId")).toBe(false);
   });
 
-  it("round-trips read_messages through a later same-ID start without structural loss", async () => {
+  it("round-trips a resume reply's verified identity as the wire session_id", async () => {
     const fake = new FakeClineCoreClient();
-    const storedMessages: JsonObject[] = [
-      { role: "user", content: "hello", metadata: { a: 1 } },
-      { role: "assistant", content: "hi", metadata: { b: { c: [true, null, 2.5] }, kept: "as-is" } },
-    ];
-    fake.script("read_messages", [{ ok: storedMessages }]);
+    fake.script("resume", [{ ok: { sessionId: "exact-session-9" } }]);
     const bridge = startTestBridge(fixedFactory(fake));
     bridge.feed(`${requestLine(1, "connect", CONNECT)}\n`);
     await until(() => (bridge.frames.some((frame) => frame["id"] === 1) ? true : undefined));
-    bridge.feed(`${requestLine(2, "start", START as JsonObject)}\n`);
+    bridge.feed(`${requestLine(2, "resume", RESUME as JsonObject)}\n`);
     await until(() => (bridge.frames.some((frame) => frame["id"] === 2) ? true : undefined));
-    bridge.feed(`${requestLine(3, "read_messages", { session_id: "cline-session-1" })}\n`);
-    await until(() => (bridge.frames.some((frame) => frame["id"] === 3) ? true : undefined));
-    const read = resultOf(bridge.frames, 3) as JsonObject[];
-    expect(read).toEqual(storedMessages);
-
-    bridge.feed(`${requestLine(4, "start", { ...START, session_id: "cline-session-1", initial_messages: read })}\n`);
-    await until(() => (bridge.frames.some((frame) => frame["id"] === 4) ? true : undefined));
-    const sameIdStart = fake.callsOf("start")[1];
-    expect(sameIdStart?.args["initialMessages"]).toEqual(storedMessages);
-    expect(sameIdStart?.args["initialMessages"]).not.toBe(storedMessages);
+    expect(resultOf(bridge.frames, 2)).toEqual({ session_id: "exact-session-9" });
   });
 
   it("returns the exact SDK session id and the native result or JSON null", async () => {

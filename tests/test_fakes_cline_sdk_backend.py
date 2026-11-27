@@ -2,21 +2,20 @@
 
 These tests prove only D2's own seam: that a Python client can consume the
 declared ``ClineSdkBackend`` contract against the fake without Node, a
-subprocess, or ``@cline/sdk``; that construction/reconstruction inputs and
-raw message arrays round-trip losslessly with exact session identity; that
-``send``/read observations pass through unparsed; that ``abort``/``stop``/
-``dispose`` stay distinct without implicit delete/replacement; that event
-forwarding, filtering, and unsubscribe are deterministic; that the backend
-error classifications stay machine-distinguishable without leaking a
-sensitive sentinel through text/representation/exception chains; and that
-fake instances and scripted FIFO outcomes are isolated. The behavioral
-matrices of #65/#67/#69/#130 and the R-series qualification experiments are
-deliberately not repeated here.
+subprocess, or ``@cline/sdk``; that the native ``resume_session``
+reconstruction (issue #408) preserves the exact conversation and identity;
+that ``send``/read observations pass through unparsed; that
+``abort``/``stop``/``dispose`` stay distinct without implicit
+delete/replacement; that event forwarding, filtering, and unsubscribe are
+deterministic; that the backend error classifications stay
+machine-distinguishable without leaking a sensitive sentinel through
+text/representation/exception chains; and that fake instances and scripted
+FIFO outcomes are isolated. The behavioral matrices of #65/#67/#69/#130 and
+the R-series qualification experiments are deliberately not repeated here.
 """
 
 from __future__ import annotations
 
-import copy
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -30,6 +29,8 @@ from openorc.adapters.cline import (
     ClineRemoteAttachmentRejectedError,
     ClineRemoteAttachmentUnavailableError,
     ClineRemoteConfig,
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSdkBackend,
     ClineSdkBackendError,
@@ -49,6 +50,7 @@ from tests.fakes.cline_sdk_backend import (
     OP_LIST_HISTORY,
     OP_LIST_RUNS,
     OP_READ_MESSAGES,
+    OP_RESUME,
     OP_SEND,
     OP_START,
     OP_STOP,
@@ -86,6 +88,27 @@ def _start_request(**overrides: Any) -> ClineStartRequest:
     }
     fields.update(overrides)
     return ClineStartRequest(**fields)
+
+
+def _resume_request(session_id: str, **overrides: Any) -> ClineResumeRequest:
+    fields: dict[str, Any] = {
+        "session_id": session_id,
+        "provider_id": "opaque-provider-id",
+        "model_id": "opaque-model-id",
+        "mode": ClineConstructionMode.ACT,
+        "rules": "# Producer role rules\n\nMarkdown guidance.",
+        "system_prompt": "",
+        "cwd": "/workspace/producer",
+        "workspace_root": "/workspace",
+        "enable_tools": True,
+        "interactive": True,
+        "tool_policies": {
+            "*": {"autoApprove": True},
+            "ask_question": {"enabled": False},
+        },
+    }
+    fields.update(overrides)
+    return ClineResumeRequest(**fields)
 
 
 def _raw_messages() -> list[dict[str, Any]]:
@@ -157,40 +180,42 @@ def test_fresh_start_preserves_the_construction_bundle_and_allocates_exact_ids()
     assert backend.start(_start_request()).session_id == "cline-session-2"
 
 
-def test_same_id_start_round_trips_the_raw_message_array_losslessly() -> None:
+def test_native_resume_preserves_the_exact_conversation_and_identity() -> None:
     backend = FakeClineSdkBackend()
     session_id = backend.start(_start_request()).session_id
-
     raw = _raw_messages()
-    backend.queue_read_messages(session_id, raw)
-    read = backend.read_messages(session_id)
-    assert read == raw
-    assert read is not raw
+    backend.seed_messages(session_id, raw)
+
+    request = _resume_request(session_id)
+    restored = backend.resume_session(request)
+
+    # The exact external session identity stays intact and the stored
+    # conversation is preserved verbatim (Hub-side saved loading):
+    assert restored == ClineResumeResult(session_id=session_id)
+    assert [call for call in backend.calls() if call.operation == OP_RESUME] == [
+        FakeBackendCall(OP_RESUME, session_id=session_id, request=request)
+    ]
+    assert backend.read_messages(session_id) == raw
 
     # What a caller received is an isolated deep copy: mutating it cannot
-    # touch what the fake recorded or will return next.
+    # touch what the fake stores.
+    read = backend.read_messages(session_id)
     read[0]["messages"][0]["metadata"]["nested"]["deep"][2]["key"] = "mutated"
+    assert backend.stored_messages(session_id) == raw
 
-    pristine = copy.deepcopy(raw)
-    reconstruction = _start_request(session_id=session_id, initial_messages=pristine)
-    restarted = backend.start(reconstruction)
+    # A saved-record absence is a positive refusal on this instance:
+    with pytest.raises(ClineSessionNotFoundError):
+        backend.resume_session(_resume_request("cline-session-404"))
 
-    # The exact external session identity stays intact:
-    assert restarted.session_id == session_id == "cline-session-1"
-    assert restarted.result is None
-    start_calls = [call for call in backend.calls() if call.operation == OP_START]
-    assert start_calls[1] == FakeBackendCall(
-        OP_START, session_id=session_id, request=reconstruction
+    # Scripted outcomes (native refusals included) raise as queued:
+    scripted = FakeClineSdkBackend()
+    scripted.start(_start_request())
+    scripted.queue_resume(
+        "cline-session-1",
+        ClineSdkOperationRejectedError("session_already_exists"),
     )
-    assert start_calls[1].request is not None
-    # The nested raw array arrived unchanged, and reads still serve it:
-    assert start_calls[1].request.initial_messages == raw
-    assert backend.read_messages(session_id) == raw
-
-    # The stored round-trip array is itself an isolated deep copy:
-    stored = backend.stored_messages(session_id)
-    stored[0]["messages"][0]["metadata"]["nested"]["deep"][2]["key"] = "mutated-again"
-    assert backend.read_messages(session_id) == raw
+    with pytest.raises(ClineSdkOperationRejectedError):
+        scripted.resume_session(_resume_request("cline-session-1"))
 
 
 def test_send_carries_exact_identity_and_prompt_and_returns_unparsed_results() -> None:
@@ -270,7 +295,8 @@ def test_release_operations_stay_distinct_without_implicit_deletion_or_replaceme
     operation: str, exercise: Callable[[FakeClineSdkBackend, str], None]
 ) -> None:
     backend = FakeClineSdkBackend()
-    session_id = backend.start(_start_request(initial_messages=_raw_messages())).session_id
+    session_id = backend.start(_start_request()).session_id
+    backend.seed_messages(session_id, _raw_messages())
     recorded_before = len(backend.calls())
 
     exercise(backend, session_id)
@@ -286,9 +312,11 @@ def test_release_operations_stay_distinct_without_implicit_deletion_or_replaceme
             assert release_call.reason == "owner-cancelled"
 
     # No implicit deletion or replacement: the session stays known with its
-    # state intact, and the next fresh start allocates the next ID.
+    # state intact (the native resume still restores it), and the next fresh
+    # start allocates the next ID.
     assert backend.known_session_ids() == (session_id,)
     assert backend.read_messages(session_id) == _raw_messages()
+    assert backend.resume_session(_resume_request(session_id)).session_id == session_id
     assert backend.start(_start_request()).session_id == "cline-session-2"
 
 
@@ -448,18 +476,22 @@ def test_operation_rejection_diagnostics_reject_arbitrary_sensitive_values() -> 
 
 
 def test_representations_never_leak_prompt_transcript_or_result_content() -> None:
-    request = _start_request(
+    start_request = _start_request(
         rules="# Rules with SENSITIVE-RULES-SENTINEL",
         system_prompt="system prompt with SENSITIVE-SYSTEM-PROMPT-SENTINEL",
-        session_id="reconstruction-target",
-        initial_messages=_raw_messages(),
     )
-    request_repr = repr(request)
-    assert "SENSITIVE-RULES-SENTINEL" not in request_repr
-    assert "SENSITIVE-SYSTEM-PROMPT-SENTINEL" not in request_repr
-    # Transcript content never enters representation either:
-    assert "composed turn text" not in request_repr
-    assert "raw-session-id" not in request_repr
+    start_repr = repr(start_request)
+    assert "SENSITIVE-RULES-SENTINEL" not in start_repr
+    assert "SENSITIVE-SYSTEM-PROMPT-SENTINEL" not in start_repr
+
+    resume_request = _resume_request(
+        "reconstruction-target",
+        rules="# Rules with SENSITIVE-RULES-SENTINEL",
+        system_prompt="system prompt with SENSITIVE-SYSTEM-PROMPT-SENTINEL",
+    )
+    resume_repr = repr(resume_request)
+    assert "SENSITIVE-RULES-SENTINEL" not in resume_repr
+    assert "SENSITIVE-SYSTEM-PROMPT-SENTINEL" not in resume_repr
 
     result = ClineStartResult(
         session_id="raw-session-id",
@@ -468,38 +500,35 @@ def test_representations_never_leak_prompt_transcript_or_result_content() -> Non
     assert "SENSITIVE-RESULT-SENTINEL" not in repr(result)
 
     call = FakeBackendCall(
-        OP_SEND,
+        OP_RESUME,
         session_id="reconstruction-target",
         prompt="composed prompt with SENSITIVE-PROMPT-SENTINEL",
-        request=request,
+        request=resume_request,
     )
     call_repr = repr(call)
     assert "SENSITIVE-PROMPT-SENTINEL" not in call_repr
     assert "SENSITIVE-RULES-SENTINEL" not in call_repr
     assert "SENSITIVE-RESULT-SENTINEL" not in call_repr
-    assert "composed turn text" not in call_repr
 
     # Representations withhold content; the values themselves stay intact
     # for lossless transport and verbatim test assertions:
     assert call.prompt == "composed prompt with SENSITIVE-PROMPT-SENTINEL"
     assert call.request is not None
-    assert call.request.initial_messages == _raw_messages()
+    assert call.request == resume_request
     assert result.result == {"agentResult": {"text": "SENSITIVE-RESULT-SENTINEL"}}
 
 
 def test_fake_instances_and_scripted_outcomes_are_isolated_and_deterministic() -> None:
     first = FakeClineSdkBackend()
     second = FakeClineSdkBackend()
-    raw = _raw_messages()
 
     for backend in (first, second):
-        session_id = backend.start(_start_request(initial_messages=raw)).session_id
+        session_id = backend.start(_start_request()).session_id
         backend.queue_send(session_id, {"echo": "scripted-once"})
         assert backend.send(session_id, "same prompt") == {"echo": "scripted-once"}
         # FIFO scripts are consumed exactly once; the next send falls back to
         # the legitimate unscripted None:
         assert backend.send(session_id, "same prompt") is None
-        assert backend.stored_messages(session_id) == raw
         assert [call.operation for call in backend.calls()] == [
             OP_START,
             OP_SEND,
@@ -512,8 +541,9 @@ def test_fake_instances_and_scripted_outcomes_are_isolated_and_deterministic() -
     assert second.known_session_ids() == ("cline-session-1",)
     assert first.calls() == second.calls()
 
-    # Scripted start outcomes keep their scripted exact ID, and explicit
-    # None read results are scripted outcomes too:
+    # Scripted start outcomes keep their scripted exact ID, scripted resume
+    # outcomes raise or return as queued, and explicit None read results are
+    # scripted outcomes too:
     third = FakeClineSdkBackend()
     third.queue_start(ClineStartResult(session_id="scripted-opaque-id"))
     assert third.start(_start_request()).session_id == "scripted-opaque-id"
@@ -522,6 +552,10 @@ def test_fake_instances_and_scripted_outcomes_are_isolated_and_deterministic() -
     assert third.get("scripted-opaque-id") is None
     third.queue_read_messages("scripted-opaque-id", [])
     assert third.read_messages("scripted-opaque-id") == []
+    third.queue_resume("scripted-opaque-id", ClineResumeResult(session_id="scripted-opaque-id"))
+    assert third.resume_session(_resume_request("scripted-opaque-id")) == ClineResumeResult(
+        session_id="scripted-opaque-id"
+    )
 
 
 def test_operation_gates_hold_a_call_open_until_released() -> None:
@@ -566,7 +600,8 @@ def test_operation_gates_hold_a_call_open_until_released() -> None:
 def test_enqueue_default_scripted_and_list_runs_status_bookkeeping() -> None:
     fake = FakeClineSdkBackend()
     assert isinstance(fake, ClineSdkBackend)
-    fake.start(_start_request(session_id="sess-1"))
+    fake.queue_start(ClineStartResult(session_id="sess-1"))
+    fake.start(_start_request())
 
     with pytest.raises(ClineSessionNotFoundError):
         fake.enqueue("sess-unknown", "turn")  # positive absence on this instance

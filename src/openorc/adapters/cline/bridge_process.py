@@ -89,6 +89,8 @@ from openorc.adapters.cline.errors import (
 from openorc.adapters.cline.values import (
     ClineHubEvent,
     ClineRemoteConfig,
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
@@ -104,6 +106,7 @@ _TRACER_SCOPE = "openorc.adapters.cline.bridge_process"
 
 _CONNECT_SPAN_NAME = "cline_bridge.connect"
 _START_SPAN_NAME = "cline_bridge.start"
+_RESUME_SPAN_NAME = "cline_bridge.resume_session"
 _SEND_SPAN_NAME = "cline_bridge.send"
 _ENQUEUE_SPAN_NAME = "cline_bridge.enqueue"
 _STOP_SPAN_NAME = "cline_bridge.stop"
@@ -264,6 +267,13 @@ def _decode_result(method: str, value: Any) -> Any:
         if result is not None and not isinstance(result, dict):
             return _INVALID_RESULT
         return ClineStartResult(session_id=session_id, result=result)
+    if method == "resume":
+        if not isinstance(value, dict):
+            return _INVALID_RESULT
+        session_id = value.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return _INVALID_RESULT
+        return ClineResumeResult(session_id=session_id)
     if method == "subscribe":
         if isinstance(value, dict):
             subscription_id = value.get("subscription_id")
@@ -311,8 +321,9 @@ def _remote_params(remote: ClineRemoteConfig) -> JsonObject:
 
 
 def _start_params(request: ClineStartRequest) -> JsonObject:
-    """Flatten the complete construction bundle verbatim; nothing synthesized."""
-    params: JsonObject = {
+    """Flatten the complete fresh-construction bundle verbatim; nothing
+    synthesized. Same-ID reconstruction is the ``resume`` operation."""
+    return {
         "provider_id": request.provider_id,
         "model_id": request.model_id,
         "mode": request.mode.value,
@@ -324,11 +335,25 @@ def _start_params(request: ClineStartRequest) -> JsonObject:
         "interactive": request.interactive,
         "tool_policies": request.tool_policies,
     }
-    if request.session_id is not None:
-        params["session_id"] = request.session_id
-    if request.initial_messages is not None:
-        params["initial_messages"] = request.initial_messages
-    return params
+
+
+def _resume_params(request: ClineResumeRequest) -> JsonObject:
+    """Flatten the complete reconstruction bundle verbatim; nothing
+    synthesized. The Hub performs the saved-history loading (issue #408) —
+    no transcript is ever uploaded."""
+    return {
+        "session_id": request.session_id,
+        "provider_id": request.provider_id,
+        "model_id": request.model_id,
+        "mode": request.mode.value,
+        "rules": request.rules,
+        "system_prompt": request.system_prompt,
+        "cwd": request.cwd,
+        "workspace_root": request.workspace_root,
+        "enable_tools": request.enable_tools,
+        "interactive": request.interactive,
+        "tool_policies": request.tool_policies,
+    }
 
 
 def _default_entrypoint_path() -> Path:
@@ -928,12 +953,25 @@ class ClineBridgeProcessBackend:
                 self._attached = False
 
     def start(self, request: ClineStartRequest) -> ClineStartResult:
-        """Allocate/bind one external session; allocation, not readiness."""
+        """Allocate/bind one fresh external session; allocation, not readiness."""
         with application_span(_TRACER_SCOPE, _START_SPAN_NAME) as span:
             annotate_span(span, operation=_START_SPAN_NAME)
             attachment = self._require_attached()
             outcome = self._rpc(attachment, "start", _start_params(request))
             assert isinstance(outcome, ClineStartResult)  # reader-validated invariant
+            return outcome
+
+    def resume_session(self, request: ClineResumeRequest) -> ClineResumeResult:
+        """Restore the exact existing session through the native Hub resume.
+
+        One consequential Hub command (issue #408) with Hub-side saved
+        loading — never a transcript upload and never a resend; the verified
+        exact restored identity is the only success value."""
+        with application_span(_TRACER_SCOPE, _RESUME_SPAN_NAME) as span:
+            annotate_span(span, operation=_RESUME_SPAN_NAME)
+            attachment = self._require_attached()
+            outcome = self._rpc(attachment, "resume", _resume_params(request))
+            assert isinstance(outcome, ClineResumeResult)  # reader-validated invariant
             return outcome
 
     def send(self, session_id: str, prompt: str) -> JsonObject | None:
@@ -959,7 +997,7 @@ class ClineBridgeProcessBackend:
             return outcome
 
     def stop(self, session_id: str) -> None:
-        """Release the runtime incarnation for same-ID reconstruction."""
+        """Release the runtime incarnation for native-resume reconstruction."""
         with application_span(_TRACER_SCOPE, _STOP_SPAN_NAME) as span:
             annotate_span(span, operation=_STOP_SPAN_NAME)
             attachment = self._require_attached()

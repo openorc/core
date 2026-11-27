@@ -16,13 +16,14 @@ code/phase evidence supports them: the two qualified hub transport codes
 classify attachment state, and a pure read can never take an external effect.
 Any other SDK machine code is forwarded by the pinned bridge without
 establishing whether the operation took effect, so an unproven effectful
-``start``/``send``/``stop`` outcome is conservatively uncertain — never a
-known pre-effect failure, never a safe retry. Deliberate non-inferences: bad
-credentials are never inferred from ``hub_connect_failed`` alone, exact-session
-loss is never inferred from connection loss, and an uncertain
-``start``/``send``/``stop`` is never downgraded to a safe retry. The backend
-taxonomy currently carries no positive timeout marker, so every uncertain
-backend outcome maps to delivery uncertainty.
+``start``/``resume``/``send``/``stop`` outcome is conservatively uncertain —
+never a known pre-effect failure, never a safe retry. Deliberate
+non-inferences: bad credentials are never inferred from
+``hub_connect_failed`` alone, exact-session loss is never inferred from
+connection loss, and an uncertain ``start``/``resume``/``send``/``stop`` is
+never downgraded to a safe retry. The backend taxonomy currently carries no
+positive timeout marker, so every uncertain backend outcome maps to
+delivery uncertainty.
 """
 
 from __future__ import annotations
@@ -64,13 +65,17 @@ _NOT_ATTACHED: Final = "not_attached"
 # Operations whose effect is an external session allocation, an incarnation
 # change, or an activity interruption: a connection-level breakage during
 # them leaves the effect unknown, and the D6b in-memory latch records it
-# until its explicit settlement. The Hub-run admission (``enqueue``, issue
-# #321) is deliberately absent: its effect is Hub-side run admission whose
-# uncertainty is owned durably by the outstanding receipt at the correlation
-# seam (issue #322), so an unproven enqueue rejection classifies as
-# uncertain (see ``_UNPROVEN_EFFECT_OPERATIONS``) without ever latching the
-# session's D6b effects.
-EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset({"start", "send", "stop", "abort"})
+# until its explicit settlement. The native ``resume`` reconstruction
+# (issue #408) is a consequential incarnation change of exactly this kind.
+# The Hub-run admission (``enqueue``, issue #321) is deliberately absent: its
+# effect is Hub-side run admission whose uncertainty is owned durably by the
+# outstanding receipt at the correlation seam (issue #322), so an unproven
+# enqueue rejection classifies as uncertain (see
+# ``_UNPROVEN_EFFECT_OPERATIONS``) without ever latching the session's D6b
+# effects.
+EFFECTFUL_OPERATIONS: Final[frozenset[str]] = frozenset(
+    {"start", "resume", "send", "stop", "abort"}
+)
 
 # The operations whose unproven rejection is conservatively uncertain: the
 # effectful operations plus the Hub-run admission, whose positive pre-effect
@@ -87,6 +92,26 @@ _UNPROVEN_EFFECT_OPERATIONS: Final[frozenset[str]] = EFFECTFUL_OPERATIONS | {"en
 _HUB_RUN_ADMISSION: Final = "enqueue"
 _HUB_ADMISSION_REFUSED_CODES: Final[frozenset[str]] = frozenset(
     {"run_admission_rejected", "hub_draining"}
+)
+
+# The native resume operation (issue #408) and the Hub's positively
+# identified reconstruction refusals: the Hub answered the resume command
+# definitively without performing the incarnation change — an already-live
+# (resident) session, an empty/unavailable saved conversation, an
+# unsupported command on this Hub, or a malformed resume request — so the
+# reconstruction verifiably did not take effect and the outcome is known.
+# The exact saved-record absence (``session_not_found``) maps onto the
+# dedicated session-absence error before this set is consulted. A resumed
+# session is never silently stopped to satisfy the resident refusal, and no
+# fallback reconstruction exists.
+_HUB_RESUME: Final = "resume"
+_HUB_RESUME_REFUSED_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "session_already_exists",
+        "session_messages_not_found",
+        "invalid_resume",
+        "unsupported_command",
+    }
 )
 
 
@@ -125,6 +150,13 @@ def classify_backend_failure(error: ClineSdkBackendError, *, operation: str) -> 
             # The Hub definitively refused the admission itself: the run was
             # never admitted, so this is a positively proven pre-effect
             # refusal — never an uncertainty that strands the receipt.
+            return AgentRuntimeUnavailableError(f"the hub refused the {operation} ({error.code!r})")
+        if operation == _HUB_RESUME and error.code in _HUB_RESUME_REFUSED_CODES:
+            # The Hub definitively refused the native reconstruction itself:
+            # the incarnation change verifiably did not take effect, so this
+            # is a positively proven pre-effect refusal. The reconstruction
+            # fails closed; the resident refusal never authorizes stopping a
+            # live incarnation, and no fallback mechanism exists.
             return AgentRuntimeUnavailableError(f"the hub refused the {operation} ({error.code!r})")
         if error.code == _HUB_CONNECTION_CLOSED:
             if operation in _UNPROVEN_EFFECT_OPERATIONS:

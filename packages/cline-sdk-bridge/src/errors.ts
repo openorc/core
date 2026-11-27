@@ -129,12 +129,14 @@ function closeCodeOf(error: unknown): number | undefined {
 }
 
 /** Bridge operations backed by Hub-native commands through the official
- * `NodeHubClient` (issue #321). Their transport failures classify as
- * uncertain outcomes, never as refusals. */
+ * `NodeHubClient` (issue #321; the native `session.resume` reconstruction,
+ * issue #408). Their transport failures classify as uncertain outcomes,
+ * never as refusals. */
 export const HUB_COMMAND_OPERATIONS: ReadonlySet<string> = new Set([
   "enqueue",
   "list_runs",
   "subscribe_hub",
+  "resume",
 ]);
 
 /** The pinned 0.2.1 `HubTransportErrorCode` union (unchanged from 0.0.90).

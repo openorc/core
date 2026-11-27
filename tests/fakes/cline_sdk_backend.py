@@ -33,12 +33,11 @@ Faithfulness and determinism guarantees:
   instance); unscripted value operations return their dumb defaults
   (``None``/empty reads).
 - Stable opaque session IDs: fresh starts allocate ``cline-session-1``,
-  ``cline-session-2``, ... in call order per instance; same-ID starts bind
-  the supplied exact ID, and a scripted start result binds its own exact
-  ID. The raw ``initial_messages`` array is deep-copied on the way in and
-  deep-copied on the way out, so the exact nested JSON round-trips across
-  ``read_messages`` → next same-ID ``start`` and callers can never mutate
-  recorded state.
+  ``cline-session-2``, ... in call order per instance; a scripted start
+  result binds its own exact ID. The native ``resume_session`` (issue
+  #408) binds the requested exact ID, preserves the stored conversation
+  (Hub-side saved loading), and records the complete construction request
+  verbatim for assertions.
 - Deterministic event delivery: ``emit`` delivers synchronously to active
   subscriptions in subscription order, filtered by exact session ID (a
   ``None`` filter receives everything). Unsubscribe is explicit and
@@ -77,6 +76,8 @@ from openorc.adapters.cline.errors import ClineSdkBackendError, ClineSessionNotF
 from openorc.adapters.cline.values import (
     ClineHubEvent,
     ClineRemoteConfig,
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSessionEvent,
     ClineStartRequest,
@@ -99,6 +100,7 @@ OP_GET_ACCUMULATED_USAGE = "get_accumulated_usage"
 OP_LIST_HISTORY = "list_history"
 OP_LIST_RUNS = "list_runs"
 OP_READ_MESSAGES = "read_messages"
+OP_RESUME = "resume"
 OP_SEND = "send"
 OP_START = "start"
 OP_STOP = "stop"
@@ -132,7 +134,7 @@ class FakeBackendCall:
     session_id: str | None = None
     prompt: str | None = None
     reason: str | None = None
-    request: ClineStartRequest | None = None
+    request: ClineStartRequest | ClineResumeRequest | None = None
     remote: ClineRemoteConfig | None = None
 
     def __repr__(self) -> str:
@@ -197,6 +199,7 @@ class FakeClineSdkBackend:
         self._hub_subscriptions: list[_HubSubscriptionEntry] = []
         self._connect_scripts: deque[ClineSdkBackendError] = deque()
         self._start_scripts: deque[ClineStartResult | ClineSdkBackendError] = deque()
+        self._resume_scripts: dict[str, deque[ClineResumeResult | ClineSdkBackendError]] = {}
         self._send_scripts: dict[str, deque[JsonObject | None | ClineSdkBackendError]] = {}
         self._enqueue_scripts: dict[str, deque[ClineRunAdmission | ClineSdkBackendError]] = {}
         self._stop_scripts: dict[str, deque[ClineSdkBackendError]] = {}
@@ -219,6 +222,12 @@ class FakeClineSdkBackend:
     def queue_start(self, outcome: ClineStartResult | ClineSdkBackendError) -> None:
         """Script one FIFO ``start`` outcome."""
         self._start_scripts.append(outcome)
+
+    def queue_resume(
+        self, session_id: str, outcome: ClineResumeResult | ClineSdkBackendError
+    ) -> None:
+        """Script one FIFO ``resume_session`` outcome for the exact session ID."""
+        self._resume_scripts.setdefault(session_id, deque()).append(outcome)
 
     def queue_send(
         self, session_id: str, outcome: JsonObject | None | ClineSdkBackendError
@@ -344,6 +353,21 @@ class FakeClineSdkBackend:
         """The raw message array currently bound to the session (deep copy)."""
         return copy.deepcopy(self._sessions[session_id])
 
+    def seed_messages(self, session_id: str, messages: list[JsonObject]) -> None:
+        """Seed the session's Hub-side saved conversation (test-only).
+
+        The fake's stored per-session array models what the qualified Hub
+        persists and what native ``resume_session`` loads Hub-side: reads
+        serve it unscripted, and a reconstruction preserves it verbatim.
+        Seeding records no call; it only establishes the deterministic
+        saved state a test needs.
+        """
+        if session_id not in self._sessions:
+            raise ClineSessionNotFoundError(
+                f"session {session_id!r} is not known to this backend instance"
+            )
+        self._sessions[session_id] = copy.deepcopy(messages)
+
         # -- the #71 ClineSdkBackend operations ---------------------------------
 
     def connect(self, remote: ClineRemoteConfig) -> None:
@@ -352,25 +376,45 @@ class FakeClineSdkBackend:
             raise self._connect_scripts.popleft()
 
     def start(self, request: ClineStartRequest) -> ClineStartResult:
-        self._calls.append(
-            FakeBackendCall(OP_START, session_id=request.session_id, request=request)
-        )
+        self._calls.append(FakeBackendCall(OP_START, request=request))
         if self._start_scripts:
             outcome = self._start_scripts.popleft()
             if isinstance(outcome, ClineSdkBackendError):
                 raise outcome
             result = outcome
-        elif request.session_id is not None:
-            result = ClineStartResult(session_id=request.session_id)
         else:
             self._allocated += 1
             result = ClineStartResult(session_id=f"cline-session-{self._allocated}")
         session_id = result.session_id
-        if request.initial_messages is not None:
-            self._sessions[session_id] = copy.deepcopy(request.initial_messages)
-        elif session_id not in self._sessions:
+        if session_id not in self._sessions:
             self._sessions[session_id] = []
         return result
+
+    def resume_session(self, request: ClineResumeRequest) -> ClineResumeResult:
+        """Restore the exact requested session with Hub-side saved loading.
+
+        Unscripted default behavior mirrors the qualified native seam: a
+        session unknown to this instance raises the saved-record absence
+        (:class:`ClineSessionNotFoundError`), and a known session restores
+        with its stored conversation preserved verbatim and the requested
+        exact identity. Scripted outcomes (including native refusals) are
+        raised or returned as queued.
+        """
+        self._calls.append(
+            FakeBackendCall(OP_RESUME, session_id=request.session_id, request=request)
+        )
+        self._apply_gate(OP_RESUME, request.session_id)
+        scripted = self._resume_scripts.get(request.session_id)
+        if scripted:
+            outcome = scripted.popleft()
+            if isinstance(outcome, ClineSdkBackendError):
+                raise outcome
+            return outcome
+        if request.session_id not in self._sessions:
+            raise ClineSessionNotFoundError(
+                f"session {request.session_id!r} is not known to this backend instance"
+            )
+        return ClineResumeResult(session_id=request.session_id)
 
     def send(self, session_id: str, prompt: str) -> JsonObject | None:
         self._calls.append(FakeBackendCall(OP_SEND, session_id=session_id, prompt=prompt))
@@ -421,6 +465,7 @@ class FakeClineSdkBackend:
 
     def stop(self, session_id: str) -> None:
         self._calls.append(FakeBackendCall(OP_STOP, session_id=session_id))
+        self._apply_gate(OP_STOP, session_id)
         scripted = self._stop_scripts.get(session_id)
         if scripted:
             raise scripted.popleft()

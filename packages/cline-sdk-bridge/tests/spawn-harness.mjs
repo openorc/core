@@ -94,9 +94,18 @@ const fake = {
   async start(input) {
     record({ method: "start", args: input });
     return await apply("start", () => {
-      const sessionId = input.config.sessionId ?? `cline-session-${++sessionCounter}`;
-      sessions.set(sessionId, input.initialMessages === undefined ? [] : structuredClone(input.initialMessages));
+      const sessionId = `cline-session-${++sessionCounter}`;
+      sessions.set(sessionId, []);
       return { sessionId };
+    });
+  },
+  async resume(input) {
+    record({ method: "resume", args: input });
+    return await apply("resume", () => {
+      if (!sessions.has(input.sessionId)) {
+        throw notFound(input.sessionId);
+      }
+      return { sessionId: input.sessionId };
     });
   },
   async send(input) {

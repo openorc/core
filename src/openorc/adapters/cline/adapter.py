@@ -168,6 +168,7 @@ from openorc.adapters.cline.reconciliation import (
 )
 from openorc.adapters.cline.values import (
     ClineConstructionMode,
+    ClineResumeRequest,
     ClineSessionEvent,
     ClineStartRequest,
     JsonObject,
@@ -293,16 +294,16 @@ def _build_start_request(
     context: ClineConstructionContext,
     *,
     mode: ClineConstructionMode,
-    session_id: str | None = None,
-    initial_messages: list[JsonObject] | None = None,
 ) -> ClineStartRequest:
-    """Build the complete v1 construction bundle for one fresh or same-ID start.
+    """Build the complete v1 fresh-construction bundle for one start.
 
     The role Markdown is the resolved role behavior input (``rules``); the
     system prompt is the required explicit empty string; the deliberate v1
     session tool policy auto-approves enabled tools and disables
     ``ask_question``. Nothing else is synthesized: no spawn/team flags, no
     approval executors, no credentials, no catalogs, no custom harnesses.
+    Fresh construction only: same-ID reconstruction builds a
+    :class:`ClineResumeRequest` instead (issue #408).
     """
     return ClineStartRequest(
         provider_id=context.configured_provider or "",
@@ -315,8 +316,37 @@ def _build_start_request(
         enable_tools=True,
         interactive=True,
         tool_policies={"*": {"autoApprove": True}, "ask_question": {"enabled": False}},
+    )
+
+
+def _build_resume_request(
+    context: ClineConstructionContext,
+    *,
+    mode: ClineConstructionMode,
+    session_id: str,
+) -> ClineResumeRequest:
+    """Build the complete v1 reconstruction bundle for the exact session.
+
+    The native same-ID reconstruction input (issue #408): the identical
+    construction bundle a fresh start would build, addressed to the exact
+    external session ID, with the caller-authorized target mode. The Hub
+    performs the saved-history loading; no transcript is ever read into the
+    request. The requested mode is an input of this invocation, never
+    adapter-persisted state: reapplying the same construction parameters is
+    valid.
+    """
+    return ClineResumeRequest(
         session_id=session_id,
-        initial_messages=initial_messages,
+        provider_id=context.configured_provider or "",
+        model_id=context.configured_model or "",
+        mode=mode,
+        rules=resolve_role_markdown(context.identity.role, context.role_prompt_override),
+        system_prompt="",
+        cwd=context.cwd or "",
+        workspace_root=context.workspace_root or "",
+        enable_tools=True,
+        interactive=True,
+        tool_policies={"*": {"autoApprove": True}, "ask_question": {"enabled": False}},
     )
 
 
@@ -891,12 +921,12 @@ class ClineAdapter(AgentRuntimeAdapter):
         backend while an ordinary or verified-PR-review ``send`` is still in
         flight, with other sessions unaffected. A short-lived per-session
         coordination gate orders the abort against the serialized
-        ``read_messages`` → ``stop`` → ``start`` reconstruction section: a
+        ``stop`` → native ``resume`` reconstruction section: a
         reconstruction that already entered its incarnation-change section
         makes the abort decline locally with a safe known pre-dispatch
         unavailability (never a queued interruption of a possibly new
         incarnation), and a reconstruction refuses — before its first
-        ``read_messages``/``stop`` effect — while any abort of the session
+        ``stop`` effect — while any abort of the session
         is outstanding, acknowledged-but-unreconciled, or outcome-uncertain.
         Outstanding aborts are counted per session, so one abort's known
         pre-effect failure can never release another concurrent abort's
@@ -998,7 +1028,7 @@ class ClineAdapter(AgentRuntimeAdapter):
         resolved first, then the dispatch takes the per-session
         send/reconstruction lock — serializing the resumed turn against
         this adapter's own same-session sends and against the whole
-        read_messages → stop → start reconstruction section (it can never
+        stop → native-resume reconstruction section (it can never
         interleave a changing runtime incarnation) — and, under the
         documented send-lock → coordination-lock order, refuses while any
         unresolved uncertain effect kind remains or while the session's
@@ -1074,16 +1104,18 @@ class ClineAdapter(AgentRuntimeAdapter):
         rebuild the addressed external session into the caller-authorized
         target construction mode with the resolver-resolved current
         construction context and phase-selected working directory, preserving
-        the exact external session identity and the full raw transcript. The
-        serialized sequence on the pinned backend is ``read_messages`` →
-        ``stop`` (incarnation release, not abort) → ``start`` carrying the
-        identical session ID and the raw persisted message array verbatim;
-        the start must return the identical session ID or the reconstruction
-        fails closed. No initialization resend, no synthesized continuation or
-        mode prose, no summarization or projection, no reliance on stale
-        native ``metadata.mode``, and no session substitution. The requested
-        mode is an input of this invocation, never adapter-persisted state:
-        reapplying the same construction parameters is valid.
+        the exact external session identity and the full conversation. The
+        serialized sequence on the pinned backend is ``stop`` (incarnation
+        release, not abort) → the Hub's native ``session.resume`` carrying
+        the identical session ID and the complete construction bundle; the
+        Hub performs the saved-history loading (no transcript is ever
+        uploaded — issue #408) and the resume must return the identical
+        session ID or the reconstruction fails closed. No initialization
+        resend, no synthesized continuation or mode prose, no summarization
+        or projection, no reliance on stale native ``metadata.mode``, and no
+        session substitution. The requested mode is an input of this
+        invocation, never adapter-persisted state: reapplying the same
+        construction parameters is valid.
 
         Serialization and safety: runtime-incarnation changes serialize
         against this adapter's own same-session sends/controls; a session
@@ -1092,9 +1124,9 @@ class ClineAdapter(AgentRuntimeAdapter):
         serialization, an uncertain one is never silently displaced, and an
         unresolved D6a activity interruption (an outstanding,
         acknowledged-but-unreconciled, or outcome-uncertain abort) is
-        likewise refused before the first ``read_messages``/``stop`` effect,
-        so reconstruction never displaces the possibly active work an abort
-        was requested to interrupt. The
+        likewise refused before the first ``stop`` effect, so reconstruction
+        never displaces the possibly active work an abort was requested to
+        interrupt. The
         bound Task/role/Connection context and the construction inputs come
         from the injected resolver's durable binding resolution; identity
         disagreement with this instance's memory fails closed. The caller
@@ -1333,6 +1365,97 @@ class ClineAdapter(AgentRuntimeAdapter):
                     self._uncertain_effects.pop(session_id, None)
             return ClineSettlementOutcome(settled=True)
 
+    def settle_uncertain_resume(
+        self,
+        session_id: str,
+        *,
+        runtime_work_settled: bool,
+        operation_accounted_for: bool,
+    ) -> ClineSettlementOutcome:
+        """Release the session's resume-kind uncertainty latch (D6b).
+
+        The explicit, caller-driven settlement of the native same-ID
+        reconstruction's incarnation-change uncertainty (issue #408): the
+        only way this adapter clears a session's ``resume``-kind unresolved
+        uncertain effect. Nothing else does — not a reconnect, not a
+        succeeding read, not a send or abort settlement, not an inferred
+        quiescence, and never the absence of a process-local latch after a
+        worker or bridge restart, which is not settlement evidence. An
+        uncertain resume (a transport loss or dispatch timeout around the
+        possibly-dispatched native command, or a mismatched reply) latches
+        this kind exactly like every other effectful operation, and every
+        later effect on the session — sends, detached admissions,
+        aborts' reconstruction interplay, and any further reconstruction —
+        is refused until this seam releases it with positive caller
+        attestation.
+
+        Caller preconditions (documented, fail closed): the caller must
+        hold positive, durable evidence that the interrupted runtime work
+        has settled or cannot still execute (``runtime_work_settled``) and
+        that the applicable logical reconstruction has been accounted for
+        by its owning caller (``operation_accounted_for``) — the durable
+        workflow facts belong to the later dispatch/reconciliation layer,
+        never to this adapter. An unsatisfied attestation raises before
+        any effect. The attestation covers every outstanding uncertain
+        resume of this session's ``resume`` kind: the per-kind latch does
+        not distinguish individual reconstructions, so settling with a
+        still-unaccounted reconstruction outstanding is a caller authority
+        error this seam cannot detect.
+
+        Concurrency: settlement serializes against this adapter's own
+        same-session sends/reconstructions (send/reconstruction lock
+        first), then takes the short coordination lock for the final
+        recheck — any outstanding abort, unresolved acknowledged or
+        uncertain abort, or active reconstruction is a veto that keeps
+        every guard latched (typed refusal). Only the ``resume`` kind is
+        released; unrelated unresolved kinds stay latched. Independent
+        sessions are unaffected.
+        """
+        with application_span(_TRACER_SCOPE, "cline_adapter.settle_uncertain_resume") as span:
+            annotate_span(span, operation="cline_adapter.settle_uncertain_resume")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
+            if not runtime_work_settled or not operation_accounted_for:
+                raise ValueError(
+                    "settlement requires positive caller evidence that the "
+                    "interrupted runtime work has settled or cannot still "
+                    "execute and that the logical reconstruction is accounted for"
+                )
+            identity = self._resolve_bound_context(session_id).identity
+            annotate_span(
+                span,
+                workspace_id=str(identity.workspace_id),
+                task_id=str(identity.task_id),
+                workflow_role=identity.role.value,
+            )
+            with self._lock_for(session_id), self._abort_coordination:
+                guard = self._abort_guards.get(session_id)
+                if guard is not None and guard.outstanding > 0:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.OUTSTANDING_ABORT,
+                    )
+                if guard is not None and guard.state is not _AbortState.NONE:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.UNRESOLVED_ABORT,
+                    )
+                if session_id in self._reconstruction_active:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.RECONSTRUCTION_ACTIVE,
+                    )
+                effects = self._uncertain_effects.get(session_id)
+                if effects is None or "resume" not in effects:
+                    return ClineSettlementOutcome(
+                        settled=False,
+                        refusal=ClineSettlementRefusal.NOTHING_TO_SETTLE,
+                    )
+                effects.discard("resume")
+                if not effects:
+                    self._uncertain_effects.pop(session_id, None)
+            return ClineSettlementOutcome(settled=True)
+
     def settle_abort(
         self,
         session_id: str,
@@ -1425,8 +1548,8 @@ class ClineAdapter(AgentRuntimeAdapter):
 
         The authorized Hub-restart recovery: rebuild the addressed exact
         external session into the caller-selected effective mode through
-        D5a's single same-ID reconstruction seam, preserving the exact
-        external session identity and the full raw transcript. The
+        D5a's single native same-ID reconstruction seam, preserving the
+        exact external session identity and the full conversation. The
         workflow selects the authorized effective mode (the Reviewer is
         always PLAN; the Producer's ACT/PLAN phase selection is the
         caller's authority) and the resolver's durable binding supplies
@@ -1454,12 +1577,13 @@ class ClineAdapter(AgentRuntimeAdapter):
           reinitialize).
 
         The narrow qualified-restart adjustment stays inside the same
-        reconstruction seam: when the serialized ``stop`` fails with a
-        positively identified session absence after the transcript was
-        just read, the recovery proceeds directly to the same-ID
-        ``start`` — an ambiguous, uncertain, or unavailable ``stop``
-        failure never permits a start. A wrong returned start ID always
-        fails closed. Genuine exact-context loss is surfaced to the
+        reconstruction seam: the exact persisted transcript is positively
+        established by the serialized ``read_messages`` before any effect,
+        and when the serialized ``stop`` fails with a positively identified
+        session absence after that read, the recovery proceeds directly to
+        the native ``resume`` — an ambiguous, uncertain, or unavailable
+        ``stop`` failure never permits a resume. A wrong returned start ID
+        always fails closed. Genuine exact-context loss is surfaced to the
         existing session-lifecycle/blocking authority through the
         normalized taxonomy; this adapter never mutates Task or
         ``TaskAgentSession`` state.
@@ -1709,28 +1833,38 @@ class ClineAdapter(AgentRuntimeAdapter):
         """Run the serialized same-ID reconstruction section (D5a seam).
 
         The single same-external-ID reconstruction mechanism, shared by
-        ``reconstruct_session`` and D6b's ``recover_session``: under the
-        per-session send/reconstruction lock, refuse while any unresolved
-        uncertain effect kind or activity-interruption guard remains,
-        register the reconstruction against concurrent aborts, then
-        execute the qualified ``read_messages`` → ``stop`` (incarnation
-        release, not abort) → ``start`` sequence with the identical
-        session ID and the raw persisted message array verbatim. The
-        start must return the identical session ID or the reconstruction
-        fails closed; no initialization resend, no synthesized
+        ``reconstruct_session`` and D6b's ``recover_session`` (issue #408):
+        under the per-session send/reconstruction lock, refuse while any
+        unresolved uncertain effect kind or activity-interruption guard
+        remains, register the reconstruction against concurrent aborts, then
+        execute the native reconstruction — ordinary live reconstruction
+        releases the exact quiescent incarnation through the qualified
+        ``stop`` (incarnation release, not abort) before the native
+        ``resume``; authorized stopped recovery positively establishes the
+        exact persisted surviving history through ``read_messages`` before
+        the section and tolerates only a positively identified stop absence
+        (no live incarnation on the attached runtime) before the native
+        ``resume``. The Hub performs the saved-history loading; no
+        transcript is ever uploaded and no fallback mechanism exists. The
+        native resume must return the identical session ID or the
+        reconstruction fails closed; no initialization resend, no synthesized
         continuation or mode prose, and no session substitution.
 
         ``tolerate_positive_stop_absence`` is D6b's narrow qualified-
         restart adjustment, staying inside this one seam: only the
-        recovery entrypoint sets it, and it changes exactly one thing —
-        a ``stop`` that fails with a positively identified session
-        absence (``AgentSessionNotFoundError``, a known pre-effect
-        outcome proving the session is not live on this runtime) is
-        accepted as the absent-incarnation evidence after the surviving
-        transcript was just read in this same section, so the authorized
-        recovery proceeds directly to the same-ID ``start``. Any
-        ambiguous, uncertain, or unavailable ``stop`` failure never
-        permits a start, with or without the flag.
+        recovery entrypoint sets it, and it changes exactly two things —
+        the exact persisted transcript must be positively established by
+        the serialized ``read_messages`` before any effect (an empty read
+        on an established bound session is inadequate evidence, never
+        permission to reinitialize), and a ``stop`` that fails with a
+        positively identified session absence
+        (``AgentSessionNotFoundError``, a known pre-effect outcome proving
+        the session is not live on this runtime) is accepted as the
+        absent-incarnation evidence after the surviving transcript was just
+        read in this same section, so the authorized recovery proceeds
+        directly to the native ``resume``. Any ambiguous, uncertain, or
+        unavailable ``stop`` failure never permits a resume, with or
+        without the flag.
         """
         with self._lock_for(session_id):
             if self._uncertain_effects.get(session_id):
@@ -1749,21 +1883,23 @@ class ClineAdapter(AgentRuntimeAdapter):
                             "unresolved; same-ID reconstruction safety cannot "
                             "be established"
                         )
-                messages = self._backend_operation(
-                    "read_messages",
-                    lambda: self._backend.read_messages(session_id),
-                    session_id=session_id,
-                )
-                if tolerate_positive_stop_absence and not messages:
-                    # Recovery precondition: the exact persisted transcript
-                    # must be positively established before a same-ID start.
-                    # An empty read on an established bound session is
-                    # inadequate evidence, never permission to reinitialize.
-                    raise AgentRuntimeUncertainOutcomeError(
-                        "the persisted transcript of the addressed session "
-                        "could not be positively established; same-ID "
-                        "recovery is refused"
+                if tolerate_positive_stop_absence:
+                    messages = self._backend_operation(
+                        "read_messages",
+                        lambda: self._backend.read_messages(session_id),
+                        session_id=session_id,
                     )
+                    if not messages:
+                        # Recovery precondition: the exact persisted transcript
+                        # must be positively established before the incarnation
+                        # is replaced. An empty read on an established bound
+                        # session is inadequate evidence, never permission to
+                        # reinitialize; the native resume is refused.
+                        raise AgentRuntimeUncertainOutcomeError(
+                            "the persisted transcript of the addressed session "
+                            "could not be positively established; same-ID "
+                            "recovery is refused"
+                        )
                 try:
                     self._backend_operation(
                         "stop",
@@ -1778,22 +1914,21 @@ class ClineAdapter(AgentRuntimeAdapter):
                     # transcript was just read in this section and no
                     # unresolved work remains (checked under the locks
                     # above), so the authorized recovery proceeds directly
-                    # to the same-ID start. An ambiguous failed stop never
+                    # to the native resume. An ambiguous failed stop never
                     # reaches this path.
-                start_request = _build_start_request(
+                resume_request = _build_resume_request(
                     context,
                     mode=target_mode,
                     session_id=session_id,
-                    initial_messages=messages,
                 )
                 result = self._backend_operation(
-                    "start",
-                    lambda: self._backend.start(start_request),
+                    "resume",
+                    lambda: self._backend.resume_session(resume_request),
                     session_id=session_id,
                 )
                 if result.session_id != session_id:
                     raise AgentRuntimeConfigurationRejectedError(
-                        "the same-ID reconstruction did not rebind the "
+                        "the same-ID reconstruction did not restore the "
                         "requested exact external session identity"
                     )
             finally:
