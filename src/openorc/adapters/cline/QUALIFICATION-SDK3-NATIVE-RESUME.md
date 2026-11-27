@@ -308,10 +308,13 @@ Cline; `--testdb` is never provisioned or run by Cline):
   the process: only counts, digests, and the identity verdict are recorded.
 - D3 now establishes EFFECTIVE post-recovery construction inside the
   scenario itself: after the native recovery at the checkout, the restored
-  ACT incarnation must actually perform the authorized scratch write inside
-  the checkout, verified Box-side through the existing Owner-approved
-  operator hook (`live.box_check`) — never inferred from a reply, a same
-  ID, a transcript count, or the earlier (pre-restart) workflow scenarios.
+  ACT incarnation must actually create the authorized uniquely named scratch
+  DIRECTORY inside the checkout, verified Box-side through the existing
+  Owner-approved operator hook (`live.box_check`, whose Cloud-runner
+  existence check is directory-shaped) — never inferred from a reply, a
+  same ID, a transcript count, or the earlier (pre-restart) workflow
+  scenarios. The scratch directory is removed by the existing authorized
+  workspace cleanup; no separate cleanup exists.
 - D3's usage recording now distinguishes the aggregate scope's absence from
   a root-scope reading per scope (`aggregate=<state> root=<state>`), with a
   genuine zero staying zero.

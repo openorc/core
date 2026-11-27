@@ -1670,18 +1670,18 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         assert isinstance(reply, AgentTextResponse)
         # EFFECTIVE post-recovery construction: the recovery restored native
         # ACT at the checkout, and the restored incarnation must actually
-        # perform the authorized scratch write there — verified Box-side
-        # through the Owner-approved operator hook, never inferred from a
-        # reply, a same ID, or a transcript count.
-        scratch_marker = f"{checkout}/sdk3-restart-marker.txt"
+        # create the authorized scratch directory there — verified Box-side
+        # through the Owner-approved operator hook (whose existence check is
+        # directory-shaped), never inferred from a reply, a same ID, or a
+        # transcript count. The uniquely named directory is removed by the
+        # existing authorized workspace cleanup; no separate cleanup exists.
+        scratch_dir = f"{checkout}/sdk3-restart-scratch-{uuid4().hex[:8]}"
         write_reply = bound.adapter.send(
             producer_id,
-            "Create the file "
-            f"{scratch_marker} containing the single word written. "
-            "Use the write tool now.",
+            f"Create the directory {scratch_dir} (mkdir -p is fine). Use your tools now.",
         )
         assert isinstance(write_reply, AgentTextResponse)
-        marker_written = live.box_check(scratch_marker, expect_exists=True)
+        scratch_created = live.box_check(scratch_dir, expect_exists=True)
         # The same-session usage after the controlled restart, recorded
         # honestly per scope: the aggregate scope's absence is distinct from
         # a root-scope reading; a genuine reset, a real zero, and absence are
@@ -1698,7 +1698,7 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         f"(prefix projection count {expected_count}), "
         "native same-ID recover_session with a post-recovery continuation turn, "
         f"effective ACT construction at the checkout verified Box-side "
-        f"(scratch marker written={marker_written}), "
+        f"(scratch directory created={scratch_created}), "
         f"aggregate usage pre [{pre_usage if pre_usage else 'unobserved'}] / "
         f"post [{usage_after}] (honest per-scope observation; a reset or "
         "absence is recorded as such, never as spend or loss)",
