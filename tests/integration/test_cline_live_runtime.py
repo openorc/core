@@ -5,8 +5,9 @@ What this module is
 -------------------
 
 One small, explicitly Owner-operated live validation suite for the frozen
-supported trio ``cline 3.0.68`` / ``@cline/core 0.0.90`` / ``@cline/sdk
-0.0.90``. It drives the production path end to end —
+supported trio ``cline 3.0.75`` / ``@cline/core 0.2.1`` / ``@cline/sdk
+0.2.1`` (SDK1/SDK2a qualification, openorc/cloud#57 and core issue #407). It
+drives the production path end to end —
 ``attach_cline_runtime`` (#190) with the real ``ClineBridgeProcessBackend``
 (#73) over the local Node D3 bridge, the durable D8a construction-context
 resolver, and the ``ClineAdapter`` — against a ready, safely reachable
@@ -165,12 +166,13 @@ _BRIDGE_PACKAGE_DIR = _REPO_ROOT / "packages" / "cline-sdk-bridge"
 _BRIDGE_ENTRYPOINT = _BRIDGE_PACKAGE_DIR / "dist" / "cli.js"
 _BRIDGE_PACKAGE_JSON = _BRIDGE_PACKAGE_DIR / "package.json"
 
-# The frozen supported runtime trio (issue #149). A mismatch blocks the
-# qualification instead of silently changing a pin: changing a version is a
-# separate identify/requalify decision, never a D7 fix.
-_PINNED_CLINE_VERSION = "3.0.68"
-_PINNED_CORE_VERSION = "0.0.90"
-_PINNED_SDK_VERSION = "0.0.90"
+# The frozen supported runtime trio (issues #149, #407: the SDK2a-qualified
+# CLI 3.0.75 / Core+SDK 0.2.1 baseline). A mismatch blocks the qualification
+# instead of silently changing a pin: changing a version is a separate
+# identify/requalify decision, never a D7 fix.
+_PINNED_CLINE_VERSION = "3.0.75"
+_PINNED_CORE_VERSION = "0.2.1"
+_PINNED_SDK_VERSION = "0.2.1"
 
 # The prepared, deliberately unmerged review fixture identity (repository,
 # PR number, and sole changed file) lives in
@@ -244,7 +246,7 @@ def _check_attested_remote_versions() -> str:
             "preflight: OPENORC_CLINE_LIVE_ATTESTED_VERSIONS is required; first "
             "verify the live Box's actual runtime versions with the Owner-operated "
             "cline-box verification flow or recorded Box facts, then attest them "
-            "here (format: 'cline@3.0.68 core@0.0.90 sdk@0.0.90')"
+            "here (format: 'cline@3.0.75 core@0.2.1 sdk@0.2.1')"
         )
     attested: dict[str, str] = {}
     for token in raw.split():

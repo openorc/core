@@ -59,7 +59,7 @@ export const HUB_EVENT_NOTIFICATION_METHOD = "cline.hub_event";
 /** SDK start config mapped from the D2 construction bundle.
  *
  * `enableSpawnAgent` / `enableAgentTeams` are deliberately absent: the D2
- * contract forbids synthesizing them and the pinned 0.0.90 runtime treats
+ * contract forbids synthesizing them and the pinned 0.2.1 runtime treats
  * absent runtime-feature flags as disabled (its own remote session-creation
  * path omits them too).
  */

@@ -10,7 +10,7 @@ Python ClineAdapter
 → internal backend contract (D2)
 → long-lived local Node subprocess (this package)
 → JSON-RPC 2.0 over stdin/stdout
-→ official @cline/sdk / ClineCore (pinned 0.0.90, backendMode "remote")
+→ official @cline/sdk / ClineCore (pinned 0.2.1, backendMode "remote")
 → remote Cline Hub
 ```
 
@@ -39,13 +39,16 @@ session ownership. See `AGENTS.md` for the binding boundary rules.
   wire-only, idempotent, and stops only its own handle (realizing D2's
   `Subscription.unsubscribe()`, which cannot cross JSON).
 - `enqueue` (issue #321) is nonblocking Hub-native run admission through the
-  public `NodeHubClient.command("run.enqueue", {prompt}, sessionId)` surface:
-  the bridge forwards exactly `{prompt}` on the Hub envelope (no delivery
-  mode is ever constructed), verifies the ack, and answers with
-  `{run_id, accepted_at, queue_position}` — transport evidence for later
-  exact correlation, never a workflow decision. `list_runs` answers with the
-  status-only `runs` array from the `run.list` reply, opaque and
-  uninterpreted; a missing or malformed array is an `uncertain_outcome`
+  public `NodeHubClient.command("run.enqueue", {prompt}, sessionId, options)`
+  surface: the bridge forwards exactly `{prompt}` on the Hub envelope (no delivery
+  mode is ever constructed), applies the documented public
+  `retryAfterDispatch: false` command option (issue #407 — consequential
+  admission is never retransmitted by SDK transport recovery, and the option is
+  a per-command argument no remote configuration can override), verifies the
+  ack, and answers with `{run_id, accepted_at, queue_position}` — transport
+  evidence for later exact correlation, never a workflow decision. `list_runs`
+  answers with the status-only `runs` array from the `run.list` reply, opaque
+  and uninterpreted; a missing or malformed array is an `uncertain_outcome`
   error, never an empty list. Admission is neither delivery nor execution;
   dispatch timeouts (`hub_command_timeout`) and Hub transport failures
   (`hub_connection_closed` and the other pinned transport codes) classify as
@@ -88,9 +91,10 @@ session ownership. See `AGENTS.md` for the binding boundary rules.
   identity as the `ClineCore` attachment, reused for the attachment
   lifetime, and disposed with it. The pinned SDK's declaration file cannot
   re-export the class through `@cline/sdk` under this package's NodeNext
-  resolution, so `sdk-client.ts` extracts the public constructor and URL
-  normalizer through the package namespace with one documented boundary
-  cast; no new dependency, no private shape, and no tsconfig change.
+  resolution (still true of the pinned 0.2.1 root declaration), so
+  `sdk-client.ts` extracts the public constructor, URL normalizer, and
+  per-command options through the package namespace with one documented
+  boundary cast; no new dependency, no private shape, and no tsconfig change.
 - `start` maps the complete D2 construction bundle onto
   `ClineCore.start({config, interactive, toolPolicies, initialMessages?})`:
   `providerId`, `modelId`, `config.mode` (`plan`/`act`), additive
@@ -139,7 +143,19 @@ infrastructure:
 
 ## Version policy
 
-`@cline/sdk` is pinned to the D1-qualified `0.0.90` exactly. Dependabot
-surfaces newer stable releases (including `0.0.x`) as individual,
-never-auto-merged compatibility-signal PRs; adopting one is a separate
-documented qualification decision, not a routine bump.
+`@cline/sdk` is pinned to the SDK1/SDK2a-qualified `0.2.1` exactly (matched to
+the CLI 3.0.75 Hub; openorc/cloud#57, core issue #407). Dependabot surfaces
+newer stable releases (including `0.0.x`) as individual, never-auto-merged
+compatibility-signal PRs; adopting one is a separate documented qualification
+decision, not a routine bump. The qualification record — static pinned-source
+findings, the deterministic controlled-transport tests, and the live ClineBox
+probe evidence — lives in [QUALIFICATION-0-2-1.md](QUALIFICATION-0-2-1.md).
+
+Consequential-dispatch discipline (issue #407): every effectful Hub command
+the bridge issues passes `retryAfterDispatch: false`; read-only queries keep
+the SDK default. Effectful `ClineCore` operations (`start`/`send`/`stop`/
+`abort`) expose no supported suppression option at their public surface, and
+the pinned SDK's transport-recovery path is additionally gated on a
+remembered local-Hub URL the bridge never registers — the SDK-internal
+retransmission evidence and any remaining limitation are recorded for the
+adapter qualification (#413).

@@ -204,8 +204,10 @@ _SUCCESSFUL_FINISH: Final = "completed"
 # classification exposes as the neutral interrupted verdict.
 
 # The D9 fixed synthetic continuation instruction (issue #300), qualified
-# live against the pinned 0.0.90 remote baseline as the Cline-native
-# same-session Resume shape. Deliberately fixed: no Owner prose, no replayed
+# live against the 0.0.90 remote baseline (R2b/R3 qualification; the
+# supported baseline is now 0.2.1 per issue #407, with adapter-level
+# requalification owned by #413) as the Cline-native same-session Resume
+# shape. Deliberately fixed: no Owner prose, no replayed
 # task prompt, no session or mode semantics. Issue #343 hoists the literal
 # into the shared runtime-neutral instruction seam so the blocking send and
 # the detached Resume admission enqueue the identical authorized instruction.
@@ -215,8 +217,10 @@ _RESUMPTION_INSTRUCTION = RESUMPTION_INSTRUCTION
 def _extract_reply_candidate(result: JsonObject | None, *, phase: str) -> str:
     """Extract the reply candidate from the pinned SDK-native ``AgentResult``.
 
-    The qualified 0.0.90 shape carries ``finishReason`` and, on successful
-    completion, the reply ``text`` (R2b/R3). Validation is envelope-first:
+    The 0.0.90-qualified shape carries ``finishReason`` and, on successful
+    completion, the reply ``text`` (R2b/R3; the supported baseline is now
+    0.2.1 per issue #407, with shape requalification owned by #413).
+    Validation is envelope-first:
     a legitimate ``None`` SDK response, a non-object result, a missing or
     non-string ``finishReason``, or a missing reply text is an
     answered-but-unusable native response — a normalized transport failure,
@@ -980,9 +984,11 @@ class ClineAdapter(AgentRuntimeAdapter):
         (issue #300): one exact-session ``send`` of the adapter-owned fixed
         synthetic continuation instruction to the already-live bound
         Producer or Reviewer session — a new model turn over the retained
-        conversation, qualified live against the pinned 0.0.90 remote
-        baseline. Never a replay of the original task prompt, never
-        Owner-written text, never a session replacement, mode change, or
+        conversation, qualified live against the 0.0.90 remote baseline
+        (the supported baseline is now 0.2.1 per issue #407, with
+        adapter-level requalification owned by #413). Never a replay of the
+        original task prompt, never Owner-written text, never a session
+        replacement, mode change, or
         ``stop``/``start``, and never a reconstruction of an already-live
         session. With an expected family the reply is validated through the
         same shared #65 funnel as ``send``; without one it stays ordinary
