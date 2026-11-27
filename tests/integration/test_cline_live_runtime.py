@@ -1566,46 +1566,34 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         assert live.repository_base is not None
         producer_id = live.producer_session_id
         checkout = f"{live.repository_base}/{live.task_id}"
+        # Record the pre-restart transcript extent, the surviving conversation
+        # IDENTITY, and the same-session aggregate usage through the ordinary
+        # public reads BEFORE branching into the supported restart modes: both
+        # in-invocation restart modes consume this evidence, and the
+        # two-stage preserved-database procedure's stage one — which reaches
+        # the NOT EXECUTED branch because the restart happens between stages —
+        # must capture it into the stage-one handoff without claiming restart
+        # execution.
+        with ExitStack() as stack:
+            bound = _attach_bound(
+                live,
+                stack,
+                role=WorkflowRole.PRODUCER,
+                external_session_id=producer_id,
+                working_directory=checkout,
+            )
+            reconciliation = bound.adapter.reconcile_session(producer_id)
+            assert reconciliation.transcript_message_count is not None
+            live.producer_count_before_restart = reconciliation.transcript_message_count
+            pre_restart_conversation = bound.adapter.read_conversation(producer_id)
+            live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
+            live.producer_conversation_count = len(pre_restart_conversation)
+            live.producer_usage_before_restart = _usage_summary_text(
+                bound.adapter.read_activity_snapshot(producer_id)
+            )
         if os.environ.get(_RESTART_COMMAND_ENV, "").strip():
-            # Record the pre-restart transcript extent and the same-session
-            # aggregate usage through the ordinary public reads, then perform
-            # the Owner-approved restart.
-            with ExitStack() as stack:
-                bound = _attach_bound(
-                    live,
-                    stack,
-                    role=WorkflowRole.PRODUCER,
-                    external_session_id=producer_id,
-                    working_directory=checkout,
-                )
-                reconciliation = bound.adapter.reconcile_session(producer_id)
-                assert reconciliation.transcript_message_count is not None
-                live.producer_count_before_restart = reconciliation.transcript_message_count
-                pre_restart_conversation = bound.adapter.read_conversation(producer_id)
-                live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
-                live.producer_conversation_count = len(pre_restart_conversation)
-                live.producer_usage_before_restart = _usage_summary_text(
-                    bound.adapter.read_activity_snapshot(producer_id)
-                )
             _run_restart_hook()
         elif os.environ.get(_PAUSE_SENTINEL_ENV, "").strip():
-            with ExitStack() as stack:
-                bound = _attach_bound(
-                    live,
-                    stack,
-                    role=WorkflowRole.PRODUCER,
-                    external_session_id=producer_id,
-                    working_directory=checkout,
-                )
-                reconciliation = bound.adapter.reconcile_session(producer_id)
-                assert reconciliation.transcript_message_count is not None
-                live.producer_count_before_restart = reconciliation.transcript_message_count
-                pre_restart_conversation = bound.adapter.read_conversation(producer_id)
-                live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
-                live.producer_conversation_count = len(pre_restart_conversation)
-                live.producer_usage_before_restart = _usage_summary_text(
-                    bound.adapter.read_activity_snapshot(producer_id)
-                )
             _pause_for_owner_restart()
         else:
             pytest.fail(
