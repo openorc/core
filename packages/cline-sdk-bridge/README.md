@@ -147,7 +147,9 @@ infrastructure:
 the CLI 3.0.75 Hub; openorc/cloud#57, core issue #407). Dependabot surfaces
 newer stable releases (including `0.0.x`) as individual, never-auto-merged
 compatibility-signal PRs; adopting one is a separate documented qualification
-decision, not a routine bump.
+decision, not a routine bump. The qualification record — static pinned-source
+findings, the deterministic controlled-transport tests, and the live ClineBox
+probe evidence — lives in [QUALIFICATION-0-2-1.md](QUALIFICATION-0-2-1.md).
 
 Consequential-dispatch discipline (issue #407): every effectful Hub command
 the bridge issues passes `retryAfterDispatch: false`; read-only queries keep

@@ -20,7 +20,10 @@
  *   fallback/start can occur.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RawData, WebSocket as StubSocket } from "ws";
 import { WebSocketServer } from "ws";
 import * as ClineSdk from "@cline/sdk";
@@ -31,6 +34,7 @@ type Frame = { kind?: string; envelope?: Envelope };
 interface StubHubState {
   registrations: number;
   enqueueFrames: Envelope[];
+  abortFrames: Envelope[];
   scenario: "ack" | "drop-after-dispatch";
 }
 
@@ -43,7 +47,7 @@ interface StubHubHandle {
 }
 
 async function startStubHub(): Promise<StubHubHandle> {
-  const state: StubHubState = { registrations: 0, enqueueFrames: [], scenario: "ack" };
+  const state: StubHubState = { registrations: 0, enqueueFrames: [], abortFrames: [], scenario: "ack" };
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const clients = new Set<StubSocket>();
   // The server binds asynchronously: wait for the ephemeral port before use.
@@ -88,6 +92,17 @@ async function startStubHub(): Promise<StubHubHandle> {
               payload: { run_id: "run-1", accepted_at: "2026-01-01T00:00:00Z", queue_position: 0 },
             },
           }),
+        );
+        return;
+      }
+      if (command === "run.abort") {
+        state.abortFrames.push(envelope);
+        if (state.scenario === "drop-after-dispatch") {
+          socket.close();
+          return;
+        }
+        socket.send(
+          JSON.stringify({ kind: "reply", envelope: { requestId: envelope["requestId"], command, ok: true, payload: {} } }),
         );
       }
     });
@@ -136,6 +151,8 @@ const { NodeHubClient } = ClineSdk as unknown as {
 /** Every client created through {@linkcode makeClient} is disposed by the
  * afterEach hook before the stub servers close, so no client keeps
  * reconnecting against a closed server. */
+/** Core instances track only disposal in the shared afterEach cleanup. */
+const openCores: Array<{ dispose(): Promise<void> }> = [];
 const openClients: StubHubClient[] = [];
 const openHubs: StubHubHandle[] = [];
 
@@ -146,6 +163,9 @@ function makeClient(hub: StubHubHandle): StubHubClient {
 }
 
 afterEach(async () => {
+  for (const core of openCores.splice(0)) {
+    await core.dispose().catch(() => {});
+  }
   for (const client of openClients.splice(0)) {
     await client.dispose().catch(() => {});
   }
@@ -225,5 +245,61 @@ describe("real pinned NodeHubClient transport behavior (issue #407)", () => {
     expect(reconnected).toBeGreaterThanOrEqual(2);
     expect(firstUrl).toBe(hub.url);
     expect(hub.state.enqueueFrames).toHaveLength(0);
+  });
+});
+
+/** The real pinned `ClineCore` remote runtime path (issue #407 review
+ * evidence): the runtime host's effectful commands (`run.start`, `run.abort`,
+ * `session.detach`, `session.create`) all issue through the same internal
+ * Hub client `command()` mechanism as the exported `NodeHubClient` (verified
+ * against the pinned bundle), so one representative consequential operation
+ * — `abort`, the control command with the strongest effect — exercises the
+ * shared transport mechanism end to end. `ClineCore` exposes no suppression
+ * option at its public surface; the established non-retransmission guarantee
+ * rests on the same never-remembered-endpoint gating proven above plus this
+ * observed behavior. `telemetry` is omitted so the SDK default is a no-op,
+ * and HOME is isolated so no user Cline state is touched. */
+describe("real pinned ClineCore remote-path transport behavior (issue #407)", () => {
+  let isolatedHome: string | undefined;
+
+  beforeAll(() => {
+    isolatedHome = mkdtempSync(join(tmpdir(), "sdk2a-cline-home-"));
+    process.env.HOME = isolatedHome;
+  });
+
+  afterAll(() => {
+    if (isolatedHome !== undefined) {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it("dispatches a consequential run.abort exactly once when the transport dies after dispatch", async () => {
+    const hub = await startStubHub();
+    openHubs.push(hub);
+    const { ClineCore } = ClineSdk as unknown as {
+      ClineCore: {
+        create(options: {
+          backendMode: "remote";
+          remote: { endpoint: string; clientType?: string };
+        }): Promise<{
+          abort(sessionId: string, reason?: unknown): Promise<void>;
+          dispose(): Promise<void>;
+        }>;
+      };
+    };
+    const core = await ClineCore.create({
+      backendMode: "remote",
+      remote: { endpoint: hub.url, clientType: "openorc-core/test" },
+    });
+    openCores.push({ dispose: () => core.dispose() });
+
+    hub.state.scenario = "drop-after-dispatch";
+    const pending = core.abort("exact-session-4", "sdk2a transport probe");
+    await expect(pending).rejects.toMatchObject({ code: "hub_connection_closed" });
+
+    // The ClineCore-path counterpart of the decisive property: exactly one
+    // dispatch of the consequential control command, no retransmission.
+    expect(hub.state.abortFrames).toHaveLength(1);
+    expect(hub.state.registrations).toBe(1);
   });
 });
