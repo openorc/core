@@ -75,6 +75,7 @@ versions, continuity classifications, and harmless bounded observations.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -499,6 +500,8 @@ class _Live:
         self.producer_session_id: str | None = None
         self.reviewer_session_id: str | None = None
         self.producer_count_before_restart: int | None = None
+        self.producer_conversation_digest: str | None = None
+        self.producer_conversation_count: int | None = None
         self.producer_usage_before_restart: str | None = None
         self.evidence: dict[str, str] = {}
 
@@ -716,6 +719,10 @@ class _Live:
         self.repository_base = base
         self.producer_session_id = str(external_session_id)
         self.producer_count_before_restart = int(handoff["producer_transcript_count"])
+        digest = handoff.get("producer_conversation_digest")
+        self.producer_conversation_digest = digest if isinstance(digest, str) else None
+        conv_count = handoff.get("producer_conversation_count")
+        self.producer_conversation_count = conv_count if isinstance(conv_count, int) else None
         usage = handoff.get("producer_usage_before_restart")
         self.producer_usage_before_restart = usage if isinstance(usage, str) else None
 
@@ -791,6 +798,8 @@ class _Live:
             "producer_session_id": self.producer_session_id,
             "reviewer_session_id": self.reviewer_session_id,
             "producer_transcript_count": self.producer_count_before_restart,
+            "producer_conversation_digest": self.producer_conversation_digest,
+            "producer_conversation_count": self.producer_conversation_count,
             "producer_usage_before_restart": self.producer_usage_before_restart,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -1495,31 +1504,45 @@ def test_e_activity_and_usage_observations(live: _Live) -> None:
 # --- scenario D3: required Hub-restart recovery (completion gate) -------------
 
 
-def _usage_summary_text(snapshot: Any) -> str:
-    """Bounded, content-free rendering of one usage snapshot observation.
+def _conversation_digest(conversation: list[Any]) -> str:
+    """Private content-free identity digest of one projected conversation.
 
-    The aggregate scope is preferred and the root scope is labeled when the
-    aggregate is absent; a genuinely observed zero stays zero (real
-    evidence, never unknown), and an absent or unusable scope renders as
-    unknown. No invented spend, no inference across scopes, and no cost
-    accounting here — this is diagnostic text for the recorded evidence.
+    The projected (index, kind, text) tuples are serialized canonically and
+    hashed: the digest establishes conversation identity across the restart
+    without ever emitting transcript content into evidence, logs, or
+    telemetry.
     """
+    payload = json.dumps(
+        [(message.index, message.kind, message.text) for message in conversation],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _usage_summary_text(snapshot: Any) -> str:
+    """Bounded per-scope usage rendering for recorded evidence.
+
+    The aggregate scope and the root scope are reported separately and an
+    aggregate-scope absence is distinct from a root-scope reading; a
+    genuinely observed zero stays zero (real evidence, never unknown), and
+    an absent or unusable scope renders as absent/unknown. No invented
+    spend, no inference across scopes, and no cost accounting here — this is
+    diagnostic text for the recorded evidence.
+    """
+
+    def _scope_state(scope: Any) -> str:
+        if scope is None:
+            return "absent"
+        cost = getattr(scope, "total_cost", None)
+        if cost is None:
+            return "cost_unknown"
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost == 0:
+            return "cost_zero"
+        return "cost_nonzero"
+
     aggregate = getattr(snapshot, "aggregate_usage", None)
     usage = getattr(snapshot, "usage", None)
-    scope = aggregate if aggregate is not None else usage
-    label = "aggregate" if aggregate is not None else "root"
-    if scope is None:
-        return "unknown"
-
-    def _number(value: Any) -> str:
-        numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
-        return f"{value}" if numeric else "unknown"
-
-    return (
-        f"{label} in={_number(getattr(scope, 'input_tokens', None))} "
-        f"out={_number(getattr(scope, 'output_tokens', None))} "
-        f"cost_usd={_number(getattr(scope, 'total_cost', None))}"
-    )
+    return f"aggregate={_scope_state(aggregate)} root={_scope_state(usage)}"
 
 
 def test_d3_hub_restart_recovery(live: _Live) -> None:
@@ -1536,6 +1559,8 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
     resume = live.resume
     if resume:
         assert live.producer_count_before_restart is not None
+        assert live.producer_conversation_digest is not None
+        assert live.producer_conversation_count is not None
     else:
         assert live.producer_session_id is not None
         assert live.repository_base is not None
@@ -1556,6 +1581,9 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
                 reconciliation = bound.adapter.reconcile_session(producer_id)
                 assert reconciliation.transcript_message_count is not None
                 live.producer_count_before_restart = reconciliation.transcript_message_count
+                pre_restart_conversation = bound.adapter.read_conversation(producer_id)
+                live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
+                live.producer_conversation_count = len(pre_restart_conversation)
                 live.producer_usage_before_restart = _usage_summary_text(
                     bound.adapter.read_activity_snapshot(producer_id)
                 )
@@ -1572,6 +1600,9 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
                 reconciliation = bound.adapter.reconcile_session(producer_id)
                 assert reconciliation.transcript_message_count is not None
                 live.producer_count_before_restart = reconciliation.transcript_message_count
+                pre_restart_conversation = bound.adapter.read_conversation(producer_id)
+                live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
+                live.producer_conversation_count = len(pre_restart_conversation)
                 live.producer_usage_before_restart = _usage_summary_text(
                     bound.adapter.read_activity_snapshot(producer_id)
                 )
@@ -1630,13 +1661,44 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         # with Hub-side saved-history loading (issue #408) — no transcript is
         # ever uploaded.
         bound.adapter.recover_session(producer_id, target_mode=ClineConstructionMode.ACT)
+        # Surviving conversation IDENTITY, established privately: the
+        # projected conversation after the native recovery must extend the
+        # pre-restart conversation verbatim (growth from the interrupted
+        # work's effects landing is a legitimate intervening change; content
+        # never leaves this process — only counts and the identity verdict).
+        post_recovery_conversation = bound.adapter.read_conversation(producer_id)
+        expected_count = live.producer_conversation_count
+        assert expected_count is not None
+        assert live.producer_conversation_digest is not None
+        assert len(post_recovery_conversation) >= expected_count, (
+            "the projected conversation shrank across the restart/recovery"
+        )
+        prefix_digest = _conversation_digest(post_recovery_conversation[:expected_count])
+        conversation_identity_preserved = prefix_digest == live.producer_conversation_digest
+        assert conversation_identity_preserved, (
+            "the surviving conversation identity did not match the pre-restart projection"
+        )
         reply = bound.adapter.send(producer_id, "Reply with the single word: recovered.")
         assert isinstance(reply, AgentTextResponse)
-        # The same-session aggregate usage after the controlled restart,
-        # recorded honestly against the pre-restart reading: continuity,
-        # a genuine reset, and absence are each distinct observations, and
-        # none of them is spend evidence, failure evidence, or a workflow
-        # claim. The application cost accounting is never changed here.
+        # EFFECTIVE post-recovery construction: the recovery restored native
+        # ACT at the checkout, and the restored incarnation must actually
+        # perform the authorized scratch write there — verified Box-side
+        # through the Owner-approved operator hook, never inferred from a
+        # reply, a same ID, or a transcript count.
+        scratch_marker = f"{checkout}/sdk3-restart-marker.txt"
+        write_reply = bound.adapter.send(
+            producer_id,
+            "Create the file "
+            f"{scratch_marker} containing the single word written. "
+            "Use the write tool now.",
+        )
+        assert isinstance(write_reply, AgentTextResponse)
+        marker_written = live.box_check(scratch_marker, expect_exists=True)
+        # The same-session usage after the controlled restart, recorded
+        # honestly per scope: the aggregate scope's absence is distinct from
+        # a root-scope reading; a genuine reset, a real zero, and absence are
+        # each distinct observations — never spend or loss evidence, and the
+        # application cost accounting is never changed here.
         usage_after = _usage_summary_text(bound.adapter.read_activity_snapshot(producer_id))
     pre_usage = live.producer_usage_before_restart
     live.record(
@@ -1644,10 +1706,14 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
         "EXECUTED" if not resume else "EXECUTED (stage-two resume)",
         f"current-credential reattachment, transcript survival "
         f"(pre {live.producer_count_before_restart} / post {count} messages), "
+        f"surviving conversation identity preserved={conversation_identity_preserved} "
+        f"(prefix projection count {expected_count}), "
         "native same-ID recover_session with a post-recovery continuation turn, "
+        f"effective ACT construction at the checkout verified Box-side "
+        f"(scratch marker written={marker_written}), "
         f"aggregate usage pre [{pre_usage if pre_usage else 'unobserved'}] / "
-        f"post [{usage_after}] (honest observation; a reset or absence is "
-        "recorded as such, never as spend or loss)",
+        f"post [{usage_after}] (honest per-scope observation; a reset or "
+        "absence is recorded as such, never as spend or loss)",
     )
 
 
