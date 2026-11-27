@@ -14,14 +14,28 @@ SSH loopback forward, the trusted current credential supplier
 (`cline hub ensure --json` over trusted SSH; the current token never left a
 mode-600 ephemeral file, deleted after use), native account auth, and the
 SDK2b-verified free pair (`cline` / `cline-free/nemotron-3.5-super-vl`) as
-the only inference. Disposable probe sessions only; every probe phase stops
-its sessions and disposes its attachments; no Hub restart, no machine-global
-change, no provider secret injection, no paid inference. The probe tool is
-committed at `packages/cline-sdk-bridge/tools/sdk2c-adapter-live-probe.py`
-(sanitized JSON phases; the production Python path — `ClineBridgeProcessBackend`
-over the built bridge, `ClineAdapter` with explicit per-role construction
-contexts, and `ClineHubTurnObservationSource` — never a fake backend, never a
-database, never `--testdb`).
+the only inference. Disposable probe sessions only; no Hub restart, no
+machine-global change, no provider secret injection, no paid inference. The
+probe tool is committed at
+`packages/cline-sdk-bridge/tools/sdk2c-adapter-live-probe.py` (sanitized JSON
+phases) so that the qualification record distinguishes what was demonstrated
+from what remains pending. The probe drives the production Python path —
+`ClineBridgeProcessBackend` over the built bridge, `ClineAdapter` with
+explicit per-role construction contexts, and `ClineHubTurnObservationSource`
+— never a fake backend, never a database, never `--testdb`.
+
+Discipline: every required verdict (attribution, ordering freshness, terminal
+outcome, formal validation, settlement, transcript preservation, cleanup
+quiescence) determines probe success — a wrong or missing verdict fails the
+run instead of being merely printed. Both the interrupted turn and the
+authorized continuation are enqueued through `admit_detached_turn` (the
+continuation content is the shared #343 fixed `RESUMPTION_INSTRUCTION`), and
+every admitted reference is classified against independently observed start
+and terminal evidence with the session's consumed markers chained across
+turns. Every allocated session is registered for bounded best-effort stop at
+allocation; stops run before attachment disposal with each outcome emitted,
+and the success path verifies quiescence through the status-only `run.list`
+surface before disposal.
 
 ## Demonstrated difference and adaptation: the abort-terminated run event
 
@@ -70,21 +84,36 @@ second_turn            idle-separated admitted turn: attributed start, fresh
 reviewer_stopped       stopped incarnation with the persisted record still
                        present — stopped is never session loss
 allocate_producer      promptless allocation ok (ACT at the probe base)
-interrupt_turn_1       start attributed, abort acknowledged, terminal
-                       observed promptly: outcome failed, interrupted TRUE
-                       (positive interrupted terminal evidence, not the ack)
+interrupt_turn_1       start attributed to the admitted reference, abort
+                       acknowledged, terminal observed promptly and fresh
+                       against the chained consumed markers: outcome failed,
+                       interrupted TRUE (positive interrupted terminal
+                       evidence, not the ack)
 settle_abort           settled (positive terminal evidence attested)
-resume_activity        the fixed authorized resume instruction started a new
-                       model turn over the retained conversation (bounded)
+resume_activity        the #343 fixed authorized resume instruction enqueued
+                       through the production detached admission seam
+                       (admit_detached_turn): the admitted reference was
+                       verified against the attributed start, and the
+                       resumed turn completed fresh on the same session over
+                       the retained conversation
 usage_attestation      aggregate_total_usd observed 0 (the free pair reports
                        totalCost = 0 — real evidence, never unknown);
-                       qualifying model-backed activity pulses observed (20)
+                       qualifying model-backed activity pulses observed (32)
 reconstruction         authorized context transition (ACT→PLAN) through the
                        serialized read_messages → stop → start seam; exact
-                       session identity; transcript retained verbatim
+                       session identity; the transcript compared privately
+                       before/after and preserved verbatim. The effective
+                       construction behavior of a mode transition is
+                       attributed to the Owner-run D7 suite (below), not
+                       claimed from this probe
 stopped_recovery       record present while stopped; exact stopped-session
                        recovery proceeded through the same-ID start with the
-                       transcript retained
+                       transcript preserved verbatim (private comparison)
+cleanup_session        both allocated sessions registered at allocation and
+                       stopped before attachment disposal (outcomes emitted)
+cleanup_quiescence     the probe's own sessions verified quiescent through
+                       the status-only run.list surface before disposal
+                       (0 active runs)
 probe_complete         ok; all probe sessions stopped, attachments disposed
 ```
 
@@ -152,13 +181,28 @@ endpoint gating plus observed non-retransmission own that guarantee),
 and the existing uncertainty/no-replay/stale guards. Any future SDK change
 to that gating is a compatibility signal requiring re-qualification.
 
-## Scope boundary and pending Owner actions
+## Scope boundary: demonstrated versus pending
 
-- The Owner-run database-backed D7 suite
-  (`tests/integration/test_cline_live_runtime.py`) remains the Owner's:
-  executed with the deliberate compatible Core checkout and the qualified
-  Cloud runner (openorc/cloud#64); Cline never provisions or executes
-  `--testdb`.
+Demonstrated by this qualification (see the evidence above): the detached
+allocation/admission/observation/attribution mechanics with chained ordering
+verdicts; validated `session_ready` from the attributable terminal; the
+status-only consultation semantics; the abort-terminated run event
+adaptation with positive interrupted evidence and settlement; the detached
+Resume admission completing on the same session; verbatim transcript
+preservation across same-ID reconstruction and stopped-session recovery;
+zero-cost usage evidence and content-free activity attestation; bounded
+session cleanup with verified quiescence.
+
+Attributed to the Owner-run database-backed D7 suite
+(`tests/integration/test_cline_live_runtime.py`), not demonstrated by this
+probe: the effective construction behavior of a mode transition inside the
+full workflow scenarios, and the complete D7 stateful scenario matrix —
+executed by the Owner with the deliberate compatible Core checkout and the
+qualified Cloud runner (openorc/cloud#64); Cline never provisions or
+executes `--testdb`.
+
+Outstanding and pending Owner disposition or execution:
+
 - The usage reset/continuity and exact stopped-session recovery across an
   Owner-authorized controlled Hub restart remains an OUTSTANDING
   qualification requirement: it requires Owner authorization and quiescence

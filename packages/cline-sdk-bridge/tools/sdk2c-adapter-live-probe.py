@@ -10,6 +10,24 @@ PRODUCTION Python path — ``ClineBridgeProcessBackend`` over the built bridge,
 database. It is a one-off qualification tool, not a test and not part of CI;
 ordinary suites stay offline.
 
+Discipline:
+
+- Every REQUIRED verdict (attribution, ordering freshness, terminal outcome,
+  formal validation, settlement, transcript preservation, cleanup
+  quiescence) determines qualification success: a wrong or missing verdict
+  fails the probe with a non-zero exit instead of merely being printed.
+- The interruption/resume cycle exercises the production detached-turn
+  mechanics only: both the interrupted turn and the authorized continuation
+  are enqueued through ``admit_detached_turn`` (the continuation content is
+  the shared #343 fixed ``RESUMPTION_INSTRUCTION``), and every admitted
+  reference is classified against independently observed start and terminal
+  evidence with the session's consumed markers chained across turns.
+- Every allocated disposable session is registered for bounded best-effort
+  cleanup at allocation; cleanup stops the sessions before releasing
+  observations and disposing attachments, reports each stop outcome, and the
+  success path additionally verifies quiescence through the status-only
+  ``run.list`` surface before attachment disposal.
+
 Inputs (environment, never logged):
 
 - ``OPENORC_SDK2C_TOKEN_FILE`` — path of a mode-600 file carrying the
@@ -29,8 +47,7 @@ emitted.
 Inference: the explicitly configured SDK1/SDK2a-verified free pair
 (provider ``cline``, model ``cline-free/nemotron-3.5-super-vl``) with
 explicit per-role configuration; native account auth; no provider secret
-injection and no paid fallback. Sessions are disposable; every acquired
-resource is released in the bounded cleanup path.
+injection and no paid fallback.
 """
 
 from __future__ import annotations
@@ -51,7 +68,11 @@ from typing import Any
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from openorc.adapters.agent_runtime.errors import AgentRuntimeError  # noqa: E402
+from openorc.adapters.agent_runtime.errors import (  # noqa: E402
+    AgentRuntimeError,
+    AgentSessionNotFoundError,
+)
+from openorc.adapters.agent_runtime.instructions import RESUMPTION_INSTRUCTION  # noqa: E402
 from openorc.adapters.agent_runtime.results import AgentSessionCreationRequest  # noqa: E402
 from openorc.adapters.cline import (  # noqa: E402
     ClineAdapter,
@@ -65,8 +86,10 @@ from openorc.adapters.cline.hub_observation import ClineHubTurnObservationSource
 from openorc.adapters.cline.values import ClineRemoteConfig  # noqa: E402
 from openorc.domain.connections import WorkflowRole  # noqa: E402
 from openorc.domain.detached_turns import (  # noqa: E402
+    TurnAttribution,
     TurnEvidenceFamily,
     TurnFreshness,
+    TurnStatusEvidenceVerdict,
 )
 from openorc.protocol.initialization_assets import compose_initialization  # noqa: E402
 from openorc.protocol.models import SESSION_READY_FAMILY  # noqa: E402
@@ -83,8 +106,14 @@ CLIENT_IDENTITY = "openorc-core/sdk2c-live"
 PROBE_DIR = "/home/openorc"
 REVIEWER_OK_PROMPT = "SDK2c probe: reply with the single word ok."
 PRODUCER_COUNT_PROMPT = "SDK2c probe: count from 1 to 60, one number per line, and nothing else."
-WINDOW_S = {"init_turn": 240.0, "second_turn": 180.0, "interrupt_turn": 240.0}
+WINDOW_S = {
+    "init_turn": 240.0,
+    "second_turn": 180.0,
+    "interrupt_turn": 240.0,
+    "resume_turn": 240.0,
+}
 INTERRUPT_ATTEMPTS = 2
+_ACTIVE_RUN_STATES = frozenset({"running", "queued", "pending"})
 
 
 def emit(phase: str, data: dict[str, Any]) -> None:
@@ -96,20 +125,61 @@ def class_name(error: BaseException) -> str:
 
 
 class Cleanup:
-    """Bounded best-effort release of everything the probe acquired."""
+    """Bounded best-effort release of everything the probe acquired.
 
-    def __init__(self) -> None:
-        self._jobs: list[tuple[str, Any]] = []
+    Phase 0 stops the exact disposable runtime sessions the probe allocated
+    (registered at allocation), phase 1 releases observations and
+    subscriptions, phase 2 disposes the observation source, and phase 3
+    disposes the bridge backend. Session stops always run first so a disposed
+    attachment can never strand a running probe session, and every stop
+    outcome is emitted for the qualification record.
+    """
 
-    def add(self, label: str, job: Any) -> None:
-        self._jobs.append((label, job))
+    _OBSERVATIONS = 1
+    _SOURCE = 2
+    _BACKEND = 3
 
-    def run(self) -> None:
-        for label, job in self._jobs:
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+        self._sessions: list[str] = []
+        self._stop_outcomes: dict[str, str] = {}
+        self._jobs: list[tuple[int, str, Any]] = []
+
+    def add_session(self, session_id: str) -> None:
+        """Register one allocated disposable session for bounded stop."""
+        self._sessions.append(session_id)
+
+    def add(self, phase: int, label: str, job: Any) -> None:
+        self._jobs.append((phase, label, job))
+
+    def stop_sessions(self) -> bool:
+        """Best-effort stop of every registered session; outcomes emitted."""
+        all_stopped = True
+        for index, session_id in enumerate(self._sessions):
+            if session_id in self._stop_outcomes:
+                continue
+            try:
+                self._backend.stop(session_id)
+                outcome = "stopped"
+            except AgentSessionNotFoundError:
+                # Positively identified absence of a live incarnation: the
+                # session was already stopped earlier in the probe.
+                outcome = "already_stopped"
+            except Exception as error:  # noqa: BLE001 - cleanup is best-effort
+                outcome = class_name(error)
+                all_stopped = False
+            self._stop_outcomes[session_id] = outcome
+            emit("cleanup_session", {"session_index": index, "outcome": outcome})
+        return all_stopped
+
+    def run(self) -> bool:
+        stopped = self.stop_sessions()
+        for _phase, label, job in sorted(self._jobs, key=lambda item: (item[0], item[1])):
             try:
                 job()
             except Exception as error:  # noqa: BLE001 - cleanup is best-effort
                 emit("cleanup_error", {"label": label, "error_class": class_name(error)})
+        return stopped
 
 
 class ProbeResolver(ClineConstructionContextResolver):
@@ -259,6 +329,32 @@ def fail_and_cleanup(phase: str, error: BaseException, cleanup: Cleanup) -> None
     cleanup.run()
 
 
+def fail(phase: str, reason: str, cleanup: Cleanup) -> int:
+    """Fail the probe on a wrong or missing required verdict."""
+    emit(phase, {"ok": False, "reason": reason})
+    cleanup.run()
+    return 3
+
+
+def verify_quiescence(backend: Any, session_ids: list[str]) -> dict[str, Any]:
+    """Verify the probe's own sessions are quiescent via status-only records."""
+    sessions: dict[str, Any] = {}
+    all_quiet = True
+    for index, session_id in enumerate(session_ids):
+        states = [
+            str(record.get("state"))
+            for record in backend.list_runs(session_id)
+            if isinstance(record, dict) and isinstance(record.get("state"), str)
+        ]
+        active = [state for state in states if state in _ACTIVE_RUN_STATES]
+        all_quiet = all_quiet and not active
+        sessions[f"session_{index}"] = {
+            "active_runs": len(active),
+            "states": sorted(set(states)),
+        }
+    return {"ok": all_quiet, "sessions": sessions}
+
+
 def main() -> int:
     for name, value in (
         ("OPENORC_SDK2C_TOKEN_FILE", TOKEN_FILE),
@@ -281,17 +377,17 @@ def main() -> int:
         return 2
     emit("preflight", {"ok": True})
 
-    cleanup = Cleanup()
     resolver = ProbeResolver()
     backend = (
         ClineBridgeProcessBackend(command=[NODE, entrypoint])
         if NODE
         else ClineBridgeProcessBackend()
     )
-    cleanup.add("backend.dispose", backend.dispose)
+    cleanup = Cleanup(backend)
+    cleanup.add(Cleanup._BACKEND, "backend.dispose", backend.dispose)
     remote = ClineRemoteConfig(endpoint=ENDPOINT, client_identity=CLIENT_IDENTITY, auth_token=token)
     source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
-    cleanup.add("source.dispose", source.dispose)
+    cleanup.add(Cleanup._SOURCE, "source.dispose", source.dispose)
     adapter = ClineAdapter(backend, resolver)
 
     try:
@@ -330,6 +426,7 @@ def main() -> int:
             return 3
         reviewer_id = allocation.external_session_id
         resolver.bind(reviewer_id, WorkflowRole.REVIEWER)
+        cleanup.add_session(reviewer_id)
         emit("allocate_reviewer", {"ok": True, "session_allocated": True})
 
         reviewer_collector = EvidenceCollector()
@@ -346,7 +443,11 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             fail_and_cleanup("observe_reviewer", error, cleanup)
             return 3
-        cleanup.add("reviewer_lease.release", lambda: source.release_observation(lease))
+        cleanup.add(
+            Cleanup._OBSERVATIONS,
+            "reviewer_lease.release",
+            lambda: source.release_observation(lease),
+        )
         emit("observe_reviewer", {"ok": True, "subscribed_before_enqueue": True})
 
         try:
@@ -393,9 +494,7 @@ def _continue_after_enqueue(
         WINDOW_S["init_turn"],
     )
     if found is None:
-        emit("initialization_turn", {"ok": False, "reason": "evidence window timed out"})
-        cleanup.run()
-        return 3
+        return fail("initialization_turn", "evidence window timed out", cleanup)
     start_evidence, terminal_evidence = found
     attribution = source.classify_turn_start(
         start_evidence.native_evidence, outstanding_turn_reference=init_ref
@@ -422,6 +521,21 @@ def _continue_after_enqueue(
             "session_ready_validated": session_ready_validated,
         },
     )
+    if attribution is not TurnAttribution.ATTRIBUTED:
+        return fail("initialization_turn", f"start attribution was {attribution.value}", cleanup)
+    if terminal["outcome_kind"] != "completed" or terminal["interrupted"]:
+        return fail(
+            "initialization_turn",
+            (
+                f"terminal outcome was {terminal['outcome_kind']} "
+                f"interrupted={terminal['interrupted']}"
+            ),
+            cleanup,
+        )
+    if terminal["freshness"] != TurnFreshness.FRESH.value:
+        return fail("initialization_turn", f"freshness was {terminal['freshness']}", cleanup)
+    if not session_ready_validated:
+        return fail("initialization_turn", "session_ready was not validated", cleanup)
     consumed = terminal["_consumed"]
 
     # --- status-only consultation after the validated terminal --------------
@@ -435,7 +549,14 @@ def _continue_after_enqueue(
         )
         emit("status_consultation", {"verdict": verdict.value})
     except Exception as error:  # noqa: BLE001
-        emit("status_consultation", {"ok": False, "error_class": class_name(error)})
+        fail_and_cleanup("status_consultation", error, cleanup)
+        return 3
+    if verdict is not TurnStatusEvidenceVerdict.COMPLETION_WITHOUT_RESULT_EVIDENCE:
+        return fail(
+            "status_consultation",
+            f"a completed run's status-only record classified as {verdict.value}",
+            cleanup,
+        )
 
     # --- idle-separated continuity: a second admitted turn -------------------
     try:
@@ -449,9 +570,7 @@ def _continue_after_enqueue(
         WINDOW_S["second_turn"],
     )
     if found is None:
-        emit("second_turn", {"ok": False, "reason": "evidence window timed out"})
-        cleanup.run()
-        return 3
+        return fail("second_turn", "evidence window timed out", cleanup)
     second_start, second_terminal = found
     second_attribution = source.classify_turn_start(
         second_start.native_evidence, outstanding_turn_reference=second_ref
@@ -467,10 +586,18 @@ def _continue_after_enqueue(
             "result_candidate_present": second["result_candidate_present"],
         },
     )
+    if second_attribution is not TurnAttribution.ATTRIBUTED:
+        return fail("second_turn", f"start attribution was {second_attribution.value}", cleanup)
+    if second["outcome_kind"] != "completed" or second["freshness"] != TurnFreshness.FRESH.value:
+        return fail(
+            "second_turn",
+            f"terminal was {second['outcome_kind']} freshness {second['freshness']}",
+            cleanup,
+        )
     source.release_observation(lease)
+    reviewer_stopped = True
     try:
         backend.stop(reviewer_id)
-        reviewer_stopped = True
     except Exception as error:  # noqa: BLE001
         reviewer_stopped = False
         emit("reviewer_stop", {"ok": False, "error_class": class_name(error)})
@@ -483,12 +610,15 @@ def _continue_after_enqueue(
         "reviewer_stopped",
         {"stopped": reviewer_stopped, "record_present": record_present},
     )
+    if not reviewer_stopped:
+        return fail("reviewer_stopped", "the reviewer session could not be stopped", cleanup)
     return _continue_with_producer(
         adapter=adapter,
         backend=backend,
         source=source,
         resolver=resolver,
         cleanup=cleanup,
+        reviewer_id=reviewer_id,
         token=token,
     )
 
@@ -500,9 +630,17 @@ def _continue_with_producer(
     source: Any,
     resolver: ProbeResolver,
     cleanup: Cleanup,
+    reviewer_id: str,
     token: str,
 ) -> int:
-    """Producer allocation, interruption/resume, usage, reconstruction, recovery."""
+    """Producer allocation, interruption/resume, usage, reconstruction, recovery.
+
+    Both the interrupted turn and the authorized continuation exercise the
+    production detached-turn mechanics: each is enqueued through
+    ``admit_detached_turn``, each admitted reference is classified against
+    independently observed start evidence, and each terminal is classified
+    against the session's chained consumed markers.
+    """
     producer_request = AgentSessionCreationRequest(
         workspace_id=resolver.workspace_id,
         task_id=resolver.task_id,
@@ -516,6 +654,7 @@ def _continue_with_producer(
         return 3
     producer_id = producer_allocation.external_session_id
     resolver.bind(producer_id, WorkflowRole.PRODUCER)
+    cleanup.add_session(producer_id)
     emit("allocate_producer", {"ok": True, "session_allocated": True})
 
     producer_collector = EvidenceCollector()
@@ -524,28 +663,39 @@ def _continue_with_producer(
         external_session_id=producer_id,
         deliver=producer_collector.deliver,
     )
-    cleanup.add("producer_lease.release", lambda: source.release_observation(producer_lease))
+    cleanup.add(
+        Cleanup._OBSERVATIONS,
+        "producer_lease.release",
+        lambda: source.release_observation(producer_lease),
+    )
     pulses = {"count": 0}
     subscription = adapter.subscribe_qualifying_activity(
         producer_id, lambda: pulses.__setitem__("count", pulses["count"] + 1)
     )
-    cleanup.add("qualifying_subscription.unsubscribe", subscription.unsubscribe)
+    cleanup.add(
+        Cleanup._OBSERVATIONS, "qualifying_subscription.unsubscribe", subscription.unsubscribe
+    )
 
     interrupted_verdict: bool | None = None
+    producer_consumed: list[int] = []
     for attempt in range(1, INTERRUPT_ATTEMPTS + 1):
         phase = f"interrupt_turn_{attempt}"
         try:
-            adapter.admit_detached_turn(producer_id, PRODUCER_COUNT_PROMPT)
+            interrupt_admission = adapter.admit_detached_turn(producer_id, PRODUCER_COUNT_PROMPT)
         except Exception as error:  # noqa: BLE001
             fail_and_cleanup(phase, error, cleanup)
             return 3
+        interrupt_ref = interrupt_admission.turn_reference
         found = producer_collector.wait_for(
             (TurnEvidenceFamily.TURN_START,), WINDOW_S["interrupt_turn"]
         )
         if found is None:
-            emit(phase, {"ok": False, "reason": "no start observation"})
-            cleanup.run()
-            return 3
+            return fail(phase, "no start observation", cleanup)
+        attribution = source.classify_turn_start(
+            found[0].native_evidence, outstanding_turn_reference=interrupt_ref
+        )
+        if attribution is not TurnAttribution.ATTRIBUTED:
+            return fail(phase, f"start attribution was {attribution.value}", cleanup)
         try:
             adapter.abort_activity(producer_id)
         except AgentRuntimeError as abort_failure:
@@ -556,19 +706,22 @@ def _continue_with_producer(
             (TurnEvidenceFamily.TURN_TERMINAL,), WINDOW_S["interrupt_turn"]
         )
         if found is None:
-            emit(phase, {"ok": False, "reason": "no terminal observation"})
-            cleanup.run()
-            return 3
-        terminal = classify_terminal(source, found[0], consumed=[])
+            return fail(phase, "no terminal observation", cleanup)
+        terminal = classify_terminal(source, found[0], consumed=producer_consumed)
         interrupted_verdict = terminal["interrupted"]
         emit(
             phase,
             {
                 "ok": True,
+                "start_attribution": attribution.value,
                 "outcome_kind": terminal["outcome_kind"],
+                "freshness": terminal["freshness"],
                 "interrupted": interrupted_verdict,
             },
         )
+        if terminal["freshness"] != TurnFreshness.FRESH.value:
+            return fail(phase, f"terminal freshness was {terminal['freshness']}", cleanup)
+        producer_consumed = terminal["_consumed"]
         if interrupted_verdict:
             break
         # An un-interrupted attempt leaves an acknowledged abort guard when
@@ -581,9 +734,7 @@ def _continue_with_producer(
         except Exception as error:  # noqa: BLE001
             emit(phase, {"settle_error": class_name(error)})
     if interrupted_verdict is not True:
-        emit("interruption", {"ok": False, "reason": "no positively interrupted terminal"})
-        cleanup.run()
-        return 3
+        return fail("interruption", "no positively interrupted terminal", cleanup)
 
     try:
         outcome = adapter.settle_abort(
@@ -593,13 +744,58 @@ def _continue_with_producer(
     except Exception as error:  # noqa: BLE001
         fail_and_cleanup("settle_abort", error, cleanup)
         return 3
+    if not outcome.settled:
+        return fail("settle_abort", "the interrupted-turn settlement did not commit", cleanup)
 
+    # --- the authorized continuation: the production detached Resume ---------
+    # The #343 fixed instruction is enqueued through the detached admission
+    # seam — the same instruction the blocking path would send — and the
+    # admitted reference is verified against the independently observed start
+    # and terminal evidence on the same session.
     try:
-        response = adapter.resume_activity(producer_id, expected_family=None)
-        emit("resume_activity", {"ok": True, "response_chars": len(getattr(response, "text", ""))})
+        resume_admission = adapter.admit_detached_turn(producer_id, RESUMPTION_INSTRUCTION)
     except Exception as error:  # noqa: BLE001
-        fail_and_cleanup("resume_activity", error, cleanup)
+        fail_and_cleanup("resume_admission", error, cleanup)
         return 3
+    resume_ref = resume_admission.turn_reference
+    found = producer_collector.wait_for(
+        (TurnEvidenceFamily.TURN_START, TurnEvidenceFamily.TURN_TERMINAL),
+        WINDOW_S["resume_turn"],
+    )
+    if found is None:
+        return fail("resume_activity", "evidence window timed out", cleanup)
+    resume_start, resume_terminal = found
+    resume_attribution = source.classify_turn_start(
+        resume_start.native_evidence, outstanding_turn_reference=resume_ref
+    )
+    resume = classify_terminal(source, resume_terminal, consumed=producer_consumed)
+    emit(
+        "resume_activity",
+        {
+            "ok": True,
+            "mechanism": "detached_admission",
+            "start_attribution": resume_attribution.value,
+            "outcome_kind": resume["outcome_kind"],
+            "freshness": resume["freshness"],
+            "result_candidate_chars": resume["result_candidate_chars"],
+        },
+    )
+    if resume_attribution is not TurnAttribution.ATTRIBUTED:
+        return fail("resume_activity", f"start attribution was {resume_attribution.value}", cleanup)
+    if (
+        resume["outcome_kind"] != "completed"
+        or resume["freshness"] != TurnFreshness.FRESH.value
+        or resume["interrupted"]
+    ):
+        return fail(
+            "resume_activity",
+            (
+                f"the resumed turn was {resume['outcome_kind']} freshness "
+                f"{resume['freshness']} interrupted={resume['interrupted']}"
+            ),
+            cleanup,
+        )
+    producer_consumed = resume["_consumed"]
 
     # --- aggregate usage and content-free activity attestation --------------
     try:
@@ -630,12 +826,19 @@ def _continue_with_producer(
     except Exception as error:  # noqa: BLE001
         fail_and_cleanup("usage_attestation", error, cleanup)
         return 3
+    if pulses["count"] <= 0:
+        return fail(
+            "usage_attestation",
+            "no qualified model-backed activity was observed for the exact session",
+            cleanup,
+        )
     return _continue_with_reconstruction(
         adapter=adapter,
         backend=backend,
         resolver=resolver,
         cleanup=cleanup,
         producer_id=producer_id,
+        reviewer_id=reviewer_id,
     )
 
 
@@ -646,44 +849,76 @@ def _continue_with_reconstruction(
     resolver: ProbeResolver,
     cleanup: Cleanup,
     producer_id: str,
+    reviewer_id: str,
 ) -> int:  # noqa: ANN201 - the probe keeps its own typing local and simple
-    """Same-ID reconstruction and exact stopped-session recovery, then cleanup."""
+    """Same-ID reconstruction and exact stopped-session recovery, then cleanup.
+
+    Transcript preservation is established by comparing the actual raw
+    transcript contents privately before and after each same-ID start (never
+    logged); the effective construction behavior of a mode transition is
+    attributed to the Owner-run D7 suite, which owns the full workflow
+    scenarios.
+    """
     try:
-        before = len(backend.read_messages(producer_id))
+        before = backend.read_messages(producer_id)
         adapter.reconstruct_session(producer_id, target_mode=ClineConstructionMode.PLAN)
-        after = len(backend.read_messages(producer_id))
-        emit(
-            "reconstruction",
-            {
-                "ok": True,
-                "target_mode": "plan",
-                "transcript_messages_before": before,
-                "transcript_messages_after": after,
-                "retained": bool(before > 0 and after == before),
-            },
-        )
+        after = backend.read_messages(producer_id)
     except Exception as error:  # noqa: BLE001
         fail_and_cleanup("reconstruction", error, cleanup)
         return 3
+    verbatim = bool(before and after == before)
+    emit(
+        "reconstruction",
+        {
+            "ok": True,
+            "target_mode": "plan",
+            "transcript_messages": len(before),
+            "transcript_verbatim": verbatim,
+        },
+    )
+    if not verbatim:
+        return fail("reconstruction", "the transcript was not preserved verbatim", cleanup)
 
     # --- exact stopped-session recovery --------------------------------------
     try:
         backend.stop(producer_id)
         record_present = backend.get(producer_id) is not None
         adapter.recover_session(producer_id, target_mode=ClineConstructionMode.ACT)
-        after = len(backend.read_messages(producer_id))
-        emit(
-            "stopped_recovery",
-            {
-                "ok": True,
-                "record_present_while_stopped": record_present,
-                "transcript_messages_after_recovery": after,
-            },
-        )
+        recovered = backend.read_messages(producer_id)
     except Exception as error:  # noqa: BLE001
         fail_and_cleanup("stopped_recovery", error, cleanup)
         return 3
+    recovered_verbatim = bool(recovered and recovered == after)
+    emit(
+        "stopped_recovery",
+        {
+            "ok": True,
+            "record_present_while_stopped": record_present,
+            "transcript_messages_after_recovery": len(recovered),
+            "transcript_verbatim": recovered_verbatim,
+        },
+    )
+    if not recovered_verbatim:
+        return fail(
+            "stopped_recovery", "the recovered transcript was not preserved verbatim", cleanup
+        )
 
+    # --- bounded cleanup and quiescence verification --------------------------
+    # Every allocated session is registered for stop at allocation; the stops
+    # run before any attachment disposal, each outcome is emitted, and the
+    # probe's own sessions are verified quiescent through the status-only
+    # run.list surface before the attachments are disposed.
+    if not cleanup.stop_sessions():
+        return fail("cleanup", "one or more probe sessions could not be stopped", cleanup)
+    try:
+        quiescence = verify_quiescence(backend, [reviewer_id, producer_id])
+    except Exception as error:  # noqa: BLE001
+        fail_and_cleanup("cleanup_quiescence", error, cleanup)
+        return 3
+    emit("cleanup_quiescence", quiescence)
+    if not quiescence["ok"]:
+        return fail("cleanup_quiescence", "a probe session still has an active run", cleanup)
+    cleanup.run()
     emit("probe_complete", {"ok": True})
     return 0
 
