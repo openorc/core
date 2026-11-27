@@ -45,9 +45,16 @@ def test_a_terminal_envelope_recognizes_the_terminal_family_with_its_own_identit
     failed = ClineHubEvent(
         session_id="sess-1", kind="run.failed", sequence=10, payload={"reason": "error"}
     )
+    aborted = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.aborted",
+        sequence=11,
+        payload={"reason": "aborted", "result": {"finishReason": "aborted"}},
+    )
 
     assert hub_evidence_family(completed) is TurnEvidenceFamily.TURN_TERMINAL
     assert hub_evidence_family(failed) is TurnEvidenceFamily.TURN_TERMINAL
+    assert hub_evidence_family(aborted) is TurnEvidenceFamily.TURN_TERMINAL
 
 
 def test_a_start_envelope_recognizes_the_start_family_and_everything_else_is_not_delivered() -> (
@@ -94,6 +101,48 @@ def test_a_terminal_classification_maps_the_kind_and_candidate_verbatim() -> Non
     assert completed_classification.freshness is TurnFreshness.FRESH
     assert failed_classification.outcome.kind is DetachedTurnObservationKind.FAILED
     assert failed_classification.outcome.result_candidate == "partial"
+
+
+def test_an_aborted_run_envelope_classifies_the_pinned_interruption_marker() -> None:
+    # The 0.2.1/CLI 3.0.75 termination of an aborted detached run (observed
+    # live, SDK2c issue #413): the Hub's own ``run.aborted`` event carries the
+    # envelope's session identity, the durable-log sequence, and a ``result``
+    # whose ``finishReason`` is the pinned interruption marker. The
+    # classification reads it kind-agnostically exactly like the other
+    # terminal events: the neutral interrupted verdict rides the terminal
+    # classification, the ordering marker stays verbatim, and the neutral
+    # outcome kind is the vocabulary's honest failure encoding (the shared
+    # seam routes the interrupted verdict before every family routing, so the
+    # kind is never consumed by an interrupted settlement).
+    event = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.aborted",
+        sequence=13,
+        payload={"reason": "aborted", "result": {"finishReason": "aborted", "text": "partial"}},
+    )
+
+    classification = classify_terminal_hub_run(event, consumed_ordering_markers=())
+
+    assert classification.outcome.kind is DetachedTurnObservationKind.FAILED
+    assert classification.outcome.interrupted is True
+    assert classification.outcome.result_candidate == "partial"
+    assert classification.ordering_marker == 13
+    assert classification.freshness is TurnFreshness.FRESH
+
+
+def test_an_aborted_run_envelope_without_the_pinned_marker_is_never_interrupted() -> None:
+    event = ClineHubEvent(
+        session_id="sess-1",
+        kind="run.aborted",
+        sequence=14,
+        payload={"reason": "draining", "result": {}},
+    )
+
+    classification = classify_terminal_hub_run(event, consumed_ordering_markers=())
+
+    assert classification.outcome.kind is DetachedTurnObservationKind.FAILED
+    assert classification.outcome.interrupted is False
+    assert classification.outcome.result_candidate is None
 
 
 def test_a_completed_run_without_a_usable_candidate_text_is_a_legitimate_classification() -> None:

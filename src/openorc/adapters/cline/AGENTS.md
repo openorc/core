@@ -2,7 +2,7 @@
 
 ## Boundary
 
-Use the official pinned `@cline/sdk` / `ClineCore` public remote-session surface through the narrow Python backend/Node bridge. Do not reimplement Hub wire protocol, parse private Cline files, or mirror the entire SDK into OpenOrc. Consult current official Cline SDK documentation before source archaeology or live qualification; upgrade the qualified CLI/core/SDK baseline deliberately together, with affected remote-runtime checks.
+Use the official pinned `@cline/sdk` / `ClineCore` public remote-session surface through the narrow Python backend/Node bridge. Do not reimplement Hub wire protocol, parse private Cline files, or mirror the entire SDK into OpenOrc. Consult current official Cline SDK documentation before source archaeology or live qualification; upgrade the qualified CLI/core/SDK baseline deliberately together, with affected remote-runtime checks. The supported adapter baseline is 0.2.1 / CLI 3.0.75: both the bridge and this adapter are qualified at that pairing — see `packages/cline-sdk-bridge/QUALIFICATION-0-2-1.md` and `src/openorc/adapters/cline/QUALIFICATION-0-2-1.md` (the latter records the qualified abort-terminated run event `run.aborted` in `hub_projection`'s terminal recognition set).
 
 ## Sessions, authority, and working context
 

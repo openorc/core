@@ -71,12 +71,23 @@ __all__ = [
     "hub_evidence_family",
 ]
 
-#: The qualified terminal run event names (issue #320) mapped to the seam's
-#: closed observation vocabulary. Every other event name is not a terminal
-#: run observation.
+#: The qualified terminal run event names (issues #320/#348, with the
+#: abort-terminated run event added by the 0.2.1/CLI 3.0.75 adapter-level
+#: requalification, issue #413) mapped to the seam's closed observation
+#: vocabulary. Every other event name is not a terminal run observation.
+#:
+#: ``run.aborted`` is the Hub's own termination event for an aborted run
+#: (observed live, SDK2c issue #413): it carries the envelope's own session
+#: identity and durable-log sequence and a ``result`` payload read exactly
+#: like the other terminal events. The pinned interruption finish reason
+#: stays the ONLY positive interrupted evidence; an aborted envelope without
+#: it classifies as the neutral failure outcome (a run that ended without a
+#: validated result and without positive interruption evidence) — never a
+#: success, never an invented verdict.
 _TERMINAL_EVENT_KINDS: Final[dict[str, DetachedTurnObservationKind]] = {
     "run.completed": DetachedTurnObservationKind.COMPLETED,
     "run.failed": DetachedTurnObservationKind.FAILED,
+    "run.aborted": DetachedTurnObservationKind.FAILED,
 }
 
 #: The pinned SDK-native interruption marker (R2b-qualified, issue #342):
@@ -150,7 +161,8 @@ def classify_terminal_hub_run(
     native result's ``finishReason`` carries the pinned SDK's own
     interruption marker — the same R2b-qualified signal the blocking-send
     path classifies as the normalized interrupted-turn outcome, read
-    kind-agnostically from either terminal event. Every other shape —
+    kind-agnostically from any recognized terminal event (the 0.2.1
+    abort-terminated run event included, issue #413). Every other shape —
     a missing, non-string, or different finish reason — is never invented
     into interruption evidence: an unqualified event kind, a missing formal
     response, or a status token alone never proves an interrupted turn.

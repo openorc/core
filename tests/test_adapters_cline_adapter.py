@@ -27,6 +27,7 @@ import json
 import threading
 from collections.abc import Callable
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -73,6 +74,7 @@ from openorc.adapters.cline.activity import (
     ClineToolCategory,
     ClineTurnFinishReason,
     ClineUsageActivity,
+    aggregate_usage_cost_usd,
     project_qualifying_pulse,
     project_session_event,
     project_usage_summary,
@@ -3726,6 +3728,43 @@ def test_snapshot_usage_leaves_unusable_fields_unreported() -> None:
     assert isinstance(negative_tokens.usage, ClineAccumulatedUsage)
     assert negative_tokens.usage.input_tokens is None
     assert negative_tokens.usage.output_tokens == 20
+
+
+def test_snapshot_usage_preserves_an_observed_zero_total_cost_as_real_evidence() -> None:
+    adapter, backend, _resolver, session_id = _bound_adapter()
+
+    # The qualified free model (SDK2c, issue #413) observably reports a
+    # totalCost of 0. An observed zero is real evidence in each scope — never
+    # an unknown placeholder, never collapsed with absence, and never
+    # substituted across the two aggregation scopes.
+    backend.queue_get_accumulated_usage(
+        session_id,
+        {
+            "usage": {"inputTokens": 10, "outputTokens": 20, "totalCost": 0},
+            "aggregateUsage": {"inputTokens": 15, "outputTokens": 25, "totalCost": 0},
+        },
+    )
+    snapshot = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(snapshot.usage, ClineAccumulatedUsage)
+    assert isinstance(snapshot.aggregate_usage, ClineAccumulatedUsage)
+    assert snapshot.usage.total_cost == 0
+    assert snapshot.aggregate_usage.total_cost == 0
+    # The aggregate extraction returns the exact decimal zero — real,
+    # finite evidence the cost path consumes as a truthful reading.
+    zero = aggregate_usage_cost_usd(snapshot.aggregate_usage)
+    assert zero == Decimal("0")
+    assert zero is not None and zero.is_finite()
+
+    # An aggregate scope that is still absent stays unknown, never zero by
+    # substitution from the root scope.
+    backend.queue_get_accumulated_usage(session_id, {"usage": {"totalCost": 0}})
+    root_only = adapter.read_activity_snapshot(session_id)
+
+    assert isinstance(root_only.usage, ClineAccumulatedUsage)
+    assert root_only.usage.total_cost == 0
+    assert root_only.aggregate_usage is None
+    assert aggregate_usage_cost_usd(root_only.aggregate_usage) is None
 
 
 def test_snapshot_usage_after_a_hub_restart_is_a_new_observation() -> None:

@@ -56,13 +56,14 @@ delivery, continuity, success, or Task progress). Reported usage values are
 finite and non-negative: missing, mistyped, or negative readings stay
 unreported rather than becoming invented numbers.
 
-Pinned-SDK mapping limits (qualified against the 0.0.90 baseline; the
-supported baseline is now 0.2.1 per issue #407, with projection
-requalification owned by #413): only demonstrated supported
+Pinned-SDK mapping limits (requalified against the supported 0.2.1
+baseline, issue #413): only demonstrated supported
 ``CoreSessionEvent``/``AgentEvent`` shapes are projected. ``chunk`` is not
 a reliably typed assistant-text/reasoning feed and is never projected;
-media content, hook/team/pending events, and unknown or malformed events
-produce no observation. No built-in file-tool input schema is documented at
+media content, hook/team/pending events (including the 0.2.1
+``team_progress``/``pending_prompts``/``pending_prompt_submitted``/``hook``
+kinds), and unknown or malformed events produce no observation. No
+built-in file-tool input schema is documented at
 the pinned baseline, so the optional repository-relative tool filename is
 deliberately not projected and tool ``input`` is never inspected. Missing,
 malformed, or unsupported observations stay explicitly non-authoritative
