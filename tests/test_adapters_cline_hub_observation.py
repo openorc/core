@@ -379,6 +379,25 @@ def test_the_usage_consultation_without_a_usable_aggregate_is_unknown() -> None:
     assert reading.aggregate_total_usd is None
 
 
+def test_the_usage_consultation_reports_an_observed_zero_as_real_evidence() -> None:
+    backend = FakeClineSdkBackend()
+    source = ClineHubTurnObservationSource(backend_factory=lambda: backend)
+    _attach(source, backend)
+    # The qualified free model (SDK2c, issue #413) observably reports a
+    # totalCost of 0: the exact decimal zero is real evidence — never
+    # unknown, never collapsed with an absent scope or substituted from the
+    # root/lead-agent scope.
+    backend.queue_get_accumulated_usage(
+        _EXTERNAL_SESSION, {"usage": {"totalCost": 0.0}, "aggregateUsage": {"totalCost": 0}}
+    )
+
+    reading = source.consult_session_usage(
+        connection_id=_CONNECTION_ID, external_session_id=_EXTERNAL_SESSION
+    )
+
+    assert reading.aggregate_total_usd == Decimal("0")
+
+
 def test_the_observation_lease_releases_both_stream_subscriptions() -> None:
     delivered: list[Any] = []
     backend, source, lease = _observe_session(delivered)
