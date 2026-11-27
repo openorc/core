@@ -48,7 +48,9 @@ export type WireRemoteConfig = {
   remote_options?: JsonObject;
 };
 
-/** Wire shape of `ClineStartRequest` (start params, flattened). */
+/** Wire shape of `ClineStartRequest` (start params, flattened). Fresh
+ * construction only: same-ID reconstruction no longer re-uses `start` —
+ * it is the native `resume` operation (issue #408). */
 export type WireStartRequest = {
   provider_id: string;
   model_id: string;
@@ -60,8 +62,30 @@ export type WireStartRequest = {
   enable_tools: boolean;
   interactive: boolean;
   tool_policies: JsonObject;
-  session_id?: string;
-  initial_messages?: JsonObject[];
+};
+
+/** Wire shape of `ClineResumeRequest` (resume params, flattened). The
+ * complete v1 construction bundle for the exact existing external session,
+ * applied by the Hub's native `session.resume` with Hub-side saved-history
+ * loading (issue #408) — no transcript is ever uploaded. */
+export type WireResumeRequest = {
+  session_id: string;
+  provider_id: string;
+  model_id: string;
+  mode: "plan" | "act";
+  rules: string;
+  system_prompt: string;
+  cwd: string;
+  workspace_root: string;
+  enable_tools: boolean;
+  interactive: boolean;
+  tool_policies: JsonObject;
+};
+
+/** Wire shape of the D2 `ClineResumeResult`: the verified exact session
+ * identity of the restored incarnation. */
+export type WireResumeResult = {
+  session_id: string;
 };
 
 /** Wire shape of the D2 `ClineStartResult`. */

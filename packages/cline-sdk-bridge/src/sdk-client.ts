@@ -10,10 +10,12 @@
  * approval executors, no provider catalog, and no synthesized flags.
  *
  * Consequential-dispatch safety (issue #407): every effectful Hub command
- * this bridge issues — `run.enqueue` admission — passes the documented public
+ * this bridge issues — `run.enqueue` admission and the native `session.resume`
+ * reconstruction (issue #408) — passes the documented public
  * `retryAfterDispatch: false` command option (issue #407), so the pinned
  * SDK's transport recovery can never retransmit an already-dispatched
- * consequential command. Read-only queries (`run.list`) keep the SDK default.
+ * consequential command. Read-only queries (`run.list`, the post-resume
+ * pending-prompts consultation) keep the SDK default.
  * Read-only queries may retain safe SDK reconnect behavior; a retransmitted
  * admission is never acceptable because dispatch alone does not confirm
  * Hub-side acceptance.
@@ -35,6 +37,8 @@ import type {
   BridgeClientFactory,
   BridgeSdkClient,
   SdkHubEvent,
+  SdkResumeInput,
+  SdkResumeResult,
   SdkSessionEvent,
   SdkStartInput,
   SdkStartResult,
@@ -93,6 +97,43 @@ const { NodeHubClient, normalizeHubWebSocketUrl } = ClineSdk as unknown as {
   normalizeHubWebSocketUrl: (url: string) => string;
 };
 
+/** A verified `session.resume` reply that does not carry the exact requested
+ * session identity. Safe machine code only; no native text is carried. The
+ * downstream classification keeps this an unproven-effect uncertain outcome:
+ * the command was dispatched and answered, so the incarnation state is never
+ * claimed known. */
+class ResumeIdentityMismatchError extends Error {
+  readonly code = "resume_identity_mismatch";
+
+  constructor() {
+    super("the native resume reply did not carry the requested session identity");
+    this.name = "ResumeIdentityMismatchError";
+  }
+}
+
+/** Extract the restored session identity from one verified `session.resume`
+ * reply payload. The pinned 0.2.1 reply shapes carry the identity as
+ * `payload.snapshot.sessionId`, `payload.session.sessionId`, or
+ * `payload.sessionId`; any other shape is unusable and returns undefined so
+ * the caller fails closed. Reply contents are never interpreted beyond this
+ * bounded identity extraction. */
+function extractResumeSessionId(payload: unknown): string | undefined {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const record = payload as { snapshot?: unknown; session?: unknown; sessionId?: unknown };
+  for (const candidate of [
+    (record.snapshot as { sessionId?: unknown } | null | undefined)?.sessionId,
+    (record.session as { sessionId?: unknown } | null | undefined)?.sessionId,
+    record.sessionId,
+  ]) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
 class ClineCoreBridgeClient implements BridgeSdkClient {
   /** The lazily established hub-client attachment for this generation:
    * created on the first hub operation, reused thereafter, disposed with
@@ -114,6 +155,92 @@ class ClineCoreBridgeClient implements BridgeSdkClient {
     return result.result === undefined
       ? { sessionId: result.sessionId }
       : { sessionId: result.sessionId, result: result.result };
+  }
+
+  /** Native same-session reconstruction (issue #408): one public
+   * `NodeHubClient.command("session.resume", …)` call carrying the complete
+   * construction bundle for the exact existing session. The Hub performs
+   * Hub-side saved-history loading — no transcript is ever uploaded, and
+   * there is no fallback to a transcript-carrying re-creation.
+   *
+   * Contract established against the pinned 0.2.1 surface (static analysis
+   * + live qualification, SDK3): the Hub's resume handler requires
+   * `payload.sessionConfig.sessionId`, refuses a missing saved record
+   * (`session_not_found`), refuses an empty/unavailable saved conversation
+   * (`session_messages_not_found`), refuses an already-resident session
+   * (`session_already_exists`), and otherwise runs the shared session
+   * creation routine with the saved messages injected as
+   * `initialMessages`; the reply carries the restored identity as
+   * `payload.snapshot.sessionId` or `payload.session.sessionId`. The
+   * sessionConfig fields mirror the SDK's own remote session-creation
+   * payload (the full construction config plus the pinned session ID), so
+   * runtime-side defaults resolve identically for the resumed incarnation.
+   *
+   * Consequential-dispatch safety (issue #407 handoff): `retryAfterDispatch:
+   * false` is applied authoritatively at this real call site — a per-command
+   * options argument, never part of the construction options, so neither the
+   * opaque `remote_options` nor any remote configuration can override it.
+   * A lost reply or transport failure is an uncertain outcome that never
+   * authorizes another resume.
+   *
+   * After the identity verification, one read-only
+   * `core.pendingPrompts.list({sessionId})` consultation establishes the
+   * documented session-event subscription wiring for the restored
+   * incarnation ("In hub mode ClineCore subscribes to a session when it
+   * starts, sends to, or lists pending prompts for it" — declared
+   * `hasSessionSubscription` contract), so ordinary observation, reads, and
+   * authorized turns address the restored incarnation through the ordinary
+   * production backend. The consultation is auxiliary: it runs after the
+   * incarnation change took effect, so its failure is contained (the wiring
+   * self-heals at the next ordinary send) and can never reclassify the
+   * already-verified resume outcome. */
+  async resume(input: SdkResumeInput): Promise<SdkResumeResult> {
+    const hub = await this.requireHub();
+    const construction = input.construction;
+    const payload = {
+      workspaceRoot: construction.workspaceRoot,
+      cwd: construction.cwd,
+      sessionConfig: {
+        sessionId: input.sessionId,
+        providerId: construction.providerId,
+        modelId: construction.modelId,
+        cwd: construction.cwd,
+        workspaceRoot: construction.workspaceRoot,
+        systemPrompt: construction.systemPrompt,
+        mode: construction.mode,
+        rules: construction.rules,
+        enableTools: construction.enableTools,
+      },
+      metadata: {
+        interactive: construction.interactive,
+        provider: construction.providerId,
+        model: construction.modelId,
+        enableTools: construction.enableTools,
+      },
+      runtimeOptions: {},
+      toolPolicies: input.toolPolicies,
+    };
+    const reply = await hub.command(
+      "session.resume",
+      payload,
+      input.sessionId,
+      { retryAfterDispatch: false },
+    );
+    const restored = extractResumeSessionId(reply.payload);
+    if (restored !== input.sessionId) {
+      // Fail closed: a reply that does not carry the exact requested
+      // identity never counts as a successful reconstruction.
+      throw new ResumeIdentityMismatchError();
+    }
+    try {
+      await this.core.pendingPrompts.list({ sessionId: input.sessionId });
+    } catch {
+      // Contained auxiliary wiring consultation only: the incarnation
+      // change already took effect and was identity-verified, and the
+      // documented subscription lifecycle re-establishes delivery at the
+      // next ordinary send. This failure never reclassifies the resume.
+    }
+    return { sessionId: restored };
   }
 
   async send(input: { sessionId: string; prompt: string }): Promise<unknown> {

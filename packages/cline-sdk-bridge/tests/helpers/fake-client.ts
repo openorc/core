@@ -9,7 +9,15 @@
  * bridge boundary classification is exercised end to end.
  */
 
-import type { BridgeSdkClient, SdkHubEvent, SdkSessionEvent, SdkStartInput, SdkStartResult } from "../../src/bridge.js";
+import type {
+  BridgeSdkClient,
+  SdkHubEvent,
+  SdkResumeInput,
+  SdkResumeResult,
+  SdkSessionEvent,
+  SdkStartInput,
+  SdkStartResult,
+} from "../../src/bridge.js";
 import type { JsonObject } from "../../src/types.js";
 
 export interface ScriptedOutcome {
@@ -131,13 +139,23 @@ export class FakeClineCoreClient implements BridgeSdkClient {
 
   async start(input: SdkStartInput): Promise<SdkStartResult> {
     this.record("start", input);
-    return await this.apply("start", () => {
-      const sessionId = input.config.sessionId ?? `cline-session-${this.nextSessionNumber + 1}`;
-      if (input.config.sessionId === undefined) {
-        this.nextSessionNumber += 1;
-      }
-      this.sessions.set(sessionId, input.initialMessages === undefined ? [] : structuredClone(input.initialMessages));
-      return { sessionId };
+    const result = await this.apply("start", () => {
+      this.nextSessionNumber += 1;
+      return { sessionId: `cline-session-${this.nextSessionNumber}` };
+    });
+    // A scripted start binds its own exact ID exactly like the fallback:
+    // the bound identity is known to this fake for exact-session operations.
+    this.sessions.set(result.sessionId, []);
+    return result;
+  }
+
+  /** Native same-session reconstruction (issue #408): scripted outcomes or
+   * the exact-identity fallback over a known session. */
+  async resume(input: SdkResumeInput): Promise<SdkResumeResult> {
+    this.record("resume", input);
+    return await this.apply("resume", () => {
+      this.requireKnown(input.sessionId);
+      return { sessionId: input.sessionId };
     });
   }
 

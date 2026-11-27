@@ -36,6 +36,8 @@ __all__ = [
     "ClineConstructionMode",
     "ClineHubEvent",
     "ClineRemoteConfig",
+    "ClineResumeRequest",
+    "ClineResumeResult",
     "ClineRunAdmission",
     "ClineSessionEvent",
     "ClineStartRequest",
@@ -117,7 +119,7 @@ class ClineRemoteConfig:
 
 @dataclass(frozen=True)
 class ClineStartRequest:
-    """The complete v1 session-construction bundle, forwarded unchanged.
+    """The complete v1 fresh-construction bundle, forwarded unchanged.
 
     Supplied by the adapter layer (D5a) and transported verbatim; the
     backend neither authors nor defaults any field:
@@ -130,23 +132,19 @@ class ClineStartRequest:
       present (the adapter supplies the required empty string);
     - ``cwd``/``workspace_root`` — the per-role working context;
     - ``enable_tools``/``interactive`` — the v1 construction booleans;
-    - ``tool_policies`` — the full per-session tool-policy JSON object;
-    - ``session_id`` — optional same external session ID for same-ID
-      reconstruction (fresh construction leaves it absent);
-    - ``initial_messages`` — optional raw persisted message array from
-      ``read_messages``, round-tripped with its entire JSON structure,
-      ordering, and nested fields preserved. Never summarized, projected,
-      flattened, redacted in flight, or rebuilt from other observations.
+    - ``tool_policies`` — the full per-session tool-policy JSON object.
 
-    Nothing else is synthesized here: no ``enableSpawnAgent``/
-    ``enableAgentTeams``, provider catalog, provider credentials, native
-    tools/executors, approval callbacks, session prompt overrides, session
-    history snapshots, or generic SDK configuration bags.
+    Fresh construction only: same-ID reconstruction is the native
+    ``resume`` operation (:class:`ClineResumeRequest`, issue #408) — never
+    a same-ID re-start carrying a transcript. Nothing else is synthesized
+    here: no ``enableSpawnAgent``/``enableAgentTeams``, provider catalog,
+    provider credentials, native tools/executors, approval callbacks,
+    session prompt overrides, session history snapshots, or generic SDK
+    configuration bags.
 
-    The representation withholds ``rules``, ``system_prompt``, and
-    ``initial_messages``: prompt and transcript content never enters
-    ``repr``, assertion-failure text, or telemetry, while the values
-    themselves stay intact for lossless transport.
+    The representation withholds ``rules`` and ``system_prompt``: prompt
+    content never enters ``repr``, assertion-failure text, or telemetry,
+    while the values themselves stay intact for lossless transport.
     """
 
     provider_id: str
@@ -159,8 +157,6 @@ class ClineStartRequest:
     enable_tools: bool
     interactive: bool
     tool_policies: JsonObject
-    session_id: str | None = None
-    initial_messages: list[JsonObject] | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_string("ClineStartRequest", "provider_id", self.provider_id)
@@ -179,16 +175,6 @@ class ClineStartRequest:
         if not isinstance(self.enable_tools, bool) or not isinstance(self.interactive, bool):
             raise ValueError("ClineStartRequest.enable_tools and .interactive must be booleans")
         _require_json_object("ClineStartRequest", "tool_policies", self.tool_policies)
-        if self.session_id is not None:
-            _require_non_empty_string("ClineStartRequest", "session_id", self.session_id)
-        if self.initial_messages is not None and not (
-            isinstance(self.initial_messages, list)
-            and all(isinstance(item, dict) for item in self.initial_messages)
-        ):
-            raise ValueError(
-                "ClineStartRequest.initial_messages must be None or a list of "
-                "JSON objects carrying the raw persisted message array"
-            )
 
     def __repr__(self) -> str:
         return (
@@ -197,9 +183,103 @@ class ClineStartRequest:
             f"rules=<withheld>, system_prompt=<withheld>, "
             f"cwd={self.cwd!r}, workspace_root={self.workspace_root!r}, "
             f"enable_tools={self.enable_tools!r}, interactive={self.interactive!r}, "
-            f"tool_policies={self.tool_policies!r}, "
-            f"session_id={self.session_id!r}, initial_messages=<withheld>)"
+            f"tool_policies={self.tool_policies!r})"
         )
+
+
+@dataclass(frozen=True)
+class ClineResumeRequest:
+    """The complete v1 construction bundle for the exact existing session.
+
+    The native same-ID reconstruction input (issue #408): the addressed
+    external session is restored by the Hub's public native
+    ``session.resume`` command, which loads the session's own saved history
+    Hub-side — no transcript is ever read into the request or uploaded.
+    Every field is the caller-authorized current construction input,
+    forwarded verbatim; the backend neither authors nor defaults any field:
+
+    - ``session_id`` — the exact external session ID to restore; required;
+    - ``provider_id``/``model_id`` — the current authorized role pair;
+    - ``mode`` — the caller-authorized target construction mode;
+    - ``rules`` — role Markdown, and ``system_prompt`` — always explicitly
+      present (the adapter supplies the required empty string);
+    - ``cwd``/``workspace_root`` — the phase-selected working context;
+    - ``enable_tools``/``interactive`` — the v1 construction booleans;
+    - ``tool_policies`` — the full per-session tool-policy JSON object.
+
+    Nothing else is synthesized here: no ``enableSpawnAgent``/
+    ``enableAgentTeams``, provider catalog, provider credentials, native
+    tools/executors, approval callbacks, or generic SDK configuration bags.
+
+    The representation withholds ``rules`` and ``system_prompt``: prompt
+    content never enters ``repr``, assertion-failure text, or telemetry,
+    while the values themselves stay intact for lossless transport.
+    """
+
+    session_id: str
+    provider_id: str
+    model_id: str
+    mode: ClineConstructionMode
+    rules: str
+    system_prompt: str
+    cwd: str
+    workspace_root: str
+    enable_tools: bool
+    interactive: bool
+    tool_policies: JsonObject
+
+    def __post_init__(self) -> None:
+        _require_non_empty_string("ClineResumeRequest", "session_id", self.session_id)
+        _require_non_empty_string("ClineResumeRequest", "provider_id", self.provider_id)
+        _require_non_empty_string("ClineResumeRequest", "model_id", self.model_id)
+        if not isinstance(self.mode, ClineConstructionMode):
+            raise ValueError(
+                "ClineResumeRequest.mode must be a ClineConstructionMode (plan or act)"
+            )
+        if not isinstance(self.rules, str):
+            raise ValueError("ClineResumeRequest.rules must be a string")
+        if not isinstance(self.system_prompt, str):
+            raise ValueError(
+                "ClineResumeRequest.system_prompt must be a string and is always "
+                "explicitly present (the adapter supplies the required empty string)"
+            )
+        _require_non_empty_string("ClineResumeRequest", "cwd", self.cwd)
+        _require_non_empty_string("ClineResumeRequest", "workspace_root", self.workspace_root)
+        if not isinstance(self.enable_tools, bool) or not isinstance(self.interactive, bool):
+            raise ValueError("ClineResumeRequest.enable_tools and .interactive must be booleans")
+        _require_json_object("ClineResumeRequest", "tool_policies", self.tool_policies)
+
+    def __repr__(self) -> str:
+        return (
+            f"ClineResumeRequest(session_id={self.session_id!r}, "
+            f"provider_id={self.provider_id!r}, model_id={self.model_id!r}, "
+            f"mode={self.mode!r}, rules=<withheld>, system_prompt=<withheld>, "
+            f"cwd={self.cwd!r}, workspace_root={self.workspace_root!r}, "
+            f"enable_tools={self.enable_tools!r}, interactive={self.interactive!r}, "
+            f"tool_policies={self.tool_policies!r})"
+        )
+
+
+@dataclass(frozen=True)
+class ClineResumeResult:
+    """The verified exact session identity of the restored incarnation.
+
+    ``session_id`` is the identity the native resume reply carried and the
+    bridge verified against the requested exact ID; it is the only success
+    value of a reconstruction. The reply is transport evidence that the
+    Hub-side saved-history loading succeeded — never OpenOrc workflow
+    authority — and the restored incarnation's conversation, usage, and
+    mode behavior are established by qualification and reconciliation, not
+    by this value.
+    """
+
+    session_id: str
+
+    def __post_init__(self) -> None:
+        _require_non_empty_string("ClineResumeResult", "session_id", self.session_id)
+
+    def __repr__(self) -> str:
+        return f"ClineResumeResult(session_id={self.session_id!r})"
 
 
 @dataclass(frozen=True)

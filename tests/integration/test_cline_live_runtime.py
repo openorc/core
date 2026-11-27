@@ -75,6 +75,7 @@ versions, continuity classifications, and harmless bounded observations.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -499,6 +500,9 @@ class _Live:
         self.producer_session_id: str | None = None
         self.reviewer_session_id: str | None = None
         self.producer_count_before_restart: int | None = None
+        self.producer_conversation_digest: str | None = None
+        self.producer_conversation_count: int | None = None
+        self.producer_usage_before_restart: str | None = None
         self.evidence: dict[str, str] = {}
 
     @property
@@ -715,6 +719,12 @@ class _Live:
         self.repository_base = base
         self.producer_session_id = str(external_session_id)
         self.producer_count_before_restart = int(handoff["producer_transcript_count"])
+        digest = handoff.get("producer_conversation_digest")
+        self.producer_conversation_digest = digest if isinstance(digest, str) else None
+        conv_count = handoff.get("producer_conversation_count")
+        self.producer_conversation_count = conv_count if isinstance(conv_count, int) else None
+        usage = handoff.get("producer_usage_before_restart")
+        self.producer_usage_before_restart = usage if isinstance(usage, str) else None
 
     def box_check(self, path: str, *, expect_exists: bool) -> str:
         """Verify a Box-side path through the Owner-approved operator hook.
@@ -788,6 +798,9 @@ class _Live:
             "producer_session_id": self.producer_session_id,
             "reviewer_session_id": self.reviewer_session_id,
             "producer_transcript_count": self.producer_count_before_restart,
+            "producer_conversation_digest": self.producer_conversation_digest,
+            "producer_conversation_count": self.producer_conversation_count,
+            "producer_usage_before_restart": self.producer_usage_before_restart,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1491,6 +1504,47 @@ def test_e_activity_and_usage_observations(live: _Live) -> None:
 # --- scenario D3: required Hub-restart recovery (completion gate) -------------
 
 
+def _conversation_digest(conversation: list[Any]) -> str:
+    """Private content-free identity digest of one projected conversation.
+
+    The projected (index, kind, text) tuples are serialized canonically and
+    hashed: the digest establishes conversation identity across the restart
+    without ever emitting transcript content into evidence, logs, or
+    telemetry.
+    """
+    payload = json.dumps(
+        [(message.index, message.kind, message.text) for message in conversation],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _usage_summary_text(snapshot: Any) -> str:
+    """Bounded per-scope usage rendering for recorded evidence.
+
+    The aggregate scope and the root scope are reported separately and an
+    aggregate-scope absence is distinct from a root-scope reading; a
+    genuinely observed zero stays zero (real evidence, never unknown), and
+    an absent or unusable scope renders as absent/unknown. No invented
+    spend, no inference across scopes, and no cost accounting here — this is
+    diagnostic text for the recorded evidence.
+    """
+
+    def _scope_state(scope: Any) -> str:
+        if scope is None:
+            return "absent"
+        cost = getattr(scope, "total_cost", None)
+        if cost is None:
+            return "cost_unknown"
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost == 0:
+            return "cost_zero"
+        return "cost_nonzero"
+
+    aggregate = getattr(snapshot, "aggregate_usage", None)
+    usage = getattr(snapshot, "usage", None)
+    return f"aggregate={_scope_state(aggregate)} root={_scope_state(usage)}"
+
+
 def test_d3_hub_restart_recovery(live: _Live) -> None:
     """The required real Hub-restart recovery completion gate.
 
@@ -1505,38 +1559,41 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
     resume = live.resume
     if resume:
         assert live.producer_count_before_restart is not None
+        assert live.producer_conversation_digest is not None
+        assert live.producer_conversation_count is not None
     else:
         assert live.producer_session_id is not None
         assert live.repository_base is not None
         producer_id = live.producer_session_id
         checkout = f"{live.repository_base}/{live.task_id}"
+        # Record the pre-restart transcript extent, the surviving conversation
+        # IDENTITY, and the same-session aggregate usage through the ordinary
+        # public reads BEFORE branching into the supported restart modes: both
+        # in-invocation restart modes consume this evidence, and the
+        # two-stage preserved-database procedure's stage one — which reaches
+        # the NOT EXECUTED branch because the restart happens between stages —
+        # must capture it into the stage-one handoff without claiming restart
+        # execution.
+        with ExitStack() as stack:
+            bound = _attach_bound(
+                live,
+                stack,
+                role=WorkflowRole.PRODUCER,
+                external_session_id=producer_id,
+                working_directory=checkout,
+            )
+            reconciliation = bound.adapter.reconcile_session(producer_id)
+            assert reconciliation.transcript_message_count is not None
+            live.producer_count_before_restart = reconciliation.transcript_message_count
+            pre_restart_conversation = bound.adapter.read_conversation(producer_id)
+            live.producer_conversation_digest = _conversation_digest(pre_restart_conversation)
+            live.producer_conversation_count = len(pre_restart_conversation)
+            live.producer_usage_before_restart = _usage_summary_text(
+                bound.adapter.read_activity_snapshot(producer_id)
+            )
         if os.environ.get(_RESTART_COMMAND_ENV, "").strip():
-            # Record the pre-restart transcript extent through the ordinary
-            # public reads, then perform the Owner-approved restart.
-            with ExitStack() as stack:
-                bound = _attach_bound(
-                    live,
-                    stack,
-                    role=WorkflowRole.PRODUCER,
-                    external_session_id=producer_id,
-                    working_directory=checkout,
-                )
-                reconciliation = bound.adapter.reconcile_session(producer_id)
-                assert reconciliation.transcript_message_count is not None
-                live.producer_count_before_restart = reconciliation.transcript_message_count
             _run_restart_hook()
         elif os.environ.get(_PAUSE_SENTINEL_ENV, "").strip():
-            with ExitStack() as stack:
-                bound = _attach_bound(
-                    live,
-                    stack,
-                    role=WorkflowRole.PRODUCER,
-                    external_session_id=producer_id,
-                    working_directory=checkout,
-                )
-                reconciliation = bound.adapter.reconcile_session(producer_id)
-                assert reconciliation.transcript_message_count is not None
-                live.producer_count_before_restart = reconciliation.transcript_message_count
             _pause_for_owner_restart()
         else:
             pytest.fail(
@@ -1585,18 +1642,66 @@ def test_d3_hub_restart_recovery(live: _Live) -> None:
             "the persisted transcript shrank across the Hub restart"
         )
         # The authorized same-ID recovery: no initialization resend, no
-        # replacement session; the recovery itself positively establishes the
-        # surviving transcript before any stop/start and honors a positively
-        # identified stop absence if the prior incarnation is non-addressable.
+        # replacement session; the recovery positively establishes the
+        # surviving transcript before any effect and honors a positively
+        # identified stop absence if the prior incarnation is non-addressable,
+        # then the Hub's native session.resume restores the exact identity
+        # with Hub-side saved-history loading (issue #408) — no transcript is
+        # ever uploaded.
         bound.adapter.recover_session(producer_id, target_mode=ClineConstructionMode.ACT)
+        # Surviving conversation IDENTITY, established privately: the
+        # projected conversation after the native recovery must extend the
+        # pre-restart conversation verbatim (growth from the interrupted
+        # work's effects landing is a legitimate intervening change; content
+        # never leaves this process — only counts and the identity verdict).
+        post_recovery_conversation = bound.adapter.read_conversation(producer_id)
+        expected_count = live.producer_conversation_count
+        assert expected_count is not None
+        assert live.producer_conversation_digest is not None
+        assert len(post_recovery_conversation) >= expected_count, (
+            "the projected conversation shrank across the restart/recovery"
+        )
+        prefix_digest = _conversation_digest(post_recovery_conversation[:expected_count])
+        conversation_identity_preserved = prefix_digest == live.producer_conversation_digest
+        assert conversation_identity_preserved, (
+            "the surviving conversation identity did not match the pre-restart projection"
+        )
         reply = bound.adapter.send(producer_id, "Reply with the single word: recovered.")
         assert isinstance(reply, AgentTextResponse)
+        # EFFECTIVE post-recovery construction: the recovery restored native
+        # ACT at the checkout, and the restored incarnation must actually
+        # create the authorized scratch directory there — verified Box-side
+        # through the Owner-approved operator hook (whose existence check is
+        # directory-shaped), never inferred from a reply, a same ID, or a
+        # transcript count. The uniquely named directory is removed by the
+        # existing authorized workspace cleanup; no separate cleanup exists.
+        scratch_dir = f"{checkout}/sdk3-restart-scratch-{uuid4().hex[:8]}"
+        write_reply = bound.adapter.send(
+            producer_id,
+            f"Create the directory {scratch_dir} (mkdir -p is fine). Use your tools now.",
+        )
+        assert isinstance(write_reply, AgentTextResponse)
+        scratch_created = live.box_check(scratch_dir, expect_exists=True)
+        # The same-session usage after the controlled restart, recorded
+        # honestly per scope: the aggregate scope's absence is distinct from
+        # a root-scope reading; a genuine reset, a real zero, and absence are
+        # each distinct observations — never spend or loss evidence, and the
+        # application cost accounting is never changed here.
+        usage_after = _usage_summary_text(bound.adapter.read_activity_snapshot(producer_id))
+    pre_usage = live.producer_usage_before_restart
     live.record(
         "D3 hub-restart recovery",
         "EXECUTED" if not resume else "EXECUTED (stage-two resume)",
         f"current-credential reattachment, transcript survival "
         f"(pre {live.producer_count_before_restart} / post {count} messages), "
-        "and same-ID recover_session with a post-recovery continuation turn",
+        f"surviving conversation identity preserved={conversation_identity_preserved} "
+        f"(prefix projection count {expected_count}), "
+        "native same-ID recover_session with a post-recovery continuation turn, "
+        f"effective ACT construction at the checkout verified Box-side "
+        f"(scratch directory created={scratch_created}), "
+        f"aggregate usage pre [{pre_usage if pre_usage else 'unobserved'}] / "
+        f"post [{usage_after}] (honest per-scope observation; a reset or "
+        "absence is recorded as such, never as spend or loss)",
     )
 
 

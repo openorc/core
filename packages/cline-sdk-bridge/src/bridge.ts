@@ -9,16 +9,16 @@
  * forwarding stays live during in-flight sends, and the bridge makes no
  * retry, resend, reconnect, or session-replacement decisions.
  *
- * Wire methods (fixed): `connect`, `start`, `send`, `stop`, `abort`, `get`,
- * `read_messages`, `list_history`, `get_accumulated_usage`, `subscribe`,
- * `unsubscribe`, `dispose`, plus the Hub-native admission/observation methods
- * `enqueue`, `list_runs`, and `subscribe_hub` (issue #321). Asynchronous SDK
- * session events are emitted as `cline.event` notifications carrying the
- * subscription handle, exact event session identity, safe machine kind, and
- * the unchanged JSON payload; asynchronous Hub event envelopes are emitted as
- * `cline.hub_event` notifications carrying the subscription handle and the
- * envelope's own session identity, event name, durable-log sequence, and
- * unchanged payload.
+ * Wire methods (fixed): `connect`, `start`, `resume`, `send`, `stop`,
+ * `abort`, `get`, `read_messages`, `list_history`, `get_accumulated_usage`,
+ * `subscribe`, `unsubscribe`, `dispose`, plus the Hub-native
+ * admission/observation methods `enqueue`, `list_runs`, and `subscribe_hub`
+ * (issue #321). Asynchronous SDK session events are emitted as `cline.event`
+ * notifications carrying the subscription handle, exact event session
+ * identity, safe machine kind, and the unchanged JSON payload; asynchronous
+ * Hub event envelopes are emitted as `cline.hub_event` notifications carrying
+ * the subscription handle and the envelope's own session identity, event
+ * name, durable-log sequence, and unchanged payload.
  */
 
 import {
@@ -33,6 +33,7 @@ import {
   validateConnectParams,
   validateEnqueueParams,
   validateListRunsParams,
+  validateResumeParams,
   validateSendParams,
   validateStartParams,
   validateSubscribeParams,
@@ -72,15 +73,41 @@ export interface SdkStartConfigInput {
   cwd: string;
   workspaceRoot: string;
   enableTools: boolean;
-  sessionId?: string;
 }
 
-/** SDK start input mapped from the D2 `ClineStartRequest`. */
+/** SDK start input mapped from the D2 `ClineStartRequest`. Fresh
+ * construction only: same-ID reconstruction is the native `resume`
+ * operation (issue #408), never a same-ID re-start carrying a transcript. */
 export interface SdkStartInput {
   config: SdkStartConfigInput;
   interactive: boolean;
   toolPolicies: JsonObject;
-  initialMessages?: unknown[];
+}
+
+/** SDK resume input mapped from the D2 `ClineResumeRequest` (issue #408):
+ * the complete construction bundle the Hub's native `session.resume`
+ * applies to the exact existing session with Hub-side saved-history
+ * loading. No transcript is ever uploaded. */
+export interface SdkResumeInput {
+  sessionId: string;
+  construction: {
+    providerId: string;
+    modelId: string;
+    mode: "plan" | "act";
+    rules: string;
+    systemPrompt: string;
+    cwd: string;
+    workspaceRoot: string;
+    enableTools: boolean;
+    interactive: boolean;
+  };
+  toolPolicies: JsonObject;
+}
+
+/** SDK resume result: the verified exact session identity of the restored
+ * incarnation. */
+export interface SdkResumeResult {
+  sessionId: string;
 }
 
 /** SDK start result observed through the structural client surface. */
@@ -113,6 +140,13 @@ export interface SdkHubEvent {
  */
 export interface BridgeSdkClient {
   start(input: SdkStartInput): Promise<SdkStartResult>;
+  /** Native same-session reconstruction (issue #408): the public
+   * `NodeHubClient.command("session.resume", …)` surface with Hub-side
+   * saved-history loading. Resolves with the verified exact restored
+   * session identity; native refusals, transport failures, and timeouts are
+   * thrown uncaught for boundary classification. Never a transcript upload
+   * and never a retry — a lost reply is an uncertain outcome. */
+  resume(input: SdkResumeInput): Promise<SdkResumeResult>;
   send(input: { sessionId: string; prompt: string }): Promise<unknown>;
   stop(sessionId: string): Promise<void>;
   abort(sessionId: string, reason?: unknown): Promise<void>;
@@ -227,6 +261,8 @@ export class BridgeCore {
         return await this.connect(params);
       case "start":
         return await this.start(params);
+      case "resume":
+        return await this.resume(params);
       case "send":
         return await this.send(params);
       case "stop":
@@ -298,11 +334,9 @@ export class BridgeCore {
         cwd: request.cwd,
         workspaceRoot: request.workspace_root,
         enableTools: request.enable_tools,
-        ...(request.session_id !== undefined ? { sessionId: request.session_id } : {}),
       },
       interactive: request.interactive,
       toolPolicies: request.tool_policies,
-      ...(request.initial_messages !== undefined ? { initialMessages: request.initial_messages } : {}),
     };
     return await this.guarded("start", async () => {
       const result = await client.start(input);
@@ -310,6 +344,36 @@ export class BridgeCore {
         session_id: result.sessionId,
         result: result.result === undefined ? null : toPlainJson(result.result),
       };
+    });
+  }
+
+  /** Native same-session reconstruction (issue #408): the wire `resume`
+   * operation maps the complete construction bundle onto the public
+   * `NodeHubClient.command("session.resume", …)` call — Hub-side saved
+   * loading, no transcript upload. The verified exact restored identity is
+   * the only success value; every native refusal, transport failure, or
+   * timeout classifies at the boundary and never authorizes a resend. */
+  private async resume(params: unknown): Promise<JsonValue> {
+    const request = validateResumeParams(params);
+    const client = this.requireClient();
+    const input: SdkResumeInput = {
+      sessionId: request.session_id,
+      construction: {
+        providerId: request.provider_id,
+        modelId: request.model_id,
+        mode: request.mode,
+        rules: request.rules,
+        systemPrompt: request.system_prompt,
+        cwd: request.cwd,
+        workspaceRoot: request.workspace_root,
+        enableTools: request.enable_tools,
+        interactive: request.interactive,
+      },
+      toolPolicies: request.tool_policies,
+    };
+    return await this.guarded("resume", async () => {
+      const result = await client.resume(input);
+      return { session_id: result.sessionId };
     });
   }
 

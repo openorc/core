@@ -95,19 +95,40 @@ session ownership. See `AGENTS.md` for the binding boundary rules.
   `sdk-client.ts` extracts the public constructor, URL normalizer, and
   per-command options through the package namespace with one documented
   boundary cast; no new dependency, no private shape, and no tsconfig change.
-- `start` maps the complete D2 construction bundle onto
-  `ClineCore.start({config, interactive, toolPolicies, initialMessages?})`:
-  `providerId`, `modelId`, `config.mode` (`plan`/`act`), additive
-  `config.rules`, explicit `config.systemPrompt`, `cwd`, `workspaceRoot`,
-  `enableTools` — and, for same-ID reconstruction, the exact ID as
-  `config.sessionId` plus the unmodified raw `readMessages` array as
-  `initialMessages`. `enableSpawnAgent`/`enableAgentTeams` are deliberately
-  never synthesized (D2 forbids it; the pinned runtime treats absent flags as
-  disabled), no approval executors are registered, and no executable initial
-  prompt is sent. `start` is allocation only.
+- `start` maps the complete D2 fresh-construction bundle onto
+  `ClineCore.start({config, interactive, toolPolicies})`: `providerId`,
+  `modelId`, `config.mode` (`plan`/`act`), additive `config.rules`, explicit
+  `config.systemPrompt`, `cwd`, `workspaceRoot`, `enableTools`.
+  `enableSpawnAgent`/`enableAgentTeams` are deliberately never synthesized
+  (D2 forbids it; the pinned runtime treats absent flags as disabled), no
+  approval executors are registered, and no executable initial prompt is
+  sent. `start` is allocation only, fresh construction only.
+- `resume` (issue #408) is the native same-ID reconstruction: one public
+  `NodeHubClient.command("session.resume", payload, sessionId,
+  {retryAfterDispatch: false})` call carrying the complete construction
+  bundle for the exact existing session — the Hub performs the saved-history
+  loading and no transcript is ever uploaded (the former
+  `read_messages → start(initialMessages)` re-upload path is removed). The
+  payload mirrors the pinned remote session-creation shape: `sessionConfig`
+  (`sessionId`, `providerId`, `modelId`, `cwd`, `workspaceRoot`,
+  `systemPrompt`, `mode`, `rules`, `enableTools`), `metadata`
+  (`interactive`, `provider`, `model`, `enableTools`), `runtimeOptions`, and
+  `toolPolicies`. The reply's restored identity is extracted from the pinned
+  reply shapes (`payload.snapshot.sessionId`, `payload.session.sessionId`, or
+  `payload.sessionId`) and verified against the requested exact ID — a
+  mismatch throws a safe machine-coded error that classifies as an unproven
+  uncertain outcome. After verification, one read-only
+  `core.pendingPrompts.list({sessionId})` consultation establishes the
+  documented session-event subscription wiring for the restored incarnation;
+  its failure is contained and never reclassifies the verified resume.
+  Native refusals (`session_already_exists`, `session_not_found`,
+  `session_messages_not_found`, `unsupported_command`) and transport
+  failures/timeouts classify at the boundary; a lost reply never authorizes
+  another resume.
 - SDK-native results are forwarded as plain JSON with safe native date
   serialization (ISO strings); `undefined` SDK responses map to JSON `null`.
-  Nested message arrays survive `read_messages → wire → start` unchanged.
+  `read_messages` serves the conversation-read/reconciliation capabilities
+  and positive continuity evidence — never a transcript upload.
 - `dispose` releases bridge/client resources only; `stop` and `abort` remain
   distinct SDK calls; `delete` is never exposed. An SDK disconnect triggers
   no automatic `start`/`send`/reconnect/replay inside the bridge.

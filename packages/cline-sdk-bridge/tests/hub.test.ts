@@ -30,10 +30,13 @@ const START = {
 };
 
 async function connectedBridge(fake: FakeClineCoreClient) {
+  // A scripted start binds the tests' fixed "s1" identity (fresh starts
+  // allocate their own IDs on the fake).
+  fake.script("start", [{ ok: { sessionId: "s1" } }]);
   const bridge = startTestBridge(fixedFactory(fake));
   bridge.feed(`${requestLine(0, "connect", CONNECT)}\n`);
   await until(() => (bridge.frames.some((frame) => frame["id"] === 0) ? true : undefined));
-  bridge.feed(`${requestLine(1, "start", { ...START, session_id: "s1" })}\n`);
+  bridge.feed(`${requestLine(1, "start", START)}\n`);
   await until(() => (bridge.frames.some((frame) => frame["id"] === 1) ? true : undefined));
   return bridge;
 }

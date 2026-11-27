@@ -7,6 +7,7 @@
 
 import {
   type WireRemoteConfig,
+  type WireResumeRequest,
   type WireStartRequest,
   isJsonObject,
   isNonEmptyString,
@@ -88,7 +89,9 @@ export function validateConnectParams(params: unknown): WireRemoteConfig {
   return config;
 }
 
-/** `start` params: the flattened D2 `ClineStartRequest`. */
+/** `start` params: the flattened D2 `ClineStartRequest` (fresh construction
+ * only; same-ID reconstruction is the native `resume` operation, issue
+ * #408). */
 export function validateStartParams(params: unknown): WireStartRequest {
   const object = requireObject(params);
   const mode = requireString(object, "mode");
@@ -99,18 +102,7 @@ export function validateStartParams(params: unknown): WireStartRequest {
   if (!isJsonObject(toolPolicies)) {
     throw invalidParams();
   }
-  const initialMessagesValue = object["initial_messages"];
-  let initialMessages: JsonObject[] | undefined;
-  if (initialMessagesValue !== undefined && initialMessagesValue !== null) {
-    if (!Array.isArray(initialMessagesValue)) {
-      throw invalidParams();
-    }
-    initialMessages = initialMessagesValue.filter(isJsonObject);
-    if (initialMessages.length !== initialMessagesValue.length) {
-      throw invalidParams();
-    }
-  }
-  const request: WireStartRequest = {
+  return {
     provider_id: requireNonEmptyString(object, "provider_id"),
     model_id: requireNonEmptyString(object, "model_id"),
     mode,
@@ -122,14 +114,34 @@ export function validateStartParams(params: unknown): WireStartRequest {
     interactive: requireBoolean(object, "interactive"),
     tool_policies: toolPolicies,
   };
-  const sessionId = optionalString(object, "session_id");
-  if (sessionId !== undefined) {
-    request.session_id = sessionId;
+}
+
+/** `resume` params (issue #408): the exact existing session ID plus the
+ * complete construction bundle the Hub's native `session.resume` applies
+ * with Hub-side saved-history loading. No transcript is ever uploaded. */
+export function validateResumeParams(params: unknown): WireResumeRequest {
+  const object = requireObject(params);
+  const mode = requireString(object, "mode");
+  if (mode !== "plan" && mode !== "act") {
+    throw invalidParams();
   }
-  if (initialMessages !== undefined) {
-    request.initial_messages = initialMessages;
+  const toolPolicies = object["tool_policies"];
+  if (!isJsonObject(toolPolicies)) {
+    throw invalidParams();
   }
-  return request;
+  return {
+    session_id: requireSessionId(object),
+    provider_id: requireNonEmptyString(object, "provider_id"),
+    model_id: requireNonEmptyString(object, "model_id"),
+    mode,
+    rules: requireString(object, "rules"),
+    system_prompt: requireString(object, "system_prompt"),
+    cwd: requireNonEmptyString(object, "cwd"),
+    workspace_root: requireNonEmptyString(object, "workspace_root"),
+    enable_tools: requireBoolean(object, "enable_tools"),
+    interactive: requireBoolean(object, "interactive"),
+    tool_policies: toolPolicies,
+  };
 }
 
 /** `send` params: exact target session ID and verbatim prompt. */

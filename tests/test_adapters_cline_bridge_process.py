@@ -34,6 +34,8 @@ from openorc.adapters.cline import (
     ClineRemoteAttachmentRejectedError,
     ClineRemoteAttachmentUnavailableError,
     ClineRemoteConfig,
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSdkBackend,
     ClineSdkOperationRejectedError,
@@ -217,15 +219,23 @@ def handle(method, params, request_id):
         record({"method": "start", "args": params})
 
         def start_fallback():
-            if params.get("session_id"):
-                session_id = params["session_id"]
-            else:
-                counters["session"] += 1
-                session_id = "cline-session-%d" % counters["session"]
-            sessions[session_id] = list(params.get("initial_messages") or [])
+            counters["session"] += 1
+            session_id = "cline-session-%d" % counters["session"]
+            sessions[session_id] = []
             return {"session_id": session_id, "result": None}
 
         apply(method, request_id, start_fallback)
+        return
+    if method == "resume":
+        record({"method": "resume", "args": params})
+
+        def resume_fallback():
+            session_id = params.get("session_id")
+            if session_id not in sessions:
+                return NOT_FOUND
+            return {"session_id": session_id}
+
+        apply(method, request_id, resume_fallback)
         return
     if method == "send":
         record({"method": "send", "args": params})
@@ -395,6 +405,24 @@ def _start_request(**overrides: Any) -> ClineStartRequest:
     return ClineStartRequest(**values)
 
 
+def _resume_request(session_id: str, **overrides: Any) -> ClineResumeRequest:
+    values: dict[str, Any] = {
+        "session_id": session_id,
+        "provider_id": "provider-x",
+        "model_id": "model-y",
+        "mode": ClineConstructionMode.ACT,
+        "rules": "# Role",
+        "system_prompt": "",
+        "cwd": "/workspace/producer",
+        "workspace_root": "/workspace",
+        "enable_tools": True,
+        "interactive": False,
+        "tool_policies": {"write": {"allowed": True}},
+    }
+    values.update(overrides)
+    return ClineResumeRequest(**values)
+
+
 def _recorded_calls(record_path: Path) -> list[dict[str, Any]]:
     if not record_path.exists():
         return []
@@ -484,7 +512,7 @@ def test_connect_round_trip_returns_declared_typed_results(tmp_path: Path) -> No
     assert not any(call["method"] in ("dispose", "unsubscribe") for call in calls)
 
 
-def test_same_id_reconstruction_round_trip_is_lossless(tmp_path: Path) -> None:
+def test_native_resume_forwards_the_full_bundle_without_any_transcript(tmp_path: Path) -> None:
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
@@ -494,20 +522,37 @@ def test_same_id_reconstruction_round_trip_is_lossless(tmp_path: Path) -> None:
         },
         {"role": "assistant", "parts": []},
     ]
-    script = {"outcomes": {"read_messages": [{"ok": messages}]}}
-    command, child_env, record_path = _scripted_child(tmp_path, "lossless", script)
+    script = {
+        "outcomes": {
+            "read_messages": [{"ok": messages}],
+        }
+    }
+    command, child_env, record_path = _scripted_child(tmp_path, "resume", script)
     backend = _make_backend(command, child_env)
     backend.connect(_remote_config())
     started = backend.start(_start_request())
     session_id = started.session_id
-    assert backend.read_messages(session_id) == messages
-    backend.start(_start_request(session_id=session_id, initial_messages=messages))
-    assert backend.read_messages(session_id) == messages
+    request = _resume_request(session_id)
+    assert backend.resume_session(request) == ClineResumeResult(session_id=session_id)
     backend.dispose()
 
-    starts = [call for call in _recorded_calls(record_path) if call["method"] == "start"]
-    assert starts[1]["args"]["session_id"] == session_id
-    assert starts[1]["args"]["initial_messages"] == messages  # byte-exact nested round-trip
+    resumes = [call for call in _recorded_calls(record_path) if call["method"] == "resume"]
+    assert len(resumes) == 1
+    args = resumes[0]["args"]
+    # The complete construction bundle arrives verbatim for the exact session,
+    # with no transcript field anywhere on the wire:
+    assert args["session_id"] == session_id
+    assert args["provider_id"] == "provider-x"
+    assert args["model_id"] == "model-y"
+    assert args["mode"] == "act"
+    assert args["rules"] == "# Role"
+    assert args["system_prompt"] == ""
+    assert args["cwd"] == "/workspace/producer"
+    assert args["workspace_root"] == "/workspace"
+    assert args["enable_tools"] is True
+    assert args["interactive"] is False
+    assert args["tool_policies"] == {"write": {"allowed": True}}
+    assert "initial_messages" not in args
 
 
 def test_independent_calls_progress_during_a_long_send(tmp_path: Path) -> None:
@@ -1186,7 +1231,9 @@ def test_real_python_to_node_bridge_seam(node_seam: tuple[list[str], dict[str, s
     assert backend.get("cline-session-1") is None
     messages = [{"role": "user", "parts": [{"type": "text", "text": "persisted"}]}]
     assert backend.read_messages("cline-session-1") == messages
-    backend.start(_start_request(session_id="cline-session-1", initial_messages=messages))
+    assert backend.resume_session(_resume_request("cline-session-1")) == ClineResumeResult(
+        session_id="cline-session-1"
+    )
     received: list[ClineSessionEvent] = []
     subscription = backend.subscribe("cline-session-1", received.append)
     _wait_until(lambda: len(received) >= 1)
@@ -1210,10 +1257,13 @@ def test_real_python_to_node_bridge_seam(node_seam: tuple[list[str], dict[str, s
     assert first_config["providerId"] == "provider-x"  # the D2 bundle mapped verbatim
     assert first_config["mode"] == "plan"
     assert "sessionId" not in first_config  # fresh construction carries no session ID
-    assert starts[1]["args"]["config"]["sessionId"] == "cline-session-1"  # same exact external ID
-    assert (
-        starts[1]["args"]["initialMessages"] == messages
-    )  # nested raw payload round-trips losslessly through the real child
+    resumes = [call for call in calls if call["method"] == "resume"]
+    assert len(resumes) == 1
+    resume_args = resumes[0]["args"]
+    assert resume_args["sessionId"] == "cline-session-1"  # same exact external ID
+    assert resume_args["construction"]["mode"] == "act"
+    assert resume_args["construction"]["cwd"] == "/workspace/producer"
+    assert "initialMessages" not in resume_args  # no transcript ever crosses the seam
     assert not any(call["method"] in ("dispose", "unsubscribe") for call in calls)
 
 
@@ -1228,7 +1278,7 @@ def test_enqueue_returns_the_verified_admission(tmp_path: Path) -> None:
     command, child_env, record_path = _scripted_child(tmp_path, "enqueue", script)
     backend = _make_backend(command, child_env)
     backend.connect(_remote_config())
-    backend.start(_start_request(session_id="sess-1"))
+    backend.start(_start_request())
     admission = backend.enqueue("sess-1", "detached turn")
     assert admission == ClineRunAdmission(
         run_id="hub-run-9", accepted_at=1794712612935, queue_position=2
@@ -1252,7 +1302,7 @@ def test_enqueue_maps_refusal_uncertainty_and_session_absence(tmp_path: Path) ->
     command, child_env, _ = _scripted_child(tmp_path, "enqueue-kinds", script)
     backend = _make_backend(command, child_env)
     backend.connect(_remote_config())
-    backend.start(_start_request(session_id="sess-1"))
+    backend.start(_start_request())
     with pytest.raises(ClineSdkOperationRejectedError) as refused:
         backend.enqueue("sess-1", "turn")
     assert refused.value.code == "run_admission_rejected"

@@ -92,6 +92,8 @@ from openorc.adapters.cline.reconciliation import (
     classify_session_evidence,
 )
 from openorc.adapters.cline.values import (
+    ClineResumeRequest,
+    ClineResumeResult,
     ClineRunAdmission,
     ClineSessionEvent,
     ClineStartResult,
@@ -318,8 +320,6 @@ def test_fresh_producer_constructs_native_act_at_the_repository_base() -> None:
         "*": {"autoApprove": True},
         "ask_question": {"enabled": False},
     }
-    assert request.session_id is None
-    assert request.initial_messages is None
     sends = [call for call in backend.calls() if call.operation == "send"]
     assert len(sends) == 1
     assert sends[0].prompt == _INITIALIZATION
@@ -616,20 +616,18 @@ def _bind_checkout(resolver: ScriptedResolver, session_id: str) -> None:
 def test_implement_realizes_authorized_plan_to_act_at_the_task_checkout() -> None:
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
 
     result = adapter.realize_control(session_id, ImplementInteraction())
 
     assert result is None
     operations = [call.operation for call in backend.calls()]
-    assert operations == ["start", "send", "read_messages", "stop", "start"]
+    assert operations == ["start", "send", "stop", "resume"]
     rebuild = backend.calls()[-1].request
-    assert rebuild is not None
+    assert isinstance(rebuild, ClineResumeRequest)
     assert rebuild.mode is ClineConstructionMode.ACT
     assert rebuild.session_id == session_id
     assert rebuild.cwd == _TASK_CHECKOUT
     assert rebuild.workspace_root == _TASK_CHECKOUT
-    assert rebuild.initial_messages == _RAW_MESSAGES
     # No implementation prompt and no second initialization was ever sent.
     assert [call.operation for call in backend.calls()].count("send") == 1
 
@@ -663,19 +661,18 @@ def test_implement_on_a_reviewer_session_is_rejected_before_effects() -> None:
 def _reconstruction_setup() -> tuple[ClineAdapter, FakeClineSdkBackend, ScriptedResolver, str]:
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     return adapter, backend, resolver, session_id
 
 
-def test_reconstruction_sequence_preserves_the_exact_id_and_raw_messages() -> None:
+def test_reconstruction_sequence_restores_the_exact_id_with_the_full_bundle() -> None:
     adapter, backend, _, session_id = _reconstruction_setup()
 
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
     operations = [call.operation for call in backend.calls()]
-    assert operations[-3:] == ["read_messages", "stop", "start"]
+    assert operations[-2:] == ["stop", "resume"]
     rebuild = backend.calls()[-1].request
-    assert rebuild is not None
+    assert isinstance(rebuild, ClineResumeRequest)
     assert rebuild.session_id == session_id
     assert rebuild.mode is ClineConstructionMode.PLAN
     assert rebuild.provider_id == "configured-provider"
@@ -690,9 +687,8 @@ def test_reconstruction_sequence_preserves_the_exact_id_and_raw_messages() -> No
         "*": {"autoApprove": True},
         "ask_question": {"enabled": False},
     }
-    # The raw nested persisted messages round-trip unmodified: ordering,
-    # nested objects, and metadata intact. No initialization resend.
-    assert rebuild.initial_messages == _RAW_MESSAGES
+    # The native resume carries no transcript: Hub-side saved loading only.
+    assert "read_messages" not in operations[2:]
     assert [call.operation for call in backend.calls()].count("send") == 1
 
 
@@ -703,22 +699,19 @@ def test_the_three_authorized_transitions_reconstruct_the_same_id() -> None:
 
     # Bootstrap ACT/base -> PLAN/Task checkout (planning).
     resolver.set_bound(session_id, checkout_context)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
     # IMPLEMENT PLAN/checkout -> ACT/same checkout.
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
 
     # Authorized cleanup ACT/checkout -> ACT/base (outside the checkout).
     resolver.set_bound(session_id, base_context)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
 
     rebuilds = [
         call.request
         for call in backend.calls()
-        if call.operation == "start" and call.request is not None and call.request.session_id
+        if call.operation == "resume" and isinstance(call.request, ClineResumeRequest)
     ]
     assert [rebuild.mode for rebuild in rebuilds] == [
         ClineConstructionMode.PLAN,
@@ -737,32 +730,31 @@ def test_repeat_reconstruction_reapplies_the_same_construction() -> None:
     adapter, backend, _, session_id = _reconstruction_setup()
 
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
 
-    starts = [call for call in backend.calls() if call.operation == "start"]
-    assert len(starts) == 3  # fresh + two same-ID reapplications
+    resumes = [call for call in backend.calls() if call.operation == "resume"]
+    assert len(resumes) == 2  # two same-ID reapplications
 
 
 def test_reconstruction_fails_closed_on_a_wrong_returned_session_id() -> None:
     adapter, backend, _, session_id = _reconstruction_setup()
-    backend.queue_start(ClineStartResult(session_id="cline-session-other"))
+    backend.queue_resume(session_id, ClineResumeResult(session_id="cline-session-other"))
 
     with pytest.raises(AgentRuntimeConfigurationRejectedError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
     operations = [call.operation for call in backend.calls()]
-    assert operations[-3:] == ["read_messages", "stop", "start"]
+    assert operations[-2:] == ["stop", "resume"]
 
 
-def test_reconstruction_stop_failure_never_reaches_start() -> None:
+def test_reconstruction_stop_failure_never_reaches_resume() -> None:
     adapter, backend, _, session_id = _reconstruction_setup()
     backend.queue_stop(session_id, ClineBackendUncertainOutcomeError())
 
     with pytest.raises(AgentRuntimeDeliveryUncertainError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
-    assert "start" not in [call.operation for call in backend.calls()[2:]]
+    assert "resume" not in [call.operation for call in backend.calls()[2:]]
 
 
 def test_reconstruction_refuses_after_an_uncertain_send() -> None:
@@ -780,6 +772,7 @@ def test_reconstruction_refuses_after_an_uncertain_send() -> None:
 
     assert "read_messages" not in [call.operation for call in backend.calls()]
     assert "stop" not in [call.operation for call in backend.calls()]
+    assert "resume" not in [call.operation for call in backend.calls()]
 
 
 def test_reconstruction_without_an_establishable_context_fails_closed() -> None:
@@ -809,14 +802,13 @@ def test_fresh_instance_reconstructs_and_uses_an_existing_bound_session() -> Non
         _context(cwd=_TASK_CHECKOUT, workspace_root=_TASK_CHECKOUT),
     )
     adapter_b = ClineAdapter(backend, resolver_b)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
 
     adapter_b.reconstruct_session(session_id, target_mode=ClineConstructionMode.PLAN)
 
     rebuild = backend.calls()[-1].request
-    assert rebuild is not None
+    assert isinstance(rebuild, ClineResumeRequest)
     assert rebuild.session_id == session_id
-    assert rebuild.initial_messages == _RAW_MESSAGES
+    assert rebuild.mode is ClineConstructionMode.PLAN
 
     # The fresh instance continues to operate on the exact bound session:
     # a Producer-only control resolves through the resolver-established
@@ -858,15 +850,15 @@ def test_normalized_error_chains_stay_clean() -> None:
 @pytest.mark.parametrize(
     ("script", "operation", "expected"),
     [
-        ("attachment_rejected_start", "start", AgentRuntimeConfigurationRejectedError),
-        ("attachment_unavailable_start", "start", AgentRuntimeUnavailableError),
-        ("hub_connect_failed_start", "start", AgentRuntimeUnavailableError),
+        ("attachment_rejected_reconstruct", "reconstruct", AgentRuntimeConfigurationRejectedError),
+        ("attachment_unavailable_reconstruct", "reconstruct", AgentRuntimeUnavailableError),
+        ("hub_connect_failed_reconstruct", "reconstruct", AgentRuntimeUnavailableError),
         ("hub_closed_send", "send", AgentRuntimeUncertainOutcomeError),
-        ("hub_closed_read", "read_messages", AgentRuntimeUnavailableError),
-        ("other_code_start", "start", AgentRuntimeUncertainOutcomeError),
+        ("hub_closed_read_recovery", "recover", AgentRuntimeUnavailableError),
+        ("other_code_reconstruct", "reconstruct", AgentRuntimeUncertainOutcomeError),
         ("unknown_code_send", "send", AgentRuntimeUncertainOutcomeError),
-        ("not_attached_start", "start", AgentRuntimeUnavailableError),
-        ("invalid_params_start", "start", AgentRuntimeConfigurationRejectedError),
+        ("not_attached_reconstruct", "reconstruct", AgentRuntimeUnavailableError),
+        ("invalid_params_reconstruct", "reconstruct", AgentRuntimeConfigurationRejectedError),
         ("attachment_rejected_abort", "abort", AgentRuntimeConfigurationRejectedError),
         ("attachment_unavailable_abort", "abort", AgentRuntimeUnavailableError),
         ("hub_connect_failed_abort", "abort", AgentRuntimeUnavailableError),
@@ -889,24 +881,24 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
 
-    if script == "attachment_rejected_start":
-        backend.queue_start(ClineRemoteAttachmentRejectedError())
-    elif script == "attachment_unavailable_start":
-        backend.queue_start(ClineRemoteAttachmentUnavailableError())
-    elif script == "hub_connect_failed_start":
-        backend.queue_start(ClineSdkOperationRejectedError("hub_connect_failed"))
+    if script == "attachment_rejected_reconstruct":
+        backend.queue_resume(session_id, ClineRemoteAttachmentRejectedError())
+    elif script == "attachment_unavailable_reconstruct":
+        backend.queue_resume(session_id, ClineRemoteAttachmentUnavailableError())
+    elif script == "hub_connect_failed_reconstruct":
+        backend.queue_resume(session_id, ClineSdkOperationRejectedError("hub_connect_failed"))
     elif script == "hub_closed_send":
         backend.queue_send(session_id, ClineSdkOperationRejectedError("hub_connection_closed"))
-    elif script == "hub_closed_read":
+    elif script == "hub_closed_read_recovery":
         backend.queue_read_messages(
             session_id, ClineSdkOperationRejectedError("hub_connection_closed")
         )
-    elif script == "other_code_start":
-        backend.queue_start(ClineSdkOperationRejectedError("operation_invalid"))
-    elif script == "not_attached_start":
-        backend.queue_start(ClineBridgeProtocolError("not_attached"))
-    elif script == "invalid_params_start":
-        backend.queue_start(ClineBridgeProtocolError("invalid_params"))
+    elif script == "other_code_reconstruct":
+        backend.queue_resume(session_id, ClineSdkOperationRejectedError("operation_invalid"))
+    elif script == "not_attached_reconstruct":
+        backend.queue_resume(session_id, ClineBridgeProtocolError("not_attached"))
+    elif script == "invalid_params_reconstruct":
+        backend.queue_resume(session_id, ClineBridgeProtocolError("invalid_params"))
     elif script == "unknown_code_send":
         backend.queue_send(session_id, ClineSdkOperationRejectedError("mystery_failure"))
     elif script == "attachment_rejected_abort":
@@ -958,6 +950,9 @@ def test_backend_failures_classify_into_the_normalized_taxonomy(
     elif operation == "resume":
         with pytest.raises(expected):
             adapter.resume_activity(session_id)
+    elif operation == "recover":
+        with pytest.raises(expected):
+            adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
     else:
         with pytest.raises(expected):
             adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -1443,13 +1438,13 @@ def test_an_abort_on_one_session_leaves_another_sessions_send_independent() -> N
 
 
 def test_abort_declines_while_reconstruction_holds_the_incarnation_section() -> None:
-    """A reconstruction that already entered its read_messages -> stop ->
-    start section makes the abort decline locally before any dispatch —
+    """A reconstruction that already entered its stop → native-resume
+    section makes the abort decline locally before any dispatch —
     never a queued interruption of the possibly new incarnation."""
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
     entered, release = threading.Event(), threading.Event()
-    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+    backend.gate_operation("stop", session_id, entered=entered, release=release)
 
     reconstruct_thread, reconstruct_errors = _call_in_thread(
         lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -1468,9 +1463,8 @@ def test_abort_declines_while_reconstruction_holds_the_incarnation_section() -> 
     assert [call.operation for call in backend.calls()] == [
         "start",
         "send",
-        "read_messages",
         "stop",
-        "start",
+        "resume",
     ]
 
     # With the reconstruction complete, a later abort dispatches normally.
@@ -1560,7 +1554,8 @@ def test_overlapping_aborts_keep_the_reconstruction_guard_until_all_settle() -> 
     # refused even though one abort already settled without any effect.
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert "read_messages" not in [call.operation for call in backend.calls()]
+    assert "stop" not in [call.operation for call in backend.calls()]
+    assert "resume" not in [call.operation for call in backend.calls()]
 
     first_release.set()
     first_thread.join(timeout=_EVENT_TIMEOUT_SECONDS)
@@ -1571,7 +1566,7 @@ def test_overlapping_aborts_keep_the_reconstruction_guard_until_all_settle() -> 
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
     operations = [call.operation for call in backend.calls()]
     assert operations.count("abort") == 2
-    assert operations[-3:] == ["read_messages", "stop", "start"]
+    assert operations[-2:] == ["stop", "resume"]
 
 
 def test_an_uncertain_abort_latches_the_session_against_reconstruction() -> None:
@@ -1613,9 +1608,8 @@ def test_a_known_pre_effect_abort_failure_releases_the_guard_when_settled() -> N
         "start",
         "send",
         "abort",
-        "read_messages",
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -1896,14 +1890,13 @@ def test_resume_activity_refuses_while_uncertain_send_effects_remain() -> None:
 
 def test_resume_activity_serializes_behind_an_in_flight_reconstruction() -> None:
     """The resumed turn takes the send/reconstruction lock: it cannot
-    dispatch while the same-ID reconstruction holds its read/stop/start
+    dispatch while the same-ID reconstruction holds its stop/resume
     section, and it dispatches only after the reconstruction completes —
     never interleaving a changing runtime incarnation."""
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     entered, release = threading.Event(), threading.Event()
-    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+    backend.gate_operation("stop", session_id, entered=entered, release=release)
 
     reconstruct_thread, reconstruct_errors = _call_in_thread(
         lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -1937,9 +1930,8 @@ def test_resume_activity_serializes_behind_an_in_flight_reconstruction() -> None
     assert [call.operation for call in backend.calls()] == [
         "start",
         "send",
-        "read_messages",
         "stop",
-        "start",
+        "resume",
         "send",
     ]
     resume_sends = [call for call in backend.calls() if call.operation == "send"]
@@ -2068,12 +2060,10 @@ def test_reconciliation_attachment_failures_are_never_terminal_claims() -> None:
     with pytest.raises(AgentRuntimeUnavailableError):
         adapter.reconcile_session(session_id)
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -2166,12 +2156,10 @@ def test_settling_an_accounted_uncertain_send_releases_only_the_send_kind() -> N
     assert outcome.settled is True
     assert outcome.refusal is None
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -2194,7 +2182,6 @@ def test_settlement_never_clears_an_unrelated_uncertain_stop() -> None:
 
     # With the send settled, an authorized reconstruction may run — and an
     # uncertain stop inside it latches the stop kind.
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     backend.queue_stop(session_id, ClineBackendUncertainOutcomeError("dropped"))
     with pytest.raises(AgentRuntimeDeliveryUncertainError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
@@ -2214,7 +2201,7 @@ def test_settlement_never_clears_an_unrelated_uncertain_stop() -> None:
 
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()].count("read_messages") == 1
+    assert [call.operation for call in backend.calls()].count("read_messages") == 0
 
 
 def test_settlement_vetoes_while_an_abort_is_outstanding_or_unresolved() -> None:
@@ -2266,12 +2253,10 @@ def test_settlement_vetoes_while_an_abort_is_outstanding_or_unresolved() -> None
     )
     assert outcome.settled is True
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -2281,9 +2266,8 @@ def test_settlement_cannot_slip_past_an_active_reconstruction() -> None:
     section, and only proceeds after the section ends."""
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     entered, release = threading.Event(), threading.Event()
-    backend.gate_operation("read_messages", session_id, entered=entered, release=release)
+    backend.gate_operation("stop", session_id, entered=entered, release=release)
     reconstruction_thread, reconstruction_errors = _call_in_thread(
         lambda: adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
     )
@@ -2336,12 +2320,10 @@ def test_settling_an_uncertain_abort_releases_guard_and_latch_atomically() -> No
     assert outcome.settled is True
     assert outcome.refusal is None
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -2374,12 +2356,10 @@ def test_abort_settlement_never_clears_an_uncertain_send() -> None:
     )
     assert outcome.settled is True
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -2394,21 +2374,20 @@ def test_failed_reconciliation_reads_never_latch_an_otherwise_safe_session() -> 
     with pytest.raises(AgentRuntimeDeliveryUncertainError):
         adapter.reconcile_session(session_id)
 
-    backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
-    assert [call.operation for call in backend.calls()][-3:] == [
-        "read_messages",
+    assert [call.operation for call in backend.calls()][-2:] == [
         "stop",
-        "start",
+        "resume",
     ]
 
 
 def test_recovery_reconstructs_the_same_id_after_a_qualified_restart() -> None:
     """Surviving transcript with a non-addressable incarnation: the
-    authorized recovery runs the single same-ID seam — read_messages, a
-    positively-absent stop, and a same-ID start carrying the raw transcript
-    verbatim in the workflow-selected mode at the resolver-bound original
-    checkout, with no connect and no initialization resend."""
+    authorized recovery runs the single native same-ID seam — read_messages
+    positively establishing the surviving history, a positively-absent stop,
+    and a native resume in the workflow-selected mode at the resolver-bound
+    original checkout, with no connect, no transcript upload, and no
+    initialization resend."""
     backend = FakeClineSdkBackend()
     session_id = _script_ready_session(backend)
     resolver = ScriptedResolver(
@@ -2421,23 +2400,23 @@ def test_recovery_reconstructs_the_same_id_after_a_qualified_restart() -> None:
     adapter = ClineAdapter(backend, resolver)
     backend.queue_read_messages(session_id, list(_RAW_MESSAGES))
     backend.queue_stop(session_id, ClineSessionNotFoundError("no live incarnation"))
+    backend.queue_resume(session_id, ClineResumeResult(session_id=session_id))
 
     adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
 
     operations = [call.operation for call in backend.calls()]
-    assert operations[-3:] == ["read_messages", "stop", "start"]
+    assert operations[-3:] == ["read_messages", "stop", "resume"]
     assert "connect" not in operations
     rebuild = backend.calls()[-1].request
-    assert rebuild is not None
+    assert isinstance(rebuild, ClineResumeRequest)
     assert rebuild.session_id == session_id
     assert rebuild.mode is ClineConstructionMode.ACT
     assert rebuild.cwd == _TASK_CHECKOUT
     assert rebuild.workspace_root == _TASK_CHECKOUT
-    assert rebuild.initial_messages == _RAW_MESSAGES
 
 
 def test_recovery_refuses_an_ambiguous_stop_failure() -> None:
-    """An uncertain stop never permits a same-ID start: the recovery fails
+    """An uncertain stop never permits a native resume: the recovery fails
     closed and the stop-kind uncertainty keeps the session guarded."""
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
@@ -2448,7 +2427,7 @@ def test_recovery_refuses_an_ambiguous_stop_failure() -> None:
         adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
 
     operations = [call.operation for call in backend.calls()]
-    assert "start" not in operations[2:]
+    assert "resume" not in operations[2:]
     with pytest.raises(AgentRuntimeUncertainOutcomeError):
         adapter.reconstruct_session(session_id, target_mode=ClineConstructionMode.ACT)
     assert [call.operation for call in backend.calls()].count("read_messages") == 1
@@ -2457,7 +2436,7 @@ def test_recovery_refuses_an_ambiguous_stop_failure() -> None:
 def test_recovery_refuses_without_surviving_transcript_evidence() -> None:
     """Recovery requires positively established surviving transcript
     evidence: a positively absent read and an empty read on an established
-    bound session both refuse before any stop/start effect."""
+    bound session both refuse before any stop/resume effect."""
     adapter, backend, resolver, session_id = _ready_adapter()
     _bind_checkout(resolver, session_id)
     backend.queue_read_messages(session_id, ClineSessionNotFoundError("gone"))
@@ -2466,7 +2445,7 @@ def test_recovery_refuses_without_surviving_transcript_evidence() -> None:
         adapter.recover_session(session_id, target_mode=ClineConstructionMode.ACT)
     operations = [call.operation for call in backend.calls()]
     assert "stop" not in operations[2:]
-    assert "start" not in operations[2:]
+    assert "resume" not in operations[2:]
 
     empty = FakeClineSdkBackend()
     empty_session = _script_ready_session(empty)
@@ -2482,7 +2461,7 @@ def test_recovery_refuses_without_surviving_transcript_evidence() -> None:
         fresh.recover_session(empty_session, target_mode=ClineConstructionMode.ACT)
     empty_operations = [call.operation for call in empty.calls()]
     assert "stop" not in empty_operations
-    assert "start" not in empty_operations
+    assert "resume" not in empty_operations
 
 
 def test_recovery_refuses_while_uncertainty_or_abort_guards_remain() -> None:
@@ -2522,7 +2501,7 @@ def test_recovery_refuses_while_uncertainty_or_abort_guards_remain() -> None:
     assert [call.operation for call in backend.calls()][-3:] == [
         "read_messages",
         "stop",
-        "start",
+        "resume",
     ]
 
 
@@ -4132,8 +4111,6 @@ def test_allocate_detached_session_starts_without_any_turn_and_registers_the_ide
     # the bundle and no send.
     assert request.mode is ClineConstructionMode.ACT
     assert request.interactive is True
-    assert request.session_id is None
-    assert request.initial_messages is None
     assert [call.operation for call in backend.calls()] == ["start"]
 
 
